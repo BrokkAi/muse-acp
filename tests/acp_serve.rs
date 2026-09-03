@@ -574,7 +574,7 @@ fn resource_link_inlines_workspace_text() {
     // Re-read the session id from the accumulated frames.
     let log = c.frames.lock().unwrap().join("\n");
     let sid = extract_str(
-        &log.lines()
+        log.lines()
             .find(|l| l.contains(&format!("\"id\":{id}")))
             .unwrap(),
         "sessionId",
