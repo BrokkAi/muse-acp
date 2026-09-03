@@ -111,11 +111,19 @@ ACP allows `session/new` and `session/resume` to carry inline stdio and HTTP
 MCP servers, and an agent that advertises those capabilities should connect to
 every requested server. Muse MSP v1 does not currently expose per-session
 transport registration: `session/start` and `session/resume` have no MCP
-fields, and `session/start.config` is explicitly reserved with no members.
+fields, and `session/start.config` is reserved with no members. The official
+TypeScript SDK source closure at upstream commit
+`507c86fef428fb0eebade068433fdc4e058eed88` confirms that boundary:
+`StartSessionOptions` omits the empty `config`, `ResumeSessionOptions` is
+derived from `SessionResumeParams`, `MuseClientSpawnOptions` exposes only
+launch-level process arguments/environment rather than a per-session agent or
+MCP definition, and the generated `MspMethod` union has no MCP method.
 Consequently `muse-acp` does not advertise MCP capabilities and rejects a
 non-empty `mcpServers` array rather than silently dropping tools or leaking a
-server into unrelated sessions. This is a Muse MSP integration gap, not an
-intentional product limit.
+server into unrelated sessions. Muse itself supports configuration/plugin-based
+MCP servers, but those are host-level surfaces; they cannot safely represent
+ACP's inline, session-scoped transports in this persistent multi-session
+gateway. This is a Muse MSP integration gap, not an intentional product limit.
 
 ## Model and reasoning-effort selection
 
