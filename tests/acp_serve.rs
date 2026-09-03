@@ -60,6 +60,7 @@ impl Client {
         cmd.env("MUSE_CLI", &wrap);
         cmd.env("FAKE_SCENARIO", scenario);
         cmd.env("FAKE_LOG", &fake_log);
+        cmd.env("FAKE_INPUT", format!("{fake_log}.input"));
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -122,6 +123,23 @@ impl Client {
         );
         self.stdin.write_all(frame.as_bytes()).expect("write frame");
         self.stdin.flush().expect("flush");
+    }
+
+    /// Wait until the fake host logged turn input containing `want`.
+    fn wait_input(&self, want: &str, timeout: Duration) {
+        let path = format!("{}.input", self.fake_log);
+        let start = Instant::now();
+        loop {
+            if let Ok(t) = std::fs::read_to_string(&path)
+                && t.contains(want)
+            {
+                return;
+            }
+            if start.elapsed() > timeout {
+                panic!("fake host never received input containing {want:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Wait until the fake host observed a given MSP method.
@@ -535,6 +553,60 @@ fn all_approve_cancellation_fails_closed() {
     assert!(
         !seen.lines().any(|l| l == "approval/decide"),
         "no approving decide was sent; host saw:\n{seen}"
+    );
+    c.finish();
+}
+
+#[test]
+fn resource_link_inlines_workspace_text() {
+    let mut c = Client::spawn("quiet", &[]);
+    let dir = std::env::temp_dir().join(format!("acp-res-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    // Percent-encoded name exercises URI decoding + workspace confinement.
+    std::fs::write(dir.join("sp ace.txt"), "secret file text").expect("write");
+    let uri = format!("file://{}", dir.join("sp%20ace.txt").to_str().unwrap());
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let cwd = dir.to_str().unwrap();
+    let id = c.req("session/new", &format!("{{\"cwd\":\"{cwd}\"}}"));
+    c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    // Re-read the session id from the accumulated frames.
+    let log = c.frames.lock().unwrap().join("\n");
+    let sid = extract_str(
+        &log.lines()
+            .find(|l| l.contains(&format!("\"id\":{id}")))
+            .unwrap(),
+        "sessionId",
+    )
+    .expect("sessionId");
+    let pid = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource_link\",\"uri\":\"{uri}\",\"name\":\"notes\"}}]}}"
+        ),
+    );
+    // Prompt accepted (v1 answers at the terminal, which never comes in
+    // quiet mode); the host must have received the inlined text.
+    let _pid = pid;
+    c.wait_input("secret file text", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn embedded_blob_resource_is_rejected() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let id = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource\",\"resource\":{{\"uri\":\"u\",\"mimeType\":\"application/octet-stream\",\"blob\":\"AA==\"}}}}]}}"
+        ),
+    );
+    let done = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"error\"") && done.contains("blob"),
+        "blob rejected explicitly: {done}"
     );
     c.finish();
 }

@@ -53,6 +53,13 @@ def log_method(method):
             f.write(method + "\n")
 
 
+def log_input(params):
+    path = os.environ.get("FAKE_INPUT", "")
+    if path:
+        with open(path, "a") as f:
+            f.write(json.dumps(params.get("input", [])) + "\n")
+
+
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
@@ -151,6 +158,7 @@ def result_for(method, msg):
         return {"models": [{"modelId": "fake-model",
                              "displayLabel": "Fake"}]}
     if method == "turn/start":
+        log_input(msg.get("params", {}))
         return on_turn_start()
     if method == "turn/cancel":
         # Like the real host: a cancelled turn still reports its terminal.
