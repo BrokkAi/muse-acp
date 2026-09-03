@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
-use crate::json::{esc, j_to_string, mint_id, J};
+use crate::json::{J, esc, j_to_string, mint_id};
 
 const MAX_CONTENT: usize = 8000;
 
@@ -26,11 +26,16 @@ fn tool_kind(tool: &str) -> &'static str {
     let t = tool.to_lowercase();
     if t.contains("read") || t.contains("list") || t.contains("cat") {
         "read"
-    } else if t.contains("write") || t.contains("edit") || t.contains("patch") || t.contains("apply") {
+    } else if t.contains("write")
+        || t.contains("edit")
+        || t.contains("patch")
+        || t.contains("apply")
+    {
         "edit"
     } else if t.contains("bash") || t.contains("shell") || t.contains("exec") || t.contains("run") {
         "execute"
-    } else if t.contains("search") || t.contains("grep") || t.contains("glob") || t.contains("find") {
+    } else if t.contains("search") || t.contains("grep") || t.contains("glob") || t.contains("find")
+    {
         "search"
     } else if t.contains("fetch") || t.contains("web") || t.contains("curl") {
         "fetch"
@@ -57,14 +62,34 @@ enum ItemRole {
     Ignored,
 }
 
+pub struct ToolUpdate<'a> {
+    pub create: bool,
+    pub tc_id: &'a str,
+    pub title: &'a str,
+    pub kind: &'a str,
+    pub status: &'a str,
+    pub content_text: Option<&'a str>,
+    pub raw_input: Option<&'a str>,
+}
+
 pub struct SessionFold {
     items: HashMap<String, ItemRole>,
+    /// Completed item ids (gap-refill replays must not re-announce).
+    done: std::collections::HashSet<String>,
     idc: AtomicU64,
 }
 
 impl SessionFold {
     pub fn new() -> Self {
-        Self { items: HashMap::new(), idc: AtomicU64::new(1) }
+        Self {
+            items: HashMap::new(),
+            done: std::collections::HashSet::new(),
+            idc: AtomicU64::new(1),
+        }
+    }
+
+    fn known(&self, item_id: &str) -> bool {
+        self.done.contains(item_id)
     }
 
     fn update_line(acp_sid: &str, update_json: &str) -> String {
@@ -84,37 +109,34 @@ impl SessionFold {
                 content
             )
         } else {
-            format!("{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{}}}", content)
+            format!(
+                "{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{}}}",
+                content
+            )
         };
         Self::update_line(acp_sid, &update)
     }
 
-    fn tool_line(
-        acp_sid: &str,
-        ver: u8,
-        create: bool,
-        tc_id: &str,
-        title: &str,
-        kind: &str,
-        status: &str,
-        content_text: Option<&str>,
-        raw_input: Option<&str>,
-    ) -> String {
-        let session_update = if ver == 2 || !create { "tool_call_update" } else { "tool_call" };
+    fn tool_line(acp_sid: &str, ver: u8, u: &ToolUpdate<'_>) -> String {
+        let session_update = if ver == 2 || !u.create {
+            "tool_call_update"
+        } else {
+            "tool_call"
+        };
         let mut f = vec![
             format!("\"sessionUpdate\":\"{session_update}\""),
-            format!("\"toolCallId\":{}", esc(tc_id)),
-            format!("\"title\":{}", esc(title)),
-            format!("\"kind\":\"{kind}\""),
-            format!("\"status\":{}", esc(status)),
+            format!("\"toolCallId\":{}", esc(u.tc_id)),
+            format!("\"title\":{}", esc(u.title)),
+            format!("\"kind\":\"{}\"", u.kind),
+            format!("\"status\":{}", esc(u.status)),
         ];
-        if let Some(t) = content_text {
+        if let Some(t) = u.content_text {
             f.push(format!(
                 "\"content\":[{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]",
                 esc(&trunc(t))
             ));
         }
-        if let Some(r) = raw_input {
+        if let Some(r) = u.raw_input {
             f.push(format!("\"rawInput\":{r}"));
         }
         Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
@@ -128,7 +150,11 @@ impl SessionFold {
             .or_else(|| item.get("summary"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        let title = if detail.is_empty() { tool.to_string() } else { format!("{tool}: {detail}") };
+        let title = if detail.is_empty() {
+            tool.to_string()
+        } else {
+            format!("{tool}: {detail}")
+        };
         (title, tool.to_string())
     }
 
@@ -138,8 +164,14 @@ impl SessionFold {
             Some(s) => s.to_string(),
             None => return,
         };
+        if self.known(&item_id) {
+            return; // gap-refill replay of a settled item
+        }
         let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-        let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("pending");
+        let status = item
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("pending");
         match kind {
             "toolCall" => {
                 let (tc_id, announced) = match self.items.get(&item_id) {
@@ -152,13 +184,34 @@ impl SessionFold {
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| mint_id("tc-", &self.idc));
-                        self.items.insert(item_id.clone(), ItemRole::Tool { tc_id: id.clone(), announced: false });
+                        self.items.insert(
+                            item_id.clone(),
+                            ItemRole::Tool {
+                                tc_id: id.clone(),
+                                announced: false,
+                            },
+                        );
                         (id, false)
                     }
                 };
                 let (title, tool) = Self::tool_title(item);
-                let raw = item.get("args").map(j_to_string).unwrap_or_else(|| "{}".to_string());
-                out.push(Self::tool_line(acp_sid, ver, !announced, &tc_id, &title, tool_kind(&tool), msp_status(status), None, Some(&raw)));
+                let raw = item
+                    .get("args")
+                    .map(j_to_string)
+                    .unwrap_or_else(|| "{}".to_string());
+                out.push(Self::tool_line(
+                    acp_sid,
+                    ver,
+                    &ToolUpdate {
+                        create: !announced,
+                        tc_id: &tc_id,
+                        title: &title,
+                        kind: tool_kind(&tool),
+                        status: msp_status(status),
+                        content_text: None,
+                        raw_input: Some(&raw),
+                    },
+                ));
                 if let Some(ItemRole::Tool { announced, .. }) = self.items.get_mut(&item_id) {
                     *announced = true;
                 }
@@ -166,7 +219,13 @@ impl SessionFold {
             "agentMessage" | "userMessage" => {
                 if !self.items.contains_key(&item_id) {
                     let msg_id = mint_id("msg-", &self.idc);
-                    self.items.insert(item_id, ItemRole::Message { msg_id, streamed: 0 });
+                    self.items.insert(
+                        item_id,
+                        ItemRole::Message {
+                            msg_id,
+                            streamed: 0,
+                        },
+                    );
                 }
             }
             _ => {
@@ -182,7 +241,12 @@ impl SessionFold {
             Some(s) => s,
             None => return,
         };
-        if params.get("field").and_then(|v| v.as_str()).unwrap_or("text") != "text" {
+        if params
+            .get("field")
+            .and_then(|v| v.as_str())
+            .unwrap_or("text")
+            != "text"
+        {
             return;
         }
         let delta = match params.get("delta").and_then(|v| v.as_str()) {
@@ -205,8 +269,15 @@ impl SessionFold {
             Some(s) => s.to_string(),
             None => return,
         };
+        if self.known(&item_id) {
+            return; // gap-refill replay of a settled item
+        }
+        self.done.insert(item_id.clone());
         let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-        let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("completed");
+        let status = item
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("completed");
         match kind {
             "toolCall" => {
                 let (tc_id, announced) = match self.items.get(&item_id) {
@@ -217,7 +288,13 @@ impl SessionFold {
                             .and_then(|v| v.as_str())
                             .map(|s| s.to_string())
                             .unwrap_or_else(|| mint_id("tc-", &self.idc));
-                        self.items.insert(item_id.clone(), ItemRole::Tool { tc_id: id.clone(), announced: false });
+                        self.items.insert(
+                            item_id.clone(),
+                            ItemRole::Tool {
+                                tc_id: id.clone(),
+                                announced: false,
+                            },
+                        );
                         (id, false)
                     }
                 };
@@ -231,8 +308,17 @@ impl SessionFold {
                 let content = if text.is_empty() { None } else { Some(text) };
                 let raw = item.get("args").map(j_to_string);
                 out.push(Self::tool_line(
-                    acp_sid, ver, !announced, &tc_id, &title, tool_kind(&tool),
-                    msp_status(status), content, raw.as_deref(),
+                    acp_sid,
+                    ver,
+                    &ToolUpdate {
+                        create: !announced,
+                        tc_id: &tc_id,
+                        title: &title,
+                        kind: tool_kind(&tool),
+                        status: msp_status(status),
+                        content_text: content,
+                        raw_input: raw.as_deref(),
+                    },
                 ));
                 self.items.remove(&item_id);
             }
@@ -258,10 +344,12 @@ impl SessionFold {
 }
 
 /// MSP turn terminal -> ACP stop reason (v1 + v2 share the vocabulary).
-pub fn stop_reason(terminal: &str) -> Option<&'static str> {
+/// `failed` and unknown terminals map to the implementation-specific
+/// `_failed` (spec-sanctioned `_` prefix): never omit completion metadata.
+pub fn stop_reason(terminal: &str) -> &'static str {
     match terminal {
-        "completed" => Some("end_turn"),
-        "cancelled" => Some("cancelled"),
-        _ => None,
+        "completed" => "end_turn",
+        "cancelled" => "cancelled",
+        _ => "_failed",
     }
 }

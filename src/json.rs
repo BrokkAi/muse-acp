@@ -25,18 +25,29 @@ impl J {
         if let J::Str(s) = self { Some(s) } else { None }
     }
     pub fn as_u64(&self) -> Option<u64> {
-        if let J::Num(n) = self { n.parse().ok() } else { None }
+        if let J::Num(n) = self {
+            n.parse().ok()
+        } else {
+            None
+        }
     }
 }
+
+const MAX_DEPTH: usize = 64;
 
 struct Parser<'a> {
     b: &'a [u8],
     pos: usize,
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
     fn new(s: &'a str) -> Self {
-        Self { b: s.as_bytes(), pos: 0 }
+        Self {
+            b: s.as_bytes(),
+            pos: 0,
+            depth: 0,
+        }
     }
     fn skip_ws(&mut self) {
         while self.pos < self.b.len() && matches!(self.b[self.pos], b' ' | b'\t' | b'\n' | b'\r') {
@@ -53,36 +64,79 @@ impl<'a> Parser<'a> {
             Some(b't') => self.parse_lit("true", J::Bool(true)),
             Some(b'f') => self.parse_lit("false", J::Bool(false)),
             Some(b'"') => Ok(J::Str(self.parse_string()?)),
-            Some(b'[') => self.parse_array(),
-            Some(b'{') => self.parse_object(),
+            Some(b'[') | Some(b'{') => {
+                if self.depth >= MAX_DEPTH {
+                    return Err("nesting too deep".to_string());
+                }
+                self.depth += 1;
+                let r = if self.peek() == Some(b'[') {
+                    self.parse_array()
+                } else {
+                    self.parse_object()
+                };
+                self.depth -= 1;
+                r
+            }
             Some(c) if c == b'-' || c.is_ascii_digit() => self.parse_number(),
             Some(c) => Err(format!("unexpected char '{}' at {}", c as char, self.pos)),
             None => Err("unexpected end of input".to_string()),
         }
     }
     fn parse_lit(&mut self, lit: &str, v: J) -> Result<J, String> {
-        if self.b.len() >= self.pos + lit.len() && &self.b[self.pos..self.pos + lit.len()] == lit.as_bytes() {
+        if self.b.len() >= self.pos + lit.len()
+            && &self.b[self.pos..self.pos + lit.len()] == lit.as_bytes()
+        {
             self.pos += lit.len();
             Ok(v)
         } else {
             Err(format!("invalid literal at {}", self.pos))
         }
     }
+    /// Strict RFC 8259 numbers: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+    /// The lexeme is kept verbatim so request ids round-trip exactly.
     fn parse_number(&mut self) -> Result<J, String> {
         let start = self.pos;
-        if self.peek() == Some(b'-') {
+        let take = |p: &mut Self, c: u8| -> bool {
+            if p.peek() == Some(c) {
+                p.pos += 1;
+                true
+            } else {
+                false
+            }
+        };
+        take(self, b'-');
+        match self.peek() {
+            Some(b'0') => {
+                self.pos += 1;
+            }
+            Some(c) if c.is_ascii_digit() => {
+                while self.peek().is_some_and(|d| d.is_ascii_digit()) {
+                    self.pos += 1;
+                }
+            }
+            _ => return Err(format!("invalid number at {start}")),
+        }
+        if take(self, b'.') {
+            if !self.peek().is_some_and(|d| d.is_ascii_digit()) {
+                return Err(format!("invalid number at {start}"));
+            }
+            while self.peek().is_some_and(|d| d.is_ascii_digit()) {
+                self.pos += 1;
+            }
+        }
+        if self.peek() == Some(b'e') || self.peek() == Some(b'E') {
             self.pos += 1;
+            let _ = take(self, b'+') || take(self, b'-');
+            if !self.peek().is_some_and(|d| d.is_ascii_digit()) {
+                return Err(format!("invalid number at {start}"));
+            }
+            while self.peek().is_some_and(|d| d.is_ascii_digit()) {
+                self.pos += 1;
+            }
         }
-        while self.pos < self.b.len()
-            && (self.b[self.pos].is_ascii_digit()
-                || matches!(self.b[self.pos], b'.' | b'e' | b'E' | b'+' | b'-'))
-        {
-            self.pos += 1;
-        }
-        if self.pos == start {
-            return Err(format!("invalid number at {}", start));
-        }
-        Ok(J::Num(String::from_utf8_lossy(&self.b[start..self.pos]).into_owned()))
+        Ok(J::Num(
+            String::from_utf8_lossy(&self.b[start..self.pos]).into_owned(),
+        ))
     }
     fn hex4(&mut self) -> Result<u32, String> {
         if self.pos + 4 > self.b.len() {
@@ -131,8 +185,12 @@ impl<'a> Parser<'a> {
                     }
                 }
                 _ => {
+                    if c < 0x20 {
+                        return Err(format!("unescaped control in string at {}", self.pos));
+                    }
                     let rest = &self.b[self.pos..];
-                    let s = std::str::from_utf8(rest).map_err(|_| "invalid utf8 in string".to_string())?;
+                    let s = std::str::from_utf8(rest)
+                        .map_err(|_| "invalid utf8 in string".to_string())?;
                     let ch = s.chars().next().ok_or("empty string tail")?;
                     out.push(ch);
                     self.pos += ch.len_utf8();
@@ -243,8 +301,10 @@ pub fn j_to_string(j: &J) -> String {
             format!("[{}]", parts.join(","))
         }
         J::Obj(pairs) => {
-            let parts: Vec<String> =
-                pairs.iter().map(|(k, v)| format!("{}:{}", esc(k), j_to_string(v))).collect();
+            let parts: Vec<String> = pairs
+                .iter()
+                .map(|(k, v)| format!("{}:{}", esc(k), j_to_string(v)))
+                .collect();
             format!("{{{}}}", parts.join(","))
         }
     }
@@ -254,11 +314,21 @@ pub fn b64(data: &[u8]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut o = String::with_capacity(data.len() / 3 * 4 + 4);
     for c in data.chunks(3) {
-        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | (*c.get(2).unwrap_or(&0) as u32);
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | (*c.get(2).unwrap_or(&0) as u32);
         o.push(T[((n >> 18) & 63) as usize] as char);
         o.push(T[((n >> 12) & 63) as usize] as char);
-        o.push(if c.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-        o.push(if c.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        o.push(if c.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        o.push(if c.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     o
 }

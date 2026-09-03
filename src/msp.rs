@@ -27,9 +27,21 @@ pub fn log(msg: &str) {
 }
 
 pub enum MspEvent {
-    Notification { method: String, params: J },
+    Notification {
+        method: String,
+        params: J,
+    },
+    /// Server-initiated request (e.g. approval/request, userInput/request).
+    /// Already acked `{}` per protocol; the payload still needs handling.
+    Request {
+        method: String,
+        params: J,
+    },
     Eof(String),
 }
+
+/// How long a host command may take to acknowledge (acks are admission-only).
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub struct MspHost {
     writer: Arc<Mutex<std::process::ChildStdin>>,
@@ -45,7 +57,10 @@ impl MspHost {
         let mut cmd = Command::new(&bin);
         cmd.arg("serve");
         // Host-lifetime posture from env (see `muse serve --help`).
-        for a in std::env::var("MUSE_SERVE_ARGS").unwrap_or_default().split_whitespace() {
+        for a in std::env::var("MUSE_SERVE_ARGS")
+            .unwrap_or_default()
+            .split_whitespace()
+        {
             cmd.arg(a);
         }
         let mut child = cmd
@@ -68,7 +83,10 @@ impl MspHost {
         std::thread::spawn(move || reader_loop(reader_host, stdout, tx));
         // Handshake.
         let res = host
-            .command("initialize", r#"{"clientInfo":{"name":"muse_acp","version":"0.2.0"}}"#)
+            .command(
+                "initialize",
+                r#"{"clientInfo":{"name":"muse_acp","version":"0.2.0"}}"#,
+            )
             .map_err(|e| format!("serve initialize failed: {}", err_message(&e)))?;
         let fp = res
             .get("schema")
@@ -110,7 +128,14 @@ impl MspHost {
             | ((r[7] as u64) << 16)
             | ((r[8] as u64) << 8)
             | (r[9] as u64);
-        format!("{:08x}-{:04x}-7{:03x}-{:04x}-{:012x}", (ms >> 16) as u32, (ms & 0xffff) as u16, b, c, d)
+        format!(
+            "{:08x}-{:04x}-7{:03x}-{:04x}-{:012x}",
+            (ms >> 16) as u32,
+            (ms & 0xffff) as u16,
+            b,
+            c,
+            d
+        )
     }
 
     /// Send a command; Ok(result) / Err(error object).
@@ -118,18 +143,30 @@ impl MspHost {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id.to_string(), tx);
-        let line = format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"{method}\",\"params\":{params_json}}}");
+        let line = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"{method}\",\"params\":{params_json}}}"
+        );
         if let Err(e) = self.send_raw(&line) {
             self.pending.lock().unwrap().remove(&id.to_string());
             return Err(mk_err(-32603, &format!("serve write failed: {e}")));
         }
-        rx.recv().map_err(|_| mk_err(-32603, "serve host closed the connection"))?
+        match rx.recv_timeout(COMMAND_TIMEOUT) {
+            Ok(r) => r,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                Err(mk_err(-32603, "serve command timed out"))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(mk_err(-32603, "serve host closed the connection"))
+            }
+        }
     }
 
     /// Client-to-server notification (no id, no response).
     pub fn notify(&self, method: &str, params_json: &str) -> Result<(), String> {
-        let line = format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\",\"params\":{params_json}}}");
-        self.send_raw(&line).map_err(|e| format!("serve notify failed: {e}"))
+        let line =
+            format!("{{\"jsonrpc\":\"2.0\",\"method\":\"{method}\",\"params\":{params_json}}}");
+        self.send_raw(&line)
+            .map_err(|e| format!("serve notify failed: {e}"))
     }
 
     pub fn send_raw(&self, line: &str) -> std::io::Result<()> {
@@ -155,11 +192,17 @@ pub fn mk_err(code: i64, message: &str) -> J {
 }
 
 pub fn err_message(e: &J) -> String {
-    e.get("message").and_then(|v| v.as_str()).unwrap_or("unknown error").to_string()
+    e.get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown error")
+        .to_string()
 }
 
 pub fn err_code(e: &J) -> i64 {
-    e.get("code").and_then(|v| v.as_u64()).map(|n| n as i64).unwrap_or(-32603)
+    e.get("code")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as i64)
+        .unwrap_or(-32603)
 }
 
 fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender<MspEvent>) {
@@ -190,10 +233,22 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
             }
         };
         let id = msg.get("id").cloned();
-        let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        if !method.is_empty() && id.is_some() {
-            // Server-initiated request (e.g. approval/request): ack handling now.
-            host.reply_ok(id.as_ref().unwrap());
+        let method = msg
+            .get("method")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !method.is_empty()
+            && let Some(idv) = id.as_ref()
+        {
+            // Server-initiated request (e.g. approval/request): ack handling
+            // now ("a client is handling this"), but still forward the payload
+            // — reissued multi-stage/resumed requests carry their own choices.
+            host.reply_ok(idv);
+            let params = msg.get("params").cloned().unwrap_or(J::Null);
+            if tx.send(MspEvent::Request { method, params }).is_err() {
+                break;
+            }
             continue;
         }
         if let Some(idv) = id {
@@ -218,5 +273,3 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
         }
     }
 }
-
-
