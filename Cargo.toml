@@ -4,3 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+agent-client-protocol = { version = "=2.0.0", features = ["unstable_auth_methods", "unstable_elicitation", "unstable_protocol_v2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
+uuid = { version = "1", features = ["v7"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
