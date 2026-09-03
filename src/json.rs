@@ -344,3 +344,49 @@ pub fn mint_id(prefix: &str, counter: &std::sync::atomic::AtomicU64) -> String {
     let hex: String = tail.iter().map(|b| format!("{b:02x}")).collect();
     format!("{prefix}{n}-{hex}")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_json;
+
+    /// Strict RFC 8259 numbers: leading zeros, bare fractions, and
+    /// dangling exponents are rejected, not echoed back as ids.
+    #[test]
+    fn numbers_are_strict() {
+        for bad in [
+            "{\"id\":01}",
+            "[1.2.3]",
+            "[1e]",
+            "[-]",
+            "[01]",
+            "[+1]",
+            "[.5]",
+            "[1.]",
+            "[1e+]",
+            "{\"a\":1} trailing",
+        ] {
+            assert!(parse_json(bad).is_err(), "must reject {bad}");
+        }
+        for good in [
+            "[0]",
+            "[-0]",
+            "[42]",
+            "[-0.5]",
+            "[1e10]",
+            "[1E-3]",
+            "[123.456e+7]",
+            "{\"jsonrpc\":\"2.0\",\"id\":3}",
+        ] {
+            assert!(parse_json(good).is_ok(), "must accept {good}");
+        }
+    }
+
+    /// Nesting is bounded so hostile frames cannot overflow the stack.
+    #[test]
+    fn nesting_is_bounded() {
+        let deep = "[".repeat(100) + &"]".repeat(100);
+        assert!(parse_json(&deep).is_err());
+        let shallow = "[".repeat(8) + &"]".repeat(8);
+        assert!(parse_json(&shallow).is_ok());
+    }
+}

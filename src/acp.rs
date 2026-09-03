@@ -163,14 +163,16 @@ pub fn perm_options(params: &J) -> (String, Vec<(String, String)>) {
     (format!("[{}]", opts.join(",")), choices)
 }
 
-/// Deny-safe fallback choice: first non-approved decision, else first choice.
+/// Deny-safe fallback choice: first non-approved decision, else None. A
+/// client cancellation/error must never resolve to an approving choice,
+/// so an all-approve (or empty) list fails closed upstream.
 pub fn fallback_deny(choices: &[(String, String)]) -> Option<String> {
     for (id, d) in choices {
         if !d.to_lowercase().starts_with("approv") {
             return Some(id.clone());
         }
     }
-    choices.first().map(|(id, _)| id.clone())
+    None
 }
 
 /// Our mode vocabulary -> MSP ApprovalMode.

@@ -28,6 +28,16 @@ static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the v2 client adver
 static CATALOG: std::sync::OnceLock<Mutex<Vec<(String, String, bool)>>> =
     std::sync::OnceLock::new();
 
+/// Folded host approval mode: `session.approvalMode.mode`
+/// (EffectiveApprovalModeState; additive-optional, may be absent).
+fn host_mode(res: &J) -> Option<String> {
+    res.get("session")?
+        .get("approvalMode")?
+        .get("mode")?
+        .as_str()
+        .map(|s| s.to_string())
+}
+
 fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
     let cell = CATALOG.get_or_init(|| Mutex::new(Vec::new()));
     {
@@ -285,28 +295,31 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             return;
                         }
                     };
-                    let mut applied_mode = "promptUnmatched".to_string();
+                    // The host reports the folded mode in
+                    // session.approvalMode.mode; without an explicit request
+                    // we adopt the host default, with one we require a match.
+                    let mut applied_mode =
+                        host_mode(&r).unwrap_or_else(|| "promptUnmatched".to_string());
                     if !start_mode.is_empty() {
-                        // The host confirms the applied mode in effectiveMode;
-                        // a mismatch means our posture did not take.
-                        let applied = r
-                            .get("effectiveMode")
-                            .and_then(|e| e.get("mode"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        if !applied.is_empty() && Some(applied) != resolved_env {
-                            acp::send_error(
-                                stdout,
-                                &id,
-                                -32603,
-                                &format!(
-                                    "requested approval mode was not applied (host reports {applied})"
-                                ),
-                            );
-                            return;
-                        }
-                        if !applied.is_empty() {
-                            applied_mode = applied.to_string();
+                        match (resolved_env, host_mode(&r)) {
+                            (Some(want), Some(got)) if got.as_str() == want => {
+                                applied_mode = got;
+                            }
+                            (Some(_), Some(got)) => {
+                                acp::send_error(
+                                    stdout,
+                                    &id,
+                                    -32603,
+                                    &format!(
+                                        "requested approval mode was not applied (host reports {got})"
+                                    ),
+                                );
+                                return;
+                            }
+                            (Some(want), None) => {
+                                applied_mode = want.to_string();
+                            }
+                            (None, _) => {}
                         }
                     }
                     let sid = mint_id("sess-", &ID_COUNTER);
@@ -466,6 +479,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         if !real_model.is_empty() {
                             entry.model_value = real_model;
                         }
+                        // Refresh the mode selector from the folded host
+                        // mode so resumed clients are not stuck stale.
+                        if let Some(m) = host_mode(&r) {
+                            entry.mode_value = acp::mode_from_msp(&m).to_string();
+                        }
                         if replay {
                             replay_history(stdout, entry, &r);
                         }
@@ -476,15 +494,30 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .get(&sid)
                         .map(|s| s.msp_sid.clone())
                         .unwrap_or_default();
-                    acp::send_result(
-                        stdout,
-                        &id,
-                        &format!(
+                    // v2 resumes also report current selectors; v1 keeps the
+                    // historical shape.
+                    let result = if ver == 2 {
+                        let (mode_v, model_v) = sessions
+                            .lock()
+                            .unwrap()
+                            .get(&sid)
+                            .map(|s| (s.mode_value.clone(), s.model_value.clone()))
+                            .unwrap_or_default();
+                        let models = catalog(host);
+                        format!(
+                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
+                            esc(&sid),
+                            esc(&msp_out),
+                            acp::config_options(&mode_v, &model_v, &models)
+                        )
+                    } else {
+                        format!(
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}}}}",
                             esc(&sid),
                             esc(&msp_out)
-                        ),
-                    );
+                        )
+                    };
+                    acp::send_result(stdout, &id, &result);
                 }
                 Err(e) => acp::send_error(
                     stdout,
@@ -801,13 +834,22 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 }
             };
             match r {
-                Ok(_) => {
+                Ok(res) => {
                     // Return the full updated option set, not just the delta.
+                    // The host echoes the folded mode; prefer it over the
+                    // request so a downgraded apply cannot desync selectors.
+                    let folded = res
+                        .get("effectiveMode")
+                        .and_then(|e| e.get("mode"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     if let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
                         if key == "mode" {
-                            if let Some(m) = acp::resolve_mode(&value) {
-                                s.mode_value = acp::mode_from_msp(m).to_string();
-                            }
+                            let m = folded
+                                .as_deref()
+                                .or_else(|| acp::resolve_mode(&value))
+                                .unwrap_or("promptUnmatched");
+                            s.mode_value = acp::mode_from_msp(m).to_string();
                         } else {
                             s.model_value = value.clone();
                         }

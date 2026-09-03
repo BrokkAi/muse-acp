@@ -26,6 +26,7 @@ struct Client {
     frames: Arc<Mutex<Vec<String>>>,
     next_id: u64,
     stderr_log: String,
+    fake_log: String,
 }
 
 impl Client {
@@ -54,9 +55,11 @@ impl Client {
         }
         let stderr_log = dir.join("adapter.stderr").to_str().unwrap().to_string();
         let err_file = std::fs::File::create(&stderr_log).expect("stderr log");
+        let fake_log = dir.join("fake.log").to_str().unwrap().to_string();
         let mut cmd = Command::new(adapter_bin());
         cmd.env("MUSE_CLI", &wrap);
         cmd.env("FAKE_SCENARIO", scenario);
+        cmd.env("FAKE_LOG", &fake_log);
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -90,6 +93,7 @@ impl Client {
             frames,
             next_id: 1,
             stderr_log,
+            fake_log,
         }
     }
 
@@ -102,6 +106,38 @@ impl Client {
         self.stdin.write_all(frame.as_bytes()).expect("write frame");
         self.stdin.flush().expect("flush");
         id
+    }
+
+    /// Raw bytes (e.g. malformed JSON probes).
+    fn raw(&mut self, text: &str) {
+        self.stdin.write_all(text.as_bytes()).expect("write raw");
+        self.stdin.write_all(b"\n").expect("write nl");
+        self.stdin.flush().expect("flush");
+    }
+
+    /// Client response to a server-initiated request (permission/elicitation).
+    fn respond_error(&mut self, server_id: &str) {
+        let frame = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{server_id}\",\"error\":{{\"code\":-32800,\"message\":\"cancelled\"}}}}\n"
+        );
+        self.stdin.write_all(frame.as_bytes()).expect("write frame");
+        self.stdin.flush().expect("flush");
+    }
+
+    /// Wait until the fake host observed a given MSP method.
+    fn wait_log(&self, want: &str, timeout: Duration) {
+        let start = Instant::now();
+        loop {
+            if let Ok(t) = std::fs::read_to_string(&self.fake_log)
+                && t.lines().any(|l| l == want)
+            {
+                return;
+            }
+            if start.elapsed() > timeout {
+                panic!("fake host never saw {want:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Raw client->server notification (e.g. initialized).
@@ -339,6 +375,198 @@ fn user_input_options_reach_the_client() {
     assert!(
         log.find("requires_action").unwrap() < log.find("elicitation/create").unwrap(),
         "state precedes the offer"
+    );
+    c.finish();
+}
+
+#[test]
+fn v2_failed_terminal_yields_failed_stop() {
+    let mut c = Client::spawn("failed", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "hi");
+    let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+    assert!(idle.contains(&sid), "idle for our session: {idle}");
+    assert!(
+        idle.contains("_failed"),
+        "failed terminal keeps its stop reason: {idle}"
+    );
+    c.finish();
+}
+
+#[test]
+fn turn_unqueued_settles_prompt_cancelled() {
+    let mut c = Client::spawn("unqueued", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"cancelled\""),
+        "reclaimed turn settles: {done}"
+    );
+    c.finish();
+}
+
+#[test]
+fn queued_turns_share_running_until_drained() {
+    let mut c = Client::spawn("queued", &[]);
+    let sid = c.new_session(2, "");
+    let p1 = c.prompt(&sid, "one");
+    let a1 = c.wait_for(&format!("\"id\":{p1}"), Duration::from_secs(15));
+    assert!(a1.contains("\"result\":{}"), "first accepted: {a1}");
+    let p2 = c.prompt(&sid, "two");
+    let a2 = c.wait_for(&format!("\"id\":{p2}"), Duration::from_secs(15));
+    assert!(a2.contains("\"result\":{}"), "second accepted: {a2}");
+    let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+    assert!(idle.contains("end_turn"), "drains with metadata: {idle}");
+    let (idles, log) = {
+        let frames = c.frames.lock().unwrap();
+        let idles = frames.iter().filter(|f| f.contains("\"idle\"")).count();
+        (idles, frames.join("\n"))
+    };
+    assert_eq!(idles, 1, "exactly one idle transition");
+    assert!(
+        log.rfind("\"running\"").unwrap() < log.find("\"idle\"").unwrap(),
+        "running persists until the last turn drains"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_close_cancels_in_flight() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    c.wait_log("turn/start", Duration::from_secs(15));
+    let cid = c.req("session/close", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let closed = c.wait_for(&format!("\"id\":{cid}"), Duration::from_secs(15));
+    assert!(closed.contains("\"result\":{}"), "close ack: {closed}");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"cancelled\""),
+        "in-flight prompt settles: {done}"
+    );
+    c.finish();
+}
+
+#[test]
+fn approval_request_without_notification_is_bridged() {
+    // Reissued server-initiated approval/request (no notification): the
+    // reader acks it AND the bridge still reaches the client.
+    let mut c = Client::spawn("approval_req", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "do it");
+    let perm = c.wait_for("request_permission", Duration::from_secs(15));
+    assert!(perm.contains(&sid), "permission for our session: {perm}");
+    assert!(perm.contains("c-allow"), "allow choice kept: {perm}");
+    assert!(perm.contains("c-deny"), "deny choice kept: {perm}");
+    c.finish();
+}
+
+#[test]
+fn session_load_replays_history() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let lid = c.req("session/load", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let load = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+    assert!(load.contains("\"result\""), "load ok: {load}");
+    let log = c.frames.lock().unwrap().join("\n");
+    let end = log.find(&format!("\"id\":{lid}")).unwrap();
+    let replay = &log[..end];
+    assert!(replay.contains("old question"), "user history replayed");
+    assert!(replay.contains("old answer"), "agent history replayed");
+    assert!(replay.contains("old bytes"), "tool history replayed");
+    c.finish();
+}
+
+#[test]
+fn host_default_mode_is_reflected() {
+    let mut c = Client::spawn("quiet", &[("FAKE_MODE", "allowAll")]);
+    let _sid = c.new_session(2, "");
+    let log = c.frames.lock().unwrap().join("\n");
+    let cfg = log
+        .lines()
+        .find(|l| l.contains("configOptions"))
+        .expect("config in session/new")
+        .to_string();
+    assert!(
+        cfg.contains("\"currentValue\":\"auto\""),
+        "host allowAll shows as auto, not ask: {cfg}"
+    );
+    c.finish();
+}
+
+#[test]
+fn set_config_option_returns_full_state() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"mode\",\"value\":\"ask\"}}"),
+    );
+    let done = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(done.contains("\"configOptions\""), "full state: {done}");
+    assert!(
+        done.contains("\"currentValue\":\"ask\""),
+        "updated value reflected: {done}"
+    );
+    c.finish();
+}
+
+#[test]
+fn all_approve_cancellation_fails_closed() {
+    // Every choice approves and the client cancels: no approval/decide may
+    // be sent; the turn is cancelled instead.
+    let mut c = Client::spawn("approval_hang", &[("FAKE_APPROVAL", "all-approve")]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "do it");
+    let perm = c.wait_for("request_permission", Duration::from_secs(15));
+    assert!(perm.contains("c-yes"), "all-approve choices shown: {perm}");
+    let perm_id = extract_str(&perm, "id").expect("perm request id");
+    c.respond_error(&perm_id);
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"cancelled\""),
+        "turn cancelled, never approved: {done}"
+    );
+    c.wait_log("turn/cancel", Duration::from_secs(15));
+    // Give the adapter a beat to (not) send approval/decide, then check.
+    std::thread::sleep(Duration::from_millis(500));
+    let seen = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+    assert!(
+        !seen.lines().any(|l| l == "approval/decide"),
+        "no approving decide was sent; host saw:\n{seen}"
+    );
+    c.finish();
+}
+
+#[test]
+fn malformed_json_is_rejected_and_survived() {
+    let mut c = Client::spawn("happy", &[]);
+    c.raw("{\"jsonrpc\":\"2.0\",\"id\":01,\"method\":\"initialize\",\"params\":{}}");
+    let err = c.wait_for("-32700", Duration::from_secs(15));
+    assert!(err.contains("\"error\""), "parse error: {err}");
+    // The adapter is still alive for well-formed frames.
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "terminal: {done}");
+    c.finish();
+}
+
+#[test]
+fn approval_mode_mismatch_fails_session_new() {
+    // Operator asked for auto but the host folded promptUnmatched: the
+    // session must fail, not silently run under the wrong posture.
+    let mut c = Client::spawn("quiet", &[("MUSE_APPROVAL_MODE", "auto")]);
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "init failed: {frame}");
+    c.notify("initialized", "{}");
+    let id = c.req("session/new", "{\"cwd\":\"/tmp\"}");
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("not applied"),
+        "mismatch must fail loudly: {frame}"
     );
     c.finish();
 }
