@@ -21,10 +21,16 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `turn/start` `ifBusy` (queue default) | concurrent prompts per session; each completes its own response; `session/cancel` stops all of them |
 | `TurnInputPart` image | image blocks (inline base64 or local `file://` path); advertised in caps |
 | `userInput/requested` | `elicitation/create` form bridge (needs client `elicitation.form` caps), else auto-cancel |
-| `session/setApprovalMode` | v2 `configOptions` mode selector (`ask`/`auto`/`deny`) + `session/set_config_option`; v1 `session/set_mode` |
-| `model/list` + `session/setModel` | v2 `configOptions` model selector + `session/set_config_option`; v1 `session/set_model` |
-| `reasoningEffort` on `turn/start` / `turn/steer` | v2 `configOptions` reasoning selector (`none` through `ultra`) |
+| `session/setApprovalMode` | `configOptions` mode selector (`ask`/`auto`/`deny`) + `session/set_config_option`; legacy v1 `modes` / `session/set_mode` |
+| `model/list` + `session/setModel` | `configOptions` model selector + `session/set_config_option`; legacy v1 `session/set_model` |
+| `reasoningEffort` on `turn/start` / `turn/steer` | `configOptions` reasoning selector (`none` through `ultra`) |
 | `turn/steer` | v2 `_session/steering` extension with exact-turn targeting and race-safe idle behavior |
+| Muse skills | ACP `available_commands_update`; aliases such as `/plan` are sent to Muse as `/skill plan` |
+
+Zed currently initializes custom agents with ACP v1 even though it supports
+config selectors, so the adapter returns `configOptions` in both protocol
+versions: v1 uses the selector field `id` (plus a legacy `modes` fallback), while
+v2 uses `configId`.
 
 ## Run
 
