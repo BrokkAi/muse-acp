@@ -17,6 +17,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   unqueued     turn/unqueued for the turn (never runs)
   quiet        turn/start answers only; nothing follows (for close/cancel)
   load         session/resume serves inline history (for session/load replay)
+  resume_active session/resume reports a running turn (for steering reattach)
 """
 import json
 import os
@@ -57,7 +58,7 @@ def log_input(params):
     path = os.environ.get("FAKE_INPUT", "")
     if path:
         with open(path, "a") as f:
-            f.write(json.dumps(params.get("input", [])) + "\n")
+            f.write(json.dumps(params) + "\n")
 
 
 def send(obj):
@@ -76,6 +77,7 @@ def turn_id():
 
 def session_obj():
     return {"sessionId": MSP_SID, "modelId": "fake-model",
+            "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
             "approvalMode": {"lastCommandId": None, "mode": MODE,
                              "source": "serverDefault"}}
 
@@ -90,7 +92,7 @@ def history_items():
     ]
 
 
-def on_turn_start():
+def on_turn_start(params):
     tid = turn_id()
     base = {"sessionId": MSP_SID, "turnId": tid}
     if SCENARIO == "happy":
@@ -137,7 +139,14 @@ def on_turn_start():
                                      "terminal": "completed"})
     elif SCENARIO == "unqueued":
         notify("turn/unqueued", dict(base))
-    return {"turnId": tid}
+    disposition = "queued" if SCENARIO == "queued" and TURNS[0] > 1 else "started"
+    return {
+        "commandId": params.get("commandId", ""),
+        "status": "accepted",
+        "turnId": tid,
+        "disposition": disposition,
+        "startedNewTurn": disposition == "started",
+    }
 
 
 def result_for(method, msg):
@@ -158,8 +167,17 @@ def result_for(method, msg):
         return {"models": [{"modelId": "fake-model",
                              "displayLabel": "Fake"}]}
     if method == "turn/start":
-        log_input(msg.get("params", {}))
-        return on_turn_start()
+        params = msg.get("params", {})
+        log_input(params)
+        return on_turn_start(params)
+    if method == "turn/steer":
+        params = msg.get("params", {})
+        log_input(params)
+        return {
+            "commandId": params.get("commandId", ""),
+            "status": "accepted",
+            "turnId": params.get("expectedTurnId", ""),
+        }
     if method == "turn/cancel":
         # Like the real host: a cancelled turn still reports its terminal.
         params = msg.get("params", {})

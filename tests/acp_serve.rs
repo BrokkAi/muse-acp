@@ -2,9 +2,9 @@
 //!
 //! The fake host ([`fixtures/fake_serve.py`]) speaks just enough MSP JSON-RPC
 //! for the adapter handshake, then plays one scripted scenario per run. Each
-//! test spawns the adapter with `MUSE_CLI=python3 <fixture>` (the adapter
-//! always appends `serve`, which the fixture ignores) and drives ACP over
-//! stdio. Requires `python3` on PATH.
+//! test points `MUSE_CLI` at the executable Python fixture (the adapter appends
+//! `serve`, which the fixture ignores) and drives ACP over stdio. Requires
+//! `python3` on PATH.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
@@ -211,7 +211,9 @@ impl Client {
             );
         } else {
             assert!(
-                frame.contains("\"capabilities\":{") && frame.contains("\"info\":"),
+                frame.contains("\"capabilities\":{")
+                    && frame.contains("\"info\":")
+                    && frame.contains("\"steering\":{\"supported\":true}"),
                 "invalid v2 initialize shape: {frame}"
             );
         }
@@ -547,6 +549,169 @@ fn set_config_option_returns_full_state() {
     assert!(
         done.contains("\"currentValue\":\"ask\""),
         "updated value reflected: {done}"
+    );
+    c.finish();
+}
+
+#[test]
+fn reasoning_effort_is_selected_and_sent_to_msp() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let initial = c.frames.lock().unwrap().join("\n");
+    assert!(
+        initial.contains("\"configId\":\"reasoning_effort\"")
+            && initial.contains("\"currentValue\":\"medium\""),
+        "reasoning selector is initialized: {initial}"
+    );
+
+    let invalid_id = c.req(
+        "session/set_config_option",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"extreme\"}}"
+        ),
+    );
+    let invalid = c.wait_for(&format!("\"id\":{invalid_id}"), Duration::from_secs(15));
+    assert!(
+        invalid.contains("\"error\""),
+        "invalid effort accepted: {invalid}"
+    );
+
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
+        ),
+    );
+    let set = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    assert!(
+        set.contains("\"currentValue\":\"high\""),
+        "updated reasoning value reflected: {set}"
+    );
+
+    let _pid = c.prompt(&sid, "think carefully");
+    c.wait_input("\"reasoningEffort\": \"high\"", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn steering_injects_into_the_exact_active_turn() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let prompt_id = c.prompt(&sid, "start");
+    c.wait_for(&format!("\"id\":{prompt_id}"), Duration::from_secs(15));
+
+    let steer_id = c.req(
+        "_session/steering",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"change course\"}}]}}"
+        ),
+    );
+    let response = c.wait_for(&format!("\"id\":{steer_id}"), Duration::from_secs(15));
+    assert!(response.contains("\"outcome\":\"injected\""), "{response}");
+    c.wait_log("turn/steer", Duration::from_secs(15));
+    c.wait_input("\"expectedTurnId\": \"turn-1\"", Duration::from_secs(15));
+
+    let frames = c.frames.lock().unwrap();
+    let response_pos = frames
+        .iter()
+        .position(|frame| frame.contains(&format!("\"id\":{steer_id}")))
+        .expect("steering response");
+    let echo_pos = frames
+        .iter()
+        .position(|frame| frame.contains("change course"))
+        .expect("steering echo");
+    assert!(
+        response_pos < echo_pos,
+        "response must precede the user echo"
+    );
+    drop(frames);
+    c.finish();
+}
+
+#[test]
+fn steering_idle_policy_is_race_safe() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(2, "");
+    let invalid_id = c.req(
+        "_session/steering",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"bad policy\"}}],\"_meta\":{{\"steering\":{{\"idleBehavior\":\"queue\"}}}}}}"
+        ),
+    );
+    let invalid = c.wait_for(&format!("\"id\":{invalid_id}"), Duration::from_secs(15));
+    assert!(
+        invalid.contains("\"error\""),
+        "invalid policy accepted: {invalid}"
+    );
+
+    let required_id = c.req(
+        "_session/steering",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"only if busy\"}}],\"_meta\":{{\"steering\":{{\"idleBehavior\":\"promptRequired\"}}}}}}"
+        ),
+    );
+    let required = c.wait_for(&format!("\"id\":{required_id}"), Duration::from_secs(15));
+    assert!(
+        required.contains("\"outcome\":\"promptRequired\"")
+            && required.contains("\"reason\":\"noRunningTurn\""),
+        "{required}"
+    );
+
+    let fallback_id = c.req(
+        "_session/steering",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"start safely\"}}]}}"
+        ),
+    );
+    let fallback = c.wait_for(&format!("\"id\":{fallback_id}"), Duration::from_secs(15));
+    assert!(
+        fallback.contains("\"outcome\":\"startedNewTurn\""),
+        "{fallback}"
+    );
+    c.wait_input("\"ifBusy\": \"steer\"", Duration::from_secs(15));
+    let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+    assert!(idle.contains("end_turn"), "steered start completes: {idle}");
+    c.finish();
+}
+
+#[test]
+fn steering_targets_a_turn_rehydrated_by_resume() {
+    let mut c = Client::spawn("resume_active", &[]);
+    let init = c.req("initialize", "{\"protocolVersion\":2}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let resume_id = c.req(
+        "session/resume",
+        "{\"sessionId\":\"existing-session\",\"cwd\":\"/tmp\"}",
+    );
+    let resumed = c.wait_for(&format!("\"id\":{resume_id}"), Duration::from_secs(15));
+    assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
+
+    let steer_id = c.req(
+        "_session/steering",
+        "{\"sessionId\":\"existing-session\",\"prompt\":[{\"type\":\"text\",\"text\":\"continue differently\"}]}",
+    );
+    let steered = c.wait_for(&format!("\"id\":{steer_id}"), Duration::from_secs(15));
+    assert!(steered.contains("\"outcome\":\"injected\""), "{steered}");
+    c.wait_input(
+        "\"expectedTurnId\": \"turn-resumed\"",
+        Duration::from_secs(15),
+    );
+    c.finish();
+}
+
+#[test]
+fn steering_is_rejected_for_v1_connections() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let steer_id = c.req(
+        "_session/steering",
+        &format!("{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"no\"}}]}}"),
+    );
+    let response = c.wait_for(&format!("\"id\":{steer_id}"), Duration::from_secs(15));
+    assert!(
+        response.contains("\"code\":-32601"),
+        "v1 steering must be unavailable: {response}"
     );
     c.finish();
 }
