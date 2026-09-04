@@ -45,8 +45,9 @@ MUSE_APPROVAL_MODE=promptUnmatched  # allowAll|promptUnmatched|onRequest|denyUnm
 to the host default; set `MUSE_APPROVAL_MODE=promptUnmatched` to force every
 unmatched tool call through `session/request_permission`.
 
-Linux arm64 note: as of muse 1.0.2 the host sandbox tries to use bwrap,
-which fails on Linux arm64, so disable it host-side:
+Linux arm64 note: as of muse 1.0.2 the host sandbox is not configured
+correctly on Linux arm64 (a required sandbox binary is missing), so
+disable it host-side:
 
 ```sh
 MUSE_SERVE_ARGS="--trust-workspace --disable-sandbox"
