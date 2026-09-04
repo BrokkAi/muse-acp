@@ -1,9 +1,60 @@
-# muse-acp (serve-backed)
+# muse-acp
 
-ACP server (v2 primary, v1 fallback) for Muse, backed by one `muse serve`
-host over the Muse Session Protocol (MSP). Std-only Rust, no dependencies.
+**Use your existing Muse Code subscription in Zed, IntelliJ IDEA, and other
+JetBrains IDEs.**
 
-## Install
+[![CI](https://github.com/BrokkAi/muse-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/BrokkAi/muse-acp/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/BrokkAi/muse-acp)](https://github.com/BrokkAi/muse-acp/releases/latest)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
+
+`muse-acp` is a small, dependency-free Rust bridge between the
+[Agent Client Protocol](https://agentclientprotocol.com/) (ACP) used by editors
+and Muse Code's native [Muse Session Protocol](https://github.com/meta-models/muse-code-sdk)
+(MSP). It ships as one native binary—no Node.js, npm, or Python runtime needed.
+
+This project started from a simple itch: I wanted to use the Muse Code
+subscription I already pay for inside the editors I already use, while keeping
+Muse's session engine, tools, authentication, and approval flow.
+
+> `muse-acp` is an independent community project. Muse Code and Muse Spark are
+> products of Meta and are not affiliated with or supported by this project.
+
+## Why MSP instead of `muse exec`?
+
+`muse-acp` starts one long-lived `muse serve` process and translates between
+ACP and MSP for the lifetime of the editor. Sessions, streamed updates,
+cancellation, configuration, approvals, and resume behavior travel over Muse's
+native protocol without starting a new Muse CLI process for every prompt.
+
+Other thoughtful integrations make a different, pragmatic choice:
+[bex-co/muse-code-acp](https://github.com/bex-co/muse-code-acp) and the
+[`muse-codes` Rust SDK](https://github.com/meawoppl/rust-code-agent-sdks/tree/main/muse-codes)
+wrap the headless `muse exec --json` event stream. That approach is useful for
+one-shot automation and broad compatibility. This project is optimized for a
+stateful IDE session, so MSP is the more direct fit.
+
+## Quick start
+
+### 1. Install Muse Code
+
+You need [Muse Code](https://dev.meta.ai/docs/muse-code) and an authenticated
+Muse account or subscription before installing this adapter:
+
+```sh
+curl -fsSL https://dev.meta.ai/install.sh | sh
+muse login
+```
+
+On macOS, Muse Code is also available through Homebrew:
+
+```sh
+brew install --cask muse-code
+```
+
+Confirm `muse --version` works before continuing.
+
+### 2. Install muse-acp
 
 On Linux or macOS, install the latest release with:
 
@@ -19,7 +70,7 @@ destination or pin a version by setting an environment variable on `sh`:
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/BrokkAi/muse-acp/releases/latest/download/install.sh \
-  | MUSE_ACP_INSTALL_DIR="$HOME/bin" MUSE_ACP_VERSION=v0.1.0 sh
+  | MUSE_ACP_INSTALL_DIR="$HOME/bin" MUSE_ACP_VERSION=v0.2.0 sh
 ```
 
 Linux release binaries require glibc. On Windows, or for a manual install,
@@ -28,12 +79,18 @@ verify it with the adjacent `.sha256` file, and place `muse-acp` (or
 `muse-acp.exe` on Windows) on `PATH`. To build and install from a checkout, run
 `cargo install --path .`.
 
+### 3. Connect your editor
+
+```sh
+muse-acp install            # Zed
+muse-acp install-intellij   # IntelliJ IDEA and other JetBrains IDEs
+```
+
 ## Requirements
 
-- Rust 1.88 or newer.
-- A Muse CLI that provides `muse serve` and a compatible MSP schema.
-- Python 3 to run the integration-test fixture.
-- Zed only if you use the optional installer.
+- Muse Code installed, authenticated, and available as `muse` on `PATH`.
+- Zed, or a JetBrains IDE with AI Assistant and custom ACP agent support.
+- Rust 1.88+ and Python 3 only when building or testing from source.
 
 ## How it works
 
@@ -105,7 +162,47 @@ adapter's workspace read confinement are not substitutes for the host sandbox.
 Sandbox posture is fixed for the `muse serve` lifetime; re-enable it as soon as
 the host supports the platform, and re-check `muse serve --help` on newer builds.
 
-## Register with Zed
+## Editor setup
+
+Both installers preserve existing agent entries, are safe to re-run, and write
+a `.bak` file before changing an existing configuration. Use `--dry-run` to
+preview an edit.
+
+### IntelliJ IDEA and other JetBrains IDEs
+
+JetBrains AI Assistant supports custom ACP agents through
+[`~/.jetbrains/acp.json`](https://www.jetbrains.com/help/ai-assistant/activate-agents.html#add-acp-agents).
+Register the installed binary with:
+
+```sh
+muse-acp install-intellij
+```
+
+The command records the running `muse-acp` binary's full path, as required by
+JetBrains, while preserving other configured agents:
+
+```json
+{
+  "agent_servers": {
+    "muse-acp": {
+      "command": "/Users/you/.local/bin/muse-acp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
+```
+
+Open AI Chat and select `muse-acp` as the agent. Useful variants:
+
+```sh
+muse-acp install-intellij --command /absolute/path/to/muse-acp
+muse-acp install-intellij --env MUSE_CLI=/absolute/path/to/muse
+muse-acp install-intellij --settings /path/to/acp.json --dry-run
+muse-acp uninstall-intellij
+```
+
+### Zed
 
 ```sh
 muse-acp install
@@ -126,9 +223,6 @@ After the binary is on `PATH`, `muse-acp install` registers it in
   }
 }
 ```
-
-The edit preserves comments, formatting, and unrelated settings, and writes a
-`.bak` backup first. Re-running `install` is idempotent.
 
 ```sh
 muse-acp install --command /path/to/muse-acp

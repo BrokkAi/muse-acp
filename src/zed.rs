@@ -1,10 +1,17 @@
-//! Zed settings installer from PR #3.
+//! Zed and JetBrains ACP settings installers.
 
 use crate::json::{J, esc, parse_json};
 
 const ZED_SETTINGS_REL: &str = ".config/zed/settings.json";
+const INTELLIJ_SETTINGS_REL: &str = ".jetbrains/acp.json";
 const DEFAULT_AGENT_NAME: &str = "muse-acp";
 const DEFAULT_COMMAND: &str = "muse-acp";
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Client {
+    Zed,
+    IntelliJ,
+}
 
 struct InstallerOpts {
     name: String,
@@ -31,28 +38,30 @@ impl InstallerOpts {
 fn usage() -> &'static str {
     "usage: muse-acp [command] [options]\n\
      \n\
-     \x20 (no command)         run the ACP agent over stdio (what Zed spawns)\n\
+     \x20 (no command)         run the ACP agent over stdio (what clients spawn)\n\
      \x20 install              register muse-acp as a Zed agent server\n\
      \x20 uninstall            remove the Zed settings entry again\n\
+     \x20 install-intellij     register muse-acp in JetBrains IDEs\n\
+     \x20 uninstall-intellij   remove the JetBrains settings entry\n\
      \x20 help [command]       show this help (-h/--help also work)\n\
      \x20 --version (-V)       print version\n\
      \n\
-     install options:\n\
+     install/install-intellij options:\n\
      \x20 --name <name>        agent_servers key (default: muse-acp)\n\
-     \x20 --settings <path>    settings.json path (default: ~/.config/zed/settings.json)\n\
-     \x20 --command <cmd>      command Zed spawns, resolved via PATH (default: muse-acp)\n\
+     \x20 --settings <path>    override the client settings file\n\
+     \x20 --command <cmd>      agent executable (IntelliJ requires an absolute path)\n\
      \x20 --env KEY=VALUE      extra env for the agent entry (repeatable)\n\
      \x20 --dry-run            print planned changes without writing anything\n\
      \x20 --no-backup          do not write a .bak backup of settings.json\n\
      \n\
-     uninstall options:\n\
+     uninstall/uninstall-intellij options:\n\
      \x20 --name, --settings, --dry-run, --no-backup (as above)"
 }
 
 enum Cli {
     Serve,
-    Install(InstallerOpts),
-    Uninstall(InstallerOpts),
+    Install(Client, InstallerOpts),
+    Uninstall(Client, InstallerOpts),
     Help,
     Version,
 }
@@ -134,14 +143,19 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
             }
             Ok(Cli::Version)
         }
-        "install" | "uninstall" => {
-            let is_install = args[0] == "install";
+        "install" | "uninstall" | "install-intellij" | "uninstall-intellij" => {
+            let is_install = args[0] == "install" || args[0] == "install-intellij";
+            let client = if args[0].ends_with("-intellij") {
+                Client::IntelliJ
+            } else {
+                Client::Zed
+            };
             let mut i = 1;
             match parse_installer_opts(args, &mut i, is_install) {
                 Ok(o) => Ok(if is_install {
-                    Cli::Install(o)
+                    Cli::Install(client, o)
                 } else {
-                    Cli::Uninstall(o)
+                    Cli::Uninstall(client, o)
                 }),
                 Err(e) if e == "__help_install" || e == "__help_uninstall" => Ok(Cli::Help),
                 Err(e) => Err(e),
@@ -447,9 +461,17 @@ fn check_valid_jsonc_object(text: &str) -> bool {
     )
 }
 
-fn render_agent_value(command: &str, env: &[(String, String)], fi: &str, ci: &str) -> String {
+fn render_agent_value(
+    client: Client,
+    command: &str,
+    env: &[(String, String)],
+    fi: &str,
+    ci: &str,
+) -> String {
     let mut s = String::from("{\n");
-    s.push_str(&format!("{fi}\"type\": \"custom\",\n"));
+    if client == Client::Zed {
+        s.push_str(&format!("{fi}\"type\": \"custom\",\n"));
+    }
     s.push_str(&format!("{fi}\"command\": {},\n", esc(command)));
     s.push_str(&format!("{fi}\"args\": [],\n"));
     if env.is_empty() {
@@ -470,13 +492,19 @@ fn render_agent_value(command: &str, env: &[(String, String)], fi: &str, ci: &st
     s
 }
 
-fn render_agent_entry(name: &str, command: &str, env: &[(String, String)], ki: &str) -> String {
+fn render_agent_entry(
+    client: Client,
+    name: &str,
+    command: &str,
+    env: &[(String, String)],
+    ki: &str,
+) -> String {
     let fi = format!("{ki}  ");
     format!(
         "{}{}: {}",
         ki,
         esc(name),
-        render_agent_value(command, env, &fi, ki)
+        render_agent_value(client, command, env, &fi, ki)
     )
 }
 
@@ -491,9 +519,10 @@ fn install_settings_edit(
     name: &str,
     command: &str,
     env: &[(String, String)],
+    client: Client,
 ) -> Result<(String, EditOutcome), String> {
     if is_trivia_only(original) {
-        let entry = render_agent_entry(name, command, env, "    ");
+        let entry = render_agent_entry(client, name, command, env, "    ");
         let fresh = format!("{{\n  \"agent_servers\": {{\n{entry}\n  }}\n}}\n");
         if !check_valid_jsonc_object(&fresh) {
             return Err("internal error: generated invalid settings".to_string());
@@ -514,7 +543,7 @@ fn install_settings_edit(
             .last()
             .map(|e| line_indent(original, e.key_start))
             .unwrap_or_else(|| "  ".to_string());
-        let entry = render_agent_entry(name, command, env, &format!("{ind}  "));
+        let entry = render_agent_entry(client, name, command, env, &format!("{ind}  "));
         let block = format!("\n{ind}\"agent_servers\": {{\n{entry}\n{ind}}}");
         let (ins, prefix) = match root.entries.last() {
             None => (root.close, String::new()), // empty (maybe commented) object
@@ -545,7 +574,7 @@ fn install_settings_edit(
     if let Some(existing) = sub.entries.iter().find(|e| e.key == name) {
         let ki = line_indent(original, existing.key_start);
         let fi = format!("{ki}  ");
-        let value = render_agent_value(command, env, &fi, &ki);
+        let value = render_agent_value(client, command, env, &fi, &ki);
         let mut out = String::with_capacity(original.len() + value.len());
         out.push_str(&original[..existing.value_start]);
         out.push_str(&value);
@@ -559,7 +588,7 @@ fn install_settings_edit(
     }
     // Insert a new entry into the existing agent_servers object.
     let entry_ind = format!("{ai_ind}  ");
-    let entry = render_agent_entry(name, command, env, &entry_ind);
+    let entry = render_agent_entry(client, name, command, env, &entry_ind);
     let mut out = String::with_capacity(original.len() + entry.len() + 8);
     if sub.entries.is_empty() {
         if slice_is_ws_only(&original[aservers.value_start + 1..sub.close]) {
@@ -665,8 +694,36 @@ fn home_dir() -> Result<std::path::PathBuf, String> {
         })
 }
 
-fn default_settings_path() -> Result<std::path::PathBuf, String> {
-    Ok(home_dir()?.join(ZED_SETTINGS_REL))
+fn default_settings_path(client: Client) -> Result<std::path::PathBuf, String> {
+    let relative = match client {
+        Client::Zed => ZED_SETTINGS_REL,
+        Client::IntelliJ => INTELLIJ_SETTINGS_REL,
+    };
+    Ok(home_dir()?.join(relative))
+}
+
+fn intellij_command(command: &str) -> Result<String, String> {
+    let path = if command == DEFAULT_COMMAND {
+        std::env::current_exe()
+            .map_err(|e| format!("cannot determine the muse-acp executable path: {e}"))?
+    } else {
+        let path = std::path::PathBuf::from(command);
+        if !path.is_absolute() {
+            return Err(format!(
+                "IntelliJ requires a full executable path; --command is not absolute: {command}"
+            ));
+        }
+        path
+    };
+    if !path.is_file() {
+        return Err(format!(
+            "IntelliJ agent executable does not exist or is not a file: {}",
+            path.display()
+        ));
+    }
+    path.into_os_string()
+        .into_string()
+        .map_err(|_| "IntelliJ agent executable path is not valid UTF-8".to_string())
 }
 
 fn write_backup(path: &std::path::Path) {
@@ -682,10 +739,10 @@ fn write_backup(path: &std::path::Path) {
     }
 }
 
-fn cmd_install(o: &InstallerOpts) -> i32 {
+fn cmd_install(client: Client, o: &InstallerOpts) -> i32 {
     let settings_path = match &o.settings {
         Some(s) => std::path::PathBuf::from(s),
-        None => match default_settings_path() {
+        None => match default_settings_path(client) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("muse-acp: {e}");
@@ -693,9 +750,18 @@ fn cmd_install(o: &InstallerOpts) -> i32 {
             }
         },
     };
-    // The registered command is resolved via PATH at spawn time; make sure
-    // `muse-acp` is on PATH (e.g. `cargo install --path .`) before launching Zed.
-    let command = o.command.clone();
+    let command = match client {
+        // Zed resolves the registered command through PATH at spawn time.
+        Client::Zed => o.command.clone(),
+        // JetBrains requires a full path in ~/.jetbrains/acp.json.
+        Client::IntelliJ => match intellij_command(&o.command) {
+            Ok(command) => command,
+            Err(e) => {
+                eprintln!("muse-acp: {e}");
+                return 1;
+            }
+        },
+    };
     let original = match std::fs::read_to_string(&settings_path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -704,13 +770,14 @@ fn cmd_install(o: &InstallerOpts) -> i32 {
             return 1;
         }
     };
-    let (updated, outcome) = match install_settings_edit(&original, &o.name, &command, &o.env) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("muse-acp: {e}");
-            return 1;
-        }
-    };
+    let (updated, outcome) =
+        match install_settings_edit(&original, &o.name, &command, &o.env, client) {
+            Ok(x) => x,
+            Err(e) => {
+                eprintln!("muse-acp: {e}");
+                return 1;
+            }
+        };
     let action = if outcome == EditOutcome::Updated {
         "update"
     } else {
@@ -749,17 +816,23 @@ fn cmd_install(o: &InstallerOpts) -> i32 {
         o.name,
         settings_path.display()
     );
-    println!(
-        "muse-acp: restart Zed (or reload settings) and select \"{}\" in the Agent panel.",
-        o.name
-    );
+    match client {
+        Client::Zed => println!(
+            "muse-acp: restart Zed (or reload settings) and select \"{}\" in the Agent panel.",
+            o.name
+        ),
+        Client::IntelliJ => println!(
+            "muse-acp: open AI Chat in your JetBrains IDE and select \"{}\" as the agent.",
+            o.name
+        ),
+    }
     0
 }
 
-fn cmd_uninstall(o: &InstallerOpts) -> i32 {
+fn cmd_uninstall(client: Client, o: &InstallerOpts) -> i32 {
     let settings_path = match &o.settings {
         Some(s) => std::path::PathBuf::from(s),
-        None => match default_settings_path() {
+        None => match default_settings_path(client) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("muse-acp: {e}");
@@ -823,11 +896,11 @@ fn cmd_uninstall(o: &InstallerOpts) -> i32 {
 pub fn dispatch(args: &[String]) -> Option<i32> {
     match parse_args(args) {
         Ok(Cli::Serve) => None,
-        Ok(Cli::Install(options)) => Some(cmd_install(&options)),
-        Ok(Cli::Uninstall(options)) => Some(cmd_uninstall(&options)),
+        Ok(Cli::Install(client, options)) => Some(cmd_install(client, &options)),
+        Ok(Cli::Uninstall(client, options)) => Some(cmd_uninstall(client, &options)),
         Ok(Cli::Help) => {
             println!(
-                "muse-acp {} — ACP adapter for the muse CLI",
+                "muse-acp {} — Rust ACP-to-MSP adapter for Muse Code",
                 env!("CARGO_PKG_VERSION")
             );
             println!();
@@ -856,7 +929,8 @@ mod tests {
 
     #[test]
     fn fresh_file_creates_agent_servers() {
-        let (out, outcome) = install_settings_edit("", "muse-acp", "/bin/muse-acp", &[]).unwrap();
+        let (out, outcome) =
+            install_settings_edit("", "muse-acp", "/bin/muse-acp", &[], Client::Zed).unwrap();
         assert_eq!(outcome, EditOutcome::Added);
         assert!(check_valid_jsonc_object(&out));
         assert!(out.contains("\"agent_servers\""));
@@ -865,10 +939,33 @@ mod tests {
     }
 
     #[test]
+    fn intellij_entry_uses_its_native_shape() {
+        let (out, outcome) =
+            install_settings_edit("", "muse-acp", "/opt/muse-acp", &env1(), Client::IntelliJ)
+                .unwrap();
+        assert_eq!(outcome, EditOutcome::Added);
+        assert!(out.contains("\"command\": \"/opt/muse-acp\""));
+        assert!(out.contains("\"args\": []"));
+        assert!(out.contains("\"FOO\": \"bar\""));
+        assert!(!out.contains("\"type\""));
+        assert!(check_valid_jsonc_object(&out));
+    }
+
+    #[test]
+    fn intellij_default_command_is_an_absolute_existing_executable() {
+        let command = intellij_command(DEFAULT_COMMAND).unwrap();
+        let path = std::path::Path::new(&command);
+        assert!(path.is_absolute());
+        assert!(path.is_file());
+        assert!(intellij_command("relative/muse-acp").is_err());
+    }
+
+    #[test]
     fn preserves_comments_and_other_keys() {
         let original = "{\n  // theme comment\n  \"theme\": \"One Dark\",\n  /* block\n     comment */\n  \"tab_size\": 4,\n}\n";
         let (out, _) =
-            install_settings_edit(original, "muse-acp", "/bin/muse-acp", &env1()).unwrap();
+            install_settings_edit(original, "muse-acp", "/bin/muse-acp", &env1(), Client::Zed)
+                .unwrap();
         assert!(out.contains("// theme comment"));
         assert!(out.contains("/* block\n     comment */"));
         assert!(out.contains("\"theme\": \"One Dark\""));
@@ -879,9 +976,10 @@ mod tests {
     #[test]
     fn install_is_idempotent() {
         let original = "{\n  \"theme\": \"x\",\n}\n";
-        let (once, _) = install_settings_edit(original, "muse-acp", "/bin/muse-acp", &[]).unwrap();
+        let (once, _) =
+            install_settings_edit(original, "muse-acp", "/bin/muse-acp", &[], Client::Zed).unwrap();
         let (twice, outcome) =
-            install_settings_edit(&once, "muse-acp", "/bin/muse-acp", &[]).unwrap();
+            install_settings_edit(&once, "muse-acp", "/bin/muse-acp", &[], Client::Zed).unwrap();
         assert_eq!(outcome, EditOutcome::Updated);
         assert_eq!(once, twice);
     }
@@ -889,7 +987,8 @@ mod tests {
     #[test]
     fn replaces_existing_entry_keeps_siblings() {
         let original = "{\n  \"agent_servers\": {\n    \"other\": {\n      \"type\": \"custom\",\n      \"command\": \"other-bin\"\n    },\n    \"muse-acp\": {\n      \"type\": \"custom\",\n      \"command\": \"/old/path\"\n    }\n  }\n}\n";
-        let (out, outcome) = install_settings_edit(original, "muse-acp", "/new/path", &[]).unwrap();
+        let (out, outcome) =
+            install_settings_edit(original, "muse-acp", "/new/path", &[], Client::Zed).unwrap();
         assert_eq!(outcome, EditOutcome::Updated);
         assert!(out.contains("\"command\": \"/new/path\""));
         assert!(!out.contains("/old/path"));
@@ -901,7 +1000,8 @@ mod tests {
     #[test]
     fn handles_trailing_commas() {
         let original = "{\n  \"agent_servers\": {\n    \"other\": {\"command\": \"x\",},\n  },\n  \"theme\": \"y\",\n}\n";
-        let (out, _) = install_settings_edit(original, "muse-acp", "/bin/muse-acp", &[]).unwrap();
+        let (out, _) =
+            install_settings_edit(original, "muse-acp", "/bin/muse-acp", &[], Client::Zed).unwrap();
         assert!(out.contains("\"other\""));
         assert!(out.contains("\"muse-acp\""));
         assert!(check_valid_jsonc_object(&out));
@@ -909,9 +1009,9 @@ mod tests {
 
     #[test]
     fn rejects_non_object_root_and_agent_servers() {
-        assert!(install_settings_edit("[1,2]", "muse-acp", "/b", &[]).is_err());
+        assert!(install_settings_edit("[1,2]", "muse-acp", "/b", &[], Client::Zed).is_err());
         let bad = "{ \"agent_servers\": null }";
-        assert!(install_settings_edit(bad, "muse-acp", "/b", &[]).is_err());
+        assert!(install_settings_edit(bad, "muse-acp", "/b", &[], Client::Zed).is_err());
     }
 
     #[test]
@@ -939,7 +1039,7 @@ mod tests {
 
     #[test]
     fn uninstall_last_entry_collapses_file() {
-        let (out, _) = install_settings_edit("", "muse-acp", "muse-acp", &[]).unwrap();
+        let (out, _) = install_settings_edit("", "muse-acp", "muse-acp", &[], Client::Zed).unwrap();
         let (out, removed) = uninstall_settings_edit(&out, "muse-acp").unwrap();
         assert!(removed);
         assert_eq!(out, "{}\n");
@@ -965,7 +1065,7 @@ mod tests {
             "--dry-run".into(),
         ];
         match parse_args(&args).unwrap() {
-            Cli::Install(o) => {
+            Cli::Install(Client::Zed, o) => {
                 assert_eq!(o.name, "n");
                 assert_eq!(o.command, "muse-acp");
                 assert_eq!(o.env, vec![("A".to_string(), "B".to_string())]);
@@ -974,9 +1074,17 @@ mod tests {
             _ => panic!("expected install"),
         }
         match parse_args(&["install".into(), "--command=/x/y".into()]).unwrap() {
-            Cli::Install(o) => assert_eq!(o.command, "/x/y"),
+            Cli::Install(Client::Zed, o) => assert_eq!(o.command, "/x/y"),
             _ => panic!("expected install"),
         }
+        assert!(matches!(
+            parse_args(&["install-intellij".into()]).unwrap(),
+            Cli::Install(Client::IntelliJ, _)
+        ));
+        assert!(matches!(
+            parse_args(&["uninstall-intellij".into()]).unwrap(),
+            Cli::Uninstall(Client::IntelliJ, _)
+        ));
         assert!(parse_args(&["install".into(), "--bogus".into()]).is_err());
         assert!(parse_args(&["uninstall".into(), "--env".into(), "A=B".into()]).is_err());
         assert!(parse_args(&["frobnicate".into()]).is_err());

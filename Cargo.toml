@@ -1,9 +1,9 @@
 [package]
 name = "muse-acp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
-description = "Agent Client Protocol adapter for Muse"
+description = "Rust ACP-to-MSP adapter for using Muse Code in Zed and JetBrains IDEs"
 license = "Apache-2.0"
 repository = "https://github.com/BrokkAi/muse-acp"
 readme = "README.md"

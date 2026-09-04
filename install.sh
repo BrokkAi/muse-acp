@@ -152,4 +152,6 @@ case ":${PATH:-}:" in
     say "For sh-compatible shells: export PATH=\"${install_dir}:\$PATH\""
     ;;
 esac
-say "To register it with Zed, run: muse-acp install"
+say "Register it with an editor:"
+say "  Zed:       muse-acp install"
+say "  JetBrains: muse-acp install-intellij"
