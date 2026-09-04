@@ -775,6 +775,71 @@ fn v1_jetbrains_mcp_attachment_does_not_hide_config_options() {
 }
 
 #[test]
+fn model_catalog_refreshes_after_initial_partial_snapshot() {
+    for ver in [1, 2] {
+        for method in [
+            "session/new",
+            "session/load",
+            "session/resume",
+            "session/set_config_option",
+        ] {
+            let mut c = Client::spawn("catalog_grows", &[]);
+            let sid = c.new_session(ver, "");
+            let initial = c.frames.lock().unwrap().join("\n");
+            assert!(initial.contains("\"value\":\"fake-model\""));
+            assert!(!initial.contains("second-model"));
+            let params = if method == "session/new" {
+                "{\"cwd\":\"/tmp\",\"mcpServers\":[]}".to_string()
+            } else if method == "session/set_config_option" {
+                format!(
+                    "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
+                )
+            } else {
+                format!("{{\"sessionId\":\"{sid}\"}}")
+            };
+            let id = c.req(method, &params);
+            let refreshed = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            assert!(
+                refreshed.contains("\"value\":\"second-model\""),
+                "v{ver} {method} kept the initial partial catalog: {refreshed}"
+            );
+            c.finish();
+        }
+    }
+}
+
+#[test]
+fn model_catalog_retains_success_on_failure_but_accepts_empty_snapshot() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("catalog_refresh_failure", &[]);
+        let sid = c.new_session(ver, "");
+        for (step, expect_model) in [(2, true), (3, true), (4, false), (5, true)] {
+            let id = c.req(
+                "session/set_config_option",
+                &format!(
+                    "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
+                ),
+            );
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            assert!(
+                frame.contains("\"result\""),
+                "config change failed: {frame}"
+            );
+            assert_eq!(
+                frame.contains("\"value\":\"fake-model\""),
+                expect_model,
+                "v{ver} catalog refresh {step}: {frame}"
+            );
+        }
+        let log = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
+        assert!(log.contains("model/list returned no models array"));
+        assert!(log.contains("model/list failed: catalog unavailable"));
+        assert!(log.contains("source=unresolvedCatalog: 0 selectable models"));
+        c.finish();
+    }
+}
+
+#[test]
 fn set_config_option_returns_full_state() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");

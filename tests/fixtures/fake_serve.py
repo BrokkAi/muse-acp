@@ -18,6 +18,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   quiet        turn/start answers only; nothing follows (for close/cancel)
   load         session/resume serves inline history (for session/load replay)
   resume_active session/resume reports a running turn (for steering reattach)
+  catalog_grows model/list expands after the first snapshot
+  catalog_refresh_failure valid catalog, malformed response, RPC error, empty catalog
 """
 import json
 import os
@@ -29,6 +31,7 @@ SCENARIO = os.environ.get("FAKE_SCENARIO", "happy")
 MODE = os.environ.get("FAKE_MODE", "promptUnmatched")
 LOG = os.environ.get("FAKE_LOG", "")
 TURNS = [0]
+CATALOG_READS = [0]
 
 APPROVAL_PARAMS = {
     "sessionId": MSP_SID, "approvalId": "ap-1", "toolCallId": "call-1",
@@ -181,8 +184,16 @@ def result_for(method, msg):
                 "effectiveMode": {"lastCommandId": "x", "mode": MODE,
                                   "source": "explicit"}}
     if method == "model/list":
-        return {"models": [{"modelId": "fake-model",
-                             "displayLabel": "Fake"}]}
+        CATALOG_READS[0] += 1
+        if SCENARIO == "catalog_refresh_failure":
+            if CATALOG_READS[0] == 2:
+                return {}
+            if CATALOG_READS[0] == 4:
+                return {"models": [], "source": "unresolvedCatalog"}
+        models = [{"modelId": "fake-model", "displayLabel": "Fake"}]
+        if SCENARIO == "catalog_grows" and CATALOG_READS[0] > 1:
+            models.append({"modelId": "second-model", "displayLabel": "Second"})
+        return {"models": models, "source": "fakeCatalog"}
     if method == "turn/start":
         params = msg.get("params", {})
         log_input(params)
@@ -221,6 +232,12 @@ def main():
             continue
         if method:
             if ident is not None:
+                if (method == "model/list" and SCENARIO == "catalog_refresh_failure"
+                        and CATALOG_READS[0] == 2):
+                    CATALOG_READS[0] += 1
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32603, "message": "catalog unavailable"}})
+                    continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
 

@@ -26,7 +26,8 @@ use msp::{MspEvent, MspHost, err_code, err_message, log};
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static VER: AtomicU64 = AtomicU64::new(0); // negotiated ACP version for the connection
 static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the v2 client advertises elicitation.form
-/// Cached model catalog: (modelId, displayLabel, isDefault).
+/// Last successful model catalog, used only when a refresh fails.
+/// Rows are (modelId, displayLabel, isDefault).
 static CATALOG: std::sync::OnceLock<Mutex<Vec<(String, String, bool)>>> =
     std::sync::OnceLock::new();
 
@@ -42,36 +43,47 @@ fn host_mode(res: &J) -> Option<String> {
 
 fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
     let cell = CATALOG.get_or_init(|| Mutex::new(Vec::new()));
-    {
-        let guard = cell.lock().unwrap();
-        if !guard.is_empty() {
-            return guard.clone();
+    // MSP exposes a point-in-time snapshot, with no catalog subscription.
+    // Refresh whenever we return config options: a nonempty startup catalog
+    // can still be incomplete and must not become a process-lifetime cache.
+    let r = match host.command("model/list", "{}") {
+        Ok(r) => r,
+        Err(e) => {
+            log(&format!(
+                "model/list failed: {}; retaining last successful catalog",
+                err_message(&e)
+            ));
+            return cell.lock().unwrap().clone();
         }
-    }
+    };
+    let Some(J::Arr(models)) = r.get("models") else {
+        log("model/list returned no models array; retaining last successful catalog");
+        return cell.lock().unwrap().clone();
+    };
     let mut out = Vec::new();
-    if let Ok(r) = host.command(
-        "model/list",
-        &format!("{{\"commandId\":{}}}", esc(&host.mint_cmd("cmd-"))),
-    ) && let Some(J::Arr(models)) = r.get("models")
-    {
-        for m in models {
-            let id = m
-                .get("modelId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if id.is_empty() {
-                continue;
-            }
-            let label = m
-                .get("displayLabel")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&id)
-                .to_string();
-            let def = matches!(m.get("isDefault"), Some(J::Bool(true)));
-            out.push((id, label, def));
+    for m in models {
+        let id = m
+            .get("modelId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if id.is_empty() {
+            continue;
         }
+        let label = m
+            .get("displayLabel")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&id)
+            .to_string();
+        let def = matches!(m.get("isDefault"), Some(J::Bool(true)));
+        out.push((id, label, def));
     }
+    let source = r.get("source").and_then(J::as_str).unwrap_or("unknown");
+    log(&format!(
+        "model/list source={source}: {} selectable models ({} rows)",
+        out.len(),
+        models.len()
+    ));
     *cell.lock().unwrap() = out.clone();
     out
 }
@@ -82,8 +94,8 @@ enum LoopMsg {
     Msp(MspEvent),
 }
 
-const V2_INIT: &str = r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}}}},"info":{"name":"muse-acp","title":"Muse ACP","version":"0.2.2"},"authMethods":[],"_meta":{"steering":{"supported":true}}}"#;
-const V1_INIT: &str = r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":"0.2.2"}}"#;
+const V2_INIT: &str = r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}}}},"info":{"name":"muse-acp","title":"Muse ACP","version":"0.2.3"},"authMethods":[],"_meta":{"steering":{"supported":true}}}"#;
+const V1_INIT: &str = r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":"0.2.3"}}"#;
 
 fn has_nonempty_array(params: Option<&J>, key: &str) -> bool {
     matches!(

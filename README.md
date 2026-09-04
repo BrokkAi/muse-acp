@@ -121,6 +121,12 @@ config selectors, so the adapter returns `configOptions` in both protocol
 versions: v1 uses the selector field `id` (plus a legacy `modes` fallback), while
 v2 uses `configId`.
 
+Model choices are refreshed from Muse when creating, loading, or resuming a
+session and after a config option changes. The adapter does not permanently
+cache the first nonempty catalog. If a refresh fails, it retains the last
+successful catalog; stderr records failures and each snapshot's source and
+model count. An open selector does not itself trigger a refresh.
+
 JetBrains may attach its integrated stdio MCP server to `session/new` even when
 the agent advertises no optional MCP transports. The adapter currently ignores
 client-provided MCP servers because Muse owns its tool runtime; their presence
