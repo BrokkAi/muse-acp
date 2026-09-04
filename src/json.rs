@@ -179,7 +179,31 @@ impl<'a> Parser<'a> {
                         b't' => out.push('\t'),
                         b'u' => {
                             let cp = self.hex4()?;
-                            out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
+                            let scalar = if (0xD800..=0xDBFF).contains(&cp) {
+                                if self.b.get(self.pos..self.pos + 2) != Some(b"\\u") {
+                                    return Err(
+                                        "high surrogate must be followed by a low surrogate"
+                                            .to_string(),
+                                    );
+                                }
+                                self.pos += 2;
+                                let low = self.hex4()?;
+                                if !(0xDC00..=0xDFFF).contains(&low) {
+                                    return Err(
+                                        "high surrogate must be followed by a low surrogate"
+                                            .to_string(),
+                                    );
+                                }
+                                0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00)
+                            } else if (0xDC00..=0xDFFF).contains(&cp) {
+                                return Err("unexpected low surrogate".to_string());
+                            } else {
+                                cp
+                            };
+                            out.push(
+                                char::from_u32(scalar)
+                                    .ok_or_else(|| "invalid unicode scalar".to_string())?,
+                            );
                         }
                         _ => return Err(format!("bad escape \\{}", e as char)),
                     }
@@ -347,7 +371,7 @@ pub fn mint_id(prefix: &str, counter: &std::sync::atomic::AtomicU64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_json;
+    use super::{J, parse_json};
 
     /// Strict RFC 8259 numbers: leading zeros, bare fractions, and
     /// dangling exponents are rejected, not echoed back as ids.
@@ -388,5 +412,20 @@ mod tests {
         assert!(parse_json(&deep).is_err());
         let shallow = "[".repeat(8) + &"]".repeat(8);
         assert!(parse_json(&shallow).is_ok());
+    }
+
+    #[test]
+    fn unicode_surrogate_pairs_are_decoded_strictly() {
+        let parsed = parse_json(r#""\ud83d\ude00""#).expect("valid surrogate pair");
+        assert!(matches!(parsed, J::Str(ref value) if value == "😀"));
+
+        for bad in [
+            r#""\ud83d""#,
+            r#""\ude00""#,
+            r#""\ud83d\u0041""#,
+            r#""\ud83dx""#,
+        ] {
+            assert!(parse_json(bad).is_err(), "must reject {bad}");
+        }
     }
 }

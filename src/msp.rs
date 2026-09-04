@@ -153,9 +153,11 @@ impl MspHost {
         match rx.recv_timeout(COMMAND_TIMEOUT) {
             Ok(r) => r,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.pending.lock().unwrap().remove(&id.to_string());
                 Err(mk_err(-32603, "serve command timed out"))
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                self.pending.lock().unwrap().remove(&id.to_string());
                 Err(mk_err(-32603, "serve host closed the connection"))
             }
         }

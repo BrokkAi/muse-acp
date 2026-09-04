@@ -10,6 +10,7 @@ mod json;
 mod msp;
 
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -81,7 +82,39 @@ enum LoopMsg {
 }
 
 const V2_INIT: &str = r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}}}},"info":{"name":"muse-acp","title":"Muse ACP","version":"0.2.0"},"authMethods":[]}"#;
-const V1_INIT: &str = r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":false,"loadSession":true},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":"0.2.0"}}"#;
+const V1_INIT: &str = r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":"0.2.0"}}"#;
+
+fn has_nonempty_array(params: Option<&J>, key: &str) -> bool {
+    matches!(
+        params.and_then(|p| p.get(key)),
+        Some(J::Arr(values)) if !values.is_empty()
+    )
+}
+
+fn validate_session_roots(stdout: &StdoutShared, id: &Option<J>, params: Option<&J>) -> bool {
+    let cwd = params
+        .and_then(|p| p.get("cwd"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if cwd.is_empty() || !Path::new(cwd).is_absolute() {
+        acp::send_error(stdout, id, -32602, "params.cwd must be an absolute path");
+        return false;
+    }
+    if has_nonempty_array(params, "mcpServers") {
+        acp::send_error(stdout, id, -32602, "MCP servers are not supported");
+        return false;
+    }
+    if has_nonempty_array(params, "additionalDirectories") {
+        acp::send_error(
+            stdout,
+            id,
+            -32602,
+            "additional directories are not supported",
+        );
+        return false;
+    }
+    true
+}
 
 fn selftest() -> i32 {
     // Validate every static emitted literal with our own parser, so a
@@ -226,8 +259,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .and_then(|p| p.get("capabilities"))
                 .and_then(|c| c.get("elicitation"))
                 .and_then(|e| e.get("form"))
-                .map(|f| !matches!(f, J::Null))
-                .unwrap_or(false);
+                .is_some_and(|f| matches!(f, J::Obj(_)));
             ELICIT_FORM.store(u64::from(v == 2 && form), Ordering::SeqCst);
             if v == 2 {
                 acp::send_result(stdout, &id, V2_INIT);
@@ -237,16 +269,15 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
         }
         "session/new" => {
             let ver = negotiated_ver();
+            if !validate_session_roots(stdout, &id, params.as_ref()) {
+                return;
+            }
             let cwd = params
                 .as_ref()
                 .and_then(|p| p.get("cwd"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            if cwd.is_empty() {
-                acp::send_error(stdout, &id, -32602, "session/new requires params.cwd");
-                return;
-            }
             // Optional approval posture, applied atomically at start: an
             // operator-specified posture must not silently fall back.
             let mode_env = std::env::var("MUSE_APPROVAL_MODE").unwrap_or_default();
@@ -381,6 +412,15 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
         }
         "session/resume" | "session/load" => {
             let ver = negotiated_ver();
+            if !validate_session_roots(stdout, &id, params.as_ref()) {
+                return;
+            }
+            let resume_cwd = params
+                .as_ref()
+                .and_then(|p| p.get("cwd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let sid = params
                 .as_ref()
                 .and_then(|p| p.get("sessionId"))
@@ -452,12 +492,6 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             && params.as_ref().and_then(|p| p.get("replayFrom")).is_some());
                     {
                         let mut map = sessions.lock().unwrap();
-                        let resume_cwd = params
-                            .as_ref()
-                            .and_then(|p| p.get("cwd"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string();
                         let entry = map.entry(sid.clone()).or_insert_with(|| AcpSession {
                             acp_sid: sid.clone(),
                             msp_sid: real_msp.clone(),

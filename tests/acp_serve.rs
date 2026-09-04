@@ -8,7 +8,10 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::{Duration, Instant};
 
 fn fixture() -> String {
@@ -30,34 +33,24 @@ struct Client {
 }
 
 impl Client {
-    /// The adapter always runs `$MUSE_CLI serve ...`, so point MUSE_CLI at a
-    /// generated wrapper that execs the Python fixture regardless of argv.
+    /// The Python fixture ignores the `serve` argument the adapter appends.
     fn spawn(scenario: &str, extra_env: &[(&str, &str)]) -> Client {
-        let dir =
-            std::env::temp_dir().join(format!("acp-fake-{}-{}", std::process::id(), scenario));
+        static NEXT_CLIENT: AtomicU64 = AtomicU64::new(1);
+        let client_id = NEXT_CLIENT.fetch_add(1, Ordering::Relaxed);
+        let started_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "acp-fake-{}-{scenario}-{client_id}-{started_at}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("tmpdir");
-        let wrap = dir.join("fake-muse.sh");
-        std::fs::write(
-            &wrap,
-            format!(
-                "#!/bin/sh\nexec \"{}\" \"{}\" \"$@\"\n",
-                which_python3(),
-                fixture()
-            ),
-        )
-        .expect("wrapper");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut p = std::fs::metadata(&wrap).expect("meta").permissions();
-            p.set_mode(0o755);
-            std::fs::set_permissions(&wrap, p).expect("chmod");
-        }
         let stderr_log = dir.join("adapter.stderr").to_str().unwrap().to_string();
         let err_file = std::fs::File::create(&stderr_log).expect("stderr log");
         let fake_log = dir.join("fake.log").to_str().unwrap().to_string();
         let mut cmd = Command::new(adapter_bin());
-        cmd.env("MUSE_CLI", &wrap);
+        cmd.env("MUSE_CLI", fixture());
         cmd.env("FAKE_SCENARIO", scenario);
         cmd.env("FAKE_LOG", &fake_log);
         cmd.env("FAKE_INPUT", format!("{fake_log}.input"));
@@ -208,8 +201,25 @@ impl Client {
             frame.contains(&format!("\"protocolVersion\":{ver}")),
             "wrong version echoed: {frame}"
         );
+        if ver == 1 {
+            assert!(
+                frame.contains("\"agentCapabilities\"")
+                    && frame.contains("\"agentInfo\"")
+                    && frame.contains("\"mcpCapabilities\":{")
+                    && frame.contains("\"sessionCapabilities\":"),
+                "invalid v1 initialize shape: {frame}"
+            );
+        } else {
+            assert!(
+                frame.contains("\"capabilities\":{") && frame.contains("\"info\":"),
+                "invalid v2 initialize shape: {frame}"
+            );
+        }
         self.notify("initialized", "{}");
-        let dir = std::env::temp_dir().join(format!("acp-test-{}", std::process::id()));
+        let dir = std::path::Path::new(&self.fake_log)
+            .parent()
+            .expect("fake log parent")
+            .join("workspace");
         std::fs::create_dir_all(&dir).expect("tmpdir");
         let cwd = dir.to_str().unwrap().replace('\\', "\\\\");
         let id = self.req("session/new", &format!("{{\"cwd\":\"{cwd}\"}}"));
@@ -253,19 +263,6 @@ impl WaitTimeout for Child {
             }
         }
     }
-}
-
-fn which_python3() -> String {
-    let out = Command::new("sh")
-        .arg("-c")
-        .arg("command -v python3")
-        .output()
-        .expect("probe python3");
-    assert!(
-        out.status.success(),
-        "these tests need python3 on PATH for the fake MSP host"
-    );
-    String::from_utf8(out.stdout).unwrap().trim().to_string()
 }
 
 /// Extract `"key":"value"` (first string occurrence) from a JSON frame.
@@ -398,6 +395,20 @@ fn user_input_options_reach_the_client() {
 }
 
 #[test]
+fn false_elicitation_capability_is_not_treated_as_supported() {
+    let mut c = Client::spawn("questions", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":false}}");
+    let _pid = c.prompt(&sid, "ask me");
+    c.wait_log("userInput/cancel", Duration::from_secs(15));
+    let frames = c.frames.lock().unwrap().join("\n");
+    assert!(
+        !frames.contains("elicitation/create"),
+        "false form capability must not enable elicitation: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
 fn v2_failed_terminal_yields_failed_stop() {
     let mut c = Client::spawn("failed", &[]);
     let sid = c.new_session(2, "");
@@ -484,7 +495,17 @@ fn approval_request_without_notification_is_bridged() {
 fn session_load_replays_history() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(1, "");
-    let lid = c.req("session/load", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let cwd = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent")
+        .join("workspace");
+    let lid = c.req(
+        "session/load",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"cwd\":\"{}\"}}",
+            cwd.to_str().expect("utf8 cwd").replace('\\', "\\\\")
+        ),
+    );
     let load = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
     assert!(load.contains("\"result\""), "load ok: {load}");
     let log = c.frames.lock().unwrap().join("\n");
@@ -622,6 +643,31 @@ fn malformed_json_is_rejected_and_survived() {
     let pid = c.prompt(&sid, "hi");
     let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
     assert!(done.contains("end_turn"), "terminal: {done}");
+    c.finish();
+}
+
+#[test]
+fn unsupported_or_invalid_session_roots_are_rejected() {
+    let mut c = Client::spawn("happy", &[]);
+    let init = c.req("initialize", "{\"protocolVersion\":2}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+
+    for params in [
+        "{\"cwd\":\"relative\"}",
+        "{\"cwd\":\"/tmp\",\"mcpServers\":[{\"name\":\"x\"}]}",
+        "{\"cwd\":\"/tmp\",\"additionalDirectories\":[\"/var/tmp\"]}",
+    ] {
+        let id = c.req("session/new", params);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"error\""), "request must fail: {frame}");
+    }
+
+    let seen = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+    assert!(
+        !seen.lines().any(|line| line == "session/start"),
+        "invalid requests must not reach the host: {seen}"
+    );
     c.finish();
 }
 
