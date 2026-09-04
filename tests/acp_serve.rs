@@ -379,6 +379,28 @@ fn approval_preserves_all_choices_with_deny_option() {
 }
 
 #[test]
+fn v2_permission_uses_the_typed_subject_shape() {
+    let mut c = Client::spawn("approval", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "do it");
+    let perm = c.wait_for("request_permission", Duration::from_secs(15));
+    assert!(
+        perm.contains(&format!(
+            "\"params\":{{\"sessionId\":\"{sid}\",\"title\":\"workspace-shell\",\"subject\":{{\"type\":\"tool_call\",\"toolCall\":{{"
+        )),
+        "v2 requires a top-level title and typed subject: {perm}"
+    );
+    assert!(
+        perm.contains("\"toolCallId\":\"call-1\"")
+            && perm.contains("\"title\":\"workspace-shell\"")
+            && perm.contains("\"kind\":\"execute\"")
+            && perm.contains("\"status\":\"pending\""),
+        "v2 tool-call subject carries display metadata: {perm}"
+    );
+    c.finish();
+}
+
+#[test]
 fn user_input_options_reach_the_client() {
     let mut c = Client::spawn("questions", &[]);
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
@@ -546,6 +568,7 @@ fn host_default_mode_is_reflected() {
 fn v1_advertises_config_options_and_slash_commands() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(1, "");
+    let commands = c.wait_for("available_commands_update", Duration::from_secs(15));
     let log = c.frames.lock().unwrap().join("\n");
     let cfg = log
         .lines()
@@ -563,10 +586,6 @@ fn v1_advertises_config_options_and_slash_commands() {
         "v1 must not leak the v2 configId field: {cfg}"
     );
 
-    let commands = log
-        .lines()
-        .find(|l| l.contains("available_commands_update"))
-        .expect("slash commands after session/new");
     assert!(
         commands.contains("\"name\":\"plan\"")
             && commands.contains("\"input\":{\"hint\":\"what to plan\"}")

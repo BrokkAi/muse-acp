@@ -2046,7 +2046,7 @@ fn open_approval(stdout: &StdoutShared, sessions: &Sessions, params: &J) {
         return;
     }
     let req_id = J::Str(mint_id("perm-", &ID_COUNTER));
-    {
+    let ver = {
         let mut map = sessions.lock().unwrap();
         if let Some(s) = map.get_mut(&acp_sid) {
             s.pending_perm = Some(PendingPerm {
@@ -2055,22 +2055,37 @@ fn open_approval(stdout: &StdoutShared, sessions: &Sessions, params: &J) {
                 requirement,
                 choices,
             });
-            if s.ver == 2 {
-                acp::send_state(stdout, &acp_sid, "requires_action", None);
-            }
+            s.ver
         } else {
             return;
         }
+    };
+    if ver == 2 {
+        acp::send_state(stdout, &acp_sid, "requires_action", None);
     }
-    acp::send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session/request_permission\",\"params\":{{\"sessionId\":{},\"toolCall\":{{\"toolCallId\":{},\"title\":{},\"kind\":\"{kind}\",\"status\":\"pending\"}},\"options\":{}}}}}",
-            j_to_string(&req_id),
+    let params = if ver == 2 {
+        format!(
+            "{{\"sessionId\":{},\"title\":{},\"subject\":{{\"type\":\"tool_call\",\"toolCall\":{{\"toolCallId\":{},\"title\":{},\"kind\":\"{kind}\",\"status\":\"pending\"}}}},\"options\":{}}}",
+            esc(&acp_sid),
+            esc(title),
+            esc(&tool_call_id),
+            esc(title),
+            options_json
+        )
+    } else {
+        format!(
+            "{{\"sessionId\":{},\"toolCall\":{{\"toolCallId\":{},\"title\":{},\"kind\":\"{kind}\",\"status\":\"pending\"}},\"options\":{}}}",
             esc(&acp_sid),
             esc(&tool_call_id),
             esc(title),
             options_json
+        )
+    };
+    acp::send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session/request_permission\",\"params\":{params}}}",
+            j_to_string(&req_id),
         ),
     );
 }
