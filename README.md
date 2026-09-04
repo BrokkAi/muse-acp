@@ -3,6 +3,31 @@
 ACP server (v2 primary, v1 fallback) for Muse, backed by one `muse serve`
 host over the Muse Session Protocol (MSP). Std-only Rust, no dependencies.
 
+## Install
+
+On Linux or macOS, install the latest release with:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/BrokkAi/muse-acp/releases/latest/download/install.sh | sh
+```
+
+The installer detects the platform, verifies the release archive's SHA-256
+checksum, and installs `muse-acp` to `~/.local/bin`. Choose another absolute
+destination or pin a version by setting an environment variable on `sh`:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/BrokkAi/muse-acp/releases/latest/download/install.sh \
+  | MUSE_ACP_INSTALL_DIR="$HOME/bin" MUSE_ACP_VERSION=v0.1.0 sh
+```
+
+Linux release binaries require glibc. On Windows, or for a manual install,
+download the archive for your platform from [GitHub Releases](https://github.com/BrokkAi/muse-acp/releases),
+verify it with the adjacent `.sha256` file, and place `muse-acp` (or
+`muse-acp.exe` on Windows) on `PATH`. To build and install from a checkout, run
+`cargo install --path .`.
+
 ## Requirements
 
 - Rust 1.88 or newer.
@@ -80,33 +105,9 @@ adapter's workspace read confinement are not substitutes for the host sandbox.
 Sandbox posture is fixed for the `muse serve` lifetime; re-enable it as soon as
 the host supports the platform, and re-check `muse serve --help` on newer builds.
 
-## Install into Zed
-
-On Linux or macOS, install the latest release with:
+## Register with Zed
 
 ```sh
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/BrokkAi/muse-acp/releases/latest/download/install.sh | sh
-```
-
-The installer detects the platform, verifies the release archive's SHA-256
-checksum, and installs `muse-acp` to `~/.local/bin`. Choose another absolute
-destination or pin a version by setting an environment variable on `sh`:
-
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/BrokkAi/muse-acp/releases/latest/download/install.sh \
-  | MUSE_ACP_INSTALL_DIR="$HOME/bin" MUSE_ACP_VERSION=v0.1.0 sh
-```
-
-Linux release binaries require glibc. On Windows, or for a manual install,
-download the archive for your platform from [GitHub Releases](https://github.com/BrokkAi/muse-acp/releases),
-verify it with the adjacent `.sha256` file, and place `muse-acp` (or
-`muse-acp.exe` on Windows) on `PATH`. You can also build and install from a
-checkout:
-
-```sh
-cargo install --path .
 muse-acp install
 ```
 
