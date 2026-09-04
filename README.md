@@ -82,6 +82,11 @@ the host supports the platform, and re-check `muse serve --help` on newer builds
 
 ## Install into Zed
 
+Download the archive for your platform from [GitHub Releases](https://github.com/BrokkAi/muse-acp/releases),
+verify it with the adjacent `.sha256` file, and place `muse-acp` (or
+`muse-acp.exe` on Windows) on `PATH`. You can also build and install from a
+checkout:
+
 ```sh
 cargo install --path .
 muse-acp install
