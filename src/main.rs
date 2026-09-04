@@ -101,9 +101,14 @@ fn validate_session_roots(stdout: &StdoutShared, id: &Option<J>, params: Option<
         acp::send_error(stdout, id, -32602, "params.cwd must be an absolute path");
         return false;
     }
+    // ACP v1 requires clients to send `mcpServers` with session/new, and
+    // JetBrains may attach its integrated stdio MCP server even though our
+    // initialize response advertises no optional HTTP/SSE MCP transports.
+    // Muse owns its tool runtime, so these client-provided servers cannot be
+    // forwarded today; tolerate and ignore them instead of aborting the whole
+    // session before its config options can be returned.
     if has_nonempty_array(params, "mcpServers") {
-        acp::send_error(stdout, id, -32602, "MCP servers are not supported");
-        return false;
+        log("ignoring client-provided MCP servers (not supported by the Muse host)");
     }
     if has_nonempty_array(params, "additionalDirectories") {
         acp::send_error(

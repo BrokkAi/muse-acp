@@ -121,6 +121,11 @@ config selectors, so the adapter returns `configOptions` in both protocol
 versions: v1 uses the selector field `id` (plus a legacy `modes` fallback), while
 v2 uses `configId`.
 
+JetBrains may attach its integrated stdio MCP server to `session/new` even when
+the agent advertises no optional MCP transports. The adapter currently ignores
+client-provided MCP servers because Muse owns its tool runtime; their presence
+does not prevent the session or its selectors from starting.
+
 ## Run
 
 ```sh

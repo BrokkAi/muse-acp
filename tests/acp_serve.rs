@@ -732,6 +732,42 @@ fn v1_advertises_config_options_and_slash_commands() {
 }
 
 #[test]
+fn v1_jetbrains_mcp_attachment_does_not_hide_config_options() {
+    let mut c = Client::spawn("quiet", &[]);
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    let initialized = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    assert!(
+        initialized.contains("\"result\""),
+        "init failed: {initialized}"
+    );
+    c.notify("initialized", "{}");
+
+    let dir = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent")
+        .join("workspace");
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let cwd = dir.to_str().unwrap().replace('\\', "\\\\");
+    let id = c.req(
+        "session/new",
+        &format!(
+            "{{\"cwd\":\"{cwd}\",\"mcpServers\":[{{\"name\":\"intellij\",\"command\":\"idea\",\"args\":[\"stdioMcpServer\"]}}]}}"
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"result\"")
+            && frame.contains("\"configOptions\"")
+            && frame.contains("\"id\":\"mode\"")
+            && frame.contains("\"id\":\"model\"")
+            && frame.contains("\"id\":\"reasoning_effort\""),
+        "JetBrains-style session must return v1 selectors: {frame}"
+    );
+    c.wait_log("session/start", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
 fn set_config_option_returns_full_state() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
@@ -1042,7 +1078,7 @@ fn malformed_json_is_rejected_and_survived() {
 }
 
 #[test]
-fn unsupported_or_invalid_session_roots_are_rejected() {
+fn invalid_session_roots_are_rejected() {
     let mut c = Client::spawn("happy", &[]);
     let init = c.req("initialize", "{\"protocolVersion\":2}");
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
@@ -1050,7 +1086,6 @@ fn unsupported_or_invalid_session_roots_are_rejected() {
 
     for params in [
         "{\"cwd\":\"relative\"}",
-        "{\"cwd\":\"/tmp\",\"mcpServers\":[{\"name\":\"x\"}]}",
         "{\"cwd\":\"/tmp\",\"additionalDirectories\":[\"/var/tmp\"]}",
     ] {
         let id = c.req("session/new", params);
