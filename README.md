@@ -39,6 +39,34 @@ Default spawn is `muse exec <extra-args> <prompt…>` in `session/new`'s `cwd`
 (non-interactive headless mode; extra args from `MUSE_CLI_EXTRA_ARGS`,
 e.g. `--provider echo`, are inserted before the prompt).
 
+## Sandbox (on by default, optional)
+
+The spawned `muse exec` runs with the sandbox **on** unless you opt out:
+
+```sh
+# Startup-wide default (both forms are equivalent):
+./target/release/muse-acp --disable-sandbox
+MUSE_DISABLE_SANDBOX=1 ./target/release/muse-acp
+# Optional: default network mode for the sandbox:
+./target/release/muse-acp --sandbox-network enabled
+MUSE_SANDBOX_NETWORK=proxy-only ./target/release/muse-acp
+```
+
+Per-session toggle without restarting, as the prompt text of
+`session/prompt` (handled locally, no `muse` spawn unless a trailing
+prompt follows):
+
+- `/sandbox off` — disable sandbox for this session
+- `/sandbox on` — re-enable sandbox for this session
+- `/sandbox status` — report the current session setting
+- `/sandbox off <prompt…>` — switch off and run `<prompt…>` in one turn
+  (same-line remainder or following lines become the prompt)
+
+The per-session command overrides the startup default. Anything else
+starting with `/sandboxfoo` (no space) is passed through to the model
+untouched. Full passthrough remains available via
+`MUSE_CLI_EXTRA_ARGS="--disable-sandbox"`.
+
 ## Minimal session (NDJSON on stdin)
 
 ```json
@@ -62,5 +90,3 @@ Cancel:
 
 - Text prompts only; image/audio/resource blocks are skipped.
 - One prompt worker per session thread; responses may interleave across sessions.
-- Build not verified in this sandbox (`bwrap` blocks `cargo`/proc spawn here);
-  run `cargo build` locally to confirm.

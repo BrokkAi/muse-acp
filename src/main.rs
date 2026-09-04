@@ -11,11 +11,23 @@
 //!   `muse exec <extra-args> <prompt>` with cwd, stream stdout chunks as
 //!   `session/update agent_message_chunk`, reply `{stopReason}`.
 //! - `session/cancel {sessionId}` (notification) -> flag + kill child.
+//! - In-prompt `/sandbox on|off|status [prompt]` toggles sandbox per session.
 //!
 //! Env:
 //! - `MUSE_CLI` (default `muse`): binary to spawn.
 //! - `MUSE_CLI_EXTRA_ARGS` (optional, space-separated): extra args inserted
 //!   before the prompt, e.g. `--model foo`. Default: none.
+//! - `MUSE_DISABLE_SANDBOX` (`1|true|yes|on`): default every session to
+//!   sandbox-off (adds `--disable-sandbox` to `muse exec`). Same as the
+//!   `--disable-sandbox` startup flag. Per-session `/sandbox` overrides it.
+//! - `MUSE_SANDBOX_NETWORK` (`restricted|enabled|proxy-only`): forwarded as
+//!   `--sandbox-network <mode>` to `muse exec`. Same as the
+//!   `--sandbox-network <mode>` startup flag.
+//!
+//! Flags (muse-acp itself):
+//! - `--disable-sandbox`: default sandbox-off for all sessions.
+//! - `--sandbox-network <mode>`: default sandbox network mode for all sessions.
+//! - `--help` / `--version`: print and exit (no stdio loop).
 //!
 //! No third-party deps (std only) so `cargo build` works offline.
 
@@ -290,6 +302,91 @@ fn j_to_string(j: &J) -> String {
 #[derive(Debug, Clone)]
 struct Session {
     cwd: String,
+    sandbox_disabled: bool,
+    sandbox_network: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct Config {
+    sandbox_disabled: bool,
+    sandbox_network: Option<String>,
+}
+
+fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => false,
+    }
+}
+
+fn parse_startup_config() -> Result<Config, String> {
+    let mut sandbox_disabled = env_flag("MUSE_DISABLE_SANDBOX");
+    let mut sandbox_network: Option<String> =
+        std::env::var("MUSE_SANDBOX_NETWORK").ok().filter(|s| !s.trim().is_empty());
+    let mut args = std::env::args().skip(1).peekable();
+    while let Some(a) = args.next() {
+        match a.as_str() {
+            "--disable-sandbox" => sandbox_disabled = true,
+            "--sandbox-network" => {
+                let mode = args.next().ok_or("--sandbox-network requires a value".to_string())?;
+                if mode.trim().is_empty() {
+                    return Err("--sandbox-network requires a non-empty value".to_string());
+                }
+                sandbox_network = Some(mode);
+            }
+            s if s.starts_with("--sandbox-network=") => {
+                let mode = s["--sandbox-network=".len()..].to_string();
+                if mode.trim().is_empty() {
+                    return Err("--sandbox-network requires a non-empty value".to_string());
+                }
+                sandbox_network = Some(mode);
+            }
+            "--help" | "-h" => {
+                println!(
+                    "muse-acp: ACP adapter over `muse exec`\n\nUsage: muse-acp [--disable-sandbox] [--sandbox-network <mode>]\n\nSandbox is ON by default (muse default). Pass --disable-sandbox or set\nMUSE_DISABLE_SANDBOX=1 to add --disable-sandbox to every `muse exec` spawn.\nIn-session override per prompt: `/sandbox on|off|status [prompt]`."
+                );
+                std::process::exit(0);
+            }
+            "--version" | "-V" => {
+                println!("muse-acp {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown argument: {other}")),
+        }
+    }
+    Ok(Config { sandbox_disabled, sandbox_network })
+}
+
+/// Parse a leading `/sandbox ...` command. Returns (action, rest-of-prompt).
+/// `rest` is the same-line remainder plus any following lines, trimmed.
+fn parse_sandbox_command(text: &str) -> Option<(String, String)> {
+    let mut lines = text.splitn(2, '\n');
+    let first = lines.next()?.trim();
+    let rest_lines = lines.next().unwrap_or("").trim().to_string();
+    let body = first.strip_prefix("/sandbox")?;
+    // Require exact `/sandbox` or `/sandbox <...>`: reject `/sandboxfoo`.
+    if !body.is_empty() && !body.starts_with(char::is_whitespace) {
+        return None;
+    }
+    let body = body.trim();
+    let (word, inline_rest) = match body.find(char::is_whitespace) {
+        Some(i) => (body[..i].to_ascii_lowercase(), body[i..].trim().to_string()),
+        None => (body.to_ascii_lowercase(), String::new()),
+    };
+    let rest = [inline_rest, rest_lines]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some((word, rest))
+}
+
+fn sandbox_status_text(disabled: bool, network: &Option<String>) -> String {
+    let state = if disabled { "off (disabled)" } else { "on (enabled)" };
+    match network {
+        Some(m) => format!("Sandbox is {state}; network mode: {m}."),
+        None => format!("Sandbox is {state} (default network mode)."),
+    }
 }
 
 struct Running {
@@ -448,10 +545,10 @@ fn run_prompt(
     session_id: String,
     prompt_text: String,
 ) {
-    let cwd = {
+    let (cwd, sandbox_disabled, sandbox_network) = {
         let map = sessions.lock().unwrap();
         match map.get(&session_id) {
-            Some(s) => s.cwd.clone(),
+            Some(s) => (s.cwd.clone(), s.sandbox_disabled, s.sandbox_network.clone()),
             None => {
                 send_error(&stdout, &id, -32602, "unknown sessionId");
                 return;
@@ -470,6 +567,13 @@ fn run_prompt(
     cmd.arg("exec");
     for a in extra_args() {
         cmd.arg(a);
+    }
+    if sandbox_disabled {
+        cmd.arg("--disable-sandbox");
+    }
+    if let Some(mode) = &sandbox_network {
+        cmd.arg("--sandbox-network");
+        cmd.arg(mode);
     }
     cmd.arg(&prompt_text);
     cmd.current_dir(&cwd);
@@ -561,6 +665,17 @@ fn run_prompt(
 
 fn main() {
     let stdout: StdoutShared = Arc::new(Mutex::new(std::io::stdout()));
+    let config = match parse_startup_config() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[muse-acp] {e}");
+            std::process::exit(2);
+        }
+    };
+    log(&format!(
+        "sandbox default: {}",
+        if config.sandbox_disabled { "off" } else { "on" }
+    ));
     let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
     let running: RunningMap = Arc::new(Mutex::new(HashMap::new()));
 
@@ -618,7 +733,14 @@ fn main() {
                 }
                 // mcpServers intentionally ignored (unsupported).
                 let sid = gen_session_id();
-                sessions.lock().unwrap().insert(sid.clone(), Session { cwd });
+                sessions.lock().unwrap().insert(
+                    sid.clone(),
+                    Session {
+                        cwd,
+                        sandbox_disabled: config.sandbox_disabled,
+                        sandbox_network: config.sandbox_network.clone(),
+                    },
+                );
                 send_result(&stdout, &id, &format!("{{\"sessionId\":{}}}", esc(&sid)));
             }
             "session/prompt" => {
@@ -635,6 +757,55 @@ fn main() {
                 let text = extract_prompt_text(params.as_ref());
                 if text.trim().is_empty() {
                     send_error(&stdout, &id, -32602, "session/prompt requires text content");
+                    continue;
+                }
+                // In-prompt `/sandbox ...` command: toggle for this session without
+                // spawning muse. An optional trailing prompt runs with the new setting.
+                if let Some((action, rest)) = parse_sandbox_command(&text) {
+                    let reply = {
+                        let mut map = sessions.lock().unwrap();
+                        match map.get_mut(&sid) {
+                            None => {
+                                send_error(&stdout, &id, -32602, "unknown sessionId");
+                                continue;
+                            }
+                            Some(s) => match action.as_str() {
+                                "off" | "disable" | "disabled" | "0" | "false" | "no" => {
+                                    s.sandbox_disabled = true;
+                                    sandbox_status_text(true, &s.sandbox_network)
+                                }
+                                "on" | "enable" | "enabled" | "1" | "true" | "yes" => {
+                                    s.sandbox_disabled = false;
+                                    sandbox_status_text(false, &s.sandbox_network)
+                                }
+                                "" | "status" => {
+                                    sandbox_status_text(s.sandbox_disabled, &s.sandbox_network)
+                                }
+                                _ => {
+                                    send_error(
+                                        &stdout,
+                                        &id,
+                                        -32602,
+                                        "usage: /sandbox on|off|status [prompt]",
+                                    );
+                                    continue;
+                                }
+                            },
+                        }
+                    };
+                    if rest.is_empty() {
+                        if id.is_some() {
+                            send_update_chunk(&stdout, &sid, &reply);
+                        }
+                        send_result(&stdout, &id, r#"{"stopReason":"end_turn"}"#);
+                        continue;
+                    }
+                    // Fall through: run the trailing prompt with the new setting.
+                    if id.is_some() {
+                        send_update_chunk(&stdout, &sid, &format!("{reply}\n"));
+                    }
+                    let (so, ss, rr) = (stdout.clone(), sessions.clone(), running.clone());
+                    std::thread::spawn(move || run_prompt(so, ss, rr, id, sid, rest));
                     continue;
                 }
                 let (so, ss, rr) = (stdout.clone(), sessions.clone(), running.clone());
