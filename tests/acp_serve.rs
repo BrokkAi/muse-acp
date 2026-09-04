@@ -364,9 +364,10 @@ fn approval_preserves_all_choices_with_deny_option() {
     let perm = c.wait_for("request_permission", Duration::from_secs(15));
     assert!(perm.contains(&sid), "permission for our session: {perm}");
     assert!(
-        perm.contains("\"title\":\"workspace-shell\"")
+        perm.contains("\"title\":\"cargo test\"")
             && perm.contains("\"kind\":\"execute\"")
-            && perm.contains("\"status\":\"pending\""),
+            && perm.contains("\"status\":\"pending\"")
+            && perm.contains("\"rawInput\":{\"kind\":\"shell\",\"command\":\"cargo test\"}"),
         "Zed requires a displayable tool call: {perm}"
     );
     assert!(perm.contains("c-allow"), "allow choice kept: {perm}");
@@ -386,16 +387,31 @@ fn v2_permission_uses_the_typed_subject_shape() {
     let perm = c.wait_for("request_permission", Duration::from_secs(15));
     assert!(
         perm.contains(&format!(
-            "\"params\":{{\"sessionId\":\"{sid}\",\"title\":\"workspace-shell\",\"subject\":{{\"type\":\"tool_call\",\"toolCall\":{{"
+            "\"params\":{{\"sessionId\":\"{sid}\",\"title\":\"cargo test\",\"subject\":{{\"type\":\"tool_call\",\"toolCall\":{{"
         )),
         "v2 requires a top-level title and typed subject: {perm}"
     );
     assert!(
         perm.contains("\"toolCallId\":\"call-1\"")
-            && perm.contains("\"title\":\"workspace-shell\"")
+            && perm.contains("\"title\":\"cargo test\"")
             && perm.contains("\"kind\":\"execute\"")
             && perm.contains("\"status\":\"pending\""),
         "v2 tool-call subject carries display metadata: {perm}"
+    );
+    c.finish();
+}
+
+#[test]
+fn file_write_permission_is_not_presented_as_a_read() {
+    let mut c = Client::spawn("approval", &[("FAKE_APPROVAL_SUBJECT", "file-write")]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "write it");
+    let perm = c.wait_for("request_permission", Duration::from_secs(15));
+    assert!(
+        perm.contains("\"title\":\"write /tmp/output.txt\"")
+            && perm.contains("\"kind\":\"edit\"")
+            && perm.contains("\"rawInput\":{\"kind\":\"fileAccess\",\"access\":\"write\",\"path\":\"/tmp/output.txt\"}"),
+        "file-write approval must disclose its operation: {perm}"
     );
     c.finish();
 }
@@ -607,6 +623,17 @@ fn v1_advertises_config_options_and_slash_commands() {
             && !set_done.contains("\"configId\":\"mode\""),
         "v1 setter response uses the v1 selector shape: {set_done}"
     );
+
+    let mode_id = c.req(
+        "session/set_mode",
+        &format!("{{\"sessionId\":\"{sid}\",\"modeId\":\"deny\"}}"),
+    );
+    let mode_done = c.wait_for(&format!("\"id\":{mode_id}"), Duration::from_secs(15));
+    assert!(
+        mode_done.contains("\"result\":{\"mode\":\"deny\"}"),
+        "legacy v1 modeId is accepted: {mode_done}"
+    );
+    c.wait_log("session/setApprovalMode", Duration::from_secs(15));
     c.finish();
 }
 
@@ -641,6 +668,23 @@ fn slash_command_aliases_use_the_muse_skill_grammar() {
     assert!(
         log.contains("\"text\":\"/plan add dropdowns\""),
         "the ACP transcript preserves the command the user selected: {log}"
+    );
+    c.finish();
+}
+
+#[test]
+fn leading_space_escapes_a_slash_command() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, " /plan send this literally");
+    c.wait_input(
+        "\"text\": \" /plan send this literally\"",
+        Duration::from_secs(15),
+    );
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    assert!(
+        !input.contains("/skill plan"),
+        "leading-space escape must not execute a slash alias: {input}"
     );
     c.finish();
 }

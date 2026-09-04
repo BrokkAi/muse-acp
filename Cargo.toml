@@ -2,5 +2,11 @@
 name = "muse-acp"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
+description = "Agent Client Protocol adapter for Muse"
+license = "Apache-2.0"
+repository = "https://github.com/BrokkAi/muse-acp"
+readme = "README.md"
+publish = false
 
 [dependencies]

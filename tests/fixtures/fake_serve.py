@@ -41,6 +41,11 @@ APPROVAL_PARAMS = {
          "decision": "denied", "scope": "once"},
     ],
 }
+if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "file-write":
+    APPROVAL_PARAMS["toolName"] = "workspace-files"
+    APPROVAL_PARAMS["subject"] = {
+        "kind": "fileAccess", "access": "write", "path": "/tmp/output.txt",
+    }
 if os.environ.get("FAKE_APPROVAL", "") == "all-approve":
     APPROVAL_PARAMS["availableChoices"] = [
         {"choiceId": "c-yes", "label": "Yes",

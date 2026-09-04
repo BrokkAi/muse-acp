@@ -3,6 +3,13 @@
 ACP server (v2 primary, v1 fallback) for Muse, backed by one `muse serve`
 host over the Muse Session Protocol (MSP). Std-only Rust, no dependencies.
 
+## Requirements
+
+- Rust 1.88 or newer.
+- A Muse CLI that provides `muse serve` and a compatible MSP schema.
+- Python 3 to run the integration-test fixture.
+- Zed only if you use the optional installer.
+
 ## How it works
 
 One `muse serve` child serves all ACP sessions. `session/start`
@@ -45,22 +52,33 @@ Env:
 MUSE_CLI=muse                      # host binary (default: muse)
 MUSE_SERVE_ARGS="--trust-workspace" # host-lifetime flags (see `muse serve --help`)
 MUSE_APPROVAL_MODE=promptUnmatched  # allowAll|promptUnmatched|onRequest|denyUnmatched
+# MUSE_ALLOW_UNSCOPED_READS=1       # DANGEROUS: allow local reads outside session cwd
 ```
 
 `session/new {cwd}` starts a host session in `cwd`. Approval posture defaults
 to the host default; set `MUSE_APPROVAL_MODE=promptUnmatched` to force every
 unmatched tool call through `session/request_permission`.
 
-Linux arm64 note: as of muse 1.0.2 the host sandbox is not configured
-correctly on Linux arm64 (a required sandbox binary is missing), so
-disable it host-side:
+Local image and resource reads are confined to the session workspace by
+default. `MUSE_ALLOW_UNSCOPED_READS` disables that boundary only when its value
+is explicitly `1`, `true`, `yes`, or `on` (case-insensitive). Do not enable it
+for untrusted sessions or workspaces.
+
+### Linux arm64 sandbox advisory
+
+Muse 1.0.2 may fail to start its sandbox on Linux arm64 because a required
+sandbox binary is missing. Prefer upgrading Muse or installing the required
+sandbox support. If neither is possible, and you explicitly accept running host
+tools without the sandbox's isolation, use:
 
 ```sh
 MUSE_SERVE_ARGS="--trust-workspace --disable-sandbox"
 ```
 
-Sandbox posture is fixed for the `muse serve` lifetime (see
-`muse serve --help`); re-check on newer builds before dropping the flag.
+`--disable-sandbox` materially reduces isolation. Approval prompts and this
+adapter's workspace read confinement are not substitutes for the host sandbox.
+Sandbox posture is fixed for the `muse serve` lifetime; re-enable it as soon as
+the host supports the platform, and re-check `muse serve --help` on newer builds.
 
 ## Install into Zed
 
@@ -116,12 +134,24 @@ muse-acp uninstall
 ## Verify
 
 ```sh
-cargo build
-./target/debug/muse-acp --selftest  # static wire literals parse
-python3 /tmp/acp2_tool.py     # v2 tool turn
-python3 /tmp/acp2_perm.py     # approval deny -> turn continues
-python3 /tmp/acp2_misc.py cancel|resume|v1
-python3 /tmp/acp2_conc.py     # concurrent turns, both idle
-python3 /tmp/acp2_focus.py    # image color, deny mode
-python3 /tmp/acp2_ui2.py      # elicitation bridge -> answered file
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+cargo run --locked -- --selftest
 ```
+
+The integration tests use the checked-in fake MSP host at
+`tests/fixtures/fake_serve.py`; they do not require a live Muse session.
+
+## Contributing and security
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow. Please
+report vulnerabilities privately as described in [SECURITY.md](SECURITY.md),
+not in a public issue.
+
+## License
+
+Copyright 2026 Brokk.ai.
+
+Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and
+[NOTICE](NOTICE).

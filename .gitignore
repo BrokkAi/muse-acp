@@ -1,2 +1,13 @@
 /target
 /.worktrees/
+.env
+.env.*
+!.env.example
+*.bak
+*.log
+*.swp
+.DS_Store
+.idea/
+.vscode/
+__pycache__/
+*.py[cod]

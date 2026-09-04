@@ -1174,7 +1174,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .to_string();
             let value = params
                 .as_ref()
-                .and_then(|p| p.get("mode"))
+                .and_then(|p| p.get("modeId").or_else(|| p.get("mode")))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -1492,8 +1492,12 @@ fn extract_prompt_parts(params: Option<&J>, cwd: &str) -> Result<(Vec<String>, S
 /// Short editor commands map to Muse's stable skill invocation syntax. The ACP
 /// user-message echo keeps what the client sent; only host input is normalized.
 fn normalize_muse_slash_command(text: &str) -> String {
-    let trimmed = text.trim_start();
-    let mut words = trimmed.splitn(2, char::is_whitespace);
+    // ACP clients use a leading space to escape slash-command execution and
+    // send the text literally. Only normalize a slash in byte position zero.
+    if !text.starts_with('/') {
+        return text.to_string();
+    }
+    let mut words = text.splitn(2, char::is_whitespace);
     let command = words.next().unwrap_or_default();
     let argument = words.next().unwrap_or_default().trim();
     match command {
@@ -1564,7 +1568,7 @@ fn hex(c: u8) -> Option<u8> {
 
 /// Confine a path to the session workspace unless explicitly opened up.
 fn confine(path: &str, cwd: &str) -> Result<(), String> {
-    if std::env::var("MUSE_ALLOW_UNSCOPED_READS").is_ok() {
+    if env_flag_enabled(std::env::var("MUSE_ALLOW_UNSCOPED_READS").ok().as_deref()) {
         return Ok(());
     }
     let canon = std::fs::canonicalize(path).map_err(|e| format!("cannot resolve {path}: {e}"))?;
@@ -1577,6 +1581,17 @@ fn confine(path: &str, cwd: &str) -> Result<(), String> {
             "{path} is outside the session workspace (set MUSE_ALLOW_UNSCOPED_READS=1 to allow)"
         ))
     }
+}
+
+/// Explicit opt-in parser for security-sensitive environment flags. Merely
+/// defining a variable (for example, to `0`) must not weaken confinement.
+fn env_flag_enabled(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
 }
 
 fn looks_textual(path: &str) -> bool {
@@ -2024,19 +2039,49 @@ fn open_approval(stdout: &StdoutShared, sessions: &Sessions, params: &J) {
         .unwrap_or("?")
         .to_string();
     let subject = params.get("subject").cloned().unwrap_or(J::Null);
-    let title = params
+    let tool_name = params
         .get("toolName")
         .and_then(|v| v.as_str())
-        .or_else(|| subject.get("command").and_then(|v| v.as_str()))
-        .or_else(|| subject.get("path").and_then(|v| v.as_str()))
-        .or_else(|| subject.get("target").and_then(|v| v.as_str()))
-        .or_else(|| subject.get("access").and_then(|v| v.as_str()))
         .unwrap_or("Muse action");
-    let kind = match subject.get("kind").and_then(|v| v.as_str()) {
-        Some("shell") | Some("process") => "execute",
-        Some("fileAccess") => "read",
-        Some("network") => "fetch",
+    let subject_kind = subject.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let command = subject.get("command").and_then(|v| v.as_str());
+    let path = subject.get("path").and_then(|v| v.as_str());
+    let target = subject.get("target").and_then(|v| v.as_str());
+    let access = subject.get("access").and_then(|v| v.as_str());
+    let description = subject.get("description").and_then(|v| v.as_str());
+    let title = match subject_kind {
+        "shell" | "process" => command.or(description).unwrap_or(tool_name).to_string(),
+        "fileAccess" => match (access, path) {
+            (Some(access), Some(path)) => format!("{access} {path}"),
+            (None, Some(path)) => path.to_string(),
+            (Some(access), None) => access.to_string(),
+            (None, None) => description.unwrap_or(tool_name).to_string(),
+        },
+        "network" => target.or(description).unwrap_or(tool_name).to_string(),
+        _ => command
+            .or(path)
+            .or(target)
+            .or(access)
+            .or(description)
+            .unwrap_or(tool_name)
+            .to_string(),
+    };
+    let kind = match subject_kind {
+        "shell" | "process" => "execute",
+        "fileAccess" => match access.unwrap_or("").to_ascii_lowercase().as_str() {
+            "read" | "list" | "stat" => "read",
+            "search" => "search",
+            "write" | "create" | "append" | "edit" | "modify" => "edit",
+            "delete" | "remove" => "delete",
+            "move" | "rename" => "move",
+            _ => "other",
+        },
+        "network" => "fetch",
         _ => "other",
+    };
+    let raw_input = match &subject {
+        J::Obj(_) => format!(",\"rawInput\":{}", j_to_string(&subject)),
+        _ => String::new(),
     };
     let (options_json, choices) = acp::perm_options(params);
     if choices.is_empty() {
@@ -2065,19 +2110,19 @@ fn open_approval(stdout: &StdoutShared, sessions: &Sessions, params: &J) {
     }
     let params = if ver == 2 {
         format!(
-            "{{\"sessionId\":{},\"title\":{},\"subject\":{{\"type\":\"tool_call\",\"toolCall\":{{\"toolCallId\":{},\"title\":{},\"kind\":\"{kind}\",\"status\":\"pending\"}}}},\"options\":{}}}",
+            "{{\"sessionId\":{},\"title\":{},\"subject\":{{\"type\":\"tool_call\",\"toolCall\":{{\"toolCallId\":{},\"title\":{},\"kind\":\"{kind}\",\"status\":\"pending\"{raw_input}}}}},\"options\":{}}}",
             esc(&acp_sid),
-            esc(title),
+            esc(&title),
             esc(&tool_call_id),
-            esc(title),
+            esc(&title),
             options_json
         )
     } else {
         format!(
-            "{{\"sessionId\":{},\"toolCall\":{{\"toolCallId\":{},\"title\":{},\"kind\":\"{kind}\",\"status\":\"pending\"}},\"options\":{}}}",
+            "{{\"sessionId\":{},\"toolCall\":{{\"toolCallId\":{},\"title\":{},\"kind\":\"{kind}\",\"status\":\"pending\"{raw_input}}},\"options\":{}}}",
             esc(&acp_sid),
             esc(&tool_call_id),
-            esc(title),
+            esc(&title),
             options_json
         )
     };
@@ -2547,5 +2592,24 @@ fn complete_elicitation(
                 log("elicitation declined/cancelled/failed; question cancelled");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::env_flag_enabled;
+
+    #[test]
+    fn unscoped_read_flag_requires_an_explicit_truthy_value() {
+        for value in ["1", "true", "TRUE", "yes", "on", " on "] {
+            assert!(env_flag_enabled(Some(value)), "{value:?} should opt in");
+        }
+        for value in ["", "0", "false", "no", "off", "anything"] {
+            assert!(
+                !env_flag_enabled(Some(value)),
+                "{value:?} must not weaken confinement"
+            );
+        }
+        assert!(!env_flag_enabled(None));
     }
 }
