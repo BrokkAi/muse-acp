@@ -220,8 +220,11 @@ pub fn is_reasoning_effort(value: &str) -> bool {
     )
 }
 
-/// v2 `configOptions`: mode, model, and reasoning selectors.
+/// `configOptions`: mode, model, and reasoning selectors. ACP v1 calls the
+/// selector key `id`; v2 renamed it to `configId` (the setter still uses
+/// `configId` in both versions).
 pub fn config_options(
+    ver: u8,
     current_mode: &str,
     current_model: &str,
     reasoning_effort: &str,
@@ -231,11 +234,113 @@ pub fn config_options(
     for (id, label, _) in models_json {
         model_opts.push(format!("{{\"value\":{},\"name\":{}}}", esc(id), esc(label)));
     }
+    let id_key = if ver == 1 { "id" } else { "configId" };
     format!(
-        "[{{\"configId\":\"mode\",\"name\":\"Session Mode\",\"description\":\"How the agent handles tool approvals\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"ask\",\"name\":\"Ask\",\"description\":\"Request permission for unmatched tools\"}},{{\"value\":\"auto\",\"name\":\"Auto\",\"description\":\"Allow all tools without asking\"}},{{\"value\":\"deny\",\"name\":\"Deny\",\"description\":\"Deny unmatched tools\"}}]}},{{\"configId\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"configId\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Reasoning effort sent with each prompt and steering message\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]}}]",
+        "[{{\"{id_key}\":\"mode\",\"name\":\"Session Mode\",\"description\":\"How the agent handles tool approvals\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"ask\",\"name\":\"Ask\",\"description\":\"Request permission for unmatched tools\"}},{{\"value\":\"auto\",\"name\":\"Auto\",\"description\":\"Allow all tools without asking\"}},{{\"value\":\"deny\",\"name\":\"Deny\",\"description\":\"Deny unmatched tools\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Reasoning effort sent with each prompt and steering message\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]}}]",
         esc(current_mode),
         esc(current_model),
         model_opts.join(","),
         esc(reasoning_effort)
     )
+}
+
+/// Legacy v1 mode state for clients which predate `configOptions`.
+pub fn session_modes(current_mode: &str) -> String {
+    format!(
+        "{{\"currentModeId\":{},\"availableModes\":[{{\"id\":\"ask\",\"name\":\"Ask\",\"description\":\"Request permission for unmatched tools\"}},{{\"id\":\"auto\",\"name\":\"Auto\",\"description\":\"Allow all tools without asking\"}},{{\"id\":\"deny\",\"name\":\"Deny\",\"description\":\"Deny unmatched tools\"}}]}}",
+        esc(current_mode)
+    )
+}
+
+/// Advertise the Muse skills which are useful from an editor session. Commands
+/// still travel as ordinary prompts; short aliases are normalized to Muse's
+/// stable `/skill <id>` spelling before they reach the host.
+fn available_commands_json(ver: u8) -> String {
+    let input = |hint: &str| {
+        if ver == 1 {
+            format!("{{\"hint\":{}}}", esc(hint))
+        } else {
+            format!("{{\"type\":\"text\",\"hint\":{}}}", esc(hint))
+        }
+    };
+    let commands = [
+        (
+            "skill",
+            "Invoke a Muse skill",
+            Some("skill id and optional prompt"),
+        ),
+        (
+            "plan",
+            "Create a grounded plan and stop for approval",
+            Some("what to plan"),
+        ),
+        (
+            "doctor",
+            "Diagnose a Muse runtime or session issue",
+            Some("symptom or session"),
+        ),
+        (
+            "create-skill",
+            "Create a Muse skill",
+            Some("what the skill should do"),
+        ),
+        (
+            "create-plugin",
+            "Create a Muse plugin",
+            Some("what the plugin should do"),
+        ),
+        (
+            "import",
+            "Import another agent's session",
+            Some("transcript, path, or session id"),
+        ),
+    ];
+    let items = commands
+        .into_iter()
+        .map(|(name, description, hint)| {
+            let input = hint
+                .map(|hint| format!(",\"input\":{}", input(hint)))
+                .unwrap_or_default();
+            format!("{{\"name\":\"{name}\",\"description\":\"{description}\"{input}}}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{items}]")
+}
+
+pub fn send_available_commands(stdout: &StdoutShared, acp_sid: &str, ver: u8) {
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":{}}}}}}}",
+            esc(acp_sid),
+            available_commands_json(ver)
+        ),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn selector_and_command_literals_are_valid_json() {
+        let models = vec![("fake-model".to_string(), "Fake".to_string(), true)];
+        for ver in [1, 2] {
+            let options = config_options(ver, "ask", "fake-model", "medium", &models);
+            let parsed = crate::json::parse_json(&options).expect("config options JSON");
+            let J::Arr(items) = parsed else {
+                panic!("config options must be an array");
+            };
+            assert_eq!(items.len(), 3);
+
+            let commands = available_commands_json(ver);
+            let parsed = crate::json::parse_json(&commands).expect("available commands JSON");
+            let J::Arr(items) = parsed else {
+                panic!("available commands must be an array");
+            };
+            assert_eq!(items.len(), 6);
+        }
+        assert!(crate::json::parse_json(&session_modes("ask")).is_ok());
+    }
 }

@@ -363,6 +363,12 @@ fn approval_preserves_all_choices_with_deny_option() {
     let _pid = c.prompt(&sid, "do it");
     let perm = c.wait_for("request_permission", Duration::from_secs(15));
     assert!(perm.contains(&sid), "permission for our session: {perm}");
+    assert!(
+        perm.contains("\"title\":\"workspace-shell\"")
+            && perm.contains("\"kind\":\"execute\"")
+            && perm.contains("\"status\":\"pending\""),
+        "Zed requires a displayable tool call: {perm}"
+    );
     assert!(perm.contains("c-allow"), "allow choice kept: {perm}");
     assert!(perm.contains("c-deny"), "deny choice kept: {perm}");
     assert!(
@@ -537,6 +543,55 @@ fn host_default_mode_is_reflected() {
 }
 
 #[test]
+fn v1_advertises_config_options_and_slash_commands() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let log = c.frames.lock().unwrap().join("\n");
+    let cfg = log
+        .lines()
+        .find(|l| l.contains("configOptions"))
+        .expect("v1 config options in session/new");
+    assert!(
+        cfg.contains("\"id\":\"mode\"")
+            && cfg.contains("\"id\":\"model\"")
+            && cfg.contains("\"id\":\"reasoning_effort\"")
+            && cfg.contains("\"modes\":{\"currentModeId\":\"ask\""),
+        "v1 selectors use the legacy id field and mode fallback: {cfg}"
+    );
+    assert!(
+        !cfg.contains("\"configId\":\"mode\""),
+        "v1 must not leak the v2 configId field: {cfg}"
+    );
+
+    let commands = log
+        .lines()
+        .find(|l| l.contains("available_commands_update"))
+        .expect("slash commands after session/new");
+    assert!(
+        commands.contains("\"name\":\"plan\"")
+            && commands.contains("\"input\":{\"hint\":\"what to plan\"}")
+            && commands.contains(&format!("\"sessionId\":\"{sid}\"")),
+        "Muse skill commands are advertised: {commands}"
+    );
+
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
+        ),
+    );
+    let set_done = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    assert!(
+        set_done.contains("\"id\":\"mode\"")
+            && set_done.contains("\"id\":\"reasoning_effort\"")
+            && set_done.contains("\"currentValue\":\"high\"")
+            && !set_done.contains("\"configId\":\"mode\""),
+        "v1 setter response uses the v1 selector shape: {set_done}"
+    );
+    c.finish();
+}
+
+#[test]
 fn set_config_option_returns_full_state() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
@@ -549,6 +604,24 @@ fn set_config_option_returns_full_state() {
     assert!(
         done.contains("\"currentValue\":\"ask\""),
         "updated value reflected: {done}"
+    );
+    c.finish();
+}
+
+#[test]
+fn slash_command_aliases_use_the_muse_skill_grammar() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "/plan add dropdowns");
+    c.wait_input(
+        "\"text\": \"/skill plan add dropdowns\"",
+        Duration::from_secs(15),
+    );
+
+    let log = c.frames.lock().unwrap().join("\n");
+    assert!(
+        log.contains("\"text\":\"/plan add dropdowns\""),
+        "the ACP transcript preserves the command the user selected: {log}"
     );
     c.finish();
 }

@@ -433,7 +433,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     );
                     // _meta exposes the host session id: pass it back to
                     // session/resume to reconnect after an adapter restart.
-                    // v2 also advertises mode + model selectors.
+                    // Config selectors are standard in v1 and v2; v1 also gets
+                    // the legacy mode state for older clients.
                     let result = if ver == 2 {
                         let models = catalog(host);
                         format!(
@@ -441,6 +442,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             esc(&sid),
                             esc(&msp_sid),
                             acp::config_options(
+                                ver,
                                 acp::mode_from_msp(&cur_mode),
                                 &cur_model,
                                 "medium",
@@ -449,12 +451,21 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         )
                     } else {
                         format!(
-                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}}}}",
+                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{},\"modes\":{}}}",
                             esc(&sid),
-                            esc(&msp_sid)
+                            esc(&msp_sid),
+                            acp::config_options(
+                                ver,
+                                acp::mode_from_msp(&cur_mode),
+                                &cur_model,
+                                "medium",
+                                &catalog(host),
+                            ),
+                            acp::session_modes(acp::mode_from_msp(&cur_mode))
                         )
                     };
                     acp::send_result(stdout, &id, &result);
+                    acp::send_available_commands(stdout, &sid, ver);
                 }
                 Err(e) => acp::send_error(
                     stdout,
@@ -589,36 +600,40 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .get(&sid)
                         .map(|s| s.msp_sid.clone())
                         .unwrap_or_default();
-                    // v2 resumes also report current selectors; v1 keeps the
-                    // historical shape.
+                    let (mode_v, model_v, reasoning_v) = sessions
+                        .lock()
+                        .unwrap()
+                        .get(&sid)
+                        .map(|s| {
+                            (
+                                s.mode_value.clone(),
+                                s.model_value.clone(),
+                                s.reasoning_effort.clone(),
+                            )
+                        })
+                        .unwrap_or_default();
+                    // Both versions report current selectors; v1 also keeps the
+                    // legacy mode state for clients which predate config options.
                     let result = if ver == 2 {
-                        let (mode_v, model_v, reasoning_v) = sessions
-                            .lock()
-                            .unwrap()
-                            .get(&sid)
-                            .map(|s| {
-                                (
-                                    s.mode_value.clone(),
-                                    s.model_value.clone(),
-                                    s.reasoning_effort.clone(),
-                                )
-                            })
-                            .unwrap_or_default();
                         let models = catalog(host);
                         format!(
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
                             esc(&sid),
                             esc(&msp_out),
-                            acp::config_options(&mode_v, &model_v, &reasoning_v, &models)
+                            acp::config_options(ver, &mode_v, &model_v, &reasoning_v, &models)
                         )
                     } else {
+                        let models = catalog(host);
                         format!(
-                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}}}}",
+                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{},\"modes\":{}}}",
                             esc(&sid),
-                            esc(&msp_out)
+                            esc(&msp_out),
+                            acp::config_options(ver, &mode_v, &model_v, &reasoning_v, &models),
+                            acp::session_modes(&mode_v)
                         )
                     };
                     acp::send_result(stdout, &id, &result);
+                    acp::send_available_commands(stdout, &sid, ver);
                 }
                 Err(e) => acp::send_error(
                     stdout,
@@ -1023,7 +1038,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             }
         }
         "session/set_config_option" => {
-            // v2 config selectors: approval posture, model, and per-turn reasoning.
+            // Config selectors: approval posture, model, and per-turn reasoning.
             let sid = params
                 .as_ref()
                 .and_then(|p| p.get("sessionId"))
@@ -1109,6 +1124,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
                     if let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
+                        let ver = s.ver;
                         match key.as_str() {
                             "mode" => {
                                 let m = folded
@@ -1128,6 +1144,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             &format!(
                                 "{{\"configOptions\":{}}}",
                                 acp::config_options(
+                                    ver,
                                     &s.mode_value,
                                     &s.model_value,
                                     &s.reasoning_effort,
@@ -1386,10 +1403,8 @@ fn extract_prompt_parts(params: Option<&J>, cwd: &str) -> Result<(Vec<String>, S
         if texts.is_empty() {
             return;
         }
-        parts.push(format!(
-            "{{\"type\":\"text\",\"text\":{}}}",
-            esc(&texts.join("\n"))
-        ));
+        let text = normalize_muse_slash_command(&texts.join("\n"));
+        parts.push(format!("{{\"type\":\"text\",\"text\":{}}}", esc(&text)));
         texts.clear();
     };
     for b in &blocks {
@@ -1472,6 +1487,26 @@ fn extract_prompt_parts(params: Option<&J>, cwd: &str) -> Result<(Vec<String>, S
     }
     flush_text(&mut texts, &mut parts);
     Ok((parts, format!("[{}]", content.join(","))))
+}
+
+/// Short editor commands map to Muse's stable skill invocation syntax. The ACP
+/// user-message echo keeps what the client sent; only host input is normalized.
+fn normalize_muse_slash_command(text: &str) -> String {
+    let trimmed = text.trim_start();
+    let mut words = trimmed.splitn(2, char::is_whitespace);
+    let command = words.next().unwrap_or_default();
+    let argument = words.next().unwrap_or_default().trim();
+    match command {
+        "/plan" | "/doctor" | "/create-skill" | "/create-plugin" | "/import" => {
+            let skill = command.trim_start_matches('/');
+            if argument.is_empty() {
+                format!("/skill {skill}")
+            } else {
+                format!("/skill {skill} {argument}")
+            }
+        }
+        _ => text.to_string(),
+    }
 }
 
 /// Decode a `file://` URI to a local path. Rejects hosts, non-file schemes,
@@ -1988,6 +2023,21 @@ fn open_approval(stdout: &StdoutShared, sessions: &Sessions, params: &J) {
         .and_then(|v| v.as_str())
         .unwrap_or("?")
         .to_string();
+    let subject = params.get("subject").cloned().unwrap_or(J::Null);
+    let title = params
+        .get("toolName")
+        .and_then(|v| v.as_str())
+        .or_else(|| subject.get("command").and_then(|v| v.as_str()))
+        .or_else(|| subject.get("path").and_then(|v| v.as_str()))
+        .or_else(|| subject.get("target").and_then(|v| v.as_str()))
+        .or_else(|| subject.get("access").and_then(|v| v.as_str()))
+        .unwrap_or("Muse action");
+    let kind = match subject.get("kind").and_then(|v| v.as_str()) {
+        Some("shell") | Some("process") => "execute",
+        Some("fileAccess") => "read",
+        Some("network") => "fetch",
+        _ => "other",
+    };
     let (options_json, choices) = acp::perm_options(params);
     if choices.is_empty() {
         log(&format!(
@@ -2015,10 +2065,11 @@ fn open_approval(stdout: &StdoutShared, sessions: &Sessions, params: &J) {
     acp::send_raw(
         stdout,
         &format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session/request_permission\",\"params\":{{\"sessionId\":{},\"toolCall\":{{\"toolCallId\":{}}},\"options\":{}}}}}",
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session/request_permission\",\"params\":{{\"sessionId\":{},\"toolCall\":{{\"toolCallId\":{},\"title\":{},\"kind\":\"{kind}\",\"status\":\"pending\"}},\"options\":{}}}}}",
             j_to_string(&req_id),
             esc(&acp_sid),
             esc(&tool_call_id),
+            esc(title),
             options_json
         ),
     );
