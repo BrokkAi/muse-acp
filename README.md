@@ -1,66 +1,70 @@
-# muse-acp
+# muse-acp (serve-backed)
 
-Minimal ACP (Agent Client Protocol v1) adapter bridging stdio JSON-RPC to the
-local `muse-code` CLI. Std-only Rust, no third-party deps.
+ACP server (v2 primary, v1 fallback) for Muse, backed by one `muse serve`
+host over the Muse Session Protocol (MSP). Std-only Rust, no dependencies.
 
 ## How it works
 
-- Transport: JSON-RPC 2.0 over stdio, NDJSON (one object per `\n` line).
-  Client spawns this binary, writes stdin, reads stdout. stderr is logs only.
-- `initialize` → advertises text-only prompt caps
-  (`loadSession: false`, no auth).
-- `session/new {cwd}` → allocates `sessionId`, stores `cwd`.
-  `mcpServers` is accepted and ignored (unsupported).
-- `session/prompt {sessionId, prompt: ContentBlock[]}` → concats
-  `{type:"text"}` blocks, spawns `muse exec <extra-args> <prompt>` with `current_dir=cwd`
-  (non-interactive, stdin closed), streams each stdout chunk as
-  `session/update {sessionUpdate:"agent_message_chunk"}` and replies
-  `{stopReason:"end_turn"}` (nonzero exit → `-32603`; cancelled → `"cancelled"`).
-- `session/cancel {sessionId}` (notification) → flags cancel + kills the child.
-- `authenticate | session/load | session/set_mode | session/set_model | logout`
-  → `-32601` not supported.
+One `muse serve` child serves all ACP sessions. `session/start`
+auto-subscribes us to the session view, so turns stream in as `item/*` and
+`turn/*` notifications, folded into ACP `session/update`s:
+
+| MSP | ACP |
+| --- | --- |
+| `item/delta` (message text) | `agent_message_chunk` (v2 carries `messageId`) |
+| toolCall `item/started\|updated\|completed` | `tool_call` (v1 create) / `tool_call_update` upsert with kind/title/status/content/rawInput |
+| `turn/completed` | v1 `session/prompt` response `{stopReason}`; v2 `state_update` idle + `stopReason` |
+| `turn/cancel` | `session/cancel` (waits for the terminal event; `already_terminal` = success) |
+| `approval/requested` + `approval/request` | `session/request_permission` → `approval/decide` (deny-safe fallback) |
+| `session/resume` + history | `session/resume` (+ `replayFrom: {type:start}` replays messages) |
+| `sessionDurability` (default durable) | continuity across turns; cross-restart resume via `_meta.mspSessionId` |
+| `turn/start` `ifBusy` (queue default) | concurrent prompts per session; each completes its own response; `session/cancel` stops all of them |
+| `TurnInputPart` image | image blocks (inline base64 or local `file://` path); advertised in caps |
+| `userInput/requested` | `elicitation/create` form bridge (needs client `elicitation.form` caps), else auto-cancel |
+| `session/setApprovalMode` | v2 `configOptions` mode selector (`ask`/`auto`/`deny`) + `session/set_config_option`; v1 `session/set_mode` |
+| `model/list` + `session/setModel` | v2 `configOptions` model selector + `session/set_config_option`; v1 `session/set_model` |
 
 ## Run
 
 ```sh
-cargo run --quiet
-# or
-cargo build --release
-./target/release/muse-acp
+cargo build
+./target/debug/muse-acp
 ```
 
-Custom CLI binary / flags:
+Env:
 
 ```sh
-MUSE_CLI=muse MUSE_CLI_EXTRA_ARGS="--model foo" cargo run --quiet
+MUSE_CLI=muse                      # host binary (default: muse)
+MUSE_SERVE_ARGS="--trust-workspace" # host-lifetime flags (see `muse serve --help`)
+MUSE_APPROVAL_MODE=promptUnmatched  # allowAll|promptUnmatched|onRequest|denyUnmatched
 ```
 
-Default spawn is `muse exec <extra-args> <prompt…>` in `session/new`'s `cwd`
-(non-interactive headless mode; extra args from `MUSE_CLI_EXTRA_ARGS`,
-e.g. `--provider echo`, are inserted before the prompt).
+`session/new {cwd}` starts a host session in `cwd`. Approval posture defaults
+to the host default; set `MUSE_APPROVAL_MODE=promptUnmatched` to force every
+unmatched tool call through `session/request_permission`.
 
-## Minimal session (NDJSON on stdin)
+## Protocol notes
 
-```json
-{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1,"clientCapabilities":{},"clientInfo":{"name":"x","version":"0"}}}
-{"jsonrpc":"2.0","id":2,"method":"session/new","params":{"cwd":"/tmp"}}
-{"jsonrpc":"2.0","id":3,"method":"session/prompt","params":{"sessionId":"<id-from-2>","prompt":[{"type":"text","text":"hello"}]}}
+- v2 `session/prompt` replies `{}` on accept; completion is the terminal
+  `state_update`. v1 replies `{stopReason}`.
+- Concurrent prompts queue host-side; every turn completes its own response.
+- Images in, audio out: the host input type is closed (`text|image`), so audio
+  blocks are rejected with the reason. Auth has no host surface
+  (`authMethods: []` is the honest answer); muse credentials live outside ACP.
+- `session/list` reports adapter-owned sessions.
+- Authority for MSP shapes is the schema the host ships
+  (`muse schema generate-json-schema`); the docs site may describe a newer
+  host — a fingerprint mismatch is logged, not fatal.
+
+## Verify
+
+```sh
+cargo build
+./target/debug/muse-acp --selftest  # static wire literals parse
+python3 /tmp/acp2_tool.py     # v2 tool turn
+python3 /tmp/acp2_perm.py     # approval deny -> turn continues
+python3 /tmp/acp2_misc.py cancel|resume|v1
+python3 /tmp/acp2_conc.py     # concurrent turns, both idle
+python3 /tmp/acp2_focus.py    # image color, deny mode
+python3 /tmp/acp2_ui2.py      # elicitation bridge -> answered file
 ```
-
-Cancel:
-
-```json
-{"jsonrpc":"2.0","method":"session/cancel","params":{"sessionId":"<id-from-2>"}}
-```
-
-## Layout
-
-- `src/main.rs` — stdio loop, dispatch, muse runner, minimal JSON parser.
-- `Cargo.toml` — package `muse-acp`, edition 2024, no dependencies.
-
-## Limits
-
-- Text prompts only; image/audio/resource blocks are skipped.
-- One prompt worker per session thread; responses may interleave across sessions.
-- Build not verified in this sandbox (`bwrap` blocks `cargo`/proc spawn here);
-  run `cargo build` locally to confirm.
