@@ -82,8 +82,9 @@ def turn_id():
     return f"turn-{TURNS[0]}"
 
 
-def session_obj():
-    return {"sessionId": MSP_SID, "modelId": "fake-model",
+def session_obj(session_id=MSP_SID, workspace_root="/tmp/fake-ws"):
+    return {"sessionId": session_id, "modelId": "fake-model",
+            "workspaceRoot": workspace_root,
             "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
             "approvalMode": {"lastCommandId": None, "mode": MODE,
                              "source": "serverDefault"}}
@@ -162,10 +163,19 @@ def result_for(method, msg):
     if method == "session/start":
         return {"session": session_obj(), "viewCursor": "cur-0"}
     if method == "session/resume":
-        return {"session": session_obj(), "viewCursor": "cur-9",
+        params = msg.get("params", {})
+        log_input(params)
+        return {"session": session_obj(params.get("sessionId", MSP_SID)),
+                "viewCursor": "cur-9",
                 "pendingRequests": [],
                 "history": {"mode": "inline", "items": history_items(),
                             "snapshot": None}}
+    if method == "session/list":
+        live = session_obj()
+        old = session_obj("msp-sess-old", "/tmp/old-ws")
+        old["updatedAt"] = "2026-08-01T00:00:00Z"
+        live["updatedAt"] = "2026-09-04T00:00:00Z"
+        return {"sessions": [live, old], "nextCursor": None}
     if method == "session/setApprovalMode":
         return {"commandId": "x", "status": "ok", "applyOutcome": "applied",
                 "effectiveMode": {"lastCommandId": "x", "mode": MODE,

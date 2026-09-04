@@ -582,6 +582,82 @@ fn session_resume_without_cwd_reconnects() {
 }
 
 #[test]
+fn session_ids_survive_adapter_restart_and_import() {
+    // A new adapter has no in-memory ACP -> MSP map. session/list must expose
+    // the durable host id, and session/load must pass that same id to Muse.
+    let mut c = Client::spawn("load", &[]);
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+
+    let list_id = c.req("session/list", "{}");
+    let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
+    assert!(
+        listed.contains("\"sessionId\":\"msp-sess-old\""),
+        "{listed}"
+    );
+    assert!(listed.contains("\"cwd\":\"/tmp/old-ws\""), "{listed}");
+    assert!(!listed.contains("\"sessionId\":\"sess-"), "{listed}");
+
+    let load_id = c.req("session/load", "{\"sessionId\":\"msp-sess-old\"}");
+    let loaded = c.wait_for(&format!("\"id\":{load_id}"), Duration::from_secs(15));
+    assert!(loaded.contains("\"result\""), "load failed: {loaded}");
+    c.wait_input("\"sessionId\": \"msp-sess-old\"", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn new_session_returns_the_durable_host_id() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    assert_eq!(sid, "msp-sess-1");
+    c.finish();
+}
+
+#[test]
+fn legacy_session_id_uses_preserved_host_metadata() {
+    let mut c = Client::spawn("load", &[]);
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let load_id = c.req(
+        "session/load",
+        "{\"sessionId\":\"sess-legacy\",\"_meta\":{\"mspSessionId\":\"msp-sess-old\"}}",
+    );
+    let loaded = c.wait_for(&format!("\"id\":{load_id}"), Duration::from_secs(15));
+    assert!(loaded.contains("\"result\""), "load failed: {loaded}");
+    c.wait_input("\"sessionId\": \"msp-sess-old\"", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn session_load_rejects_invalid_or_unsupported_roots() {
+    let mut c = Client::spawn("load", &[]);
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+
+    for params in [
+        "{\"sessionId\":\"msp-sess-old\",\"cwd\":\"\"}",
+        "{\"sessionId\":\"msp-sess-old\",\"cwd\":\"relative\"}",
+        "{\"sessionId\":\"msp-sess-old\",\"cwd\":7}",
+        "{\"sessionId\":\"msp-sess-old\",\"mcpServers\":[{\"name\":\"x\"}]}",
+        "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":[\"/var/tmp\"]}",
+    ] {
+        let id = c.req("session/load", params);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"error\""), "request must fail: {frame}");
+    }
+
+    let seen = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+    assert!(
+        !seen.lines().any(|line| line == "session/resume"),
+        "invalid requests must not reach the host: {seen}"
+    );
+    c.finish();
+}
+
+#[test]
 fn host_default_mode_is_reflected() {
     let mut c = Client::spawn("quiet", &[("FAKE_MODE", "allowAll")]);
     let _sid = c.new_session(2, "");

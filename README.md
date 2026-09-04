@@ -70,7 +70,7 @@ destination or pin a version by setting an environment variable on `sh`:
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/BrokkAi/muse-acp/releases/latest/download/install.sh \
-  | MUSE_ACP_INSTALL_DIR="$HOME/bin" MUSE_ACP_VERSION=v0.2.0 sh
+  | MUSE_ACP_INSTALL_DIR="$HOME/bin" MUSE_ACP_VERSION=v0.2.1 sh
 ```
 
 Linux release binaries require glibc. On Windows, or for a manual install,
@@ -106,7 +106,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `turn/cancel` | `session/cancel` (waits for the terminal event; `already_terminal` = success) |
 | `approval/requested` + `approval/request` | `session/request_permission` → `approval/decide` (deny-safe fallback) |
 | `session/resume` + history | `session/resume` (+ `replayFrom: {type:start}` replays messages) |
-| `sessionDurability` (default durable) | continuity across turns; cross-restart resume via `_meta.mspSessionId` |
+| `sessionDurability` (default durable) | continuity across turns; Muse's durable session ID is used directly by ACP |
 | `turn/start` `ifBusy` (queue default) | concurrent prompts per session; each completes its own response; `session/cancel` stops all of them |
 | `TurnInputPart` image | image blocks (inline base64 or local `file://` path); advertised in caps |
 | `userInput/requested` | `elicitation/create` form bridge (needs client `elicitation.form` caps), else auto-cancel |
@@ -244,7 +244,8 @@ muse-acp uninstall
 - Images in, audio out: the host input type is closed (`text|image`), so audio
   blocks are rejected with the reason. Auth has no host surface
   (`authMethods: []` is the honest answer); muse credentials live outside ACP.
-- `session/list` reports adapter-owned sessions.
+- `session/list` reports durable Muse sessions, including sessions created
+  outside the current adapter process, so Zed can import and restore them.
 - Authority for MSP shapes is the schema the host ships
   (`muse schema generate-json-schema`); the docs site may describe a newer
   host — a fingerprint mismatch is logged, not fatal.

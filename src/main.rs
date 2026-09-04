@@ -82,8 +82,8 @@ enum LoopMsg {
     Msp(MspEvent),
 }
 
-const V2_INIT: &str = r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}}}},"info":{"name":"muse-acp","title":"Muse ACP","version":"0.2.0"},"authMethods":[],"_meta":{"steering":{"supported":true}}}"#;
-const V1_INIT: &str = r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":"0.2.0"}}"#;
+const V2_INIT: &str = r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}}}},"info":{"name":"muse-acp","title":"Muse ACP","version":"0.2.1"},"authMethods":[],"_meta":{"steering":{"supported":true}}}"#;
+const V1_INIT: &str = r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":"0.2.1"}}"#;
 
 fn has_nonempty_array(params: Option<&J>, key: &str) -> bool {
     matches!(
@@ -395,7 +395,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             (None, _) => {}
                         }
                     }
-                    let sid = mint_id("sess-", &ID_COUNTER);
+                    // ACP session ids outlive this adapter process (Zed stores
+                    // them for thread restore/import). Use the host's durable
+                    // id directly; an adapter-local `sess-*` id loses its
+                    // mapping on restart and is then invalid to `muse serve`.
+                    let sid = msp_sid.clone();
                     let cur_mode = applied_mode;
                     let cur_model = r
                         .get("session")
@@ -479,14 +483,26 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             let ver = negotiated_ver();
             // `cwd` is required for `session/new` but optional when
             // resuming/loading: only validate it when one is provided.
-            if let Some(cwd) = params
-                .as_ref()
-                .and_then(|p| p.get("cwd"))
-                .and_then(|v| v.as_str())
-                && !cwd.is_empty()
-                && !Path::new(cwd).is_absolute()
-            {
-                acp::send_error(stdout, &id, -32602, "params.cwd must be an absolute path");
+            if let Some(cwd) = params.as_ref().and_then(|p| p.get("cwd")) {
+                let valid = cwd
+                    .as_str()
+                    .is_some_and(|cwd| !cwd.is_empty() && Path::new(cwd).is_absolute());
+                if !valid {
+                    acp::send_error(stdout, &id, -32602, "params.cwd must be an absolute path");
+                    return;
+                }
+            }
+            if has_nonempty_array(params.as_ref(), "mcpServers") {
+                acp::send_error(stdout, &id, -32602, "MCP servers are not supported");
+                return;
+            }
+            if has_nonempty_array(params.as_ref(), "additionalDirectories") {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    "additional directories are not supported",
+                );
                 return;
             }
             let resume_cwd = params
@@ -510,13 +526,23 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 );
                 return;
             }
-            // Known ACP session: re-attach. Unknown id: try it as a host
-            // session id directly (cross-restart resume), then adopt it.
+            // Known ACP session: re-attach. New versions expose the durable
+            // host id as the ACP id, so an unknown id can be used directly
+            // after restart. `_meta.mspSessionId` recovers older `sess-*`
+            // ids when a client preserved our metadata.
+            let meta_msp_sid = params
+                .as_ref()
+                .and_then(|p| p.get("_meta"))
+                .and_then(|m| m.get("mspSessionId"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             let msp_sid = sessions
                 .lock()
                 .unwrap()
                 .get(&sid)
                 .map(|s| s.msp_sid.clone())
+                .or(meta_msp_sid)
                 .unwrap_or_else(|| sid.clone());
             let cmd = host.mint_cmd("cmd-");
             // Ask for inline history explicitly; the host may still downgrade
@@ -558,6 +584,15 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let restored_cwd = if resume_cwd.is_empty() {
+                        r.get("session")
+                            .and_then(|s| s.get("workspaceRoot"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        resume_cwd.clone()
+                    };
                     // v1 session/load always replays; v2 resumes replay only
                     // with replayFrom; v1 session/resume reconnects silently.
                     let replay = method == "session/load"
@@ -569,7 +604,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         let entry = map.entry(sid.clone()).or_insert_with(|| AcpSession {
                             acp_sid: sid.clone(),
                             msp_sid: real_msp.clone(),
-                            cwd: resume_cwd.clone(),
+                            cwd: restored_cwd.clone(),
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
@@ -583,8 +618,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         });
                         entry.msp_sid = real_msp;
                         entry.ver = ver;
-                        if !resume_cwd.is_empty() {
-                            entry.cwd = resume_cwd;
+                        if !restored_cwd.is_empty() {
+                            entry.cwd = restored_cwd;
                         }
                         if !real_model.is_empty() {
                             entry.model_value = real_model;
@@ -1021,29 +1056,77 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             // them Cancelled itself as part of cancellation.
         }
         "session/list" => {
+            // Sessions are durable in the host: list them there so existing
+            // threads are visible to plain clients. Always publish the host
+            // id, including for adapter-live sessions, because clients persist
+            // this value and may load it through a fresh adapter process.
+            let filter_root = params
+                .as_ref()
+                .and_then(|p| p.get("cwd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
             let cmd = host.mint_cmd("cmd-");
-            match host.command("session/list", &format!("{{\"commandId\":{}}}", esc(&cmd))) {
+            let mut host_params = format!("{{\"commandId\":{},\"limit\":200", esc(&cmd));
+            if !filter_root.is_empty() {
+                host_params.push_str(&format!(",\"workspaceRoot\":{}", esc(&filter_root)));
+            }
+            host_params.push('}');
+            // Snapshot adapter state without holding the lock across the host call.
+            let owned: Vec<(String, String)> = sessions
+                .lock()
+                .unwrap()
+                .values()
+                .map(|s| (s.msp_sid.clone(), s.cwd.clone()))
+                .collect();
+            match host.command("session/list", &host_params) {
                 Ok(r) => {
-                    // Report the sessions this adapter owns.
-                    let map = sessions.lock().unwrap();
-                    let ids: Vec<String> = map
-                        .keys()
-                        .map(|k| format!("{{\"sessionId\":{}}}", esc(k)))
+                    let owned_msp: std::collections::HashSet<&str> =
+                        owned.iter().map(|(m, _)| m.as_str()).collect();
+                    let mut entries: Vec<String> = owned
+                        .iter()
+                        .map(|(m, c)| format!("{{\"sessionId\":{},\"cwd\":{}}}", esc(m), esc(c)))
                         .collect();
-                    drop(map);
-                    let _ = r;
+                    if let Some(J::Arr(items)) = r.get("sessions") {
+                        for item in items {
+                            let msp_id =
+                                item.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+                            if msp_id.is_empty() || owned_msp.contains(msp_id) {
+                                continue; // already listed under its ACP id
+                            }
+                            let cwd = item
+                                .get("workspaceRoot")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let mut parts = vec![
+                                format!("\"sessionId\":{}", esc(msp_id)),
+                                format!("\"cwd\":{}", esc(cwd)),
+                            ];
+                            if let Some(updated) = item.get("updatedAt").and_then(|v| v.as_str()) {
+                                parts.push(format!("\"updatedAt\":{}", esc(updated)));
+                            }
+                            entries.push(format!("{{{}}}", parts.join(",")));
+                        }
+                    }
                     acp::send_result(
                         stdout,
                         &id,
-                        &format!("{{\"sessions\":[{}]}}", ids.join(",")),
+                        &format!("{{\"sessions\":[{}]}}", entries.join(",")),
                     );
                 }
-                Err(e) => acp::send_error(
-                    stdout,
-                    &id,
-                    -32603,
-                    &format!("session/list failed: {}", err_message(&e)),
-                ),
+                Err(e) => {
+                    // A host listing hiccup must not hide live sessions.
+                    log(&format!("session/list failed: {}", err_message(&e)));
+                    let entries: Vec<String> = owned
+                        .iter()
+                        .map(|(m, c)| format!("{{\"sessionId\":{},\"cwd\":{}}}", esc(m), esc(c)))
+                        .collect();
+                    acp::send_result(
+                        stdout,
+                        &id,
+                        &format!("{{\"sessions\":[{}]}}", entries.join(",")),
+                    );
+                }
             }
         }
         "session/set_config_option" => {
