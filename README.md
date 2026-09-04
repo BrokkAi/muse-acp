@@ -39,6 +39,43 @@ Default spawn is `muse exec <extra-args> <prompt…>` in `session/new`'s `cwd`
 (non-interactive headless mode; extra args from `MUSE_CLI_EXTRA_ARGS`,
 e.g. `--provider echo`, are inserted before the prompt).
 
+## Install into Zed
+
+```sh
+cargo install --path .   # puts `muse-acp` on PATH
+muse-acp install
+```
+
+This registers `muse-acp` in `~/.config/zed/settings.json` as a custom agent
+server (resolved via `PATH`, so no binary copying involved):
+
+```json
+{
+  "agent_servers": {
+    "muse-acp": {
+      "type": "custom",
+      "command": "muse-acp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
+```
+
+Then restart Zed (or reload settings) and pick `muse-acp` in the Agent panel.
+The edit is surgical: comments, formatting, and all other keys in
+`settings.json` are preserved (a `.bak` backup is written first). Re-running
+`install` is idempotent.
+
+Options:
+
+```sh
+muse-acp install --command /path/to/muse-acp  # pin an absolute path instead
+muse-acp install --env MUSE_CLI=muse --env FOO=bar
+muse-acp install --settings /path/to/settings.json --dry-run
+muse-acp uninstall                             # remove the entry again
+```
+
 ## Minimal session (NDJSON on stdin)
 
 ```json
