@@ -564,6 +564,24 @@ fn session_load_replays_history() {
 }
 
 #[test]
+fn session_resume_without_cwd_reconnects() {
+    // Real clients load existing threads with just a sessionId (no cwd);
+    // that must not be rejected as "params.cwd must be an absolute path".
+    let mut c = Client::spawn("load", &[]);
+    let sid = c.new_session(1, "");
+    let lid = c.req("session/load", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let load = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+    assert!(load.contains("\"result\""), "load without cwd ok: {load}");
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(
+        resumed.contains("\"result\""),
+        "resume without cwd ok: {resumed}"
+    );
+    c.finish();
+}
+
+#[test]
 fn host_default_mode_is_reflected() {
     let mut c = Client::spawn("quiet", &[("FAKE_MODE", "allowAll")]);
     let _sid = c.new_session(2, "");

@@ -477,7 +477,16 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
         }
         "session/resume" | "session/load" => {
             let ver = negotiated_ver();
-            if !validate_session_roots(stdout, &id, params.as_ref()) {
+            // `cwd` is required for `session/new` but optional when
+            // resuming/loading: only validate it when one is provided.
+            if let Some(cwd) = params
+                .as_ref()
+                .and_then(|p| p.get("cwd"))
+                .and_then(|v| v.as_str())
+                && !cwd.is_empty()
+                && !Path::new(cwd).is_absolute()
+            {
+                acp::send_error(stdout, &id, -32602, "params.cwd must be an absolute path");
                 return;
             }
             let resume_cwd = params
