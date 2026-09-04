@@ -85,7 +85,7 @@ impl MspHost {
         let res = host
             .command(
                 "initialize",
-                r#"{"clientInfo":{"name":"muse_acp","version":"0.2.1"}}"#,
+                r#"{"clientInfo":{"name":"muse_acp","version":"0.2.2"}}"#,
             )
             .map_err(|e| format!("serve initialize failed: {}", err_message(&e)))?;
         let fp = res

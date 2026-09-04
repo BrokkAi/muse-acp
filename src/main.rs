@@ -82,14 +82,20 @@ enum LoopMsg {
     Msp(MspEvent),
 }
 
-const V2_INIT: &str = r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}}}},"info":{"name":"muse-acp","title":"Muse ACP","version":"0.2.1"},"authMethods":[],"_meta":{"steering":{"supported":true}}}"#;
-const V1_INIT: &str = r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":"0.2.1"}}"#;
+const V2_INIT: &str = r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}}}},"info":{"name":"muse-acp","title":"Muse ACP","version":"0.2.2"},"authMethods":[],"_meta":{"steering":{"supported":true}}}"#;
+const V1_INIT: &str = r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":"0.2.2"}}"#;
 
 fn has_nonempty_array(params: Option<&J>, key: &str) -> bool {
     matches!(
         params.and_then(|p| p.get(key)),
         Some(J::Arr(values)) if !values.is_empty()
     )
+}
+
+fn ignore_client_mcp_servers(params: Option<&J>) {
+    if has_nonempty_array(params, "mcpServers") {
+        log("ignoring client-provided MCP servers (not supported by the Muse host)");
+    }
 }
 
 fn validate_session_roots(stdout: &StdoutShared, id: &Option<J>, params: Option<&J>) -> bool {
@@ -107,9 +113,7 @@ fn validate_session_roots(stdout: &StdoutShared, id: &Option<J>, params: Option<
     // Muse owns its tool runtime, so these client-provided servers cannot be
     // forwarded today; tolerate and ignore them instead of aborting the whole
     // session before its config options can be returned.
-    if has_nonempty_array(params, "mcpServers") {
-        log("ignoring client-provided MCP servers (not supported by the Muse host)");
-    }
+    ignore_client_mcp_servers(params);
     if has_nonempty_array(params, "additionalDirectories") {
         acp::send_error(
             stdout,
@@ -497,10 +501,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     return;
                 }
             }
-            if has_nonempty_array(params.as_ref(), "mcpServers") {
-                acp::send_error(stdout, &id, -32602, "MCP servers are not supported");
-                return;
-            }
+            ignore_client_mcp_servers(params.as_ref());
             if has_nonempty_array(params.as_ref(), "additionalDirectories") {
                 acp::send_error(
                     stdout,

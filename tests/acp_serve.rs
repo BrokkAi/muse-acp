@@ -631,7 +631,7 @@ fn legacy_session_id_uses_preserved_host_metadata() {
 }
 
 #[test]
-fn session_load_rejects_invalid_or_unsupported_roots() {
+fn session_load_rejects_invalid_roots_and_tolerates_mcp() {
     let mut c = Client::spawn("load", &[]);
     let init = c.req("initialize", "{\"protocolVersion\":1}");
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
@@ -641,7 +641,6 @@ fn session_load_rejects_invalid_or_unsupported_roots() {
         "{\"sessionId\":\"msp-sess-old\",\"cwd\":\"\"}",
         "{\"sessionId\":\"msp-sess-old\",\"cwd\":\"relative\"}",
         "{\"sessionId\":\"msp-sess-old\",\"cwd\":7}",
-        "{\"sessionId\":\"msp-sess-old\",\"mcpServers\":[{\"name\":\"x\"}]}",
         "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":[\"/var/tmp\"]}",
     ] {
         let id = c.req("session/load", params);
@@ -654,6 +653,14 @@ fn session_load_rejects_invalid_or_unsupported_roots() {
         !seen.lines().any(|line| line == "session/resume"),
         "invalid requests must not reach the host: {seen}"
     );
+
+    let id = c.req(
+        "session/load",
+        "{\"sessionId\":\"msp-sess-old\",\"mcpServers\":[{\"name\":\"intellij\",\"command\":\"idea\",\"args\":[\"stdioMcpServer\"]}]}",
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "load failed: {frame}");
+    c.wait_log("session/resume", Duration::from_secs(15));
     c.finish();
 }
 

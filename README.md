@@ -70,7 +70,7 @@ destination or pin a version by setting an environment variable on `sh`:
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/BrokkAi/muse-acp/releases/latest/download/install.sh \
-  | MUSE_ACP_INSTALL_DIR="$HOME/bin" MUSE_ACP_VERSION=v0.2.1 sh
+  | MUSE_ACP_INSTALL_DIR="$HOME/bin" MUSE_ACP_VERSION=v0.2.2 sh
 ```
 
 Linux release binaries require glibc. On Windows, or for a manual install,
