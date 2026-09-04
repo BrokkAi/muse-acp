@@ -51,6 +51,9 @@ pub struct AcpSession {
     pub pending_ui: Vec<PendingUi>,
     pub mode_value: String,
     pub model_value: String,
+    pub reasoning_effort: String,
+    /// The foreground MSP turn, excluding queued turns.
+    pub active_turn: Option<String>,
     pub view_cursor: String,
     pub fold: SessionFold,
 }
@@ -210,10 +213,18 @@ pub fn resolve_mode(value: &str) -> Option<&'static str> {
     }
 }
 
-/// v2 `configOptions`: mode + model selectors with explicit current values.
+pub fn is_reasoning_effort(value: &str) -> bool {
+    matches!(
+        value,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "ultra"
+    )
+}
+
+/// v2 `configOptions`: mode, model, and reasoning selectors.
 pub fn config_options(
     current_mode: &str,
     current_model: &str,
+    reasoning_effort: &str,
     models_json: &[(String, String, bool)],
 ) -> String {
     let mut model_opts = Vec::new();
@@ -221,9 +232,10 @@ pub fn config_options(
         model_opts.push(format!("{{\"value\":{},\"name\":{}}}", esc(id), esc(label)));
     }
     format!(
-        "[{{\"configId\":\"mode\",\"name\":\"Session Mode\",\"description\":\"How the agent handles tool approvals\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"ask\",\"name\":\"Ask\",\"description\":\"Request permission for unmatched tools\"}},{{\"value\":\"auto\",\"name\":\"Auto\",\"description\":\"Allow all tools without asking\"}},{{\"value\":\"deny\",\"name\":\"Deny\",\"description\":\"Deny unmatched tools\"}}]}},{{\"configId\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}}]",
+        "[{{\"configId\":\"mode\",\"name\":\"Session Mode\",\"description\":\"How the agent handles tool approvals\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"ask\",\"name\":\"Ask\",\"description\":\"Request permission for unmatched tools\"}},{{\"value\":\"auto\",\"name\":\"Auto\",\"description\":\"Allow all tools without asking\"}},{{\"value\":\"deny\",\"name\":\"Deny\",\"description\":\"Deny unmatched tools\"}}]}},{{\"configId\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"configId\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Reasoning effort sent with each prompt and steering message\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]}}]",
         esc(current_mode),
         esc(current_model),
-        model_opts.join(",")
+        model_opts.join(","),
+        esc(reasoning_effort)
     )
 }

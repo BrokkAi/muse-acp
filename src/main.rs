@@ -81,7 +81,7 @@ enum LoopMsg {
     Msp(MspEvent),
 }
 
-const V2_INIT: &str = r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}}}},"info":{"name":"muse-acp","title":"Muse ACP","version":"0.2.0"},"authMethods":[]}"#;
+const V2_INIT: &str = r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}}}},"info":{"name":"muse-acp","title":"Muse ACP","version":"0.2.0"},"authMethods":[],"_meta":{"steering":{"supported":true}}}"#;
 const V1_INIT: &str = r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":"0.2.0"}}"#;
 
 fn has_nonempty_array(params: Option<&J>, key: &str) -> bool {
@@ -222,6 +222,43 @@ fn negotiated_ver() -> u8 {
     match VER.load(Ordering::SeqCst) {
         2 => 2,
         _ => 1,
+    }
+}
+
+fn send_v2_user_message(stdout: &StdoutShared, sid: &str, content: &str) {
+    let msg_id = mint_id("msg-", &ID_COUNTER);
+    acp::send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"user_message\",\"messageId\":{},\"content\":{}}}}}}}",
+            esc(sid),
+            esc(&msg_id),
+            content
+        ),
+    );
+}
+
+fn steering_prompt_required(params: Option<&J>) -> Result<bool, String> {
+    let Some(meta) = params.and_then(|p| p.get("_meta")) else {
+        return Ok(false);
+    };
+    if matches!(meta, J::Null) {
+        return Ok(false);
+    }
+    if !matches!(meta, J::Obj(_)) {
+        return Err("steering _meta must be an object".to_string());
+    }
+    let Some(steering) = meta.get("steering") else {
+        return Ok(false);
+    };
+    if !matches!(steering, J::Obj(_)) {
+        return Err("steering _meta.steering must be an object".to_string());
+    }
+    match steering.get("idleBehavior") {
+        None | Some(J::Null) => Ok(false),
+        Some(J::Str(value)) if value == "promptRequired" => Ok(true),
+        Some(J::Str(_)) => Err("unsupported steering idleBehavior".to_string()),
+        Some(_) => Err("steering idleBehavior must be a string".to_string()),
     }
 }
 
@@ -366,6 +403,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let active_turn = r
+                        .get("session")
+                        .and_then(|s| s.get("activeTurnId"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
                     sessions.lock().unwrap().insert(
                         sid.clone(),
                         AcpSession {
@@ -378,6 +420,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             pending_ui: Vec::new(),
                             mode_value: acp::mode_from_msp(&cur_mode).to_string(),
                             model_value: cur_model.clone(),
+                            reasoning_effort: "medium".to_string(),
+                            active_turn,
                             view_cursor: cur_cursor.clone(),
                             fold: SessionFold::new(),
                         },
@@ -391,7 +435,12 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
                             esc(&sid),
                             esc(&msp_sid),
-                            acp::config_options(acp::mode_from_msp(&cur_mode), &cur_model, &models)
+                            acp::config_options(
+                                acp::mode_from_msp(&cur_mode),
+                                &cur_model,
+                                "medium",
+                                &models,
+                            )
                         )
                     } else {
                         format!(
@@ -502,6 +551,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             pending_ui: Vec::new(),
                             mode_value: "ask".to_string(),
                             model_value: String::new(),
+                            reasoning_effort: "medium".to_string(),
+                            active_turn: None,
                             view_cursor: String::new(),
                             fold: SessionFold::new(),
                         });
@@ -513,6 +564,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         if !real_model.is_empty() {
                             entry.model_value = real_model;
                         }
+                        entry.active_turn = r
+                            .get("session")
+                            .and_then(|s| s.get("activeTurnId"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
                         // Refresh the mode selector from the folded host
                         // mode so resumed clients are not stuck stale.
                         if let Some(m) = host_mode(&r) {
@@ -531,18 +587,24 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     // v2 resumes also report current selectors; v1 keeps the
                     // historical shape.
                     let result = if ver == 2 {
-                        let (mode_v, model_v) = sessions
+                        let (mode_v, model_v, reasoning_v) = sessions
                             .lock()
                             .unwrap()
                             .get(&sid)
-                            .map(|s| (s.mode_value.clone(), s.model_value.clone()))
+                            .map(|s| {
+                                (
+                                    s.mode_value.clone(),
+                                    s.model_value.clone(),
+                                    s.reasoning_effort.clone(),
+                                )
+                            })
                             .unwrap_or_default();
                         let models = catalog(host);
                         format!(
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
                             esc(&sid),
                             esc(&msp_out),
-                            acp::config_options(&mode_v, &model_v, &models)
+                            acp::config_options(&mode_v, &model_v, &reasoning_v, &models)
                         )
                     } else {
                         format!(
@@ -569,8 +631,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let (msp_sid, cwd) = match sessions.lock().unwrap().get(&sid) {
-                Some(s) => (s.msp_sid.clone(), s.cwd.clone()),
+            let (msp_sid, cwd, reasoning_effort) = match sessions.lock().unwrap().get(&sid) {
+                Some(s) => (s.msp_sid.clone(), s.cwd.clone(), s.reasoning_effort.clone()),
                 None => {
                     acp::send_error(stdout, &id, -32602, "unknown sessionId");
                     return;
@@ -595,10 +657,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             match host.command(
                 "turn/start",
                 &format!(
-                    "{{\"commandId\":{},\"sessionId\":{},\"input\":{}}}",
+                    "{{\"commandId\":{},\"sessionId\":{},\"input\":{},\"reasoningEffort\":{}}}",
                     esc(&cmd),
                     esc(&msp_sid),
-                    input
+                    input,
+                    esc(&reasoning_effort)
                 ),
             ) {
                 Ok(r) => {
@@ -607,26 +670,28 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    if turn.is_empty() {
+                        acp::send_error(stdout, &id, -32603, "turn/start returned no turnId");
+                        return;
+                    }
+                    let started = r
+                        .get("disposition")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|value| value == "started");
                     if let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
                         s.in_flight.push(InFlight {
-                            msp_turn: turn,
+                            msp_turn: turn.clone(),
                             req_id: id.clone().unwrap_or(J::Null),
                         });
+                        if started {
+                            s.active_turn = Some(turn);
+                        }
                     }
                     if ver == 2 {
                         // Accepted: empty response, then the user-message echo
                         // (v2 MUST), then running.
                         acp::send_result(stdout, &id, "{}");
-                        let msg_id = mint_id("msg-", &ID_COUNTER);
-                        acp::send_raw(
-                            stdout,
-                            &format!(
-                                "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"user_message\",\"messageId\":{},\"content\":{}}}}}}}",
-                                esc(&sid),
-                                esc(&msg_id),
-                                acp_content
-                            ),
-                        );
+                        send_v2_user_message(stdout, &sid, &acp_content);
                         acp::send_state(stdout, &sid, "running", None);
                     } else {
                         // v1 prompt flow echoes user content as chunks.
@@ -666,6 +731,149 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     }
                 }
             }
+        }
+        "_session/steering" => {
+            if negotiated_ver() != 2 {
+                acp::send_error(stdout, &id, -32601, "steering requires ACP v2");
+                return;
+            }
+            let prompt_required = match steering_prompt_required(params.as_ref()) {
+                Ok(value) => value,
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
+            let sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let (msp_sid, cwd, reasoning_effort, active_turn) =
+                match sessions.lock().unwrap().get(&sid) {
+                    Some(s) => (
+                        s.msp_sid.clone(),
+                        s.cwd.clone(),
+                        s.reasoning_effort.clone(),
+                        s.active_turn.clone(),
+                    ),
+                    None => {
+                        acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                        return;
+                    }
+                };
+            let (parts, acp_content) = match extract_prompt_parts(params.as_ref(), &cwd) {
+                Ok((parts, content)) if !parts.is_empty() => (parts, content),
+                Ok(_) => {
+                    acp::send_error(stdout, &id, -32602, "steering requires content");
+                    return;
+                }
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
+            if active_turn.is_none() && prompt_required {
+                acp::send_result(
+                    stdout,
+                    &id,
+                    "{\"outcome\":\"promptRequired\",\"reason\":\"noRunningTurn\"}",
+                );
+                return;
+            }
+            let cmd = host.mint_cmd("cmd-");
+            let input = format!("[{}]", parts.join(","));
+            let result = match active_turn.as_deref() {
+                Some(expected_turn) => host.command(
+                    "turn/steer",
+                    &format!(
+                        "{{\"commandId\":{},\"sessionId\":{},\"expectedTurnId\":{},\"input\":{},\"reasoningEffort\":{}}}",
+                        esc(&cmd),
+                        esc(&msp_sid),
+                        esc(expected_turn),
+                        input,
+                        esc(&reasoning_effort)
+                    ),
+                ),
+                None => host.command(
+                    "turn/start",
+                    &format!(
+                        "{{\"commandId\":{},\"sessionId\":{},\"input\":{},\"ifBusy\":\"steer\",\"reasoningEffort\":{}}}",
+                        esc(&cmd),
+                        esc(&msp_sid),
+                        input,
+                        esc(&reasoning_effort)
+                    ),
+                ),
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    acp::send_error(
+                        stdout,
+                        &id,
+                        -32603,
+                        &format!("steering failed: {}", err_message(&error)),
+                    );
+                    return;
+                }
+            };
+            let turn = result
+                .get("turnId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if turn.is_empty() {
+                acp::send_error(stdout, &id, -32603, "steering returned no turnId");
+                return;
+            }
+            let (outcome, started_new) = if let Some(expected) = active_turn.as_deref() {
+                if turn != expected {
+                    acp::send_error(
+                        stdout,
+                        &id,
+                        -32603,
+                        "turn/steer returned a different turnId",
+                    );
+                    return;
+                }
+                ("injected", false)
+            } else {
+                match result.get("disposition").and_then(|v| v.as_str()) {
+                    Some("started") => ("startedNewTurn", true),
+                    Some("steered") => ("injected", false),
+                    Some(other) => {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32603,
+                            &format!("unexpected steering disposition '{other}'"),
+                        );
+                        return;
+                    }
+                    None => {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32603,
+                            "steering turn/start returned no disposition",
+                        );
+                        return;
+                    }
+                }
+            };
+            if started_new && let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
+                s.active_turn = Some(turn.clone());
+                s.in_flight.push(InFlight {
+                    msp_turn: turn,
+                    req_id: J::Null,
+                });
+            }
+            // Acknowledge the extension before emitting the synthetic echo.
+            acp::send_result(stdout, &id, &format!("{{\"outcome\":{}}}", esc(outcome)));
+            send_v2_user_message(stdout, &sid, &acp_content);
+            acp::send_state(stdout, &sid, "running", None);
         }
         "session/close" => {
             // v2 baseline: stop session work, drop local state, resolve
@@ -810,7 +1018,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             }
         }
         "session/set_config_option" => {
-            // v2 config selectors: mode -> approval posture, model -> catalog id.
+            // v2 config selectors: approval posture, model, and per-turn reasoning.
             let sid = params
                 .as_ref()
                 .and_then(|p| p.get("sessionId"))
@@ -862,8 +1070,26 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         esc(&value)
                     ),
                 ),
+                "reasoning_effort" => {
+                    if acp::is_reasoning_effort(&value) {
+                        Ok(J::Null)
+                    } else {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32602,
+                            "reasoning_effort must be none|minimal|low|medium|high|xhigh|ultra",
+                        );
+                        return;
+                    }
+                }
                 _ => {
-                    acp::send_error(stdout, &id, -32602, "unknown configId (want mode|model)");
+                    acp::send_error(
+                        stdout,
+                        &id,
+                        -32602,
+                        "unknown configId (want mode|model|reasoning_effort)",
+                    );
                     return;
                 }
             };
@@ -878,14 +1104,17 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
                     if let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
-                        if key == "mode" {
-                            let m = folded
-                                .as_deref()
-                                .or_else(|| acp::resolve_mode(&value))
-                                .unwrap_or("promptUnmatched");
-                            s.mode_value = acp::mode_from_msp(m).to_string();
-                        } else {
-                            s.model_value = value.clone();
+                        match key.as_str() {
+                            "mode" => {
+                                let m = folded
+                                    .as_deref()
+                                    .or_else(|| acp::resolve_mode(&value))
+                                    .unwrap_or("promptUnmatched");
+                                s.mode_value = acp::mode_from_msp(m).to_string();
+                            }
+                            "model" => s.model_value = value.clone(),
+                            "reasoning_effort" => s.reasoning_effort = value.clone(),
+                            _ => unreachable!(),
                         }
                         let models = catalog(host);
                         acp::send_result(
@@ -893,7 +1122,12 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             &id,
                             &format!(
                                 "{{\"configOptions\":{}}}",
-                                acp::config_options(&s.mode_value, &s.model_value, &models)
+                                acp::config_options(
+                                    &s.mode_value,
+                                    &s.model_value,
+                                    &s.reasoning_effort,
+                                    &models,
+                                )
                             ),
                         );
                     } else {
@@ -1497,6 +1731,9 @@ fn handle_msp(
                 None => return,
             };
             let settled = sessions.lock().unwrap().get_mut(&acp_sid).map(|s| {
+                if s.active_turn.as_deref() == Some(turn_id) {
+                    s.active_turn = None;
+                }
                 let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id);
                 let ver = s.ver;
                 let req_id = pos.map(|p| s.in_flight.remove(p).req_id);
@@ -1633,7 +1870,21 @@ fn handle_msp(
             }
         }
         "userInput/settled" => {}
-        "turn/started" | "turn/retracted" | "turn/retryScheduled" => {
+        "turn/started" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
+                && !turn_id.is_empty()
+                && let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid)
+            {
+                s.active_turn = Some(turn_id.to_string());
+            }
+            log(&format!("turn/started turn={turn_id} sess={msp_sid}"));
+        }
+        "turn/retracted" | "turn/retryScheduled" => {
             log(&format!(
                 "{method} turn={} sess={}",
                 params.get("turnId").and_then(|v| v.as_str()).unwrap_or("?"),

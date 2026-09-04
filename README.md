@@ -23,6 +23,8 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `userInput/requested` | `elicitation/create` form bridge (needs client `elicitation.form` caps), else auto-cancel |
 | `session/setApprovalMode` | v2 `configOptions` mode selector (`ask`/`auto`/`deny`) + `session/set_config_option`; v1 `session/set_mode` |
 | `model/list` + `session/setModel` | v2 `configOptions` model selector + `session/set_config_option`; v1 `session/set_model` |
+| `reasoningEffort` on `turn/start` / `turn/steer` | v2 `configOptions` reasoning selector (`none` through `ultra`) |
+| `turn/steer` | v2 `_session/steering` extension with exact-turn targeting and race-safe idle behavior |
 
 ## Run
 
@@ -47,6 +49,11 @@ unmatched tool call through `session/request_permission`.
 
 - v2 `session/prompt` replies `{}` on accept; completion is the terminal
   `state_update`. v1 replies `{stopReason}`.
+- v2 initialization advertises steering at `_meta.steering.supported`. The
+  `_session/steering` request accepts the same `sessionId` and `prompt` fields
+  as `session/prompt`. `_meta.steering.idleBehavior: "promptRequired"` avoids
+  starting a turn when the session is idle; otherwise the adapter uses MSP's
+  atomic `ifBusy: "steer"` fallback.
 - Concurrent prompts queue host-side; every turn completes its own response.
 - Images in, audio out: the host input type is closed (`text|image`), so audio
   blocks are rejected with the reason. Auth has no host surface
