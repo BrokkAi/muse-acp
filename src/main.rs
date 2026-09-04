@@ -8,6 +8,7 @@ mod acp;
 mod fold;
 mod json;
 mod msp;
+mod zed;
 
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -130,8 +131,12 @@ fn selftest() -> i32 {
 }
 
 fn main() {
-    if std::env::args().any(|a| a == "--selftest") {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["--selftest"] {
         std::process::exit(selftest());
+    }
+    if let Some(exit_code) = zed::dispatch(&args) {
+        std::process::exit(exit_code);
     }
     let stdout: StdoutShared = Arc::new(Mutex::new(std::io::stdout()));
     let sessions: Sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));

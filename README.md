@@ -45,6 +45,39 @@ MUSE_APPROVAL_MODE=promptUnmatched  # allowAll|promptUnmatched|onRequest|denyUnm
 to the host default; set `MUSE_APPROVAL_MODE=promptUnmatched` to force every
 unmatched tool call through `session/request_permission`.
 
+## Install into Zed
+
+```sh
+cargo install --path .
+muse-acp install
+```
+
+This registers `muse-acp` in `~/.config/zed/settings.json` as a custom agent
+server resolved through `PATH`:
+
+```json
+{
+  "agent_servers": {
+    "muse-acp": {
+      "type": "custom",
+      "command": "muse-acp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
+```
+
+The edit preserves comments, formatting, and unrelated settings, and writes a
+`.bak` backup first. Re-running `install` is idempotent.
+
+```sh
+muse-acp install --command /path/to/muse-acp
+muse-acp install --env MUSE_CLI=muse --env MUSE_SERVE_ARGS=--trust-workspace
+muse-acp install --settings /path/to/settings.json --dry-run
+muse-acp uninstall
+```
+
 ## Protocol notes
 
 - v2 `session/prompt` replies `{}` on accept; completion is the terminal
