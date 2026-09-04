@@ -1,1599 +1,2485 @@
-//! muse-acp: minimal ACP (Agent Client Protocol v1) adapter bridging stdio
-//! JSON-RPC to the local `muse-code` CLI.
+//! muse-acp: ACP (v2 primary, v1 fallback) server backed by one `muse serve` host.
 //!
-//! Transport: JSON-RPC 2.0 over stdio, NDJSON (one object per `\n` line).
-//! stdin: client -> agent, stdout: agent -> client, stderr: logs only.
-//!
-//! Mapping:
-//! - `initialize` -> advertise text-only prompt caps (no loadSession/auth).
-//! - `session/new {cwd}` -> allocate sessionId, store cwd.
-//! - `session/prompt {sessionId, prompt}` -> concat text blocks, spawn
-//!   `muse exec <extra-args> <prompt>` with cwd, stream stdout chunks as
-//!   `session/update agent_message_chunk`, reply `{stopReason}`.
-//! - `session/cancel {sessionId}` (notification) -> flag + kill child.
-//!
-//! Env:
-//! - `MUSE_CLI` (default `muse`): binary to spawn.
-//! - `MUSE_CLI_EXTRA_ARGS` (optional, space-separated): extra args inserted
-//!   before the prompt, e.g. `--model foo`. Default: none.
-//!
-//! Subcommands:
-//! - (no args): run the ACP agent over stdio (what Zed spawns).
-//! - `install [options]`: register `muse-acp` (resolved via PATH) as a custom
-//!   ACP server in Zed's `settings.json`.
-//! - `uninstall [options]`: remove the `settings.json` entry again.
-//!
-//! No third-party deps (std only) so `cargo build` works offline.
+//! ACP client <-> stdio NDJSON <-> this adapter <-> stdio NDJSON <-> serve host.
+//! One host serves all ACP sessions; `session/start` auto-subscribes us to its
+//! view, so turns stream in as `item/*` + `turn/*` notifications.
 
-use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, Stdio};
+mod acp;
+mod fold;
+mod json;
+mod msp;
+mod zed;
+
+use std::io::{BufRead, BufReader};
+use std::path::Path;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicU64, Ordering},
+    mpsc,
 };
 
-// ---------------------------------------------------------------------------
-// Minimal JSON value + parser (std only)
-// ---------------------------------------------------------------------------
+use acp::{AcpSession, InFlight, PendingPerm, Sessions, StdoutShared};
+use fold::SessionFold;
+use json::{J, esc, j_to_string, mint_id, parse_json};
+use msp::{MspEvent, MspHost, err_code, err_message, log};
 
-#[derive(Debug, Clone)]
-enum J {
-    Null,
-    Bool(bool),
-    Num(String),
-    Str(String),
-    Arr(Vec<J>),
-    Obj(Vec<(String, J)>),
+static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+static VER: AtomicU64 = AtomicU64::new(0); // negotiated ACP version for the connection
+static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the v2 client advertises elicitation.form
+/// Cached model catalog: (modelId, displayLabel, isDefault).
+static CATALOG: std::sync::OnceLock<Mutex<Vec<(String, String, bool)>>> =
+    std::sync::OnceLock::new();
+
+/// Folded host approval mode: `session.approvalMode.mode`
+/// (EffectiveApprovalModeState; additive-optional, may be absent).
+fn host_mode(res: &J) -> Option<String> {
+    res.get("session")?
+        .get("approvalMode")?
+        .get("mode")?
+        .as_str()
+        .map(|s| s.to_string())
 }
 
-impl J {
-    fn get(&self, key: &str) -> Option<&J> {
-        if let J::Obj(pairs) = self {
-            for (k, v) in pairs {
-                if k == key {
-                    return Some(v);
-                }
-            }
-        }
-        None
-    }
-    fn as_str(&self) -> Option<&str> {
-        if let J::Str(s) = self { Some(s) } else { None }
-    }
-}
-
-struct Parser<'a> {
-    b: &'a [u8],
-    pos: usize,
-}
-
-impl<'a> Parser<'a> {
-    fn new(s: &'a str) -> Self {
-        Self { b: s.as_bytes(), pos: 0 }
-    }
-    fn skip_ws(&mut self) {
-        while self.pos < self.b.len() && matches!(self.b[self.pos], b' ' | b'\t' | b'\n' | b'\r') {
-            self.pos += 1;
+fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
+    let cell = CATALOG.get_or_init(|| Mutex::new(Vec::new()));
+    {
+        let guard = cell.lock().unwrap();
+        if !guard.is_empty() {
+            return guard.clone();
         }
     }
-    fn peek(&self) -> Option<u8> {
-        self.b.get(self.pos).copied()
-    }
-    fn parse_value(&mut self) -> Result<J, String> {
-        self.skip_ws();
-        match self.peek() {
-            Some(b'n') => self.parse_lit("null", J::Null),
-            Some(b't') => self.parse_lit("true", J::Bool(true)),
-            Some(b'f') => self.parse_lit("false", J::Bool(false)),
-            Some(b'"') => Ok(J::Str(self.parse_string()?)),
-            Some(b'[') => self.parse_array(),
-            Some(b'{') => self.parse_object(),
-            Some(c) if c == b'-' || c.is_ascii_digit() => self.parse_number(),
-            Some(c) => Err(format!("unexpected char '{}' at {}", c as char, self.pos)),
-            None => Err("unexpected end of input".to_string()),
-        }
-    }
-    fn parse_lit(&mut self, lit: &str, v: J) -> Result<J, String> {
-        if self.b.len() >= self.pos + lit.len() && &self.b[self.pos..self.pos + lit.len()] == lit.as_bytes() {
-            self.pos += lit.len();
-            Ok(v)
-        } else {
-            Err(format!("invalid literal at {}", self.pos))
-        }
-    }
-    fn parse_number(&mut self) -> Result<J, String> {
-        let start = self.pos;
-        if self.peek() == Some(b'-') {
-            self.pos += 1;
-        }
-        while self.pos < self.b.len()
-            && (self.b[self.pos].is_ascii_digit()
-                || matches!(self.b[self.pos], b'.' | b'e' | b'E' | b'+' | b'-'))
-        {
-            self.pos += 1;
-        }
-        if self.pos == start {
-            return Err(format!("invalid number at {}", start));
-        }
-        Ok(J::Num(String::from_utf8_lossy(&self.b[start..self.pos]).into_owned()))
-    }
-    fn hex4(&mut self) -> Result<u32, String> {
-        if self.pos + 4 > self.b.len() {
-            return Err("truncated \\u escape".to_string());
-        }
-        let s = std::str::from_utf8(&self.b[self.pos..self.pos + 4])
-            .map_err(|_| "\\u not utf8".to_string())?;
-        let v = u32::from_str_radix(s, 16).map_err(|_| "bad \\u hex".to_string())?;
-        self.pos += 4;
-        Ok(v)
-    }
-    fn parse_string(&mut self) -> Result<String, String> {
-        // assumes current char is '"'
-        self.pos += 1; // open quote
-        let mut out = String::new();
-        loop {
-            if self.pos >= self.b.len() {
-                return Err("unterminated string".to_string());
-            }
-            let c = self.b[self.pos];
-            match c {
-                b'"' => {
-                    self.pos += 1;
-                    return Ok(out);
-                }
-                b'\\' => {
-                    self.pos += 1;
-                    if self.pos >= self.b.len() {
-                        return Err("truncated escape".to_string());
-                    }
-                    let e = self.b[self.pos];
-                    self.pos += 1;
-                    match e {
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        b'/' => out.push('/'),
-                        b'b' => out.push('\u{0008}'),
-                        b'f' => out.push('\u{000C}'),
-                        b'n' => out.push('\n'),
-                        b'r' => out.push('\r'),
-                        b't' => out.push('\t'),
-                        b'u' => {
-                            let cp = self.hex4()?;
-                            match char::from_u32(cp) {
-                                Some(ch) => out.push(ch),
-                                None => out.push('\u{FFFD}'),
-                            }
-                        }
-                        _ => return Err(format!("bad escape \\{}", e as char)),
-                    }
-                }
-                _ => {
-                    // copy one UTF-8 codepoint
-                    let rest = &self.b[self.pos..];
-                    let s = std::str::from_utf8(rest).map_err(|_| "invalid utf8 in string".to_string())?;
-                    let ch = s.chars().next().ok_or("empty string tail")?;
-                    out.push(ch);
-                    self.pos += ch.len_utf8();
-                }
-            }
-        }
-    }
-    fn parse_array(&mut self) -> Result<J, String> {
-        self.pos += 1; // [
-        let mut items = Vec::new();
-        loop {
-            self.skip_ws();
-            if self.peek() == Some(b']') {
-                self.pos += 1;
-                return Ok(J::Arr(items));
-            }
-            let v = self.parse_value()?;
-            items.push(v);
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
-                Some(b']') => {
-                    self.pos += 1;
-                    return Ok(J::Arr(items));
-                }
-                _ => return Err(format!("expected ',' or ']' at {}", self.pos)),
-            }
-        }
-    }
-    fn parse_object(&mut self) -> Result<J, String> {
-        self.pos += 1; // {
-        let mut pairs = Vec::new();
-        loop {
-            self.skip_ws();
-            if self.peek() == Some(b'}') {
-                self.pos += 1;
-                return Ok(J::Obj(pairs));
-            }
-            if self.peek() != Some(b'"') {
-                return Err(format!("expected string key at {}", self.pos));
-            }
-            let k = self.parse_string()?;
-            self.skip_ws();
-            if self.peek() != Some(b':') {
-                return Err(format!("expected ':' at {}", self.pos));
-            }
-            self.pos += 1;
-            let v = self.parse_value()?;
-            pairs.push((k, v));
-            self.skip_ws();
-            match self.peek() {
-                Some(b',') => {
-                    self.pos += 1;
-                }
-                Some(b'}') => {
-                    self.pos += 1;
-                    return Ok(J::Obj(pairs));
-                }
-                _ => return Err(format!("expected ',' or '}}' at {}", self.pos)),
-            }
-        }
-    }
-}
-
-fn parse_json(s: &str) -> Result<J, String> {
-    let mut p = Parser::new(s);
-    let v = p.parse_value()?;
-    p.skip_ws();
-    if p.pos != p.b.len() {
-        return Err("trailing characters".to_string());
-    }
-    Ok(v)
-}
-
-fn esc(s: &str) -> String {
-    let mut o = String::with_capacity(s.len() + 2);
-    o.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => o.push_str("\\\""),
-            '\\' => o.push_str("\\\\"),
-            '\n' => o.push_str("\\n"),
-            '\r' => o.push_str("\\r"),
-            '\t' => o.push_str("\\t"),
-            '\u{0008}' => o.push_str("\\b"),
-            '\u{000C}' => o.push_str("\\f"),
-            c if (c as u32) < 0x20 => {
-                o.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => o.push(c),
-        }
-    }
-    o.push('"');
-    o
-}
-
-fn j_to_string(j: &J) -> String {
-    match j {
-        J::Null => "null".to_string(),
-        J::Bool(true) => "true".to_string(),
-        J::Bool(false) => "false".to_string(),
-        J::Num(n) => n.clone(),
-        J::Str(s) => esc(s),
-        J::Arr(items) => {
-            let parts: Vec<String> = items.iter().map(j_to_string).collect();
-            format!("[{}]", parts.join(","))
-        }
-        J::Obj(pairs) => {
-            let parts: Vec<String> =
-                pairs.iter().map(|(k, v)| format!("{}:{}", esc(k), j_to_string(v))).collect();
-            format!("{{{}}}", parts.join(","))
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Sessions + running children
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct Session {
-    cwd: String,
-}
-
-struct Running {
-    cancelled: AtomicBool,
-    child: Mutex<Option<Child>>,
-}
-
-type Sessions = Arc<Mutex<HashMap<String, Session>>>;
-type RunningMap = Arc<Mutex<HashMap<String, Arc<Running>>>>;
-type StdoutShared = Arc<Mutex<std::io::Stdout>>;
-
-static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-fn gen_session_id() -> String {
-    // Prefer /dev/urandom UUIDv4 (exactly 16 bytes); fallback to time+pid+counter.
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let mut b = [0u8; 16];
-        if Read::read_exact(&mut f, &mut b).is_ok() {
-            b[6] = (b[6] & 0x0f) | 0x40;
-            b[8] = (b[8] & 0x3f) | 0x80;
-            return format!(
-                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-                b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
-                b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]
-            );
-        }
-    }
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("sess-{}-{}-{}", std::process::id(), now, n)
-}
-
-fn log(msg: &str) {
-    eprintln!("[muse-acp] {msg}");
-}
-
-// ---------------------------------------------------------------------------
-// JSON-RPC send helpers (stdout only; stderr is logs)
-// ---------------------------------------------------------------------------
-
-fn send_raw(stdout: &StdoutShared, line: String) {
-    let mut out = stdout.lock().unwrap();
-    let _ = writeln!(out, "{line}");
-    let _ = out.flush();
-}
-
-fn id_json(id: &Option<J>) -> String {
-    match id {
-        None => "null".to_string(),
-        Some(j) => j_to_string(j),
-    }
-}
-
-fn send_result(stdout: &StdoutShared, id: &Option<J>, result_json: &str) {
-    if id.is_none() {
-        return; // notification: no response
-    }
-    send_raw(
-        stdout,
-        format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}",
-            id_json(id),
-            result_json
-        ),
-    );
-}
-
-fn send_error(stdout: &StdoutShared, id: &Option<J>, code: i32, message: &str) {
-    send_raw(
-        stdout,
-        format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":{code},\"message\":{}}}}}",
-            id_json(id),
-            esc(message)
-        ),
-    );
-}
-
-fn send_update_chunk(stdout: &StdoutShared, session_id: &str, text: &str) {
-    send_raw(
-        stdout,
-        format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
-            esc(session_id),
-            esc(text)
-        ),
-    );
-}
-
-// ---------------------------------------------------------------------------
-// Prompt text extraction: concat {type:"text", text} blocks
-// ---------------------------------------------------------------------------
-
-fn extract_prompt_text(params: Option<&J>) -> String {
-    let Some(p) = params else { return String::new() };
-    let prompt = p.get("prompt").unwrap_or(p);
-    match prompt {
-        J::Str(s) => s.clone(),
-        J::Arr(blocks) => {
-            let mut parts = Vec::new();
-            for b in blocks {
-                match b {
-                    J::Str(s) => parts.push(s.clone()),
-                    J::Obj(_) => {
-                        let t = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                        if t == "text" {
-                            if let Some(txt) = b.get("text").and_then(|v| v.as_str()) {
-                                parts.push(txt.to_string());
-                            }
-                        }
-                        // image/audio/resource/embedded parts are unsupported (text-only caps)
-                    }
-                    _ => {}
-                }
-            }
-            parts.join("\n")
-        }
-        J::Obj(_) => {
-            // params itself was the object and prompt lives under "prompt"
-            if let Some(arr) = p.get("prompt") {
-                return extract_prompt_text(Some(&J::Arr(match arr {
-                    J::Arr(v) => v.clone(),
-                    J::Str(s) => vec![J::Str(s.clone())],
-                    _ => vec![],
-                })));
-            }
-            String::new()
-        }
-        _ => String::new(),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Prompt worker: spawn muse CLI, stream stdout, reply stopReason
-// ---------------------------------------------------------------------------
-
-fn muse_bin() -> String {
-    std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string())
-}
-
-fn extra_args() -> Vec<String> {
-    match std::env::var("MUSE_CLI_EXTRA_ARGS") {
-        Ok(s) => s.split_whitespace().map(|x| x.to_string()).collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
-fn run_prompt(
-    stdout: StdoutShared,
-    sessions: Sessions,
-    running: RunningMap,
-    id: Option<J>,
-    session_id: String,
-    prompt_text: String,
-) {
-    let cwd = {
-        let map = sessions.lock().unwrap();
-        match map.get(&session_id) {
-            Some(s) => s.cwd.clone(),
-            None => {
-                send_error(&stdout, &id, -32602, "unknown sessionId");
-                return;
-            }
-        }
-    };
-
-    let handle = Arc::new(Running {
-        cancelled: AtomicBool::new(false),
-        child: Mutex::new(None),
-    });
-    running.lock().unwrap().insert(session_id.clone(), handle.clone());
-
-    let bin = muse_bin();
-    let mut cmd = Command::new(&bin);
-    cmd.arg("exec");
-    for a in extra_args() {
-        cmd.arg(a);
-    }
-    cmd.arg(&prompt_text);
-    cmd.current_dir(&cwd);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            running.lock().unwrap().remove(&session_id);
-            send_error(&stdout, &id, -32603, &format!("failed to spawn '{bin}': {e}"));
-            return;
-        }
-    };
-
-    let mut child_stdout = child.stdout.take();
-    let mut child_stderr = child.stderr.take();
-    *handle.child.lock().unwrap() = Some(child);
-
-    // Stream stdout chunks as agent_message_chunk notifications.
-    if let Some(mut out) = child_stdout.take() {
-        let mut buf = [0u8; 2048];
-        loop {
-            if handle.cancelled.load(Ordering::SeqCst) {
-                break;
-            }
-            match out.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    let text = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    if !text.is_empty() && !handle.cancelled.load(Ordering::SeqCst) {
-                        send_update_chunk(&stdout, &session_id, &text);
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    }
-
-    // Drain stderr to our logs (ACP forbids agent stdout pollution).
-    if let Some(mut err) = child_stderr.take() {
-        let mut s = String::new();
-        let _ = err.read_to_string(&mut s);
-        if !s.trim().is_empty() {
-            log(&format!("muse stderr ({session_id}): {}", s.trim()));
-        }
-    }
-
-    let cancelled = handle.cancelled.load(Ordering::SeqCst);
-    let status = handle
-        .child
-        .lock()
-        .unwrap()
-        .as_mut()
-        .map(|c| c.wait())
-        .transpose();
-
-    running.lock().unwrap().remove(&session_id);
-
-    if cancelled {
-        send_result(&stdout, &id, r#"{"stopReason":"cancelled"}"#);
-        return;
-    }
-    match status {
-        Ok(Some(st)) if st.success() => {
-            send_result(&stdout, &id, r#"{"stopReason":"end_turn"}"#);
-        }
-        Ok(Some(st)) => {
-            send_error(
-                &stdout,
-                &id,
-                -32603,
-                &format!("muse exited with {}", st.code().unwrap_or(-1)),
-            );
-        }
-        Ok(None) => {
-            send_error(&stdout, &id, -32603, "muse process already reaped");
-        }
-        Err(e) => {
-            send_error(&stdout, &id, -32603, &format!("muse wait failed: {e}"));
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Zed installer: `muse-acp install` / `muse-acp uninstall`
-//
-// Registers this binary as a custom ACP agent server in Zed's settings.json:
-//
-//   { "agent_servers": { "muse-acp": {
-//       "type": "custom", "command": "<abs path>", "args": [], "env": {} } } }
-//
-// Edits are surgical: only the touched entry changes, everything else in the
-// file (comments, formatting, key order — Zed settings are JSONC) is
-// preserved byte-for-byte.
-// ---------------------------------------------------------------------------
-
-const ZED_SETTINGS_REL: &str = ".config/zed/settings.json";
-const DEFAULT_AGENT_NAME: &str = "muse-acp";
-const DEFAULT_COMMAND: &str = "muse-acp";
-
-struct InstallerOpts {
-    name: String,
-    settings: Option<String>,
-    command: String,
-    env: Vec<(String, String)>,
-    dry_run: bool,
-    no_backup: bool,
-}
-
-impl InstallerOpts {
-    fn new() -> Self {
-        Self {
-            name: DEFAULT_AGENT_NAME.to_string(),
-            settings: None,
-            command: DEFAULT_COMMAND.to_string(),
-            env: Vec::new(),
-            dry_run: false,
-            no_backup: false,
-        }
-    }
-}
-
-fn usage() -> &'static str {
-    "usage: muse-acp [command] [options]\n\
-     \n\
-     \x20 (no command)         run the ACP agent over stdio (what Zed spawns)\n\
-     \x20 install              register muse-acp as a Zed agent server\n\
-     \x20 uninstall            remove the Zed settings entry again\n\
-     \x20 help [command]       show this help (-h/--help also work)\n\
-     \x20 --version (-V)       print version\n\
-     \n\
-     install options:\n\
-     \x20 --name <name>        agent_servers key (default: muse-acp)\n\
-     \x20 --settings <path>    settings.json path (default: ~/.config/zed/settings.json)\n\
-     \x20 --command <cmd>      command Zed spawns, resolved via PATH (default: muse-acp)\n\
-     \x20 --env KEY=VALUE      extra env for the agent entry (repeatable)\n\
-     \x20 --dry-run            print planned changes without writing anything\n\
-     \x20 --no-backup          do not write a .bak backup of settings.json\n\
-     \n\
-     uninstall options:\n\
-     \x20 --name, --settings, --dry-run, --no-backup (as above)"
-}
-
-enum Cli {
-    Serve,
-    Install(InstallerOpts),
-    Uninstall(InstallerOpts),
-    Help,
-    Version,
-}
-
-fn take_value(args: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
-    let arg = &args[*i];
-    if let Some(v) = arg.strip_prefix(&format!("{flag}=")) {
-        if v.is_empty() {
-            return Err(format!("{flag} requires a value"));
-        }
-        return Ok(v.to_string());
-    }
-    *i += 1;
-    if *i >= args.len() {
-        return Err(format!("{flag} requires a value"));
-    }
-    Ok(args[*i].clone())
-}
-
-fn parse_installer_opts(args: &[String], i: &mut usize, is_install: bool) -> Result<InstallerOpts, String> {
-    let cmd = if is_install { "install" } else { "uninstall" };
-    let mut o = InstallerOpts::new();
-    while *i < args.len() {
-        let a = args[*i].clone();
-        if a == "-h" || a == "--help" {
-            return Err(format!("__help_{cmd}"));
-        } else if a == "--name" || a.starts_with("--name=") {
-            o.name = take_value(args, i, "--name")?;
-            if o.name.trim().is_empty() {
-                return Err("--name must not be empty".to_string());
-            }
-        } else if a == "--settings" || a.starts_with("--settings=") {
-            o.settings = Some(take_value(args, i, "--settings")?);
-        } else if a == "--command" || a.starts_with("--command=") {
-            if !is_install {
-                return Err("--command is only valid for install".to_string());
-            }
-            o.command = take_value(args, i, "--command")?;
-            if o.command.trim().is_empty() {
-                return Err("--command must not be empty".to_string());
-            }
-        } else if a == "--env" || a.starts_with("--env=") {
-            if !is_install {
-                return Err("--env is only valid for install".to_string());
-            }
-            let kv = take_value(args, i, "--env")?;
-            let (k, v) = kv
-                .split_once('=')
-                .ok_or_else(|| "--env requires KEY=VALUE".to_string())?;
-            if k.is_empty() {
-                return Err("--env requires a non-empty key".to_string());
-            }
-            o.env.push((k.to_string(), v.to_string()));
-        } else if a == "--dry-run" {
-            o.dry_run = true;
-        } else if a == "--no-backup" {
-            o.no_backup = true;
-        } else {
-            return Err(format!("unexpected argument: {a}"));
-        }
-        *i += 1;
-    }
-    Ok(o)
-}
-
-fn parse_args(args: &[String]) -> Result<Cli, String> {
-    if args.is_empty() {
-        return Ok(Cli::Serve);
-    }
-    match args[0].as_str() {
-        "-h" | "--help" | "help" => Ok(Cli::Help),
-        "-V" | "--version" => {
-            if args.len() > 1 {
-                return Err(format!("unexpected argument: {}", args[1]));
-            }
-            Ok(Cli::Version)
-        }
-        "install" | "uninstall" => {
-            let is_install = args[0] == "install";
-            let mut i = 1;
-            match parse_installer_opts(args, &mut i, is_install) {
-                Ok(o) => Ok(if is_install { Cli::Install(o) } else { Cli::Uninstall(o) }),
-                Err(e) if e == "__help_install" || e == "__help_uninstall" => Ok(Cli::Help),
-                Err(e) => Err(e),
-            }
-        }
-        other => Err(format!("unexpected argument: {other}")),
-    }
-}
-
-// --- JSONC scanner (Zed settings allow comments + trailing commas) ---
-
-#[derive(Debug)]
-struct JsoncEntry {
-    key: String,
-    key_start: usize,
-    value_start: usize,
-    value_end: usize,
-    comma_after: Option<usize>,
-}
-
-#[derive(Debug)]
-struct JsoncObject {
-    #[allow(dead_code)]
-    open: usize,
-    close: usize,
-    entries: Vec<JsoncEntry>,
-}
-
-fn is_ws(b: u8) -> bool {
-    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
-}
-
-fn skip_trivia(b: &[u8], mut p: usize) -> usize {
-    while p < b.len() {
-        if is_ws(b[p]) {
-            p += 1;
-        } else if b[p] == b'/' && p + 1 < b.len() && b[p + 1] == b'/' {
-            p += 2;
-            while p < b.len() && b[p] != b'\n' {
-                p += 1;
-            }
-        } else if b[p] == b'/' && p + 1 < b.len() && b[p + 1] == b'*' {
-            p += 2;
-            while p + 1 < b.len() && !(b[p] == b'*' && b[p + 1] == b'/') {
-                p += 1;
-            }
-            p = (p + 2).min(b.len());
-        } else {
-            break;
-        }
-    }
-    p
-}
-
-fn is_trivia_only(s: &str) -> bool {
-    skip_trivia(s.as_bytes(), 0) == s.len()
-}
-
-fn slice_is_ws_only(s: &str) -> bool {
-    s.bytes().all(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
-}
-
-fn parse_jsonc_string(b: &[u8], p: usize) -> Option<(String, usize)> {
-    if b.get(p) != Some(&b'"') {
-        return None;
-    }
-    let mut out = String::new();
-    let mut i = p + 1;
-    while i < b.len() {
-        match b[i] {
-            b'"' => return Some((out, i + 1)),
-            b'\\' => {
-                i += 1;
-                if i >= b.len() {
-                    return None;
-                }
-                match b[i] {
-                    b'"' => out.push('"'),
-                    b'\\' => out.push('\\'),
-                    b'/' => out.push('/'),
-                    b'b' => out.push('\u{0008}'),
-                    b'f' => out.push('\u{000C}'),
-                    b'n' => out.push('\n'),
-                    b'r' => out.push('\r'),
-                    b't' => out.push('\t'),
-                    b'u' => {
-                        if i + 4 >= b.len() {
-                            return None;
-                        }
-                        let hex = std::str::from_utf8(&b[i + 1..i + 5]).ok()?;
-                        let cp = u32::from_str_radix(hex, 16).ok()?;
-                        // BMP only; astral keys compare by replacement char (fine:
-                        // we only compare ASCII keys like "agent_servers").
-                        out.push(char::from_u32(cp).unwrap_or('\u{FFFD}'));
-                        i += 4;
-                    }
-                    _ => return None,
-                }
-                i += 1;
-            }
-            _ => {
-                let s = std::str::from_utf8(&b[i..]).ok()?;
-                let c = s.chars().next()?;
-                out.push(c);
-                i += c.len_utf8();
-            }
-        }
-    }
-    None
-}
-
-fn scan_jsonc_value_end(b: &[u8], p: usize) -> Option<usize> {
-    let c = *b.get(p)?;
-    match c {
-        b'"' => Some(parse_jsonc_string(b, p)?.1),
-        b'{' | b'[' => {
-            let close = if c == b'{' { b'}' } else { b']' };
-            let mut depth = 0usize;
-            let mut i = p;
-            while i < b.len() {
-                if b[i] == b'"' {
-                    i = parse_jsonc_string(b, i)?.1;
-                    continue;
-                }
-                if b[i] == b'/' && i + 1 < b.len() && (b[i + 1] == b'/' || b[i + 1] == b'*') {
-                    i = skip_trivia(b, i);
-                    continue;
-                }
-                if b[i] == c {
-                    depth += 1;
-                } else if b[i] == close {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some(i + 1);
-                    }
-                }
-                i += 1;
-            }
-            None
-        }
-        _ => {
-            let mut i = p;
-            while i < b.len() && !matches!(b[i], b',' | b'}' | b']') {
-                i += 1;
-            }
-            while i > p && is_ws(b[i - 1]) {
-                i -= 1;
-            }
-            if i == p { None } else { Some(i) }
-        }
-    }
-}
-
-fn parse_jsonc_object(b: &[u8], open: usize) -> Option<JsoncObject> {
-    if b.get(open) != Some(&b'{') {
-        return None;
-    }
-    let mut entries = Vec::new();
-    let mut p = skip_trivia(b, open + 1);
-    if b.get(p) == Some(&b'}') {
-        return Some(JsoncObject { open, close: p, entries });
-    }
-    loop {
-        let (key, key_end) = parse_jsonc_string(b, p)?;
-        let key_start = p;
-        p = skip_trivia(b, key_end);
-        if b.get(p) != Some(&b':') {
-            return None;
-        }
-        p = skip_trivia(b, p + 1);
-        let value_start = p;
-        let value_end = scan_jsonc_value_end(b, p)?;
-        p = skip_trivia(b, value_end);
-        let comma_after = if b.get(p) == Some(&b',') {
-            p += 1;
-            Some(p - 1)
-        } else {
-            None
-        };
-        entries.push(JsoncEntry { key, key_start, value_start, value_end, comma_after });
-        p = skip_trivia(b, p);
-        match b.get(p) {
-            Some(&b'}') => return Some(JsoncObject { open, close: p, entries }),
-            Some(&b'"') => {}
-            _ => return None,
-        }
-    }
-}
-
-/// Leading whitespace of the line containing `pos` (for matching indent style).
-fn line_indent(text: &str, pos: usize) -> String {
-    let b = text.as_bytes();
-    let mut s = pos.min(b.len());
-    while s > 0 && b[s - 1] != b'\n' {
-        s -= 1;
-    }
-    let mut indent = String::new();
-    for &c in &b[s..pos.min(b.len())] {
-        if c == b' ' || c == b'\t' {
-            indent.push(c as char);
-        } else {
-            break;
-        }
-    }
-    indent
-}
-
-fn strip_comments(src: &str) -> String {
-    let b = src.as_bytes();
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'"' {
-            match parse_jsonc_string(b, i) {
-                Some((_, end)) => {
-                    out.push_str(&src[i..end]);
-                    i = end;
-                }
-                None => {
-                    out.push_str(&src[i..]);
-                    break;
-                }
-            }
-        } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'/' {
-            i += 2;
-            while i < b.len() && b[i] != b'\n' {
-                i += 1;
-            }
-        } else if b[i] == b'/' && i + 1 < b.len() && b[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
-                if b[i] == b'\n' {
-                    out.push('\n');
-                }
-                i += 1;
-            }
-            i = (i + 2).min(b.len());
-        } else {
-            let c = src[i..].chars().next().unwrap();
-            out.push(c);
-            i += c.len_utf8();
-        }
-    }
-    out
-}
-
-fn strip_trailing_commas(src: &str) -> String {
-    let b = src.as_bytes();
-    let mut out = String::with_capacity(src.len());
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'"' {
-            match parse_jsonc_string(b, i) {
-                Some((_, end)) => {
-                    out.push_str(&src[i..end]);
-                    i = end;
-                }
-                None => {
-                    out.push_str(&src[i..]);
-                    break;
-                }
-            }
-        } else if b[i] == b',' {
-            let mut j = i + 1;
-            while j < b.len() && is_ws(b[j]) {
-                j += 1;
-            }
-            if j < b.len() && (b[j] == b'}' || b[j] == b']') {
-                i += 1; // drop trailing comma
-            } else {
-                out.push(',');
-                i += 1;
-            }
-        } else {
-            let c = src[i..].chars().next().unwrap();
-            out.push(c);
-            i += c.len_utf8();
-        }
-    }
-    out
-}
-
-fn check_valid_jsonc_object(text: &str) -> bool {
-    match parse_json(strip_trailing_commas(&strip_comments(text)).trim()) {
-        Ok(J::Obj(_)) => true,
-        _ => false,
-    }
-}
-
-fn render_agent_value(command: &str, env: &[(String, String)], fi: &str, ci: &str) -> String {
-    let mut s = String::from("{\n");
-    s.push_str(&format!("{fi}\"type\": \"custom\",\n"));
-    s.push_str(&format!("{fi}\"command\": {},\n", esc(command)));
-    s.push_str(&format!("{fi}\"args\": [],\n"));
-    if env.is_empty() {
-        s.push_str(&format!("{fi}\"env\": {{}}\n"));
-    } else {
-        s.push_str(&format!("{fi}\"env\": {{\n"));
-        for (i, (k, v)) in env.iter().enumerate() {
-            s.push_str(&format!("{fi}  {}: {}", esc(k), esc(v)));
-            if i + 1 < env.len() {
-                s.push(',');
-            }
-            s.push('\n');
-        }
-        s.push_str(&format!("{fi}}}\n"));
-    }
-    s.push_str(ci);
-    s.push('}');
-    s
-}
-
-fn render_agent_entry(name: &str, command: &str, env: &[(String, String)], ki: &str) -> String {
-    let fi = format!("{ki}  ");
-    format!("{}{}: {}", ki, esc(name), render_agent_value(command, env, &fi, ki))
-}
-
-#[derive(Debug, PartialEq)]
-enum EditOutcome {
-    Added,
-    Updated,
-}
-
-fn install_settings_edit(
-    original: &str,
-    name: &str,
-    command: &str,
-    env: &[(String, String)],
-) -> Result<(String, EditOutcome), String> {
-    if is_trivia_only(original) {
-        let entry = render_agent_entry(name, command, env, "    ");
-        let fresh = format!("{{\n  \"agent_servers\": {{\n{entry}\n  }}\n}}\n");
-        if !check_valid_jsonc_object(&fresh) {
-            return Err("internal error: generated invalid settings".to_string());
-        }
-        return Ok((fresh, EditOutcome::Added));
-    }
-    if !check_valid_jsonc_object(original) {
-        return Err("existing settings file is not valid JSON/JSONC; fix it manually or pass --settings <path>".to_string());
-    }
-    let b = original.as_bytes();
-    let root = parse_jsonc_object(b, skip_trivia(b, 0))
-        .ok_or_else(|| "settings file root is not a JSON object; refusing to edit".to_string())?;
-    let aservers = root.entries.iter().find(|e| e.key == "agent_servers");
-    let Some(aservers) = aservers else {
-        // Insert a new top-level "agent_servers" key before the closing brace.
-        let ind = root
-            .entries
-            .last()
-            .map(|e| line_indent(original, e.key_start))
-            .unwrap_or_else(|| "  ".to_string());
-        let entry = render_agent_entry(name, command, env, &format!("{ind}  "));
-        let block = format!("\n{ind}\"agent_servers\": {{\n{entry}\n{ind}}}");
-        let (ins, prefix) = match root.entries.last() {
-            None => (root.close, String::new()), // empty (maybe commented) object
-            Some(last) => (
-                last.comma_after.map(|c| c + 1).unwrap_or(last.value_end),
-                if last.comma_after.is_some() { "" } else { "," }.to_string(),
-            ),
-        };
-        let mut out = String::with_capacity(original.len() + block.len() + 2);
-        out.push_str(&original[..ins]);
-        out.push_str(&prefix);
-        out.push_str(&block);
-        if root.entries.is_empty() {
-            out.push('\n');
-        }
-        out.push_str(&original[ins..]);
-        if !check_valid_jsonc_object(&out) {
-            return Err("internal error: produced invalid settings; file left untouched".to_string());
-        }
-        return Ok((out, EditOutcome::Added));
-    };
-    let sub = parse_jsonc_object(b, aservers.value_start)
-        .ok_or_else(|| "\"agent_servers\" exists but is not an object; remove or fix it manually".to_string())?;
-    let ai_ind = line_indent(original, aservers.key_start);
-    if let Some(existing) = sub.entries.iter().find(|e| e.key == name) {
-        let ki = line_indent(original, existing.key_start);
-        let fi = format!("{ki}  ");
-        let value = render_agent_value(command, env, &fi, &ki);
-        let mut out = String::with_capacity(original.len() + value.len());
-        out.push_str(&original[..existing.value_start]);
-        out.push_str(&value);
-        out.push_str(&original[existing.value_end..]);
-        if !check_valid_jsonc_object(&out) {
-            return Err("internal error: produced invalid settings; file left untouched".to_string());
-        }
-        return Ok((out, EditOutcome::Updated));
-    }
-    // Insert a new entry into the existing agent_servers object.
-    let entry_ind = format!("{ai_ind}  ");
-    let entry = render_agent_entry(name, command, env, &entry_ind);
-    let mut out = String::with_capacity(original.len() + entry.len() + 8);
-    if sub.entries.is_empty() {
-        if slice_is_ws_only(&original[aservers.value_start + 1..sub.close]) {
-            out.push_str(&original[..aservers.value_start]);
-            out.push_str(&format!("{{\n{entry}\n{ai_ind}}}"));
-            out.push_str(&original[sub.close + 1..]);
-        } else {
-            // Non-empty trivia (comments): keep it, append after, re-indent close.
-            out.push_str(&original[..sub.close]);
-            out.push_str(&format!("\n{entry}\n{ai_ind}}}"));
-            out.push_str(&original[sub.close + 1..]);
-        }
-    } else {
-        let last = sub.entries.last().unwrap();
-        let ins = last.comma_after.map(|c| c + 1).unwrap_or(last.value_end);
-        let prefix = if last.comma_after.is_some() { "" } else { "," };
-        out.push_str(&original[..ins]);
-        out.push_str(prefix);
-        out.push_str(&format!("\n{entry}"));
-        out.push_str(&original[ins..]);
-    }
-    if !check_valid_jsonc_object(&out) {
-        return Err("internal error: produced invalid settings; file left untouched".to_string());
-    }
-    Ok((out, EditOutcome::Added))
-}
-
-/// Span covering an object entry plus one adjacent comma, so removal leaves
-/// valid JSON.
-fn entry_removal_span(obj: &JsoncObject, idx: usize) -> (usize, usize) {
-    let e = &obj.entries[idx];
-    if let Some(c) = e.comma_after {
-        return (e.key_start, c + 1);
-    }
-    if idx > 0 {
-        let prev = &obj.entries[idx - 1];
-        return (prev.comma_after.unwrap_or(prev.value_end), e.value_end);
-    }
-    (e.key_start, e.value_end)
-}
-
-fn remove_entry_at(text: &str, obj: &JsoncObject, idx: usize) -> String {
-    let (rs, re) = entry_removal_span(obj, idx);
-    let mut out = String::with_capacity(text.len());
-    out.push_str(&text[..rs]);
-    out.push_str(&text[re..]);
-    out
-}
-
-fn uninstall_settings_edit(original: &str, name: &str) -> Result<(String, bool), String> {
-    if is_trivia_only(original) {
-        return Ok((original.to_string(), false));
-    }
-    if !check_valid_jsonc_object(original) {
-        return Err("existing settings file is not valid JSON/JSONC; fix it manually or pass --settings <path>".to_string());
-    }
-    let b = original.as_bytes();
-    let root = parse_jsonc_object(b, skip_trivia(b, 0))
-        .ok_or_else(|| "settings file root is not a JSON object; refusing to edit".to_string())?;
-    let Some(ai) = root.entries.iter().position(|e| e.key == "agent_servers") else {
-        return Ok((original.to_string(), false));
-    };
-    let sub = parse_jsonc_object(b, root.entries[ai].value_start)
-        .ok_or_else(|| "\"agent_servers\" exists but is not an object; remove or fix it manually".to_string())?;
-    let Some(idx) = sub.entries.iter().position(|e| e.key == name) else {
-        return Ok((original.to_string(), false));
-    };
-    let mut out = remove_entry_at(original, &sub, idx);
-    // Drop agent_servers itself when it is left empty.
-    let b2 = out.clone();
-    let bb = b2.as_bytes();
-    if let Some(root2) = parse_jsonc_object(bb, skip_trivia(bb, 0)) {
-        if let Some(ai2) = root2.entries.iter().position(|e| e.key == "agent_servers") {
-            let v = &root2.entries[ai2];
-            if let Some(sub2) = parse_jsonc_object(bb, v.value_start) {
-                if sub2.entries.is_empty() {
-                    out = remove_entry_at(&out, &root2, ai2);
-                }
-            }
-        }
-    }
-    // Normalize a fully-emptied file instead of leaving a whitespace shell.
-    let compact: String = out.chars().filter(|c| !c.is_whitespace()).collect();
-    if compact == "{}" {
-        out = "{}\n".to_string();
-    }
-    if !check_valid_jsonc_object(&out) {
-        return Err("internal error: produced invalid settings; file left untouched".to_string());
-    }
-    Ok((out, true))
-}
-
-// --- paths + binary install ---
-
-fn home_dir() -> Result<std::path::PathBuf, String> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map(std::path::PathBuf::from)
-        .map_err(|_| "cannot determine home directory (HOME/USERPROFILE unset); pass --settings <path>".to_string())
-}
-
-fn default_settings_path() -> Result<std::path::PathBuf, String> {
-    Ok(home_dir()?.join(ZED_SETTINGS_REL))
-}
-
-fn write_backup(path: &std::path::Path) {
-    let mut bak = path.as_os_str().to_owned();
-    bak.push(".bak");
-    let bak_path = std::path::Path::new(&bak);
-    match std::fs::copy(path, bak_path) {
-        Ok(_) => println!("muse-acp: backup: {}", bak_path.display()),
-        Err(e) => eprintln!("muse-acp: warning: cannot write backup {}: {e}", bak_path.display()),
-    }
-}
-
-fn cmd_install(o: &InstallerOpts) -> i32 {
-    let settings_path = match &o.settings {
-        Some(s) => std::path::PathBuf::from(s),
-        None => match default_settings_path() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("muse-acp: {e}");
-                return 1;
-            }
-        },
-    };
-    // The registered command is resolved via PATH at spawn time; make sure
-    // `muse-acp` is on PATH (e.g. `cargo install --path .`) before launching Zed.
-    let command = o.command.clone();
-    let original = match std::fs::read_to_string(&settings_path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(e) => {
-            eprintln!("muse-acp: cannot read {}: {e}", settings_path.display());
-            return 1;
-        }
-    };
-    let (updated, outcome) = match install_settings_edit(&original, &o.name, &command, &o.env) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("muse-acp: {e}");
-            return 1;
-        }
-    };
-    let action = if outcome == EditOutcome::Updated { "update" } else { "add" };
-    if o.dry_run {
-        println!("muse-acp: dry run — nothing written");
-        println!("muse-acp: would {action} entry \"{}\" in {} (command: {command})", o.name, settings_path.display());
-        return 0;
-    }
-    if !original.is_empty() && !o.no_backup {
-        write_backup(&settings_path);
-    }
-    if let Some(parent) = settings_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
-                eprintln!("muse-acp: cannot create {}: {e}", parent.display());
-                return 1;
-            }
-        }
-    }
-    if let Err(e) = std::fs::write(&settings_path, &updated) {
-        eprintln!("muse-acp: cannot write {}: {e}", settings_path.display());
-        return 1;
-    }
-    println!(
-        "muse-acp: {} entry \"{}\" in {} (command: {command})",
-        if outcome == EditOutcome::Updated { "updated" } else { "added" },
-        o.name,
-        settings_path.display()
-    );
-    println!("muse-acp: restart Zed (or reload settings) and select \"{}\" in the Agent panel.", o.name);
-    0
-}
-
-fn cmd_uninstall(o: &InstallerOpts) -> i32 {
-    let settings_path = match &o.settings {
-        Some(s) => std::path::PathBuf::from(s),
-        None => match default_settings_path() {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("muse-acp: {e}");
-                return 1;
-            }
-        },
-    };
-    let original = match std::fs::read_to_string(&settings_path) {
-        Ok(s) => s,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            println!("muse-acp: nothing to do (no settings file at {})", settings_path.display());
-            return 0;
-        }
-        Err(e) => {
-            eprintln!("muse-acp: cannot read {}: {e}", settings_path.display());
-            return 1;
-        }
-    };
-    let (updated, removed) = match uninstall_settings_edit(&original, &o.name) {
-        Ok(x) => x,
-        Err(e) => {
-            eprintln!("muse-acp: {e}");
-            return 1;
-        }
-    };
-    if !removed {
-        println!("muse-acp: nothing to do (no \"{}\" entry in {})", o.name, settings_path.display());
-        return 0;
-    }
-    if o.dry_run {
-        println!("muse-acp: dry run — nothing written");
-        println!("muse-acp: would remove entry \"{}\" from {}", o.name, settings_path.display());
-        return 0;
-    }
-    if !o.no_backup {
-        write_backup(&settings_path);
-    }
-    if let Err(e) = std::fs::write(&settings_path, &updated) {
-        eprintln!("muse-acp: cannot write {}: {e}", settings_path.display());
-        return 1;
-    }
-    println!("muse-acp: removed entry \"{}\" from {}", o.name, settings_path.display());
-    0
-}
-
-// ---------------------------------------------------------------------------
-// Main stdio loop (default: ACP over stdio)
-// ---------------------------------------------------------------------------
-
-fn run_server() {
-    let stdout: StdoutShared = Arc::new(Mutex::new(std::io::stdout()));
-    let sessions: Sessions = Arc::new(Mutex::new(HashMap::new()));
-    let running: RunningMap = Arc::new(Mutex::new(HashMap::new()));
-
-    let stdin = std::io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
-    let mut line = String::new();
-
-    loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF
-            Ok(_) => {}
-            Err(e) => {
-                log(&format!("stdin read error: {e}"));
-                break;
-            }
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let msg = match parse_json(trimmed) {
-            Ok(v) => v,
-            Err(e) => {
-                send_error(&stdout, &None, -32700, &format!("parse error: {e}"));
+    let mut out = Vec::new();
+    if let Ok(r) = host.command(
+        "model/list",
+        &format!("{{\"commandId\":{}}}", esc(&host.mint_cmd("cmd-"))),
+    ) && let Some(J::Arr(models)) = r.get("models")
+    {
+        for m in models {
+            let id = m
+                .get("modelId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
                 continue;
             }
-        };
-        let method = msg.get("method").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let id = msg.get("id").cloned();
-        let params = msg.get("params").cloned();
-
-        match method.as_str() {
-            "" => {
-                // No method: likely a client response to our request; ignore.
-                continue;
-            }
-            "initialize" => {
-                send_result(
-                    &stdout,
-                    &id,
-                    r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":false,"audio":false,"embeddedContext":true},"mcpCapabilities":false,"loadSession":false}}"#,
-                );
-            }
-            "session/new" => {
-                let cwd = params
-                    .as_ref()
-                    .and_then(|p| p.get("cwd"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if cwd.is_empty() {
-                    send_error(&stdout, &id, -32602, "session/new requires params.cwd");
-                    continue;
-                }
-                // mcpServers intentionally ignored (unsupported).
-                let sid = gen_session_id();
-                sessions.lock().unwrap().insert(sid.clone(), Session { cwd });
-                send_result(&stdout, &id, &format!("{{\"sessionId\":{}}}", esc(&sid)));
-            }
-            "session/prompt" => {
-                let sid = params
-                    .as_ref()
-                    .and_then(|p| p.get("sessionId"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if sid.is_empty() {
-                    send_error(&stdout, &id, -32602, "session/prompt requires params.sessionId");
-                    continue;
-                }
-                let text = extract_prompt_text(params.as_ref());
-                if text.trim().is_empty() {
-                    send_error(&stdout, &id, -32602, "session/prompt requires text content");
-                    continue;
-                }
-                let (so, ss, rr) = (stdout.clone(), sessions.clone(), running.clone());
-                std::thread::spawn(move || run_prompt(so, ss, rr, id, sid, text));
-            }
-            "session/cancel" => {
-                let sid = params
-                    .as_ref()
-                    .and_then(|p| p.get("sessionId"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if sid.is_empty() {
-                    continue; // notification: nothing to acknowledge
-                }
-                let target = running.lock().unwrap().get(&sid).cloned();
-                if let Some(h) = target {
-                    h.cancelled.store(true, Ordering::SeqCst);
-                    if let Some(child) = h.child.lock().unwrap().as_mut() {
-                        let _ = child.kill();
-                    }
-                }
-                // Notification: no response per ACP.
-            }
-            "authenticate" | "session/load" | "session/set_mode" | "session/set_model" | "logout" => {
-                send_error(&stdout, &id, -32601, "method not supported by this agent");
-            }
-            "shutdown" | "exit" => {
-                if method == "shutdown" {
-                    send_result(&stdout, &id, "null");
-                }
-                break;
-            }
-            _ => {
-                // Only respond when an id is present (request vs notification).
-                if id.is_some() {
-                    send_error(&stdout, &id, -32601, "method not found");
-                }
-            }
+            let label = m
+                .get("displayLabel")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&id)
+                .to_string();
+            let def = matches!(m.get("isDefault"), Some(J::Bool(true)));
+            out.push((id, label, def));
         }
     }
+    *cell.lock().unwrap() = out.clone();
+    out
 }
 
-// ---------------------------------------------------------------------------
-// Entry point: subcommand dispatch (default = ACP server over stdio)
-// ---------------------------------------------------------------------------
+enum LoopMsg {
+    AcpLine(String),
+    AcpEof,
+    Msp(MspEvent),
+}
+
+const V2_INIT: &str = r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}}}},"info":{"name":"muse-acp","title":"Muse ACP","version":"0.2.0"},"authMethods":[],"_meta":{"steering":{"supported":true}}}"#;
+const V1_INIT: &str = r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":"0.2.0"}}"#;
+
+fn has_nonempty_array(params: Option<&J>, key: &str) -> bool {
+    matches!(
+        params.and_then(|p| p.get(key)),
+        Some(J::Arr(values)) if !values.is_empty()
+    )
+}
+
+fn validate_session_roots(stdout: &StdoutShared, id: &Option<J>, params: Option<&J>) -> bool {
+    let cwd = params
+        .and_then(|p| p.get("cwd"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if cwd.is_empty() || !Path::new(cwd).is_absolute() {
+        acp::send_error(stdout, id, -32602, "params.cwd must be an absolute path");
+        return false;
+    }
+    if has_nonempty_array(params, "mcpServers") {
+        acp::send_error(stdout, id, -32602, "MCP servers are not supported");
+        return false;
+    }
+    if has_nonempty_array(params, "additionalDirectories") {
+        acp::send_error(
+            stdout,
+            id,
+            -32602,
+            "additional directories are not supported",
+        );
+        return false;
+    }
+    true
+}
+
+fn selftest() -> i32 {
+    // Validate every static emitted literal with our own parser, so a
+    // misplaced brace fails here instead of at a live client.
+    for lit in [V2_INIT, V1_INIT] {
+        if let Err(e) = parse_json(lit) {
+            eprintln!("[muse-acp] selftest FAIL: {e} in {lit}");
+            return 1;
+        }
+    }
+    println!("[muse-acp] selftest: static literals OK");
+    0
+}
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match parse_args(&args) {
-        Ok(Cli::Serve) => run_server(),
-        Ok(Cli::Install(o)) => std::process::exit(cmd_install(&o)),
-        Ok(Cli::Uninstall(o)) => std::process::exit(cmd_uninstall(&o)),
-        Ok(Cli::Help) => {
-            println!("muse-acp {} — ACP adapter for the muse CLI", env!("CARGO_PKG_VERSION"));
-            println!();
-            println!("{}", usage());
+    if args.as_slice() == ["--selftest"] {
+        std::process::exit(selftest());
+    }
+    if let Some(exit_code) = zed::dispatch(&args) {
+        std::process::exit(exit_code);
+    }
+    let stdout: StdoutShared = Arc::new(Mutex::new(std::io::stdout()));
+    let sessions: Sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let (tx, rx) = mpsc::channel::<LoopMsg>();
+
+    // ACP stdin pump. EOF ends the adapter: the client is gone, and the
+    // serve host (our child) dies with us.
+    let stdin_tx = tx.clone();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(std::io::stdin());
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = stdin_tx.send(LoopMsg::AcpEof);
+                    break;
+                }
+                Ok(_) => {
+                    if stdin_tx.send(LoopMsg::AcpLine(line.clone())).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    let _ = stdin_tx.send(LoopMsg::AcpEof);
+                    break;
+                }
+            }
         }
-        Ok(Cli::Version) => println!("muse-acp {}", env!("CARGO_PKG_VERSION")),
+    });
+
+    // Serve host + notification forwarder.
+    let (host, msp_rx) = match MspHost::launch() {
+        Ok(h) => h,
         Err(e) => {
-            eprintln!("muse-acp: {e}");
-            eprintln!("{}", usage());
-            std::process::exit(2);
+            eprintln!("[muse-acp] fatal: {e}");
+            std::process::exit(1);
+        }
+    };
+    let fwd_tx = tx.clone();
+    std::thread::spawn(move || {
+        for ev in msp_rx {
+            if fwd_tx.send(LoopMsg::Msp(ev)).is_err() {
+                break;
+            }
+        }
+    });
+
+    for msg in rx {
+        match msg {
+            LoopMsg::AcpLine(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match parse_json(trimmed) {
+                    Ok(v) => handle_acp(&host, &stdout, &sessions, &v),
+                    Err(e) => acp::send_error(&stdout, &None, -32700, &format!("parse error: {e}")),
+                }
+            }
+            LoopMsg::Msp(MspEvent::Notification { method, params }) => {
+                handle_msp(&host, &stdout, &sessions, &method, &params)
+            }
+            LoopMsg::Msp(MspEvent::Request { method, params }) => {
+                // Reissued server requests (multi-stage approvals, resumed
+                // questions) carry their own payloads: bridge them too.
+                match method.as_str() {
+                    "approval/request" => open_approval(&stdout, &sessions, &params),
+                    "userInput/request" => {
+                        handle_msp(&host, &stdout, &sessions, "userInput/requested", &params);
+                    }
+                    _ => log(&format!("unhandled MSP request: {method}")),
+                }
+            }
+            LoopMsg::AcpEof => {
+                std::process::exit(0);
+            }
+            LoopMsg::Msp(MspEvent::Eof(why)) => {
+                log(&format!("serve host gone ({why}); failing in-flight turns"));
+                fail_all(&stdout, &sessions);
+                std::process::exit(1);
+            }
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+fn negotiated_ver() -> u8 {
+    match VER.load(Ordering::SeqCst) {
+        2 => 2,
+        _ => 1,
+    }
+}
 
-    fn env1() -> Vec<(String, String)> {
-        vec![("FOO".to_string(), "bar".to_string())]
+fn send_v2_user_message(stdout: &StdoutShared, sid: &str, content: &str) {
+    let msg_id = mint_id("msg-", &ID_COUNTER);
+    acp::send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"user_message\",\"messageId\":{},\"content\":{}}}}}}}",
+            esc(sid),
+            esc(&msg_id),
+            content
+        ),
+    );
+}
+
+fn steering_prompt_required(params: Option<&J>) -> Result<bool, String> {
+    let Some(meta) = params.and_then(|p| p.get("_meta")) else {
+        return Ok(false);
+    };
+    if matches!(meta, J::Null) {
+        return Ok(false);
+    }
+    if !matches!(meta, J::Obj(_)) {
+        return Err("steering _meta must be an object".to_string());
+    }
+    let Some(steering) = meta.get("steering") else {
+        return Ok(false);
+    };
+    if !matches!(steering, J::Obj(_)) {
+        return Err("steering _meta.steering must be an object".to_string());
+    }
+    match steering.get("idleBehavior") {
+        None | Some(J::Null) => Ok(false),
+        Some(J::Str(value)) if value == "promptRequired" => Ok(true),
+        Some(J::Str(_)) => Err("unsupported steering idleBehavior".to_string()),
+        Some(_) => Err("steering idleBehavior must be a string".to_string()),
+    }
+}
+
+fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, msg: &J) {
+    let method = msg
+        .get("method")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let id = msg.get("id").cloned();
+    let params = msg.get("params").cloned();
+
+    // No method: a client response — maybe to our session/request_permission
+    // or elicitation/create.
+    if method.is_empty() {
+        if id.is_some() {
+            complete_permission(host, stdout, sessions, &id, msg);
+            complete_elicitation(host, stdout, sessions, &id, msg);
+        }
+        return;
     }
 
-    #[test]
-    fn fresh_file_creates_agent_servers() {
-        let (out, outcome) = install_settings_edit("", "muse-acp", "/bin/muse-acp", &[]).unwrap();
-        assert_eq!(outcome, EditOutcome::Added);
-        assert!(check_valid_jsonc_object(&out));
-        assert!(out.contains("\"agent_servers\""));
-        assert!(out.contains("\"command\": \"/bin/muse-acp\""));
-        assert!(out.contains("\"type\": \"custom\""));
-    }
-
-    #[test]
-    fn preserves_comments_and_other_keys() {
-        let original = "{\n  // theme comment\n  \"theme\": \"One Dark\",\n  /* block\n     comment */\n  \"tab_size\": 4,\n}\n";
-        let (out, _) = install_settings_edit(original, "muse-acp", "/bin/muse-acp", &env1()).unwrap();
-        assert!(out.contains("// theme comment"));
-        assert!(out.contains("/* block\n     comment */"));
-        assert!(out.contains("\"theme\": \"One Dark\""));
-        assert!(out.contains("\"FOO\": \"bar\""));
-        assert!(check_valid_jsonc_object(&out));
-    }
-
-    #[test]
-    fn install_is_idempotent() {
-        let original = "{\n  \"theme\": \"x\",\n}\n";
-        let (once, _) = install_settings_edit(original, "muse-acp", "/bin/muse-acp", &[]).unwrap();
-        let (twice, outcome) = install_settings_edit(&once, "muse-acp", "/bin/muse-acp", &[]).unwrap();
-        assert_eq!(outcome, EditOutcome::Updated);
-        assert_eq!(once, twice);
-    }
-
-    #[test]
-    fn replaces_existing_entry_keeps_siblings() {
-        let original = "{\n  \"agent_servers\": {\n    \"other\": {\n      \"type\": \"custom\",\n      \"command\": \"other-bin\"\n    },\n    \"muse-acp\": {\n      \"type\": \"custom\",\n      \"command\": \"/old/path\"\n    }\n  }\n}\n";
-        let (out, outcome) = install_settings_edit(original, "muse-acp", "/new/path", &[]).unwrap();
-        assert_eq!(outcome, EditOutcome::Updated);
-        assert!(out.contains("\"command\": \"/new/path\""));
-        assert!(!out.contains("/old/path"));
-        assert!(out.contains("\"other\""));
-        assert!(out.contains("other-bin"));
-        assert!(check_valid_jsonc_object(&out));
-    }
-
-    #[test]
-    fn handles_trailing_commas() {
-        let original = "{\n  \"agent_servers\": {\n    \"other\": {\"command\": \"x\",},\n  },\n  \"theme\": \"y\",\n}\n";
-        let (out, _) = install_settings_edit(original, "muse-acp", "/bin/muse-acp", &[]).unwrap();
-        assert!(out.contains("\"other\""));
-        assert!(out.contains("\"muse-acp\""));
-        assert!(check_valid_jsonc_object(&out));
-    }
-
-    #[test]
-    fn rejects_non_object_root_and_agent_servers() {
-        assert!(install_settings_edit("[1,2]", "muse-acp", "/b", &[]).is_err());
-        let bad = "{ \"agent_servers\": null }";
-        assert!(install_settings_edit(bad, "muse-acp", "/b", &[]).is_err());
-    }
-
-    #[test]
-    fn uninstall_removes_entry_and_empty_parent() {
-        let original = "{\n  // keep me\n  \"theme\": \"x\",\n  \"agent_servers\": {\n    \"muse-acp\": {\n      \"type\": \"custom\",\n      \"command\": \"/bin/muse-acp\"\n    }\n  }\n}\n";
-        let (out, removed) = uninstall_settings_edit(original, "muse-acp").unwrap();
-        assert!(removed);
-        assert!(!out.contains("muse-acp"));
-        assert!(!out.contains("agent_servers"));
-        assert!(out.contains("// keep me"));
-        assert!(out.contains("\"theme\": \"x\""));
-        assert!(check_valid_jsonc_object(&out));
-    }
-
-    #[test]
-    fn uninstall_keeps_siblings() {
-        let original = "{\n  \"agent_servers\": {\n    \"other\": {\"command\": \"x\"},\n    \"muse-acp\": {\"command\": \"y\"}\n  }\n}\n";
-        let (out, removed) = uninstall_settings_edit(original, "muse-acp").unwrap();
-        assert!(removed);
-        assert!(!out.contains("muse-acp"));
-        assert!(out.contains("\"agent_servers\""));
-        assert!(out.contains("\"other\""));
-        assert!(check_valid_jsonc_object(&out));
-    }
-
-    #[test]
-    fn uninstall_last_entry_collapses_file() {
-        let (out, _) = install_settings_edit("", "muse-acp", "muse-acp", &[]).unwrap();
-        let (out, removed) = uninstall_settings_edit(&out, "muse-acp").unwrap();
-        assert!(removed);
-        assert_eq!(out, "{}\n");
-    }
-
-    #[test]
-    fn uninstall_missing_entry_is_noop() {
-        let original = "{ \"theme\": \"x\" }\n";
-        let (out, removed) = uninstall_settings_edit(original, "muse-acp").unwrap();
-        assert!(!removed);
-        assert_eq!(out, original);
-    }
-
-    #[test]
-    fn arg_parsing() {
-        assert!(matches!(parse_args(&[]).unwrap(), Cli::Serve));
-        assert!(matches!(parse_args(&["help".into()]).unwrap(), Cli::Help));
-        let args = vec!["install".into(), "--name=n".into(), "--env".into(), "A=B".into(), "--dry-run".into()];
-        match parse_args(&args).unwrap() {
-            Cli::Install(o) => {
-                assert_eq!(o.name, "n");
-                assert_eq!(o.command, "muse-acp");
-                assert_eq!(o.env, vec![("A".to_string(), "B".to_string())]);
-                assert!(o.dry_run);
+    match method.as_str() {
+        "initialize" => {
+            let v = params
+                .as_ref()
+                .and_then(|p| p.get("protocolVersion"))
+                .and_then(|n| n.as_u64())
+                .unwrap_or(1);
+            let v = if v >= 2 { 2 } else { 1 };
+            VER.store(v, Ordering::SeqCst);
+            // v2 elicitation support gates the userInput bridge.
+            let form = params
+                .as_ref()
+                .and_then(|p| p.get("capabilities"))
+                .and_then(|c| c.get("elicitation"))
+                .and_then(|e| e.get("form"))
+                .is_some_and(|f| matches!(f, J::Obj(_)));
+            ELICIT_FORM.store(u64::from(v == 2 && form), Ordering::SeqCst);
+            if v == 2 {
+                acp::send_result(stdout, &id, V2_INIT);
+            } else {
+                acp::send_result(stdout, &id, V1_INIT);
             }
-            _ => panic!("expected install"),
         }
-        match parse_args(&["install".into(), "--command=/x/y".into()]).unwrap() {
-            Cli::Install(o) => assert_eq!(o.command, "/x/y"),
-            _ => panic!("expected install"),
+        "session/new" => {
+            let ver = negotiated_ver();
+            if !validate_session_roots(stdout, &id, params.as_ref()) {
+                return;
+            }
+            let cwd = params
+                .as_ref()
+                .and_then(|p| p.get("cwd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            // Optional approval posture, applied atomically at start: an
+            // operator-specified posture must not silently fall back.
+            let mode_env = std::env::var("MUSE_APPROVAL_MODE").unwrap_or_default();
+            let resolved_env = acp::resolve_mode(mode_env.trim());
+            let start_mode = if mode_env.trim().is_empty() {
+                String::new()
+            } else {
+                match resolved_env {
+                    Some(m) => format!(",\"approvalMode\":{}", esc(m)),
+                    None => {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32602,
+                            "MUSE_APPROVAL_MODE must be ask|auto|deny or a host mode",
+                        );
+                        return;
+                    }
+                }
+            };
+            let cmd = host.mint_cmd("cmd-");
+            let res = host.command(
+                "session/start",
+                &format!(
+                    "{{\"commandId\":{},\"workspaceRoot\":{}{}}}",
+                    esc(&cmd),
+                    esc(&cwd),
+                    start_mode
+                ),
+            );
+            match res {
+                Ok(r) => {
+                    let msp_sid = match r
+                        .get("session")
+                        .and_then(|s| s.get("sessionId"))
+                        .and_then(|v| v.as_str())
+                    {
+                        Some(s) => s.to_string(),
+                        None => {
+                            acp::send_error(
+                                stdout,
+                                &id,
+                                -32603,
+                                "session/start returned no session.sessionId",
+                            );
+                            return;
+                        }
+                    };
+                    // The host reports the folded mode in
+                    // session.approvalMode.mode; without an explicit request
+                    // we adopt the host default, with one we require a match.
+                    let mut applied_mode =
+                        host_mode(&r).unwrap_or_else(|| "promptUnmatched".to_string());
+                    if !start_mode.is_empty() {
+                        match (resolved_env, host_mode(&r)) {
+                            (Some(want), Some(got)) if got.as_str() == want => {
+                                applied_mode = got;
+                            }
+                            (Some(_), Some(got)) => {
+                                acp::send_error(
+                                    stdout,
+                                    &id,
+                                    -32603,
+                                    &format!(
+                                        "requested approval mode was not applied (host reports {got})"
+                                    ),
+                                );
+                                return;
+                            }
+                            (Some(want), None) => {
+                                applied_mode = want.to_string();
+                            }
+                            (None, _) => {}
+                        }
+                    }
+                    let sid = mint_id("sess-", &ID_COUNTER);
+                    let cur_mode = applied_mode;
+                    let cur_model = r
+                        .get("session")
+                        .and_then(|s| s.get("modelId"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let cur_cursor = r
+                        .get("viewCursor")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let active_turn = r
+                        .get("session")
+                        .and_then(|s| s.get("activeTurnId"))
+                        .and_then(|v| v.as_str())
+                        .map(str::to_string);
+                    sessions.lock().unwrap().insert(
+                        sid.clone(),
+                        AcpSession {
+                            acp_sid: sid.clone(),
+                            msp_sid: msp_sid.clone(),
+                            cwd: cwd.clone(),
+                            ver,
+                            in_flight: Vec::new(),
+                            pending_perm: None,
+                            pending_ui: Vec::new(),
+                            mode_value: acp::mode_from_msp(&cur_mode).to_string(),
+                            model_value: cur_model.clone(),
+                            reasoning_effort: "medium".to_string(),
+                            active_turn,
+                            view_cursor: cur_cursor.clone(),
+                            fold: SessionFold::new(),
+                        },
+                    );
+                    // _meta exposes the host session id: pass it back to
+                    // session/resume to reconnect after an adapter restart.
+                    // v2 also advertises mode + model selectors.
+                    let result = if ver == 2 {
+                        let models = catalog(host);
+                        format!(
+                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
+                            esc(&sid),
+                            esc(&msp_sid),
+                            acp::config_options(
+                                acp::mode_from_msp(&cur_mode),
+                                &cur_model,
+                                "medium",
+                                &models,
+                            )
+                        )
+                    } else {
+                        format!(
+                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}}}}",
+                            esc(&sid),
+                            esc(&msp_sid)
+                        )
+                    };
+                    acp::send_result(stdout, &id, &result);
+                }
+                Err(e) => acp::send_error(
+                    stdout,
+                    &id,
+                    -32603,
+                    &format!("session/start failed: {}", err_message(&e)),
+                ),
+            }
         }
-        assert!(parse_args(&["install".into(), "--bogus".into()]).is_err());
-        assert!(parse_args(&["uninstall".into(), "--env".into(), "A=B".into()]).is_err());
-        assert!(parse_args(&["frobnicate".into()]).is_err());
+        "session/resume" | "session/load" => {
+            let ver = negotiated_ver();
+            if !validate_session_roots(stdout, &id, params.as_ref()) {
+                return;
+            }
+            let resume_cwd = params
+                .as_ref()
+                .and_then(|p| p.get("cwd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if sid.is_empty() {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    "session resume requires params.sessionId",
+                );
+                return;
+            }
+            // Known ACP session: re-attach. Unknown id: try it as a host
+            // session id directly (cross-restart resume), then adopt it.
+            let msp_sid = sessions
+                .lock()
+                .unwrap()
+                .get(&sid)
+                .map(|s| s.msp_sid.clone())
+                .unwrap_or_else(|| sid.clone());
+            let cmd = host.mint_cmd("cmd-");
+            // Ask for inline history explicitly; the host may still downgrade
+            // (history.mode reports what was served).
+            match host.command(
+                "session/resume",
+                &format!(
+                    "{{\"commandId\":{},\"sessionId\":{},\"history\":\"inline\"}}",
+                    esc(&cmd),
+                    esc(&msp_sid)
+                ),
+            ) {
+                Ok(r) => {
+                    // Pending questions/approvals survive reconnects; the host
+                    // re-issues their requests, which the normal bridge picks
+                    // up. Log them so a stuck-looking turn is diagnosable.
+                    if let Some(J::Arr(pend)) = r.get("pendingRequests") {
+                        for p in pend {
+                            log(&format!("resume: pending request {}", j_to_string(p)));
+                        }
+                    }
+                    if let Some(h) = r.get("history") {
+                        let mode = h.get("mode").and_then(|v| v.as_str()).unwrap_or("?");
+                        if mode != "inline" {
+                            log(&format!(
+                                "resume: history downgraded to {mode}; replay may be partial"
+                            ));
+                        }
+                    }
+                    let real_msp = r
+                        .get("session")
+                        .and_then(|s| s.get("sessionId"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&msp_sid)
+                        .to_string();
+                    let real_model = r
+                        .get("session")
+                        .and_then(|s| s.get("modelId"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    // v1 session/load always replays; v2 resumes replay only
+                    // with replayFrom; v1 session/resume reconnects silently.
+                    let replay = method == "session/load"
+                        || (method == "session/resume"
+                            && ver == 2
+                            && params.as_ref().and_then(|p| p.get("replayFrom")).is_some());
+                    {
+                        let mut map = sessions.lock().unwrap();
+                        let entry = map.entry(sid.clone()).or_insert_with(|| AcpSession {
+                            acp_sid: sid.clone(),
+                            msp_sid: real_msp.clone(),
+                            cwd: resume_cwd.clone(),
+                            ver,
+                            in_flight: Vec::new(),
+                            pending_perm: None,
+                            pending_ui: Vec::new(),
+                            mode_value: "ask".to_string(),
+                            model_value: String::new(),
+                            reasoning_effort: "medium".to_string(),
+                            active_turn: None,
+                            view_cursor: String::new(),
+                            fold: SessionFold::new(),
+                        });
+                        entry.msp_sid = real_msp;
+                        entry.ver = ver;
+                        if !resume_cwd.is_empty() {
+                            entry.cwd = resume_cwd;
+                        }
+                        if !real_model.is_empty() {
+                            entry.model_value = real_model;
+                        }
+                        entry.active_turn = r
+                            .get("session")
+                            .and_then(|s| s.get("activeTurnId"))
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string);
+                        // Refresh the mode selector from the folded host
+                        // mode so resumed clients are not stuck stale.
+                        if let Some(m) = host_mode(&r) {
+                            entry.mode_value = acp::mode_from_msp(&m).to_string();
+                        }
+                        if replay {
+                            replay_history(stdout, entry, &r);
+                        }
+                    }
+                    let msp_out = sessions
+                        .lock()
+                        .unwrap()
+                        .get(&sid)
+                        .map(|s| s.msp_sid.clone())
+                        .unwrap_or_default();
+                    // v2 resumes also report current selectors; v1 keeps the
+                    // historical shape.
+                    let result = if ver == 2 {
+                        let (mode_v, model_v, reasoning_v) = sessions
+                            .lock()
+                            .unwrap()
+                            .get(&sid)
+                            .map(|s| {
+                                (
+                                    s.mode_value.clone(),
+                                    s.model_value.clone(),
+                                    s.reasoning_effort.clone(),
+                                )
+                            })
+                            .unwrap_or_default();
+                        let models = catalog(host);
+                        format!(
+                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
+                            esc(&sid),
+                            esc(&msp_out),
+                            acp::config_options(&mode_v, &model_v, &reasoning_v, &models)
+                        )
+                    } else {
+                        format!(
+                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}}}}",
+                            esc(&sid),
+                            esc(&msp_out)
+                        )
+                    };
+                    acp::send_result(stdout, &id, &result);
+                }
+                Err(e) => acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    &format!("resume failed: {}", err_message(&e)),
+                ),
+            }
+        }
+        "session/prompt" => {
+            let ver = negotiated_ver();
+            let sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let (msp_sid, cwd, reasoning_effort) = match sessions.lock().unwrap().get(&sid) {
+                Some(s) => (s.msp_sid.clone(), s.cwd.clone(), s.reasoning_effort.clone()),
+                None => {
+                    acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                    return;
+                }
+            };
+            let (parts, acp_content) = match extract_prompt_parts(params.as_ref(), &cwd) {
+                Ok((p, c)) if !p.is_empty() => (p, c),
+                Ok(_) => {
+                    acp::send_error(stdout, &id, -32602, "session/prompt requires content");
+                    return;
+                }
+                Err(e) => {
+                    acp::send_error(stdout, &id, -32602, &e);
+                    return;
+                }
+            };
+            // The host queues concurrent turns itself (ifBusy defaults to
+            // queue); track every in-flight turn so each completes its own
+            // prompt response.
+            let cmd = host.mint_cmd("cmd-");
+            let input = format!("[{}]", parts.join(","));
+            match host.command(
+                "turn/start",
+                &format!(
+                    "{{\"commandId\":{},\"sessionId\":{},\"input\":{},\"reasoningEffort\":{}}}",
+                    esc(&cmd),
+                    esc(&msp_sid),
+                    input,
+                    esc(&reasoning_effort)
+                ),
+            ) {
+                Ok(r) => {
+                    let turn = r
+                        .get("turnId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if turn.is_empty() {
+                        acp::send_error(stdout, &id, -32603, "turn/start returned no turnId");
+                        return;
+                    }
+                    let started = r
+                        .get("disposition")
+                        .and_then(|v| v.as_str())
+                        .is_none_or(|value| value == "started");
+                    if let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
+                        s.in_flight.push(InFlight {
+                            msp_turn: turn.clone(),
+                            req_id: id.clone().unwrap_or(J::Null),
+                        });
+                        if started {
+                            s.active_turn = Some(turn);
+                        }
+                    }
+                    if ver == 2 {
+                        // Accepted: empty response, then the user-message echo
+                        // (v2 MUST), then running.
+                        acp::send_result(stdout, &id, "{}");
+                        send_v2_user_message(stdout, &sid, &acp_content);
+                        acp::send_state(stdout, &sid, "running", None);
+                    } else {
+                        // v1 prompt flow echoes user content as chunks.
+                        let msg_id = mint_id("msg-", &ID_COUNTER);
+                        if let Ok(J::Arr(blocks)) = parse_json(&acp_content) {
+                            for b in blocks {
+                                acp::send_raw(
+                                    stdout,
+                                    &format!(
+                                        "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":{},\"content\":{}}}}}}}",
+                                        esc(&sid),
+                                        esc(&msg_id),
+                                        j_to_string(&b)
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    // v1: the prompt response arrives with the terminal.
+                }
+                Err(e) => {
+                    let code = err_code(&e);
+                    if code == -32000 || err_message(&e).contains("already_terminal") {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32603,
+                            &format!("turn rejected: {}", err_message(&e)),
+                        );
+                    } else {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32603,
+                            &format!("turn/start failed: {}", err_message(&e)),
+                        );
+                    }
+                }
+            }
+        }
+        "_session/steering" => {
+            if negotiated_ver() != 2 {
+                acp::send_error(stdout, &id, -32601, "steering requires ACP v2");
+                return;
+            }
+            let prompt_required = match steering_prompt_required(params.as_ref()) {
+                Ok(value) => value,
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
+            let sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let (msp_sid, cwd, reasoning_effort, active_turn) =
+                match sessions.lock().unwrap().get(&sid) {
+                    Some(s) => (
+                        s.msp_sid.clone(),
+                        s.cwd.clone(),
+                        s.reasoning_effort.clone(),
+                        s.active_turn.clone(),
+                    ),
+                    None => {
+                        acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                        return;
+                    }
+                };
+            let (parts, acp_content) = match extract_prompt_parts(params.as_ref(), &cwd) {
+                Ok((parts, content)) if !parts.is_empty() => (parts, content),
+                Ok(_) => {
+                    acp::send_error(stdout, &id, -32602, "steering requires content");
+                    return;
+                }
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
+            if active_turn.is_none() && prompt_required {
+                acp::send_result(
+                    stdout,
+                    &id,
+                    "{\"outcome\":\"promptRequired\",\"reason\":\"noRunningTurn\"}",
+                );
+                return;
+            }
+            let cmd = host.mint_cmd("cmd-");
+            let input = format!("[{}]", parts.join(","));
+            let result = match active_turn.as_deref() {
+                Some(expected_turn) => host.command(
+                    "turn/steer",
+                    &format!(
+                        "{{\"commandId\":{},\"sessionId\":{},\"expectedTurnId\":{},\"input\":{},\"reasoningEffort\":{}}}",
+                        esc(&cmd),
+                        esc(&msp_sid),
+                        esc(expected_turn),
+                        input,
+                        esc(&reasoning_effort)
+                    ),
+                ),
+                None => host.command(
+                    "turn/start",
+                    &format!(
+                        "{{\"commandId\":{},\"sessionId\":{},\"input\":{},\"ifBusy\":\"steer\",\"reasoningEffort\":{}}}",
+                        esc(&cmd),
+                        esc(&msp_sid),
+                        input,
+                        esc(&reasoning_effort)
+                    ),
+                ),
+            };
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    acp::send_error(
+                        stdout,
+                        &id,
+                        -32603,
+                        &format!("steering failed: {}", err_message(&error)),
+                    );
+                    return;
+                }
+            };
+            let turn = result
+                .get("turnId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if turn.is_empty() {
+                acp::send_error(stdout, &id, -32603, "steering returned no turnId");
+                return;
+            }
+            let (outcome, started_new) = if let Some(expected) = active_turn.as_deref() {
+                if turn != expected {
+                    acp::send_error(
+                        stdout,
+                        &id,
+                        -32603,
+                        "turn/steer returned a different turnId",
+                    );
+                    return;
+                }
+                ("injected", false)
+            } else {
+                match result.get("disposition").and_then(|v| v.as_str()) {
+                    Some("started") => ("startedNewTurn", true),
+                    Some("steered") => ("injected", false),
+                    Some(other) => {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32603,
+                            &format!("unexpected steering disposition '{other}'"),
+                        );
+                        return;
+                    }
+                    None => {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32603,
+                            "steering turn/start returned no disposition",
+                        );
+                        return;
+                    }
+                }
+            };
+            if started_new && let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
+                s.active_turn = Some(turn.clone());
+                s.in_flight.push(InFlight {
+                    msp_turn: turn,
+                    req_id: J::Null,
+                });
+            }
+            // Acknowledge the extension before emitting the synthetic echo.
+            acp::send_result(stdout, &id, &format!("{{\"outcome\":{}}}", esc(outcome)));
+            send_v2_user_message(stdout, &sid, &acp_content);
+            acp::send_state(stdout, &sid, "running", None);
+        }
+        "session/close" => {
+            // v2 baseline: stop session work, drop local state, resolve
+            // pending client interactions as cancelled, return {}.
+            let sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if sid.is_empty() {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    "session/close requires params.sessionId",
+                );
+                return;
+            }
+            let turns = sessions
+                .lock()
+                .unwrap()
+                .get(&sid)
+                .map(|s| {
+                    let msp = s.msp_sid.clone();
+                    s.in_flight
+                        .iter()
+                        .map(|f| (msp.clone(), f.msp_turn.clone(), f.req_id.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            for (msp_sid, turn_id, req_id) in &turns {
+                let cmd = host.mint_cmd("cmd-");
+                let _ = host.command(
+                    "turn/cancel",
+                    &format!(
+                        "{{\"commandId\":{},\"sessionId\":{},\"turnId\":{}}}",
+                        esc(&cmd),
+                        esc(msp_sid),
+                        esc(turn_id)
+                    ),
+                );
+                let _ = req_id;
+            }
+            let removed = sessions.lock().unwrap().remove(&sid);
+            match removed {
+                Some(s) => {
+                    for f in s.in_flight {
+                        if s.ver == 2 {
+                            acp::send_state(stdout, &sid, "idle", Some("cancelled"));
+                        } else {
+                            acp::send_result(
+                                stdout,
+                                &Some(f.req_id),
+                                "{\"stopReason\":\"cancelled\"}",
+                            );
+                        }
+                    }
+                    for p in s.pending_ui {
+                        acp::send_error(stdout, &Some(p.req_id), -32800, "session closed");
+                    }
+                    if let Some(p) = s.pending_perm {
+                        acp::send_error(stdout, &Some(p.req_id), -32800, "session closed");
+                    }
+                    acp::send_result(stdout, &id, "{}");
+                }
+                None => acp::send_error(stdout, &id, -32602, "unknown sessionId"),
+            }
+        }
+        "session/cancel" => {
+            let sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if sid.is_empty() {
+                return; // notification: nothing to acknowledge
+            }
+            let turns = sessions
+                .lock()
+                .unwrap()
+                .get(&sid)
+                .map(|s| {
+                    let msp = s.msp_sid.clone();
+                    s.in_flight
+                        .iter()
+                        .map(|f| (msp.clone(), f.msp_turn.clone()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            // session/cancel stops all session work: cancel every in-flight turn.
+            for (msp_sid, turn_id) in turns {
+                let cmd = host.mint_cmd("cmd-");
+                match host.command(
+                    "turn/cancel",
+                    &format!(
+                        "{{\"commandId\":{},\"sessionId\":{},\"turnId\":{}}}",
+                        esc(&cmd),
+                        esc(&msp_sid),
+                        esc(&turn_id)
+                    ),
+                ) {
+                    Ok(_) => {}
+                    Err(e) => {
+                        // already_terminal just means the terminal event is on
+                        // its way (or arrived); anything else is real.
+                        if !(err_message(&e).contains("already_terminal") || err_code(&e) == -32000)
+                        {
+                            log(&format!("turn/cancel failed: {}", err_message(&e)));
+                        }
+                    }
+                }
+            }
+            // Pending permission answers stay open: per ACP the client answers
+            // them Cancelled itself as part of cancellation.
+        }
+        "session/list" => {
+            let cmd = host.mint_cmd("cmd-");
+            match host.command("session/list", &format!("{{\"commandId\":{}}}", esc(&cmd))) {
+                Ok(r) => {
+                    // Report the sessions this adapter owns.
+                    let map = sessions.lock().unwrap();
+                    let ids: Vec<String> = map
+                        .keys()
+                        .map(|k| format!("{{\"sessionId\":{}}}", esc(k)))
+                        .collect();
+                    drop(map);
+                    let _ = r;
+                    acp::send_result(
+                        stdout,
+                        &id,
+                        &format!("{{\"sessions\":[{}]}}", ids.join(",")),
+                    );
+                }
+                Err(e) => acp::send_error(
+                    stdout,
+                    &id,
+                    -32603,
+                    &format!("session/list failed: {}", err_message(&e)),
+                ),
+            }
+        }
+        "session/set_config_option" => {
+            // v2 config selectors: approval posture, model, and per-turn reasoning.
+            let sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let key = params
+                .as_ref()
+                .and_then(|p| p.get("configId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let value = params
+                .as_ref()
+                .and_then(|p| p.get("value"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let msp_sid = match sessions.lock().unwrap().get(&sid) {
+                Some(s) => s.msp_sid.clone(),
+                None => {
+                    acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                    return;
+                }
+            };
+            let cmd = host.mint_cmd("cmd-");
+            let r = match key.as_str() {
+                "mode" => match acp::resolve_mode(&value) {
+                    Some(m) => host.command(
+                        "session/setApprovalMode",
+                        &format!(
+                            "{{\"commandId\":{},\"sessionId\":{},\"mode\":{}}}",
+                            esc(&cmd),
+                            esc(&msp_sid),
+                            esc(m)
+                        ),
+                    ),
+                    None => {
+                        acp::send_error(stdout, &id, -32602, "mode must be ask|auto|deny");
+                        return;
+                    }
+                },
+                "model" => host.command(
+                    "session/setModel",
+                    &format!(
+                        "{{\"commandId\":{},\"sessionId\":{},\"model\":{{\"modelId\":{}}}}}",
+                        esc(&cmd),
+                        esc(&msp_sid),
+                        esc(&value)
+                    ),
+                ),
+                "reasoning_effort" => {
+                    if acp::is_reasoning_effort(&value) {
+                        Ok(J::Null)
+                    } else {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32602,
+                            "reasoning_effort must be none|minimal|low|medium|high|xhigh|ultra",
+                        );
+                        return;
+                    }
+                }
+                _ => {
+                    acp::send_error(
+                        stdout,
+                        &id,
+                        -32602,
+                        "unknown configId (want mode|model|reasoning_effort)",
+                    );
+                    return;
+                }
+            };
+            match r {
+                Ok(res) => {
+                    // Return the full updated option set, not just the delta.
+                    // The host echoes the folded mode; prefer it over the
+                    // request so a downgraded apply cannot desync selectors.
+                    let folded = res
+                        .get("effectiveMode")
+                        .and_then(|e| e.get("mode"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    if let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
+                        match key.as_str() {
+                            "mode" => {
+                                let m = folded
+                                    .as_deref()
+                                    .or_else(|| acp::resolve_mode(&value))
+                                    .unwrap_or("promptUnmatched");
+                                s.mode_value = acp::mode_from_msp(m).to_string();
+                            }
+                            "model" => s.model_value = value.clone(),
+                            "reasoning_effort" => s.reasoning_effort = value.clone(),
+                            _ => unreachable!(),
+                        }
+                        let models = catalog(host);
+                        acp::send_result(
+                            stdout,
+                            &id,
+                            &format!(
+                                "{{\"configOptions\":{}}}",
+                                acp::config_options(
+                                    &s.mode_value,
+                                    &s.model_value,
+                                    &s.reasoning_effort,
+                                    &models,
+                                )
+                            ),
+                        );
+                    } else {
+                        acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                    }
+                }
+                Err(e) => acp::send_error(
+                    stdout,
+                    &id,
+                    -32603,
+                    &format!("set failed: {}", err_message(&e)),
+                ),
+            }
+        }
+        "session/set_mode" => {
+            // v1 operating mode switch, same ask|auto|deny vocabulary.
+            let sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let value = params
+                .as_ref()
+                .and_then(|p| p.get("mode"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let msp_sid = match sessions.lock().unwrap().get(&sid) {
+                Some(s) => s.msp_sid.clone(),
+                None => {
+                    acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                    return;
+                }
+            };
+            match acp::resolve_mode(&value) {
+                Some(m) => {
+                    let cmd = host.mint_cmd("cmd-");
+                    match host.command(
+                        "session/setApprovalMode",
+                        &format!(
+                            "{{\"commandId\":{},\"sessionId\":{},\"mode\":{}}}",
+                            esc(&cmd),
+                            esc(&msp_sid),
+                            esc(m)
+                        ),
+                    ) {
+                        Ok(_) => {
+                            if let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
+                                s.mode_value = acp::mode_from_msp(m).to_string();
+                            }
+                            acp::send_result(stdout, &id, &format!("{{\"mode\":{}}}", esc(&value)))
+                        }
+                        Err(e) => acp::send_error(
+                            stdout,
+                            &id,
+                            -32603,
+                            &format!("set failed: {}", err_message(&e)),
+                        ),
+                    }
+                }
+                None => acp::send_error(stdout, &id, -32602, "mode must be ask|auto|deny"),
+            }
+        }
+        "session/set_model" => {
+            let sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let value = params
+                .as_ref()
+                .and_then(|p| p.get("model"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if value.is_empty() {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    "session/set_model requires params.model",
+                );
+                return;
+            }
+            let msp_sid = match sessions.lock().unwrap().get(&sid) {
+                Some(s) => s.msp_sid.clone(),
+                None => {
+                    acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                    return;
+                }
+            };
+            let cmd = host.mint_cmd("cmd-");
+            match host.command(
+                "session/setModel",
+                &format!(
+                    "{{\"commandId\":{},\"sessionId\":{},\"model\":{{\"modelId\":{}}}}}",
+                    esc(&cmd),
+                    esc(&msp_sid),
+                    esc(&value)
+                ),
+            ) {
+                Ok(_) => {
+                    if let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
+                        s.model_value = value.clone();
+                    }
+                    acp::send_result(stdout, &id, &format!("{{\"model\":{}}}", esc(&value)))
+                }
+                Err(e) => acp::send_error(
+                    stdout,
+                    &id,
+                    -32603,
+                    &format!("set failed: {}", err_message(&e)),
+                ),
+            }
+        }
+        "authenticate" | "auth/login" | "auth/logout" | "logout" => {
+            // The host exposes no auth surface (authMethods is []); there is
+            // nothing to log in to. muse credentials live outside ACP.
+            acp::send_error(stdout, &id, -32601, "method not supported by this agent");
+        }
+        "shutdown" | "exit" => {
+            if method == "shutdown" {
+                acp::send_result(stdout, &id, "null");
+            }
+            std::process::exit(0);
+        }
+        _ => {
+            if id.is_some() {
+                acp::send_error(stdout, &id, -32601, "method not found");
+            }
+        }
+    }
+}
+
+/// History replay for `session/load` (always) and v2 `session/resume` with
+/// `replayFrom`. Messages replay as message updates/chunks; tool calls replay
+/// as completed tool updates (history carries args but no output text).
+/// Unknown shapes resume without replay (logged), never fail.
+fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) {
+    let items = match resume_res.get("history").and_then(|h| h.get("items")) {
+        Some(J::Arr(v)) => v.clone(),
+        _ => {
+            log("resume: unrecognized history shape; resumed without replay");
+            return;
+        }
+    };
+    let mut out = Vec::new();
+    for it in &items {
+        let kind = it.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        match kind {
+            "toolCall" => {
+                // Fold replays the call (title/kind/status/args, no content).
+                let wrap = J::Obj(vec![("item".to_string(), it.clone())]);
+                sess.fold
+                    .on_item_completed(&sess.acp_sid, sess.ver, &wrap, &mut out);
+            }
+            "userMessage" | "agentMessage" => {
+                let text = it.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if text.is_empty() {
+                    continue;
+                }
+                let msg_id = mint_id("msg-", &ID_COUNTER);
+                let content = format!("[{{\"type\":\"text\",\"text\":{}}}]", esc(text));
+                // v1 replays stream chunks; v2 replays full message upserts.
+                let update = match (kind, sess.ver) {
+                    ("userMessage", 2) => format!(
+                        "{{\"sessionUpdate\":\"user_message\",\"messageId\":{},\"content\":{}}}",
+                        esc(&msg_id),
+                        content
+                    ),
+                    ("agentMessage", 2) => format!(
+                        "{{\"sessionUpdate\":\"agent_message\",\"messageId\":{},\"content\":{}}}",
+                        esc(&msg_id),
+                        content
+                    ),
+                    _ => format!(
+                        "{{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}",
+                        esc(&msg_id),
+                        esc(text)
+                    ),
+                };
+                // v1 agent messages replay as agent chunks.
+                let update = if kind == "agentMessage" && sess.ver != 2 {
+                    format!(
+                        "{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}",
+                        esc(&msg_id),
+                        esc(text)
+                    )
+                } else {
+                    update
+                };
+                out.push(format!("{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{}}}}}", esc(&sess.acp_sid), update));
+            }
+            _ => {}
+        }
+    }
+    for line in out {
+        acp::send_raw(stdout, &line);
+    }
+}
+
+fn mime_for(path: &str) -> &'static str {
+    let p = path.to_lowercase();
+    if p.ends_with(".png") {
+        "image/png"
+    } else if p.ends_with(".jpg") || p.ends_with(".jpeg") {
+        "image/jpeg"
+    } else if p.ends_with(".gif") {
+        "image/gif"
+    } else if p.ends_with(".webp") {
+        "image/webp"
+    } else {
+        "application/octet-stream"
+    }
+}
+
+fn image_part(data_b64: &str, mime: &str) -> String {
+    format!(
+        "{{\"type\":\"image\",\"base64Data\":{},\"mediaType\":{}}}",
+        esc(data_b64),
+        esc(mime)
+    )
+}
+
+/// Build MSP turn input parts: text (+ inlined resource text) and images.
+/// Image sources: inline base64 `data`, or a local `file://`/`/` path which
+/// is read and encoded here (same machine). Audio has no host surface
+/// (TurnInputPartType is closed: text|image) and is rejected.
+///
+/// Returns `(msp_parts, acp_content)`: the host input and the accepted prompt
+/// re-serialized as ACP content for the user-message echo.
+fn extract_prompt_parts(params: Option<&J>, cwd: &str) -> Result<(Vec<String>, String), String> {
+    let p = params.ok_or("session/prompt requires params")?;
+    let prompt = p.get("prompt").unwrap_or(p);
+    let blocks: Vec<J> = match prompt {
+        J::Arr(b) => b.clone(),
+        J::Str(s) => vec![J::Str(s.clone())],
+        J::Obj(_) => match p.get("prompt") {
+            Some(J::Arr(b)) => b.clone(),
+            Some(J::Str(s)) => vec![J::Str(s.clone())],
+            _ => return Err("session/prompt requires a prompt array".to_string()),
+        },
+        _ => return Err("session/prompt requires a prompt array".to_string()),
+    };
+    let mut texts = Vec::new();
+    let mut parts = Vec::new();
+    let mut content: Vec<String> = Vec::new(); // accepted prompt as ACP content
+    let flush_text = |texts: &mut Vec<String>, parts: &mut Vec<String>| {
+        if texts.is_empty() {
+            return;
+        }
+        parts.push(format!(
+            "{{\"type\":\"text\",\"text\":{}}}",
+            esc(&texts.join("\n"))
+        ));
+        texts.clear();
+    };
+    for b in &blocks {
+        match b {
+            J::Str(s) => {
+                texts.push(s.clone());
+                content.push(format!("{{\"type\":\"text\",\"text\":{}}}", esc(s)));
+            }
+            J::Obj(_) => {
+                let t = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match t {
+                    "text" => {
+                        if let Some(x) = b.get("text").and_then(|v| v.as_str()) {
+                            texts.push(x.to_string());
+                            content.push(format!("{{\"type\":\"text\",\"text\":{}}}", esc(x)));
+                        }
+                    }
+                    "resource" => {
+                        let r = b.get("resource").cloned().unwrap_or(J::Null);
+                        let uri = r.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+                        let mime = r.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
+                        match r.get("text").and_then(|v| v.as_str()) {
+                            Some(x) => {
+                                texts.push(x.to_string());
+                                content.push(j_to_string(b));
+                            }
+                            None => match r.get("blob").and_then(|v| v.as_str()) {
+                                Some(blob) if mime.starts_with("image/") => {
+                                    flush_text(&mut texts, &mut parts);
+                                    parts.push(image_part(blob, mime));
+                                    content.push(j_to_string(b));
+                                }
+                                Some(_) => return Err("embedded non-image resource blobs are not supported; send text".to_string()),
+                                None if !uri.is_empty() => {
+                                    texts.push(format!("[resource: {uri}]"));
+                                    content.push(j_to_string(b));
+                                }
+                                None => return Err("resource block needs resource.text, resource.blob, or resource.uri".to_string()),
+                            },
+                        }
+                    }
+                    "resource_link" => {
+                        // Baseline content: resources the agent can access.
+                        let uri = b.get("uri").and_then(|v| v.as_str()).unwrap_or("");
+                        let name = b.get("name").and_then(|v| v.as_str()).unwrap_or(uri);
+                        let mime = b.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
+                        if uri.is_empty() {
+                            return Err("resource_link block needs uri".to_string());
+                        }
+                        match local_file_text(uri, Some(cwd)) {
+                            Some(text) if mime.starts_with("text/") || mime.is_empty() || looks_textual(uri) => {
+                                texts.push(format!("[{name} {uri}]\n{text}"));
+                            }
+                            _ => {
+                                texts.push(format!("[resource: {name} ({uri})]"));
+                            }
+                        }
+                        content.push(j_to_string(b));
+                    }
+                    "image" => {
+                        flush_text(&mut texts, &mut parts);
+                        if let Some(d) = b.get("data").and_then(|v| v.as_str()) {
+                            let mime = b.get("mimeType").and_then(|v| v.as_str()).unwrap_or("image/png");
+                            parts.push(image_part(d, mime));
+                            content.push(j_to_string(b));
+                        } else if let Some(uri) = b.get("uri").and_then(|v| v.as_str()) {
+                            let (bytes, mime) = read_image_uri(uri, Some(cwd))?;
+                            parts.push(image_part(&json::b64(&bytes), &mime));
+                            content.push(j_to_string(b));
+                        } else {
+                            return Err("image block needs data or uri".to_string());
+                        }
+                    }
+                    "audio" => return Err("audio blocks are not supported: the host input type is closed (text|image)".to_string()),
+                    _ => return Err(format!("unsupported content block type '{t}'")),
+                }
+            }
+            _ => return Err("prompt blocks must be objects or strings".to_string()),
+        }
+    }
+    flush_text(&mut texts, &mut parts);
+    Ok((parts, format!("[{}]", content.join(","))))
+}
+
+/// Decode a `file://` URI to a local path. Rejects hosts, non-file schemes,
+/// and bad escapes. Relative paths resolve against `cwd`.
+fn file_uri_path(uri: &str, cwd: &str) -> Result<String, String> {
+    let rest = match uri.strip_prefix("file://") {
+        Some(r) => r,
+        None if uri.starts_with('/') => return Ok(uri.to_string()),
+        None if !uri.contains("://") => {
+            return Ok(format!("{}/{}", cwd.trim_end_matches('/'), uri));
+        }
+        None => return Err(format!("unsupported URI scheme in {uri}")),
+    };
+    // file://host/path: only empty/localhost hosts are local files.
+    let path = match rest.find('/') {
+        Some(i) => {
+            let (host, p) = rest.split_at(i);
+            if !host.is_empty() && host != "localhost" {
+                return Err(format!("remote file host in {uri}"));
+            }
+            p.to_string()
+        }
+        None => return Err(format!("bad file URI {uri}")),
+    };
+    Ok(percent_decode(&path))
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut out = Vec::with_capacity(s.len());
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push(h << 4 | l);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Confine a path to the session workspace unless explicitly opened up.
+fn confine(path: &str, cwd: &str) -> Result<(), String> {
+    if std::env::var("MUSE_ALLOW_UNSCOPED_READS").is_ok() {
+        return Ok(());
+    }
+    let canon = std::fs::canonicalize(path).map_err(|e| format!("cannot resolve {path}: {e}"))?;
+    let root =
+        std::fs::canonicalize(cwd).map_err(|e| format!("cannot resolve workspace {cwd}: {e}"))?;
+    if canon.starts_with(&root) {
+        Ok(())
+    } else {
+        Err(format!(
+            "{path} is outside the session workspace (set MUSE_ALLOW_UNSCOPED_READS=1 to allow)"
+        ))
+    }
+}
+
+fn looks_textual(path: &str) -> bool {
+    let p = path.to_lowercase();
+    p.ends_with(".txt")
+        || p.ends_with(".md")
+        || p.ends_with(".rs")
+        || p.ends_with(".py")
+        || p.ends_with(".js")
+        || p.ends_with(".ts")
+        || p.ends_with(".json")
+        || p.ends_with(".toml")
+        || p.ends_with(".yaml")
+        || p.ends_with(".yml")
+        || p.ends_with(".sh")
+        || p.ends_with(".log")
+}
+
+fn read_image_uri(uri: &str, cwd: Option<&str>) -> Result<(Vec<u8>, String), String> {
+    let path = file_uri_path(uri, cwd.unwrap_or("/"))?;
+    if let Some(c) = cwd {
+        confine(&path, c)?;
+    }
+    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read image {path}: {e}"))?;
+    Ok((bytes, mime_for(&path).to_string()))
+}
+
+/// Read a small text file for resource_link inlining (None = mention only).
+fn local_file_text(uri: &str, cwd: Option<&str>) -> Option<String> {
+    let path = file_uri_path(uri, cwd.unwrap_or("/")).ok()?;
+    if let Some(c) = cwd {
+        confine(&path, c).ok()?;
+    }
+    let meta = std::fs::metadata(&path).ok()?;
+    if meta.len() > 262144 {
+        return None;
+    }
+    std::fs::read_to_string(&path).ok()
+}
+
+// ---------------------------------------------------------------------------
+// MSP -> ACP event routing (main thread; the serve reader only forwards)
+// ---------------------------------------------------------------------------
+
+fn find_acp_sid(sessions: &Sessions, msp_sid: &str) -> Option<String> {
+    sessions
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, s)| s.msp_sid == msp_sid)
+        .map(|(k, _)| k.clone())
+}
+
+fn handle_msp(
+    host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    method: &str,
+    params: &J,
+) {
+    // Track the newest view cursor on every event that carries one, so a
+    // view/gap can page forward without duplicates (fold skips settled ids).
+    if let Some(cur) = params.get("viewCursor").and_then(|v| v.as_str())
+        && !cur.is_empty()
+    {
+        let msp_sid = params
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
+            && let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid)
+        {
+            s.view_cursor = cur.to_string();
+        }
+    }
+    match method {
+        "view/gap" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let (acp_sid, cursor) = match find_acp_sid(sessions, msp_sid) {
+                Some(a) => {
+                    let c = sessions
+                        .lock()
+                        .unwrap()
+                        .get(&a)
+                        .map(|s| s.view_cursor.clone())
+                        .unwrap_or_default();
+                    (a, c)
+                }
+                None => return,
+            };
+            if cursor.is_empty() {
+                log("view/gap with no known cursor; cannot refill");
+                return;
+            }
+            let cmd = host.mint_cmd("cmd-");
+            match host.command("view/page", &format!("{{\"commandId\":{},\"sessionId\":{},\"cursor\":{},\"direction\":\"forward\",\"limit\":100}}", esc(&cmd), esc(msp_sid), esc(&cursor))) {
+                Ok(r) => {
+                    let mut n = 0;
+                    if let Some(J::Arr(evs)) = r.get("events") {
+                        for e in evs.clone() {
+                            let m = e.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                            let p = e.get("params").cloned().unwrap_or(J::Null);
+                            if !m.is_empty() {
+                                n += 1;
+                                handle_msp(host, stdout, sessions, m, &p);
+                            }
+                        }
+                    } else if let Some(J::Arr(items)) = r.get("items") {
+                        for it in items.clone() {
+                            let wrap = J::Obj(vec![("item".to_string(), it)]);
+                            let mut out = Vec::new();
+                            if let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid) {
+                                s.fold.on_item_completed(&acp_sid, s.ver, &wrap, &mut out);
+                            }
+                            for line in out {
+                                acp::send_raw(stdout, &line);
+                            }
+                            n += 1;
+                        }
+                    } else {
+                        log(&format!("view/page returned no events/items: {}", j_to_string(&r)));
+                    }
+                    log(&format!("view/gap refilled {n} events"));
+                }
+                Err(e) => log(&format!("view/page failed: {}", err_message(&e))),
+            }
+        }
+        "item/started" | "item/updated" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let item = params.get("item").cloned().unwrap_or(J::Null);
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                let mut out = Vec::new();
+                if let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid) {
+                    s.fold.on_item_snapshot(&acp_sid, s.ver, &item, &mut out);
+                }
+                for line in out {
+                    acp::send_raw(stdout, &line);
+                }
+            }
+        }
+        "item/delta" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                let mut out = Vec::new();
+                if let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid) {
+                    s.fold.on_item_delta(&acp_sid, s.ver, params, &mut out);
+                }
+                for line in out {
+                    acp::send_raw(stdout, &line);
+                }
+            }
+        }
+        "item/completed" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                let mut out = Vec::new();
+                if let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid) {
+                    s.fold.on_item_completed(&acp_sid, s.ver, params, &mut out);
+                }
+                for line in out {
+                    acp::send_raw(stdout, &line);
+                }
+            }
+        }
+        "turn/completed" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+            let terminal = params
+                .get("terminal")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            log(&format!(
+                "turn/completed turn={turn_id} terminal={terminal}"
+            ));
+            let acp_sid = match find_acp_sid(sessions, msp_sid) {
+                Some(s) => s,
+                None => return,
+            };
+            let settled = sessions.lock().unwrap().get_mut(&acp_sid).map(|s| {
+                if s.active_turn.as_deref() == Some(turn_id) {
+                    s.active_turn = None;
+                }
+                let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id);
+                let ver = s.ver;
+                let req_id = pos.map(|p| s.in_flight.remove(p).req_id);
+                let rest = s.in_flight.len();
+                (req_id, ver, rest)
+            });
+            if let Some((req_id, ver, rest)) = settled {
+                let stop = fold::stop_reason(terminal);
+                if ver == 2 {
+                    // Idle only when no session work remains; otherwise
+                    // re-assert running so queued work isn't misreported.
+                    if rest == 0 {
+                        acp::send_state(stdout, &acp_sid, "idle", Some(stop));
+                    } else {
+                        acp::send_state(stdout, &acp_sid, "running", None);
+                    }
+                }
+                if let Some(req_id) = req_id {
+                    if ver != 2 {
+                        if terminal == "completed" || terminal == "cancelled" {
+                            acp::send_result(
+                                stdout,
+                                &Some(req_id),
+                                &format!("{{\"stopReason\":\"{stop}\"}}"),
+                            );
+                        } else {
+                            acp::send_error(
+                                stdout,
+                                &Some(req_id),
+                                -32603,
+                                &format!("turn ended with terminal '{terminal}'"),
+                            );
+                        }
+                    }
+                } else {
+                    log(&format!("turn/completed for untracked turn {turn_id}"));
+                }
+            }
+        }
+        "turn/unqueued" => {
+            // A reclaimed queued turn never runs: no started/completed will
+            // ever arrive, so settle the tracked prompt now as cancelled.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+            let acp_sid = match find_acp_sid(sessions, msp_sid) {
+                Some(s) => s,
+                None => return,
+            };
+            let settled = sessions.lock().unwrap().get_mut(&acp_sid).map(|s| {
+                let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id)?;
+                let ver = s.ver;
+                Some((s.in_flight.remove(pos).req_id, ver, s.in_flight.len()))
+            });
+            if let Some((req_id, ver, rest)) = settled.flatten() {
+                if ver == 2 {
+                    if rest == 0 {
+                        acp::send_state(stdout, &acp_sid, "idle", Some("cancelled"));
+                    }
+                } else {
+                    acp::send_result(stdout, &Some(req_id), "{\"stopReason\":\"cancelled\"}");
+                }
+                let _ = req_id;
+            }
+        }
+        "approval/requested" => {
+            open_approval(stdout, sessions, params);
+        }
+        "approval/resolved" | "approval/updated" => {
+            // Authoritative outcome: if session work continues, re-assert
+            // running (a resolved approval unblocks the turn).
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                let (ver, busy) = sessions
+                    .lock()
+                    .unwrap()
+                    .get(&acp_sid)
+                    .map(|s| (s.ver, !s.in_flight.is_empty()))
+                    .unwrap_or((1, false));
+                if ver == 2 && busy {
+                    acp::send_state(stdout, &acp_sid, "running", None);
+                }
+            }
+        }
+        "userInput/requested" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let acp_sid = find_acp_sid(sessions, msp_sid);
+            // Bridge to ACP elicitation when the client advertised form mode;
+            // otherwise cancel so the turn proceeds instead of hanging.
+            let bridged = match (&acp_sid, ELICIT_FORM.load(Ordering::SeqCst)) {
+                (Some(sid), 1) => {
+                    let ver = sessions
+                        .lock()
+                        .unwrap()
+                        .get(sid)
+                        .map(|s| s.ver)
+                        .unwrap_or(1);
+                    ver == 2 && bridge_user_input(host, stdout, sessions, sid, params)
+                }
+                _ => false,
+            };
+            if !bridged {
+                let qid = params
+                    .get("userInputId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                log(&format!(
+                    "userInput/requested not bridged (elicit_form={}); falling back",
+                    ELICIT_FORM.load(Ordering::SeqCst)
+                ));
+                if !msp_sid.is_empty() && !qid.is_empty() {
+                    let cmd = host.mint_cmd("cmd-");
+                    let _ = host.command(
+                        "userInput/cancel",
+                        &format!(
+                            "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{}}}",
+                            esc(&cmd),
+                            esc(msp_sid),
+                            esc(qid)
+                        ),
+                    );
+                    log(&format!(
+                        "userInput {qid} auto-cancelled (client has no elicitation form)"
+                    ));
+                }
+            }
+        }
+        "userInput/settled" => {}
+        "turn/started" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
+                && !turn_id.is_empty()
+                && let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid)
+            {
+                s.active_turn = Some(turn_id.to_string());
+            }
+            log(&format!("turn/started turn={turn_id} sess={msp_sid}"));
+        }
+        "turn/retracted" | "turn/retryScheduled" => {
+            log(&format!(
+                "{method} turn={} sess={}",
+                params.get("turnId").and_then(|v| v.as_str()).unwrap_or("?"),
+                params
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+            ));
+        }
+        "session/approvalModeChanged" => {
+            // Audit fact of an accepted mode change: refresh the selector.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let mode = params.get("mode").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
+                && !mode.is_empty()
+            {
+                if let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid) {
+                    s.mode_value = acp::mode_from_msp(mode).to_string();
+                }
+                let _ = acp_sid;
+            }
+        }
+        "session/modelChanged" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let model = params
+                .get("modelId")
+                .or_else(|| params.get("model"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
+                && !model.is_empty()
+            {
+                if let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid) {
+                    s.model_value = model.to_string();
+                }
+                let _ = acp_sid;
+            }
+        }
+        "initialized"
+        | "session/started"
+        | "session/contextUsage"
+        | "session/tokenUsage"
+        | "session/goalChanged"
+        | "session/todoListChanged"
+        | "session/branchChanged" => {}
+        _ => {
+            log(&format!("unhandled MSP notification: {method}"));
+        }
+    }
+}
+
+/// Open an ACP permission request for MSP approval params (from either the
+/// `approval/requested` event or a reissued `approval/request`). Dedupes by
+/// approval id so multi-stage/resumed flows bridge exactly once.
+fn open_approval(stdout: &StdoutShared, sessions: &Sessions, params: &J) {
+    let msp_sid = params
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let acp_sid = match find_acp_sid(sessions, msp_sid) {
+        Some(s) => s,
+        None => return,
+    };
+    let approval_id = params
+        .get("approvalId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if approval_id.is_empty() {
+        return;
+    }
+    let already = sessions
+        .lock()
+        .unwrap()
+        .get(&acp_sid)
+        .map(|s| match &s.pending_perm {
+            Some(p) => p.approval_id == approval_id,
+            None => false,
+        })
+        .unwrap_or(false);
+    if already {
+        return;
+    }
+    let requirement = params
+        .get("currentRequirementId")
+        .cloned()
+        .unwrap_or(J::Null);
+    let tool_call_id = params
+        .get("toolCallId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("?")
+        .to_string();
+    let (options_json, choices) = acp::perm_options(params);
+    if choices.is_empty() {
+        log(&format!(
+            "approval {approval_id} has no choices; leaving unresolved"
+        ));
+        return;
+    }
+    let req_id = J::Str(mint_id("perm-", &ID_COUNTER));
+    {
+        let mut map = sessions.lock().unwrap();
+        if let Some(s) = map.get_mut(&acp_sid) {
+            s.pending_perm = Some(PendingPerm {
+                req_id: req_id.clone(),
+                approval_id,
+                requirement,
+                choices,
+            });
+            if s.ver == 2 {
+                acp::send_state(stdout, &acp_sid, "requires_action", None);
+            }
+        } else {
+            return;
+        }
+    }
+    acp::send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session/request_permission\",\"params\":{{\"sessionId\":{},\"toolCall\":{{\"toolCallId\":{}}},\"options\":{}}}}}",
+            j_to_string(&req_id),
+            esc(&acp_sid),
+            esc(&tool_call_id),
+            options_json
+        ),
+    );
+}
+
+/// Client reply to our `session/request_permission` (matched by id).
+/// Fail closed: without an explicit approving choice from the client, never
+/// send an approving decide — cancel the underlying turn instead.
+fn complete_permission(
+    host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    id: &Option<J>,
+    msg: &J,
+) {
+    let idv = match id {
+        Some(v) => v.clone(),
+        None => return,
+    };
+    // Locate the session holding this pending permission.
+    let found = sessions
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|(k, s)| match &s.pending_perm {
+            Some(p) if j_to_string(&p.req_id) == j_to_string(&idv) => Some(k.clone()),
+            _ => None,
+        });
+    let acp_sid = match found {
+        Some(s) => s,
+        None => return, // not ours; ignore (e.g. late duplicate)
+    };
+    let (msp_sid, ver, approval_id, requirement, choices) = {
+        let mut map = sessions.lock().unwrap();
+        let s = match map.get_mut(&acp_sid) {
+            Some(s) => s,
+            None => return,
+        };
+        let p = match s.pending_perm.take() {
+            Some(p) => p,
+            None => return,
+        };
+        (
+            s.msp_sid.clone(),
+            s.ver,
+            p.approval_id,
+            p.requirement,
+            p.choices,
+        )
+    };
+    // Outcome -> (choiceId, approved?). Only an explicit client selection of
+    // an approving choice may approve. Everything else fails closed: cancel
+    // the underlying turn rather than risk an approving decide.
+    enum Verdict {
+        Approve(String),
+        Deny(String),
+        FailClosed,
+    }
+    let is_approving = |cid: &str| {
+        choices
+            .iter()
+            .find(|(id, _)| id == cid)
+            .map(|(_, d)| d.to_lowercase().starts_with("approv"))
+            .unwrap_or(false)
+    };
+    let verdict = if msg.get("error").is_some() {
+        log("session/request_permission failed at client; failing closed");
+        match acp::fallback_deny(&choices) {
+            Some(c) => Verdict::Deny(c),
+            None => Verdict::FailClosed,
+        }
+    } else {
+        match msg.get("result").and_then(|r| r.get("outcome")) {
+            Some(o) => match o.get("outcome").and_then(|v| v.as_str()).unwrap_or("") {
+                "selected" => match o.get("optionId").and_then(|v| v.as_str()) {
+                    Some(cid) if is_approving(cid) => Verdict::Approve(cid.to_string()),
+                    Some(cid) => Verdict::Deny(cid.to_string()),
+                    None => match acp::fallback_deny(&choices) {
+                        Some(c) => Verdict::Deny(c),
+                        None => Verdict::FailClosed,
+                    },
+                },
+                _ => match acp::fallback_deny(&choices) {
+                    Some(c) => Verdict::Deny(c),
+                    None => Verdict::FailClosed,
+                },
+            },
+            None => match acp::fallback_deny(&choices) {
+                Some(c) => Verdict::Deny(c),
+                None => Verdict::FailClosed,
+            },
+        }
+    };
+    let choice = match verdict {
+        Verdict::Approve(c) | Verdict::Deny(c) => c,
+        Verdict::FailClosed => {
+            log("permission: no deny choice available; cancelling the turn instead of approving");
+            cancel_session_turns(host, sessions, &acp_sid);
+            return;
+        }
+    };
+    let cmd = host.mint_cmd("cmd-");
+    match host.command(
+        "approval/decide",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{},\"approvalId\":{},\"requirementId\":{},\"choiceId\":{}}}",
+            esc(&cmd),
+            esc(&msp_sid),
+            esc(&approval_id),
+            j_to_string(&requirement),
+            esc(&choice)
+        ),
+    ) {
+        Ok(r) => {
+            // Admission is not the outcome: terminal=false means further
+            // requirements remain pending, so stay in requires_action.
+            let terminal = r.get("terminal").and_then(|v| match v {
+                J::Bool(b) => Some(*b),
+                _ => None,
+            }).unwrap_or(true);
+            if ver == 2 && terminal {
+                let busy = sessions.lock().unwrap().get(&acp_sid).map(|s| !s.in_flight.is_empty()).unwrap_or(false);
+                if busy {
+                    acp::send_state(stdout, &acp_sid, "running", None);
+                }
+            }
+        }
+        Err(e) => log(&format!("approval/decide failed: {}", err_message(&e))),
+    }
+}
+
+/// Cancel every in-flight turn of one ACP session (fail-closed helper).
+fn cancel_session_turns(host: &Arc<MspHost>, sessions: &Sessions, acp_sid: &str) {
+    let turns = sessions
+        .lock()
+        .unwrap()
+        .get(acp_sid)
+        .map(|s| {
+            let msp = s.msp_sid.clone();
+            s.in_flight
+                .iter()
+                .map(|f| (msp.clone(), f.msp_turn.clone()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    for (msp_sid, turn_id) in turns {
+        let cmd = host.mint_cmd("cmd-");
+        let _ = host.command(
+            "turn/cancel",
+            &format!(
+                "{{\"commandId\":{},\"sessionId\":{},\"turnId\":{}}}",
+                esc(&cmd),
+                esc(&msp_sid),
+                esc(&turn_id)
+            ),
+        );
+    }
+}
+
+fn fail_all(stdout: &StdoutShared, sessions: &Sessions) {
+    let mut map = sessions.lock().unwrap();
+    for s in map.values_mut() {
+        for f in s.in_flight.drain(..) {
+            if s.ver == 2 {
+                acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
+            } else {
+                acp::send_result(stdout, &Some(f.req_id), "{\"stopReason\":\"cancelled\"}");
+            }
+        }
+    }
+}
+
+/// Bridge an MSP `userInput/requested` to ACP `elicitation/create` (form mode).
+/// Returns false when there is nothing bridgeable (caller falls back).
+fn bridge_user_input(
+    _host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    params: &J,
+) -> bool {
+    let user_input_id = params
+        .get("userInputId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let tool_call = params
+        .get("toolCallId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let questions = match params.get("questions") {
+        Some(J::Arr(q)) => q.clone(),
+        _ => return false,
+    };
+    if user_input_id.is_empty() || questions.is_empty() {
+        return false;
+    }
+    let mut props = Vec::new();
+    let mut required = Vec::new();
+    let mut msg = Vec::new();
+    let mut ui_qs = Vec::new();
+    for (i, q) in questions.iter().enumerate() {
+        let qid = q
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if qid.is_empty() {
+            continue;
+        }
+        let header = q.get("header").and_then(|v| v.as_str()).unwrap_or("");
+        let text = q.get("question").and_then(|v| v.as_str()).unwrap_or("");
+        // Dedupe display labels (duplicate enum values confuse clients);
+        // answers map back to originals by position.
+        let mut labels = Vec::new();
+        let mut display = Vec::new();
+        if let Some(J::Arr(o)) = q.get("options") {
+            for x in o {
+                if let Some(l) = x.get("label").and_then(|v| v.as_str()) {
+                    let mut name = l.to_string();
+                    let mut n = 2;
+                    while display.iter().any(|e: &String| e == &name) {
+                        name = format!("{l} ({n})");
+                        n += 1;
+                    }
+                    labels.push(l.to_string());
+                    display.push(name);
+                }
+            }
+        }
+        let single = q
+            .get("selection")
+            .and_then(|s| s.get("mode"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("single")
+            == "single";
+        let min = q
+            .get("selection")
+            .and_then(|s| s.get("minSelections"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
+        let max = q
+            .get("selection")
+            .and_then(|s| s.get("maxSelections"))
+            .and_then(|v| v.as_u64());
+        let key = format!("q{i}");
+        let en: Vec<String> = display.iter().map(|l| esc(l)).collect();
+        if labels.is_empty() {
+            // Free-text question: no options, plain string answer.
+            props.push(format!("{}: {{\"type\":\"string\"}}", esc(&key)));
+        } else if single {
+            props.push(format!(
+                "{}: {{\"type\":\"string\",\"enum\":[{}]}}",
+                esc(&key),
+                en.join(",")
+            ));
+        } else {
+            let mut sch = format!(
+                "{}: {{\"type\":\"array\",\"items\":{{\"type\":\"string\",\"enum\":[{}]}}",
+                esc(&key),
+                en.join(",")
+            );
+            sch.push_str(&format!("}},\"minItems\":{min}"));
+            if let Some(m) = max {
+                sch.push_str(&format!(",\"maxItems\":{m}"));
+            }
+            sch.push('}');
+            props.push(sch);
+        }
+        if single || min > 0 {
+            required.push(key.to_string());
+        }
+        msg.push(format!("{header}: {text}"));
+        ui_qs.push(acp::UiQuestion {
+            qid,
+            labels,
+            display,
+        });
+    }
+    if ui_qs.is_empty() {
+        return false;
+    }
+    let schema = format!(
+        "{{\"type\":\"object\",\"properties\":{{{}}},\"required\":[{}]}}",
+        props.join(","),
+        required
+            .iter()
+            .map(|k| esc(k))
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
+    if let Some(s) = sessions.lock().unwrap().get_mut(acp_sid) {
+        s.pending_ui.push(acp::PendingUi {
+            req_id: req_id.clone(),
+            user_input_id: user_input_id.clone(),
+            questions: ui_qs,
+        });
+        log(&format!(
+            "bridging userInput {user_input_id} to elicitation {}",
+            j_to_string(&req_id)
+        ));
+        if s.ver == 2 {
+            acp::send_state(stdout, acp_sid, "requires_action", None);
+        }
+    } else {
+        return false;
+    }
+    let tool_f = if tool_call.is_empty() {
+        String::new()
+    } else {
+        format!(",\"toolCallId\":{}", esc(&tool_call))
+    };
+    acp::send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"elicitation/create\",\"params\":{{\"sessionId\":{}{},\"mode\":\"form\",\"message\":{},\"requestedSchema\":{}}}}}",
+            j_to_string(&req_id),
+            esc(acp_sid),
+            tool_f,
+            esc(&msg.join("\n")),
+            schema
+        ),
+    );
+    true
+}
+
+/// Match a client-returned display label back to the original host label.
+fn ui_original(q: &acp::UiQuestion, shown: &str) -> Option<String> {
+    q.display
+        .iter()
+        .position(|d| d == shown)
+        .and_then(|i| q.labels.get(i))
+        .cloned()
+}
+
+/// Client reply to our `elicitation/create` (matched by id).
+fn complete_elicitation(
+    host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    id: &Option<J>,
+    msg: &J,
+) {
+    let idv = match id {
+        Some(v) => v.clone(),
+        None => return,
+    };
+    let found = sessions.lock().unwrap().iter().find_map(|(k, s)| {
+        s.pending_ui
+            .iter()
+            .position(|p| j_to_string(&p.req_id) == j_to_string(&idv))
+            .map(|i| (k.clone(), i))
+    });
+    let (acp_sid, idx) = match found {
+        Some(v) => v,
+        None => return,
+    };
+    let (msp_sid, ver, user_input_id, questions) = {
+        let mut map = sessions.lock().unwrap();
+        let s = match map.get_mut(&acp_sid) {
+            Some(s) => s,
+            None => return,
+        };
+        if idx >= s.pending_ui.len() {
+            return;
+        }
+        let p = s.pending_ui.remove(idx);
+        (s.msp_sid.clone(), s.ver, p.user_input_id, p.questions)
+    };
+    let cmd = host.mint_cmd("cmd-");
+    // accept + content -> answers; anything else -> cancel the question.
+    let mut answers: Option<String> = None;
+    if msg.get("error").is_none()
+        && let Some(res) = msg.get("result")
+        && res.get("action").and_then(|v| v.as_str()).unwrap_or("") == "accept"
+    {
+        let content = res.get("content").cloned().unwrap_or(J::Null);
+        let mut parts = Vec::new();
+        for (i, q) in questions.iter().enumerate() {
+            let key = format!("q{i}");
+            match content.get(key.as_str()) {
+                Some(J::Str(v)) => match ui_original(q, v) {
+                    Some(orig) => parts.push(format!(
+                        "{{\"questionId\":{},\"selectedLabel\":{}}}",
+                        esc(&q.qid),
+                        esc(&orig)
+                    )),
+                    None => parts.push(format!(
+                        "{{\"questionId\":{},\"freeText\":{}}}",
+                        esc(&q.qid),
+                        esc(v)
+                    )),
+                },
+                Some(J::Arr(vs)) => {
+                    let mut matched = Vec::new();
+                    let mut free = Vec::new();
+                    for v in vs {
+                        match v.as_str().and_then(|s| ui_original(q, s)) {
+                            Some(orig) => matched.push(esc(&orig)),
+                            None => {
+                                if let Some(s) = v.as_str() {
+                                    free.push(s.to_string());
+                                }
+                            }
+                        }
+                    }
+                    let mut f = vec![format!("\"questionId\":{}", esc(&q.qid))];
+                    if !matched.is_empty() {
+                        f.push(format!("\"selectedLabels\":[{}]", matched.join(",")));
+                    }
+                    if !free.is_empty() {
+                        f.push(format!("\"freeText\":{}", esc(&free.join(", "))));
+                    }
+                    parts.push(format!("{{{}}}", f.join(",")));
+                }
+                _ => {}
+            }
+        }
+        answers = Some(format!("[{}]", parts.join(",")));
+    }
+    match answers {
+        Some(a) => {
+            if let Err(e) = host.command(
+                "userInput/answer",
+                &format!(
+                    "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{},\"answers\":{}}}",
+                    esc(&cmd),
+                    esc(&msp_sid),
+                    esc(&user_input_id),
+                    a
+                ),
+            ) {
+                log(&format!("userInput/answer failed: {}", err_message(&e)));
+            } else if ver == 2 {
+                let busy = sessions
+                    .lock()
+                    .unwrap()
+                    .get(&acp_sid)
+                    .map(|s| !s.in_flight.is_empty())
+                    .unwrap_or(false);
+                if busy {
+                    acp::send_state(stdout, &acp_sid, "running", None);
+                }
+            }
+        }
+        None => {
+            if let Err(e) = host.command(
+                "userInput/cancel",
+                &format!(
+                    "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{}}}",
+                    esc(&cmd),
+                    esc(&msp_sid),
+                    esc(&user_input_id)
+                ),
+            ) {
+                log(&format!("userInput/cancel failed: {}", err_message(&e)));
+            } else {
+                log("elicitation declined/cancelled/failed; question cancelled");
+            }
+        }
     }
 }
