@@ -460,6 +460,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             active_turn,
                             view_cursor: cur_cursor.clone(),
                             fold: SessionFold::new(),
+                            usage_used: None,
+                            usage_size: None,
+                            cum_prompt: None,
+                            cum_output: None,
+                            cum_total: None,
                         },
                     );
                     // _meta exposes the host session id: pass it back to
@@ -639,6 +644,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             active_turn: None,
                             view_cursor: String::new(),
                             fold: SessionFold::new(),
+                            usage_used: None,
+                            usage_size: None,
+                            cum_prompt: None,
+                            cum_output: None,
+                            cum_total: None,
                         });
                         entry.msp_sid = real_msp;
                         entry.ver = ver;
@@ -2092,10 +2102,53 @@ fn handle_msp(
                 let _ = acp_sid;
             }
         }
+        "session/contextUsage" => {
+            // Context-window pressure: counted-once occupancy at the latest
+            // provider-reported fact. Replace wholesale; MSP only emits on
+            // triple change, so every event is worth forwarding.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let used = params.get("usedTokens").and_then(|v| v.as_u64());
+            let size = params.get("windowTokens").and_then(|v| v.as_u64());
+            let pressure = params.get("pressure").and_then(|v| v.as_str());
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                let mut map = sessions.lock().unwrap();
+                if let Some(s) = map.get_mut(&acp_sid) {
+                    if let Some(u) = used {
+                        s.usage_used = Some(u);
+                    }
+                    if let Some(w) = size {
+                        s.usage_size = Some(w);
+                    }
+                    acp::send_usage(stdout, s, pressure);
+                }
+            }
+        }
+        "session/tokenUsage" => {
+            // One per model completion: stash the counted-once cumulative
+            // block and re-emit with the last known occupancy. When no
+            // contextUsage has arrived yet there is no `used`/`size` pair,
+            // so there is nothing valid to send — the totals wait for it.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                let mut map = sessions.lock().unwrap();
+                if let Some(s) = map.get_mut(&acp_sid) {
+                    if let Some(c) = params.get("cumulative") {
+                        s.cum_prompt = c.get("promptTokens").and_then(|v| v.as_u64());
+                        s.cum_output = c.get("outputTokens").and_then(|v| v.as_u64());
+                        s.cum_total = c.get("totalTokens").and_then(|v| v.as_u64());
+                    }
+                    acp::send_usage(stdout, s, None);
+                }
+            }
+        }
         "initialized"
         | "session/started"
-        | "session/contextUsage"
-        | "session/tokenUsage"
         | "session/goalChanged"
         | "session/todoListChanged"
         | "session/branchChanged" => {}

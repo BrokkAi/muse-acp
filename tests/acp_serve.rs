@@ -277,6 +277,33 @@ fn extract_str(frame: &str, key: &str) -> Option<String> {
 }
 
 #[test]
+fn usage_events_forward_msp_usage_as_acp_usage_update() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("usage", &[]);
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "hi");
+        let update = c.wait_for("\"totalTokens\":7500", Duration::from_secs(15));
+        assert!(update.contains(&sid), "usage for our session: {update}");
+        assert!(
+            update.contains("\"used\":1234") && update.contains("\"size\":200000"),
+            "occupancy bridged: {update}"
+        );
+        assert!(
+            update.contains("\"totalTokens\":7500"),
+            "cumulative totals in _meta: {update}"
+        );
+        if ver == 1 {
+            let done = c.wait_for("\"end_turn\"", Duration::from_secs(15));
+            assert!(!done.is_empty(), "terminal: {done}");
+        } else {
+            let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+            assert!(idle.contains(&sid), "v2 terminal idle: {idle}");
+        }
+        c.finish();
+    }
+}
+
+#[test]
 fn v1_prompt_happy_path_ends_end_turn() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(1, "");

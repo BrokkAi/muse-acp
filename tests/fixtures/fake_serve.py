@@ -150,6 +150,21 @@ def on_turn_start(params):
                                      "terminal": "completed"})
     elif SCENARIO == "unqueued":
         notify("turn/unqueued", dict(base))
+    elif SCENARIO == "usage":
+        notify("session/contextUsage", {
+            "sessionId": MSP_SID, "usedTokens": 1234, "windowTokens": 200000,
+            "pressure": "low", "viewCursor": "cur-1",
+            "sourceRange": {"start": 0, "end": 1}})
+        notify("session/tokenUsage", {
+            "sessionId": MSP_SID, "promptTokens": 1000, "totalTokens": 1500,
+            "modelId": "fake-model", "viewCursor": "cur-2",
+            "sourceRange": {"start": 0, "end": 2},
+            "cumulative": {"promptTokens": 5000, "outputTokens": 2500,
+                           "totalTokens": 7500}})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-1", "kind": "agentMessage",
+            "status": "completed", "text": "done"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     disposition = "queued" if SCENARIO == "queued" and TURNS[0] > 1 else "started"
     return {
         "commandId": params.get("commandId", ""),
