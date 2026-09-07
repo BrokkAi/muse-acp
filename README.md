@@ -121,6 +121,11 @@ config selectors, so the adapter returns `configOptions` in both protocol
 versions: v1 uses the selector field `id` (plus a legacy `modes` fallback), while
 v2 uses `configId`.
 
+Form questions also work in both versions when the client advertises
+`elicitation.form: {}` under `clientCapabilities` (v1) or `capabilities` (v2).
+Without that capability, the adapter cancels the question so the turn can
+continue; it does not emit an unsupported request.
+
 Model choices are refreshed from Muse when creating, loading, or resuming a
 session and after a config option changes. The adapter does not permanently
 cache the first nonempty catalog. If a refresh fails, it retains the last

@@ -441,6 +441,45 @@ fn user_input_options_reach_the_client() {
 }
 
 #[test]
+fn v1_questions_use_advertised_client_form_capability() {
+    let mut c = Client::spawn("questions", &[]);
+    let sid = c.new_session(1, ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let elicit = c.wait_for("elicitation/create", Duration::from_secs(15));
+    assert!(
+        elicit.contains(&sid),
+        "elicitation for our session: {elicit}"
+    );
+    assert!(elicit.contains("Alpha"), "option Alpha bridged: {elicit}");
+    assert!(elicit.contains("Beta"), "option Beta bridged: {elicit}");
+    let frames = c.frames.lock().unwrap().join("\n");
+    assert!(
+        !frames.contains("requires_action"),
+        "v1 must not emit v2 state: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn v1_questions_without_form_support_are_cancelled() {
+    for caps in [
+        "",
+        ",\"clientCapabilities\":{\"elicitation\":{\"form\":false}}",
+    ] {
+        let mut c = Client::spawn("questions", &[]);
+        let sid = c.new_session(1, caps);
+        let _pid = c.prompt(&sid, "ask me");
+        c.wait_log("userInput/cancel", Duration::from_secs(15));
+        let frames = c.frames.lock().unwrap().join("\n");
+        assert!(
+            !frames.contains("elicitation/create"),
+            "unsupported form: {frames}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn false_elicitation_capability_is_not_treated_as_supported() {
     let mut c = Client::spawn("questions", &[]);
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":false}}");

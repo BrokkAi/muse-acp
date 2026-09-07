@@ -25,7 +25,7 @@ use msp::{MspEvent, MspHost, err_code, err_message, log};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static VER: AtomicU64 = AtomicU64::new(0); // negotiated ACP version for the connection
-static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the v2 client advertises elicitation.form
+static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the client advertises elicitation.form
 /// Last successful model catalog, used only when a refresh fails.
 /// Rows are (modelId, displayLabel, isDefault).
 static CATALOG: std::sync::OnceLock<Mutex<Vec<(String, String, bool)>>> =
@@ -94,8 +94,8 @@ enum LoopMsg {
     Msp(MspEvent),
 }
 
-const V2_INIT: &str = r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}}}},"info":{"name":"muse-acp","title":"Muse ACP","version":"0.2.3"},"authMethods":[],"_meta":{"steering":{"supported":true}}}"#;
-const V1_INIT: &str = r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":"0.2.3"}}"#;
+const V2_INIT: &str = r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}}}},"info":{"name":"muse-acp","title":"Muse ACP","version":"0.2.4"},"authMethods":[],"_meta":{"steering":{"supported":true}}}"#;
+const V1_INIT: &str = r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":"0.2.4"}}"#;
 
 fn has_nonempty_array(params: Option<&J>, key: &str) -> bool {
     matches!(
@@ -316,14 +316,20 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .unwrap_or(1);
             let v = if v >= 2 { 2 } else { 1 };
             VER.store(v, Ordering::SeqCst);
-            // v2 elicitation support gates the userInput bridge.
+            // Both ACP versions can advertise the form elicitation extension.
             let form = params
                 .as_ref()
-                .and_then(|p| p.get("capabilities"))
+                .and_then(|p| {
+                    p.get(if v == 1 {
+                        "clientCapabilities"
+                    } else {
+                        "capabilities"
+                    })
+                })
                 .and_then(|c| c.get("elicitation"))
                 .and_then(|e| e.get("form"))
                 .is_some_and(|f| matches!(f, J::Obj(_)));
-            ELICIT_FORM.store(u64::from(v == 2 && form), Ordering::SeqCst);
+            ELICIT_FORM.store(u64::from(form), Ordering::SeqCst);
             if v == 2 {
                 acp::send_result(stdout, &id, V2_INIT);
             } else {
@@ -1997,15 +2003,7 @@ fn handle_msp(
             // Bridge to ACP elicitation when the client advertised form mode;
             // otherwise cancel so the turn proceeds instead of hanging.
             let bridged = match (&acp_sid, ELICIT_FORM.load(Ordering::SeqCst)) {
-                (Some(sid), 1) => {
-                    let ver = sessions
-                        .lock()
-                        .unwrap()
-                        .get(sid)
-                        .map(|s| s.ver)
-                        .unwrap_or(1);
-                    ver == 2 && bridge_user_input(host, stdout, sessions, sid, params)
-                }
+                (Some(sid), 1) => bridge_user_input(host, stdout, sessions, sid, params),
                 _ => false,
             };
             if !bridged {
