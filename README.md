@@ -115,6 +115,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `reasoningEffort` on `turn/start` / `turn/steer` | `configOptions` reasoning selector (`none` through `ultra`) |
 | `turn/steer` | v2 `_session/steering` extension with exact-turn targeting and race-safe idle behavior |
 | Muse skills | ACP `available_commands_update`; aliases such as `/plan` are sent to Muse as `/skill plan` |
+| `session/contextUsage` + `session/tokenUsage` | `usage_update` (`used`/`size` from context occupancy; `_meta.museCumulative` session totals, `_meta.musePressure`); `cost` is a client-local list-price estimate from `model/list` catalog rates, summed per completion — an upper bound (cached input at full rate, only live completions priced), never a billing figure |
 
 Zed currently initializes custom agents with ACP v1 even though it supports
 config selectors, so the adapter returns `configOptions` in both protocol

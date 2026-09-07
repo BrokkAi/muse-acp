@@ -37,14 +37,31 @@ type CostRates = HashMap<String, (f64, f64, String)>;
 static CATALOG_RATES: std::sync::OnceLock<Mutex<CostRates>> = std::sync::OnceLock::new();
 
 /// Parse one MSP `ModelCost` block into (input/1M, output/1M, currency).
+/// Rates must be finite and non-negative: `str::parse::<f64>` accepts
+/// `inf`/`NaN` and overflows to infinity, none of which survive as JSON.
+/// A null currency (schema-allowed) leaves the model unpriced.
 fn parse_rates(cost: &J) -> Option<(f64, f64, String)> {
-    let input: f64 = cost.get("input")?.as_str()?.parse().ok()?;
-    let output: f64 = cost.get("output")?.as_str()?.parse().ok()?;
+    let rate = |key: &str| -> Option<f64> {
+        let v: f64 = cost.get(key)?.as_str()?.trim().parse().ok()?;
+        (v.is_finite() && v >= 0.0).then_some(v)
+    };
+    let input = rate("input")?;
+    let output = rate("output")?;
     let currency = cost.get("currency")?.as_str()?.to_string();
     if currency.len() != 3 || !currency.bytes().all(|b| b.is_ascii_uppercase()) {
         return None;
     }
     Some((input, output, currency))
+}
+
+/// Look up a model's catalog rates, if `model/list` priced it.
+fn catalog_rates(model: &str) -> Option<(f64, f64, String)> {
+    CATALOG_RATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(model)
+        .cloned()
 }
 
 /// Folded host approval mode: `session.approvalMode.mode`
@@ -2131,8 +2148,10 @@ fn handle_msp(
         }
         "session/contextUsage" => {
             // Context-window pressure: counted-once occupancy at the latest
-            // provider-reported fact. Replace wholesale; MSP only emits on
-            // triple change, so every event is worth forwarding.
+            // provider-reported fact. Replace wholesale (an absent
+            // `windowTokens` means the basis has no limit, so the stale size
+            // is dropped rather than re-emitted); MSP only emits on triple
+            // change, so every event is worth forwarding.
             let msp_sid = params
                 .get("sessionId")
                 .and_then(|v| v.as_str())
@@ -2143,12 +2162,8 @@ fn handle_msp(
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
                 let mut map = sessions.lock().unwrap();
                 if let Some(s) = map.get_mut(&acp_sid) {
-                    if let Some(u) = used {
-                        s.usage_used = Some(u);
-                    }
-                    if let Some(w) = size {
-                        s.usage_size = Some(w);
-                    }
+                    s.usage_used = used;
+                    s.usage_size = size;
                     acp::send_usage(stdout, s, pressure);
                 }
             }
@@ -2170,22 +2185,26 @@ fn handle_msp(
                         s.cum_output = c.get("outputTokens").and_then(|v| v.as_u64());
                         s.cum_total = c.get("totalTokens").and_then(|v| v.as_u64());
                     }
-                    // Client-local cost math from catalog per-1M rates keyed
-                    // by this completion's model. Cached-input split is not
-                    // priced separately: estimate only, never billing.
+                    // Client-local cost math: price *this* completion's
+                    // counted-once `promptTokens`/`totalTokens` at the rates
+                    // of the model that produced it, and add to the running
+                    // total. Pricing the session cumulative at the latest
+                    // model would re-price history after `session/setModel`.
+                    // Legs with no `modelId`, an unknown model, or a currency
+                    // that differs from the running total stay unpriced.
                     let model = params.get("modelId").and_then(|v| v.as_str());
-                    if let (Some(m), Some(p), Some(o)) = (model, s.cum_prompt, s.cum_output)
-                        && let Some((rin, rout, cur)) = CATALOG_RATES
-                            .get_or_init(|| Mutex::new(HashMap::new()))
-                            .lock()
-                            .unwrap()
-                            .get(m)
-                            .cloned()
+                    let prompt = params.get("promptTokens").and_then(|v| v.as_u64());
+                    let total = params.get("totalTokens").and_then(|v| v.as_u64());
+                    if let (Some(m), Some(p), Some(t)) = (model, prompt, total)
+                        && let Some((input_rate, output_rate, currency)) = catalog_rates(m)
                     {
-                        s.cost_amount = Some((
-                            p as f64 / 1_000_000.0 * rin + o as f64 / 1_000_000.0 * rout,
-                            cur,
-                        ));
+                        let o = t.saturating_sub(p);
+                        let leg = (p as f64 * input_rate + o as f64 * output_rate) / 1_000_000.0;
+                        match &mut s.cost_amount {
+                            Some((amount, cur)) if *cur == currency => *amount += leg,
+                            Some(_) => {}
+                            None => s.cost_amount = Some((leg, currency)),
+                        }
                     }
                     acp::send_usage(stdout, s, None);
                 }
@@ -2802,7 +2821,47 @@ fn complete_elicitation(
 
 #[cfg(test)]
 mod tests {
-    use super::env_flag_enabled;
+    use super::{env_flag_enabled, parse_rates};
+    use crate::json::parse_json;
+
+    fn rates(input: &str, output: &str, currency: &str) -> Option<(f64, f64, String)> {
+        let cost = parse_json(&format!(
+            "{{\"input\":{input},\"output\":{output},\"cached\":\"0.1\",\"currency\":{currency}}}"
+        ))
+        .unwrap();
+        parse_rates(&cost)
+    }
+
+    #[test]
+    fn catalog_rates_parse_decimal_strings_with_iso_currency() {
+        assert_eq!(
+            rates("\"3.00\"", "\"15.00\"", "\"USD\""),
+            Some((3.0, 15.0, "USD".to_string()))
+        );
+        assert_eq!(
+            rates("\"0\"", "\" 2.5 \"", "\"EUR\""),
+            Some((0.0, 2.5, "EUR".to_string()))
+        );
+    }
+
+    #[test]
+    fn catalog_rates_reject_values_that_cannot_be_json_numbers() {
+        // `str::parse::<f64>` accepts these; the ACP frame must not.
+        for bad in ["\"inf\"", "\"-inf\"", "\"NaN\"", "\"1e400\"", "\"-1\""] {
+            assert_eq!(rates(bad, "\"1\"", "\"USD\""), None, "input {bad}");
+            assert_eq!(rates("\"1\"", bad, "\"USD\""), None, "output {bad}");
+        }
+        for bad in ["\"\"", "\"abc\"", "\"$3\"", "3", "null"] {
+            assert_eq!(rates(bad, "\"1\"", "\"USD\""), None, "input {bad}");
+        }
+    }
+
+    #[test]
+    fn catalog_rates_require_an_iso_4217_code() {
+        for bad in ["null", "\"usd\"", "\"US\"", "\"USDX\"", "\"$\"", "\"\""] {
+            assert_eq!(rates("\"1\"", "\"1\"", bad), None, "currency {bad}");
+        }
+    }
 
     #[test]
     fn unscoped_read_flag_requires_an_explicit_truthy_value() {

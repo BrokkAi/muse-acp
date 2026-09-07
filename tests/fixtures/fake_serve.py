@@ -151,16 +151,38 @@ def on_turn_start(params):
     elif SCENARIO == "unqueued":
         notify("turn/unqueued", dict(base))
     elif SCENARIO == "usage":
+        # A tokenUsage before any contextUsage has no used/size pair and
+        # must be held back, not emitted with nulls.
+        notify("session/tokenUsage", {
+            "sessionId": MSP_SID, "turnId": tid,
+            "promptTokens": 100, "totalTokens": 120, "modelId": "fake-model",
+            "usage": {"inputTokens": 100, "outputTokens": 20,
+                      "cachedTokens": 0, "reasoningTokens": 0},
+            "viewCursor": "cur-0", "sourceRange": {"start": 0, "end": 1},
+            "cumulative": {"promptTokens": 100, "outputTokens": 20,
+                           "totalTokens": 120}})
         notify("session/contextUsage", {
             "sessionId": MSP_SID, "usedTokens": 1234, "windowTokens": 200000,
-            "pressure": "low", "viewCursor": "cur-1",
+            "pressure": "normal", "viewCursor": "cur-1",
             "sourceRange": {"start": 0, "end": 1}})
         notify("session/tokenUsage", {
-            "sessionId": MSP_SID, "promptTokens": 1000, "totalTokens": 1500,
-            "modelId": "fake-model", "viewCursor": "cur-2",
-            "sourceRange": {"start": 0, "end": 2},
+            "sessionId": MSP_SID, "turnId": tid,
+            "promptTokens": 1000, "totalTokens": 1500, "modelId": "fake-model",
+            "usage": {"inputTokens": 1000, "outputTokens": 500,
+                      "cachedTokens": 0, "reasoningTokens": 0},
+            "viewCursor": "cur-2", "sourceRange": {"start": 0, "end": 2},
             "cumulative": {"promptTokens": 5000, "outputTokens": 2500,
                            "totalTokens": 7500}})
+        # Pre-schema record: no modelId, so an unpriced leg. Totals still
+        # advance; the running cost must not.
+        notify("session/tokenUsage", {
+            "sessionId": MSP_SID, "turnId": tid,
+            "promptTokens": 1000, "totalTokens": 1500,
+            "usage": {"inputTokens": 1000, "outputTokens": 500,
+                      "cachedTokens": 0, "reasoningTokens": 0},
+            "viewCursor": "cur-3", "sourceRange": {"start": 0, "end": 3},
+            "cumulative": {"promptTokens": 6000, "outputTokens": 3000,
+                           "totalTokens": 9000}})
         notify("item/completed", {**base, "item": {
             "itemId": "it-1", "kind": "agentMessage",
             "status": "completed", "text": "done"}})

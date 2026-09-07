@@ -292,9 +292,31 @@ fn usage_events_forward_msp_usage_as_acp_usage_update() {
             update.contains("\"totalTokens\":7500"),
             "cumulative totals in _meta: {update}"
         );
+        // Two priced legs so far: (100·3 + 20·15)/1M + (1000·3 + 500·15)/1M.
         assert!(
-            update.contains("\"cost\":{\"amount\":0.0525,\"currency\":\"USD\"}"),
-            "catalog-rate cost estimate: {update}"
+            update.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\"}"),
+            "per-completion cost accumulated at catalog rates: {update}"
+        );
+        // The unpriced (no modelId) leg advances totals but not cost.
+        let later = c.wait_for("\"totalTokens\":9000", Duration::from_secs(15));
+        assert!(
+            later.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\"}"),
+            "unpriced leg leaves the running cost alone: {later}"
+        );
+        // The tokenUsage that arrived before any contextUsage was held back:
+        // the first usage frame already carries a real used/size pair (and
+        // the stashed totals), never nulls.
+        let first = c
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|f| f.contains("usage_update"))
+            .cloned()
+            .expect("a usage_update frame");
+        assert!(
+            first.contains("\"used\":1234") && first.contains("\"totalTokens\":120"),
+            "held-back totals ride the first valid occupancy: {first}"
         );
         if ver == 1 {
             let done = c.wait_for("\"end_turn\"", Duration::from_secs(15));

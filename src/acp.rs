@@ -64,8 +64,11 @@ pub struct AcpSession {
     pub cum_prompt: Option<u64>,
     pub cum_output: Option<u64>,
     pub cum_total: Option<u64>,
-    /// Estimated session cost from catalog per-1M rates: (amount, currency).
-    /// List-price math only — never a billing figure on plan subscriptions.
+    /// Running list-price estimate, accumulated per completion from catalog
+    /// per-1M rates: (amount, currency). Only completions observed live are
+    /// priced (resumed history is not back-filled) and cached input is
+    /// charged at the full input rate, so this is an upper bound — never a
+    /// billing figure on plan subscriptions.
     pub cost_amount: Option<(f64, String)>,
 }
 
@@ -127,12 +130,14 @@ pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>)
     if let Some(p) = pressure {
         meta.push_str(&format!(",\"musePressure\":{}", esc(p)));
     }
+    // `amount` must be a JSON number: Rust's Display prints `inf`/`NaN`
+    // verbatim, which would corrupt the whole frame.
     let cost_f = match &s.cost_amount {
-        Some((amount, currency)) => format!(
+        Some((amount, currency)) if amount.is_finite() => format!(
             ",\"cost\":{{\"amount\":{amount},\"currency\":{}}}",
             esc(currency)
         ),
-        None => String::new(),
+        _ => String::new(),
     };
     send_raw(
         stdout,
