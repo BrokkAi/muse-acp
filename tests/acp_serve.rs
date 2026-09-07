@@ -292,6 +292,10 @@ fn usage_events_forward_msp_usage_as_acp_usage_update() {
             update.contains("\"totalTokens\":7500"),
             "cumulative totals in _meta: {update}"
         );
+        assert!(
+            update.contains("\"cost\":{\"amount\":0.0525,\"currency\":\"USD\"}"),
+            "catalog-rate cost estimate: {update}"
+        );
         if ver == 1 {
             let done = c.wait_for("\"end_turn\"", Duration::from_secs(15));
             assert!(!done.is_empty(), "terminal: {done}");

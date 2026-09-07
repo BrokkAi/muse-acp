@@ -64,6 +64,9 @@ pub struct AcpSession {
     pub cum_prompt: Option<u64>,
     pub cum_output: Option<u64>,
     pub cum_total: Option<u64>,
+    /// Estimated session cost from catalog per-1M rates: (amount, currency).
+    /// List-price math only — never a billing figure on plan subscriptions.
+    pub cost_amount: Option<(f64, String)>,
 }
 
 pub type Sessions = Arc<Mutex<HashMap<String, AcpSession>>>;
@@ -124,10 +127,17 @@ pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>)
     if let Some(p) = pressure {
         meta.push_str(&format!(",\"musePressure\":{}", esc(p)));
     }
+    let cost_f = match &s.cost_amount {
+        Some((amount, currency)) => format!(
+            ",\"cost\":{{\"amount\":{amount},\"currency\":{}}}",
+            esc(currency)
+        ),
+        None => String::new(),
+    };
     send_raw(
         stdout,
         &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"usage_update\",\"used\":{used},\"size\":{size},\"_meta\":{{{meta}}}}}}}}}",
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"usage_update\",\"used\":{used},\"size\":{size}{cost_f},\"_meta\":{{{meta}}}}}}}}}",
             esc(&s.acp_sid),
         ),
     );

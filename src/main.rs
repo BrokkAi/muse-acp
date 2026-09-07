@@ -10,6 +10,7 @@ mod json;
 mod msp;
 mod zed;
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::{
@@ -30,6 +31,21 @@ static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the client advertis
 /// Rows are (modelId, displayLabel, isDefault).
 static CATALOG: std::sync::OnceLock<Mutex<Vec<(String, String, bool)>>> =
     std::sync::OnceLock::new();
+/// Per-model catalog cost rates by modelId: (input/1M, output/1M, currency).
+/// Decimal strings carried verbatim by MSP; parsed here for client-local math.
+type CostRates = HashMap<String, (f64, f64, String)>;
+static CATALOG_RATES: std::sync::OnceLock<Mutex<CostRates>> = std::sync::OnceLock::new();
+
+/// Parse one MSP `ModelCost` block into (input/1M, output/1M, currency).
+fn parse_rates(cost: &J) -> Option<(f64, f64, String)> {
+    let input: f64 = cost.get("input")?.as_str()?.parse().ok()?;
+    let output: f64 = cost.get("output")?.as_str()?.parse().ok()?;
+    let currency = cost.get("currency")?.as_str()?.to_string();
+    if currency.len() != 3 || !currency.bytes().all(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    Some((input, output, currency))
+}
 
 /// Folded host approval mode: `session.approvalMode.mode`
 /// (EffectiveApprovalModeState; additive-optional, may be absent).
@@ -76,6 +92,15 @@ fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
             .unwrap_or(&id)
             .to_string();
         let def = matches!(m.get("isDefault"), Some(J::Bool(true)));
+        if let Some(cost) = m.get("cost")
+            && let Some(rates) = parse_rates(cost)
+        {
+            CATALOG_RATES
+                .get_or_init(|| Mutex::new(HashMap::new()))
+                .lock()
+                .unwrap()
+                .insert(id.clone(), rates);
+        }
         out.push((id, label, def));
     }
     let source = r.get("source").and_then(J::as_str).unwrap_or("unknown");
@@ -465,6 +490,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             cum_prompt: None,
                             cum_output: None,
                             cum_total: None,
+                            cost_amount: None,
                         },
                     );
                     // _meta exposes the host session id: pass it back to
@@ -649,6 +675,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             cum_prompt: None,
                             cum_output: None,
                             cum_total: None,
+                            cost_amount: None,
                         });
                         entry.msp_sid = real_msp;
                         entry.ver = ver;
@@ -2142,6 +2169,23 @@ fn handle_msp(
                         s.cum_prompt = c.get("promptTokens").and_then(|v| v.as_u64());
                         s.cum_output = c.get("outputTokens").and_then(|v| v.as_u64());
                         s.cum_total = c.get("totalTokens").and_then(|v| v.as_u64());
+                    }
+                    // Client-local cost math from catalog per-1M rates keyed
+                    // by this completion's model. Cached-input split is not
+                    // priced separately: estimate only, never billing.
+                    let model = params.get("modelId").and_then(|v| v.as_str());
+                    if let (Some(m), Some(p), Some(o)) = (model, s.cum_prompt, s.cum_output)
+                        && let Some((rin, rout, cur)) = CATALOG_RATES
+                            .get_or_init(|| Mutex::new(HashMap::new()))
+                            .lock()
+                            .unwrap()
+                            .get(m)
+                            .cloned()
+                    {
+                        s.cost_amount = Some((
+                            p as f64 / 1_000_000.0 * rin + o as f64 / 1_000_000.0 * rout,
+                            cur,
+                        ));
                     }
                     acp::send_usage(stdout, s, None);
                 }

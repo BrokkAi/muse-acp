@@ -205,7 +205,9 @@ def result_for(method, msg):
                 return {}
             if CATALOG_READS[0] == 4:
                 return {"models": [], "source": "unresolvedCatalog"}
-        models = [{"modelId": "fake-model", "displayLabel": "Fake"}]
+        models = [{"modelId": "fake-model", "displayLabel": "Fake",
+                   "cost": {"input": "3.00", "output": "15.00",
+                            "cached": "0.30", "currency": "USD"}}]
         if SCENARIO == "catalog_grows" and CATALOG_READS[0] > 1:
             models.append({"modelId": "second-model", "displayLabel": "Second"})
         return {"models": models, "source": "fakeCatalog"}
