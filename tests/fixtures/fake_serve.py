@@ -20,6 +20,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   resume_active session/resume reports a running turn (for steering reattach)
   catalog_grows model/list expands after the first snapshot
   catalog_refresh_failure valid catalog, malformed response, RPC error, empty catalog
+  usage_gap    view/gap refill page overlapping a live completion
 """
 import json
 import os
@@ -101,6 +102,26 @@ def history_items():
          "status": "completed", "tool": "read",
          "args": {"path": "/tmp/h"}, "result": "old bytes"},
     ]
+
+
+def token_usage(cursor, prompt, output, cumulative_prompt, cumulative_output):
+    """One `session/tokenUsage` completion leg, identified by view cursor."""
+    return {"sessionId": MSP_SID, "turnId": f"turn-{TURNS[0]}",
+            "promptTokens": prompt, "totalTokens": prompt + output,
+            "modelId": "fake-model",
+            "usage": {"inputTokens": prompt, "outputTokens": output,
+                      "cachedTokens": 0, "reasoningTokens": 0},
+            "viewCursor": cursor,
+            "sourceRange": {"start": 0, "end": int(cursor.split("-")[1])},
+            "cumulative": {"promptTokens": cumulative_prompt,
+                           "outputTokens": cumulative_output,
+                           "totalTokens": cumulative_prompt + cumulative_output}}
+
+
+def context_usage(used, cursor):
+    return {"sessionId": MSP_SID, "usedTokens": used, "windowTokens": 200000,
+            "pressure": "normal", "viewCursor": cursor,
+            "sourceRange": {"start": 0, "end": int(cursor.split("-")[1])}}
 
 
 def on_turn_start(params):
@@ -187,6 +208,15 @@ def on_turn_start(params):
             "itemId": "it-1", "kind": "agentMessage",
             "status": "completed", "text": "done"}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "usage_gap":
+        # cur-3 is delivered twice: once by the view/gap refill page and
+        # once on the live stream. Two distinct completions, one price each.
+        notify("session/contextUsage", context_usage(120, "cur-1"))
+        notify("view/gap", {"sessionId": MSP_SID,
+                            "after": "cur-1", "next": "cur-3"})
+        notify("session/tokenUsage", token_usage("cur-3", 1000, 500, 1100, 520))
+        notify("session/contextUsage", context_usage(1620, "cur-4"))
+        notify("turn/completed", {**base, "terminal": "completed"})
     disposition = "queued" if SCENARIO == "queued" and TURNS[0] > 1 else "started"
     return {
         "commandId": params.get("commandId", ""),
@@ -210,6 +240,14 @@ def result_for(method, msg):
                 "pendingRequests": [],
                 "history": {"mode": "inline", "items": history_items(),
                             "snapshot": None}}
+    if method == "view/page" and SCENARIO == "usage_gap":
+        # Refill overlaps the live stream: cur-3 is in this page too.
+        return {"events": [
+            {"method": "session/tokenUsage",
+             "params": token_usage("cur-2", 100, 20, 100, 20)},
+            {"method": "session/tokenUsage",
+             "params": token_usage("cur-3", 1000, 500, 1100, 520)}],
+            "nextCursor": "cur-3"}
     if method == "session/list":
         live = session_obj()
         old = session_obj("msp-sess-old", "/tmp/old-ws")

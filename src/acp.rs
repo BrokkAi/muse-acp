@@ -70,6 +70,9 @@ pub struct AcpSession {
     /// charged at the full input rate, so this is an upper bound — never a
     /// billing figure on plan subscriptions.
     pub cost_amount: Option<(f64, String)>,
+    /// View cursors of completions already folded into the totals above.
+    /// `view/gap` recovery can replay a completion that also arrives live.
+    pub usage_seen: std::collections::HashSet<String>,
 }
 
 pub type Sessions = Arc<Mutex<HashMap<String, AcpSession>>>;

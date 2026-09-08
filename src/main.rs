@@ -528,6 +528,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             cum_output: None,
                             cum_total: None,
                             cost_amount: None,
+                            usage_seen: std::collections::HashSet::new(),
                         },
                     );
                     // _meta exposes the host session id: pass it back to
@@ -713,6 +714,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             cum_output: None,
                             cum_total: None,
                             cost_amount: None,
+                            usage_seen: std::collections::HashSet::new(),
                         });
                         entry.msp_sid = real_msp;
                         entry.ver = ver;
@@ -2196,6 +2198,22 @@ fn handle_msp(
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
                 let mut map = sessions.lock().unwrap();
                 if let Some(s) = map.get_mut(&acp_sid) {
+                    // `view/gap` recovery pages forward from the last cursor,
+                    // so a completion in that page can also be queued on the
+                    // live stream. Cumulative totals are counted-once and
+                    // survive a replay, but the per-completion cost leg below
+                    // would be charged once per delivery, so discard the
+                    // overlap by view cursor the way the item fold does. MSP
+                    // requires a strictly monotonic `viewCursor` on every one
+                    // of these events, so it is the completion's identity; the
+                    // emptiness check is only belt-and-braces.
+                    let cursor = params
+                        .get("viewCursor")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !cursor.is_empty() && !s.usage_seen.insert(cursor.to_string()) {
+                        return; // gap-refill replay of a priced completion
+                    }
                     if let Some(c) = params.get("cumulative") {
                         adopt_cumulative(s, c);
                     }

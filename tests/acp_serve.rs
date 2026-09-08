@@ -330,6 +330,41 @@ fn usage_events_forward_msp_usage_as_acp_usage_update() {
 }
 
 #[test]
+fn gap_refill_does_not_price_a_replayed_completion_twice() {
+    // view/gap pages forward from the last cursor, so a completion in that
+    // page can also be queued on the live stream. Cumulative totals are
+    // counted-once and survive the replay; the cost leg must too.
+    for ver in [1, 2] {
+        let mut c = Client::spawn("usage_gap", &[]);
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "hi");
+        // Settle the turn: every usage frame precedes the terminal.
+        if ver == 1 {
+            c.wait_for("\"end_turn\"", Duration::from_secs(15));
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        let frames = c.frames.lock().unwrap().join("\n");
+        // cur-2 (0.0006) plus cur-3 (0.0105); cur-3 is delivered twice.
+        assert!(
+            frames.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\"}"),
+            "v{ver} both distinct completions priced once: {frames}"
+        );
+        assert!(
+            !frames.contains("\"amount\":0.0216"),
+            "v{ver} replayed completion priced twice: {frames}"
+        );
+        // The replay must not disturb the counted-once cumulative either.
+        let totals = c.wait_for("\"totalTokens\":1620", Duration::from_secs(15));
+        assert!(
+            totals.contains(&sid),
+            "v{ver} usage for our session: {totals}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn v1_prompt_happy_path_ends_end_turn() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(1, "");
