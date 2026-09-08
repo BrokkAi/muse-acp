@@ -74,6 +74,26 @@ fn host_mode(res: &J) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Adopt a `(usedTokens, windowTokens, pressure)` occupancy triple, replacing
+/// wholesale: an absent `windowTokens` means the basis has no limit, so the
+/// stale size is dropped rather than re-emitted. Returns the pressure to ride
+/// along with the resulting `usage_update`.
+fn adopt_context_usage(s: &mut AcpSession, cu: &J) -> Option<String> {
+    s.usage_used = cu.get("usedTokens").and_then(|v| v.as_u64());
+    s.usage_size = cu.get("windowTokens").and_then(|v| v.as_u64());
+    cu.get("pressure")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Adopt a counted-once session `cumulative` block. Live events, snapshots and
+/// paged history all carry the same shape, so they all land here.
+fn adopt_cumulative(s: &mut AcpSession, c: &J) {
+    s.cum_prompt = c.get("promptTokens").and_then(|v| v.as_u64());
+    s.cum_output = c.get("outputTokens").and_then(|v| v.as_u64());
+    s.cum_total = c.get("totalTokens").and_then(|v| v.as_u64());
+}
+
 fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
     let cell = CATALOG.get_or_init(|| Mutex::new(Vec::new()));
     // MSP exposes a point-in-time snapshot, with no catalog subscription.
@@ -2156,15 +2176,11 @@ fn handle_msp(
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let used = params.get("usedTokens").and_then(|v| v.as_u64());
-            let size = params.get("windowTokens").and_then(|v| v.as_u64());
-            let pressure = params.get("pressure").and_then(|v| v.as_str());
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
                 let mut map = sessions.lock().unwrap();
                 if let Some(s) = map.get_mut(&acp_sid) {
-                    s.usage_used = used;
-                    s.usage_size = size;
-                    acp::send_usage(stdout, s, pressure);
+                    let pressure = adopt_context_usage(s, params);
+                    acp::send_usage(stdout, s, pressure.as_deref());
                 }
             }
         }
@@ -2181,9 +2197,7 @@ fn handle_msp(
                 let mut map = sessions.lock().unwrap();
                 if let Some(s) = map.get_mut(&acp_sid) {
                     if let Some(c) = params.get("cumulative") {
-                        s.cum_prompt = c.get("promptTokens").and_then(|v| v.as_u64());
-                        s.cum_output = c.get("outputTokens").and_then(|v| v.as_u64());
-                        s.cum_total = c.get("totalTokens").and_then(|v| v.as_u64());
+                        adopt_cumulative(s, c);
                     }
                     // Client-local cost math: price *this* completion's
                     // counted-once `promptTokens`/`totalTokens` at the rates
