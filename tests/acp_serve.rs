@@ -365,6 +365,87 @@ fn gap_refill_does_not_price_a_replayed_completion_twice() {
 }
 
 #[test]
+fn a_successful_catalog_refresh_drops_stale_rates() {
+    // The model list is replaced by each successful snapshot, so pricing must
+    // be too: a model that comes back without a usable `cost` goes unpriced
+    // instead of being charged at the rates it used to have.
+    // The three ways a successful refresh can stop pricing a model:
+    // `cost: null`, the model leaving the catalog, and rates that reject.
+    for scenario in [
+        "usage_rates_dropped",
+        "usage_rates_empty",
+        "usage_rates_invalid",
+    ] {
+        for ver in [1, 2] {
+            let mut c = Client::spawn(scenario, &[]);
+            let sid = c.new_session(ver, "");
+            let _first = c.prompt(&sid, "hi");
+            let priced = c.wait_for("\"totalTokens\":120", Duration::from_secs(15));
+            assert!(
+                priced.contains("\"cost\":{\"amount\":0.0006,\"currency\":\"USD\"}"),
+                "v{ver} first completion priced at catalog rates: {priced}"
+            );
+            if ver == 1 {
+                c.wait_for("\"end_turn\"", Duration::from_secs(15));
+            } else {
+                c.wait_for("\"idle\"", Duration::from_secs(15));
+            }
+            // Refresh the catalog; this time the model carries `cost: null`.
+            let cfg = c.req(
+            "session/set_config_option",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
+            ),
+        );
+            c.wait_for(&format!("\"id\":{cfg}"), Duration::from_secs(15));
+            let _second = c.prompt(&sid, "again");
+            let after = c.wait_for("\"totalTokens\":240", Duration::from_secs(15));
+            assert!(
+                !after.contains("\"amount\":0.0012"),
+                "v{ver} later leg priced from stale rates: {after}"
+            );
+            assert!(
+                after.contains("\"cost\":{\"amount\":0.0006,\"currency\":\"USD\"}"),
+                "{scenario} v{ver} priced subtotal kept, unpriceable leg skipped: {after}"
+            );
+            c.finish();
+        }
+    }
+}
+
+#[test]
+fn a_failed_catalog_refresh_retains_the_last_good_rates() {
+    // The other half of the contract the fix rests on: only a *successful*
+    // response replaces pricing. A malformed one keeps the last good rates,
+    // so the later completion is still priced.
+    for ver in [1, 2] {
+        let mut c = Client::spawn("usage_rates_failure", &[]);
+        let sid = c.new_session(ver, "");
+        let _first = c.prompt(&sid, "hi");
+        c.wait_for("\"totalTokens\":120", Duration::from_secs(15));
+        if ver == 1 {
+            c.wait_for("\"end_turn\"", Duration::from_secs(15));
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        let cfg = c.req(
+            "session/set_config_option",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
+            ),
+        );
+        c.wait_for(&format!("\"id\":{cfg}"), Duration::from_secs(15));
+        let _second = c.prompt(&sid, "again");
+        let after = c.wait_for("\"totalTokens\":240", Duration::from_secs(15));
+        assert!(
+            after.contains("\"cost\":{\"amount\":0.0012,\"currency\":\"USD\"}"),
+            "v{ver} a failed refresh must keep the last good rates: {after}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn v1_prompt_happy_path_ends_end_turn() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(1, "");

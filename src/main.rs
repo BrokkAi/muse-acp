@@ -114,6 +114,11 @@ fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
         return cell.lock().unwrap().clone();
     };
     let mut out = Vec::new();
+    // Rebuilt from scratch, then swapped in below: a successful refresh is the
+    // whole pricing truth, so a model that lost its `cost`, returned rates
+    // `parse_rates` rejects, or left the catalog entirely must go back to
+    // unpriced instead of being charged at a surviving stale entry.
+    let mut rates = CostRates::new();
     for m in models {
         let id = m
             .get("modelId")
@@ -130,13 +135,9 @@ fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
             .to_string();
         let def = matches!(m.get("isDefault"), Some(J::Bool(true)));
         if let Some(cost) = m.get("cost")
-            && let Some(rates) = parse_rates(cost)
+            && let Some(parsed) = parse_rates(cost)
         {
-            CATALOG_RATES
-                .get_or_init(|| Mutex::new(HashMap::new()))
-                .lock()
-                .unwrap()
-                .insert(id.clone(), rates);
+            rates.insert(id.clone(), parsed);
         }
         out.push((id, label, def));
     }
@@ -146,6 +147,10 @@ fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
         out.len(),
         models.len()
     ));
+    *CATALOG_RATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap() = rates;
     *cell.lock().unwrap() = out.clone();
     out
 }

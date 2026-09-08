@@ -21,6 +21,10 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   catalog_grows model/list expands after the first snapshot
   catalog_refresh_failure valid catalog, malformed response, RPC error, empty catalog
   usage_gap    view/gap refill page overlapping a live completion
+  usage_rates_dropped priced catalog, then a refresh whose model has no cost
+  usage_rates_empty   ... then a refresh returning models: []
+  usage_rates_invalid ... then a refresh whose rates do not parse
+  usage_rates_failure ... then a FAILED refresh (rates must survive)
 """
 import json
 import os
@@ -217,6 +221,13 @@ def on_turn_start(params):
         notify("session/tokenUsage", token_usage("cur-3", 1000, 500, 1100, 520))
         notify("session/contextUsage", context_usage(1620, "cur-4"))
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO in ("usage_rates_dropped", "usage_rates_empty",
+                      "usage_rates_invalid", "usage_rates_failure"):
+        if TURNS[0] == 1:
+            notify("session/contextUsage", context_usage(120, "cur-1"))
+        notify("session/tokenUsage", token_usage(
+            f"cur-{TURNS[0] + 1}", 100, 20, 100 * TURNS[0], 20 * TURNS[0]))
+        notify("turn/completed", {**base, "terminal": "completed"})
     disposition = "queued" if SCENARIO == "queued" and TURNS[0] > 1 else "started"
     return {
         "commandId": params.get("commandId", ""),
@@ -260,6 +271,8 @@ def result_for(method, msg):
                                   "source": "explicit"}}
     if method == "model/list":
         CATALOG_READS[0] += 1
+        if SCENARIO == "usage_rates_failure" and CATALOG_READS[0] > 1:
+            return {}  # malformed: no models array, so the refresh failed
         if SCENARIO == "catalog_refresh_failure":
             if CATALOG_READS[0] == 2:
                 return {}
@@ -268,6 +281,13 @@ def result_for(method, msg):
         models = [{"modelId": "fake-model", "displayLabel": "Fake",
                    "cost": {"input": "3.00", "output": "15.00",
                             "cached": "0.30", "currency": "USD"}}]
+        if CATALOG_READS[0] > 1:
+            if SCENARIO == "usage_rates_dropped":
+                models[0]["cost"] = None
+            elif SCENARIO == "usage_rates_empty":
+                models = []
+            elif SCENARIO == "usage_rates_invalid":
+                models[0]["cost"]["input"] = "NaN"
         if SCENARIO == "catalog_grows" and CATALOG_READS[0] > 1:
             models.append({"modelId": "second-model", "displayLabel": "Second"})
         return {"models": models, "source": "fakeCatalog"}
