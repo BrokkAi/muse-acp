@@ -25,6 +25,11 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_rates_empty   ... then a refresh returning models: []
   usage_rates_invalid ... then a refresh whose rates do not parse
   usage_rates_failure ... then a FAILED refresh (rates must survive)
+  usage_resume session/resume serves an anchoredSnapshot carrying usage
+  usage_snapshot_null snapshot whose contextUsage is null (the common shape)
+  usage_inline inline by default; the explicit snapshot rung carries usage
+  usage_inline_nosnapshot every rung downgrades; only the durable page has
+               totals, and contextUsage is never durable (as on the real host)
 """
 import json
 import os
@@ -128,6 +133,26 @@ def context_usage(used, cursor):
             "sourceRange": {"start": 0, "end": int(cursor.split("-")[1])}}
 
 
+def usage_snapshot_history(context=True, cumulative=(100, 20)):
+    """anchoredSnapshot history whose state already knows the usage. MSP
+    serves `contextUsage` as null until the fold holds a tracked anchor, so
+    context=False is the ordinary shape, not an exotic one."""
+    return {"mode": "anchoredSnapshot", "items": None, "snapshot": {
+        "schemaVersion": 1, "viewCursor": "cur-9",
+        "anchor": {"boundaryCursor": "cur-8", "summarizedThrough": "anchor-8"},
+        "state": {"items": [], "activeTurn": None, "queuedTurns": [],
+                  "pendingApprovals": [], "pendingUserInputs": [],
+                  "approvalMode": session_obj()["approvalMode"],
+                  "effectiveModel": None, "branch": None, "goal": None,
+                  "todoList": None, "turnCount": 1,
+                  "contextUsage": ({"usedTokens": 120,
+                                    "windowTokens": 200000,
+                                    "pressure": "normal"} if context else None),
+                  "tokenUsage": {"promptTokens": cumulative[0],
+                                 "outputTokens": cumulative[1],
+                                 "totalTokens": sum(cumulative)}}}}
+
+
 def on_turn_start(params):
     tid = turn_id()
     base = {"sessionId": MSP_SID, "turnId": tid}
@@ -228,6 +253,25 @@ def on_turn_start(params):
         notify("session/tokenUsage", token_usage(
             f"cur-{TURNS[0] + 1}", 100, 20, 100 * TURNS[0], 20 * TURNS[0]))
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "usage_inline_nosnapshot":
+        # The occupancy only ever arrives live; the totals must already be
+        # the ones read back from the durable page, never null.
+        notify("session/contextUsage", context_usage(1500, "cur-9"))
+        notify("session/tokenUsage", token_usage("cur-10", 100, 20, 400, 80))
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "usage_snapshot_null":
+        # Turn 1 establishes real occupancy; turn 2 runs after a reattach
+        # whose snapshot has no contextUsage, and reports no new occupancy.
+        if TURNS[0] == 1:
+            notify("session/contextUsage", context_usage(120, "cur-1"))
+        notify("session/tokenUsage", token_usage(
+            f"cur-{TURNS[0] + 1}", 100, 20, 100 * TURNS[0], 20 * TURNS[0]))
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "usage_resume":
+        # Occupancy is unchanged after the resume, so the host emits no
+        # contextUsage: only the restored window makes this leg sendable.
+        notify("session/tokenUsage", token_usage("cur-10", 100, 20, 200, 40))
+        notify("turn/completed", {**base, "terminal": "completed"})
     disposition = "queued" if SCENARIO == "queued" and TURNS[0] > 1 else "started"
     return {
         "commandId": params.get("commandId", ""),
@@ -246,19 +290,43 @@ def result_for(method, msg):
     if method == "session/resume":
         params = msg.get("params", {})
         log_input(params)
+        # Only the explicitly requested snapshot rung can carry occupancy;
+        # the default `auto` rung resolves to inline on the real host.
+        snapshot_rung = params.get("history") == "snapshot"
+        if SCENARIO == "usage_resume":
+            history = usage_snapshot_history()
+        elif SCENARIO == "usage_snapshot_null":
+            history = usage_snapshot_history(context=False)
+        elif SCENARIO == "usage_inline" and snapshot_rung:
+            history = usage_snapshot_history(cumulative=(300, 60))
+        else:
+            history = {"mode": "inline", "items": history_items(),
+                       "snapshot": None}
         return {"session": session_obj(params.get("sessionId", MSP_SID)),
                 "viewCursor": "cur-9",
                 "pendingRequests": [],
-                "history": {"mode": "inline", "items": history_items(),
-                            "snapshot": None}}
-    if method == "view/page" and SCENARIO == "usage_gap":
-        # Refill overlaps the live stream: cur-3 is in this page too.
-        return {"events": [
-            {"method": "session/tokenUsage",
-             "params": token_usage("cur-2", 100, 20, 100, 20)},
-            {"method": "session/tokenUsage",
-             "params": token_usage("cur-3", 1000, 500, 1100, 520)}],
-            "nextCursor": "cur-3"}
+                "history": history}
+    if method == "view/page":
+        page = msg.get("params", {})
+        if SCENARIO == "usage_gap" and page.get("direction") != "backward":
+            # Refill overlaps the live stream: cur-3 is in this page too.
+            return {"events": [
+                {"method": "session/tokenUsage",
+                 "params": token_usage("cur-2", 100, 20, 100, 20)},
+                {"method": "session/tokenUsage",
+                 "params": token_usage("cur-3", 1000, 500, 1100, 520)}],
+                "nextCursor": "cur-3"}
+        if (SCENARIO in ("usage_inline", "usage_inline_nosnapshot")
+                and page.get("direction") == "backward"):
+            # Ascending by viewCursor, as MSP guarantees in both directions.
+            # No session/contextUsage: it is not durable-sourced, so it never
+            # appears in a page -- verified against a real Muse 1.0.3 host.
+            return {"events": [
+                {"method": "session/tokenUsage",
+                 "params": token_usage("cur-8", 300, 60, 300, 60)}],
+                "nextCursor": None}
+        # Every other session pages back to nothing usable.
+        return {"events": [], "nextCursor": None}
     if method == "session/list":
         live = session_obj()
         old = session_obj("msp-sess-old", "/tmp/old-ws")

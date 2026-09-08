@@ -446,6 +446,158 @@ fn a_failed_catalog_refresh_retains_the_last_good_rates() {
 }
 
 #[test]
+fn inline_history_resume_reads_usage_back_from_the_view() {
+    // `history.snapshot` is null for the inline and none modes, so there is
+    // no snapshot to restore from: the usage has to come from a bounded
+    // backward page of the view the host just handed us.
+    for (ver, method) in [(1u64, "session/load"), (2, "session/resume")] {
+        let mut c = Client::spawn("usage_inline", &[]);
+        let init = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+        c.notify("initialized", "{}");
+        let lid = c.req(method, "{\"sessionId\":\"msp-sess-1\"}");
+        let attached = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+        assert!(
+            attached.contains("\"result\""),
+            "{method} failed: {attached}"
+        );
+        // No prompt, no new completion: this can only come from the read.
+        let restored = c.wait_for("usage_update", Duration::from_secs(15));
+        assert!(
+            restored.contains("\"used\":120") && restored.contains("\"size\":200000"),
+            "v{ver} occupancy read back from the view: {restored}"
+        );
+        assert!(
+            restored.contains("\"totalTokens\":360"),
+            "v{ver} cumulative read back from the view: {restored}"
+        );
+        assert!(
+            !restored.contains("\"cost\""),
+            "v{ver} paged history stays unpriced: {restored}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn a_downgraded_resume_still_recovers_the_running_totals() {
+    // The common real shape: every history rung downgrades to inline, and
+    // `session/contextUsage` is not durable-sourced, so it never appears in a
+    // page and the occupancy can only arrive live. The totals still come back
+    // from the durable page, so the first frame after a reattach reports them
+    // instead of nulls.
+    for (ver, method) in [(1u64, "session/load"), (2, "session/resume")] {
+        let mut c = Client::spawn("usage_inline_nosnapshot", &[]);
+        let init = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+        c.notify("initialized", "{}");
+        let lid = c.req(method, "{\"sessionId\":\"msp-sess-1\"}");
+        let attached = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+        assert!(
+            attached.contains("\"result\""),
+            "{method} failed: {attached}"
+        );
+        let _pid = c.prompt("msp-sess-1", "hi");
+        let first = c.wait_for("\"totalTokens\":360", Duration::from_secs(15));
+        assert!(
+            first.contains("\"used\":1500") && first.contains("\"size\":200000"),
+            "v{ver} live occupancy joined to the recovered totals: {first}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn a_snapshot_without_context_usage_keeps_the_known_window() {
+    // MSP serves the snapshot `contextUsage` as null until the fold holds a
+    // tracked anchor, and our JSON cannot tell null from absent. Adopting it
+    // blindly would blank a live window and silence the session -- the very
+    // symptom the restore exists to cure. v2 also covers the silent
+    // reconnect (session/resume with no replayFrom).
+    for (ver, method) in [(1u64, "session/load"), (2, "session/resume")] {
+        let mut c = Client::spawn("usage_snapshot_null", &[]);
+        let sid = c.new_session(ver, "");
+        let _first = c.prompt(&sid, "hi");
+        let live = c.wait_for("\"totalTokens\":120", Duration::from_secs(15));
+        assert!(
+            live.contains("\"used\":120") && live.contains("\"size\":200000"),
+            "v{ver} live occupancy established: {live}"
+        );
+        if ver == 1 {
+            c.wait_for("\"end_turn\"", Duration::from_secs(15));
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        let lid = c.req(method, &format!("{{\"sessionId\":\"{sid}\"}}"));
+        let attached = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+        assert!(
+            attached.contains("\"result\""),
+            "{method} failed: {attached}"
+        );
+        let _second = c.prompt(&sid, "again");
+        // Occupancy is unchanged, so nothing re-establishes the window. If
+        // the null snapshot had blanked it, this frame never arrives.
+        let after = c.wait_for("\"totalTokens\":240", Duration::from_secs(15));
+        assert!(
+            after.contains("\"used\":120") && after.contains("\"size\":200000"),
+            "v{ver} a null snapshot contextUsage blanked the window: {after}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn load_and_resume_restore_usage_from_the_history_snapshot() {
+    // Muse subscribes after the returned view head, so the usage events that
+    // built the snapshot are never resent, and session/contextUsage only
+    // fires when the occupancy triple changes. Without restoring the
+    // snapshot's own state a reattached session reports nothing at all.
+    for (ver, method) in [(1u64, "session/load"), (2, "session/resume")] {
+        let mut c = Client::spawn("usage_resume", &[]);
+        let init = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+        c.notify("initialized", "{}");
+        let params = if ver == 2 {
+            "{\"sessionId\":\"msp-sess-1\",\"replayFrom\":{\"type\":\"start\"}}".to_string()
+        } else {
+            "{\"sessionId\":\"msp-sess-1\"}".to_string()
+        };
+        let lid = c.req(method, &params);
+        let attached = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+        assert!(
+            attached.contains("\"result\""),
+            "{method} failed: {attached}"
+        );
+        let restored = c.wait_for("usage_update", Duration::from_secs(15));
+        assert!(
+            restored.contains("\"used\":120") && restored.contains("\"size\":200000"),
+            "v{ver} occupancy restored from the snapshot: {restored}"
+        );
+        assert!(
+            restored.contains("\"totalTokens\":120"),
+            "v{ver} cumulative restored from the snapshot: {restored}"
+        );
+        assert!(
+            !restored.contains("\"cost\""),
+            "v{ver} historic completions stay unpriced: {restored}"
+        );
+        // The restored window is what makes the next completion sendable:
+        // its occupancy is unchanged, so no contextUsage follows it.
+        let _pid = c.prompt("msp-sess-1", "hi");
+        let after = c.wait_for("\"totalTokens\":240", Duration::from_secs(15));
+        assert!(
+            after.contains("\"used\":120") && after.contains("\"size\":200000"),
+            "v{ver} restored occupancy carried into later usage: {after}"
+        );
+        assert!(
+            after.contains("\"cost\":{\"amount\":0.0006,\"currency\":\"USD\"}"),
+            "v{ver} the live completion is priced: {after}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn v1_prompt_happy_path_ends_end_turn() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(1, "");

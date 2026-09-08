@@ -74,6 +74,12 @@ fn host_mode(res: &J) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Folded session state carried by a resume/load result:
+/// `history.snapshot.state` (SnapshotState; absent for a non-snapshot history).
+fn snapshot_state(res: &J) -> Option<&J> {
+    res.get("history")?.get("snapshot")?.get("state")
+}
+
 /// Adopt a `(usedTokens, windowTokens, pressure)` occupancy triple, replacing
 /// wholesale: an absent `windowTokens` means the basis has no limit, so the
 /// stale size is dropped rather than re-emitted. Returns the pressure to ride
@@ -92,6 +98,110 @@ fn adopt_cumulative(s: &mut AcpSession, c: &J) {
     s.cum_prompt = c.get("promptTokens").and_then(|v| v.as_u64());
     s.cum_output = c.get("outputTokens").and_then(|v| v.as_u64());
     s.cum_total = c.get("totalTokens").and_then(|v| v.as_u64());
+}
+
+/// Latest usage for a resumed session whose history carried none.
+///
+/// Two reads, because the host exposes the two halves in different places.
+/// `session/contextUsage` is never durable-sourced -- it does not appear in a
+/// `view/page` at all -- and the default `auto` history rung resolves to
+/// `inline` in practice, which carries no snapshot. Occupancy therefore only
+/// comes from a snapshot rung, asked for explicitly; the durable page can
+/// still recover the cumulative block, which is worth having so the first
+/// frame after a reattach reports real totals instead of nulls.
+///
+/// Restores facts, not cost: historic completions stay unpriced.
+fn backfill_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
+    let (msp_sid, want_context, want_totals) = match sessions.lock().unwrap().get(acp_sid) {
+        Some(s) => (
+            s.msp_sid.clone(),
+            s.usage_used.is_none(),
+            s.cum_total.is_none(),
+        ),
+        None => return,
+    };
+    if !want_context && !want_totals {
+        return;
+    }
+    let (mut context, mut cumulative) = (None, None);
+    // The snapshot rung: the one surface that carries occupancy. The host
+    // downgrades freely, so an `inline`/`none` answer here is normal and
+    // simply leaves the occupancy unknown until the next live event.
+    let cmd = host.mint_cmd("cmd-");
+    match host.command(
+        "session/resume",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{},\"history\":\"snapshot\"}}",
+            esc(&cmd),
+            esc(msp_sid.as_str())
+        ),
+    ) {
+        Ok(r) => {
+            if let Some(state) = snapshot_state(&r) {
+                if let Some(cu) = state.get("contextUsage")
+                    && matches!(cu, J::Obj(_))
+                {
+                    context = Some(cu.clone());
+                }
+                if let Some(tu) = state.get("tokenUsage")
+                    && matches!(tu, J::Obj(_))
+                {
+                    cumulative = Some(tu.clone());
+                }
+            }
+        }
+        Err(e) => log(&format!(
+            "snapshot read for resumed usage failed: {}",
+            err_message(&e)
+        )),
+    }
+    // Fall back to the durable view for the totals alone.
+    if want_totals && cumulative.is_none() {
+        let cmd = host.mint_cmd("cmd-");
+        // An omitted `cursor` reads backward from the head; paged events are
+        // always ascending by `viewCursor`, so the last match is the newest.
+        match host.command(
+            "view/page",
+            &format!(
+                "{{\"commandId\":{},\"sessionId\":{},\"direction\":\"backward\",\"limit\":100}}",
+                esc(&cmd),
+                esc(msp_sid.as_str())
+            ),
+        ) {
+            Ok(r) => {
+                if let Some(J::Arr(events)) = r.get("events") {
+                    for e in events {
+                        if e.get("method").and_then(|v| v.as_str()) == Some("session/tokenUsage")
+                            && let Some(p) = e.get("params")
+                        {
+                            cumulative = p.get("cumulative").cloned();
+                        }
+                    }
+                }
+            }
+            Err(e) => log(&format!(
+                "view/page for resumed usage failed: {}",
+                err_message(&e)
+            )),
+        }
+    }
+    let mut map = sessions.lock().unwrap();
+    let Some(s) = map.get_mut(acp_sid) else {
+        return;
+    };
+    let mut pressure = None;
+    let mut adopted = false;
+    if want_context && let Some(cu) = &context {
+        pressure = adopt_context_usage(s, cu);
+        adopted = true;
+    }
+    if want_totals && let Some(c) = &cumulative {
+        adopt_cumulative(s, c);
+        adopted = true;
+    }
+    if adopted {
+        acp::send_usage(stdout, s, pressure.as_deref());
+    }
 }
 
 fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
@@ -739,10 +849,41 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         if let Some(m) = host_mode(&r) {
                             entry.mode_value = acp::mode_from_msp(&m).to_string();
                         }
+                        // Usage the host already knows, restored from the
+                        // snapshot rather than from message replay: Muse
+                        // subscribes after the returned view head, so the
+                        // original usage events are never resent, and
+                        // `session/contextUsage` only fires when the
+                        // occupancy triple changes. Without this a reattached
+                        // session reports nothing until something moves.
+                        // Historic completions stay unpriced — `cost_amount`
+                        // is deliberately untouched.
+                        // `J::get` cannot tell an absent key from an explicit
+                        // null, and MSP serves the snapshot `contextUsage` as
+                        // null until the fold holds a tracked anchor. Match the
+                        // object itself so a reattach whose snapshot carries no
+                        // occupancy keeps what the session already knows
+                        // instead of having it blanked back to silence.
+                        let mut pressure: Option<String> = None;
+                        if let Some(state) = snapshot_state(&r) {
+                            if let Some(cu) = state.get("contextUsage")
+                                && matches!(cu, J::Obj(_))
+                            {
+                                pressure = adopt_context_usage(entry, cu);
+                            }
+                            if let Some(tu) = state.get("tokenUsage")
+                                && matches!(tu, J::Obj(_))
+                            {
+                                adopt_cumulative(entry, tu);
+                            }
+                        }
                         if replay {
                             replay_history(stdout, entry, &r);
                         }
+                        acp::send_usage(stdout, entry, pressure.as_deref());
                     }
+                    // Outside the lock: this reads back from the host.
+                    backfill_usage(host, stdout, sessions, &sid);
                     let msp_out = sessions
                         .lock()
                         .unwrap()
