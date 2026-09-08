@@ -65,10 +65,10 @@ pub struct AcpSession {
     pub cum_output: Option<u64>,
     pub cum_total: Option<u64>,
     /// Running list-price estimate, accumulated per completion from catalog
-    /// per-1M rates: (amount, currency). Only completions observed live are
-    /// priced (resumed history is not back-filled) and cached input is
-    /// charged at the full input rate, so this is an upper bound — never a
-    /// billing figure on plan subscriptions.
+    /// per-1M rates: (amount, currency). Partial in both directions —
+    /// historic and unpriceable completions are excluded, while cached input
+    /// is charged at the full input rate — so it is never a billing figure
+    /// on plan subscriptions.
     pub cost_amount: Option<(f64, String)>,
     /// View cursors of completions already folded into the totals above.
     /// `view/gap` recovery can replay a completion that also arrives live.
