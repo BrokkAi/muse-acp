@@ -13,6 +13,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   approval     approval/requested notification (two choices), then completed
   approval_req approval/request server-initiated REQUEST (no notification)
   questions    userInput/requested with options, then completed
+  questions_resume reissue a pending question after both attach and usage backfill
   queued       1st turn/start: silence; 2nd: completed(TURN_1), completed(TURN_2)
   unqueued     turn/unqueued for the turn (never runs)
   quiet        turn/start answers only; nothing follows (for close/cancel)
@@ -153,6 +154,18 @@ def usage_snapshot_history(context=True, cumulative=(100, 20)):
                                  "totalTokens": sum(cumulative)}}}}
 
 
+def question_params(user_input_id="ui-1"):
+    return {"sessionId": MSP_SID, "userInputId": user_input_id,
+            "turnId": "turn-question", "itemId": f"item-{user_input_id}",
+            "toolCallId": f"call-{user_input_id}", "toolName": "request_user_input",
+            "viewCursor": "cur-8",
+            "questions": [{
+                "id": "q0", "header": "Pick", "question": "Which?",
+                "selection": {"mode": "single"},
+                "options": [{"label": "Alpha"}, {"label": "Beta"}],
+            }]}
+
+
 def on_turn_start(params):
     tid = turn_id()
     base = {"sessionId": MSP_SID, "turnId": tid}
@@ -181,14 +194,13 @@ def on_turn_start(params):
         send({"jsonrpc": "2.0", "id": 9100, "method": "approval/request",
               "params": dict(APPROVAL_PARAMS)})
         notify("turn/completed", {**base, "terminal": "completed"})
-    elif SCENARIO == "questions":
-        notify("userInput/requested", {
-            "sessionId": MSP_SID, "userInputId": "ui-1",
-            "questions": [{
-                "id": "q0", "header": "Pick", "question": "Which?",
-                "selection": {"mode": "single"},
-                "options": [{"label": "Alpha"}, {"label": "Beta"}],
-            }]})
+    elif SCENARIO in ("questions", "questions_resume"):
+        qid = "ui-2" if SCENARIO == "questions_resume" else "ui-1"
+        notify("userInput/requested", question_params(qid))
+        if SCENARIO == "questions_resume":
+            # The request and view notification also describe the same ask.
+            send({"jsonrpc": "2.0", "id": 9200, "method": "userInput/request",
+                  "params": question_params(qid)})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "queued":
         if TURNS[0] == 2:
@@ -297,14 +309,22 @@ def result_for(method, msg):
             history = usage_snapshot_history()
         elif SCENARIO == "usage_snapshot_null":
             history = usage_snapshot_history(context=False)
-        elif SCENARIO == "usage_inline" and snapshot_rung:
+        elif SCENARIO in ("usage_inline", "questions_resume") and snapshot_rung:
             history = usage_snapshot_history(cumulative=(300, 60))
         else:
             history = {"mode": "inline", "items": history_items(),
                        "snapshot": None}
+        pending = []
+        if SCENARIO == "questions_resume":
+            pending = [{"kind": "userInput", "userInputId": "ui-1",
+                        "viewCursor": "cur-8"}]
+            if history.get("snapshot"):
+                history["snapshot"]["state"]["pendingUserInputs"] = [
+                    {"userInputId": "ui-1", "itemId": "item-ui-1",
+                     "viewCursor": "cur-8"}]
         return {"session": session_obj(params.get("sessionId", MSP_SID)),
                 "viewCursor": "cur-9",
-                "pendingRequests": [],
+                "pendingRequests": pending,
                 "history": history}
     if method == "view/page":
         page = msg.get("params", {})
@@ -363,6 +383,9 @@ def result_for(method, msg):
         params = msg.get("params", {})
         log_input(params)
         return on_turn_start(params)
+    if method == "userInput/answer":
+        log_input(msg.get("params", {}))
+        return {}
     if method == "turn/steer":
         params = msg.get("params", {})
         log_input(params)
@@ -405,6 +428,15 @@ def main():
                     continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
+                if SCENARIO == "questions_resume" and method == "session/resume":
+                    # MSP reissues pending requests after the resume response.
+                    send({"jsonrpc": "2.0", "id": 9100 + ident,
+                          "method": "userInput/request", "params": question_params()})
+                    if msg["params"].get("history") == "snapshot":
+                        # A stream barrier: both reissues precede this item.
+                        notify("item/completed", {"sessionId": MSP_SID, "item": {
+                            "itemId": "reissue-barrier", "kind": "agentMessage",
+                            "status": "completed", "text": "resume questions delivered"}})
 
 
 main()

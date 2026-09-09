@@ -124,6 +124,8 @@ v2 uses `configId`.
 
 Form questions also work in both versions when the client advertises
 `elicitation.form: {}` under `clientCapabilities` (v1) or `capabilities` (v2).
+Repeated deliveries of a pending question reuse its existing form, including
+requests reissued during session resume.
 Without that capability, the adapter cancels the question so the turn can
 continue; it does not emit an unsupported request.
 

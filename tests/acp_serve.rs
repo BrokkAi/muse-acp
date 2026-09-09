@@ -762,6 +762,91 @@ fn user_input_options_reach_the_client() {
 }
 
 #[test]
+fn resumed_user_input_is_presented_once_and_remains_answerable() {
+    for (ver, method, caps) in [
+        (1, "session/load", "clientCapabilities"),
+        (2, "session/resume", "capabilities"),
+    ] {
+        let mut c = Client::spawn("questions_resume", &[]);
+        let init = c.req(
+            "initialize",
+            &format!(
+                "{{\"protocolVersion\":{ver},\"{caps}\":{{\"elicitation\":{{\"form\":{{}}}}}}}}"
+            ),
+        );
+        c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+        c.notify("initialized", "{}");
+        let load = c.req(method, "{\"sessionId\":\"msp-sess-1\"}");
+        c.wait_for(&format!("\"id\":{load}"), Duration::from_secs(15));
+        // The fixture reissues ui-1 after both resumes. This stream marker
+        // follows the second reissue, so counting forms needs no timing guess.
+        c.wait_for("resume questions delivered", Duration::from_secs(15));
+        let forms: Vec<String> = c
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f.contains("elicitation/create"))
+            .cloned()
+            .collect();
+        assert_eq!(forms.len(), 1, "v{ver} duplicated pending form: {forms:?}");
+        let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+        assert_eq!(calls.lines().filter(|m| *m == "session/resume").count(), 2);
+        assert!(
+            !calls.lines().any(|m| m == "userInput/cancel"),
+            "v{ver} duplicate must count as handled, not trigger cancellation: {calls}"
+        );
+        let usage = c.wait_for("usage_update", Duration::from_secs(15));
+        assert!(
+            usage.contains("\"used\":120") && usage.contains("\"totalTokens\":360"),
+            "v{ver} backfill still restores usage: {usage}"
+        );
+        let first_id = extract_str(&forms[0], "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{first_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
+        ));
+        c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
+
+        // A distinct ask is still displayed; its request/notification pair
+        // is deduplicated too, and the second answer retains its own ID.
+        let prompt = c.prompt("msp-sess-1", "ask again");
+        if ver == 1 {
+            c.wait_for(&format!("\"id\":{prompt}"), Duration::from_secs(15));
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        let forms: Vec<String> = c
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f.contains("elicitation/create"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            forms.len(),
+            2,
+            "v{ver} one form per distinct question: {forms:?}"
+        );
+        let second_id = extract_str(&forms[1], "id").unwrap();
+        assert_ne!(first_id, second_id);
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{second_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Beta\"}}}}}}"
+        ));
+        c.wait_input("\"selectedLabel\": \"Beta\"", Duration::from_secs(15));
+        let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        let answers: Vec<&str> = inputs
+            .lines()
+            .filter(|l| l.contains("\"answers\""))
+            .collect();
+        assert_eq!(answers.len(), 2, "v{ver} one answer per question: {inputs}");
+        assert!(answers[0].contains("\"userInputId\": \"ui-1\"") && answers[0].contains("Alpha"));
+        assert!(answers[1].contains("\"userInputId\": \"ui-2\"") && answers[1].contains("Beta"));
+        c.finish();
+    }
+}
+
+#[test]
 fn v1_questions_use_advertised_client_form_capability() {
     let mut c = Client::spawn("questions", &[]);
     let sid = c.new_session(1, ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}");

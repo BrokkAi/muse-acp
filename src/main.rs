@@ -2730,6 +2730,16 @@ fn bridge_user_input(
     if user_input_id.is_empty() || questions.is_empty() {
         return false;
     }
+    // Resume reissues and the request/notification pair can repeat the same
+    // pending question. Keep the original ACP request and answer mapping;
+    // returning true also prevents the caller's auto-cancel fallback.
+    if sessions.lock().unwrap().get(acp_sid).is_some_and(|s| {
+        s.pending_ui
+            .iter()
+            .any(|p| p.user_input_id == user_input_id)
+    }) {
+        return true;
+    }
     let mut props = Vec::new();
     let mut required = Vec::new();
     let mut msg = Vec::new();
