@@ -105,7 +105,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `turn/completed` | v1 `session/prompt` response `{stopReason}`; v2 `state_update` idle + `stopReason` |
 | `turn/cancel` | `session/cancel` (waits for the terminal event; `already_terminal` = success) |
 | `approval/requested` + `approval/request` | `session/request_permission` → `approval/decide` (deny-safe fallback) |
-| `session/resume` + history | `session/resume` (+ `replayFrom: {type:start}` replays messages) |
+| `session/resume` + history | `session/resume` (+ `replayFrom: {type:start}` replays messages); usage is restored on attach: from `history.snapshot.state` when a snapshot is served, else by asking for the snapshot rung explicitly, else from one backward `view/page` read for the running totals |
 | `sessionDurability` (default durable) | continuity across turns; Muse's durable session ID is used directly by ACP |
 | `turn/start` `ifBusy` (queue default) | concurrent prompts per session; each completes its own response; `session/cancel` stops all of them |
 | `TurnInputPart` image | image blocks (inline base64 or local `file://` path); advertised in caps |
@@ -115,6 +115,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `reasoningEffort` on `turn/start` / `turn/steer` | `configOptions` reasoning selector (`none` through `ultra`) |
 | `turn/steer` | v2 `_session/steering` extension with exact-turn targeting and race-safe idle behavior |
 | Muse skills | ACP `available_commands_update`; aliases such as `/plan` are sent to Muse as `/skill plan` |
+| `session/contextUsage` + `session/tokenUsage` | `usage_update` (`used`/`size` from context occupancy, also restored on attach; `_meta.museCumulative` session totals, `_meta.musePressure`); each completion is counted once, so a `view/gap` refill that replays one already seen does not re-price it; `cost` is a client-local list-price estimate from `model/list` catalog rates, summed per completion — partial in both directions (historic and unpriceable completions are excluded, cached input is charged at the full rate), never a billing figure |
 
 Zed currently initializes custom agents with ACP v1 even though it supports
 config selectors, so the adapter returns `configOptions` in both protocol
@@ -131,6 +132,21 @@ session and after a config option changes. The adapter does not permanently
 cache the first nonempty catalog. If a refresh fails, it retains the last
 successful catalog; stderr records failures and each snapshot's source and
 model count. An open selector does not itself trigger a refresh.
+
+Restoring usage on attach takes up to two extra reads, and only when the
+resume itself carried none. `session/contextUsage` is not durable-sourced, so
+it never appears in a `view/page`; the context occupancy is only ever served in
+a snapshot, and the default `auto` history rung usually resolves to `inline`.
+The adapter therefore asks for the snapshot rung explicitly, and falls back to
+a backward page for the running totals alone. When neither carries usage, the
+session reports none until the next live `session/contextUsage`.
+
+Catalog pricing follows the same snapshot: a successful refresh replaces the
+per-model rates outright, so a model that comes back without a usable `cost`,
+or that leaves the catalog, stops being priced rather than keeping the rates it
+used to have. Only a failed refresh retains the previous rates. Completions
+already added to a session's running estimate keep the price they were charged
+at; a rate change never re-prices history.
 
 JetBrains may attach its integrated stdio MCP server to `session/new` even when
 the agent advertises no optional MCP transports. The adapter currently ignores

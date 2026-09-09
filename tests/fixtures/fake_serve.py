@@ -20,6 +20,16 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   resume_active session/resume reports a running turn (for steering reattach)
   catalog_grows model/list expands after the first snapshot
   catalog_refresh_failure valid catalog, malformed response, RPC error, empty catalog
+  usage_gap    view/gap refill page overlapping a live completion
+  usage_rates_dropped priced catalog, then a refresh whose model has no cost
+  usage_rates_empty   ... then a refresh returning models: []
+  usage_rates_invalid ... then a refresh whose rates do not parse
+  usage_rates_failure ... then a FAILED refresh (rates must survive)
+  usage_resume session/resume serves an anchoredSnapshot carrying usage
+  usage_snapshot_null snapshot whose contextUsage is null (the common shape)
+  usage_inline inline by default; the explicit snapshot rung carries usage
+  usage_inline_nosnapshot every rung downgrades; only the durable page has
+               totals, and contextUsage is never durable (as on the real host)
 """
 import json
 import os
@@ -103,6 +113,46 @@ def history_items():
     ]
 
 
+def token_usage(cursor, prompt, output, cumulative_prompt, cumulative_output):
+    """One `session/tokenUsage` completion leg, identified by view cursor."""
+    return {"sessionId": MSP_SID, "turnId": f"turn-{TURNS[0]}",
+            "promptTokens": prompt, "totalTokens": prompt + output,
+            "modelId": "fake-model",
+            "usage": {"inputTokens": prompt, "outputTokens": output,
+                      "cachedTokens": 0, "reasoningTokens": 0},
+            "viewCursor": cursor,
+            "sourceRange": {"start": 0, "end": int(cursor.split("-")[1])},
+            "cumulative": {"promptTokens": cumulative_prompt,
+                           "outputTokens": cumulative_output,
+                           "totalTokens": cumulative_prompt + cumulative_output}}
+
+
+def context_usage(used, cursor):
+    return {"sessionId": MSP_SID, "usedTokens": used, "windowTokens": 200000,
+            "pressure": "normal", "viewCursor": cursor,
+            "sourceRange": {"start": 0, "end": int(cursor.split("-")[1])}}
+
+
+def usage_snapshot_history(context=True, cumulative=(100, 20)):
+    """anchoredSnapshot history whose state already knows the usage. MSP
+    serves `contextUsage` as null until the fold holds a tracked anchor, so
+    context=False is the ordinary shape, not an exotic one."""
+    return {"mode": "anchoredSnapshot", "items": None, "snapshot": {
+        "schemaVersion": 1, "viewCursor": "cur-9",
+        "anchor": {"boundaryCursor": "cur-8", "summarizedThrough": "anchor-8"},
+        "state": {"items": [], "activeTurn": None, "queuedTurns": [],
+                  "pendingApprovals": [], "pendingUserInputs": [],
+                  "approvalMode": session_obj()["approvalMode"],
+                  "effectiveModel": None, "branch": None, "goal": None,
+                  "todoList": None, "turnCount": 1,
+                  "contextUsage": ({"usedTokens": 120,
+                                    "windowTokens": 200000,
+                                    "pressure": "normal"} if context else None),
+                  "tokenUsage": {"promptTokens": cumulative[0],
+                                 "outputTokens": cumulative[1],
+                                 "totalTokens": sum(cumulative)}}}}
+
+
 def on_turn_start(params):
     tid = turn_id()
     base = {"sessionId": MSP_SID, "turnId": tid}
@@ -150,6 +200,78 @@ def on_turn_start(params):
                                      "terminal": "completed"})
     elif SCENARIO == "unqueued":
         notify("turn/unqueued", dict(base))
+    elif SCENARIO == "usage":
+        # A tokenUsage before any contextUsage has no used/size pair and
+        # must be held back, not emitted with nulls.
+        notify("session/tokenUsage", {
+            "sessionId": MSP_SID, "turnId": tid,
+            "promptTokens": 100, "totalTokens": 120, "modelId": "fake-model",
+            "usage": {"inputTokens": 100, "outputTokens": 20,
+                      "cachedTokens": 0, "reasoningTokens": 0},
+            "viewCursor": "cur-0", "sourceRange": {"start": 0, "end": 1},
+            "cumulative": {"promptTokens": 100, "outputTokens": 20,
+                           "totalTokens": 120}})
+        notify("session/contextUsage", {
+            "sessionId": MSP_SID, "usedTokens": 1234, "windowTokens": 200000,
+            "pressure": "normal", "viewCursor": "cur-1",
+            "sourceRange": {"start": 0, "end": 1}})
+        notify("session/tokenUsage", {
+            "sessionId": MSP_SID, "turnId": tid,
+            "promptTokens": 1000, "totalTokens": 1500, "modelId": "fake-model",
+            "usage": {"inputTokens": 1000, "outputTokens": 500,
+                      "cachedTokens": 0, "reasoningTokens": 0},
+            "viewCursor": "cur-2", "sourceRange": {"start": 0, "end": 2},
+            "cumulative": {"promptTokens": 5000, "outputTokens": 2500,
+                           "totalTokens": 7500}})
+        # Pre-schema record: no modelId, so an unpriced leg. Totals still
+        # advance; the running cost must not.
+        notify("session/tokenUsage", {
+            "sessionId": MSP_SID, "turnId": tid,
+            "promptTokens": 1000, "totalTokens": 1500,
+            "usage": {"inputTokens": 1000, "outputTokens": 500,
+                      "cachedTokens": 0, "reasoningTokens": 0},
+            "viewCursor": "cur-3", "sourceRange": {"start": 0, "end": 3},
+            "cumulative": {"promptTokens": 6000, "outputTokens": 3000,
+                           "totalTokens": 9000}})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-1", "kind": "agentMessage",
+            "status": "completed", "text": "done"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "usage_gap":
+        # cur-3 is delivered twice: once by the view/gap refill page and
+        # once on the live stream. Two distinct completions, one price each.
+        notify("session/contextUsage", context_usage(120, "cur-1"))
+        notify("view/gap", {"sessionId": MSP_SID,
+                            "after": "cur-1", "next": "cur-3"})
+        notify("session/tokenUsage", token_usage("cur-3", 1000, 500, 1100, 520))
+        notify("session/contextUsage", context_usage(1620, "cur-4"))
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO in ("usage_rates_dropped", "usage_rates_empty",
+                      "usage_rates_invalid", "usage_rates_failure"):
+        if TURNS[0] == 1:
+            notify("session/contextUsage", context_usage(120, "cur-1"))
+        notify("session/tokenUsage", token_usage(
+            f"cur-{TURNS[0] + 1}", 100, 20, 100 * TURNS[0], 20 * TURNS[0]))
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "usage_inline_nosnapshot":
+        # The occupancy only ever arrives live; the totals must already be
+        # the ones read back from the durable page, never null.
+        notify("session/contextUsage", context_usage(1500, "cur-9"))
+        notify("session/tokenUsage", token_usage("cur-10", 100, 20, 400, 80))
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "usage_snapshot_null":
+        # Turn 1 establishes real occupancy; turn 2 runs after a reattach
+        # whose snapshot has no contextUsage, and reports no new occupancy.
+        if TURNS[0] == 1:
+            notify("session/contextUsage", context_usage(120, "cur-1"))
+        notify("session/tokenUsage", token_usage(
+            f"cur-{TURNS[0] + 1}", 100, 20, 100 * TURNS[0], 20 * TURNS[0]))
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "usage_resume":
+        # Occupancy is unchanged after the resume, so the host emits no
+        # contextUsage: only the restored window makes this leg sendable.
+        notify("session/tokenUsage", token_usage("cur-10", 100, 20, 200, 40))
+        notify("turn/completed", {**base, "terminal": "completed"})
     disposition = "queued" if SCENARIO == "queued" and TURNS[0] > 1 else "started"
     return {
         "commandId": params.get("commandId", ""),
@@ -168,11 +290,43 @@ def result_for(method, msg):
     if method == "session/resume":
         params = msg.get("params", {})
         log_input(params)
+        # Only the explicitly requested snapshot rung can carry occupancy;
+        # the default `auto` rung resolves to inline on the real host.
+        snapshot_rung = params.get("history") == "snapshot"
+        if SCENARIO == "usage_resume":
+            history = usage_snapshot_history()
+        elif SCENARIO == "usage_snapshot_null":
+            history = usage_snapshot_history(context=False)
+        elif SCENARIO == "usage_inline" and snapshot_rung:
+            history = usage_snapshot_history(cumulative=(300, 60))
+        else:
+            history = {"mode": "inline", "items": history_items(),
+                       "snapshot": None}
         return {"session": session_obj(params.get("sessionId", MSP_SID)),
                 "viewCursor": "cur-9",
                 "pendingRequests": [],
-                "history": {"mode": "inline", "items": history_items(),
-                            "snapshot": None}}
+                "history": history}
+    if method == "view/page":
+        page = msg.get("params", {})
+        if SCENARIO == "usage_gap" and page.get("direction") != "backward":
+            # Refill overlaps the live stream: cur-3 is in this page too.
+            return {"events": [
+                {"method": "session/tokenUsage",
+                 "params": token_usage("cur-2", 100, 20, 100, 20)},
+                {"method": "session/tokenUsage",
+                 "params": token_usage("cur-3", 1000, 500, 1100, 520)}],
+                "nextCursor": "cur-3"}
+        if (SCENARIO in ("usage_inline", "usage_inline_nosnapshot")
+                and page.get("direction") == "backward"):
+            # Ascending by viewCursor, as MSP guarantees in both directions.
+            # No session/contextUsage: it is not durable-sourced, so it never
+            # appears in a page -- verified against a real Muse 1.0.3 host.
+            return {"events": [
+                {"method": "session/tokenUsage",
+                 "params": token_usage("cur-8", 300, 60, 300, 60)}],
+                "nextCursor": None}
+        # Every other session pages back to nothing usable.
+        return {"events": [], "nextCursor": None}
     if method == "session/list":
         live = session_obj()
         old = session_obj("msp-sess-old", "/tmp/old-ws")
@@ -185,12 +339,23 @@ def result_for(method, msg):
                                   "source": "explicit"}}
     if method == "model/list":
         CATALOG_READS[0] += 1
+        if SCENARIO == "usage_rates_failure" and CATALOG_READS[0] > 1:
+            return {}  # malformed: no models array, so the refresh failed
         if SCENARIO == "catalog_refresh_failure":
             if CATALOG_READS[0] == 2:
                 return {}
             if CATALOG_READS[0] == 4:
                 return {"models": [], "source": "unresolvedCatalog"}
-        models = [{"modelId": "fake-model", "displayLabel": "Fake"}]
+        models = [{"modelId": "fake-model", "displayLabel": "Fake",
+                   "cost": {"input": "3.00", "output": "15.00",
+                            "cached": "0.30", "currency": "USD"}}]
+        if CATALOG_READS[0] > 1:
+            if SCENARIO == "usage_rates_dropped":
+                models[0]["cost"] = None
+            elif SCENARIO == "usage_rates_empty":
+                models = []
+            elif SCENARIO == "usage_rates_invalid":
+                models[0]["cost"]["input"] = "NaN"
         if SCENARIO == "catalog_grows" and CATALOG_READS[0] > 1:
             models.append({"modelId": "second-model", "displayLabel": "Second"})
         return {"models": models, "source": "fakeCatalog"}

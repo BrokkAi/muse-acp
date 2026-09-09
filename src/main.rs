@@ -10,6 +10,7 @@ mod json;
 mod msp;
 mod zed;
 
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::{
@@ -30,6 +31,38 @@ static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the client advertis
 /// Rows are (modelId, displayLabel, isDefault).
 static CATALOG: std::sync::OnceLock<Mutex<Vec<(String, String, bool)>>> =
     std::sync::OnceLock::new();
+/// Per-model catalog cost rates by modelId: (input/1M, output/1M, currency).
+/// Decimal strings carried verbatim by MSP; parsed here for client-local math.
+type CostRates = HashMap<String, (f64, f64, String)>;
+static CATALOG_RATES: std::sync::OnceLock<Mutex<CostRates>> = std::sync::OnceLock::new();
+
+/// Parse one MSP `ModelCost` block into (input/1M, output/1M, currency).
+/// Rates must be finite and non-negative: `str::parse::<f64>` accepts
+/// `inf`/`NaN` and overflows to infinity, none of which survive as JSON.
+/// A null currency (schema-allowed) leaves the model unpriced.
+fn parse_rates(cost: &J) -> Option<(f64, f64, String)> {
+    let rate = |key: &str| -> Option<f64> {
+        let v: f64 = cost.get(key)?.as_str()?.trim().parse().ok()?;
+        (v.is_finite() && v >= 0.0).then_some(v)
+    };
+    let input = rate("input")?;
+    let output = rate("output")?;
+    let currency = cost.get("currency")?.as_str()?.to_string();
+    if currency.len() != 3 || !currency.bytes().all(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    Some((input, output, currency))
+}
+
+/// Look up a model's catalog rates, if `model/list` priced it.
+fn catalog_rates(model: &str) -> Option<(f64, f64, String)> {
+    CATALOG_RATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(model)
+        .cloned()
+}
 
 /// Folded host approval mode: `session.approvalMode.mode`
 /// (EffectiveApprovalModeState; additive-optional, may be absent).
@@ -39,6 +72,136 @@ fn host_mode(res: &J) -> Option<String> {
         .get("mode")?
         .as_str()
         .map(|s| s.to_string())
+}
+
+/// Folded session state carried by a resume/load result:
+/// `history.snapshot.state` (SnapshotState; absent for a non-snapshot history).
+fn snapshot_state(res: &J) -> Option<&J> {
+    res.get("history")?.get("snapshot")?.get("state")
+}
+
+/// Adopt a `(usedTokens, windowTokens, pressure)` occupancy triple, replacing
+/// wholesale: an absent `windowTokens` means the basis has no limit, so the
+/// stale size is dropped rather than re-emitted. Returns the pressure to ride
+/// along with the resulting `usage_update`.
+fn adopt_context_usage(s: &mut AcpSession, cu: &J) -> Option<String> {
+    s.usage_used = cu.get("usedTokens").and_then(|v| v.as_u64());
+    s.usage_size = cu.get("windowTokens").and_then(|v| v.as_u64());
+    cu.get("pressure")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Adopt a counted-once session `cumulative` block. Live events, snapshots and
+/// paged history all carry the same shape, so they all land here.
+fn adopt_cumulative(s: &mut AcpSession, c: &J) {
+    s.cum_prompt = c.get("promptTokens").and_then(|v| v.as_u64());
+    s.cum_output = c.get("outputTokens").and_then(|v| v.as_u64());
+    s.cum_total = c.get("totalTokens").and_then(|v| v.as_u64());
+}
+
+/// Latest usage for a resumed session whose history carried none.
+///
+/// Two reads, because the host exposes the two halves in different places.
+/// `session/contextUsage` is never durable-sourced -- it does not appear in a
+/// `view/page` at all -- and the default `auto` history rung resolves to
+/// `inline` in practice, which carries no snapshot. Occupancy therefore only
+/// comes from a snapshot rung, asked for explicitly; the durable page can
+/// still recover the cumulative block, which is worth having so the first
+/// frame after a reattach reports real totals instead of nulls.
+///
+/// Restores facts, not cost: historic completions stay unpriced.
+fn backfill_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
+    let (msp_sid, want_context, want_totals) = match sessions.lock().unwrap().get(acp_sid) {
+        Some(s) => (
+            s.msp_sid.clone(),
+            s.usage_used.is_none(),
+            s.cum_total.is_none(),
+        ),
+        None => return,
+    };
+    if !want_context && !want_totals {
+        return;
+    }
+    let (mut context, mut cumulative) = (None, None);
+    // The snapshot rung: the one surface that carries occupancy. The host
+    // downgrades freely, so an `inline`/`none` answer here is normal and
+    // simply leaves the occupancy unknown until the next live event.
+    let cmd = host.mint_cmd("cmd-");
+    match host.command(
+        "session/resume",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{},\"history\":\"snapshot\"}}",
+            esc(&cmd),
+            esc(msp_sid.as_str())
+        ),
+    ) {
+        Ok(r) => {
+            if let Some(state) = snapshot_state(&r) {
+                if let Some(cu) = state.get("contextUsage")
+                    && matches!(cu, J::Obj(_))
+                {
+                    context = Some(cu.clone());
+                }
+                if let Some(tu) = state.get("tokenUsage")
+                    && matches!(tu, J::Obj(_))
+                {
+                    cumulative = Some(tu.clone());
+                }
+            }
+        }
+        Err(e) => log(&format!(
+            "snapshot read for resumed usage failed: {}",
+            err_message(&e)
+        )),
+    }
+    // Fall back to the durable view for the totals alone.
+    if want_totals && cumulative.is_none() {
+        let cmd = host.mint_cmd("cmd-");
+        // An omitted `cursor` reads backward from the head; paged events are
+        // always ascending by `viewCursor`, so the last match is the newest.
+        match host.command(
+            "view/page",
+            &format!(
+                "{{\"commandId\":{},\"sessionId\":{},\"direction\":\"backward\",\"limit\":100}}",
+                esc(&cmd),
+                esc(msp_sid.as_str())
+            ),
+        ) {
+            Ok(r) => {
+                if let Some(J::Arr(events)) = r.get("events") {
+                    for e in events {
+                        if e.get("method").and_then(|v| v.as_str()) == Some("session/tokenUsage")
+                            && let Some(p) = e.get("params")
+                        {
+                            cumulative = p.get("cumulative").cloned();
+                        }
+                    }
+                }
+            }
+            Err(e) => log(&format!(
+                "view/page for resumed usage failed: {}",
+                err_message(&e)
+            )),
+        }
+    }
+    let mut map = sessions.lock().unwrap();
+    let Some(s) = map.get_mut(acp_sid) else {
+        return;
+    };
+    let mut pressure = None;
+    let mut adopted = false;
+    if want_context && let Some(cu) = &context {
+        pressure = adopt_context_usage(s, cu);
+        adopted = true;
+    }
+    if want_totals && let Some(c) = &cumulative {
+        adopt_cumulative(s, c);
+        adopted = true;
+    }
+    if adopted {
+        acp::send_usage(stdout, s, pressure.as_deref());
+    }
 }
 
 fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
@@ -61,6 +224,11 @@ fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
         return cell.lock().unwrap().clone();
     };
     let mut out = Vec::new();
+    // Rebuilt from scratch, then swapped in below: a successful refresh is the
+    // whole pricing truth, so a model that lost its `cost`, returned rates
+    // `parse_rates` rejects, or left the catalog entirely must go back to
+    // unpriced instead of being charged at a surviving stale entry.
+    let mut rates = CostRates::new();
     for m in models {
         let id = m
             .get("modelId")
@@ -76,6 +244,11 @@ fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
             .unwrap_or(&id)
             .to_string();
         let def = matches!(m.get("isDefault"), Some(J::Bool(true)));
+        if let Some(cost) = m.get("cost")
+            && let Some(parsed) = parse_rates(cost)
+        {
+            rates.insert(id.clone(), parsed);
+        }
         out.push((id, label, def));
     }
     let source = r.get("source").and_then(J::as_str).unwrap_or("unknown");
@@ -84,6 +257,10 @@ fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
         out.len(),
         models.len()
     ));
+    *CATALOG_RATES
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap() = rates;
     *cell.lock().unwrap() = out.clone();
     out
 }
@@ -460,6 +637,13 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             active_turn,
                             view_cursor: cur_cursor.clone(),
                             fold: SessionFold::new(),
+                            usage_used: None,
+                            usage_size: None,
+                            cum_prompt: None,
+                            cum_output: None,
+                            cum_total: None,
+                            cost_amount: None,
+                            usage_seen: std::collections::HashSet::new(),
                         },
                     );
                     // _meta exposes the host session id: pass it back to
@@ -639,6 +823,13 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             active_turn: None,
                             view_cursor: String::new(),
                             fold: SessionFold::new(),
+                            usage_used: None,
+                            usage_size: None,
+                            cum_prompt: None,
+                            cum_output: None,
+                            cum_total: None,
+                            cost_amount: None,
+                            usage_seen: std::collections::HashSet::new(),
                         });
                         entry.msp_sid = real_msp;
                         entry.ver = ver;
@@ -658,10 +849,41 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         if let Some(m) = host_mode(&r) {
                             entry.mode_value = acp::mode_from_msp(&m).to_string();
                         }
+                        // Usage the host already knows, restored from the
+                        // snapshot rather than from message replay: Muse
+                        // subscribes after the returned view head, so the
+                        // original usage events are never resent, and
+                        // `session/contextUsage` only fires when the
+                        // occupancy triple changes. Without this a reattached
+                        // session reports nothing until something moves.
+                        // Historic completions stay unpriced — `cost_amount`
+                        // is deliberately untouched.
+                        // `J::get` cannot tell an absent key from an explicit
+                        // null, and MSP serves the snapshot `contextUsage` as
+                        // null until the fold holds a tracked anchor. Match the
+                        // object itself so a reattach whose snapshot carries no
+                        // occupancy keeps what the session already knows
+                        // instead of having it blanked back to silence.
+                        let mut pressure: Option<String> = None;
+                        if let Some(state) = snapshot_state(&r) {
+                            if let Some(cu) = state.get("contextUsage")
+                                && matches!(cu, J::Obj(_))
+                            {
+                                pressure = adopt_context_usage(entry, cu);
+                            }
+                            if let Some(tu) = state.get("tokenUsage")
+                                && matches!(tu, J::Obj(_))
+                            {
+                                adopt_cumulative(entry, tu);
+                            }
+                        }
                         if replay {
                             replay_history(stdout, entry, &r);
                         }
+                        acp::send_usage(stdout, entry, pressure.as_deref());
                     }
+                    // Outside the lock: this reads back from the host.
+                    backfill_usage(host, stdout, sessions, &sid);
                     let msp_out = sessions
                         .lock()
                         .unwrap()
@@ -2092,10 +2314,82 @@ fn handle_msp(
                 let _ = acp_sid;
             }
         }
+        "session/contextUsage" => {
+            // Context-window pressure: counted-once occupancy at the latest
+            // provider-reported fact. Replace wholesale (an absent
+            // `windowTokens` means the basis has no limit, so the stale size
+            // is dropped rather than re-emitted); MSP only emits on triple
+            // change, so every event is worth forwarding.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                let mut map = sessions.lock().unwrap();
+                if let Some(s) = map.get_mut(&acp_sid) {
+                    let pressure = adopt_context_usage(s, params);
+                    acp::send_usage(stdout, s, pressure.as_deref());
+                }
+            }
+        }
+        "session/tokenUsage" => {
+            // One per model completion: stash the counted-once cumulative
+            // block and re-emit with the last known occupancy. When no
+            // contextUsage has arrived yet there is no `used`/`size` pair,
+            // so there is nothing valid to send — the totals wait for it.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                let mut map = sessions.lock().unwrap();
+                if let Some(s) = map.get_mut(&acp_sid) {
+                    // `view/gap` recovery pages forward from the last cursor,
+                    // so a completion in that page can also be queued on the
+                    // live stream. Cumulative totals are counted-once and
+                    // survive a replay, but the per-completion cost leg below
+                    // would be charged once per delivery, so discard the
+                    // overlap by view cursor the way the item fold does. MSP
+                    // requires a strictly monotonic `viewCursor` on every one
+                    // of these events, so it is the completion's identity; the
+                    // emptiness check is only belt-and-braces.
+                    let cursor = params
+                        .get("viewCursor")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    if !cursor.is_empty() && !s.usage_seen.insert(cursor.to_string()) {
+                        return; // gap-refill replay of a priced completion
+                    }
+                    if let Some(c) = params.get("cumulative") {
+                        adopt_cumulative(s, c);
+                    }
+                    // Client-local cost math: price *this* completion's
+                    // counted-once `promptTokens`/`totalTokens` at the rates
+                    // of the model that produced it, and add to the running
+                    // total. Pricing the session cumulative at the latest
+                    // model would re-price history after `session/setModel`.
+                    // Legs with no `modelId`, an unknown model, or a currency
+                    // that differs from the running total stay unpriced.
+                    let model = params.get("modelId").and_then(|v| v.as_str());
+                    let prompt = params.get("promptTokens").and_then(|v| v.as_u64());
+                    let total = params.get("totalTokens").and_then(|v| v.as_u64());
+                    if let (Some(m), Some(p), Some(t)) = (model, prompt, total)
+                        && let Some((input_rate, output_rate, currency)) = catalog_rates(m)
+                    {
+                        let o = t.saturating_sub(p);
+                        let leg = (p as f64 * input_rate + o as f64 * output_rate) / 1_000_000.0;
+                        match &mut s.cost_amount {
+                            Some((amount, cur)) if *cur == currency => *amount += leg,
+                            Some(_) => {}
+                            None => s.cost_amount = Some((leg, currency)),
+                        }
+                    }
+                    acp::send_usage(stdout, s, None);
+                }
+            }
+        }
         "initialized"
         | "session/started"
-        | "session/contextUsage"
-        | "session/tokenUsage"
         | "session/goalChanged"
         | "session/todoListChanged"
         | "session/branchChanged" => {}
@@ -2705,7 +2999,47 @@ fn complete_elicitation(
 
 #[cfg(test)]
 mod tests {
-    use super::env_flag_enabled;
+    use super::{env_flag_enabled, parse_rates};
+    use crate::json::parse_json;
+
+    fn rates(input: &str, output: &str, currency: &str) -> Option<(f64, f64, String)> {
+        let cost = parse_json(&format!(
+            "{{\"input\":{input},\"output\":{output},\"cached\":\"0.1\",\"currency\":{currency}}}"
+        ))
+        .unwrap();
+        parse_rates(&cost)
+    }
+
+    #[test]
+    fn catalog_rates_parse_decimal_strings_with_iso_currency() {
+        assert_eq!(
+            rates("\"3.00\"", "\"15.00\"", "\"USD\""),
+            Some((3.0, 15.0, "USD".to_string()))
+        );
+        assert_eq!(
+            rates("\"0\"", "\" 2.5 \"", "\"EUR\""),
+            Some((0.0, 2.5, "EUR".to_string()))
+        );
+    }
+
+    #[test]
+    fn catalog_rates_reject_values_that_cannot_be_json_numbers() {
+        // `str::parse::<f64>` accepts these; the ACP frame must not.
+        for bad in ["\"inf\"", "\"-inf\"", "\"NaN\"", "\"1e400\"", "\"-1\""] {
+            assert_eq!(rates(bad, "\"1\"", "\"USD\""), None, "input {bad}");
+            assert_eq!(rates("\"1\"", bad, "\"USD\""), None, "output {bad}");
+        }
+        for bad in ["\"\"", "\"abc\"", "\"$3\"", "3", "null"] {
+            assert_eq!(rates(bad, "\"1\"", "\"USD\""), None, "input {bad}");
+        }
+    }
+
+    #[test]
+    fn catalog_rates_require_an_iso_4217_code() {
+        for bad in ["null", "\"usd\"", "\"US\"", "\"USDX\"", "\"$\"", "\"\""] {
+            assert_eq!(rates("\"1\"", "\"1\"", bad), None, "currency {bad}");
+        }
+    }
 
     #[test]
     fn unscoped_read_flag_requires_an_explicit_truthy_value() {

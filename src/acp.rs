@@ -56,6 +56,23 @@ pub struct AcpSession {
     pub active_turn: Option<String>,
     pub view_cursor: String,
     pub fold: SessionFold,
+    /// Last known context occupancy (`session/contextUsage.usedTokens`).
+    pub usage_used: Option<u64>,
+    /// Last known context window (`session/contextUsage.windowTokens`).
+    pub usage_size: Option<u64>,
+    /// Counted-once session cumulative totals (`session/tokenUsage.cumulative`).
+    pub cum_prompt: Option<u64>,
+    pub cum_output: Option<u64>,
+    pub cum_total: Option<u64>,
+    /// Running list-price estimate, accumulated per completion from catalog
+    /// per-1M rates: (amount, currency). Partial in both directions —
+    /// historic and unpriceable completions are excluded, while cached input
+    /// is charged at the full input rate — so it is never a billing figure
+    /// on plan subscriptions.
+    pub cost_amount: Option<(f64, String)>,
+    /// View cursors of completions already folded into the totals above.
+    /// `view/gap` recovery can replay a completion that also arrives live.
+    pub usage_seen: std::collections::HashSet<String>,
 }
 
 pub type Sessions = Arc<Mutex<HashMap<String, AcpSession>>>;
@@ -94,6 +111,42 @@ pub fn send_error(stdout: &StdoutShared, id: &Option<J>, code: i64, message: &st
             "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":{code},\"message\":{}}}}}",
             id_json(id),
             esc(message)
+        ),
+    );
+}
+
+/// `usage_update` for both ACP versions (`{used, size}` plus counted-once
+/// session cumulative totals in `_meta`). Emits only when both `used` and
+/// `size` are known; callers stash partial state on the session instead.
+pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>) {
+    let (Some(used), Some(size)) = (s.usage_used, s.usage_size) else {
+        return;
+    };
+    let mut meta = String::from("\"museCumulative\":{");
+    meta.push_str(&format!(
+        "\"promptTokens\":{},\"outputTokens\":{},\"totalTokens\":{}",
+        s.cum_prompt.map(|v| v.to_string()).unwrap_or("null".into()),
+        s.cum_output.map(|v| v.to_string()).unwrap_or("null".into()),
+        s.cum_total.map(|v| v.to_string()).unwrap_or("null".into()),
+    ));
+    meta.push('}');
+    if let Some(p) = pressure {
+        meta.push_str(&format!(",\"musePressure\":{}", esc(p)));
+    }
+    // `amount` must be a JSON number: Rust's Display prints `inf`/`NaN`
+    // verbatim, which would corrupt the whole frame.
+    let cost_f = match &s.cost_amount {
+        Some((amount, currency)) if amount.is_finite() => format!(
+            ",\"cost\":{{\"amount\":{amount},\"currency\":{}}}",
+            esc(currency)
+        ),
+        _ => String::new(),
+    };
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"usage_update\",\"used\":{used},\"size\":{size}{cost_f},\"_meta\":{{{meta}}}}}}}}}",
+            esc(&s.acp_sid),
         ),
     );
 }

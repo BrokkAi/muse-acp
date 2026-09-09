@@ -277,6 +277,327 @@ fn extract_str(frame: &str, key: &str) -> Option<String> {
 }
 
 #[test]
+fn usage_events_forward_msp_usage_as_acp_usage_update() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("usage", &[]);
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "hi");
+        let update = c.wait_for("\"totalTokens\":7500", Duration::from_secs(15));
+        assert!(update.contains(&sid), "usage for our session: {update}");
+        assert!(
+            update.contains("\"used\":1234") && update.contains("\"size\":200000"),
+            "occupancy bridged: {update}"
+        );
+        assert!(
+            update.contains("\"totalTokens\":7500"),
+            "cumulative totals in _meta: {update}"
+        );
+        // Two priced legs so far: (100·3 + 20·15)/1M + (1000·3 + 500·15)/1M.
+        assert!(
+            update.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\"}"),
+            "per-completion cost accumulated at catalog rates: {update}"
+        );
+        // The unpriced (no modelId) leg advances totals but not cost.
+        let later = c.wait_for("\"totalTokens\":9000", Duration::from_secs(15));
+        assert!(
+            later.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\"}"),
+            "unpriced leg leaves the running cost alone: {later}"
+        );
+        // The tokenUsage that arrived before any contextUsage was held back:
+        // the first usage frame already carries a real used/size pair (and
+        // the stashed totals), never nulls.
+        let first = c
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|f| f.contains("usage_update"))
+            .cloned()
+            .expect("a usage_update frame");
+        assert!(
+            first.contains("\"used\":1234") && first.contains("\"totalTokens\":120"),
+            "held-back totals ride the first valid occupancy: {first}"
+        );
+        if ver == 1 {
+            let done = c.wait_for("\"end_turn\"", Duration::from_secs(15));
+            assert!(!done.is_empty(), "terminal: {done}");
+        } else {
+            let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+            assert!(idle.contains(&sid), "v2 terminal idle: {idle}");
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn gap_refill_does_not_price_a_replayed_completion_twice() {
+    // view/gap pages forward from the last cursor, so a completion in that
+    // page can also be queued on the live stream. Cumulative totals are
+    // counted-once and survive the replay; the cost leg must too.
+    for ver in [1, 2] {
+        let mut c = Client::spawn("usage_gap", &[]);
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "hi");
+        // Settle the turn: every usage frame precedes the terminal.
+        if ver == 1 {
+            c.wait_for("\"end_turn\"", Duration::from_secs(15));
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        let frames = c.frames.lock().unwrap().join("\n");
+        // cur-2 (0.0006) plus cur-3 (0.0105); cur-3 is delivered twice.
+        assert!(
+            frames.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\"}"),
+            "v{ver} both distinct completions priced once: {frames}"
+        );
+        assert!(
+            !frames.contains("\"amount\":0.0216"),
+            "v{ver} replayed completion priced twice: {frames}"
+        );
+        // The replay must not disturb the counted-once cumulative either.
+        let totals = c.wait_for("\"totalTokens\":1620", Duration::from_secs(15));
+        assert!(
+            totals.contains(&sid),
+            "v{ver} usage for our session: {totals}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn a_successful_catalog_refresh_drops_stale_rates() {
+    // The model list is replaced by each successful snapshot, so pricing must
+    // be too: a model that comes back without a usable `cost` goes unpriced
+    // instead of being charged at the rates it used to have.
+    // The three ways a successful refresh can stop pricing a model:
+    // `cost: null`, the model leaving the catalog, and rates that reject.
+    for scenario in [
+        "usage_rates_dropped",
+        "usage_rates_empty",
+        "usage_rates_invalid",
+    ] {
+        for ver in [1, 2] {
+            let mut c = Client::spawn(scenario, &[]);
+            let sid = c.new_session(ver, "");
+            let _first = c.prompt(&sid, "hi");
+            let priced = c.wait_for("\"totalTokens\":120", Duration::from_secs(15));
+            assert!(
+                priced.contains("\"cost\":{\"amount\":0.0006,\"currency\":\"USD\"}"),
+                "v{ver} first completion priced at catalog rates: {priced}"
+            );
+            if ver == 1 {
+                c.wait_for("\"end_turn\"", Duration::from_secs(15));
+            } else {
+                c.wait_for("\"idle\"", Duration::from_secs(15));
+            }
+            // Refresh the catalog; this time the model carries `cost: null`.
+            let cfg = c.req(
+            "session/set_config_option",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
+            ),
+        );
+            c.wait_for(&format!("\"id\":{cfg}"), Duration::from_secs(15));
+            let _second = c.prompt(&sid, "again");
+            let after = c.wait_for("\"totalTokens\":240", Duration::from_secs(15));
+            assert!(
+                !after.contains("\"amount\":0.0012"),
+                "v{ver} later leg priced from stale rates: {after}"
+            );
+            assert!(
+                after.contains("\"cost\":{\"amount\":0.0006,\"currency\":\"USD\"}"),
+                "{scenario} v{ver} priced subtotal kept, unpriceable leg skipped: {after}"
+            );
+            c.finish();
+        }
+    }
+}
+
+#[test]
+fn a_failed_catalog_refresh_retains_the_last_good_rates() {
+    // The other half of the contract the fix rests on: only a *successful*
+    // response replaces pricing. A malformed one keeps the last good rates,
+    // so the later completion is still priced.
+    for ver in [1, 2] {
+        let mut c = Client::spawn("usage_rates_failure", &[]);
+        let sid = c.new_session(ver, "");
+        let _first = c.prompt(&sid, "hi");
+        c.wait_for("\"totalTokens\":120", Duration::from_secs(15));
+        if ver == 1 {
+            c.wait_for("\"end_turn\"", Duration::from_secs(15));
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        let cfg = c.req(
+            "session/set_config_option",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
+            ),
+        );
+        c.wait_for(&format!("\"id\":{cfg}"), Duration::from_secs(15));
+        let _second = c.prompt(&sid, "again");
+        let after = c.wait_for("\"totalTokens\":240", Duration::from_secs(15));
+        assert!(
+            after.contains("\"cost\":{\"amount\":0.0012,\"currency\":\"USD\"}"),
+            "v{ver} a failed refresh must keep the last good rates: {after}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn inline_history_resume_reads_usage_back_from_the_view() {
+    // `history.snapshot` is null for the inline and none modes, so there is
+    // no snapshot to restore from: the usage has to come from a bounded
+    // backward page of the view the host just handed us.
+    for (ver, method) in [(1u64, "session/load"), (2, "session/resume")] {
+        let mut c = Client::spawn("usage_inline", &[]);
+        let init = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+        c.notify("initialized", "{}");
+        let lid = c.req(method, "{\"sessionId\":\"msp-sess-1\"}");
+        let attached = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+        assert!(
+            attached.contains("\"result\""),
+            "{method} failed: {attached}"
+        );
+        // No prompt, no new completion: this can only come from the read.
+        let restored = c.wait_for("usage_update", Duration::from_secs(15));
+        assert!(
+            restored.contains("\"used\":120") && restored.contains("\"size\":200000"),
+            "v{ver} occupancy read back from the view: {restored}"
+        );
+        assert!(
+            restored.contains("\"totalTokens\":360"),
+            "v{ver} cumulative read back from the view: {restored}"
+        );
+        assert!(
+            !restored.contains("\"cost\""),
+            "v{ver} paged history stays unpriced: {restored}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn a_downgraded_resume_still_recovers_the_running_totals() {
+    // The common real shape: every history rung downgrades to inline, and
+    // `session/contextUsage` is not durable-sourced, so it never appears in a
+    // page and the occupancy can only arrive live. The totals still come back
+    // from the durable page, so the first frame after a reattach reports them
+    // instead of nulls.
+    for (ver, method) in [(1u64, "session/load"), (2, "session/resume")] {
+        let mut c = Client::spawn("usage_inline_nosnapshot", &[]);
+        let init = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+        c.notify("initialized", "{}");
+        let lid = c.req(method, "{\"sessionId\":\"msp-sess-1\"}");
+        let attached = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+        assert!(
+            attached.contains("\"result\""),
+            "{method} failed: {attached}"
+        );
+        let _pid = c.prompt("msp-sess-1", "hi");
+        let first = c.wait_for("\"totalTokens\":360", Duration::from_secs(15));
+        assert!(
+            first.contains("\"used\":1500") && first.contains("\"size\":200000"),
+            "v{ver} live occupancy joined to the recovered totals: {first}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn a_snapshot_without_context_usage_keeps_the_known_window() {
+    // MSP serves the snapshot `contextUsage` as null until the fold holds a
+    // tracked anchor, and our JSON cannot tell null from absent. Adopting it
+    // blindly would blank a live window and silence the session -- the very
+    // symptom the restore exists to cure. v2 also covers the silent
+    // reconnect (session/resume with no replayFrom).
+    for (ver, method) in [(1u64, "session/load"), (2, "session/resume")] {
+        let mut c = Client::spawn("usage_snapshot_null", &[]);
+        let sid = c.new_session(ver, "");
+        let _first = c.prompt(&sid, "hi");
+        let live = c.wait_for("\"totalTokens\":120", Duration::from_secs(15));
+        assert!(
+            live.contains("\"used\":120") && live.contains("\"size\":200000"),
+            "v{ver} live occupancy established: {live}"
+        );
+        if ver == 1 {
+            c.wait_for("\"end_turn\"", Duration::from_secs(15));
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        let lid = c.req(method, &format!("{{\"sessionId\":\"{sid}\"}}"));
+        let attached = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+        assert!(
+            attached.contains("\"result\""),
+            "{method} failed: {attached}"
+        );
+        let _second = c.prompt(&sid, "again");
+        // Occupancy is unchanged, so nothing re-establishes the window. If
+        // the null snapshot had blanked it, this frame never arrives.
+        let after = c.wait_for("\"totalTokens\":240", Duration::from_secs(15));
+        assert!(
+            after.contains("\"used\":120") && after.contains("\"size\":200000"),
+            "v{ver} a null snapshot contextUsage blanked the window: {after}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn load_and_resume_restore_usage_from_the_history_snapshot() {
+    // Muse subscribes after the returned view head, so the usage events that
+    // built the snapshot are never resent, and session/contextUsage only
+    // fires when the occupancy triple changes. Without restoring the
+    // snapshot's own state a reattached session reports nothing at all.
+    for (ver, method) in [(1u64, "session/load"), (2, "session/resume")] {
+        let mut c = Client::spawn("usage_resume", &[]);
+        let init = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+        c.notify("initialized", "{}");
+        let params = if ver == 2 {
+            "{\"sessionId\":\"msp-sess-1\",\"replayFrom\":{\"type\":\"start\"}}".to_string()
+        } else {
+            "{\"sessionId\":\"msp-sess-1\"}".to_string()
+        };
+        let lid = c.req(method, &params);
+        let attached = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+        assert!(
+            attached.contains("\"result\""),
+            "{method} failed: {attached}"
+        );
+        let restored = c.wait_for("usage_update", Duration::from_secs(15));
+        assert!(
+            restored.contains("\"used\":120") && restored.contains("\"size\":200000"),
+            "v{ver} occupancy restored from the snapshot: {restored}"
+        );
+        assert!(
+            restored.contains("\"totalTokens\":120"),
+            "v{ver} cumulative restored from the snapshot: {restored}"
+        );
+        assert!(
+            !restored.contains("\"cost\""),
+            "v{ver} historic completions stay unpriced: {restored}"
+        );
+        // The restored window is what makes the next completion sendable:
+        // its occupancy is unchanged, so no contextUsage follows it.
+        let _pid = c.prompt("msp-sess-1", "hi");
+        let after = c.wait_for("\"totalTokens\":240", Duration::from_secs(15));
+        assert!(
+            after.contains("\"used\":120") && after.contains("\"size\":200000"),
+            "v{ver} restored occupancy carried into later usage: {after}"
+        );
+        assert!(
+            after.contains("\"cost\":{\"amount\":0.0006,\"currency\":\"USD\"}"),
+            "v{ver} the live completion is priced: {after}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn v1_prompt_happy_path_ends_end_turn() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(1, "");
