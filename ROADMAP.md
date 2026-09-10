@@ -544,6 +544,12 @@ MSP provides `session/compact` (with `CompactionOutcome`
 `tokensAfter`, `outcome`, `reason`, `strategyId`, `summarizedThrough`), and
 `ContextPressureLevel` (`normal|warning|blocked`) on context usage.
 
+Status: **items and command implemented.** Compaction items surface as
+think-kind tool calls with `contextCompaction` v1 provenance metadata and
+token facts; a bare `/compact` prompt maps to `session/compact` and settles
+the ACP prompt honestly for both `accepted` and `noop`. Remaining work: carry
+the context pressure level alongside `usage_update` metadata.
+
 **Work items**
 
 - Surface `compaction` items as a visible think-kind tool call with `_meta`

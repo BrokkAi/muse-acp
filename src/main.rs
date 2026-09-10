@@ -1069,6 +1069,63 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     return;
                 }
             };
+            // `/compact` is a protocol command, not a prompt: run
+            // session/compact and settle immediately. The compaction item
+            // (when the host emits one) arrives as its own visible update.
+            let is_compact = parse_json(&acp_content).ok().and_then(|c| match c {
+                J::Arr(blocks) if blocks.len() == 1 => {
+                    let only = &blocks[0];
+                    let text = only.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    (only.get("type").and_then(|v| v.as_str()) == Some("text")
+                        && text.trim() == "/compact")
+                        .then_some(())
+                }
+                _ => None,
+            });
+            if is_compact.is_some() {
+                let cmd = host.mint_cmd("cmd-");
+                match host.command(
+                    "session/compact",
+                    &format!(
+                        "{{\"commandId\":{},\"sessionId\":{}}}",
+                        esc(&cmd),
+                        esc(&msp_sid)
+                    ),
+                ) {
+                    Ok(r) => {
+                        let status = r.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                        if status == "noop" {
+                            log(&format!(
+                                "compact noop: {}",
+                                r.get("reason").and_then(|v| v.as_str()).unwrap_or("?")
+                            ));
+                        }
+                        if ver == 2 {
+                            acp::send_result(stdout, &id, "{}");
+                            send_v2_user_message(stdout, &sid, &acp_content);
+                            acp::send_state(stdout, &sid, "idle", Some("end_turn"));
+                        } else {
+                            let msg_id = mint_id("msg-", &ID_COUNTER);
+                            acp::send_raw(
+                                stdout,
+                                &format!(
+                                    "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":\"/compact\"}}}}}}}}",
+                                    esc(&sid),
+                                    esc(&msg_id)
+                                ),
+                            );
+                            acp::send_result(stdout, &id, "{\"stopReason\":\"end_turn\"}");
+                        }
+                    }
+                    Err(e) => acp::send_error(
+                        stdout,
+                        &id,
+                        -32603,
+                        &format!("session/compact failed: {}", err_message(&e)),
+                    ),
+                }
+                return;
+            }
             // The host queues concurrent turns itself (ifBusy defaults to
             // queue); track every in-flight turn so each completes its own
             // prompt response.

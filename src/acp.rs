@@ -334,6 +334,7 @@ fn available_commands_json(ver: u8) -> String {
             "Create a grounded plan and stop for approval",
             Some("what to plan"),
         ),
+        ("compact", "Compact the session context", None),
         (
             "doctor",
             "Diagnose a Muse runtime or session issue",
@@ -444,7 +445,7 @@ mod tests {
             let J::Arr(items) = parsed else {
                 panic!("available commands must be an array");
             };
-            assert_eq!(items.len(), 6);
+            assert_eq!(items.len(), 7);
         }
         assert!(crate::json::parse_json(&session_modes("ask")).is_ok());
     }

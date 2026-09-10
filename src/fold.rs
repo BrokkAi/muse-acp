@@ -51,7 +51,7 @@ fn msp_status(s: &str) -> &'static str {
         "completed" => "completed",
         "failed" => "failed",
         "cancelled" => "cancelled",
-        "in_progress" | "running" | "started" => "in_progress",
+        "in_progress" | "inProgress" | "running" | "started" => "in_progress",
         _ => "pending",
     }
 }
@@ -143,6 +143,66 @@ impl SessionFold {
             )
         };
         Self::update_line(acp_sid, &update)
+    }
+
+    /// Compaction is host work the user must see, but it is not a tool the
+    /// model called. Present it as a think-kind tool call with provenance
+    /// metadata, matching codex-acp's compaction presentation.
+    fn compaction_line(
+        acp_sid: &str,
+        ver: u8,
+        item_id: &str,
+        status: &str,
+        content_text: Option<&str>,
+    ) -> String {
+        let session_update = if ver == 2 || status != "in_progress" {
+            "tool_call_update"
+        } else {
+            "tool_call"
+        };
+        let mut f = vec![
+            format!("\"sessionUpdate\":\"{session_update}\""),
+            format!("\"toolCallId\":{}", esc(&format!("compact-{item_id}"))),
+            "\"title\":\"Compact conversation\"".to_string(),
+            "\"kind\":\"think\"".to_string(),
+            format!("\"status\":{}", esc(status)),
+        ];
+        if let Some(t) = content_text {
+            f.push(format!(
+                "\"content\":[{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]",
+                esc(t)
+            ));
+        }
+        f.push("\"_meta\":{\"contextCompaction\":{\"version\":1}}".to_string());
+        Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
+    }
+
+    fn compaction_content(item: &J) -> Option<String> {
+        let outcome = item.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
+        match outcome {
+            "compacted" => {
+                let before = item.get("tokensBefore").and_then(|v| v.as_u64());
+                let after = item.get("tokensAfter").and_then(|v| v.as_u64());
+                match (before, after) {
+                    (Some(b), Some(a)) => Some(format!("Context compacted ({b} → {a} tokens)")),
+                    _ => Some("Context compacted".to_string()),
+                }
+            }
+            "noop" => Some(format!(
+                "Nothing to compact ({})",
+                item.get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("noop")
+            )),
+            "failed" | "cancelled" => Some(format!(
+                "Compaction {outcome}: {}",
+                item.get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("no reason given")
+            )),
+            // In progress or an unknown outcome: the host has not spoken yet.
+            _ => None,
+        }
     }
 
     fn tool_line(acp_sid: &str, ver: u8, u: &ToolUpdate<'_>) -> String {
@@ -268,6 +328,16 @@ impl SessionFold {
                         },
                     );
                 }
+            }
+            "compaction" => {
+                let status = msp_status(status);
+                out.push(Self::compaction_line(
+                    acp_sid,
+                    ver,
+                    &item_id,
+                    status,
+                    Self::compaction_content(item).as_deref(),
+                ));
             }
             _ => {
                 self.items.entry(item_id).or_insert(ItemRole::Ignored);
@@ -436,6 +506,16 @@ impl SessionFold {
                     out.push(Self::thought_chunk(acp_sid, ver, &msg_id, text));
                 }
                 self.items.remove(&item_id);
+            }
+            "compaction" => {
+                let status = msp_status(status);
+                out.push(Self::compaction_line(
+                    acp_sid,
+                    ver,
+                    &item_id,
+                    status,
+                    Self::compaction_content(item).as_deref(),
+                ));
             }
             _ => {
                 self.items.remove(&item_id);

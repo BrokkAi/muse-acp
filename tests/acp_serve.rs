@@ -1983,3 +1983,57 @@ fn reasoning_completion_without_deltas_emits_the_summary_once() {
     );
     c.finish();
 }
+
+#[test]
+fn compact_command_runs_and_surfaces_the_compaction_item() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "/compact");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "compact failed: {frame}");
+    c.wait_log("session/compact", Duration::from_secs(10));
+    c.wait_for("\"kind\":\"think\"", Duration::from_secs(15));
+    let card = c.wait_for("Compact conversation", Duration::from_secs(15));
+    assert!(
+        card.contains("Context compacted (12000 → 8000 tokens)"),
+        "token facts missing: {card}"
+    );
+    assert!(
+        card.contains("\"_meta\":{\"contextCompaction\":{\"version\":1}}"),
+        "provenance meta missing: {card}"
+    );
+    c.wait_for("\"state\":\"idle\"", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn compact_noop_settles_the_prompt_without_faking_work() {
+    let mut c = Client::spawn("compact_noop", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "/compact");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"stopReason\":\"end_turn\""),
+        "noop compact must settle honestly: {frame}"
+    );
+    c.wait_stderr(
+        "compact noop: no_compactable_history",
+        Duration::from_secs(10),
+    );
+    c.finish();
+}
+
+#[test]
+fn compact_in_running_text_is_still_a_prompt() {
+    // Only a bare /compact is a command; prefixed text stays a turn.
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "please /compact now");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"stopReason\":\"end_turn\""),
+        "prompt must complete normally: {frame}"
+    );
+    c.wait_input("please /compact now", Duration::from_secs(10));
+    c.finish();
+}

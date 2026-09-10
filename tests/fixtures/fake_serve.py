@@ -467,6 +467,18 @@ def result_for(method, msg):
         params = msg.get("params", {})
         log_input(params)
         return on_turn_start(params)
+    if method == "session/compact":
+        log_input(msg.get("params", {}))
+        if SCENARIO == "compact_noop":
+            return {"commandId": msg["params"].get("commandId", ""),
+                    "status": "noop", "reason": "no_compactable_history"}
+        notify("item/completed", {"sessionId": MSP_SID, "item": {
+            "itemId": "it-c1", "kind": "compaction", "status": "completed",
+            "revision": 1, "outcome": "compacted",
+            "tokensBefore": 12000, "tokensAfter": 8000,
+            "trigger": "manual"}, "viewCursor": "cur-c1"})
+        return {"commandId": msg["params"].get("commandId", ""),
+                "status": "accepted"}
     if method == "userInput/answer":
         log_input(msg.get("params", {}))
         return {}
