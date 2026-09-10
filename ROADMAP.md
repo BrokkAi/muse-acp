@@ -8,6 +8,10 @@ access, and useful in real editor workflows.
 - **Baseline:** `v0.2.5`
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
+- **Reference snapshots used for this revision:** Muse SDK `fbce769`
+  (2026-09-02; stable schema version 1, manifest fingerprint
+  `sha256:cfd31ee77d78fdada9febc4edccd29b0434ff8f6bf157c7c03fd0ecfcbc29f5a`)
+  and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
 
@@ -59,6 +63,13 @@ compatibility table maintained in the adapter.
 
 **Work items**
 
+- Seed the table with the inputs already known to differ: the adapter pins
+  `sha256:03312c213efd14277a0e0a102f70adeae497a469ca4edf7242f479953ed758b7`
+  (host 1.0.2), while the SDK manifest at `fbce769` publishes
+  `sha256:cfd31ee77d78fdada9febc4edccd29b0434ff8f6bf157c7c03fd0ecfcbc29f5a`
+  (schema version 1). Transcript fixtures intentionally carry their own
+  fingerprint (`sha256:c8d1a2a1866814e220fd396d382a9a75861412feee884b5021b2ee359bd3dc59`)
+  and must not be conflated with either surface.
 - Record tested schema version/fingerprint pairs.
     - Include the host protocol version, adapter release, and support status.
     - Distinguish tested, warning, and incompatible combinations.
@@ -67,6 +78,9 @@ compatibility table maintained in the adapter.
 - Decide separately whether fingerprint mismatch is fatal or degraded.
 - Avoid relying only on a single source snapshot: the SDK repository and docs
   can briefly publish different schema fingerprints.
+- Record host-versus-schema discrepancies as compatibility facts. Known
+  example: hosts emit a `session/started` notification after `session/start`,
+  but the published `MspNotification` union omits it.
 
 **Acceptance criteria**
 
@@ -82,8 +96,13 @@ The Rust adapter should consume those artifacts as conformance inputs.
 
 **Work items**
 
-- Vendor a pinned SDK/schema revision under `tests/protocol/` or fetch a locked
-  revision in CI.
+- Pin the SDK revision (currently `fbce769`, 2026-09-02) and vendor
+  `schema/msp/stable/manifest.json`, `schema/msp/stable/msp.schema.json`, and
+  the `schema/msp/transcripts/` corpus under `tests/protocol/`, or fetch that
+  locked revision in CI. The corpus already covers approvals, cancellation,
+  compaction, cursor/gap recovery, goals, handshakes, models, pending-command
+  reconciliation, resume, subagents, user input, user shell, workflows, and
+  unknown-kind/state/stream tolerance.
 - Validate JSON payloads emitted by the adapter against the schema bundle.
 - Replay recorded MSP transcripts through the notification fold and permission
   paths.
@@ -111,6 +130,11 @@ after reconnect, resume, load, and view attachment.
 - Preserve current deduplication for replayed user-input forms.
 - Define reconciliation behavior when a notification and pull result disagree.
 - Ensure no pending request can be lost because a replay was missed.
+- Extend the same reconciliation to queued turns: the resume snapshot carries
+  `queuedTurns`, `pendingApprovals`, and `pendingUserInputs` (the SDK's SS4.13
+  pending-command set). Use them to re-associate in-flight ACP prompts with
+  admitted-but-not-launched turns, and reuse the original `commandId` when
+  retrying an admitted command.
 
 **Acceptance criteria**
 
@@ -118,6 +142,8 @@ after reconnect, resume, load, and view attachment.
   after reconciliation.
 - Replayed and pulled copies of the same request are displayed once.
 - Stale requirements cannot satisfy a later approval stage.
+- After reconnect/resume, in-flight ACP prompts correspond one-to-one with the
+  snapshot's queued/active turns or settle with an explicit classification.
 
 ### 4. Method-specific handling of server-initiated requests
 
@@ -233,6 +259,9 @@ are intentional.
 
 **Initial matrix rows**
 
+- `initialized`
+- `view/gap`
+- `session/started` (host-emitted; absent from the published notification index)
 - `session/todoListChanged`
 - `session/goalChanged`
 - `session/branchChanged`
@@ -242,7 +271,6 @@ are intentional.
 - `turn/unqueued`
 - `turn/retryScheduled`
 - `turn/retracted`
-- `turn/cancel`
 - `turn/completed`
 - `item/delta`
 - `item/started`
@@ -258,6 +286,10 @@ are intentional.
 - `session/contextUsage`
 - `session/tokenUsage`
 
+`approval/request` and `userInput/request` are server-initiated *requests*, not
+notifications; list them in a separate section with their response policy.
+`turn/cancel` is a client command, not an event.
+
 Each row should state whether the event is consumed, mapped to ACP, internally
 tracked, intentionally ignored, or unsupported pending a protocol decision.
 
@@ -265,6 +297,8 @@ tracked, intentionally ignored, or unsupported pending a protocol decision.
 
 - Every schema notification has a documented disposition.
 - CI checks that new schema notifications require an explicit matrix decision.
+- The matrix distinguishes published notifications, host-emitted extras, and
+  server-initiated requests.
 
 ### 10. Truncation and large-output policy
 
@@ -273,6 +307,10 @@ and configurable.
 
 **Work items**
 
+- Consume the host's own truncation facts rather than only local bounds:
+  `item.truncated` marks a saturated streamed surface (`agentMessage.text`,
+  `reasoning.summary[*]`, `toolCall/userShell.visibleOutput`), and
+  `outputRef` names stored output that can be fetched via `item/readOutput`.
 - Add visible truncation metadata and original/retained length.
 - Make the limit configurable.
 - Consider preserving both head and tail for logs and errors.
@@ -311,15 +349,22 @@ Add features only where MSP can provide authoritative behavior.
 
 ### 12. Plan/todo visibility
 
-Map Muse todo or plan notifications to the best supported ACP representation.
+MSP v1 already provides the authoritative signal. `session/todoListChanged`
+carries the full list wholesale (`TodoItem { text, status, activeForm? }`,
+status `pending|inProgress|completed|cancelled` plus open values), the resume
+snapshot serves `state.todoList`, and an empty `items` array is a cleared
+list. Map it to ACP `plan`/`plan_update`, matching `codex-acp`'s plan
+presentation.
 
 **Work items**
 
-- Inventory all MSP todo/plan item shapes.
-- Choose native ACP plan support, a compatible extension, or a conservative
-  synthetic item representation.
-- Preserve state on resume.
-- Test transitions: created, updated, completed, failed, retried, and retracted.
+- Fold `session/todoListChanged` by replacing the whole list on every event;
+  order by `viewCursor` (the `revision` field is diagnostics-only).
+- Emit ACP `plan` once and `plan_update` thereafter, mapping
+  `inProgress` to an in-progress entry and unknown statuses to pending.
+- Restore the plan from the resume snapshot (`state.todoList`).
+- Test transitions: created, updated, completed, cancelled, cleared, and
+  unknown open statuses.
 
 **Acceptance criteria**
 - Users can see long-running task progress without relying only on tool output.
@@ -330,7 +375,11 @@ Provide an editor-friendly summary of files changed during a turn.
 
 **Work items**
 
-- Identify the authoritative MSP source for changed paths.
+- Identify the authoritative MSP source for changed paths. No dedicated
+  file-change event exists in MSP v1; writes surface as `toolCall` items.
+  `codex-acp` computes its report from a hidden read-only fork; MSP's
+  `session/fork` (see item 19) is the analogous primitive if a host-derived
+  report is ever built.
 - Represent adds, edits, deletions, renames, and binary changes safely.
 - Consider an ACP extension only after client capability negotiation.
 - Ensure resumed sessions do not duplicate reports.
@@ -341,15 +390,20 @@ Provide an editor-friendly summary of files changed during a turn.
 
 ### 14. Reasoning and status visibility
 
-Expose model reasoning/status only when MSP provides an appropriate signal and
-the client can represent it.
+MSP v1 provides a native `reasoning` item kind: `summary[]` streams part-wise
+via `item/delta` field `summary.<n>`, committed raw reasoning rides `text`,
+and `truncated` marks server-side saturation. `codex-acp` maps its equivalent
+signal to ACP `agent_thought_chunk`; do the same rather than dropping it.
 
 **Work items**
 
-- Identify MSP item/notification fields that indicate planning, reasoning, web
-  search, terminal work, retries, or waiting.
-- Map to supported ACP events where available.
+- Fold `reasoning` items and stream summary parts as `agent_thought_chunk`.
+- Emit the committed summary (or raw text when no summary exists) exactly once
+  at completion when deltas were missed.
+- Respect `item.truncated`; never present saturated text as complete.
 - Use non-misleading generic status when detailed content is unavailable.
+- Render unknown item kinds generically from `fallbackText` rather than
+  silently hiding them.
 - Respect host privacy/redaction behavior.
 
 **Acceptance criteria**
@@ -361,8 +415,18 @@ the client can represent it.
 Surface session-level state without corrupting prompt settlement.
 
 **Work items**
-- Represent branch changes in metadata/status.
-- Define goal semantics or explicitly defer them.
+- Represent branch changes (`BranchState { branch, vcs, workspaceRoot }` from
+  `session/branchChanged`; branch may be `null` on detached HEAD) in
+  metadata/status.
+- Publish goal display state from `session/goalChanged` (`Goal { objective,
+  status, percentComplete, currentWork?, nextWork? }`) and the resume snapshot
+  (`state.goal`) via `session_info_update`, mirroring the provider-neutral
+  goal presentation `codex-acp` uses. Pass through out-of-contract statuses
+  and >100 percentages without clamping.
+- Defer goal *control* (`goal/set|pause|resume|clear`): those methods are
+  absent from the stable v1 method index and masked in the transcript corpus,
+  i.e. experimental; revisit only when the adapter deliberately opts into
+  `experimentalApi`.
 - Ensure retry/retract notifications settle or supersede affected queued ACP
   prompts.
 - Add race tests against terminal `turn/completed` events.
@@ -371,14 +435,23 @@ Surface session-level state without corrupting prompt settlement.
 - No queued ACP request hangs or falsely reports success because a turn was
   retracted or retried.
 
-### 16. Background tasks
+### 16. Background tasks and the user shell
 
-Investigate whether MSP can represent long-running/background tasks.
+MSP v1 can represent this work: `session/userShell` (gated on the
+`userShell` initialize capability) runs shell commands outside any turn;
+`userShell` items carry `commandText`, `exitCode`/`exitSignal`,
+`visibleOutput`, and a null `turnId`; and a `toolCall` may be durably
+backgrounded (`background: true`, `backgroundInitiator: user|timeout`).
 
 **Work items**
 
-- Inventory task/item lifecycle and stop/cancel semantics.
-- Add native ACP extension support only after bilateral capability negotiation.
+- Map backgrounded `toolCall`/`userShell` items to the AIR async-tasks
+  extension (spawned/state updates plus targeted stop) only after bilateral
+  capability negotiation, as `codex-acp` does.
+- Request the `userShell` host capability only when an editor feature needs it,
+  and never request it by default.
+- Surface `userShell` exit facts verbatim (code vs signal number); do not
+  invent signal names.
 - Ensure root-routed permissions apply to background work.
 - Define host-shutdown and adapter-restart behavior.
 
@@ -388,25 +461,103 @@ Investigate whether MSP can represent long-running/background tasks.
 
 ### 17. Subagents
 
-Do not emulate subagents until MSP exposes native semantics.
+The earlier premise — wait for MSP to expose native semantics — is resolved.
+MSP v1 publishes `subagent/sendMessage`, `subagent/followupTask`,
+`subagent/interrupt`, `subagent/stop`, `subagent/resume`, `subagent/reopen`,
+`subagent/close`, and `subagent/readResult`; `subagent`, `workflow`, and
+`reminderChild` item kinds carry `subagentId`, `childSessionId`,
+`controlStatus`, `result`, and transitive `usage`; and the transcript corpus
+covers nested lifecycles, steering replay/rejection, and close round-trips.
 
 **Work items**
 
-- Track the ACP subagent proposal.
-- Identify MSP concepts for separate histories, permissions, routing, and
-  lifecycle.
-- Add bilateral capability negotiation before enabling native behavior.
-- Keep a conservative tool-call representation only if it does not obscure
-  permission boundaries.
+- Implement the draft ACP subagent RFD on top of MSP children after bilateral
+  capability negotiation (`subagent_spawned`/`subagent_state_update`), keeping
+  a tool-call-shaped representation for non-negotiating clients.
+- Route child output through `childSessionId` using `session/read`/
+  `view/page` drill-down rather than inventing a second protocol.
+- Map `controlStatus` transitions (`accepted`, `starting`, `running`,
+  `resultReady`, `closing`, `closed`, `recoveryPending`,
+  `manualReconciliation`) to ACP child states; the generic item `status`
+  remains the terminal authority.
+- Route child approvals/user input fail-closed through the owner session;
+  a child must never inherit or widen root/permission scope.
+- Reconstruct the child tree on `session/load`; an unproven outcome stays
+  unknown rather than being reported as success or failure.
 
 **Acceptance criteria**
 - A child agent cannot inherit or widen root/permission scope implicitly.
+
+### 18. Context compaction visibility
+
+MSP provides `session/compact` (with `CompactionOutcome`
+`compacted|noop|failed|cancelled`), `compaction` items (`tokensBefore`,
+`tokensAfter`, `outcome`, `reason`, `strategyId`, `summarizedThrough`), and
+`ContextPressureLevel` (`normal|warning|blocked`) on context usage.
+
+**Work items**
+
+- Surface `compaction` items as a visible think-kind tool call with `_meta`
+  provenance (matching `codex-acp`'s compaction presentation) instead of
+  dropping them.
+- Add a `/compact` slash command mapped to `session/compact`; report `noop`
+  and failure outcomes honestly.
+- Carry the pressure level alongside `usage_update` where the client accepts
+  metadata.
+- Treat `summarizedThrough` as opaque provenance: display only, never parse it
+  or use it as a cursor.
+
+**Acceptance criteria**
+- A user can see that compaction happened and whether it succeeded.
+- Compaction visibility never changes turn settlement or permissions.
+
+### 19. ACP session fork
+
+ACP defines `session/fork` (including AIR fork-point metadata) and
+`codex-acp` advertises the capability. MSP provides `session/fork` with a
+`ForkCutPoint { lastTurnId }` cutting through a completed turn, plus durable
+`ForkProvenance` on the new session.
+
+**Work items**
+
+- Advertise the ACP `fork` session capability and map `session/fork` to the
+  MSP command with a fresh UUIDv7 `commandId`.
+- Resolve AIR fork points (`messageId`, `messageFingerprint`, occurrence) by
+  reading history (`session/read`) to find the owning completed turn; map
+  unresolved points to an explicit invalid-params error rather than a silent
+  full copy.
+- Default an omitted cut point to "all completed turns".
+- Rebuild the new session's view exactly like `session/resume`, and preserve
+  `forkedFrom` provenance for diagnostics.
+
+**Acceptance criteria**
+- A fork reproduces the source history through the requested turn and no
+  further.
+- Fork failures never leave an ACP session half-registered.
+
+### 20. Recommended values and session presentation
+
+Small editor-facing parity items from the `codex-acp` comparison.
+
+**Work items**
+
+- Implement the AIR `recommendedValue` extension for the model selector from
+  the catalog's `isDefault` row, after client capability negotiation; emit a
+  recommendation only when the value is present among advertised options.
+- Consider reasoning-effort recommendations if the host ever publishes a
+  default; do not fabricate one.
+- Consider lightweight session titles for `session/list` if clients render
+  them; derive only from host-provided facts, never from prompt text mining.
+
+**Acceptance criteria**
+- Recommended metadata never overrides the user's current selection.
+- No presentation data is inferred from content the host did not provide.
 
 ## P3: engineering hardening and maintenance
 
 These reduce long-term maintenance cost as the protocol and test matrix grow.
 
-### 18. JSON robustness and fuzzing
+### 21. JSON robustness and fuzzing
 
 The dependency-free parser is a security- and reliability-critical component.
 
@@ -423,7 +574,7 @@ The dependency-free parser is a security- and reliability-critical component.
 - Fuzz failures cannot panic or deadlock the adapter.
 - Invalid JSON never terminates an otherwise healthy stdio connection.
 
-### 19. Shutdown and lock robustness
+### 22. Shutdown and lock robustness
 
 Handle host death and internal lock failure deterministically.
 
@@ -433,12 +584,25 @@ Handle host death and internal lock failure deterministically.
 - Test writes to a closed editor stdout and closed host stdin.
 - Reap the child process and drain/capture stderr without deadlock.
 - Add timeout protection around all shutdown paths.
+- Add deterministic host-restart handling for durable sessions: on abnormal
+  host death, respawn `muse serve`, re-run the initialize handshake, and
+  re-attach known sessions via `session/resume` instead of failing every
+  in-flight turn and exiting. `codex-acp` restarts its provider this way, and
+  the Muse SDK defines the durability/host-death obligations the adapter must
+  discharge.
+- Classify live turn-waits by the handshake's durability profile: durable
+  sessions recover terminals on resume; unrecognized or ephemeral profiles
+  mark in-progress items terminal-unknown and refuse `commandId` replay.
+- Bound the restart loop (for example, N attempts with backoff) and surface
+  the classification in diagnostics.
 
 **Acceptance criteria**
 - Host or client disconnect settles all open ACP requests.
 - Shutdown cannot block indefinitely on I/O or lock ownership.
+- A transient host crash recovers durable sessions without duplicate turns
+  or double-settled prompts; an unrecoverable crash degrades explicitly.
 
-### 20. Single-source version metadata
+### 23. Single-source version metadata
 
 Use Cargo package metadata for all adapter version strings.
 
@@ -452,7 +616,7 @@ Use Cargo package metadata for all adapter version strings.
 **Acceptance criteria**
 - A release changes the reported version in exactly one source.
 
-### 21. Installer safety and platform coverage
+### 24. Installer safety and platform coverage
 
 Keep editor installation conservative while expanding supported environments.
 
@@ -469,7 +633,7 @@ Keep editor installation conservative while expanding supported environments.
 - A failed install never leaves partially replaced editor configuration.
 - Supported OS/architecture/runtime combinations are explicit.
 
-### 22. Diagnostic levels and log contract
+### 25. Diagnostic levels and log contract
 
 Make support reports reproducible without exposing secrets or workspace data.
 
@@ -503,6 +667,7 @@ Track these alongside each release:
 - unresolved protocol mismatches at release;
 - live-host smoke-test pass rate when a host is available;
 - failed/failing/hung ACP requests after host disconnect;
+- durable sessions recovered without duplicate turns after a host restart;
 - duplicate approval/user-input presentations after resume;
 - missed pending approvals found by reconciliation;
 - resource-link escape attempts blocked;
@@ -527,16 +692,25 @@ Track these alongside each release:
 - MCP policy warning and documentation.
 - Root/resource-link hardening.
 - Shutdown and lock robustness.
+- Durable-session host restart and pending-set reconciliation.
 - Event compatibility matrix.
 - Explicit truncation metadata.
 
 ### `v0.4.0` — Richer editor integration
 
 - Plan/todo visibility.
+- Reasoning thought-stream visibility.
+- Context compaction visibility.
 - Per-turn file-change report.
 - Branch/retry/retract status settlement.
-- Reasoning/status mapping where safely supported.
 - Diagnostic levels and redacted support bundles.
+
+### `v0.5.0` — MSP-native breadth
+
+- Native subagent sessions mapped from MSP `subagent/*` and child items.
+- Background tasks and the user shell via the AIR async-tasks extension.
+- ACP session fork mapped to MSP `session/fork`.
+- Recommended model values from the catalog default.
 
 ### `v1.0.0` — Stable adapter
 
