@@ -151,6 +151,22 @@ impl Client {
         }
     }
 
+    /// Wait until the adapter logged a line containing `want`.
+    fn wait_stderr(&self, want: &str, timeout: Duration) {
+        let start = Instant::now();
+        loop {
+            if let Ok(t) = std::fs::read_to_string(&self.stderr_log)
+                && t.contains(want)
+            {
+                return;
+            }
+            if start.elapsed() > timeout {
+                panic!("adapter never logged {want:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Raw client->server notification (e.g. initialized).
     fn notify(&mut self, method: &str, params: &str) {
         let frame =
@@ -1650,4 +1666,88 @@ fn bogus_approval_mode_fails_session_new_atomically() {
         "bogus mode must fail, not fall back: {frame}"
     );
     c.finish();
+}
+
+#[test]
+fn validated_schema_logs_machine_readable_compat_lines() {
+    let mut c = Client::spawn("quiet", &[]);
+    c.wait_stderr(
+        &format!(
+            "schema-compat adapter={} host=muse-session-server-fixture/0.0.0-fixture",
+            env!("CARGO_PKG_VERSION")
+        ),
+        Duration::from_secs(10),
+    );
+    c.wait_stderr("schema_version=1", Duration::from_secs(10));
+    c.wait_stderr("status=tested", Duration::from_secs(10));
+    c.wait_stderr(
+        "host-ready server=muse-session-server-fixture/0.0.0-fixture",
+        Duration::from_secs(10),
+    );
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "init failed: {frame}");
+    c.finish();
+}
+
+#[test]
+fn unknown_schema_fingerprint_degrades_without_blocking() {
+    let mut c = Client::spawn("quiet", &[("FAKE_FINGERPRINT", "sha256:deadbeefdeadbeef")]);
+    c.wait_stderr("status=unknown", Duration::from_secs(10));
+    c.wait_stderr(
+        "fingerprint=sha256:deadbeefdeadbeef",
+        Duration::from_secs(10),
+    );
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "init failed: {frame}");
+    c.finish();
+}
+
+#[test]
+fn sdk_manifest_fingerprint_is_degraded_not_tested() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[(
+            "FAKE_FINGERPRINT",
+            "sha256:cfd31ee77d78fdada9febc4edccd29b0434ff8f6bf157c7c03fd0ecfcbc29f5a",
+        )],
+    );
+    c.wait_stderr("status=degraded", Duration::from_secs(10));
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "init failed: {frame}");
+    c.finish();
+}
+
+#[test]
+fn transcript_fixture_fingerprint_is_never_reported_as_host_compatible() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[(
+            "FAKE_FINGERPRINT",
+            "sha256:c8d1a2a1866814e220fd396d382a9a75861412feee884b5021b2ee359bd3dc59",
+        )],
+    );
+    c.wait_stderr("status=fixture", Duration::from_secs(10));
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "init failed: {frame}");
+    c.finish();
+}
+
+#[test]
+fn unsupported_envelope_schema_version_fails_closed() {
+    let mut c = Client::spawn("quiet", &[("FAKE_SCHEMA_VERSION", "2")]);
+    let status = c
+        .child
+        .wait_timeout(Duration::from_secs(10))
+        .expect("wait")
+        .expect("adapter exited");
+    assert!(!status.success(), "adapter must fail closed: {status}");
+    let log = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
+    assert!(
+        log.contains("incompatible host schema"),
+        "missing fatal diagnostic: {log}"
+    );
 }

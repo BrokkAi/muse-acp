@@ -15,12 +15,25 @@ use std::sync::{
     mpsc::{self, Receiver, Sender},
 };
 
+use crate::compat;
 use crate::json::{J, j_to_string, parse_json};
 
-/// Fingerprint our client was built against (host 1.0.2). A mismatch warns;
-/// the local schema, not the docs site, is authoritative for shapes.
-pub const EXPECTED_FINGERPRINT: &str =
-    "sha256:03312c213efd14277a0e0a102f70adeae497a469ca4edf7242f479953ed758b7";
+/// Host identification captured from the MSP initialize handshake.
+#[derive(Debug, Clone, Default)]
+pub struct HandshakeInfo {
+    pub server_name: String,
+    pub server_version: String,
+    pub schema_version: Option<u64>,
+    pub fingerprint: String,
+    pub status: &'static str,
+    pub detail: &'static str,
+}
+
+impl HandshakeInfo {
+    pub fn host_label(&self) -> String {
+        format!("{}/{}", self.server_name, self.server_version)
+    }
+}
 
 pub fn log(msg: &str) {
     eprintln!("[muse-acp] {msg}");
@@ -48,7 +61,18 @@ pub struct MspHost {
     next_id: AtomicU64,
     cmd_seq: AtomicU64,
     pending: Mutex<HashMap<String, Sender<Result<J, J>>>>,
+    handshake: Mutex<HandshakeInfo>,
     _child: Child,
+}
+
+impl MspHost {
+    /// Handshake facts captured at launch, for diagnostics and support output.
+    pub fn handshake(&self) -> HandshakeInfo {
+        self.handshake
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
 }
 
 impl MspHost {
@@ -76,6 +100,7 @@ impl MspHost {
             next_id: AtomicU64::new(1),
             cmd_seq: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
+            handshake: Mutex::new(HandshakeInfo::default()),
             _child: child,
         });
         let (tx, rx) = mpsc::channel();
@@ -89,14 +114,41 @@ impl MspHost {
         let res = host
             .command("initialize", &init_params)
             .map_err(|e| format!("serve initialize failed: {}", err_message(&e)))?;
-        let fp = res
-            .get("schema")
-            .and_then(|s| s.get("fingerprint"))
+        let schema = res.get("schema").cloned().unwrap_or(J::Null);
+        let schema_version = schema.get("version").and_then(|v| v.as_u64());
+        let fp = schema
+            .get("fingerprint")
             .and_then(|v| v.as_str())
             .unwrap_or("?");
-        if fp != EXPECTED_FINGERPRINT {
-            log(&format!(
-                "schema fingerprint mismatch: host reports {fp}, built against {EXPECTED_FINGERPRINT}; shapes may differ"
+        let server = res.get("serverInfo").cloned().unwrap_or(J::Null);
+        let server_name = server
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let server_version = server
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let verdict = compat::classify(schema_version, fp);
+        let host_label = format!("{server_name}/{server_version}");
+        log(&verdict.log_line(env!("CARGO_PKG_VERSION"), &host_label));
+        *host.handshake.lock().unwrap_or_else(|p| p.into_inner()) = HandshakeInfo {
+            server_name,
+            server_version,
+            schema_version,
+            fingerprint: verdict.fingerprint.clone(),
+            status: verdict.status.as_str(),
+            detail: verdict.detail,
+        };
+        if verdict.is_fatal() {
+            return Err(format!(
+                "incompatible host schema: version={} fingerprint={}; upgrade muse-acp",
+                schema_version
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "absent".into()),
+                verdict.fingerprint
             ));
         }
         // Close the handshake (SS1.4.2): no session/turn command is accepted

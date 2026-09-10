@@ -37,12 +37,21 @@ import os
 import sys
 
 FP = "sha256:03312c213efd14277a0e0a102f70adeae497a469ca4edf7242f479953ed758b7"
+SCHEMA = {"fingerprint": FP, "version": 1}
 MSP_SID = "msp-sess-1"
 SCENARIO = os.environ.get("FAKE_SCENARIO", "happy")
 MODE = os.environ.get("FAKE_MODE", "promptUnmatched")
 LOG = os.environ.get("FAKE_LOG", "")
 TURNS = [0]
 CATALOG_READS = [0]
+
+# Compatibility-diagnostics knobs: the fixture defaults to the validated
+# host shape, but tests can present an unknown fingerprint or a future
+# envelope schema version.
+if os.environ.get("FAKE_FINGERPRINT", ""):
+    SCHEMA["fingerprint"] = os.environ["FAKE_FINGERPRINT"]
+if os.environ.get("FAKE_SCHEMA_VERSION", ""):
+    SCHEMA["version"] = int(os.environ["FAKE_SCHEMA_VERSION"])
 
 APPROVAL_PARAMS = {
     "sessionId": MSP_SID, "approvalId": "ap-1", "toolCallId": "call-1",
@@ -296,7 +305,14 @@ def on_turn_start(params):
 
 def result_for(method, msg):
     if method == "initialize":
-        return {"schema": {"fingerprint": FP}, "capabilities": {}}
+        return {
+            "schema": SCHEMA,
+            "capabilities": {},
+            "serverInfo": {
+                "name": "muse-session-server-fixture",
+                "version": "0.0.0-fixture",
+            },
+        }
     if method == "session/start":
         return {"session": session_obj(), "viewCursor": "cur-0"}
     if method == "session/resume":

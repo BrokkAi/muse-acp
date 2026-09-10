@@ -61,6 +61,13 @@ These are prerequisites for safely tracking a Developer Preview protocol.
 Compare the MSP schema version and fingerprint reported by `muse serve` with a
 compatibility table maintained in the adapter.
 
+Status: **partially implemented.** Every launch classifies the handshake and
+logs a machine-readable `schema-compat` line plus a `host-ready` line;
+`--selftest` prints the offline table. Current policy: unknown fingerprints
+degrade with a warning, while an unsupported envelope schema version fails
+closed. Remaining work: enrich the table as live hosts are validated and feed
+the verdict into richer support bundles.
+
 **Work items**
 
 - Seed the table with the inputs already known to differ: the adapter pins

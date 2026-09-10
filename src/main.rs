@@ -5,6 +5,7 @@
 //! view, so turns stream in as `item/*` + `turn/*` notifications.
 
 mod acp;
+mod compat;
 mod fold;
 mod json;
 mod msp;
@@ -336,6 +337,9 @@ fn selftest() -> i32 {
         }
     }
     println!("[muse-acp] selftest: static literals OK");
+    for line in compat::selftest_lines(env!("CARGO_PKG_VERSION")) {
+        println!("[muse-acp] {line}");
+    }
     0
 }
 
@@ -385,6 +389,17 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let hi = host.handshake();
+    log(&format!(
+        "host-ready server={} schema_version={} fingerprint={} status={} detail={}",
+        hi.host_label(),
+        hi.schema_version
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "absent".into()),
+        hi.fingerprint,
+        hi.status,
+        hi.detail
+    ));
     let fwd_tx = tx.clone();
     std::thread::spawn(move || {
         for ev in msp_rx {
