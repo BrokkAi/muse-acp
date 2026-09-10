@@ -48,7 +48,14 @@ pub struct AcpSession {
     pub ver: u8,
     pub in_flight: Vec<InFlight>,
     pub pending_perm: Option<PendingPerm>,
+    /// Approvals awaiting display while another permission is shown. Raw MSP
+    /// `approval/request` params; drained one at a time because the adapter
+    /// shows one ACP permission request per session at a time.
+    pub perm_queue: Vec<J>,
     pub pending_ui: Vec<PendingUi>,
+    /// User-input ids already presented or auto-cancelled, so reconciliation
+    /// cannot replay a settled question.
+    pub ui_seen: std::collections::HashSet<String>,
     pub mode_value: String,
     pub model_value: String,
     pub reasoning_effort: String,

@@ -192,7 +192,7 @@ def on_turn_start(params):
             "status": "completed", "tool": "read",
             "args": {"path": "/tmp/x"}, "result": "file bytes"}})
         notify("turn/completed", {**base, "terminal": "completed"})
-    elif SCENARIO == "approval":
+    elif SCENARIO in ("approval", "pending_reconcile_dup"):
         notify("approval/requested", dict(APPROVAL_PARAMS))
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "approval_hang":
@@ -314,6 +314,14 @@ def result_for(method, msg):
                 "version": "0.0.0-fixture",
             },
         }
+    if method == "approval/listPending":
+        if SCENARIO == "pending_reconcile":
+            return {"approvals": [dict(APPROVAL_PARAMS, approvalId="ap-reconcile")],
+                    "userInputs": [question_params("ui-reconcile")]}
+        if SCENARIO == "pending_reconcile_dup":
+            # The same approval the adapter is already displaying.
+            return {"approvals": [dict(APPROVAL_PARAMS)], "userInputs": []}
+        return {"approvals": [], "userInputs": []}
     if method == "session/start":
         return {"session": session_obj(), "viewCursor": "cur-0"}
     if method == "session/resume":

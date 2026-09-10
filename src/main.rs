@@ -111,6 +111,72 @@ fn adopt_cumulative(s: &mut AcpSession, c: &J) {
 /// still recover the cumulative block, which is worth having so the first
 /// frame after a reattach reports real totals instead of nulls.
 ///
+/// Pull `approval/listPending` after attach and reconcile both halves of the
+/// pending set (approvals and user input) with what is already displayed.
+/// Deduplication is by approval/user-input id, so pull-versus-reissue races
+/// resolve to exactly one ACP presentation.
+fn reconcile_pending(
+    host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+) {
+    let msp_sid = match sessions.lock().unwrap().get(acp_sid) {
+        Some(s) => s.msp_sid.clone(),
+        None => return,
+    };
+    // This is a log-fold query: no commandId, no admission record.
+    let params = format!("{{\"sessionId\":{}}}", esc(&msp_sid));
+    let r = match host.command("approval/listPending", &params) {
+        Ok(r) => r,
+        Err(e) => {
+            log(&format!(
+                "approval/listPending reconciliation failed: {}",
+                err_message(&e)
+            ));
+            return;
+        }
+    };
+    let (mut n_approvals, mut n_inputs) = (0usize, 0usize);
+    if let Some(J::Arr(approvals)) = r.get("approvals") {
+        for a in approvals.clone() {
+            let known = sessions.lock().unwrap().get(acp_sid).is_some_and(|s| {
+                let displayed = s
+                    .pending_perm
+                    .as_ref()
+                    .map(|p| p.approval_id.as_str())
+                    .unwrap_or("");
+                let id = a.get("approvalId").and_then(|v| v.as_str()).unwrap_or("");
+                displayed == id && !id.is_empty()
+                    || s.perm_queue.iter().any(|q| {
+                        q.get("approvalId").and_then(|v| v.as_str()) == Some(id) && !id.is_empty()
+                    })
+            });
+            if !known {
+                n_approvals += 1;
+                open_approval(stdout, sessions, &a);
+            }
+        }
+    }
+    if let Some(J::Arr(inputs)) = r.get("userInputs") {
+        for u in inputs.clone() {
+            let known = sessions.lock().unwrap().get(acp_sid).is_some_and(|s| {
+                let id = u.get("userInputId").and_then(|v| v.as_str()).unwrap_or("");
+                !id.is_empty()
+                    && (s.pending_ui.iter().any(|p| p.user_input_id == id)
+                        || s.ui_seen.contains(id))
+            });
+            if !known {
+                n_inputs += 1;
+                handle_msp(host, stdout, sessions, "userInput/requested", &u);
+            }
+        }
+    }
+    log(&format!(
+        "pending reconciliation: {n_approvals} approval(s), {n_inputs} user input(s) presented"
+    ));
+}
+
 /// Restores facts, not cost: historic completions stay unpriced.
 fn backfill_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
     let (msp_sid, want_context, want_totals) = match sessions.lock().unwrap().get(acp_sid) {
@@ -658,7 +724,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
+                            perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
+                            ui_seen: std::collections::HashSet::new(),
                             mode_value: acp::mode_from_msp(&cur_mode).to_string(),
                             model_value: cur_model.clone(),
                             reasoning_effort: "medium".to_string(),
@@ -844,7 +912,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
+                            perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
+                            ui_seen: std::collections::HashSet::new(),
                             mode_value: "ask".to_string(),
                             model_value: String::new(),
                             reasoning_effort: "medium".to_string(),
@@ -912,6 +982,10 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     }
                     // Outside the lock: this reads back from the host.
                     backfill_usage(host, stdout, sessions, &sid);
+                    // Reissued server requests are the primary pending
+                    // delivery; the pull endpoint is the belt-and-braces
+                    // pass so a dropped notification cannot hide a request.
+                    reconcile_pending(host, stdout, sessions, &sid);
                     let msp_out = sessions
                         .lock()
                         .unwrap()
@@ -2266,6 +2340,13 @@ fn handle_msp(
                     ELICIT_FORM.load(Ordering::SeqCst)
                 ));
                 if !msp_sid.is_empty() && !qid.is_empty() {
+                    if let Some(acp_sid) = acp_sid.as_ref() {
+                        sessions
+                            .lock()
+                            .unwrap()
+                            .get_mut(acp_sid)
+                            .map(|s| s.ui_seen.insert(qid.to_string()));
+                    }
                     let cmd = host.mint_cmd("cmd-");
                     let _ = host.command(
                         "userInput/cancel",
@@ -2458,6 +2539,26 @@ fn open_approval(stdout: &StdoutShared, sessions: &Sessions, params: &J) {
         .unwrap_or(false);
     if already {
         return;
+    }
+    // A second concurrent approval cannot overwrite the one the client is
+    // deciding on; queue it and display it when the current one settles.
+    {
+        let mut map = sessions.lock().unwrap();
+        if let Some(s) = map.get_mut(&acp_sid)
+            && s.pending_perm.is_some()
+        {
+            if s.perm_queue
+                .iter()
+                .any(|p| p.get("approvalId").and_then(|v| v.as_str()) == Some(&approval_id))
+            {
+                return;
+            }
+            s.perm_queue.push(params.clone());
+            log(&format!(
+                "approval {approval_id} queued behind the displayed permission"
+            ));
+            return;
+        }
     }
     let requirement = params
         .get("currentRequirementId")
@@ -2689,6 +2790,24 @@ fn complete_permission(
         }
         Err(e) => log(&format!("approval/decide failed: {}", err_message(&e))),
     }
+    // Whether or not the decide was admitted, the displayed permission is
+    // settled from the client's perspective; show the next queued approval.
+    pop_queued_approval(stdout, sessions, &acp_sid);
+}
+
+/// Display the next queued approval for a session, if any.
+fn pop_queued_approval(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
+    let next = sessions.lock().unwrap().get_mut(acp_sid).and_then(|s| {
+        if s.pending_perm.is_some() || s.perm_queue.is_empty() {
+            None
+        } else {
+            Some(s.perm_queue.remove(0))
+        }
+    });
+    if let Some(params) = next {
+        log("displaying next queued approval");
+        open_approval(stdout, sessions, &params);
+    }
 }
 
 /// Cancel every in-flight turn of one ACP session (fail-closed helper).
@@ -2768,6 +2887,11 @@ fn bridge_user_input(
     }) {
         return true;
     }
+    sessions
+        .lock()
+        .unwrap()
+        .get_mut(acp_sid)
+        .map(|s| s.ui_seen.insert(user_input_id.clone()));
     let mut props = Vec::new();
     let mut required = Vec::new();
     let mut msg = Vec::new();

@@ -130,6 +130,13 @@ The Rust adapter should consume those artifacts as conformance inputs.
 Use MSP `approval/listPending` to reconcile approvals and user-input prompts
 after reconnect, resume, load, and view attachment.
 
+Status: **implemented for resume/load.** Every successful attach now pulls
+`approval/listPending` and presents approvals and user input that were not
+already displayed, deduplicated by id against displayed, queued, and settled
+requests. Concurrent approvals queue behind the displayed permission instead
+of overwriting it. Remaining work: queued-turn re-association from the resume
+snapshot's pending-command set.
+
 **Work items**
 
 - Call the pull endpoint after session resume/load and view attachment.

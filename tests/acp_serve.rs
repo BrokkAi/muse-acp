@@ -1825,3 +1825,54 @@ fn command_timeout_reports_method_id_and_configured_duration() {
         "missing timeout diagnostics: {log}"
     );
 }
+
+#[test]
+fn resume_reconciliation_presents_unnotified_pending_requests() {
+    // The host reports pending work only through approval/listPending: a
+    // dropped notification must not leave the request invisible.
+    let mut c = Client::spawn("pending_reconcile", &[]);
+    let sid = c.new_session(1, ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}");
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "resume failed: {frame}");
+
+    let perm = c.wait_for("session/request_permission", Duration::from_secs(15));
+    assert!(
+        perm.contains("call-1"),
+        "reconciled approval missing: {perm}"
+    );
+    let elicit = c.wait_for("elicitation/create", Duration::from_secs(15));
+    assert!(
+        elicit.contains("Which?"),
+        "reconciled question missing: {elicit}"
+    );
+    c.wait_stderr(
+        "pending reconciliation: 1 approval(s), 1 user input(s) presented",
+        Duration::from_secs(10),
+    );
+    c.finish();
+}
+
+#[test]
+fn resume_reconciliation_does_not_duplicate_displayed_approval() {
+    let mut c = Client::spawn("pending_reconcile_dup", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "needs approval");
+    let first = c.wait_for("session/request_permission", Duration::from_secs(15));
+    assert!(first.contains("cargo test"), "approval missing: {first}");
+
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "resume failed: {frame}");
+    c.wait_stderr(
+        "pending reconciliation: 0 approval(s), 0 user input(s) presented",
+        Duration::from_secs(10),
+    );
+    let frames = c.frames.lock().unwrap().join("\n");
+    assert_eq!(
+        frames.matches("session/request_permission").count(),
+        1,
+        "duplicate permission presentation: {frames}"
+    );
+    c.finish();
+}
