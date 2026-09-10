@@ -393,6 +393,12 @@ snapshot serves `state.todoList`, and an empty `items` array is a cleared
 list. Map it to ACP `plan`/`plan_update`, matching `codex-acp`'s plan
 presentation.
 
+Status: **implemented.** `session/todoListChanged` and the resume snapshot's
+`state.todoList` map to ACP `plan` updates (whole-list replacement, empty list
+clears the plan, `cancelled` and unknown statuses stay `pending`). Remaining
+work: none for the v1 wire shape; revisit if ACP adopts a distinct todo
+surface.
+
 **Work items**
 
 - Fold `session/todoListChanged` by replacing the whole list on every event;

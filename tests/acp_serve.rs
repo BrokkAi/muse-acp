@@ -1876,3 +1876,57 @@ fn resume_reconciliation_does_not_duplicate_displayed_approval() {
     );
     c.finish();
 }
+
+#[test]
+fn todo_list_changed_maps_to_an_acp_plan() {
+    let mut c = Client::spawn("todo", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "do the thing");
+    let plan = c.wait_for("\"sessionUpdate\":\"plan\"", Duration::from_secs(15));
+    assert!(plan.contains(&sid), "plan must target our session: {plan}");
+    assert!(
+        plan.contains("Read the schema"),
+        "completed entry missing: {plan}"
+    );
+    assert!(
+        plan.contains(
+            "\"content\":\"Map todo lists\",\"priority\":\"medium\",\"status\":\"in_progress\""
+        ),
+        "in-progress entry missing: {plan}"
+    );
+    assert!(plan.contains("Add tests"), "pending entry missing: {plan}");
+    // Cancelled is not completed: it must fall back to pending.
+    assert!(
+        plan.contains(
+            "\"content\":\"Dropped task\",\"priority\":\"medium\",\"status\":\"pending\""
+        ),
+        "cancelled entry must stay pending: {plan}"
+    );
+    c.finish();
+}
+
+#[test]
+fn an_empty_todo_list_clears_the_plan() {
+    let mut c = Client::spawn("todo_cleared", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "clear the plan");
+    c.wait_for("\"sessionUpdate\":\"plan\"", Duration::from_secs(15));
+    let cleared = c.wait_for("\"entries\":[]", Duration::from_secs(15));
+    assert!(cleared.contains(&sid), "cleared plan frame: {cleared}");
+    c.finish();
+}
+
+#[test]
+fn resume_restores_the_plan_from_the_snapshot() {
+    let mut c = Client::spawn("todo_resume", &[]);
+    let sid = c.new_session(1, "");
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "resume failed: {frame}");
+    let plan = c.wait_for("\"sessionUpdate\":\"plan\"", Duration::from_secs(15));
+    assert!(
+        plan.contains("Read the schema"),
+        "snapshot plan missing: {plan}"
+    );
+    c.finish();
+}

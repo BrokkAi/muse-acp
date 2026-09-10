@@ -974,6 +974,14 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             {
                                 adopt_cumulative(entry, tu);
                             }
+                            // The todo list is part of the folded snapshot:
+                            // restore the plan so a resumed session shows its
+                            // task state before the next live change.
+                            if let Some(todo) = state.get("todoList")
+                                && matches!(todo, J::Obj(_))
+                            {
+                                acp::send_plan(stdout, &sid, todo.get("items"));
+                            }
                         }
                         if replay {
                             replay_history(stdout, entry, &r);
@@ -2423,6 +2431,15 @@ fn handle_msp(
                 let _ = acp_sid;
             }
         }
+        "session/todoListChanged" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                acp::send_plan(stdout, &acp_sid, params.get("items"));
+            }
+        }
         "session/contextUsage" => {
             // Context-window pressure: counted-once occupancy at the latest
             // provider-reported fact. Replace wholesale (an absent
@@ -2497,11 +2514,7 @@ fn handle_msp(
                 }
             }
         }
-        "initialized"
-        | "session/started"
-        | "session/goalChanged"
-        | "session/todoListChanged"
-        | "session/branchChanged" => {}
+        "initialized" | "session/started" | "session/goalChanged" | "session/branchChanged" => {}
         _ => {
             log(&format!("unhandled MSP notification: {method}"));
         }

@@ -379,6 +379,51 @@ pub fn send_available_commands(stdout: &StdoutShared, acp_sid: &str, ver: u8) {
     );
 }
 
+/// Map one MSP `TodoItem` to an ACP plan entry.
+///
+/// MSP statuses are a superset (`cancelled` and open values): anything that is
+/// not `inProgress`/`completed` stays `pending` so an unknown state can never
+/// be presented as finished work.
+fn todo_entry(item: &J) -> Option<String> {
+    let text = item.get("text").and_then(|v| v.as_str())?;
+    if text.trim().is_empty() {
+        return None;
+    }
+    let status = match item.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+        "inProgress" => "in_progress",
+        "completed" => "completed",
+        _ => "pending",
+    };
+    Some(format!(
+        "{{\"content\":{},\"priority\":\"medium\",\"status\":\"{status}\"}}",
+        esc(text)
+    ))
+}
+
+/// Emit an ACP `plan` update from an MSP todo list. The whole list is
+/// replaced on every event (and an empty list is a cleared plan, not a
+/// no-op), matching both protocols' replace-wholesale semantics.
+pub fn send_plan(stdout: &StdoutShared, acp_sid: &str, items: Option<&J>) {
+    let entries = match items {
+        Some(J::Arr(values)) => values
+            .iter()
+            .filter_map(todo_entry)
+            .collect::<Vec<_>>()
+            .join(","),
+        // A missing or malformed list carries no authoritative fact; keep the
+        // last plan rather than clearing on garbage.
+        _ => return,
+    };
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"plan\",\"entries\":[{}]}}}}}}",
+            esc(acp_sid),
+            entries
+        ),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

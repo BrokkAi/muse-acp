@@ -164,6 +164,15 @@ def usage_snapshot_history(context=True, cumulative=(100, 20)):
                                  "totalTokens": sum(cumulative)}}}}
 
 
+TODO_ITEMS = [
+    {"text": "Read the schema", "status": "completed"},
+    {"text": "Map todo lists", "status": "inProgress",
+     "activeForm": "Mapping todo lists"},
+    {"text": "Add tests", "status": "pending"},
+    {"text": "Dropped task", "status": "cancelled"},
+]
+
+
 def question_params(user_input_id="ui-1"):
     return {"sessionId": MSP_SID, "userInputId": user_input_id,
             "turnId": "turn-question", "itemId": f"item-{user_input_id}",
@@ -211,6 +220,20 @@ def on_turn_start(params):
             # The request and view notification also describe the same ask.
             send({"jsonrpc": "2.0", "id": 9200, "method": "userInput/request",
                   "params": question_params(qid)})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "todo":
+        notify("session/todoListChanged", {
+            "sessionId": MSP_SID, "viewCursor": "cur-t1",
+            "revision": 1, "sourceTool": "todo_write",
+            "items": TODO_ITEMS})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "todo_cleared":
+        notify("session/todoListChanged", {
+            "sessionId": MSP_SID, "viewCursor": "cur-t1",
+            "revision": 1, "sourceTool": "todo_write", "items": TODO_ITEMS})
+        notify("session/todoListChanged", {
+            "sessionId": MSP_SID, "viewCursor": "cur-t2",
+            "revision": 2, "sourceTool": "todo_write", "items": []})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "queued":
         if TURNS[0] == 2:
@@ -332,6 +355,11 @@ def result_for(method, msg):
         snapshot_rung = params.get("history") == "snapshot"
         if SCENARIO == "usage_resume":
             history = usage_snapshot_history()
+        elif SCENARIO == "todo_resume":
+            history = usage_snapshot_history()
+            history["snapshot"]["state"]["todoList"] = {
+                "items": TODO_ITEMS, "revision": 3,
+                "sourceTool": "todo_write"}
         elif SCENARIO == "usage_snapshot_null":
             history = usage_snapshot_history(context=False)
         elif SCENARIO in ("usage_inline", "questions_resume") and snapshot_rung:
