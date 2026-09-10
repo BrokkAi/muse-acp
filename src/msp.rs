@@ -82,11 +82,12 @@ impl MspHost {
         let reader_host = host.clone();
         std::thread::spawn(move || reader_loop(reader_host, stdout, tx));
         // Handshake.
+        let init_params = format!(
+            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}}}}"#,
+            ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
+        );
         let res = host
-            .command(
-                "initialize",
-                r#"{"clientInfo":{"name":"muse_acp","version":"0.2.5"}}"#,
-            )
+            .command("initialize", &init_params)
             .map_err(|e| format!("serve initialize failed: {}", err_message(&e)))?;
         let fp = res
             .get("schema")

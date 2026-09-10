@@ -271,8 +271,19 @@ enum LoopMsg {
     Msp(MspEvent),
 }
 
-const V2_INIT: &str = r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}}}},"info":{"name":"muse-acp","title":"Muse ACP","version":"0.2.5"},"authMethods":[],"_meta":{"steering":{"supported":true}}}"#;
-const V1_INIT: &str = r#"{"protocolVersion":1,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":"0.2.5"}}"#;
+fn v2_init() -> String {
+    format!(
+        r#"{{"protocolVersion":2,"capabilities":{{"session":{{"prompt":{{"image":{{}},"embeddedContext":{{}}}}}}}},"info":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}},"authMethods":[],"_meta":{{"steering":{{"supported":true}}}}}}"#,
+        ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
+    )
+}
+
+fn v1_init() -> String {
+    format!(
+        r#"{{"protocolVersion":1,"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
+        ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
+    )
+}
 
 fn has_nonempty_array(params: Option<&J>, key: &str) -> bool {
     matches!(
@@ -318,8 +329,8 @@ fn validate_session_roots(stdout: &StdoutShared, id: &Option<J>, params: Option<
 fn selftest() -> i32 {
     // Validate every static emitted literal with our own parser, so a
     // misplaced brace fails here instead of at a live client.
-    for lit in [V2_INIT, V1_INIT] {
-        if let Err(e) = parse_json(lit) {
+    for lit in [v2_init(), v1_init()] {
+        if let Err(e) = parse_json(&lit) {
             eprintln!("[muse-acp] selftest FAIL: {e} in {lit}");
             return 1;
         }
@@ -508,9 +519,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .is_some_and(|f| matches!(f, J::Obj(_)));
             ELICIT_FORM.store(u64::from(form), Ordering::SeqCst);
             if v == 2 {
-                acp::send_result(stdout, &id, V2_INIT);
+                acp::send_result(stdout, &id, &v2_init());
             } else {
-                acp::send_result(stdout, &id, V1_INIT);
+                acp::send_result(stdout, &id, &v1_init());
             }
         }
         "session/new" => {
@@ -3009,7 +3020,7 @@ fn complete_elicitation(
 
 #[cfg(test)]
 mod tests {
-    use super::{env_flag_enabled, parse_rates};
+    use super::{env_flag_enabled, parse_rates, v1_init, v2_init};
     use crate::json::parse_json;
 
     fn rates(input: &str, output: &str, currency: &str) -> Option<(f64, f64, String)> {
@@ -3063,5 +3074,45 @@ mod tests {
             );
         }
         assert!(!env_flag_enabled(None));
+    }
+
+    #[test]
+    fn initialization_payloads_report_the_cargo_version() {
+        for payload in [v2_init(), v1_init()] {
+            let parsed = parse_json(&payload).expect("initialization payload JSON");
+            let version = ["info", "agentInfo"]
+                .iter()
+                .find_map(|key| parsed.get(key))
+                .and_then(|info| info.get("version"))
+                .and_then(|v| v.as_str())
+                .expect("version field");
+            assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        }
+    }
+
+    #[test]
+    fn source_does_not_hardcode_an_adapter_version() {
+        // A numeric version literal in a `version` field only ever means
+        // release drift: the Cargo manifest is the single source of truth.
+        for source in [
+            include_str!("main.rs"),
+            include_str!("msp.rs"),
+            include_str!("acp.rs"),
+        ] {
+            let mut rest = source;
+            while let Some(pos) = rest.find("version\":\"") {
+                let tail = &rest[pos + "version\":\"".len()..];
+                let value = tail.split('"').next().unwrap_or("");
+                let numeric = value
+                    .split('.')
+                    .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()));
+                let shaped = value.split('.').count() >= 2;
+                assert!(
+                    !(numeric && shaped),
+                    "hardcoded adapter version {value:?}; use env!(\"CARGO_PKG_VERSION\")"
+                );
+                rest = tail;
+            }
+        }
     }
 }
