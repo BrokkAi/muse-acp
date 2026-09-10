@@ -326,13 +326,14 @@ fn usage_events_forward_msp_usage_as_acp_usage_update() {
         );
         // Two priced legs so far: (100·3 + 20·15)/1M + (1000·3 + 500·15)/1M.
         assert!(
-            update.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\"}"),
-            "per-completion cost accumulated at catalog rates: {update}"
+            update.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\"")
+                && update.contains("\"billing\":false"),
+            "per-completion cost accumulated and labeled as an estimate: {update}"
         );
         // The unpriced (no modelId) leg advances totals but not cost.
         let later = c.wait_for("\"totalTokens\":9000", Duration::from_secs(15));
         assert!(
-            later.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\"}"),
+            later.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\""),
             "unpriced leg leaves the running cost alone: {later}"
         );
         // The tokenUsage that arrived before any contextUsage was held back:
@@ -379,7 +380,7 @@ fn gap_refill_does_not_price_a_replayed_completion_twice() {
         let frames = c.frames.lock().unwrap().join("\n");
         // cur-2 (0.0006) plus cur-3 (0.0105); cur-3 is delivered twice.
         assert!(
-            frames.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\"}"),
+            frames.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\""),
             "v{ver} both distinct completions priced once: {frames}"
         );
         assert!(
@@ -414,7 +415,7 @@ fn a_successful_catalog_refresh_drops_stale_rates() {
             let _first = c.prompt(&sid, "hi");
             let priced = c.wait_for("\"totalTokens\":120", Duration::from_secs(15));
             assert!(
-                priced.contains("\"cost\":{\"amount\":0.0006,\"currency\":\"USD\"}"),
+                priced.contains("\"cost\":{\"amount\":0.0006,\"currency\":\"USD\""),
                 "v{ver} first completion priced at catalog rates: {priced}"
             );
             if ver == 1 {
@@ -437,7 +438,7 @@ fn a_successful_catalog_refresh_drops_stale_rates() {
                 "v{ver} later leg priced from stale rates: {after}"
             );
             assert!(
-                after.contains("\"cost\":{\"amount\":0.0006,\"currency\":\"USD\"}"),
+                after.contains("\"cost\":{\"amount\":0.0006,\"currency\":\"USD\""),
                 "{scenario} v{ver} priced subtotal kept, unpriceable leg skipped: {after}"
             );
             c.finish();
@@ -470,7 +471,7 @@ fn a_failed_catalog_refresh_retains_the_last_good_rates() {
         let _second = c.prompt(&sid, "again");
         let after = c.wait_for("\"totalTokens\":240", Duration::from_secs(15));
         assert!(
-            after.contains("\"cost\":{\"amount\":0.0012,\"currency\":\"USD\"}"),
+            after.contains("\"cost\":{\"amount\":0.0012,\"currency\":\"USD\""),
             "v{ver} a failed refresh must keep the last good rates: {after}"
         );
         c.finish();
@@ -622,7 +623,7 @@ fn load_and_resume_restore_usage_from_the_history_snapshot() {
             "v{ver} restored occupancy carried into later usage: {after}"
         );
         assert!(
-            after.contains("\"cost\":{\"amount\":0.0006,\"currency\":\"USD\"}"),
+            after.contains("\"cost\":{\"amount\":0.0006,\"currency\":\"USD\""),
             "v{ver} the live completion is priced: {after}"
         );
         c.finish();

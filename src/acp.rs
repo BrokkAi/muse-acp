@@ -149,7 +149,7 @@ pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>)
     // verbatim, which would corrupt the whole frame.
     let cost_f = match &s.cost_amount {
         Some((amount, currency)) if amount.is_finite() => format!(
-            ",\"cost\":{{\"amount\":{amount},\"currency\":{}}}",
+            ",\"cost\":{{\"amount\":{amount},\"currency\":{},\"source\":\"adapter-estimate\",\"basis\":\"catalog-list-price\",\"billing\":false}}",
             esc(currency)
         ),
         _ => String::new(),

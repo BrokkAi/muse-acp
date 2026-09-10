@@ -374,6 +374,13 @@ fetch-through for `outputRef`.
 Keep usage forwarding accurate and make client-local estimates harder to
 misinterpret.
 
+Status: **implemented.** Host usage facts and client-local cost remain
+separate: the `cost` object carries `source: adapter-estimate`,
+`basis: catalog-list-price`, and `billing: false`, replay-once accounting and
+rate-refresh replacement are covered by tests, and historic/unpriceable
+completions are excluded. Remaining work: cached-input rate separation if the
+host ever exposes cached-token counts per completion.
+
 **Work items**
 
 - Keep host-provided context/cumulative usage separate from derived values.
