@@ -340,14 +340,14 @@ enum LoopMsg {
 
 fn v2_init() -> String {
     format!(
-        r#"{{"protocolVersion":2,"capabilities":{{"session":{{"prompt":{{"image":{{}},"embeddedContext":{{}}}}}}}},"info":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}},"authMethods":[],"_meta":{{"steering":{{"supported":true}}}}}}"#,
+        r#"{{"protocolVersion":2,"capabilities":{{"session":{{"prompt":{{"image":{{}},"embeddedContext":{{}}}},"fork":{{}}}}}},"info":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}},"authMethods":[],"_meta":{{"steering":{{"supported":true}}}}}}"#,
         ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
     )
 }
 
 fn v1_init() -> String {
     format!(
-        r#"{{"protocolVersion":1,"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
+        r#"{{"protocolVersion":1,"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}},"fork":{{}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
         ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
     )
 }
@@ -391,6 +391,67 @@ fn validate_session_roots(stdout: &StdoutShared, id: &Option<J>, params: Option<
         return false;
     }
     true
+}
+
+/// Resolve an ACP fork point (`_meta.jetbrains.air.forkPoint`) to an MSP
+/// `cutPoint.lastTurnId`. `Ok(None)` means "all completed turns".
+///
+/// Only `messageId` cut points are supported today: matching a text
+/// fingerprint would require hashing agent-authored content, and an
+/// unresolved point must fail closed rather than silently fork the whole
+/// history.
+fn resolve_fork_cut_point(
+    host: &Arc<MspHost>,
+    msp_sid: &str,
+    params: Option<&J>,
+) -> Result<Option<String>, String> {
+    let fork_point = params
+        .and_then(|p| p.get("_meta"))
+        .and_then(|m| m.get("jetbrains"))
+        .and_then(|j| j.get("air"))
+        .and_then(|a| a.get("forkPoint"));
+    let Some(fork_point) = fork_point else {
+        return Ok(None);
+    };
+    let message_id = fork_point
+        .get("messageId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if message_id.is_empty() {
+        // Fingerprint-only points are a deliberate, explicit gap.
+        return Err(
+            "fork points without messageId are not supported yet; fork from a message id"
+                .to_string(),
+        );
+    }
+    let read = host
+        .command(
+            "session/read",
+            &format!("{{\"sessionId\":{},\"excludeItems\":false}}", esc(msp_sid)),
+        )
+        .map_err(|e| format!("fork point history read failed: {}", err_message(&e)))?;
+    let items = read
+        .get("history")
+        .and_then(|h| h.get("items"))
+        .cloned()
+        .unwrap_or(J::Null);
+    let J::Arr(items) = items else {
+        return Err("fork point history read returned no items".to_string());
+    };
+    let turn = items
+        .iter()
+        .find(|item| item.get("itemId").and_then(|v| v.as_str()) == Some(message_id))
+        .and_then(|item| item.get("turnId").cloned());
+    match turn {
+        Some(J::Str(turn)) if !turn.is_empty() => Ok(Some(turn)),
+        // userShell items carry turnId: null; they cannot bound a turn.
+        Some(_) => Err(format!(
+            "fork point message {message_id} is not turn-scoped"
+        )),
+        None => Err(format!(
+            "fork point message {message_id} not found in session history"
+        )),
+    }
 }
 
 fn selftest() -> i32 {
@@ -1060,6 +1121,183 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     &id,
                     -32602,
                     &format!("resume failed: {}", err_message(&e)),
+                ),
+            }
+        }
+        "session/fork" => {
+            let ver = negotiated_ver();
+            let src_sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if src_sid.is_empty() {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    "session/fork requires params.sessionId",
+                );
+                return;
+            }
+            // A fork may target a new workspace; when a cwd is supplied it
+            // must still be absolute (same rule as session/new).
+            let fork_cwd = params
+                .as_ref()
+                .and_then(|p| p.get("cwd"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if !fork_cwd.is_empty() && !Path::new(&fork_cwd).is_absolute() {
+                acp::send_error(stdout, &id, -32602, "params.cwd must be an absolute path");
+                return;
+            }
+            ignore_client_mcp_servers(params.as_ref());
+            if has_nonempty_array(params.as_ref(), "additionalDirectories") {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    "additional directories are not supported",
+                );
+                return;
+            }
+            // Resolve the source MSP session: known ACP session first, then
+            // preserved metadata (same rule as resume).
+            let meta_msp_sid = params
+                .as_ref()
+                .and_then(|p| p.get("_meta"))
+                .and_then(|m| m.get("mspSessionId"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let msp_sid = sessions
+                .lock()
+                .unwrap()
+                .get(&src_sid)
+                .map(|s| s.msp_sid.clone())
+                .or(meta_msp_sid)
+                .unwrap_or_else(|| src_sid.clone());
+            let cut_point = match resolve_fork_cut_point(host, &msp_sid, params.as_ref()) {
+                Ok(c) => c,
+                Err(e) => {
+                    acp::send_error(stdout, &id, -32602, &e);
+                    return;
+                }
+            };
+            let cmd = host.mint_cmd("cmd-");
+            let cut_json = match &cut_point {
+                Some(turn) => format!(",\"cutPoint\":{{\"lastTurnId\":{}}}", esc(turn)),
+                None => String::new(),
+            };
+            match host.command(
+                "session/fork",
+                &format!(
+                    "{{\"commandId\":{},\"sessionId\":{}{cut_json}}}",
+                    esc(&cmd),
+                    esc(&msp_sid)
+                ),
+            ) {
+                Ok(r) => {
+                    let new_session = r.get("session").cloned().unwrap_or(J::Null);
+                    let new_msp = new_session
+                        .get("sessionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if new_msp.is_empty() {
+                        acp::send_error(stdout, &id, -32603, "session/fork returned no sessionId");
+                        return;
+                    }
+                    let new_model = new_session
+                        .get("modelId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let restored_cwd = if fork_cwd.is_empty() {
+                        new_session
+                            .get("workspaceRoot")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string()
+                    } else {
+                        fork_cwd.clone()
+                    };
+                    let mut mode_value = "ask".to_string();
+                    if let Some(m) = host_mode(&r) {
+                        mode_value = acp::mode_from_msp(&m).to_string();
+                    }
+                    {
+                        let mut map = sessions.lock().unwrap();
+                        let entry = map.entry(new_msp.clone()).or_insert_with(|| AcpSession {
+                            acp_sid: new_msp.clone(),
+                            msp_sid: new_msp.clone(),
+                            cwd: restored_cwd.clone(),
+                            ver,
+                            in_flight: Vec::new(),
+                            pending_perm: None,
+                            perm_queue: Vec::new(),
+                            pending_ui: Vec::new(),
+                            ui_seen: std::collections::HashSet::new(),
+                            mode_value: mode_value.clone(),
+                            model_value: new_model.clone(),
+                            reasoning_effort: "medium".to_string(),
+                            active_turn: None,
+                            view_cursor: String::new(),
+                            fold: SessionFold::new(),
+                            usage_used: None,
+                            usage_size: None,
+                            cum_prompt: None,
+                            cum_output: None,
+                            cum_total: None,
+                            cost_amount: None,
+                            usage_seen: std::collections::HashSet::new(),
+                            goal_meta: None,
+                            branch_meta: None,
+                        });
+                        entry.msp_sid = new_msp.clone();
+                        entry.ver = ver;
+                        if !restored_cwd.is_empty() {
+                            entry.cwd = restored_cwd;
+                        }
+                        if !new_model.is_empty() {
+                            entry.model_value = new_model;
+                        }
+                        if !mode_value.is_empty() {
+                            entry.mode_value = mode_value;
+                        }
+                    }
+                    let (mode_out, model_out) = sessions
+                        .lock()
+                        .unwrap()
+                        .get(&new_msp)
+                        .map(|s| (s.mode_value.clone(), s.model_value.clone()))
+                        .unwrap_or_default();
+                    let models = catalog(host);
+                    let result = if ver == 2 {
+                        format!(
+                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
+                            esc(&new_msp),
+                            esc(&new_msp),
+                            acp::config_options(ver, &mode_out, &model_out, "medium", &models)
+                        )
+                    } else {
+                        format!(
+                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{},\"modes\":{}}}",
+                            esc(&new_msp),
+                            esc(&new_msp),
+                            acp::config_options(ver, &mode_out, &model_out, "medium", &models),
+                            acp::session_modes(&mode_out)
+                        )
+                    };
+                    acp::send_result(stdout, &id, &result);
+                }
+                Err(e) => acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    &format!("fork failed: {}", err_message(&e)),
                 ),
             }
         }

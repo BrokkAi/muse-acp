@@ -2185,3 +2185,106 @@ fn unknown_kinds_render_fallback_text_only() {
     );
     c.finish();
 }
+
+#[test]
+fn session_fork_advertises_and_copies_without_a_cut_point() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(1, "");
+    let init_frame = c.frames.lock().unwrap().join("\n");
+    assert!(
+        init_frame.contains("\"fork\":{}"),
+        "fork capability not advertised: {init_frame}"
+    );
+    let fid = c.req(
+        "session/fork",
+        &format!("{{\"sessionId\":\"{sid}\",\"cwd\":\"/tmp\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "fork failed: {frame}");
+    assert!(
+        frame.contains("\"sessionId\":\"msp-sess-forked\""),
+        "new session id missing: {frame}"
+    );
+    c.wait_log("session/fork", Duration::from_secs(10));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("input log");
+    let fork_line = input
+        .lines()
+        .find(|l| l.contains("commandId") && l.contains("msp-sess-1"))
+        .expect("fork params logged");
+    assert!(
+        !fork_line.contains("cutPoint"),
+        "no cut point was requested: {fork_line}"
+    );
+
+    // The forked session must be registered and promptable.
+    let pid = c.prompt("msp-sess-forked", "hello from the fork");
+    let pframe = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        pframe.contains("\"stopReason\":\"end_turn\""),
+        "forked session prompt failed: {pframe}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_fork_resolves_a_message_id_cut_point() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let fid = c.req(
+        "session/fork",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageId\":\"msg-fork\"}}}}}}}}}}"
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "fork failed: {frame}");
+    c.wait_log("session/read", Duration::from_secs(10));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("input log");
+    let fork_line = input
+        .lines()
+        .rev()
+        .find(|l| l.contains("msp-sess-1"))
+        .expect("fork params logged");
+    assert!(
+        fork_line.contains("\"cutPoint\"") && fork_line.contains("\"lastTurnId\": \"turn-1\""),
+        "cut point not resolved to the owning turn: {fork_line}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_fork_rejects_unresolvable_and_fingerprint_cut_points() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+
+    let missing = c.req(
+        "session/fork",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageId\":\"no-such-message\"}}}}}}}}}}"
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{missing}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("not found in session history"),
+        "unresolved point must fail closed: {frame}"
+    );
+
+    let fp = c.req(
+        "session/fork",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"abc\",\"messageOccurrence\":1}}}}}}}}}}"
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{fp}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("without messageId are not supported"),
+        "fingerprint gap must be explicit: {frame}"
+    );
+
+    let seen = std::fs::read_to_string(&c.fake_log).expect("fake log");
+    assert!(
+        !seen.lines().any(|l| l == "session/fork"),
+        "no fork command may reach the host on invalid points: {seen}"
+    );
+    c.finish();
+}

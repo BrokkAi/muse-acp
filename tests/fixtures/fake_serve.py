@@ -106,7 +106,14 @@ def turn_id():
     return f"turn-{TURNS[0]}"
 
 
-def session_obj(session_id=MSP_SID, workspace_root="/tmp/fake-ws"):
+# The session notifications currently target; a fork switches it so turns
+# started on the forked session complete on the forked session.
+ACTIVE_SESSION = [MSP_SID]
+
+
+def session_obj(session_id=None, workspace_root="/tmp/fake-ws"):
+    if session_id is None:
+        session_id = ACTIVE_SESSION[0]
     return {"sessionId": session_id, "modelId": "fake-model",
             "workspaceRoot": workspace_root,
             "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
@@ -187,7 +194,7 @@ def question_params(user_input_id="ui-1"):
 
 def on_turn_start(params):
     tid = turn_id()
-    base = {"sessionId": MSP_SID, "turnId": tid}
+    base = {"sessionId": ACTIVE_SESSION[0], "turnId": tid}
     if SCENARIO == "happy":
         notify("item/completed", {**base, "item": {
             "itemId": "it-1", "kind": "agentMessage",
@@ -546,6 +553,37 @@ def result_for(method, msg):
         params = msg.get("params", {})
         log_input(params)
         return on_turn_start(params)
+    if method == "session/read":
+        read_params = msg.get("params", {})
+        log_input(read_params)
+        # Items carry turnId so fork points can resolve to a completed turn.
+        items = history_items() + [
+            {"itemId": "msg-fork", "kind": "agentMessage",
+             "text": "fork here", "turnId": "turn-1", "status": "completed"},
+            {"itemId": "msg-fork-2", "kind": "agentMessage",
+             "text": "later answer", "turnId": "turn-2", "status": "completed"},
+            {"itemId": "shell-no-turn", "kind": "userShell",
+             "commandText": "git status", "turnId": None,
+             "status": "completed"},
+        ]
+        return {"session": session_obj(read_params.get("sessionId")),
+                "history": {"mode": "inline", "items": items,
+                            "snapshot": None},
+                "viewCursor": "cur-read", "pendingRequests": []}
+    if method == "session/fork":
+        params = msg.get("params", {})
+        log_input(params)
+        ACTIVE_SESSION[0] = "msp-sess-forked"
+        forked = session_obj()
+        forked["forkedFrom"] = {
+            "sessionId": params.get("sessionId", MSP_SID),
+            "commandId": params.get("commandId", ""),
+            "cutCursor": "opaque-cut",
+            "cutExplicit": "cutPoint" in params,
+        }
+        return {"session": forked,
+                "history": {"mode": "inline", "items": [], "snapshot": None},
+                "viewCursor": "cur-f1", "pendingRequests": []}
     if method == "session/compact":
         log_input(msg.get("params", {}))
         if SCENARIO == "compact_noop":
