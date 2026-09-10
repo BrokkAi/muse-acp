@@ -1800,3 +1800,28 @@ fn unknown_server_request_gets_method_not_found_and_survives() {
     assert!(frame.contains("\"result\""), "init failed: {frame}");
     c.finish();
 }
+
+#[test]
+fn command_timeout_reports_method_id_and_configured_duration() {
+    // The env override bounds the admission ack; the error must name the
+    // method, request id, and duration so slow-vs-dead hosts are diagnosable.
+    let mut c = Client::spawn(
+        "happy",
+        &[
+            ("FAKE_DELAY_METHOD", "initialize"),
+            ("FAKE_DELAY_MS", "3000"),
+            ("MUSE_COMMAND_TIMEOUT_MS", "200"),
+        ],
+    );
+    let status = c
+        .child
+        .wait_timeout(Duration::from_secs(10))
+        .expect("wait")
+        .expect("adapter exited");
+    assert!(!status.success(), "adapter must fail on timeout: {status}");
+    let log = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
+    assert!(
+        log.contains("serve command timed out after 200ms method=initialize id=1"),
+        "missing timeout diagnostics: {log}"
+    );
+}

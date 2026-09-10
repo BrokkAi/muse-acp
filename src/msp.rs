@@ -54,8 +54,41 @@ pub enum MspEvent {
     Eof(String),
 }
 
-/// How long a host command may take to acknowledge (acks are admission-only).
-const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Default admission-ack budget in milliseconds for unclassified commands.
+const DEFAULT_TIMEOUT_MS: u64 = 60_000;
+
+/// Method-aware admission-ack budgets. Acks are admission-only, not outcomes:
+/// a turn may legitimately run for minutes after `turn/start` accepts.
+///
+/// Retry policy: commands that carry a caller-minted `commandId` may be
+/// retried after a timeout *with the same handle* (the host answers a
+/// value-identical ack); query-shaped methods without one (`model/list`)
+/// may be re-issued. Never mint a fresh `commandId` for a retry.
+fn method_timeout_ms(method: &str) -> u64 {
+    match method {
+        // Handshake: bounded startup, but leave room for cold binary start.
+        "initialize" => 30_000,
+        // Lifecycle/history work can page and replay large views.
+        "session/start" | "session/resume" | "session/read" | "view/page" => 180_000,
+        // Cheap queries.
+        "model/list" | "session/list" | "view/unsubscribe" => 30_000,
+        // Control-plane decisions should be fast but not flaky.
+        "approval/decide" | "userInput/answer" | "userInput/cancel" | "userInput/clarify" => 30_000,
+        _ => DEFAULT_TIMEOUT_MS,
+    }
+}
+
+/// Resolve a command timeout from an optional environment override
+/// (`MUSE_COMMAND_TIMEOUT_MS`, milliseconds) and the method table.
+pub fn command_timeout(env_override: Option<&str>, method: &str) -> std::time::Duration {
+    if let Some(raw) = env_override
+        && let Ok(ms) = raw.trim().parse::<u64>()
+        && ms > 0
+    {
+        return std::time::Duration::from_millis(ms);
+    }
+    std::time::Duration::from_millis(method_timeout_ms(method))
+}
 
 pub struct MspHost {
     writer: Arc<Mutex<std::process::ChildStdin>>,
@@ -195,6 +228,10 @@ impl MspHost {
     /// Send a command; Ok(result) / Err(error object).
     pub fn command(&self, method: &str, params_json: &str) -> Result<J, J> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let timeout = command_timeout(
+            std::env::var("MUSE_COMMAND_TIMEOUT_MS").ok().as_deref(),
+            method,
+        );
         let (tx, rx) = mpsc::channel();
         self.pending.lock().unwrap().insert(id.to_string(), tx);
         let line = format!(
@@ -204,11 +241,18 @@ impl MspHost {
             self.pending.lock().unwrap().remove(&id.to_string());
             return Err(mk_err(-32603, &format!("serve write failed: {e}")));
         }
-        match rx.recv_timeout(COMMAND_TIMEOUT) {
+        match rx.recv_timeout(timeout) {
             Ok(r) => r,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 self.pending.lock().unwrap().remove(&id.to_string());
-                Err(mk_err(-32603, "serve command timed out"))
+                Err(mk_err(
+                    -32603,
+                    &format!(
+                        "serve command timed out after {}ms method={method} id={id}{}",
+                        timeout.as_millis(),
+                        session_suffix(params_json)
+                    ),
+                ))
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 self.pending.lock().unwrap().remove(&id.to_string());
@@ -261,6 +305,18 @@ pub fn mk_err(code: i64, message: &str) -> J {
         ("code".to_string(), J::Num(code.to_string())),
         ("message".to_string(), J::Str(message.to_string())),
     ])
+}
+
+/// Extract `" session=<id>"` for timeout diagnostics when params carry one.
+fn session_suffix(params_json: &str) -> String {
+    parse_json(params_json)
+        .ok()
+        .and_then(|p| {
+            p.get("sessionId")
+                .and_then(|v| v.as_str())
+                .map(|s| format!(" session={s}"))
+        })
+        .unwrap_or_default()
 }
 
 pub fn err_message(e: &J) -> String {
@@ -357,7 +413,8 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
 
 #[cfg(test)]
 mod tests {
-    use super::known_server_request;
+    use super::{command_timeout, known_server_request, session_suffix};
+    use std::time::Duration;
 
     #[test]
     fn only_deliberately_handled_server_requests_are_forwarded() {
@@ -370,5 +427,49 @@ mod tests {
                 "{method:?} must get methodNotFound, not a synthetic result"
             );
         }
+    }
+
+    #[test]
+    fn command_timeouts_are_method_aware() {
+        let t = |m: &str| command_timeout(None, m);
+        assert_eq!(t("initialize"), Duration::from_millis(30_000));
+        assert_eq!(t("session/resume"), Duration::from_millis(180_000));
+        assert_eq!(t("view/page"), Duration::from_millis(180_000));
+        assert_eq!(t("model/list"), Duration::from_millis(30_000));
+        assert_eq!(t("approval/decide"), Duration::from_millis(30_000));
+        assert_eq!(t("turn/start"), Duration::from_millis(60_000));
+        assert_eq!(t("future/method"), Duration::from_millis(60_000));
+    }
+
+    #[test]
+    fn command_timeout_environment_override_wins() {
+        assert_eq!(
+            command_timeout(Some("250"), "session/resume"),
+            Duration::from_millis(250)
+        );
+        // Invalid or non-positive overrides must not silently disable the
+        // timeout: fall back to the method table.
+        assert_eq!(
+            command_timeout(Some("bogus"), "initialize"),
+            Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            command_timeout(Some("0"), "initialize"),
+            Duration::from_millis(30_000)
+        );
+        assert_eq!(
+            command_timeout(Some(" -5 "), "initialize"),
+            Duration::from_millis(30_000)
+        );
+    }
+
+    #[test]
+    fn timeout_diagnostics_carry_the_session_when_present() {
+        assert_eq!(
+            session_suffix(r#"{"commandId":"c","sessionId":"s-1"}"#),
+            " session=s-1"
+        );
+        assert_eq!(session_suffix(r#"{"commandId":"c"}"#), "");
+        assert_eq!(session_suffix("not json"), "");
     }
 }

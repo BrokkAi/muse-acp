@@ -35,6 +35,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
 import json
 import os
 import sys
+import time
 
 FP = "sha256:03312c213efd14277a0e0a102f70adeae497a469ca4edf7242f479953ed758b7"
 SCHEMA = {"fingerprint": FP, "version": 1}
@@ -444,6 +445,9 @@ def main():
             continue
         if method:
             if ident is not None:
+                if (os.environ.get("FAKE_DELAY_METHOD", "") == method
+                        and os.environ.get("FAKE_DELAY_MS", "")):
+                    time.sleep(int(os.environ["FAKE_DELAY_MS"]) / 1000.0)
                 if (method == "model/list" and SCENARIO == "catalog_refresh_failure"
                         and CATALOG_READS[0] == 2):
                     CATALOG_READS[0] += 1

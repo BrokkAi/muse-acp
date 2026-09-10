@@ -180,6 +180,14 @@ table entry plus a disposition in the event matrix.
 Replace the single 60-second command timeout with policy appropriate to MSP
 method semantics.
 
+Status: **implemented.** Timeouts now follow a per-method table (30s for the
+handshake/queries/control decisions, 180s for history-bearing lifecycle work,
+60s default) with a global `MUSE_COMMAND_TIMEOUT_MS` override. Timeout errors
+carry the method, request id, duration, and session when present. Retry
+policy: reissue only with the original `commandId` (admission is idempotent);
+never mint a fresh handle for a retry. Remaining work: profile the table
+against slow real hosts and adjust.
+
 **Work items**
 
 - Profile normal and slow behavior for startup, `model/list`, resume, view
