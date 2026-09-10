@@ -9,17 +9,49 @@ use std::sync::atomic::AtomicU64;
 
 use crate::json::{J, esc, j_to_string, mint_id};
 
-const MAX_CONTENT: usize = 8000;
+const DEFAULT_MAX_CONTENT: usize = 8000;
+const MIN_MAX_CONTENT: usize = 200;
 
-fn trunc(s: &str) -> String {
-    if s.len() <= MAX_CONTENT {
-        return s.to_string();
+/// Editor-facing output bound, configurable via `MUSE_TOOL_OUTPUT_LIMIT`
+/// (characters). Values below the floor are clamped so a typo cannot zero out
+/// decision-relevant output.
+fn max_content() -> usize {
+    static LIMIT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        std::env::var("MUSE_TOOL_OUTPUT_LIMIT")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|v| *v >= MIN_MAX_CONTENT)
+            .unwrap_or(DEFAULT_MAX_CONTENT)
+    })
+}
+
+/// Truncate for display and report the fact: the second element carries the
+/// fields for `_meta.muse.truncated` when the adapter cut the text.
+fn trunc(s: &str) -> (String, Option<String>) {
+    let limit = max_content();
+    if s.len() <= limit {
+        return (s.to_string(), None);
     }
-    let mut cut = MAX_CONTENT;
+    let mut cut = limit;
     while !s.is_char_boundary(cut) {
         cut -= 1;
     }
-    format!("{}…[truncated]", &s[..cut])
+    let meta = format!(
+        "\"source\":\"adapter\",\"originalChars\":{},\"retainedChars\":{}",
+        s.chars().count(),
+        s[..cut].chars().count()
+    );
+    (format!("{}…[truncated]", &s[..cut]), Some(meta))
+}
+
+/// Build the `_meta` field for tool-call truncation facts. The host flag is
+/// authoritative when both sources apply: its durable log holds the full text.
+fn truncation_meta(adapter_cut: Option<&str>, host_truncated: bool) -> Option<String> {
+    if host_truncated {
+        return Some("\"_meta\":{\"muse\":{\"truncated\":{\"source\":\"host\"}}}".to_string());
+    }
+    adapter_cut.map(|cut| format!("\"_meta\":{{\"muse\":{{\"truncated\":{{{cut}}}}}}}"))
 }
 
 fn tool_kind(tool: &str) -> &'static str {
@@ -81,6 +113,8 @@ pub struct ToolUpdate<'a> {
     pub status: &'a str,
     pub content_text: Option<&'a str>,
     pub raw_input: Option<&'a str>,
+    /// The host already saturated this surface (`item.truncated`).
+    pub host_truncated: bool,
 }
 
 pub struct SessionFold {
@@ -149,6 +183,7 @@ impl SessionFold {
     /// call (subagents, workflows, the user shell, unknown future kinds).
     /// `_meta` carries the MSP facts so support can see the source item.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn card_line(
         acp_sid: &str,
         ver: u8,
@@ -158,7 +193,8 @@ impl SessionFold {
         kind: &str,
         status: &str,
         content_text: Option<&str>,
-        meta: Option<&str>,
+        muse_fields: Option<&str>,
+        host_truncated: bool,
     ) -> String {
         let session_update = if ver == 2 || !create {
             "tool_call_update"
@@ -172,14 +208,28 @@ impl SessionFold {
             format!("\"kind\":\"{kind}\""),
             format!("\"status\":{}", esc(status)),
         ];
+        let mut fields = muse_fields.unwrap_or_default().to_string();
         if let Some(t) = content_text {
+            let (text, adapter_cut) = trunc(t);
             f.push(format!(
                 "\"content\":[{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]",
-                esc(&trunc(t))
+                esc(&text)
             ));
+            if let Some(cut) = adapter_cut {
+                if !fields.is_empty() {
+                    fields.push(',');
+                }
+                fields.push_str(&format!("\"truncated\":{{{cut}}}"));
+            }
         }
-        if let Some(m) = meta {
-            f.push(format!("\"_meta\":{m}"));
+        if host_truncated {
+            if !fields.is_empty() {
+                fields.push(',');
+            }
+            fields.push_str("\"truncated\":{\"source\":\"host\"}");
+        }
+        if !fields.is_empty() {
+            f.push(format!("\"_meta\":{{\"muse\":{{{fields}}}}}"));
         }
         Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
     }
@@ -257,10 +307,7 @@ impl SessionFold {
             if parts.is_empty() {
                 None
             } else {
-                Some(format!(
-                    "{{\"muse\":{{\"{namespace}\":{{{}}}}}}}",
-                    parts.join(",")
-                ))
+                Some(format!("\"{namespace}\":{{{}}}", parts.join(",")))
             }
         };
         match kind {
@@ -391,8 +438,7 @@ impl SessionFold {
                 (
                     text.to_string(),
                     None,
-                    (!text.is_empty())
-                        .then(|| format!("{{\"muse\":{{\"itemKind\":{}}}}}", esc(kind))),
+                    (!text.is_empty()).then(|| format!("\"itemKind\":{}", esc(kind))),
                 )
             }
         }
@@ -436,10 +482,14 @@ impl SessionFold {
             format!("\"status\":{}", esc(u.status)),
         ];
         if let Some(t) = u.content_text {
+            let (text, adapter_cut) = trunc(t);
             f.push(format!(
                 "\"content\":[{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]",
-                esc(&trunc(t))
+                esc(&text)
             ));
+            if let Some(meta) = truncation_meta(adapter_cut.as_deref(), u.host_truncated) {
+                f.push(meta);
+            }
         }
         if let Some(r) = u.raw_input {
             f.push(format!("\"rawInput\":{r}"));
@@ -515,6 +565,7 @@ impl SessionFold {
                         status: msp_status(status),
                         content_text: None,
                         raw_input: Some(&raw),
+                        host_truncated: false,
                     },
                 ));
                 if let Some(ItemRole::Tool { announced, .. }) = self.items.get_mut(&item_id) {
@@ -570,6 +621,8 @@ impl SessionFold {
                         msp_status(status),
                         content.as_deref(),
                         meta.as_deref(),
+                        item.get("truncated")
+                            .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
                 }
             }
@@ -587,6 +640,8 @@ impl SessionFold {
                         msp_status(status),
                         content.as_deref(),
                         meta.as_deref(),
+                        item.get("truncated")
+                            .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
                 }
                 self.items.entry(item_id).or_insert(ItemRole::Ignored);
@@ -699,6 +754,9 @@ impl SessionFold {
                         status: msp_status(status),
                         content_text: content,
                         raw_input: raw.as_deref(),
+                        host_truncated: item
+                            .get("truncated")
+                            .is_some_and(|v| matches!(v, J::Bool(true))),
                     },
                 ));
                 self.items.remove(&item_id);
@@ -780,6 +838,8 @@ impl SessionFold {
                         msp_status(status),
                         content.as_deref(),
                         meta.as_deref(),
+                        item.get("truncated")
+                            .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
                 }
                 self.items.remove(&item_id);
@@ -798,6 +858,8 @@ impl SessionFold {
                         msp_status(status),
                         content.as_deref(),
                         meta.as_deref(),
+                        item.get("truncated")
+                            .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
                 }
                 self.items.remove(&item_id);

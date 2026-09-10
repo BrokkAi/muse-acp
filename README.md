@@ -172,6 +172,7 @@ MUSE_CLI=muse                      # host binary (default: muse)
 MUSE_SERVE_ARGS="--trust-workspace" # host-lifetime flags (see `muse serve --help`)
 MUSE_APPROVAL_MODE=promptUnmatched  # allowAll|promptUnmatched|onRequest|denyUnmatched
 MUSE_COMMAND_TIMEOUT_MS=60000       # override host admission-ack timeout (milliseconds)
+MUSE_TOOL_OUTPUT_LIMIT=8000         # editor-facing tool output bound (characters)
 # MUSE_ALLOW_UNSCOPED_READS=1       # DANGEROUS: allow local reads outside session cwd
 ```
 

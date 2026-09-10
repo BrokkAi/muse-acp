@@ -2324,3 +2324,45 @@ fn durable_host_crash_restarts_and_reattaches() {
     c.finish();
     let _ = std::fs::remove_file(&marker);
 }
+
+#[test]
+fn adapter_truncation_is_visible_and_configurable() {
+    let mut c = Client::spawn("tool_huge_output", &[("MUSE_TOOL_OUTPUT_LIMIT", "300")]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "read big");
+    let card = c.wait_for("call-big", Duration::from_secs(15));
+    assert!(
+        card.contains("…[truncated]"),
+        "human marker missing: {card}"
+    );
+    assert!(
+        card.contains("\"truncated\":{\"source\":\"adapter\""),
+        "machine metadata missing: {card}"
+    );
+    assert!(
+        card.contains("\"originalChars\":20000"),
+        "original length missing: {card}"
+    );
+    assert!(
+        card.contains("\"retainedChars\":300"),
+        "retained length missing: {card}"
+    );
+    c.finish();
+}
+
+#[test]
+fn host_truncation_is_reported_as_host_sourced() {
+    let mut c = Client::spawn("tool_host_truncated", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "read bounded");
+    let card = c.wait_for("call-ht", Duration::from_secs(15));
+    assert!(
+        card.contains("\"truncated\":{\"source\":\"host\"}"),
+        "host truncation must be attributed to the host: {card}"
+    );
+    assert!(
+        !card.contains("source\":\"adapter\""),
+        "short host text must not claim an adapter cut: {card}"
+    );
+    c.finish();
+}

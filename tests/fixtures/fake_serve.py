@@ -229,6 +229,19 @@ def on_turn_start(params):
             send({"jsonrpc": "2.0", "id": 9200, "method": "userInput/request",
                   "params": question_params(qid)})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "tool_huge_output":
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-big", "kind": "toolCall", "callId": "call-big",
+            "status": "completed", "tool": "read",
+            "args": {"path": "/tmp/big"}, "result": "x" * 20000}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "tool_host_truncated":
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-ht", "kind": "toolCall", "callId": "call-ht",
+            "status": "completed", "tool": "read",
+            "args": {"path": "/tmp/ht"}, "result": "short bounded text",
+            "truncated": True}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "host_exit":
         # Complete the turn, then die like a crashed host once the ack is on
         # the wire: the adapter must restart, re-attach, and keep serving.

@@ -342,6 +342,14 @@ tracked, intentionally ignored, or unsupported pending a protocol decision.
 Tool output is currently bounded for editor usability. Make truncation explicit
 and configurable.
 
+Status: **implemented.** The output bound is configurable through
+`MUSE_TOOL_OUTPUT_LIMIT` (clamped to a 200-character floor), adapter cuts emit
+both the human `…[truncated]` marker and machine-readable
+`_meta.muse.truncated` with `source`, `originalChars`, and `retainedChars`,
+and a host-saturated surface reports `source: "host"` without claiming an
+adapter cut. Remaining work: head+tail retention and `item/readOutput`
+fetch-through for `outputRef`.
+
 **Work items**
 
 - Consume the host's own truncation facts rather than only local bounds:
