@@ -20,6 +20,9 @@ Muse's session engine, tools, authentication, and approval flow.
 > `muse-acp` is an independent community project. Muse Code and Muse Spark are
 > products of Meta and are not affiliated with or supported by this project.
 
+See [ROADMAP.md](ROADMAP.md) for protocol-compatibility, reliability, feature,
+and release priorities.
+
 ## Why MSP instead of `muse exec`?
 
 `muse-acp` starts one long-lived `muse serve` process and translates between
