@@ -101,6 +101,15 @@ the verdict into richer support bundles.
 The SDK publishes generated MSP types, a schema bundle, and recorded transcripts.
 The Rust adapter should consume those artifacts as conformance inputs.
 
+Status: **corpus vendored and replaying.** `tests/protocol/` pins SDK revision
+`fbce769` (stable manifest, JSON schema bundle, 50 golden transcripts) with
+provenance and license. CI now replays every server-side item event through
+the notification fold (unknown kinds must tolerate), validates every emitted
+ACP frame with the adapter's own parser, and fails if the vendored manifest
+fingerprint drifts from the compatibility table. Remaining work: schema-bundle
+validation of full adapter payloads, permission-path transcript replays, and
+the optional live-host smoke gate.
+
 **Work items**
 
 - Pin the SDK revision (currently `fbce769`, 2026-09-02) and vendor

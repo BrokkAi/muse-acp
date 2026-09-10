@@ -353,3 +353,99 @@ pub fn stop_reason(terminal: &str) -> &'static str {
         _ => "_failed",
     }
 }
+
+#[cfg(test)]
+mod corpus_tests {
+    use super::SessionFold;
+    use crate::json::{J, parse_json};
+    use std::path::{Path, PathBuf};
+
+    fn transcript_paths() -> Vec<PathBuf> {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/protocol/transcripts");
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&root)
+            .expect("vendored transcript corpus")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().join("transcript.ndjson"))
+            .filter(|p| p.is_file())
+            .collect();
+        paths.sort();
+        assert!(
+            !paths.is_empty(),
+            "tests/protocol/transcripts is empty; corpus was not vendored"
+        );
+        paths
+    }
+
+    /// Replay every server-side item event in the pinned SDK corpus through
+    /// the notification fold. Unknown kinds and future shapes must tolerate
+    /// (not panic), and every emitted ACP frame must parse with our own
+    /// dependency-free JSON parser.
+    #[test]
+    fn replays_every_vendored_transcript_through_the_fold() {
+        let mut scenarios = 0usize;
+        let mut item_events = 0usize;
+        let mut emitted = 0usize;
+        for path in transcript_paths() {
+            let scenario = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("scenario")
+                .to_string();
+            scenarios += 1;
+            let mut fold = SessionFold::new();
+            let mut out = Vec::new();
+            for (lineno, line) in std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{scenario}: read: {e}"))
+                .lines()
+                .enumerate()
+            {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                let envelope = parse_json(line)
+                    .unwrap_or_else(|e| panic!("{scenario}:{lineno}: envelope: {e}"));
+                if envelope.get("dir").and_then(|v| v.as_str()) != Some("server") {
+                    continue;
+                }
+                let raw = envelope
+                    .get("raw")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_else(|| panic!("{scenario}:{lineno}: missing raw"));
+                let frame =
+                    parse_json(raw).unwrap_or_else(|e| panic!("{scenario}:{lineno}: frame: {e}"));
+                let method = frame.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                let params = frame.get("params").cloned().unwrap_or(J::Null);
+                if !matches!(
+                    method,
+                    "item/started" | "item/updated" | "item/delta" | "item/completed"
+                ) {
+                    continue;
+                }
+                item_events += 1;
+                match method {
+                    "item/started" | "item/updated" => {
+                        let item = params.get("item").cloned().unwrap_or(J::Null);
+                        fold.on_item_snapshot(&scenario, 2, &item, &mut out);
+                    }
+                    "item/delta" => fold.on_item_delta(&scenario, 2, &params, &mut out),
+                    "item/completed" => fold.on_item_completed(&scenario, 2, &params, &mut out),
+                    _ => unreachable!("item method filter above"),
+                }
+            }
+            for line in &out {
+                parse_json(line)
+                    .unwrap_or_else(|e| panic!("{scenario}: emitted invalid JSON {line}: {e}"));
+                emitted += 1;
+            }
+        }
+        // The corpus must stay meaningful: if these ever hit zero the vendor
+        // step or the schema drifted in a way this test can no longer see.
+        assert!(scenarios >= 40, "unexpectedly small corpus: {scenarios}");
+        assert!(
+            item_events >= 60,
+            "too few item events replayed: {item_events}"
+        );
+        assert!(emitted >= 30, "fold emitted too little: {emitted}");
+    }
+}

@@ -221,3 +221,45 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("kind=transcript-fixture")));
     }
 }
+
+#[cfg(test)]
+mod corpus_tests {
+    use super::{SDK_MANIFEST_FINGERPRINT, SUPPORTED_SCHEMA_VERSION};
+    use crate::json::parse_json;
+
+    fn protocol_path(rel: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/protocol")
+            .join(rel)
+    }
+
+    #[test]
+    fn vendored_sdk_manifest_matches_the_compatibility_table() {
+        // A schema advance that forgets to re-pin must fail here, not at a
+        // user's first prompt.
+        let text = std::fs::read_to_string(protocol_path("stable/manifest.json"))
+            .expect("vendored manifest");
+        let manifest = parse_json(&text).expect("manifest JSON");
+        let fingerprint = manifest
+            .get("fingerprint")
+            .and_then(|v| v.as_str())
+            .expect("manifest fingerprint");
+        assert_eq!(fingerprint, SDK_MANIFEST_FINGERPRINT);
+        let version = manifest
+            .get("schemaVersion")
+            .and_then(|v| v.as_u64())
+            .expect("manifest schemaVersion");
+        assert_eq!(version, SUPPORTED_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn vendored_schema_bundle_is_well_formed() {
+        let text = std::fs::read_to_string(protocol_path("stable/msp.schema.json"))
+            .expect("vendored schema bundle");
+        let schema = parse_json(&text).expect("schema bundle JSON");
+        let defs = schema.get("$defs").expect("$defs");
+        for required in ["Item", "ApprovalRequestParams", "UserInputRequestParams"] {
+            assert!(defs.get(required).is_some(), "missing $defs.{required}");
+        }
+    }
+}
