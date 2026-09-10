@@ -432,7 +432,9 @@ fn main() {
                     "userInput/request" => {
                         handle_msp(&host, &stdout, &sessions, "userInput/requested", &params);
                     }
-                    _ => log(&format!("unhandled MSP request: {method}")),
+                    // reader_loop answers unknown methods with methodNotFound
+                    // before forwarding; this arm is defense in depth.
+                    _ => log(&format!("internal: unhandled known MSP request: {method}")),
                 }
             }
             LoopMsg::AcpEof => {

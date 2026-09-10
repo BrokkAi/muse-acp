@@ -151,6 +151,22 @@ impl Client {
         }
     }
 
+    /// Wait until the fake host logged a line containing `want`.
+    fn wait_log_contains(&self, want: &str, timeout: Duration) {
+        let start = Instant::now();
+        loop {
+            if let Ok(t) = std::fs::read_to_string(&self.fake_log)
+                && t.lines().any(|l| l.contains(want))
+            {
+                return;
+            }
+            if start.elapsed() > timeout {
+                panic!("fake host never logged {want:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Wait until the adapter logged a line containing `want`.
     fn wait_stderr(&self, want: &str, timeout: Duration) {
         let start = Instant::now();
@@ -1750,4 +1766,37 @@ fn unsupported_envelope_schema_version_fails_closed() {
         log.contains("incompatible host schema"),
         "missing fatal diagnostic: {log}"
     );
+}
+
+#[test]
+fn unknown_server_request_gets_method_not_found_and_survives() {
+    // A future MSP server-initiated request must not receive a synthetic
+    // success result; the typed methodNotFound reply leaves the connection
+    // healthy and the method observable in diagnostics.
+    let mut c = Client::spawn("unknown_request", &[]);
+    c.wait_log_contains("unknown-request-reply:", Duration::from_secs(10));
+    let seen = std::fs::read_to_string(&c.fake_log).expect("fake log");
+    let reply = seen
+        .lines()
+        .find(|l| l.starts_with("unknown-request-reply:"))
+        .expect("reply logged");
+    assert!(reply.contains("-32601"), "code missing: {reply}");
+    assert!(
+        reply.contains("methodNotFound"),
+        "typed kind missing: {reply}"
+    );
+    assert!(
+        reply.contains("method not found: future/request"),
+        "method missing: {reply}"
+    );
+    c.wait_stderr(
+        "unsupported MSP server request: future/request",
+        Duration::from_secs(10),
+    );
+
+    // The stdio connection must remain usable after the unknown request.
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "init failed: {frame}");
+    c.finish();
 }

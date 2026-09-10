@@ -46,6 +46,7 @@ pub enum MspEvent {
     },
     /// Server-initiated request (e.g. approval/request, userInput/request).
     /// Already acked `{}` per protocol; the payload still needs handling.
+    /// Only methods accepted by [`known_server_request`] reach the loop.
     Request {
         method: String,
         params: J,
@@ -237,6 +238,22 @@ impl MspHost {
             j_to_string(id)
         ));
     }
+
+    /// Reply with the typed MSP `methodNotFound` error to a server request we
+    /// cannot handle, matching the reference SDK client's failure shape.
+    pub fn reply_method_not_found(&self, id: &J, method: &str) {
+        let _ = self.send_raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":-32601,\"message\":{},\"data\":{{\"kind\":\"methodNotFound\",\"retryable\":false}}}}}}",
+            j_to_string(id),
+            crate::json::esc(&format!("method not found: {method}"))
+        ));
+    }
+}
+
+/// Server-initiated request methods this adapter deliberately handles.
+/// Everything else must receive `methodNotFound`, never a synthetic `{}`.
+pub fn known_server_request(method: &str) -> bool {
+    matches!(method, "approval/request" | "userInput/request")
 }
 
 pub fn mk_err(code: i64, message: &str) -> J {
@@ -296,14 +313,23 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
         if !method.is_empty()
             && let Some(idv) = id.as_ref()
         {
-            // Server-initiated request (e.g. approval/request): ack handling
-            // now ("a client is handling this"), but still forward the payload
-            // — reissued multi-stage/resumed requests carry their own choices.
-            host.reply_ok(idv);
-            let params = msg.get("params").cloned().unwrap_or(J::Null);
-            if tx.send(MspEvent::Request { method, params }).is_err() {
-                break;
+            // Server-initiated request. Known methods are acked `{}` now and
+            // forwarded — reissued multi-stage/resumed requests carry their
+            // own choices. Unknown methods get the typed methodNotFound error:
+            // a synthetic success result could corrupt host state.
+            if known_server_request(&method) {
+                host.reply_ok(idv);
+                let params = msg.get("params").cloned().unwrap_or(J::Null);
+                if tx.send(MspEvent::Request { method, params }).is_err() {
+                    break;
+                }
+                continue;
             }
+            log(&format!(
+                "unsupported MSP server request: {method} id={}",
+                j_to_string(idv)
+            ));
+            host.reply_method_not_found(idv, &method);
             continue;
         }
         if let Some(idv) = id {
@@ -325,6 +351,24 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
             if tx.send(MspEvent::Notification { method, params }).is_err() {
                 break;
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::known_server_request;
+
+    #[test]
+    fn only_deliberately_handled_server_requests_are_forwarded() {
+        for method in ["approval/request", "userInput/request"] {
+            assert!(known_server_request(method), "{method} must be known");
+        }
+        for method in ["future/request", "approval/decide", "userInput/answer", ""] {
+            assert!(
+                !known_server_request(method),
+                "{method:?} must get methodNotFound, not a synthetic result"
+            );
         }
     }
 }

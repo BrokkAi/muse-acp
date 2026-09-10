@@ -432,7 +432,15 @@ def main():
         method = msg.get("method", "")
         ident = msg.get("id")
         log_method(method or "(response)")
+        if not method and ident == "srv-77":
+            # The adapter's reply to the fixture's unknown server request.
+            log_method("unknown-request-reply:" + json.dumps(msg))
+            continue
         if method == "initialized":
+            if SCENARIO == "unknown_request":
+                send({"jsonrpc": "2.0", "id": "srv-77",
+                      "method": "future/request",
+                      "params": {"sessionId": MSP_SID, "novel": True}})
             continue
         if method:
             if ident is not None:

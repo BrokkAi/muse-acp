@@ -156,6 +156,12 @@ after reconnect, resume, load, and view attachment.
 
 Do not return a generic `{}` result for every server-initiated MSP request.
 
+Status: **implemented for the current schema.** Only `approval/request` and
+`userInput/request` are acked `{}` and forwarded; every other server-initiated
+request receives the typed `methodNotFound` error (matching the reference SDK
+client's shape) and is logged with its id. New methods require a deliberate
+table entry plus a disposition in the event matrix.
+
 **Work items**
 
 - Explicitly support known request methods such as `approval/request` and
