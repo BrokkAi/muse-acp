@@ -2288,3 +2288,39 @@ fn session_fork_rejects_unresolvable_and_fingerprint_cut_points() {
     );
     c.finish();
 }
+
+#[test]
+fn durable_host_crash_restarts_and_reattaches() {
+    let marker = std::env::temp_dir().join(format!(
+        "muse-acp-restart-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let marker_str = marker.to_str().unwrap().to_string();
+    let mut c = Client::spawn("host_exit", &[("FAKE_RESTART_MARKER", marker_str.as_str())]);
+    let sid = c.new_session(1, "");
+    let p1 = c.prompt(&sid, "before crash");
+    let f1 = c.wait_for(&format!("\"id\":{p1}"), Duration::from_secs(15));
+    assert!(
+        f1.contains("\"stopReason\":\"end_turn\""),
+        "first turn must settle before the crash: {f1}"
+    );
+    c.wait_stderr(
+        "host-restarted attempt=1 sessions=1 failures=0",
+        Duration::from_secs(10),
+    );
+    c.wait_stderr("host-ready", Duration::from_secs(10));
+
+    // The re-attached session must remain usable on the replacement host.
+    let p2 = c.prompt(&sid, "after crash");
+    let f2 = c.wait_for(&format!("\"id\":{p2}"), Duration::from_secs(15));
+    assert!(
+        f2.contains("\"stopReason\":\"end_turn\""),
+        "post-restart prompt failed: {f2}"
+    );
+    c.finish();
+    let _ = std::fs::remove_file(&marker);
+}

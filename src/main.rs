@@ -470,6 +470,100 @@ fn selftest() -> i32 {
     0
 }
 
+/// Restart a dead durable host and re-attach every known session.
+///
+/// The Muse SDK's durability contract says a durable session's pending
+/// terminals arrive on resume, so in-flight ACP prompts are deliberately left
+/// open: the re-attached view settles them. Returns the new host on success.
+fn restart_durable_host(
+    old: &Arc<MspHost>,
+    tx: &mpsc::Sender<LoopMsg>,
+    sessions: &Sessions,
+) -> Result<Arc<MspHost>, String> {
+    // Snapshot the attach list first; host calls must happen unlocked.
+    let attach: Vec<String> = sessions
+        .lock()
+        .unwrap()
+        .values()
+        .map(|s| s.msp_sid.clone())
+        .collect();
+    let max_attempts = 3u32;
+    let mut last_err = String::new();
+    for attempt in 1..=max_attempts {
+        // Backoff: 250ms, 500ms, 1s. A wedged host must not become a spawn
+        // loop, but a transient crash deserves a quick second chance.
+        if attempt > 1 {
+            std::thread::sleep(std::time::Duration::from_millis(250u64 << (attempt - 2)));
+        }
+        match MspHost::launch() {
+            Ok((host, msp_rx)) => {
+                let fwd_tx = tx.clone();
+                std::thread::spawn(move || {
+                    for ev in msp_rx {
+                        if fwd_tx.send(LoopMsg::Msp(ev)).is_err() {
+                            break;
+                        }
+                    }
+                });
+                let mut failures = Vec::new();
+                for msp_sid in &attach {
+                    let cmd = host.mint_cmd("cmd-");
+                    match host.command(
+                        "session/resume",
+                        &format!(
+                            "{{\"commandId\":{},\"sessionId\":{},\"history\":\"inline\"}}",
+                            esc(&cmd),
+                            esc(msp_sid)
+                        ),
+                    ) {
+                        Ok(r) => {
+                            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                                let mut map = sessions.lock().unwrap();
+                                if let Some(s) = map.get_mut(&acp_sid) {
+                                    s.active_turn = r
+                                        .get("session")
+                                        .and_then(|x| x.get("activeTurnId"))
+                                        .and_then(|v| v.as_str())
+                                        .map(str::to_string);
+                                    if let Some(m) = host_mode(&r) {
+                                        s.mode_value = acp::mode_from_msp(&m).to_string();
+                                    }
+                                    if let Some(model) = r
+                                        .get("session")
+                                        .and_then(|x| x.get("modelId"))
+                                        .and_then(|v| v.as_str())
+                                        && !model.is_empty()
+                                    {
+                                        s.model_value = model.to_string();
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => failures.push(format!("{msp_sid}: {}", err_message(&e))),
+                    }
+                }
+                log(&format!(
+                    "host-restarted attempt={attempt} sessions={} failures={}",
+                    attach.len(),
+                    failures.len()
+                ));
+                for f in &failures {
+                    log(&format!("restart re-attach failed: {f}"));
+                }
+                old.reap();
+                return Ok(host);
+            }
+            Err(e) => {
+                last_err = e;
+                log(&format!(
+                    "host restart attempt {attempt}/{max_attempts} failed: {last_err}"
+                ));
+            }
+        }
+    }
+    Err(last_err)
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.as_slice() == ["--selftest"] {
@@ -508,8 +602,9 @@ fn main() {
         }
     });
 
-    // Serve host + notification forwarder.
-    let (host, msp_rx) = match MspHost::launch() {
+    // Serve host + notification forwarder. `host` is mutable: a durable
+    // host's death is recoverable by relaunching and re-attaching.
+    let (mut host, msp_rx) = match MspHost::launch() {
         Ok(h) => h,
         Err(e) => {
             eprintln!("[muse-acp] fatal: {e}");
@@ -568,9 +663,38 @@ fn main() {
                 std::process::exit(0);
             }
             LoopMsg::Msp(MspEvent::Eof(why)) => {
-                log(&format!("serve host gone ({why}); failing in-flight turns"));
-                fail_all(&stdout, &sessions);
-                std::process::exit(1);
+                log(&format!("serve host gone ({why})"));
+                host.reap();
+                // Durable sessions recover by re-attaching: their pending
+                // terminals arrive on resume. Ephemeral or unrecognized
+                // profiles get no such guarantee, so they fail closed.
+                if host.handshake().restartable() {
+                    match restart_durable_host(&host, &tx, &sessions) {
+                        Ok(new_host) => {
+                            host = new_host;
+                            // Reissued requests arrive on the new view; pull
+                            // reconciliation as the belt-and-braces pass.
+                            let ids: Vec<String> =
+                                sessions.lock().unwrap().keys().cloned().collect();
+                            for sid in ids {
+                                reconcile_pending(&host, &stdout, &sessions, &sid);
+                            }
+                        }
+                        Err(e) => {
+                            log(&format!(
+                                "host restart exhausted; failing in-flight turns: {e}"
+                            ));
+                            fail_all(&stdout, &sessions);
+                            std::process::exit(1);
+                        }
+                    }
+                } else {
+                    log(
+                        "host is not restartable (ephemeral or unknown durability); failing in-flight turns",
+                    );
+                    fail_all(&stdout, &sessions);
+                    std::process::exit(1);
+                }
             }
         }
     }

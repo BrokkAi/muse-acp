@@ -27,6 +27,18 @@ pub struct HandshakeInfo {
     pub fingerprint: String,
     pub status: &'static str,
     pub detail: &'static str,
+    /// `sessionDurability` from the handshake. Absent means durable (the
+    /// schema's compatibility rule); unknown values are treated as ephemeral.
+    pub durability: Option<String>,
+}
+
+impl HandshakeInfo {
+    /// Whether a dead host of this profile may be restarted and its sessions
+    /// re-attached. Only `durable` (including the absent-means-durable arm)
+    /// carries the recovery guarantee.
+    pub fn restartable(&self) -> bool {
+        matches!(self.durability.as_deref(), None | Some("durable"))
+    }
 }
 
 impl HandshakeInfo {
@@ -96,7 +108,7 @@ pub struct MspHost {
     cmd_seq: AtomicU64,
     pending: Mutex<HashMap<String, Sender<Result<J, J>>>>,
     handshake: Mutex<HandshakeInfo>,
-    _child: Child,
+    _child: Mutex<Child>,
 }
 
 impl MspHost {
@@ -106,6 +118,16 @@ impl MspHost {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone()
+    }
+
+    /// Best-effort reap of an exited host child; EOF has already been
+    /// observed, so this only prevents a zombie.
+    pub fn reap(&self) {
+        let _ = self
+            ._child
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .try_wait();
     }
 }
 
@@ -135,7 +157,7 @@ impl MspHost {
             cmd_seq: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             handshake: Mutex::new(HandshakeInfo::default()),
-            _child: child,
+            _child: Mutex::new(child),
         });
         let (tx, rx) = mpsc::channel();
         let reader_host = host.clone();
@@ -168,6 +190,10 @@ impl MspHost {
         let verdict = compat::classify(schema_version, fp);
         let host_label = format!("{server_name}/{server_version}");
         log(&verdict.log_line(env!("CARGO_PKG_VERSION"), &host_label));
+        let durability = res
+            .get("sessionDurability")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
         *host.handshake.lock().unwrap_or_else(|p| p.into_inner()) = HandshakeInfo {
             server_name,
             server_version,
@@ -175,6 +201,7 @@ impl MspHost {
             fingerprint: verdict.fingerprint.clone(),
             status: verdict.status.as_str(),
             detail: verdict.detail,
+            durability,
         };
         if verdict.is_fatal() {
             return Err(format!(
@@ -471,5 +498,32 @@ mod tests {
         );
         assert_eq!(session_suffix(r#"{"commandId":"c"}"#), "");
         assert_eq!(session_suffix("not json"), "");
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::HandshakeInfo;
+
+    fn info(durability: Option<&str>) -> HandshakeInfo {
+        HandshakeInfo {
+            server_name: "s".into(),
+            server_version: "0".into(),
+            schema_version: Some(1),
+            fingerprint: "fp".into(),
+            status: "tested",
+            detail: "",
+            durability: durability.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn only_durable_profiles_may_restart() {
+        // Absent means durable per the schema's compatibility rule.
+        assert!(info(None).restartable());
+        assert!(info(Some("durable")).restartable());
+        // Unknown values carry no recovery guarantee: fail closed.
+        assert!(!info(Some("ephemeral")).restartable());
+        assert!(!info(Some("future-profile")).restartable());
     }
 }

@@ -109,6 +109,7 @@ def turn_id():
 # The session notifications currently target; a fork switches it so turns
 # started on the forked session complete on the forked session.
 ACTIVE_SESSION = [MSP_SID]
+CRASH_AFTER_ACK = [False]
 
 
 def session_obj(session_id=None, workspace_root="/tmp/fake-ws"):
@@ -228,6 +229,14 @@ def on_turn_start(params):
             send({"jsonrpc": "2.0", "id": 9200, "method": "userInput/request",
                   "params": question_params(qid)})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "host_exit":
+        # Complete the turn, then die like a crashed host once the ack is on
+        # the wire: the adapter must restart, re-attach, and keep serving.
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-hx", "kind": "agentMessage", "status": "completed",
+            "text": "before the crash"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+        CRASH_AFTER_ACK[0] = True
     elif SCENARIO == "todo":
         notify("session/todoListChanged", {
             "sessionId": MSP_SID, "viewCursor": "cur-t1",
@@ -617,6 +626,21 @@ def result_for(method, msg):
     return {}
 
 
+def scenario_after_restart():
+    """host_exit is a one-shot: the first process creates the marker and
+    crashes; the replacement process sees the marker and behaves sanely."""
+    marker = os.environ.get("FAKE_RESTART_MARKER", "")
+    if SCENARIO == "host_exit" and marker:
+        if os.path.exists(marker):
+            return "happy"
+        with open(marker, "w") as f:
+            f.write("crashed")
+    return SCENARIO
+
+
+SCENARIO = scenario_after_restart()
+
+
 def main():
     for line in sys.stdin:
         line = line.strip()
@@ -652,6 +676,9 @@ def main():
                     continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
+                if CRASH_AFTER_ACK[0]:
+                    sys.stdout.flush()
+                    os._exit(0)
                 if SCENARIO == "questions_resume" and method == "session/resume":
                     # MSP reissues pending requests after the resume response.
                     send({"jsonrpc": "2.0", "id": 9100 + ident,
