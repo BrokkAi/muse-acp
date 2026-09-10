@@ -80,6 +80,11 @@ pub struct AcpSession {
     /// View cursors of completions already folded into the totals above.
     /// `view/gap` recovery can replay a completion that also arrives live.
     pub usage_seen: std::collections::HashSet<String>,
+    /// Latest goal block as raw MSP JSON (`"null"` after an explicit clear;
+    /// `None` before any fact arrives).
+    pub goal_meta: Option<String>,
+    /// Latest branch observation as raw MSP JSON (`None` before any fact).
+    pub branch_meta: Option<String>,
 }
 
 pub type Sessions = Arc<Mutex<HashMap<String, AcpSession>>>;
@@ -421,6 +426,38 @@ pub fn send_plan(stdout: &StdoutShared, acp_sid: &str, items: Option<&J>) {
             "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"plan\",\"entries\":[{}]}}}}}}",
             esc(acp_sid),
             entries
+        ),
+    );
+}
+
+/// Publish provider-neutral goal state (the presentation codex-acp uses) and
+/// a namespaced branch observation through one `session_info_update`.
+pub fn send_session_meta(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    goal: Option<&str>,
+    branch: Option<&str>,
+) {
+    let mut meta = Vec::new();
+    if let Some(goal) = goal {
+        meta.push(format!("\"goal\":{goal}"));
+    }
+    if let Some(branch) = branch {
+        meta.push(format!("\"muse\":{{\"branch\":{branch}}}"));
+    }
+    if meta.is_empty() {
+        return;
+    }
+    let update = format!(
+        "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{{}}}}}",
+        meta.join(",")
+    );
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{}}}}}",
+            esc(acp_sid),
+            update
         ),
     );
 }

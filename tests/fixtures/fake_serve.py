@@ -257,6 +257,26 @@ def on_turn_start(params):
             "itemId": "it-m1", "kind": "agentMessage", "status": "completed",
             "text": "done"}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "goal_branch":
+        notify("session/goalChanged", {
+            "sessionId": MSP_SID, "viewCursor": "cur-g1",
+            "goal": {"objective": "Green the suite", "status": "active",
+                     "percentComplete": 42,
+                     "currentWork": "Fixing fold tests",
+                     "nextWork": "Re-run CI"}})
+        notify("session/branchChanged", {
+            "sessionId": MSP_SID, "viewCursor": "cur-b1",
+            "branch": "feat/msp", "vcs": "git",
+            "workspaceRoot": "/home/me/src/proj"})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "goal_clear":
+        notify("session/goalChanged", {
+            "sessionId": MSP_SID, "viewCursor": "cur-g1",
+            "goal": {"objective": "Old", "status": "active",
+                     "percentComplete": 10}})
+        notify("session/goalChanged", {
+            "sessionId": MSP_SID, "viewCursor": "cur-g2", "goal": None})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "reasoning_quiet":
         # No deltas: the completed summary must still be emitted once.
         notify("item/completed", {**base, "item": {
@@ -391,6 +411,14 @@ def result_for(method, msg):
             history["snapshot"]["state"]["todoList"] = {
                 "items": TODO_ITEMS, "revision": 3,
                 "sourceTool": "todo_write"}
+        elif SCENARIO == "goal_branch_resume":
+            history = usage_snapshot_history()
+            history["snapshot"]["state"]["goal"] = {
+                "objective": "Snapshot goal", "status": "paused",
+                "percentComplete": 5}
+            history["snapshot"]["state"]["branch"] = {
+                "branch": "main", "vcs": "git",
+                "workspaceRoot": "/home/me/src/proj"}
         elif SCENARIO == "usage_snapshot_null":
             history = usage_snapshot_history(context=False)
         elif SCENARIO in ("usage_inline", "questions_resume") and snapshot_rung:

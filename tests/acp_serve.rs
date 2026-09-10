@@ -2037,3 +2037,62 @@ fn compact_in_running_text_is_still_a_prompt() {
     c.wait_input("please /compact now", Duration::from_secs(10));
     c.finish();
 }
+
+#[test]
+fn goal_and_branch_state_publish_as_session_metadata() {
+    let mut c = Client::spawn("goal_branch", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "work");
+    let goal = c.wait_for(
+        "\"goal\":{\"objective\":\"Green the suite\"",
+        Duration::from_secs(15),
+    );
+    assert!(goal.contains(&sid), "goal targets our session: {goal}");
+    assert!(
+        goal.contains("\"percentComplete\":42"),
+        "percent missing: {goal}"
+    );
+    assert!(
+        goal.contains("Fixing fold tests"),
+        "currentWork missing: {goal}"
+    );
+    let branch = c.wait_for(
+        "\"muse\":{\"branch\":{\"branch\":\"feat/msp\"",
+        Duration::from_secs(15),
+    );
+    assert!(branch.contains("\"vcs\":\"git\""), "vcs missing: {branch}");
+    c.finish();
+}
+
+#[test]
+fn an_explicit_null_goal_clears_the_metadata() {
+    let mut c = Client::spawn("goal_clear", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "clear it");
+    c.wait_for("\"goal\":{\"objective\":\"Old\"", Duration::from_secs(15));
+    let cleared = c.wait_for("\"goal\":null", Duration::from_secs(15));
+    assert!(
+        cleared.contains(&sid),
+        "clear targets our session: {cleared}"
+    );
+    c.finish();
+}
+
+#[test]
+fn resume_restores_goal_and_branch_from_the_snapshot() {
+    let mut c = Client::spawn("goal_branch_resume", &[]);
+    let sid = c.new_session(2, "");
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "resume failed: {frame}");
+    let goal = c.wait_for(
+        "\"goal\":{\"objective\":\"Snapshot goal\"",
+        Duration::from_secs(15),
+    );
+    assert!(
+        goal.contains("\"status\":\"paused\""),
+        "status missing: {goal}"
+    );
+    c.wait_for("\"branch\":\"main\"", Duration::from_secs(15));
+    c.finish();
+}

@@ -740,6 +740,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             cum_total: None,
                             cost_amount: None,
                             usage_seen: std::collections::HashSet::new(),
+                            goal_meta: None,
+                            branch_meta: None,
                         },
                     );
                     // _meta exposes the host session id: pass it back to
@@ -928,6 +930,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             cum_total: None,
                             cost_amount: None,
                             usage_seen: std::collections::HashSet::new(),
+                            goal_meta: None,
+                            branch_meta: None,
                         });
                         entry.msp_sid = real_msp;
                         entry.ver = ver;
@@ -982,6 +986,22 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             {
                                 acp::send_plan(stdout, &sid, todo.get("items"));
                             }
+                            // Goal and branch are folded snapshot facts too:
+                            // adopt them so session metadata survives attach.
+                            if let Some(goal) = state.get("goal") {
+                                entry.goal_meta = Some(j_to_string(goal));
+                            }
+                            if let Some(branch) = state.get("branch") {
+                                entry.branch_meta = Some(j_to_string(branch));
+                            }
+                            let (goal_meta, branch_meta) =
+                                (entry.goal_meta.clone(), entry.branch_meta.clone());
+                            acp::send_session_meta(
+                                stdout,
+                                &sid,
+                                goal_meta.as_deref(),
+                                branch_meta.as_deref(),
+                            );
                         }
                         if replay {
                             replay_history(stdout, entry, &r);
@@ -2497,6 +2517,72 @@ fn handle_msp(
                 acp::send_plan(stdout, &acp_sid, params.get("items"));
             }
         }
+        "session/goalChanged" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
+                && let Some(goal) = params.get("goal")
+            {
+                let (goal_meta, branch_meta) = {
+                    let mut map = sessions.lock().unwrap();
+                    match map.get_mut(&acp_sid) {
+                        Some(s) => {
+                            // An explicit null clears; the raw encoding keeps
+                            // that distinct from "never seen".
+                            s.goal_meta = Some(j_to_string(goal));
+                            (s.goal_meta.clone(), s.branch_meta.clone())
+                        }
+                        None => (None, None),
+                    }
+                };
+                acp::send_session_meta(
+                    stdout,
+                    &acp_sid,
+                    goal_meta.as_deref(),
+                    branch_meta.as_deref(),
+                );
+            }
+        }
+        "session/branchChanged" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                let branch = J::Obj(vec![
+                    (
+                        "branch".to_string(),
+                        params.get("branch").cloned().unwrap_or(J::Null),
+                    ),
+                    (
+                        "vcs".to_string(),
+                        params.get("vcs").cloned().unwrap_or(J::Null),
+                    ),
+                    (
+                        "workspaceRoot".to_string(),
+                        params.get("workspaceRoot").cloned().unwrap_or(J::Null),
+                    ),
+                ]);
+                let (goal_meta, branch_meta) = {
+                    let mut map = sessions.lock().unwrap();
+                    match map.get_mut(&acp_sid) {
+                        Some(s) => {
+                            s.branch_meta = Some(j_to_string(&branch));
+                            (s.goal_meta.clone(), s.branch_meta.clone())
+                        }
+                        None => (None, None),
+                    }
+                };
+                acp::send_session_meta(
+                    stdout,
+                    &acp_sid,
+                    goal_meta.as_deref(),
+                    branch_meta.as_deref(),
+                );
+            }
+        }
         "session/contextUsage" => {
             // Context-window pressure: counted-once occupancy at the latest
             // provider-reported fact. Replace wholesale (an absent
@@ -2571,7 +2657,7 @@ fn handle_msp(
                 }
             }
         }
-        "initialized" | "session/started" | "session/goalChanged" | "session/branchChanged" => {}
+        "initialized" | "session/started" => {}
         _ => {
             log(&format!("unhandled MSP notification: {method}"));
         }

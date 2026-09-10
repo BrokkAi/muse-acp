@@ -463,6 +463,13 @@ Remaining work: generic `fallbackText` rendering for unknown item kinds.
 
 Surface session-level state without corrupting prompt settlement.
 
+Status: **goal and branch display implemented.** `session/goalChanged`
+(including explicit `null` clears) publishes the provider-neutral `_meta.goal`
+presentation on `session_info_update`; `session/branchChanged` publishes a
+namespaced branch observation; both are restored from the resume snapshot.
+Goal control stays deferred (experimental upstream). Remaining work:
+retry/retract settlement race tests.
+
 **Work items**
 - Represent branch changes (`BranchState { branch, vcs, workspaceRoot }` from
   `session/branchChanged`; branch may be `null` on detached HEAD) in
