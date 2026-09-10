@@ -2096,3 +2096,92 @@ fn resume_restores_goal_and_branch_from_the_snapshot() {
     c.wait_for("\"branch\":\"main\"", Duration::from_secs(15));
     c.finish();
 }
+
+#[test]
+fn subagent_items_render_as_visible_tool_cards() {
+    let mut c = Client::spawn("subagent", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "delegate");
+    let started = c.wait_for("subagent-it-sub1", Duration::from_secs(15));
+    assert!(
+        started.contains("researcher: survey failing tests"),
+        "objective title missing: {started}"
+    );
+    let done = c.wait_for("child finished", Duration::from_secs(15));
+    assert!(
+        done.contains("\"status\":\"completed\""),
+        "terminal status missing: {done}"
+    );
+    assert!(
+        done.contains("\"childSessionId\":\"child-sess-1\""),
+        "child session meta missing: {done}"
+    );
+    assert!(
+        done.contains("\"controlStatus\":\"closed\""),
+        "control status meta missing: {done}"
+    );
+    assert!(done.contains(&sid), "wrong session: {done}");
+    c.finish();
+}
+
+#[test]
+fn workflow_items_render_children_state() {
+    let mut c = Client::spawn("workflow", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "run workflow");
+    let card = c.wait_for("workflow-it-wf1", Duration::from_secs(15));
+    assert!(
+        card.contains("Workflow triage-batch"),
+        "title missing: {card}"
+    );
+    assert!(
+        card.contains("triage issue #1: started (triage)"),
+        "child state missing: {card}"
+    );
+    let done = c.wait_for("triage issue #1: completed", Duration::from_secs(15));
+    assert!(
+        done.contains("\"workflowRunId\":\"wfr-1\""),
+        "run id meta missing: {done}"
+    );
+    c.finish();
+}
+
+#[test]
+fn user_shell_items_render_exit_facts_verbatim() {
+    let mut c = Client::spawn("usershell_item", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "check status");
+    let card = c.wait_for("shell-it-sh1", Duration::from_secs(15));
+    assert!(card.contains("git status"), "command missing: {card}");
+    assert!(card.contains("## main"), "output missing: {card}");
+    assert!(
+        card.contains("exited with code 0"),
+        "exit fact missing: {card}"
+    );
+    assert!(card.contains("\"exitCode\":0"), "exit meta missing: {card}");
+    c.finish();
+}
+
+#[test]
+fn unknown_kinds_render_fallback_text_only() {
+    let mut c = Client::spawn("unknown_kind", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "surprise me");
+    let card = c.wait_for("item-it-u1", Duration::from_secs(15));
+    assert!(
+        card.contains("Previewed a hologram"),
+        "fallback missing: {card}"
+    );
+    assert!(
+        card.contains("\"itemKind\":\"hologramPreview\""),
+        "kind provenance missing: {card}"
+    );
+    // The final answer must still arrive.
+    c.wait_for("done", Duration::from_secs(15));
+    let frames = c.frames.lock().unwrap().join("\n");
+    assert!(
+        !frames.contains("it-u2"),
+        "a kind with no fallbackText must stay invisible: {frames}"
+    );
+    c.finish();
+}

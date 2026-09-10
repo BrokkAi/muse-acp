@@ -257,6 +257,57 @@ def on_turn_start(params):
             "itemId": "it-m1", "kind": "agentMessage", "status": "completed",
             "text": "done"}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "subagent":
+        sid_item = "it-sub1"
+        notify("item/started", {**base, "item": {
+            "itemId": sid_item, "kind": "subagent", "status": "inProgress",
+            "revision": 1, "subagentId": "sub-1", "agentPath": "researcher",
+            "depth": 1, "objective": "survey failing tests",
+            "childSessionId": "child-sess-1", "controlStatus": "running"}})
+        notify("item/completed", {**base, "item": {
+            "itemId": sid_item, "kind": "subagent", "status": "completed",
+            "revision": 2, "subagentId": "sub-1", "agentPath": "researcher",
+            "depth": 1, "objective": "survey failing tests",
+            "childSessionId": "child-sess-1", "controlStatus": "closed",
+            "result": {"summary": "child finished", "evidenceRefs": [],
+                       "artifactRefs": []}}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "workflow":
+        wf = "it-wf1"
+        notify("item/updated", {**base, "item": {
+            "itemId": wf, "kind": "workflow", "status": "inProgress",
+            "revision": 2, "workflowRunId": "wfr-1", "entryId": "triage-batch",
+            "scriptId": "triage@sha256:aa10", "triggerSource": "modelProposal",
+            "children": [{"childId": "c1", "attempt": 1, "status": "started",
+                          "phase": "triage", "label": "triage issue #1"}]}})
+        notify("item/completed", {**base, "item": {
+            "itemId": wf, "kind": "workflow", "status": "completed",
+            "revision": 3, "workflowRunId": "wfr-1", "entryId": "triage-batch",
+            "scriptId": "triage@sha256:aa10", "triggerSource": "modelProposal",
+            "children": [{"childId": "c1", "attempt": 1, "status": "completed",
+                          "label": "triage issue #1"}]}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "usershell_item":
+        notify("item/completed", {"sessionId": MSP_SID, "item": {
+            "itemId": "it-sh1", "kind": "userShell", "status": "completed",
+            "revision": 1, "turnId": None, "commandText": "git status",
+            "exitCode": 0, "visibleOutput": "## main", "durationMs": 120},
+            "viewCursor": "cur-sh1"})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-m2", "kind": "agentMessage", "status": "completed",
+            "text": "shell done"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "unknown_kind":
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-u1", "kind": "hologramPreview", "status": "completed",
+            "revision": 1, "fallbackText": "Previewed a hologram"}})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-u2", "kind": "mysteryKind", "status": "completed",
+            "revision": 1}})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-m3", "kind": "agentMessage", "status": "completed",
+            "text": "done"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "goal_branch":
         notify("session/goalChanged", {
             "sessionId": MSP_SID, "viewCursor": "cur-g1",

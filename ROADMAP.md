@@ -442,7 +442,9 @@ Status: **reasoning implemented.** Summary parts stream as
 `agent_thought_chunk` with a section break on part transitions; a completion
 with no observed deltas emits the committed summary (or raw text) exactly
 once, and host-side truncation is logged rather than presented as complete.
-Remaining work: generic `fallbackText` rendering for unknown item kinds.
+Unknown future item kinds render generically from `fallbackText` (with the
+source kind in `_meta.muse.itemKind`) and stay invisible when the host
+supplies no summary.
 
 **Work items**
 
@@ -499,6 +501,11 @@ MSP v1 can represent this work: `session/userShell` (gated on the
 `visibleOutput`, and a null `turnId`; and a `toolCall` may be durably
 backgrounded (`background: true`, `backgroundInitiator: user|timeout`).
 
+Status: **user-shell visibility implemented.** `userShell` items render as
+execute-kind tool cards with verbatim command, output, and exit facts (code
+and signal stay distinct; numbers are never mapped to names). Remaining work:
+AIR async-task negotiation and stop, and the `userShell` host capability.
+
 **Work items**
 
 - Map backgrounded `toolCall`/`userShell` items to the AIR async-tasks
@@ -524,6 +531,12 @@ MSP v1 publishes `subagent/sendMessage`, `subagent/followupTask`,
 `reminderChild` item kinds carry `subagentId`, `childSessionId`,
 `controlStatus`, `result`, and transitive `usage`; and the transcript corpus
 covers nested lifecycles, steering replay/rejection, and close round-trips.
+
+Status: **legacy visibility implemented.** Subagent and workflow items render
+as synthetic tool cards (`agent: objective` titles, result summaries, child
+state lines) carrying `subagentId`, `childSessionId`, `controlStatus`, and
+run provenance in `_meta.muse`, so no child work is silently dropped. Native
+ACP subagent sessions and `subagent/*` controls remain the open work.
 
 **Work items**
 

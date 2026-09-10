@@ -145,6 +145,45 @@ impl SessionFold {
         Self::update_line(acp_sid, &update)
     }
 
+    /// A synthetic tool card for host-side work that is not a model tool
+    /// call (subagents, workflows, the user shell, unknown future kinds).
+    /// `_meta` carries the MSP facts so support can see the source item.
+    #[allow(clippy::too_many_arguments)]
+    fn card_line(
+        acp_sid: &str,
+        ver: u8,
+        create: bool,
+        tc_id: &str,
+        title: &str,
+        kind: &str,
+        status: &str,
+        content_text: Option<&str>,
+        meta: Option<&str>,
+    ) -> String {
+        let session_update = if ver == 2 || !create {
+            "tool_call_update"
+        } else {
+            "tool_call"
+        };
+        let mut f = vec![
+            format!("\"sessionUpdate\":\"{session_update}\""),
+            format!("\"toolCallId\":{}", esc(tc_id)),
+            format!("\"title\":{}", esc(title)),
+            format!("\"kind\":\"{kind}\""),
+            format!("\"status\":{}", esc(status)),
+        ];
+        if let Some(t) = content_text {
+            f.push(format!(
+                "\"content\":[{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]",
+                esc(&trunc(t))
+            ));
+        }
+        if let Some(m) = meta {
+            f.push(format!("\"_meta\":{m}"));
+        }
+        Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
+    }
+
     /// Compaction is host work the user must see, but it is not a tool the
     /// model called. Present it as a think-kind tool call with provenance
     /// metadata, matching codex-acp's compaction presentation.
@@ -202,6 +241,184 @@ impl SessionFold {
             )),
             // In progress or an unknown outcome: the host has not spoken yet.
             _ => None,
+        }
+    }
+
+    /// Build (title, content, `_meta` JSON) for host-side item kinds that
+    /// render as synthetic tool cards. `meta` is a complete JSON object.
+    fn host_card_parts(kind: &str, item: &J) -> (String, Option<String>, Option<String>) {
+        let str_field = |key: &str| item.get(key).and_then(|v| v.as_str()).unwrap_or("");
+        let meta_obj = |namespace: &str, fields: Vec<(&str, &J)>| {
+            let parts: Vec<String> = fields
+                .into_iter()
+                .filter(|(_, v)| !matches!(v, J::Null))
+                .map(|(k, v)| format!("\"{k}\":{}", j_to_string(v)))
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(format!(
+                    "{{\"muse\":{{\"{namespace}\":{{{}}}}}}}",
+                    parts.join(",")
+                ))
+            }
+        };
+        match kind {
+            "subagent" => {
+                let agent = str_field("agentPath");
+                let objective = str_field("objective");
+                let title = match (agent.is_empty(), objective.is_empty()) {
+                    (false, false) => format!("{agent}: {objective}"),
+                    (false, true) => agent.to_string(),
+                    (true, false) => objective.to_string(),
+                    (true, true) => str_field("fallbackText").to_string(),
+                };
+                let content = item
+                    .get("result")
+                    .and_then(|r| r.get("summary"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                    .or_else(|| {
+                        let failure = str_field("failureReason");
+                        (!failure.is_empty()).then_some(failure.to_string())
+                    });
+                let meta = meta_obj(
+                    "subagent",
+                    vec![
+                        ("subagentId", item.get("subagentId").unwrap_or(&J::Null)),
+                        (
+                            "childSessionId",
+                            item.get("childSessionId").unwrap_or(&J::Null),
+                        ),
+                        (
+                            "controlStatus",
+                            item.get("controlStatus").unwrap_or(&J::Null),
+                        ),
+                        ("depth", item.get("depth").unwrap_or(&J::Null)),
+                    ],
+                );
+                (title, content, meta)
+            }
+            "workflow" => {
+                let entry = str_field("entryId");
+                let script = str_field("scriptId");
+                let title = if !entry.is_empty() {
+                    format!("Workflow {entry}")
+                } else if !script.is_empty() {
+                    format!("Workflow {script}")
+                } else {
+                    "Workflow".to_string()
+                };
+                let content = match item.get("children") {
+                    Some(J::Arr(children)) if !children.is_empty() => {
+                        let lines: Vec<String> = children
+                            .iter()
+                            .map(|c| {
+                                let label =
+                                    c.get("label").and_then(|v| v.as_str()).unwrap_or("child");
+                                let status = c
+                                    .get("status")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("unknown");
+                                let phase = c.get("phase").and_then(|v| v.as_str());
+                                match phase {
+                                    Some(phase) => format!("{label}: {status} ({phase})"),
+                                    None => format!("{label}: {status}"),
+                                }
+                            })
+                            .collect();
+                        Some(lines.join("\n"))
+                    }
+                    _ => None,
+                };
+                let meta = meta_obj(
+                    "workflow",
+                    vec![
+                        (
+                            "workflowRunId",
+                            item.get("workflowRunId").unwrap_or(&J::Null),
+                        ),
+                        ("entryId", item.get("entryId").unwrap_or(&J::Null)),
+                        ("scriptId", item.get("scriptId").unwrap_or(&J::Null)),
+                        (
+                            "triggerSource",
+                            item.get("triggerSource").unwrap_or(&J::Null),
+                        ),
+                    ],
+                );
+                (title, content, meta)
+            }
+            "userShell" => {
+                let command = str_field("commandText");
+                let title = if command.is_empty() {
+                    "User shell".to_string()
+                } else {
+                    command.to_string()
+                };
+                let mut content = str_field("visibleOutput").to_string();
+                // Exit facts are verbatim host facts: code and signal stay
+                // distinct, and signal numbers are never mapped to names.
+                if let Some(code) = item.get("exitCode").and_then(|v| v.as_u64()) {
+                    let fact = format!("exited with code {code}");
+                    if content.is_empty() {
+                        content = fact;
+                    } else {
+                        content = format!("{content}\n{fact}");
+                    }
+                } else if let Some(signal) = item.get("exitSignal").and_then(|v| v.as_u64()) {
+                    let fact = format!("terminated by signal {signal}");
+                    if content.is_empty() {
+                        content = fact;
+                    } else {
+                        content = format!("{content}\n{fact}");
+                    }
+                }
+                let content = (!content.is_empty()).then_some(content);
+                let meta = meta_obj(
+                    "userShell",
+                    vec![
+                        ("exitCode", item.get("exitCode").unwrap_or(&J::Null)),
+                        ("exitSignal", item.get("exitSignal").unwrap_or(&J::Null)),
+                    ],
+                );
+                (title, content, meta)
+            }
+            _ => {
+                // Unknown future kinds: the schema says a one-line summary
+                // SHOULD ride `fallbackText`; without it there is nothing
+                // honest to render.
+                let text = str_field("fallbackText");
+                (
+                    text.to_string(),
+                    None,
+                    (!text.is_empty())
+                        .then(|| format!("{{\"muse\":{{\"itemKind\":{}}}}}", esc(kind))),
+                )
+            }
+        }
+    }
+
+    /// Stable synthetic toolCall id + first-announcement flag for host cards.
+    fn host_item_role(&mut self, item_id: &str, kind: &str) -> (String, bool) {
+        let prefix = match kind {
+            "subagent" => "subagent-",
+            "workflow" => "workflow-",
+            "userShell" => "shell-",
+            _ => "item-",
+        };
+        match self.items.get(item_id) {
+            Some(ItemRole::Tool { tc_id, announced }) => (tc_id.clone(), *announced),
+            _ => {
+                let id = format!("{prefix}{item_id}");
+                self.items.insert(
+                    item_id.to_string(),
+                    ItemRole::Tool {
+                        tc_id: id.clone(),
+                        announced: false,
+                    },
+                );
+                (id, false)
+            }
         }
     }
 
@@ -339,7 +556,39 @@ impl SessionFold {
                     Self::compaction_content(item).as_deref(),
                 ));
             }
+            "subagent" | "workflow" | "userShell" => {
+                let (tc_id, announced) = self.host_item_role(&item_id, kind);
+                let (title, content, meta) = Self::host_card_parts(kind, item);
+                if !title.is_empty() {
+                    out.push(Self::card_line(
+                        acp_sid,
+                        ver,
+                        !announced,
+                        &tc_id,
+                        &title,
+                        "other",
+                        msp_status(status),
+                        content.as_deref(),
+                        meta.as_deref(),
+                    ));
+                }
+            }
             _ => {
+                let (title, content, meta) = Self::host_card_parts(kind, item);
+                if !title.is_empty() {
+                    let (tc_id, announced) = self.host_item_role(&item_id, "item-");
+                    out.push(Self::card_line(
+                        acp_sid,
+                        ver,
+                        !announced,
+                        &tc_id,
+                        &title,
+                        "other",
+                        msp_status(status),
+                        content.as_deref(),
+                        meta.as_deref(),
+                    ));
+                }
                 self.items.entry(item_id).or_insert(ItemRole::Ignored);
             }
         }
@@ -517,7 +766,40 @@ impl SessionFold {
                     Self::compaction_content(item).as_deref(),
                 ));
             }
+            "subagent" | "workflow" | "userShell" => {
+                let (tc_id, announced) = self.host_item_role(&item_id, kind);
+                let (title, content, meta) = Self::host_card_parts(kind, item);
+                if !title.is_empty() {
+                    out.push(Self::card_line(
+                        acp_sid,
+                        ver,
+                        !announced,
+                        &tc_id,
+                        &title,
+                        "other",
+                        msp_status(status),
+                        content.as_deref(),
+                        meta.as_deref(),
+                    ));
+                }
+                self.items.remove(&item_id);
+            }
             _ => {
+                let (title, content, meta) = Self::host_card_parts(kind, item);
+                if !title.is_empty() {
+                    let (tc_id, announced) = self.host_item_role(&item_id, "item-");
+                    out.push(Self::card_line(
+                        acp_sid,
+                        ver,
+                        !announced,
+                        &tc_id,
+                        &title,
+                        "other",
+                        msp_status(status),
+                        content.as_deref(),
+                        meta.as_deref(),
+                    ));
+                }
                 self.items.remove(&item_id);
             }
         }
