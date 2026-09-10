@@ -438,6 +438,12 @@ via `item/delta` field `summary.<n>`, committed raw reasoning rides `text`,
 and `truncated` marks server-side saturation. `codex-acp` maps its equivalent
 signal to ACP `agent_thought_chunk`; do the same rather than dropping it.
 
+Status: **reasoning implemented.** Summary parts stream as
+`agent_thought_chunk` with a section break on part transitions; a completion
+with no observed deltas emits the committed summary (or raw text) exactly
+once, and host-side truncation is logged rather than presented as complete.
+Remaining work: generic `fallbackText` rendering for unknown item kinds.
+
 **Work items**
 
 - Fold `reasoning` items and stream summary parts as `agent_thought_chunk`.

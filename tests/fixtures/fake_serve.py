@@ -235,6 +235,37 @@ def on_turn_start(params):
             "sessionId": MSP_SID, "viewCursor": "cur-t2",
             "revision": 2, "sourceTool": "todo_write", "items": []})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "reasoning_stream":
+        rid = "it-r1"
+        notify("item/started", {**base, "item": {
+            "itemId": rid, "kind": "reasoning", "status": "inProgress",
+            "revision": 1}})
+        notify("item/delta", {"sessionId": MSP_SID, "itemId": rid,
+                              "field": "summary.0", "delta": "Considering ",
+                              "viewCursor": "cur-r1"})
+        notify("item/delta", {"sessionId": MSP_SID, "itemId": rid,
+                              "field": "summary.0", "delta": "the schema",
+                              "viewCursor": "cur-r2"})
+        notify("item/delta", {"sessionId": MSP_SID, "itemId": rid,
+                              "field": "summary.1", "delta": "Then testing",
+                              "viewCursor": "cur-r3"})
+        notify("item/completed", {**base, "item": {
+            "itemId": rid, "kind": "reasoning", "status": "completed",
+            "revision": 2, "truncated": False,
+            "summary": ["Considering the schema", "Then testing"]}})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-m1", "kind": "agentMessage", "status": "completed",
+            "text": "done"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "reasoning_quiet":
+        # No deltas: the completed summary must still be emitted once.
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-r9", "kind": "reasoning", "status": "completed",
+            "revision": 1, "summary": ["Committed thought"]}})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-m9", "kind": "agentMessage", "status": "completed",
+            "text": "done"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "queued":
         if TURNS[0] == 2:
             notify("turn/completed", {"sessionId": MSP_SID,

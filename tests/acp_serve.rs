@@ -1930,3 +1930,56 @@ fn resume_restores_the_plan_from_the_snapshot() {
     );
     c.finish();
 }
+
+#[test]
+fn reasoning_summary_parts_stream_as_thought_chunks() {
+    let mut c = Client::spawn("reasoning_stream", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "think aloud");
+    let first = c.wait_for("agent_thought_chunk", Duration::from_secs(15));
+    assert!(
+        first.contains("Considering "),
+        "first part missing: {first}"
+    );
+    c.wait_for("the schema", Duration::from_secs(15));
+    let section = c.wait_for("Then testing", Duration::from_secs(15));
+    assert!(
+        section.contains("\\n\\nThen testing"),
+        "part boundary must be a section break: {section}"
+    );
+    // The completed frame must not duplicate what already streamed.
+    let frames = c.frames.lock().unwrap().join("\n");
+    assert_eq!(
+        frames.matches("Considering the schema").count(),
+        0,
+        "completion must not re-emit streamed text: {frames}"
+    );
+    assert!(
+        frames.contains("agent_message_chunk"),
+        "final answer missing: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn reasoning_completion_without_deltas_emits_the_summary_once() {
+    let mut c = Client::spawn("reasoning_quiet", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "quiet thought");
+    let thought = c.wait_for("agent_thought_chunk", Duration::from_secs(15));
+    assert!(
+        thought.contains("Committed thought"),
+        "summary missing: {thought}"
+    );
+    assert!(
+        !thought.contains("messageId"),
+        "v1 thought chunks carry no messageId: {thought}"
+    );
+    let frames = c.frames.lock().unwrap().join("\n");
+    assert_eq!(
+        frames.matches("Committed thought").count(),
+        1,
+        "summary must be emitted exactly once: {frames}"
+    );
+    c.finish();
+}

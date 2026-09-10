@@ -57,8 +57,19 @@ fn msp_status(s: &str) -> &'static str {
 }
 
 enum ItemRole {
-    Message { msg_id: String, streamed: usize },
-    Tool { tc_id: String, announced: bool },
+    Message {
+        msg_id: String,
+        streamed: usize,
+    },
+    Thought {
+        msg_id: String,
+        streamed: usize,
+        part: usize,
+    },
+    Tool {
+        tc_id: String,
+        announced: bool,
+    },
     Ignored,
 }
 
@@ -111,6 +122,23 @@ impl SessionFold {
         } else {
             format!(
                 "{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{}}}",
+                content
+            )
+        };
+        Self::update_line(acp_sid, &update)
+    }
+
+    fn thought_chunk(acp_sid: &str, ver: u8, msg_id: &str, text: &str) -> String {
+        let content = format!("{{\"type\":\"text\",\"text\":{}}}", esc(text));
+        let update = if ver == 2 {
+            format!(
+                "{{\"sessionUpdate\":\"agent_thought_chunk\",\"messageId\":{},\"content\":{}}}",
+                esc(msg_id),
+                content
+            )
+        } else {
+            format!(
+                "{{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{}}}",
                 content
             )
         };
@@ -228,6 +256,19 @@ impl SessionFold {
                     );
                 }
             }
+            "reasoning" => {
+                if !self.items.contains_key(&item_id) {
+                    let msg_id = mint_id("thought-", &self.idc);
+                    self.items.insert(
+                        item_id,
+                        ItemRole::Thought {
+                            msg_id,
+                            streamed: 0,
+                            part: 0,
+                        },
+                    );
+                }
+            }
             _ => {
                 self.items.entry(item_id).or_insert(ItemRole::Ignored);
             }
@@ -241,21 +282,42 @@ impl SessionFold {
             Some(s) => s,
             None => return,
         };
-        if params
+        let field = params
             .get("field")
             .and_then(|v| v.as_str())
             .unwrap_or("text")
-            != "text"
-        {
-            return;
-        }
+            .to_string();
         let delta = match params.get("delta").and_then(|v| v.as_str()) {
             Some(s) if !s.is_empty() => s,
             _ => return,
         };
-        if let Some(ItemRole::Message { msg_id, streamed }) = self.items.get_mut(item_id) {
-            *streamed += delta.len();
-            out.push(Self::chunk(acp_sid, ver, msg_id, delta));
+        if field == "text" {
+            if let Some(ItemRole::Message { msg_id, streamed }) = self.items.get_mut(item_id) {
+                *streamed += delta.len();
+                out.push(Self::chunk(acp_sid, ver, msg_id, delta));
+            }
+            return;
+        }
+        // Reasoning summaries stream part-wise as `summary.<n>`; a part-index
+        // advance is a section break, matching codex-acp's presentation.
+        if let Some(part) = field.strip_prefix("summary.")
+            && let Ok(part) = part.parse::<usize>()
+            && let Some(ItemRole::Thought {
+                msg_id,
+                streamed,
+                part: current,
+            }) = self.items.get_mut(item_id)
+        {
+            let mut text = String::new();
+            if part > *current {
+                text.push_str("\n\n");
+                *current = part;
+            } else if part < *current {
+                return; // stale replay of an earlier part
+            }
+            text.push_str(delta);
+            *streamed += text.len();
+            out.push(Self::thought_chunk(acp_sid, ver, msg_id, &text));
         }
     }
 
@@ -333,6 +395,45 @@ impl SessionFold {
                 if streamed == 0 && !text.is_empty() {
                     let msg_id = mint_id("msg-", &self.idc);
                     out.push(Self::chunk(acp_sid, ver, &msg_id, text));
+                }
+                self.items.remove(&item_id);
+            }
+            "reasoning" => {
+                // The committed summary (or raw text when no summary exists)
+                // is emitted exactly once when no delta was observed; deltas
+                // are authoritative-in-motion and already carried the text.
+                let summary = match item.get("summary") {
+                    Some(J::Arr(parts)) => parts
+                        .iter()
+                        .filter_map(|p| p.as_str())
+                        .filter(|p| !p.is_empty())
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                    _ => String::new(),
+                };
+                let text = if summary.is_empty() {
+                    item.get("text").and_then(|v| v.as_str()).unwrap_or("")
+                } else {
+                    &summary
+                };
+                if item
+                    .get("truncated")
+                    .is_some_and(|v| matches!(v, J::Bool(true)))
+                {
+                    // The host saturated this surface; the durable full text
+                    // stays in the log. Emit the visible prefix, never as a
+                    // claim of completeness.
+                    crate::msp::log(
+                        "reasoning item arrived truncated; showing the bounded surface",
+                    );
+                }
+                let streamed = match self.items.get(&item_id) {
+                    Some(ItemRole::Thought { streamed, .. }) => *streamed,
+                    _ => 0,
+                };
+                if streamed == 0 && !text.is_empty() {
+                    let msg_id = mint_id("thought-", &self.idc);
+                    out.push(Self::thought_chunk(acp_sid, ver, &msg_id, text));
                 }
                 self.items.remove(&item_id);
             }
