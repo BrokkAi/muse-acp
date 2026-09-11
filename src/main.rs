@@ -9,6 +9,7 @@ mod compat;
 mod fold;
 mod json;
 mod msp;
+mod sha256;
 mod zed;
 
 use std::collections::HashMap;
@@ -472,12 +473,21 @@ fn resolve_fork_cut_point(
         .get("messageId")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    if message_id.is_empty() {
-        // Fingerprint-only points are a deliberate, explicit gap.
-        return Err(
-            "fork points without messageId are not supported yet; fork from a message id"
-                .to_string(),
-        );
+    let fingerprint = fork_point
+        .get("messageFingerprint")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if message_id.is_empty() && fingerprint.is_empty() {
+        return Err("fork point needs a messageId or messageFingerprint".to_string());
+    }
+    let well_formed = fingerprint.starts_with("sha256:") && {
+        let hex = &fingerprint["sha256:".len()..];
+        hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
+    };
+    if !fingerprint.is_empty() && !well_formed {
+        return Err(format!(
+            "fork point fingerprint must be sha256:<64 hex chars>: {fingerprint}"
+        ));
     }
     let read = host
         .command(
@@ -493,18 +503,49 @@ fn resolve_fork_cut_point(
     let J::Arr(items) = items else {
         return Err("fork point history read returned no items".to_string());
     };
-    let turn = items
+    if !message_id.is_empty() {
+        let turn = items
+            .iter()
+            .find(|item| item.get("itemId").and_then(|v| v.as_str()) == Some(message_id))
+            .and_then(|item| item.get("turnId").cloned());
+        return match turn {
+            Some(J::Str(turn)) if !turn.is_empty() => Ok(Some(turn)),
+            // userShell items carry turnId: null; they cannot bound a turn.
+            Some(_) => Err(format!(
+                "fork point message {message_id} is not turn-scoped"
+            )),
+            None => Err(format!(
+                "fork point message {message_id} not found in session history"
+            )),
+        };
+    }
+
+    // Fingerprint mode (AIR): match agent-authored message text, then pick the
+    // 1-based occurrence among duplicates. Only agentMessage items count.
+    let occurrence = fork_point
+        .get("messageOccurrence")
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v >= 1)
+        .unwrap_or(1) as usize;
+    let matches: Vec<&str> = items
         .iter()
-        .find(|item| item.get("itemId").and_then(|v| v.as_str()) == Some(message_id))
-        .and_then(|item| item.get("turnId").cloned());
-    match turn {
-        Some(J::Str(turn)) if !turn.is_empty() => Ok(Some(turn)),
-        // userShell items carry turnId: null; they cannot bound a turn.
-        Some(_) => Err(format!(
-            "fork point message {message_id} is not turn-scoped"
-        )),
+        .filter(|item| item.get("kind").and_then(|v| v.as_str()) == Some("agentMessage"))
+        .filter(|item| {
+            item.get("text")
+                .and_then(|v| v.as_str())
+                .is_some_and(|text| sha256::air_fingerprint(text) == fingerprint)
+        })
+        .filter_map(|item| item.get("turnId").and_then(|v| v.as_str()))
+        .filter(|turn| !turn.is_empty())
+        .collect();
+    match matches.get(occurrence - 1) {
+        Some(turn) => Ok(Some(turn.to_string())),
+        None if matches.is_empty() => {
+            Err("fork point fingerprint matched no agent message in session history".to_string())
+        }
         None => Err(format!(
-            "fork point message {message_id} not found in session history"
+            "fork point occurrence {occurrence} exceeds the {} matching message(s)",
+            matches.len()
         )),
     }
 }

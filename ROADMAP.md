@@ -637,14 +637,16 @@ ACP defines `session/fork` (including AIR fork-point metadata) and
 `ForkCutPoint { lastTurnId }` cutting through a completed turn, plus durable
 `ForkProvenance` on the new session.
 
-Status: **implemented for message-id cut points.** Both protocol versions
-advertise the fork capability; an omitted cut point maps to "all completed
-turns", an AIR `messageId` point resolves through `session/read` to the
-owning turn, and unresolvable or fingerprint-only points fail closed with an
-explicit invalid-params error instead of silently copying extra history. The
-new session is registered immediately so the fork result envelope's view
-notifications are never orphaned. Remaining work: fingerprint-based cut
-points (needs a hash implementation), and history replay on request.
+Status: **implemented for message-id and fingerprint cut points.** Both
+protocol versions advertise the fork capability; an omitted cut point maps to
+"all completed turns", an AIR `messageId` point resolves through
+`session/read` to the owning turn, and a `messageFingerprint`
+(`sha256:<64 hex>` of agent-authored message text, dependency-free SHA-256)
+resolves with 1-based `messageOccurrence` among duplicate texts. Unresolvable
+or malformed points fail closed with explicit invalid-params errors instead
+of silently copying extra history, and the new session is registered
+immediately so the fork result envelope's view notifications are never
+orphaned. Remaining work: history replay on request.
 
 **Work items**
 

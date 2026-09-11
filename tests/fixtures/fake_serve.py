@@ -631,6 +631,8 @@ def result_for(method, msg):
         items = history_items() + [
             {"itemId": "msg-fork", "kind": "agentMessage",
              "text": "fork here", "turnId": "turn-1", "status": "completed"},
+            {"itemId": "msg-fork-dup", "kind": "agentMessage",
+             "text": "fork here", "turnId": "turn-2", "status": "completed"},
             {"itemId": "msg-fork-2", "kind": "agentMessage",
              "text": "later answer", "turnId": "turn-2", "status": "completed"},
             {"itemId": "shell-no-turn", "kind": "userShell",

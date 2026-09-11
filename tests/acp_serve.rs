@@ -2353,8 +2353,8 @@ fn session_fork_rejects_unresolvable_and_fingerprint_cut_points() {
     );
     let frame = c.wait_for(&format!("\"id\":{fp}"), Duration::from_secs(15));
     assert!(
-        frame.contains("without messageId are not supported"),
-        "fingerprint gap must be explicit: {frame}"
+        frame.contains("sha256:<64 hex chars>"),
+        "malformed fingerprint must be explicit: {frame}"
     );
 
     let seen = std::fs::read_to_string(&c.fake_log).expect("fake log");
@@ -2932,4 +2932,94 @@ fn emitted_frames_conform_to_the_vendored_schema() {
         );
     }
     assert!(validated >= 10, "too few frames validated: {validated}");
+}
+
+#[test]
+fn session_fork_resolves_fingerprint_occurrences() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let fp = "sha256:e2bab1be910abb02f77bcbfaf13466c19100b8f0db25b9a2b4f9c80164556eab";
+
+    let first = c.req(
+        "session/fork",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"{fp}\",\"messageOccurrence\":1}}}}}}}}}}"
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{first}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"result\""),
+        "occurrence 1 fork failed: {frame}"
+    );
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("input log");
+    let fork_line = input
+        .lines()
+        .rev()
+        .find(|l| l.contains("msp-sess-1"))
+        .expect("fork params");
+    assert!(
+        fork_line.contains("\"lastTurnId\": \"turn-1\""),
+        "occurrence 1 must cut at turn-1: {fork_line}"
+    );
+
+    let second = c.req(
+        "session/fork",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"{fp}\",\"messageOccurrence\":2}}}}}}}}}}"
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{second}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"result\""),
+        "occurrence 2 fork failed: {frame}"
+    );
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("input log");
+    let fork_line = input
+        .lines()
+        .rev()
+        .find(|l| l.contains("msp-sess-1"))
+        .expect("fork params");
+    assert!(
+        fork_line.contains("\"lastTurnId\": \"turn-2\""),
+        "occurrence 2 must cut at turn-2: {fork_line}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_fork_rejects_unmatched_and_malformed_fingerprints() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+
+    let unmatched = format!("sha256:{}", "0".repeat(64));
+    let rid = c.req(
+        "session/fork",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"{unmatched}\"}}}}}}}}}}"
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("matched no agent message"),
+        "unmatched fingerprint must fail closed: {frame}"
+    );
+
+    let bad = c.req(
+        "session/fork",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"not-a-digest\"}}}}}}}}}}"
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{bad}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("sha256:<64 hex chars>"),
+        "malformed fingerprint must be explicit: {frame}"
+    );
+
+    let seen = std::fs::read_to_string(&c.fake_log).expect("fake log");
+    assert!(
+        !seen.lines().any(|l| l == "session/fork"),
+        "invalid points must not reach the host: {seen}"
+    );
+    c.finish();
 }
