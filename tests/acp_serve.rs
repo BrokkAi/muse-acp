@@ -2452,3 +2452,84 @@ fn subagent_cards_stay_legacy_without_negotiation() {
     );
     c.finish();
 }
+
+#[test]
+fn async_task_updates_follow_negotiation() {
+    let mut c = Client::spawn("async_task", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    c.wait_stderr(
+        "client negotiated AIR async-task updates",
+        Duration::from_secs(10),
+    );
+    let _pid = c.prompt(&sid, "run in background");
+
+    // Backgrounded tool call: card marked, task spawned.
+    let bg = c.wait_for("\"backgrounded\":true", Duration::from_secs(15));
+    assert!(bg.contains("call-bg1"), "wrong tool marked: {bg}");
+    let tool_task = c.wait_for("async_task_spawned", Duration::from_secs(15));
+    assert!(
+        tool_task.contains("\"toolCallId\":\"call-bg1\""),
+        "tool task missing: {tool_task}"
+    );
+    assert!(
+        tool_task.contains("\"canStop\":false"),
+        "canStop must be honest without a host stop: {tool_task}"
+    );
+
+    // User shell: its own task, spawned once and settled from exit facts.
+    let shell_task = c.wait_for("shell-it-sh2", Duration::from_secs(15));
+    assert!(
+        shell_task.contains("cargo watch"),
+        "shell name missing: {shell_task}"
+    );
+    let state = c.wait_for("\"state\":\"completed\"", Duration::from_secs(15));
+    assert!(
+        state.contains("shell-it-sh2"),
+        "shell terminal state missing: {state}"
+    );
+
+    let frames = c.frames.lock().unwrap().join("\n");
+    assert_eq!(
+        frames.matches("async_task_spawned").count(),
+        2,
+        "exactly one spawn per task: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn async_task_updates_stay_off_without_negotiation() {
+    let mut c = Client::spawn("async_task", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "no air caps");
+    c.wait_for("shell-it-sh2", Duration::from_secs(15));
+    let frames = c.frames.lock().unwrap().join("\n");
+    assert!(
+        !frames.contains("async_task_spawned"),
+        "async tasks must not leak without negotiation: {frames}"
+    );
+    assert!(
+        !frames.contains("\"backgrounded\":true"),
+        "background meta must not leak without negotiation: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn async_task_stop_is_rejected_honestly() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let rid = c.req(
+        "_session/async_task/stop",
+        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"task-1\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("not supported by the Muse host"),
+        "stop must fail explicitly: {frame}"
+    );
+    c.finish();
+}

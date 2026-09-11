@@ -331,6 +331,23 @@ def on_turn_start(params):
             "children": [{"childId": "c1", "attempt": 1, "status": "completed",
                           "label": "triage issue #1"}]}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "async_task":
+        # A backgrounded toolCall plus a user-shell item: both are async work.
+        notify("item/updated", {**base, "item": {
+            "itemId": "it-bg1", "kind": "toolCall", "callId": "call-bg1",
+            "status": "inProgress", "revision": 2, "tool": "workspace-shell",
+            "args": {"command": "npm watch"}, "background": True,
+            "backgroundInitiator": "user"}})
+        notify("item/started", {"sessionId": MSP_SID, "item": {
+            "itemId": "it-sh2", "kind": "userShell", "status": "inProgress",
+            "revision": 1, "turnId": None, "commandText": "cargo watch"},
+            "viewCursor": "cur-sh2"})
+        notify("item/completed", {"sessionId": MSP_SID, "item": {
+            "itemId": "it-sh2", "kind": "userShell", "status": "completed",
+            "revision": 2, "turnId": None, "commandText": "cargo watch",
+            "exitSignal": 9, "visibleOutput": "watching"},
+            "viewCursor": "cur-sh3"})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "usershell_item":
         notify("item/completed", {"sessionId": MSP_SID, "item": {
             "itemId": "it-sh1", "kind": "userShell", "status": "completed",

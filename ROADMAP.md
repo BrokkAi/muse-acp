@@ -516,10 +516,14 @@ MSP v1 can represent this work: `session/userShell` (gated on the
 `visibleOutput`, and a null `turnId`; and a `toolCall` may be durably
 backgrounded (`background: true`, `backgroundInitiator: user|timeout`).
 
-Status: **user-shell visibility implemented.** `userShell` items render as
-execute-kind tool cards with verbatim command, output, and exit facts (code
-and signal stay distinct; numbers are never mapped to names). Remaining work:
-AIR async-task negotiation and stop, and the `userShell` host capability.
+Status: **AIR async tasks implemented (display-only).** After bilateral AIR
+negotiation, backgrounded tool calls mark their command card
+(`_meta.jetbrains.air.asyncTasks.backgrounded`) and emit
+`async_task_spawned`/`async_task_state_update`; user-shell items map to their
+own shell tasks with exit facts settled from code/signal. `canStop` is
+honestly false and `_session/async_task/stop` fails explicitly because MSP v1
+publishes no stop primitive. Remaining work: the `userShell` host capability
+request, active-task reconciliation, and stop once MSP exposes one.
 
 **Work items**
 

@@ -128,6 +128,10 @@ pub struct SessionFold {
     pub native_subagents: bool,
     /// Child session ids already announced to this client (idempotent spawn).
     pub spawned_subagents: std::collections::HashSet<String>,
+    /// Whether the client negotiated the AIR async-tasks extension.
+    pub air_async_tasks: bool,
+    /// Async task ids already announced (spawned updates are idempotent).
+    pub announced_tasks: std::collections::HashSet<String>,
 }
 
 impl SessionFold {
@@ -138,6 +142,8 @@ impl SessionFold {
             idc: AtomicU64::new(1),
             native_subagents: false,
             spawned_subagents: std::collections::HashSet::new(),
+            air_async_tasks: false,
+            announced_tasks: std::collections::HashSet::new(),
         }
     }
 
@@ -486,6 +492,62 @@ impl SessionFold {
         )
     }
 
+    /// AIR async-task extension. MSP v1 has no stop primitive for background
+    /// work, so `canStop` is honestly false; the task card still owns output.
+    fn async_task_spawned_line(
+        acp_sid: &str,
+        task_id: &str,
+        name: &str,
+        tool_call_id: Option<&str>,
+    ) -> String {
+        let mut update = format!(
+            "{{\"sessionUpdate\":\"async_task_spawned\",\"asyncTaskId\":{},\"name\":{},\"taskType\":\"shell\",\"showInTranscript\":false,\"canStop\":false",
+            esc(task_id),
+            esc(name)
+        );
+        if let Some(tc) = tool_call_id {
+            update.push_str(&format!(",\"toolCallId\":{}", esc(tc)));
+        }
+        update.push('}');
+        Self::update_line(acp_sid, &update)
+    }
+
+    fn async_task_state_line(acp_sid: &str, task_id: &str, state: &str) -> String {
+        Self::update_line(
+            acp_sid,
+            &format!(
+                "{{\"sessionUpdate\":\"async_task_state_update\",\"asyncTaskId\":{},\"state\":\"{state}\"}}",
+                esc(task_id)
+            ),
+        )
+    }
+
+    /// AIR marks the owning command card as backgrounded so its output stays
+    /// live without duplicating the transcript.
+    fn backgrounded_tool_line(acp_sid: &str, ver: u8, tc_id: &str) -> String {
+        let session_update = if ver == 2 {
+            "tool_call_update"
+        } else {
+            "tool_call"
+        };
+        Self::update_line(
+            acp_sid,
+            &format!(
+                "{{\"sessionUpdate\":\"{session_update}\",\"toolCallId\":{},\"_meta\":{{\"jetbrains\":{{\"air\":{{\"asyncTasks\":{{\"backgrounded\":true}}}}}}}}}}",
+                esc(tc_id)
+            ),
+        )
+    }
+
+    fn async_task_state(item: &J) -> Option<&'static str> {
+        match item.get("status").and_then(|v| v.as_str()).unwrap_or("") {
+            "completed" => Some("completed"),
+            "failed" | "rejected" => Some("failed"),
+            "cancelled" | "timedOut" => Some("stopped"),
+            _ => None,
+        }
+    }
+
     fn subagent_state(item: &J) -> Option<&'static str> {
         let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
         let control = item
@@ -630,6 +692,21 @@ impl SessionFold {
                         host_truncated: false,
                     },
                 ));
+                if item
+                    .get("background")
+                    .is_some_and(|v| matches!(v, J::Bool(true)))
+                    && self.air_async_tasks
+                    && !self.announced_tasks.contains(&tc_id)
+                {
+                    self.announced_tasks.insert(tc_id.clone());
+                    out.push(Self::backgrounded_tool_line(acp_sid, ver, &tc_id));
+                    out.push(Self::async_task_spawned_line(
+                        acp_sid,
+                        &tc_id,
+                        &title,
+                        Some(&tc_id),
+                    ));
+                }
                 if let Some(ItemRole::Tool { announced, .. }) = self.items.get_mut(&item_id) {
                     *announced = true;
                 }
@@ -724,6 +801,18 @@ impl SessionFold {
                         meta.as_deref(),
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
+                    ));
+                }
+                if kind == "userShell"
+                    && self.air_async_tasks
+                    && !self.announced_tasks.contains(&tc_id)
+                {
+                    self.announced_tasks.insert(tc_id.clone());
+                    out.push(Self::async_task_spawned_line(
+                        acp_sid,
+                        &tc_id,
+                        &title,
+                        Some(&tc_id),
                     ));
                 }
             }
@@ -860,6 +949,25 @@ impl SessionFold {
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     },
                 ));
+                if item
+                    .get("background")
+                    .is_some_and(|v| matches!(v, J::Bool(true)))
+                    && self.air_async_tasks
+                {
+                    if !self.announced_tasks.contains(&tc_id) {
+                        self.announced_tasks.insert(tc_id.clone());
+                        out.push(Self::backgrounded_tool_line(acp_sid, ver, &tc_id));
+                        out.push(Self::async_task_spawned_line(
+                            acp_sid,
+                            &tc_id,
+                            &title,
+                            Some(&tc_id),
+                        ));
+                    }
+                    if let Some(state) = Self::async_task_state(item) {
+                        out.push(Self::async_task_state_line(acp_sid, &tc_id, state));
+                    }
+                }
                 self.items.remove(&item_id);
             }
             "agentMessage" => {
@@ -970,6 +1078,20 @@ impl SessionFold {
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
+                }
+                if kind == "userShell" && self.air_async_tasks {
+                    if !self.announced_tasks.contains(&tc_id) {
+                        self.announced_tasks.insert(tc_id.clone());
+                        out.push(Self::async_task_spawned_line(
+                            acp_sid,
+                            &tc_id,
+                            &title,
+                            Some(&tc_id),
+                        ));
+                    }
+                    if let Some(state) = Self::async_task_state(item) {
+                        out.push(Self::async_task_state_line(acp_sid, &tc_id, state));
+                    }
                 }
                 self.items.remove(&item_id);
             }

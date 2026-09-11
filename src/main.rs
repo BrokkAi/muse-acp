@@ -29,6 +29,30 @@ static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static VER: AtomicU64 = AtomicU64::new(0); // negotiated ACP version for the connection
 static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the client advertises elicitation.form
 static NATIVE_SUBAGENTS: AtomicU64 = AtomicU64::new(0); // 1 when subagent sessions are negotiated
+static AIR_ASYNC_TASKS: AtomicU64 = AtomicU64::new(0); // 1 when the client wants async-task updates
+
+/// True when the client's `_meta.jetbrains.air.capabilities` advertises a key.
+fn client_supports_air(capabilities: Option<&J>, key: &str) -> bool {
+    let Some(air) = capabilities
+        .and_then(|c| c.get("_meta"))
+        .and_then(|m| m.get("jetbrains"))
+        .and_then(|j| j.get("air"))
+    else {
+        return false;
+    };
+    let version_ok = air
+        .get("version")
+        .and_then(|v| v.as_u64())
+        .is_some_and(|v| v >= 1);
+    let supported = air
+        .get("capabilities")
+        .map(|c| match c {
+            J::Arr(values) => values.iter().any(|v| v.as_str() == Some(key)),
+            _ => false,
+        })
+        .unwrap_or(false);
+    version_ok && supported
+}
 
 /// The draft ACP subagent RFD negotiates through `clientCapabilities.subagents`
 /// (canonical) or JetBrains AIR's `nativeSubagentSessions` capability key.
@@ -39,12 +63,7 @@ fn client_supports_subagents(capabilities: Option<&J>) -> bool {
     if matches!(caps.get("subagents"), Some(J::Obj(_))) {
         return true;
     }
-    caps.get("_meta")
-        .and_then(|m| m.get("jetbrains"))
-        .and_then(|j| j.get("air"))
-        .and_then(|a| a.get("capabilities"))
-        .and_then(|c| c.as_str())
-        .is_some_and(|v| v.contains("nativeSubagentSessions"))
+    client_supports_air(Some(caps), "nativeSubagentSessions")
 }
 /// Last successful model catalog, used only when a refresh fails.
 /// Rows are (modelId, displayLabel, isDefault).
@@ -358,14 +377,14 @@ enum LoopMsg {
 
 fn v2_init() -> String {
     format!(
-        r#"{{"protocolVersion":2,"capabilities":{{"session":{{"prompt":{{"image":{{}},"embeddedContext":{{}}}},"fork":{{}},"subagents":{{}}}}}},"info":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}},"authMethods":[],"_meta":{{"steering":{{"supported":true}},"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions"]}}}}}}}}"#,
+        r#"{{"protocolVersion":2,"capabilities":{{"session":{{"prompt":{{"image":{{}},"embeddedContext":{{}}}},"fork":{{}},"subagents":{{}}}}}},"info":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}},"authMethods":[],"_meta":{{"steering":{{"supported":true}},"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions","asyncTasks"]}}}}}}}}"#,
         ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
     )
 }
 
 fn v1_init() -> String {
     format!(
-        r#"{{"protocolVersion":1,"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}},"fork":{{}},"subagents":{{}}}},"_meta":{{"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions"]}}}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
+        r#"{{"protocolVersion":1,"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}},"fork":{{}},"subagents":{{}}}},"_meta":{{"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions","asyncTasks"]}}}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
         ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
     )
 }
@@ -722,6 +741,7 @@ fn main() {
 fn fresh_fold() -> SessionFold {
     let mut fold = SessionFold::new();
     fold.native_subagents = NATIVE_SUBAGENTS.load(Ordering::SeqCst) == 1;
+    fold.air_async_tasks = AIR_ASYNC_TASKS.load(Ordering::SeqCst) == 1;
     fold
 }
 
@@ -819,6 +839,18 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 })
             }));
             NATIVE_SUBAGENTS.store(u64::from(subagents), Ordering::SeqCst);
+            let air_caps = params.as_ref().and_then(|p| {
+                p.get(if v == 1 {
+                    "clientCapabilities"
+                } else {
+                    "capabilities"
+                })
+            });
+            let async_tasks = client_supports_air(air_caps, "asyncTasks");
+            AIR_ASYNC_TASKS.store(u64::from(async_tasks), Ordering::SeqCst);
+            if async_tasks {
+                log("client negotiated AIR async-task updates");
+            }
             if subagents {
                 log("client negotiated native subagent sessions");
             }
@@ -1629,6 +1661,18 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     }
                 }
             }
+        }
+        "_session/async_task/stop" => {
+            // Honest gap: MSP v1 publishes no stop primitive for background
+            // work, and canStop is advertised false. Pretending to stop would
+            // leave a running task the editor believes is dead.
+            log("async-task stop requested; MSP v1 exposes no stop primitive");
+            acp::send_error(
+                stdout,
+                &id,
+                -32601,
+                "background task stop is not supported by the Muse host",
+            );
         }
         "_session/steering" => {
             if negotiated_ver() != 2 {
