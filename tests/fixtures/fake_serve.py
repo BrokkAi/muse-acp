@@ -286,6 +286,21 @@ def on_turn_start(params):
             "itemId": "it-m1", "kind": "agentMessage", "status": "completed",
             "text": "done"}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "subagent_native":
+        sid_item = "it-subn"
+        notify("item/started", {**base, "item": {
+            "itemId": sid_item, "kind": "subagent", "status": "inProgress",
+            "revision": 1, "subagentId": "sub-n1", "agentPath": "researcher",
+            "depth": 1, "objective": "survey failing tests",
+            "childSessionId": "child-sess-native", "controlStatus": "running"}})
+        notify("item/completed", {**base, "item": {
+            "itemId": sid_item, "kind": "subagent", "status": "completed",
+            "revision": 2, "subagentId": "sub-n1", "agentPath": "researcher",
+            "depth": 1, "objective": "survey failing tests",
+            "childSessionId": "child-sess-native", "controlStatus": "closed",
+            "result": {"summary": "native child finished",
+                       "evidenceRefs": [], "artifactRefs": []}}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "subagent":
         sid_item = "it-sub1"
         notify("item/started", {**base, "item": {
@@ -578,6 +593,18 @@ def result_for(method, msg):
     if method == "session/read":
         read_params = msg.get("params", {})
         log_input(read_params)
+        if read_params.get("sessionId") == "child-sess-native":
+            return {"session": session_obj("child-sess-native"),
+                    "history": {"mode": "inline", "items": [
+                        {"itemId": "c-msg-1", "kind": "agentMessage",
+                         "status": "completed",
+                         "text": "child did the research"},
+                        {"itemId": "c-tool-1", "kind": "toolCall",
+                         "callId": "c-call-1", "status": "completed",
+                         "tool": "read", "args": {"path": "/tmp/c"},
+                         "result": "child bytes"},
+                    ], "snapshot": None},
+                    "viewCursor": "cur-child", "pendingRequests": []}
         # Items carry turnId so fork points can resolve to a completed turn.
         items = history_items() + [
             {"itemId": "msg-fork", "kind": "agentMessage",

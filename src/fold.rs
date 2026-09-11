@@ -122,6 +122,12 @@ pub struct SessionFold {
     /// Completed item ids (gap-refill replays must not re-announce).
     done: std::collections::HashSet<String>,
     idc: AtomicU64,
+    /// Whether the client negotiated the draft ACP subagent extension. When
+    /// set, `subagent` items map to spawned/state updates on the parent and a
+    /// per-child fold; otherwise they render as legacy tool cards.
+    pub native_subagents: bool,
+    /// Child session ids already announced to this client (idempotent spawn).
+    pub spawned_subagents: std::collections::HashSet<String>,
 }
 
 impl SessionFold {
@@ -130,6 +136,8 @@ impl SessionFold {
             items: HashMap::new(),
             done: std::collections::HashSet::new(),
             idc: AtomicU64::new(1),
+            native_subagents: false,
+            spawned_subagents: std::collections::HashSet::new(),
         }
     }
 
@@ -444,6 +452,60 @@ impl SessionFold {
         }
     }
 
+    /// Draft ACP subagent extension: announce a child session on the parent.
+    fn subagent_spawned_line(
+        acp_sid: &str,
+        subagent_session_id: &str,
+        name: &str,
+        task: &str,
+        muse_fields: Option<&str>,
+    ) -> String {
+        let mut update = format!(
+            "{{\"sessionUpdate\":\"subagent_spawned\",\"subagentSessionId\":{},\"name\":{},\"task\":{},\"capabilities\":{{}}",
+            esc(subagent_session_id),
+            esc(name),
+            esc(task)
+        );
+        if let Some(fields) = muse_fields {
+            update.push_str(&format!(",\"_meta\":{{\"muse\":{{{fields}}}}}"));
+        }
+        update.push('}');
+        Self::update_line(acp_sid, &update)
+    }
+
+    /// Draft ACP subagent extension: terminal state on the parent. MSP's
+    /// generic item status is the terminal authority; recovery-pending
+    /// control states map to `disconnected` rather than a guess.
+    fn subagent_state_line(acp_sid: &str, subagent_session_id: &str, state: &str) -> String {
+        Self::update_line(
+            acp_sid,
+            &format!(
+                "{{\"sessionUpdate\":\"subagent_state_update\",\"subagentSessionId\":{},\"state\":\"{state}\"}}",
+                esc(subagent_session_id)
+            ),
+        )
+    }
+
+    fn subagent_state(item: &J) -> Option<&'static str> {
+        let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let control = item
+            .get("controlStatus")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let state = match status {
+            // The generic item status is the terminal authority; a completed
+            // item is a settled child outcome even if control lagged behind.
+            "completed" => "completed",
+            "failed" | "rejected" => "failed",
+            "cancelled" | "timedOut" => "cancelled",
+            _ => match control {
+                "recoveryPending" | "manualReconciliation" => "disconnected",
+                _ => return None, // still running: no state update
+            },
+        };
+        Some(state)
+    }
+
     /// Stable synthetic toolCall id + first-announcement flag for host cards.
     fn host_item_role(&mut self, item_id: &str, kind: &str) -> (String, bool) {
         let prefix = match kind {
@@ -606,6 +668,45 @@ impl SessionFold {
                     status,
                     Self::compaction_content(item).as_deref(),
                 ));
+            }
+            "subagent" if self.native_subagents => {
+                if let Some(child) = item.get("childSessionId").and_then(|v| v.as_str())
+                    && !child.is_empty()
+                    && !self.spawned_subagents.contains(child)
+                {
+                    self.spawned_subagents.insert(child.to_string());
+                    let name = item
+                        .get("agentPath")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("subagent");
+                    let task = item
+                        .get("objective")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("Delegated task");
+                    let fields = [
+                        ("subagentId", item.get("subagentId")),
+                        ("depth", item.get("depth")),
+                        ("controlStatus", item.get("controlStatus")),
+                    ];
+                    let parts: Vec<String> = fields
+                        .into_iter()
+                        .filter(|(_, v)| matches!(v, Some(J::Num(_)) | Some(J::Str(_))))
+                        .map(|(k, v)| format!("\"{k}\":{}", j_to_string(v.unwrap())))
+                        .collect();
+                    let fields = (!parts.is_empty()).then(|| parts.join(","));
+                    out.push(Self::subagent_spawned_line(
+                        acp_sid,
+                        child,
+                        name,
+                        task,
+                        fields.as_deref(),
+                    ));
+                    if let Some(state) = Self::subagent_state(item) {
+                        out.push(Self::subagent_state_line(acp_sid, child, state));
+                    }
+                }
             }
             "subagent" | "workflow" | "userShell" => {
                 let (tc_id, announced) = self.host_item_role(&item_id, kind);
@@ -823,6 +924,34 @@ impl SessionFold {
                     status,
                     Self::compaction_content(item).as_deref(),
                 ));
+            }
+            "subagent" if self.native_subagents => {
+                if let Some(child) = item.get("childSessionId").and_then(|v| v.as_str())
+                    && !child.is_empty()
+                {
+                    if !self.spawned_subagents.contains(child) {
+                        // A completion can be the first durable-sourced frame a
+                        // reconnecting client sees; spawn before settling.
+                        self.spawned_subagents.insert(child.to_string());
+                        let name = item
+                            .get("agentPath")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("subagent");
+                        let task = item
+                            .get("objective")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("Delegated task");
+                        out.push(Self::subagent_spawned_line(
+                            acp_sid, child, name, task, None,
+                        ));
+                    }
+                    if let Some(state) = Self::subagent_state(item) {
+                        out.push(Self::subagent_state_line(acp_sid, child, state));
+                    }
+                }
+                self.items.remove(&item_id);
             }
             "subagent" | "workflow" | "userShell" => {
                 let (tc_id, announced) = self.host_item_role(&item_id, kind);

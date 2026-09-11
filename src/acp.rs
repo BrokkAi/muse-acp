@@ -85,6 +85,9 @@ pub struct AcpSession {
     pub goal_meta: Option<String>,
     /// Latest branch observation as raw MSP JSON (`None` before any fact).
     pub branch_meta: Option<String>,
+    /// Per-child folds for negotiated native subagent sessions, keyed by the
+    /// MSP child session id. Holds replayed child history dedup state.
+    pub child_folds: HashMap<String, SessionFold>,
 }
 
 pub type Sessions = Arc<Mutex<HashMap<String, AcpSession>>>;

@@ -2367,3 +2367,88 @@ fn host_truncation_is_reported_as_host_sourced() {
     );
     c.finish();
 }
+
+#[test]
+fn native_subagent_sessions_spawn_state_and_replay_the_child() {
+    let mut c = Client::spawn("subagent_native", &[("FAKE_CAPS", "subagents")]);
+    let sid = c
+        .new_session(2, ",\"capabilities\":{\"subagents\":{}}")
+        .to_string();
+    c.wait_stderr(
+        "client negotiated native subagent sessions",
+        Duration::from_secs(10),
+    );
+    let _pid = c.prompt(&sid, "delegate natively");
+
+    // Spawn announcement on the parent, exactly once, with provenance.
+    let spawned = c.wait_for("subagent_spawned", Duration::from_secs(15));
+    assert!(
+        spawned.contains("\"subagentSessionId\":\"child-sess-native\""),
+        "child session id missing: {spawned}"
+    );
+    assert!(
+        spawned.contains("\"name\":\"researcher\""),
+        "name missing: {spawned}"
+    );
+    assert!(
+        spawned.contains("\"task\":\"survey failing tests\""),
+        "objective task missing: {spawned}"
+    );
+    assert!(
+        spawned.contains("\"subagentId\":\"sub-n1\""),
+        "muse provenance missing: {spawned}"
+    );
+
+    // Child transcript replay targets the child session id.
+    let child_msg = c.wait_for(
+        "\"sessionId\":\"child-sess-native\"",
+        Duration::from_secs(15),
+    );
+    assert!(
+        child_msg.contains("child did the research"),
+        "child message missing: {child_msg}"
+    );
+    let child_tool = c.wait_for("c-call-1", Duration::from_secs(15));
+    assert!(
+        child_tool.contains("child bytes"),
+        "child tool output missing: {child_tool}"
+    );
+
+    // Terminal state lands on the parent.
+    let state = c.wait_for("subagent_state_update", Duration::from_secs(15));
+    assert!(
+        state.contains("\"state\":\"completed\""),
+        "state missing: {state}"
+    );
+
+    // Native mode must not double-render the legacy tool card.
+    let frames = c.frames.lock().unwrap().join("\n");
+    assert!(
+        !frames.contains("subagent-it-subn"),
+        "legacy card must not appear when native is negotiated: {frames}"
+    );
+    assert_eq!(
+        frames.matches("subagent_spawned").count(),
+        1,
+        "spawn must be idempotent across started+completed: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn subagent_cards_stay_legacy_without_negotiation() {
+    let mut c = Client::spawn("subagent", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "delegate legacy");
+    let card = c.wait_for("subagent-it-sub1", Duration::from_secs(15));
+    assert!(
+        card.contains("researcher: survey failing tests"),
+        "card missing: {card}"
+    );
+    let frames = c.frames.lock().unwrap().join("\n");
+    assert!(
+        !frames.contains("subagent_spawned"),
+        "native updates must not leak without negotiation: {frames}"
+    );
+    c.finish();
+}

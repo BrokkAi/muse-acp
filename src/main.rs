@@ -28,6 +28,24 @@ use msp::{MspEvent, MspHost, err_code, err_message, log};
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static VER: AtomicU64 = AtomicU64::new(0); // negotiated ACP version for the connection
 static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the client advertises elicitation.form
+static NATIVE_SUBAGENTS: AtomicU64 = AtomicU64::new(0); // 1 when subagent sessions are negotiated
+
+/// The draft ACP subagent RFD negotiates through `clientCapabilities.subagents`
+/// (canonical) or JetBrains AIR's `nativeSubagentSessions` capability key.
+fn client_supports_subagents(capabilities: Option<&J>) -> bool {
+    let Some(caps) = capabilities else {
+        return false;
+    };
+    if matches!(caps.get("subagents"), Some(J::Obj(_))) {
+        return true;
+    }
+    caps.get("_meta")
+        .and_then(|m| m.get("jetbrains"))
+        .and_then(|j| j.get("air"))
+        .and_then(|a| a.get("capabilities"))
+        .and_then(|c| c.as_str())
+        .is_some_and(|v| v.contains("nativeSubagentSessions"))
+}
 /// Last successful model catalog, used only when a refresh fails.
 /// Rows are (modelId, displayLabel, isDefault).
 static CATALOG: std::sync::OnceLock<Mutex<Vec<(String, String, bool)>>> =
@@ -340,14 +358,14 @@ enum LoopMsg {
 
 fn v2_init() -> String {
     format!(
-        r#"{{"protocolVersion":2,"capabilities":{{"session":{{"prompt":{{"image":{{}},"embeddedContext":{{}}}},"fork":{{}}}}}},"info":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}},"authMethods":[],"_meta":{{"steering":{{"supported":true}}}}}}"#,
+        r#"{{"protocolVersion":2,"capabilities":{{"session":{{"prompt":{{"image":{{}},"embeddedContext":{{}}}},"fork":{{}},"subagents":{{}}}}}},"info":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}},"authMethods":[],"_meta":{{"steering":{{"supported":true}},"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions"]}}}}}}}}"#,
         ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
     )
 }
 
 fn v1_init() -> String {
     format!(
-        r#"{{"protocolVersion":1,"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}},"fork":{{}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
+        r#"{{"protocolVersion":1,"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}},"fork":{{}},"subagents":{{}}}},"_meta":{{"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions"]}}}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
         ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
     )
 }
@@ -700,6 +718,13 @@ fn main() {
     }
 }
 
+/// A fresh fold configured with the connection's subagent negotiation.
+fn fresh_fold() -> SessionFold {
+    let mut fold = SessionFold::new();
+    fold.native_subagents = NATIVE_SUBAGENTS.load(Ordering::SeqCst) == 1;
+    fold
+}
+
 fn negotiated_ver() -> u8 {
     match VER.load(Ordering::SeqCst) {
         2 => 2,
@@ -786,6 +811,17 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .and_then(|e| e.get("form"))
                 .is_some_and(|f| matches!(f, J::Obj(_)));
             ELICIT_FORM.store(u64::from(form), Ordering::SeqCst);
+            let subagents = client_supports_subagents(params.as_ref().and_then(|p| {
+                p.get(if v == 1 {
+                    "clientCapabilities"
+                } else {
+                    "capabilities"
+                })
+            }));
+            NATIVE_SUBAGENTS.store(u64::from(subagents), Ordering::SeqCst);
+            if subagents {
+                log("client negotiated native subagent sessions");
+            }
             if v == 2 {
                 acp::send_result(stdout, &id, &v2_init());
             } else {
@@ -917,7 +953,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             reasoning_effort: "medium".to_string(),
                             active_turn,
                             view_cursor: cur_cursor.clone(),
-                            fold: SessionFold::new(),
+                            fold: fresh_fold(),
                             usage_used: None,
                             usage_size: None,
                             cum_prompt: None,
@@ -927,6 +963,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             usage_seen: std::collections::HashSet::new(),
                             goal_meta: None,
                             branch_meta: None,
+                            child_folds: HashMap::new(),
                         },
                     );
                     // _meta exposes the host session id: pass it back to
@@ -1107,7 +1144,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             reasoning_effort: "medium".to_string(),
                             active_turn: None,
                             view_cursor: String::new(),
-                            fold: SessionFold::new(),
+                            fold: fresh_fold(),
                             usage_used: None,
                             usage_size: None,
                             cum_prompt: None,
@@ -1117,6 +1154,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             usage_seen: std::collections::HashSet::new(),
                             goal_meta: None,
                             branch_meta: None,
+                            child_folds: HashMap::new(),
                         });
                         entry.msp_sid = real_msp;
                         entry.ver = ver;
@@ -1369,7 +1407,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             reasoning_effort: "medium".to_string(),
                             active_turn: None,
                             view_cursor: String::new(),
-                            fold: SessionFold::new(),
+                            fold: fresh_fold(),
                             usage_used: None,
                             usage_size: None,
                             cum_prompt: None,
@@ -1379,6 +1417,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             usage_seen: std::collections::HashSet::new(),
                             goal_meta: None,
                             branch_meta: None,
+                            child_folds: HashMap::new(),
                         });
                         entry.msp_sid = new_msp.clone();
                         entry.ver = ver;
@@ -2532,6 +2571,76 @@ fn find_acp_sid(sessions: &Sessions, msp_sid: &str) -> Option<String> {
         .map(|(k, _)| k.clone())
 }
 
+/// Pull a negotiated child session's transcript once and replay it onto the
+/// child ACP session id. MSP's subagent items name the child session; the
+/// drill-down is a point-in-time `session/read`, exactly what tdd SS4.5.7
+/// prescribes ("child transcript drill-down without a second protocol").
+fn drill_down_subagent_child(
+    host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    item: &J,
+) {
+    if NATIVE_SUBAGENTS.load(Ordering::SeqCst) == 0
+        || item.get("kind").and_then(|v| v.as_str()) != Some("subagent")
+    {
+        return;
+    }
+    let Some(child) = item
+        .get("childSessionId")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        return;
+    };
+    let (ver, needs_read) = {
+        let mut map = sessions.lock().unwrap();
+        let Some(s) = map.get_mut(acp_sid) else {
+            return;
+        };
+        let needs = !s.child_folds.contains_key(child);
+        if needs {
+            s.child_folds.insert(child.to_string(), fresh_fold());
+        }
+        (s.ver, needs)
+    };
+    if !needs_read {
+        return;
+    }
+    let read = host.command(
+        "session/read",
+        &format!("{{\"sessionId\":{},\"excludeItems\":false}}", esc(child)),
+    );
+    match read {
+        Ok(r) => {
+            let mut out = Vec::new();
+            {
+                let mut map = sessions.lock().unwrap();
+                if let Some(s) = map.get_mut(acp_sid)
+                    && let Some(fold) = s.child_folds.get_mut(child)
+                    && let Some(J::Arr(items)) = r.get("history").and_then(|h| h.get("items"))
+                {
+                    for it in items.clone() {
+                        let wrap = J::Obj(vec![("item".to_string(), it)]);
+                        fold.on_item_completed(child, ver, &wrap, &mut out);
+                    }
+                }
+            }
+            for line in out {
+                acp::send_raw(stdout, &line);
+            }
+            log(&format!("subagent child {child} transcript replayed"));
+        }
+        Err(e) => {
+            log(&format!(
+                "subagent child {child} transcript read failed: {}",
+                err_message(&e)
+            ));
+        }
+    }
+}
+
 fn handle_msp(
     host: &Arc<MspHost>,
     stdout: &StdoutShared,
@@ -2623,6 +2732,7 @@ fn handle_msp(
                 for line in out {
                     acp::send_raw(stdout, &line);
                 }
+                drill_down_subagent_child(host, stdout, sessions, &acp_sid, &item);
             }
         }
         "item/delta" => {
@@ -2645,6 +2755,7 @@ fn handle_msp(
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let item = params.get("item").cloned().unwrap_or(J::Null);
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
                 let mut out = Vec::new();
                 if let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid) {
@@ -2653,6 +2764,7 @@ fn handle_msp(
                 for line in out {
                     acp::send_raw(stdout, &line);
                 }
+                drill_down_subagent_child(host, stdout, sessions, &acp_sid, &item);
             }
         }
         "turn/completed" => {
