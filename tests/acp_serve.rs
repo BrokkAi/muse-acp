@@ -987,6 +987,77 @@ fn turn_unqueued_settles_prompt_cancelled() {
 }
 
 #[test]
+fn turn_retracted_settles_prompt_cancelled() {
+    let mut c = Client::spawn("retracted", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"cancelled\""),
+        "retracted turn settles: {done}"
+    );
+    c.finish();
+}
+
+#[test]
+fn turn_retracted_settles_v2_idle_cancelled() {
+    let mut c = Client::spawn("retracted", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "hi");
+    let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+    assert!(idle.contains(&sid), "idle for our session: {idle}");
+    assert!(
+        idle.contains("cancelled"),
+        "retract reports cancelled: {idle}"
+    );
+    c.finish();
+}
+
+#[test]
+fn turn_retracted_then_completed_settles_once() {
+    let mut c = Client::spawn("retract_then_completed", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"cancelled\""),
+        "retract settles first: {done}"
+    );
+    // The late terminal must find no tracked prompt left to settle.
+    c.wait_stderr("turn/completed for untracked turn", Duration::from_secs(15));
+    let (count, log) = {
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+        let needle = format!("\"id\":{pid}");
+        let count = frames.iter().filter(|f| f.contains(&needle)).count();
+        (count, frames.join("\n"))
+    };
+    assert_eq!(count, 1, "exactly one settle for the prompt: {log}");
+    c.finish();
+}
+
+#[test]
+fn turn_retry_then_completed_settles_once_as_end_turn() {
+    // Retry is non-terminal: it must not settle, and the later completion
+    // settles exactly once with the real outcome, not cancelled.
+    let mut c = Client::spawn("retry_then_completed", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"end_turn\""),
+        "completion settles after retry: {done}"
+    );
+    let (count, log) = {
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+        let needle = format!("\"id\":{pid}");
+        let count = frames.iter().filter(|f| f.contains(&needle)).count();
+        (count, frames.join("\n"))
+    };
+    assert_eq!(count, 1, "exactly one settle for the prompt: {log}");
+    c.finish();
+}
+
+#[test]
 fn queued_turns_share_running_until_drained() {
     let mut c = Client::spawn("queued", &[]);
     let sid = c.new_session(2, "");

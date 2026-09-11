@@ -16,6 +16,9 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   questions_resume reissue a pending question after both attach and usage backfill
   queued       1st turn/start: silence; 2nd: completed(TURN_1), completed(TURN_2)
   unqueued     turn/unqueued for the turn (never runs)
+  retracted    turn/retracted for the turn (no completion follows)
+  retract_then_completed retract, then a late turn/completed (settle once)
+  retry_then_completed turn/retryScheduled, then a normal completion
   quiet        turn/start answers only; nothing follows (for close/cancel)
   load         session/resume serves inline history (for session/load replay)
   resume_active session/resume reports a running turn (for steering reattach)
@@ -412,6 +415,23 @@ def on_turn_start(params):
                                      "terminal": "completed"})
     elif SCENARIO == "unqueued":
         notify("turn/unqueued", dict(base))
+    elif SCENARIO == "retracted":
+        # The submission is durably retracted: no turn/completed follows.
+        notify("turn/retracted", {**base, "commandId": params.get("commandId", "")})
+    elif SCENARIO == "retract_then_completed":
+        # A terminal still arrives after the retract: settle exactly once.
+        notify("turn/retracted", {**base, "commandId": params.get("commandId", "")})
+        notify("turn/completed", {**base, "terminal": "cancelled"})
+    elif SCENARIO == "retry_then_completed":
+        # Retry is non-terminal: the later completion settles, exactly once.
+        notify("turn/retryScheduled", {**base,
+                                      "attempt": 1, "nextAttempt": 2,
+                                      "maxAttempts": 3, "retryDelayMs": 2000,
+                                      "reason": "provider stream disconnected"})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-rt", "kind": "agentMessage",
+            "status": "completed", "text": "recovered"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "usage":
         # A tokenUsage before any contextUsage has no used/size pair and
         # must be held back, not emitted with nulls.
