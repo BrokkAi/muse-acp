@@ -3121,6 +3121,7 @@ fn client_disconnect_exits_promptly_with_a_turn_in_flight() {
 fn support_bundle_redacts_unknown_muse_env_values() {
     let out = std::process::Command::new(adapter_bin())
         .arg("--support")
+        .env("MUSE_CLI", "/bin/echo")
         .env("MUSE_SECRET_TOKEN", "super-secret-value")
         .env("MUSE_TOOL_OUTPUT_LIMIT", "1234")
         .output()
