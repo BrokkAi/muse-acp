@@ -229,6 +229,13 @@ These items improve day-to-day reliability for existing users.
 Current setup assumes `muse` is installed and authenticated. Make failures
 obvious before the first prompt.
 
+Status: **host-readiness implemented.** Spawn failures distinguish a missing
+CLI (install/PATH/`MUSE_CLI` guidance) from a non-executable one, and
+`--selftest` reports `cli-ready`/`cli-unready` with the binary and version
+without gating the exit status, so support bundles can be collected from
+machines without Muse. Remaining work: an auth probe if MSP ever exposes one,
+and browserless-login guidance.
+
 **Work items**
 
 - Distinguish missing executable, unauthenticated host, expired session,

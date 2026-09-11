@@ -2565,3 +2565,56 @@ fn recommended_value_is_omitted_without_negotiation() {
     );
     c.finish();
 }
+
+#[test]
+fn missing_cli_failure_names_the_next_action() {
+    let mut c = Client::spawn("happy", &[("MUSE_CLI", "/nonexistent-muse")]);
+    let status = c
+        .child
+        .wait_timeout(Duration::from_secs(10))
+        .expect("wait")
+        .expect("adapter exited");
+    assert!(!status.success(), "missing CLI must fail: {status}");
+    let log = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
+    assert!(
+        log.contains("Muse CLI not found: '/nonexistent-muse'"),
+        "unactionable spawn error: {log}"
+    );
+    assert!(
+        log.contains("action") || log.contains("MUSE_CLI="),
+        "missing guidance: {log}"
+    );
+}
+
+#[test]
+fn selftest_reports_cli_readiness_without_gating() {
+    let ok = std::process::Command::new(adapter_bin())
+        .arg("--selftest")
+        .env("MUSE_CLI", "/bin/echo")
+        .output()
+        .expect("selftest");
+    let text = String::from_utf8_lossy(&ok.stdout);
+    assert!(
+        ok.status.success(),
+        "selftest must stay a diagnostic: {ok:?}"
+    );
+    assert!(
+        text.contains("cli-ready binary=/bin/echo"),
+        "ready probe missing: {text}"
+    );
+
+    let missing = std::process::Command::new(adapter_bin())
+        .arg("--selftest")
+        .env("MUSE_CLI", "/nonexistent-muse")
+        .output()
+        .expect("selftest");
+    let text = String::from_utf8_lossy(&missing.stdout);
+    assert!(
+        missing.status.success(),
+        "a support bundle must be collectable without Muse: {missing:?}"
+    );
+    assert!(
+        text.contains("cli-unready binary=/nonexistent-muse"),
+        "unready probe missing: {text}"
+    );
+}

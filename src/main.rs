@@ -505,7 +505,44 @@ fn selftest() -> i32 {
     for line in compat::selftest_lines(env!("CARGO_PKG_VERSION")) {
         println!("[muse-acp] {line}");
     }
+    for line in cli_readiness_lines() {
+        println!("[muse-acp] {line}");
+    }
     0
+}
+
+/// Probe the configured Muse CLI so support output distinguishes "binary
+/// missing" from "binary present" before any session is attempted. This is
+/// diagnostic only: it must never gate selftest's exit status, because a
+/// support bundle may legitimately come from a machine without Muse.
+fn cli_readiness_lines() -> Vec<String> {
+    let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
+    let output = std::process::Command::new(&bin)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output();
+    let line = match output {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(if out.stdout.is_empty() {
+                &out.stderr
+            } else {
+                &out.stdout
+            })
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string();
+            format!(
+                "cli-ready binary={bin} version={}",
+                if text.is_empty() { "unreported" } else { &text }
+            )
+        }
+        Err(e) => format!("cli-unready binary={bin} action=install-muse-or-set-MUSE_CLI error={e}"),
+    };
+    vec![line]
 }
 
 /// Restart a dead durable host and re-attach every known session.

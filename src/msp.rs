@@ -102,6 +102,21 @@ pub fn command_timeout(env_override: Option<&str>, method: &str) -> std::time::D
     std::time::Duration::from_millis(method_timeout_ms(method))
 }
 
+/// Turn a host spawn failure into the next user action. MSP exposes no
+/// auth/health probe, so the readiness diagnosis starts at "can we even run
+/// the CLI"; session errors carry host text from there.
+pub fn describe_spawn_error(bin: &str, e: &std::io::Error) -> String {
+    match e.kind() {
+        std::io::ErrorKind::NotFound => format!(
+            "Muse CLI not found: '{bin}'. Install Muse Code              (https://dev.meta.ai/docs/muse-code), ensure it is on PATH, or set              MUSE_CLI=/absolute/path/to/muse"
+        ),
+        std::io::ErrorKind::PermissionDenied => format!(
+            "Muse CLI is not executable: '{bin}'. Fix permissions or set              MUSE_CLI=/absolute/path/to/muse"
+        ),
+        _ => format!("failed to spawn '{bin} serve': {e}"),
+    }
+}
+
 pub struct MspHost {
     writer: Arc<Mutex<std::process::ChildStdin>>,
     next_id: AtomicU64,
@@ -148,7 +163,7 @@ impl MspHost {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|e| format!("failed to spawn '{bin} serve': {e}"))?;
+            .map_err(|e| describe_spawn_error(&bin, &e))?;
         let stdout = child.stdout.take().ok_or("serve: no stdout")?;
         let stdin = child.stdin.take().ok_or("serve: no stdin")?;
         let host = Arc::new(MspHost {
@@ -525,5 +540,23 @@ mod durability_tests {
         // Unknown values carry no recovery guarantee: fail closed.
         assert!(!info(Some("ephemeral")).restartable());
         assert!(!info(Some("future-profile")).restartable());
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::describe_spawn_error;
+
+    #[test]
+    fn spawn_errors_name_the_next_user_action() {
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        let msg = describe_spawn_error("/opt/muse", &not_found);
+        assert!(msg.contains("Muse CLI not found"), "{msg}");
+        assert!(msg.contains("'/opt/muse'"), "{msg}");
+        assert!(msg.contains("MUSE_CLI="), "{msg}");
+
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let msg = describe_spawn_error("/opt/muse", &denied);
+        assert!(msg.contains("not executable"), "{msg}");
     }
 }

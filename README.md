@@ -164,8 +164,14 @@ does not prevent the session or its selectors from starting.
 
 ```sh
 cargo build
-./target/debug/muse-acp
+./target/debug/muse-acp --selftest
 ```
+
+`--selftest` validates the adapter's static payloads, prints the MSP schema
+compatibility table, and probes the configured Muse CLI
+(`cli-ready`/`cli-unready` with the binary and reported version). It is a
+diagnostic and always exits successfully, so support output can be collected
+before Muse is installed.
 
 Env:
 
