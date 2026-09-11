@@ -3023,3 +3023,25 @@ fn session_fork_rejects_unmatched_and_malformed_fingerprints() {
     );
     c.finish();
 }
+
+#[test]
+fn client_disconnect_exits_promptly_with_a_turn_in_flight() {
+    // The editor closing must not wait on a quiet host: stdin EOF is the
+    // client's authoritative disconnect and the adapter exits immediately.
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "never completes");
+    let started = std::time::Instant::now();
+    drop(c.stdin);
+    let status = c
+        .child
+        .wait_timeout(Duration::from_secs(5))
+        .expect("wait")
+        .expect("adapter exits on client disconnect");
+    assert!(status.success(), "disconnect exit: {status}");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "adapter lingered after client EOF: {:?}",
+        started.elapsed()
+    );
+}

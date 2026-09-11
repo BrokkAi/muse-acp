@@ -111,7 +111,9 @@ table, validates every adapter→host request frame against the schema bundle's
 required fields and property types (via a test-only `serde_json`
 dev-dependency; the binary stays dependency-free), and replays every corpus
 approval payload through the permission mapping, requiring ordered choices
-plus a deny fallback. Remaining work: the optional live-host smoke gate.
+plus a deny fallback, and an env-gated `MUSE_ACP_LIVE_HOST=1` smoke test
+drives a real host handshake, session lifecycle, and close (skipped with an
+explicit message by default).
 
 **Work items**
 
@@ -736,7 +738,9 @@ before exiting, and the exited child is reaped. Mutex acquisition now
 recovers from poisoning (`unwrap_or_else(|p| p.into_inner())`) across the
 session store, host writer, handshake, child handle, and stdout: the locks
 guard plain data, so a panic in one thread must not cascade into a wedged
-adapter. Remaining work: closed-stdio tests and a bounded shutdown timer.
+adapter. A client-disconnect test pins that stdin EOF exits promptly even
+with a turn in flight. Remaining work: a bounded shutdown timer around child
+reaping.
 
 **Work items**
 - Audit mutex poisoning and convert it into bounded, explicit adapter errors.
