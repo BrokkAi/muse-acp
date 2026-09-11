@@ -2533,3 +2533,35 @@ fn async_task_stop_is_rejected_honestly() {
     );
     c.finish();
 }
+
+#[test]
+fn recommended_model_value_follows_air_negotiation() {
+    let mut c = Client::spawn("catalog_grows", &[]);
+    let _sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"recommendedValue\"]}}}}",
+    );
+    c.wait_stderr(
+        "client negotiated AIR recommended config values",
+        Duration::from_secs(10),
+    );
+    // The fixture catalog marks fake-model default from the first read.
+    let frame = c.frames.lock().unwrap().join("\n");
+    assert!(
+        frame.contains("\"recommendedValue\":\"fake-model\""),
+        "recommended value missing: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn recommended_value_is_omitted_without_negotiation() {
+    let mut c = Client::spawn("quiet", &[]);
+    let _sid = c.new_session(2, "");
+    let frame = c.frames.lock().unwrap().join("\n");
+    assert!(
+        !frame.contains("\"recommendedValue\":\""),
+        "recommendation metadata must not leak without negotiation: {frame}"
+    );
+    c.finish();
+}

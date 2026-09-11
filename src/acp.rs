@@ -297,14 +297,24 @@ pub fn config_options(
     current_model: &str,
     reasoning_effort: &str,
     models_json: &[(String, String, bool)],
+    recommended_model: Option<&str>,
 ) -> String {
     let mut model_opts = Vec::new();
     for (id, label, _) in models_json {
         model_opts.push(format!("{{\"value\":{},\"name\":{}}}", esc(id), esc(label)));
     }
     let id_key = if ver == 1 { "id" } else { "configId" };
+    // AIR recommendedValue is additive metadata: emit it only when the client
+    // negotiated it and the value is present among this selector's options.
+    let recommended_meta = match recommended_model {
+        Some(model) if models_json.iter().any(|(id, _, _)| id == model) => format!(
+            ",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}",
+            esc(model)
+        ),
+        _ => String::new(),
+    };
     format!(
-        "[{{\"{id_key}\":\"mode\",\"name\":\"Session Mode\",\"description\":\"How the agent handles tool approvals\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"ask\",\"name\":\"Ask\",\"description\":\"Request permission for unmatched tools\"}},{{\"value\":\"auto\",\"name\":\"Auto\",\"description\":\"Allow all tools without asking\"}},{{\"value\":\"deny\",\"name\":\"Deny\",\"description\":\"Deny unmatched tools\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Reasoning effort sent with each prompt and steering message\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]}}]",
+        "[{{\"{id_key}\":\"mode\",\"name\":\"Session Mode\",\"description\":\"How the agent handles tool approvals\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"ask\",\"name\":\"Ask\",\"description\":\"Request permission for unmatched tools\"}},{{\"value\":\"auto\",\"name\":\"Auto\",\"description\":\"Allow all tools without asking\"}},{{\"value\":\"deny\",\"name\":\"Deny\",\"description\":\"Deny unmatched tools\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Reasoning effort sent with each prompt and steering message\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]}}]",
         esc(current_mode),
         esc(current_model),
         model_opts.join(","),
@@ -473,7 +483,7 @@ mod tests {
     fn selector_and_command_literals_are_valid_json() {
         let models = vec![("fake-model".to_string(), "Fake".to_string(), true)];
         for ver in [1, 2] {
-            let options = config_options(ver, "ask", "fake-model", "medium", &models);
+            let options = config_options(ver, "ask", "fake-model", "medium", &models, None);
             let parsed = crate::json::parse_json(&options).expect("config options JSON");
             let J::Arr(items) = parsed else {
                 panic!("config options must be an array");

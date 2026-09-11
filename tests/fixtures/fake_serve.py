@@ -591,6 +591,7 @@ def result_for(method, msg):
             if CATALOG_READS[0] == 4:
                 return {"models": [], "source": "unresolvedCatalog"}
         models = [{"modelId": "fake-model", "displayLabel": "Fake",
+                   "isDefault": True,
                    "cost": {"input": "3.00", "output": "15.00",
                             "cached": "0.30", "currency": "USD"}}]
         if CATALOG_READS[0] > 1:

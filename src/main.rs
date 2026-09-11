@@ -30,6 +30,7 @@ static VER: AtomicU64 = AtomicU64::new(0); // negotiated ACP version for the con
 static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the client advertises elicitation.form
 static NATIVE_SUBAGENTS: AtomicU64 = AtomicU64::new(0); // 1 when subagent sessions are negotiated
 static AIR_ASYNC_TASKS: AtomicU64 = AtomicU64::new(0); // 1 when the client wants async-task updates
+static AIR_RECOMMENDED: AtomicU64 = AtomicU64::new(0); // 1 when the client wants recommendedValue metadata
 
 /// True when the client's `_meta.jetbrains.air.capabilities` advertises a key.
 fn client_supports_air(capabilities: Option<&J>, key: &str) -> bool {
@@ -377,14 +378,14 @@ enum LoopMsg {
 
 fn v2_init() -> String {
     format!(
-        r#"{{"protocolVersion":2,"capabilities":{{"session":{{"prompt":{{"image":{{}},"embeddedContext":{{}}}},"fork":{{}},"subagents":{{}}}}}},"info":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}},"authMethods":[],"_meta":{{"steering":{{"supported":true}},"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions","asyncTasks"]}}}}}}}}"#,
+        r#"{{"protocolVersion":2,"capabilities":{{"session":{{"prompt":{{"image":{{}},"embeddedContext":{{}}}},"fork":{{}},"subagents":{{}}}}}},"info":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}},"authMethods":[],"_meta":{{"steering":{{"supported":true}},"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}}}}}"#,
         ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
     )
 }
 
 fn v1_init() -> String {
     format!(
-        r#"{{"protocolVersion":1,"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}},"fork":{{}},"subagents":{{}}}},"_meta":{{"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions","asyncTasks"]}}}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
+        r#"{{"protocolVersion":1,"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}},"fork":{{}},"subagents":{{}}}},"_meta":{{"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
         ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
     )
 }
@@ -737,6 +738,18 @@ fn main() {
     }
 }
 
+/// The catalog's default model, but only when the client asked for AIR
+/// recommendedValue metadata. Never fabricates a default of its own.
+fn recommended_model(models: &[(String, String, bool)]) -> Option<String> {
+    if AIR_RECOMMENDED.load(Ordering::SeqCst) == 0 {
+        return None;
+    }
+    models
+        .iter()
+        .find(|(_, _, is_default)| *is_default)
+        .map(|(id, _, _)| id.clone())
+}
+
 /// A fresh fold configured with the connection's subagent negotiation.
 fn fresh_fold() -> SessionFold {
     let mut fold = SessionFold::new();
@@ -848,8 +861,13 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             });
             let async_tasks = client_supports_air(air_caps, "asyncTasks");
             AIR_ASYNC_TASKS.store(u64::from(async_tasks), Ordering::SeqCst);
+            let recommended = client_supports_air(air_caps, "recommendedValue");
+            AIR_RECOMMENDED.store(u64::from(recommended), Ordering::SeqCst);
             if async_tasks {
                 log("client negotiated AIR async-task updates");
+            }
+            if recommended {
+                log("client negotiated AIR recommended config values");
             }
             if subagents {
                 log("client negotiated native subagent sessions");
@@ -1002,8 +1020,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     // session/resume to reconnect after an adapter restart.
                     // Config selectors are standard in v1 and v2; v1 also gets
                     // the legacy mode state for older clients.
+                    // One catalog fetch for both protocol versions: an extra
+                    // read is not free on the host and advances read-counted
+                    // fixtures/scenarios.
+                    let models = catalog(host);
                     let result = if ver == 2 {
-                        let models = catalog(host);
                         format!(
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
                             esc(&sid),
@@ -1014,6 +1035,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                                 &cur_model,
                                 "medium",
                                 &models,
+                                recommended_model(&models).as_deref(),
                             )
                         )
                     } else {
@@ -1026,7 +1048,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                                 acp::mode_from_msp(&cur_mode),
                                 &cur_model,
                                 "medium",
-                                &catalog(host),
+                                &models,
+                                recommended_model(&models).as_deref(),
                             ),
                             acp::session_modes(acp::mode_from_msp(&cur_mode))
                         )
@@ -1295,7 +1318,14 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
                             esc(&sid),
                             esc(&msp_out),
-                            acp::config_options(ver, &mode_v, &model_v, &reasoning_v, &models)
+                            acp::config_options(
+                                ver,
+                                &mode_v,
+                                &model_v,
+                                &reasoning_v,
+                                &models,
+                                recommended_model(&models).as_deref(),
+                            )
                         )
                     } else {
                         let models = catalog(host);
@@ -1303,7 +1333,14 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{},\"modes\":{}}}",
                             esc(&sid),
                             esc(&msp_out),
-                            acp::config_options(ver, &mode_v, &model_v, &reasoning_v, &models),
+                            acp::config_options(
+                                ver,
+                                &mode_v,
+                                &model_v,
+                                &reasoning_v,
+                                &models,
+                                recommended_model(&models).as_deref(),
+                            ),
                             acp::session_modes(&mode_v)
                         )
                     };
@@ -1475,14 +1512,28 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
                             esc(&new_msp),
                             esc(&new_msp),
-                            acp::config_options(ver, &mode_out, &model_out, "medium", &models)
+                            acp::config_options(
+                                ver,
+                                &mode_out,
+                                &model_out,
+                                "medium",
+                                &models,
+                                recommended_model(&models).as_deref(),
+                            )
                         )
                     } else {
                         format!(
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{},\"modes\":{}}}",
                             esc(&new_msp),
                             esc(&new_msp),
-                            acp::config_options(ver, &mode_out, &model_out, "medium", &models),
+                            acp::config_options(
+                                ver,
+                                &mode_out,
+                                &model_out,
+                                "medium",
+                                &models,
+                                recommended_model(&models).as_deref(),
+                            ),
                             acp::session_modes(&mode_out)
                         )
                     };
@@ -2119,6 +2170,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                                     &s.model_value,
                                     &s.reasoning_effort,
                                     &models,
+                                    recommended_model(&models).as_deref(),
                                 )
                             ),
                         );

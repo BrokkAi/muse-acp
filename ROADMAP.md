@@ -649,11 +649,19 @@ points (needs a hash implementation), and history replay on request.
 
 Small editor-facing parity items from the `codex-acp` comparison.
 
+Status: **model recommendation implemented.** After AIR
+`recommendedValue` negotiation, the model selector carries the catalog's
+`isDefault` row as `_meta.jetbrains.air.recommendedValue`, only when that
+value appears among the advertised options; recommendation metadata never
+overrides the current selection and is omitted without negotiation.
+Reasoning-effort recommendations stay unimplemented (the host publishes no
+default; none is fabricated).
+
 **Work items**
 
-- Implement the AIR `recommendedValue` extension for the model selector from
+- ~~Implement the AIR `recommendedValue` extension for the model selector from
   the catalog's `isDefault` row, after client capability negotiation; emit a
-  recommendation only when the value is present among advertised options.
+  recommendation only when the value is present among advertised options.~~
 - Consider reasoning-effort recommendations if the host ever publishes a
   default; do not fabricate one.
 - Consider lightweight session titles for `session/list` if clients render
