@@ -75,7 +75,10 @@ impl Client {
                     Ok(_) => {
                         let t = line.trim();
                         if !t.is_empty() {
-                            writer.lock().unwrap().push(t.to_string());
+                            writer
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .push(t.to_string());
                         }
                     }
                 }
@@ -195,7 +198,7 @@ impl Client {
         let start = Instant::now();
         loop {
             {
-                let frames = self.frames.lock().unwrap();
+                let frames = self.frames.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(f) = frames.iter().find(|f| f.contains(want)) {
                     return f.clone();
                 }
@@ -213,7 +216,10 @@ impl Client {
                     .join("\n");
                 panic!(
                     "timed out waiting for {want:?}; got:\n{}\nadapter stderr:\n{tail}",
-                    self.frames.lock().unwrap().join("\n")
+                    self.frames
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .join("\n")
                 );
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -377,7 +383,11 @@ fn gap_refill_does_not_price_a_replayed_completion_twice() {
         } else {
             c.wait_for("\"idle\"", Duration::from_secs(15));
         }
-        let frames = c.frames.lock().unwrap().join("\n");
+        let frames = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n");
         // cur-2 (0.0006) plus cur-3 (0.0105); cur-3 is delivered twice.
         assert!(
             frames.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\""),
@@ -786,7 +796,11 @@ fn user_input_options_reach_the_client() {
     );
     assert!(elicit.contains("Alpha"), "option Alpha bridged: {elicit}");
     assert!(elicit.contains("Beta"), "option Beta bridged: {elicit}");
-    let log = c.frames.lock().unwrap().join("\n");
+    let log = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert!(
         log.find("requires_action").unwrap() < log.find("elicitation/create").unwrap(),
         "state precedes the offer"
@@ -891,7 +905,11 @@ fn v1_questions_use_advertised_client_form_capability() {
     );
     assert!(elicit.contains("Alpha"), "option Alpha bridged: {elicit}");
     assert!(elicit.contains("Beta"), "option Beta bridged: {elicit}");
-    let frames = c.frames.lock().unwrap().join("\n");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert!(
         !frames.contains("requires_action"),
         "v1 must not emit v2 state: {frames}"
@@ -909,7 +927,11 @@ fn v1_questions_without_form_support_are_cancelled() {
         let sid = c.new_session(1, caps);
         let _pid = c.prompt(&sid, "ask me");
         c.wait_log("userInput/cancel", Duration::from_secs(15));
-        let frames = c.frames.lock().unwrap().join("\n");
+        let frames = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n");
         assert!(
             !frames.contains("elicitation/create"),
             "unsupported form: {frames}"
@@ -924,7 +946,11 @@ fn false_elicitation_capability_is_not_treated_as_supported() {
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":false}}");
     let _pid = c.prompt(&sid, "ask me");
     c.wait_log("userInput/cancel", Duration::from_secs(15));
-    let frames = c.frames.lock().unwrap().join("\n");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert!(
         !frames.contains("elicitation/create"),
         "false form capability must not enable elicitation: {frames}"
@@ -972,7 +998,7 @@ fn queued_turns_share_running_until_drained() {
     let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
     assert!(idle.contains("end_turn"), "drains with metadata: {idle}");
     let (idles, log) = {
-        let frames = c.frames.lock().unwrap();
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
         let idles = frames.iter().filter(|f| f.contains("\"idle\"")).count();
         (idles, frames.join("\n"))
     };
@@ -1032,7 +1058,11 @@ fn session_load_replays_history() {
     );
     let load = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
     assert!(load.contains("\"result\""), "load ok: {load}");
-    let log = c.frames.lock().unwrap().join("\n");
+    let log = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     let end = log.find(&format!("\"id\":{lid}")).unwrap();
     let replay = &log[..end];
     assert!(replay.contains("old question"), "user history replayed");
@@ -1146,7 +1176,11 @@ fn session_load_rejects_invalid_roots_and_tolerates_mcp() {
 fn host_default_mode_is_reflected() {
     let mut c = Client::spawn("quiet", &[("FAKE_MODE", "allowAll")]);
     let _sid = c.new_session(2, "");
-    let log = c.frames.lock().unwrap().join("\n");
+    let log = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     let cfg = log
         .lines()
         .find(|l| l.contains("configOptions"))
@@ -1164,7 +1198,11 @@ fn v1_advertises_config_options_and_slash_commands() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(1, "");
     let commands = c.wait_for("available_commands_update", Duration::from_secs(15));
-    let log = c.frames.lock().unwrap().join("\n");
+    let log = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     let cfg = log
         .lines()
         .find(|l| l.contains("configOptions"))
@@ -1263,7 +1301,11 @@ fn model_catalog_refreshes_after_initial_partial_snapshot() {
         ] {
             let mut c = Client::spawn("catalog_grows", &[]);
             let sid = c.new_session(ver, "");
-            let initial = c.frames.lock().unwrap().join("\n");
+            let initial = c
+                .frames
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .join("\n");
             assert!(initial.contains("\"value\":\"fake-model\""));
             assert!(!initial.contains("second-model"));
             let params = if method == "session/new" {
@@ -1344,7 +1386,11 @@ fn slash_command_aliases_use_the_muse_skill_grammar() {
         Duration::from_secs(15),
     );
 
-    let log = c.frames.lock().unwrap().join("\n");
+    let log = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert!(
         log.contains("\"text\":\"/plan add dropdowns\""),
         "the ACP transcript preserves the command the user selected: {log}"
@@ -1373,7 +1419,11 @@ fn leading_space_escapes_a_slash_command() {
 fn reasoning_effort_is_selected_and_sent_to_msp() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
-    let initial = c.frames.lock().unwrap().join("\n");
+    let initial = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert!(
         initial.contains("\"configId\":\"reasoning_effort\"")
             && initial.contains("\"currentValue\":\"medium\""),
@@ -1427,7 +1477,7 @@ fn steering_injects_into_the_exact_active_turn() {
     c.wait_log("turn/steer", Duration::from_secs(15));
     c.wait_input("\"expectedTurnId\": \"turn-1\"", Duration::from_secs(15));
 
-    let frames = c.frames.lock().unwrap();
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
     let response_pos = frames
         .iter()
         .position(|frame| frame.contains(&format!("\"id\":{steer_id}")))
@@ -1574,7 +1624,11 @@ fn resource_link_inlines_workspace_text() {
     let id = c.req("session/new", &format!("{{\"cwd\":\"{cwd}\"}}"));
     c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     // Re-read the session id from the accumulated frames.
-    let log = c.frames.lock().unwrap().join("\n");
+    let log = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     let sid = extract_str(
         log.lines()
             .find(|l| l.contains(&format!("\"id\":{id}")))
@@ -1869,7 +1923,11 @@ fn resume_reconciliation_does_not_duplicate_displayed_approval() {
         "pending reconciliation: 0 approval(s), 0 user input(s) presented",
         Duration::from_secs(10),
     );
-    let frames = c.frames.lock().unwrap().join("\n");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert_eq!(
         frames.matches("session/request_permission").count(),
         1,
@@ -1949,7 +2007,11 @@ fn reasoning_summary_parts_stream_as_thought_chunks() {
         "part boundary must be a section break: {section}"
     );
     // The completed frame must not duplicate what already streamed.
-    let frames = c.frames.lock().unwrap().join("\n");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert_eq!(
         frames.matches("Considering the schema").count(),
         0,
@@ -1976,7 +2038,11 @@ fn reasoning_completion_without_deltas_emits_the_summary_once() {
         !thought.contains("messageId"),
         "v1 thought chunks carry no messageId: {thought}"
     );
-    let frames = c.frames.lock().unwrap().join("\n");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert_eq!(
         frames.matches("Committed thought").count(),
         1,
@@ -2179,7 +2245,11 @@ fn unknown_kinds_render_fallback_text_only() {
     );
     // The final answer must still arrive.
     c.wait_for("done", Duration::from_secs(15));
-    let frames = c.frames.lock().unwrap().join("\n");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert!(
         !frames.contains("it-u2"),
         "a kind with no fallbackText must stay invisible: {frames}"
@@ -2191,7 +2261,11 @@ fn unknown_kinds_render_fallback_text_only() {
 fn session_fork_advertises_and_copies_without_a_cut_point() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(1, "");
-    let init_frame = c.frames.lock().unwrap().join("\n");
+    let init_frame = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert!(
         init_frame.contains("\"fork\":{}"),
         "fork capability not advertised: {init_frame}"
@@ -2422,7 +2496,11 @@ fn native_subagent_sessions_spawn_state_and_replay_the_child() {
     );
 
     // Native mode must not double-render the legacy tool card.
-    let frames = c.frames.lock().unwrap().join("\n");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert!(
         !frames.contains("subagent-it-subn"),
         "legacy card must not appear when native is negotiated: {frames}"
@@ -2445,7 +2523,11 @@ fn subagent_cards_stay_legacy_without_negotiation() {
         card.contains("researcher: survey failing tests"),
         "card missing: {card}"
     );
-    let frames = c.frames.lock().unwrap().join("\n");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert!(
         !frames.contains("subagent_spawned"),
         "native updates must not leak without negotiation: {frames}"
@@ -2491,7 +2573,11 @@ fn async_task_updates_follow_negotiation() {
         "shell terminal state missing: {state}"
     );
 
-    let frames = c.frames.lock().unwrap().join("\n");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert_eq!(
         frames.matches("async_task_spawned").count(),
         2,
@@ -2506,7 +2592,11 @@ fn async_task_updates_stay_off_without_negotiation() {
     let sid = c.new_session(2, "");
     let _pid = c.prompt(&sid, "no air caps");
     c.wait_for("shell-it-sh2", Duration::from_secs(15));
-    let frames = c.frames.lock().unwrap().join("\n");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert!(
         !frames.contains("async_task_spawned"),
         "async tasks must not leak without negotiation: {frames}"
@@ -2546,7 +2636,11 @@ fn recommended_model_value_follows_air_negotiation() {
         Duration::from_secs(10),
     );
     // The fixture catalog marks fake-model default from the first read.
-    let frame = c.frames.lock().unwrap().join("\n");
+    let frame = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert!(
         frame.contains("\"recommendedValue\":\"fake-model\""),
         "recommended value missing: {frame}"
@@ -2558,7 +2652,11 @@ fn recommended_model_value_follows_air_negotiation() {
 fn recommended_value_is_omitted_without_negotiation() {
     let mut c = Client::spawn("quiet", &[]);
     let _sid = c.new_session(2, "");
-    let frame = c.frames.lock().unwrap().join("\n");
+    let frame = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
     assert!(
         !frame.contains("\"recommendedValue\":\""),
         "recommendation metadata must not leak without negotiation: {frame}"

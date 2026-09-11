@@ -159,7 +159,11 @@ fn reconcile_pending(
     sessions: &Sessions,
     acp_sid: &str,
 ) {
-    let msp_sid = match sessions.lock().unwrap().get(acp_sid) {
+    let msp_sid = match sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(acp_sid)
+    {
         Some(s) => s.msp_sid.clone(),
         None => return,
     };
@@ -178,18 +182,23 @@ fn reconcile_pending(
     let (mut n_approvals, mut n_inputs) = (0usize, 0usize);
     if let Some(J::Arr(approvals)) = r.get("approvals") {
         for a in approvals.clone() {
-            let known = sessions.lock().unwrap().get(acp_sid).is_some_and(|s| {
-                let displayed = s
-                    .pending_perm
-                    .as_ref()
-                    .map(|p| p.approval_id.as_str())
-                    .unwrap_or("");
-                let id = a.get("approvalId").and_then(|v| v.as_str()).unwrap_or("");
-                displayed == id && !id.is_empty()
-                    || s.perm_queue.iter().any(|q| {
-                        q.get("approvalId").and_then(|v| v.as_str()) == Some(id) && !id.is_empty()
-                    })
-            });
+            let known = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(acp_sid)
+                .is_some_and(|s| {
+                    let displayed = s
+                        .pending_perm
+                        .as_ref()
+                        .map(|p| p.approval_id.as_str())
+                        .unwrap_or("");
+                    let id = a.get("approvalId").and_then(|v| v.as_str()).unwrap_or("");
+                    displayed == id && !id.is_empty()
+                        || s.perm_queue.iter().any(|q| {
+                            q.get("approvalId").and_then(|v| v.as_str()) == Some(id)
+                                && !id.is_empty()
+                        })
+                });
             if !known {
                 n_approvals += 1;
                 open_approval(stdout, sessions, &a);
@@ -198,12 +207,16 @@ fn reconcile_pending(
     }
     if let Some(J::Arr(inputs)) = r.get("userInputs") {
         for u in inputs.clone() {
-            let known = sessions.lock().unwrap().get(acp_sid).is_some_and(|s| {
-                let id = u.get("userInputId").and_then(|v| v.as_str()).unwrap_or("");
-                !id.is_empty()
-                    && (s.pending_ui.iter().any(|p| p.user_input_id == id)
-                        || s.ui_seen.contains(id))
-            });
+            let known = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(acp_sid)
+                .is_some_and(|s| {
+                    let id = u.get("userInputId").and_then(|v| v.as_str()).unwrap_or("");
+                    !id.is_empty()
+                        && (s.pending_ui.iter().any(|p| p.user_input_id == id)
+                            || s.ui_seen.contains(id))
+                });
             if !known {
                 n_inputs += 1;
                 handle_msp(host, stdout, sessions, "userInput/requested", &u);
@@ -217,7 +230,11 @@ fn reconcile_pending(
 
 /// Restores facts, not cost: historic completions stay unpriced.
 fn backfill_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
-    let (msp_sid, want_context, want_totals) = match sessions.lock().unwrap().get(acp_sid) {
+    let (msp_sid, want_context, want_totals) = match sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(acp_sid)
+    {
         Some(s) => (
             s.msp_sid.clone(),
             s.usage_used.is_none(),
@@ -290,7 +307,7 @@ fn backfill_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Session
             )),
         }
     }
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     let Some(s) = map.get_mut(acp_sid) else {
         return;
     };
@@ -321,12 +338,12 @@ fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
                 "model/list failed: {}; retaining last successful catalog",
                 err_message(&e)
             ));
-            return cell.lock().unwrap().clone();
+            return cell.lock().unwrap_or_else(|p| p.into_inner()).clone();
         }
     };
     let Some(J::Arr(models)) = r.get("models") else {
         log("model/list returned no models array; retaining last successful catalog");
-        return cell.lock().unwrap().clone();
+        return cell.lock().unwrap_or_else(|p| p.into_inner()).clone();
     };
     let mut out = Vec::new();
     // Rebuilt from scratch, then swapped in below: a successful refresh is the
@@ -366,7 +383,7 @@ fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
         .unwrap() = rates;
-    *cell.lock().unwrap() = out.clone();
+    *cell.lock().unwrap_or_else(|p| p.into_inner()) = out.clone();
     out
 }
 
@@ -583,7 +600,7 @@ fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
         }
     }
     let (settled, rest, ver) = {
-        let mut map = sessions.lock().unwrap();
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
         match map.get_mut(acp_sid) {
             Some(sess) => {
                 let mut settled = Vec::new();
@@ -661,7 +678,7 @@ fn restart_durable_host(
                     ) {
                         Ok(r) => {
                             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
-                                let mut map = sessions.lock().unwrap();
+                                let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Some(s) = map.get_mut(&acp_sid) {
                                     s.active_turn = r
                                         .get("session")
@@ -820,8 +837,12 @@ fn main() {
                             host = new_host;
                             // Reissued requests arrive on the new view; pull
                             // reconciliation as the belt-and-braces pass.
-                            let ids: Vec<String> =
-                                sessions.lock().unwrap().keys().cloned().collect();
+                            let ids: Vec<String> = sessions
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .keys()
+                                .cloned()
+                                .collect();
                             for sid in ids {
                                 reconcile_pending(&host, &stdout, &sessions, &sid);
                             }
@@ -1094,7 +1115,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .and_then(|s| s.get("activeTurnId"))
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
-                    sessions.lock().unwrap().insert(
+                    sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(
                         sid.clone(),
                         AcpSession {
                             acp_sid: sid.clone(),
@@ -1291,7 +1312,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             && ver == 2
                             && params.as_ref().and_then(|p| p.get("replayFrom")).is_some());
                     {
-                        let mut map = sessions.lock().unwrap();
+                        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                         let entry = map.entry(sid.clone()).or_insert_with(|| AcpSession {
                             acp_sid: sid.clone(),
                             msp_sid: real_msp.clone(),
@@ -1571,7 +1592,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         mode_value = acp::mode_from_msp(&m).to_string();
                     }
                     {
-                        let mut map = sessions.lock().unwrap();
+                        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                         let entry = map.entry(new_msp.clone()).or_insert_with(|| AcpSession {
                             acp_sid: new_msp.clone(),
                             msp_sid: new_msp.clone(),
@@ -1666,13 +1687,14 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let (msp_sid, cwd, reasoning_effort) = match sessions.lock().unwrap().get(&sid) {
-                Some(s) => (s.msp_sid.clone(), s.cwd.clone(), s.reasoning_effort.clone()),
-                None => {
-                    acp::send_error(stdout, &id, -32602, "unknown sessionId");
-                    return;
-                }
-            };
+            let (msp_sid, cwd, reasoning_effort) =
+                match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
+                    Some(s) => (s.msp_sid.clone(), s.cwd.clone(), s.reasoning_effort.clone()),
+                    None => {
+                        acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                        return;
+                    }
+                };
             let (parts, acp_content) = match extract_prompt_parts(params.as_ref(), &cwd) {
                 Ok((p, c)) if !p.is_empty() => (p, c),
                 Ok(_) => {
@@ -1770,7 +1792,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .get("disposition")
                         .and_then(|v| v.as_str())
                         .is_none_or(|value| value == "started");
-                    if let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
+                    if let Some(s) = sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get_mut(&sid)
+                    {
                         s.in_flight.push(InFlight {
                             msp_turn: turn.clone(),
                             req_id: id.clone().unwrap_or(J::Null),
@@ -1855,7 +1881,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .unwrap_or("")
                 .to_string();
             let (msp_sid, cwd, reasoning_effort, active_turn) =
-                match sessions.lock().unwrap().get(&sid) {
+                match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
                     Some(s) => (
                         s.msp_sid.clone(),
                         s.cwd.clone(),
@@ -1967,7 +1993,12 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     }
                 }
             };
-            if started_new && let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
+            if started_new
+                && let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&sid)
+            {
                 s.active_turn = Some(turn.clone());
                 s.in_flight.push(InFlight {
                     msp_turn: turn,
@@ -2022,7 +2053,10 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 );
                 let _ = req_id;
             }
-            let removed = sessions.lock().unwrap().remove(&sid);
+            let removed = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&sid);
             match removed {
                 Some(s) => {
                     for f in s.in_flight {
@@ -2189,7 +2223,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let msp_sid = match sessions.lock().unwrap().get(&sid) {
+            let msp_sid = match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
                 Some(s) => s.msp_sid.clone(),
                 None => {
                     acp::send_error(stdout, &id, -32602, "unknown sessionId");
@@ -2255,7 +2289,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .and_then(|e| e.get("mode"))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
-                    if let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
+                    if let Some(s) = sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get_mut(&sid)
+                    {
                         let ver = s.ver;
                         match key.as_str() {
                             "mode" => {
@@ -2311,7 +2349,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let msp_sid = match sessions.lock().unwrap().get(&sid) {
+            let msp_sid = match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
                 Some(s) => s.msp_sid.clone(),
                 None => {
                     acp::send_error(stdout, &id, -32602, "unknown sessionId");
@@ -2331,7 +2369,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         ),
                     ) {
                         Ok(_) => {
-                            if let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
+                            if let Some(s) = sessions
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get_mut(&sid)
+                            {
                                 s.mode_value = acp::mode_from_msp(m).to_string();
                             }
                             acp::send_result(stdout, &id, &format!("{{\"mode\":{}}}", esc(&value)))
@@ -2369,7 +2411,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 );
                 return;
             }
-            let msp_sid = match sessions.lock().unwrap().get(&sid) {
+            let msp_sid = match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
                 Some(s) => s.msp_sid.clone(),
                 None => {
                     acp::send_error(stdout, &id, -32602, "unknown sessionId");
@@ -2387,7 +2429,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 ),
             ) {
                 Ok(_) => {
-                    if let Some(s) = sessions.lock().unwrap().get_mut(&sid) {
+                    if let Some(s) = sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get_mut(&sid)
+                    {
                         s.model_value = value.clone();
                     }
                     acp::send_result(stdout, &id, &format!("{{\"model\":{}}}", esc(&value)))
@@ -2802,7 +2848,7 @@ fn drill_down_subagent_child(
         return;
     };
     let (ver, needs_read) = {
-        let mut map = sessions.lock().unwrap();
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
         let Some(s) = map.get_mut(acp_sid) else {
             return;
         };
@@ -2823,7 +2869,7 @@ fn drill_down_subagent_child(
         Ok(r) => {
             let mut out = Vec::new();
             {
-                let mut map = sessions.lock().unwrap();
+                let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(s) = map.get_mut(acp_sid)
                     && let Some(fold) = s.child_folds.get_mut(child)
                     && let Some(J::Arr(items)) = r.get("history").and_then(|h| h.get("items"))
@@ -2865,7 +2911,10 @@ fn handle_msp(
             .and_then(|v| v.as_str())
             .unwrap_or("");
         if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
-            && let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid)
+            && let Some(s) = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&acp_sid)
         {
             s.view_cursor = cur.to_string();
         }
@@ -2909,7 +2958,7 @@ fn handle_msp(
                         for it in items.clone() {
                             let wrap = J::Obj(vec![("item".to_string(), it)]);
                             let mut out = Vec::new();
-                            if let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid) {
+                            if let Some(s) = sessions.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&acp_sid) {
                                 s.fold.on_item_completed(&acp_sid, s.ver, &wrap, &mut out);
                             }
                             for line in out {
@@ -2933,7 +2982,11 @@ fn handle_msp(
             let item = params.get("item").cloned().unwrap_or(J::Null);
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
                 let mut out = Vec::new();
-                if let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid) {
+                if let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&acp_sid)
+                {
                     s.fold.on_item_snapshot(&acp_sid, s.ver, &item, &mut out);
                 }
                 for line in out {
@@ -2949,7 +3002,11 @@ fn handle_msp(
                 .unwrap_or("");
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
                 let mut out = Vec::new();
-                if let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid) {
+                if let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&acp_sid)
+                {
                     s.fold.on_item_delta(&acp_sid, s.ver, params, &mut out);
                 }
                 for line in out {
@@ -2965,7 +3022,11 @@ fn handle_msp(
             let item = params.get("item").cloned().unwrap_or(J::Null);
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
                 let mut out = Vec::new();
-                if let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid) {
+                if let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&acp_sid)
+                {
                     s.fold.on_item_completed(&acp_sid, s.ver, params, &mut out);
                 }
                 for line in out {
@@ -2991,16 +3052,20 @@ fn handle_msp(
                 Some(s) => s,
                 None => return,
             };
-            let settled = sessions.lock().unwrap().get_mut(&acp_sid).map(|s| {
-                if s.active_turn.as_deref() == Some(turn_id) {
-                    s.active_turn = None;
-                }
-                let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id);
-                let ver = s.ver;
-                let req_id = pos.map(|p| s.in_flight.remove(p).req_id);
-                let rest = s.in_flight.len();
-                (req_id, ver, rest)
-            });
+            let settled = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&acp_sid)
+                .map(|s| {
+                    if s.active_turn.as_deref() == Some(turn_id) {
+                        s.active_turn = None;
+                    }
+                    let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id);
+                    let ver = s.ver;
+                    let req_id = pos.map(|p| s.in_flight.remove(p).req_id);
+                    let rest = s.in_flight.len();
+                    (req_id, ver, rest)
+                });
             if let Some((req_id, ver, rest)) = settled {
                 let stop = fold::stop_reason(terminal);
                 if ver == 2 {
@@ -3046,11 +3111,15 @@ fn handle_msp(
                 Some(s) => s,
                 None => return,
             };
-            let settled = sessions.lock().unwrap().get_mut(&acp_sid).map(|s| {
-                let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id)?;
-                let ver = s.ver;
-                Some((s.in_flight.remove(pos).req_id, ver, s.in_flight.len()))
-            });
+            let settled = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&acp_sid)
+                .map(|s| {
+                    let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id)?;
+                    let ver = s.ver;
+                    Some((s.in_flight.remove(pos).req_id, ver, s.in_flight.len()))
+                });
             if let Some((req_id, ver, rest)) = settled.flatten() {
                 if ver == 2 {
                     if rest == 0 {
@@ -3138,7 +3207,10 @@ fn handle_msp(
             let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
                 && !turn_id.is_empty()
-                && let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid)
+                && let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&acp_sid)
             {
                 s.active_turn = Some(turn_id.to_string());
             }
@@ -3164,7 +3236,11 @@ fn handle_msp(
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
                 && !mode.is_empty()
             {
-                if let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid) {
+                if let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&acp_sid)
+                {
                     s.mode_value = acp::mode_from_msp(mode).to_string();
                 }
                 let _ = acp_sid;
@@ -3183,7 +3259,11 @@ fn handle_msp(
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
                 && !model.is_empty()
             {
-                if let Some(s) = sessions.lock().unwrap().get_mut(&acp_sid) {
+                if let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&acp_sid)
+                {
                     s.model_value = model.to_string();
                 }
                 let _ = acp_sid;
@@ -3207,7 +3287,7 @@ fn handle_msp(
                 && let Some(goal) = params.get("goal")
             {
                 let (goal_meta, branch_meta) = {
-                    let mut map = sessions.lock().unwrap();
+                    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                     match map.get_mut(&acp_sid) {
                         Some(s) => {
                             // An explicit null clears; the raw encoding keeps
@@ -3247,7 +3327,7 @@ fn handle_msp(
                     ),
                 ]);
                 let (goal_meta, branch_meta) = {
-                    let mut map = sessions.lock().unwrap();
+                    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                     match map.get_mut(&acp_sid) {
                         Some(s) => {
                             s.branch_meta = Some(j_to_string(&branch));
@@ -3275,7 +3355,7 @@ fn handle_msp(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
-                let mut map = sessions.lock().unwrap();
+                let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(s) = map.get_mut(&acp_sid) {
                     let pressure = adopt_context_usage(s, params);
                     acp::send_usage(stdout, s, pressure.as_deref());
@@ -3292,7 +3372,7 @@ fn handle_msp(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
-                let mut map = sessions.lock().unwrap();
+                let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(s) = map.get_mut(&acp_sid) {
                     // `view/gap` recovery pages forward from the last cursor,
                     // so a completion in that page can also be queued on the
@@ -3380,7 +3460,7 @@ fn open_approval(stdout: &StdoutShared, sessions: &Sessions, params: &J) {
     // A second concurrent approval cannot overwrite the one the client is
     // deciding on; queue it and display it when the current one settles.
     {
-        let mut map = sessions.lock().unwrap();
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = map.get_mut(&acp_sid)
             && s.pending_perm.is_some()
         {
@@ -3460,7 +3540,7 @@ fn open_approval(stdout: &StdoutShared, sessions: &Sessions, params: &J) {
     }
     let req_id = J::Str(mint_id("perm-", &ID_COUNTER));
     let ver = {
-        let mut map = sessions.lock().unwrap();
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(s) = map.get_mut(&acp_sid) {
             s.pending_perm = Some(PendingPerm {
                 req_id: req_id.clone(),
@@ -3531,7 +3611,7 @@ fn complete_permission(
         None => return, // not ours; ignore (e.g. late duplicate)
     };
     let (msp_sid, ver, approval_id, requirement, choices) = {
-        let mut map = sessions.lock().unwrap();
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
         let s = match map.get_mut(&acp_sid) {
             Some(s) => s,
             None => return,
@@ -3619,7 +3699,7 @@ fn complete_permission(
                 _ => None,
             }).unwrap_or(true);
             if ver == 2 && terminal {
-                let busy = sessions.lock().unwrap().get(&acp_sid).map(|s| !s.in_flight.is_empty()).unwrap_or(false);
+                let busy = sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&acp_sid).map(|s| !s.in_flight.is_empty()).unwrap_or(false);
                 if busy {
                     acp::send_state(stdout, &acp_sid, "running", None);
                 }
@@ -3634,13 +3714,17 @@ fn complete_permission(
 
 /// Display the next queued approval for a session, if any.
 fn pop_queued_approval(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
-    let next = sessions.lock().unwrap().get_mut(acp_sid).and_then(|s| {
-        if s.pending_perm.is_some() || s.perm_queue.is_empty() {
-            None
-        } else {
-            Some(s.perm_queue.remove(0))
-        }
-    });
+    let next = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(acp_sid)
+        .and_then(|s| {
+            if s.pending_perm.is_some() || s.perm_queue.is_empty() {
+                None
+            } else {
+                Some(s.perm_queue.remove(0))
+            }
+        });
     if let Some(params) = next {
         log("displaying next queued approval");
         open_approval(stdout, sessions, &params);
@@ -3676,7 +3760,7 @@ fn cancel_session_turns(host: &Arc<MspHost>, sessions: &Sessions, acp_sid: &str)
 }
 
 fn fail_all(stdout: &StdoutShared, sessions: &Sessions) {
-    let mut map = sessions.lock().unwrap();
+    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     for s in map.values_mut() {
         for f in s.in_flight.drain(..) {
             if s.ver == 2 {
@@ -3717,11 +3801,16 @@ fn bridge_user_input(
     // Resume reissues and the request/notification pair can repeat the same
     // pending question. Keep the original ACP request and answer mapping;
     // returning true also prevents the caller's auto-cancel fallback.
-    if sessions.lock().unwrap().get(acp_sid).is_some_and(|s| {
-        s.pending_ui
-            .iter()
-            .any(|p| p.user_input_id == user_input_id)
-    }) {
+    if sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(acp_sid)
+        .is_some_and(|s| {
+            s.pending_ui
+                .iter()
+                .any(|p| p.user_input_id == user_input_id)
+        })
+    {
         return true;
     }
     sessions
@@ -3824,7 +3913,11 @@ fn bridge_user_input(
             .join(",")
     );
     let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
-    if let Some(s) = sessions.lock().unwrap().get_mut(acp_sid) {
+    if let Some(s) = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(acp_sid)
+    {
         s.pending_ui.push(acp::PendingUi {
             req_id: req_id.clone(),
             user_input_id: user_input_id.clone(),
@@ -3880,18 +3973,22 @@ fn complete_elicitation(
         Some(v) => v.clone(),
         None => return,
     };
-    let found = sessions.lock().unwrap().iter().find_map(|(k, s)| {
-        s.pending_ui
-            .iter()
-            .position(|p| j_to_string(&p.req_id) == j_to_string(&idv))
-            .map(|i| (k.clone(), i))
-    });
+    let found = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find_map(|(k, s)| {
+            s.pending_ui
+                .iter()
+                .position(|p| j_to_string(&p.req_id) == j_to_string(&idv))
+                .map(|i| (k.clone(), i))
+        });
     let (acp_sid, idx) = match found {
         Some(v) => v,
         None => return,
     };
     let (msp_sid, ver, user_input_id, questions) = {
-        let mut map = sessions.lock().unwrap();
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
         let s = match map.get_mut(&acp_sid) {
             Some(s) => s,
             None => return,

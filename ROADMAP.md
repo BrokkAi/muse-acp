@@ -711,14 +711,17 @@ The dependency-free parser is a security- and reliability-critical component.
 
 Handle host death and internal lock failure deterministically.
 
-Status: **durable host restart implemented.** A crashed host whose handshake
-reported `durable` (or omitted durability, which the schema reads as durable)
-is relaunched up to three times with backoff, every known session is
-re-attached via `session/resume`, and pending requests are reconciled —
-in-flight ACP prompts stay open because durable terminals arrive on resume.
-Ephemeral or unknown profiles still fail closed, and exhausted restarts settle
-all requests before exiting. Remaining work: mutex-poisoning audit and
-closed-stdio tests.
+Status: **restart and lock robustness implemented.** A crashed host whose
+handshake reported `durable` (or omitted durability, which the schema reads
+as durable) is relaunched up to three times with backoff, every known session
+is re-attached via `session/resume`, pending requests are reconciled, and
+in-flight prompts settle explicitly against the reattached fold. Ephemeral or
+unknown profiles still fail closed, exhausted restarts settle all requests
+before exiting, and the exited child is reaped. Mutex acquisition now
+recovers from poisoning (`unwrap_or_else(|p| p.into_inner())`) across the
+session store, host writer, handshake, child handle, and stdout: the locks
+guard plain data, so a panic in one thread must not cascade into a wedged
+adapter. Remaining work: closed-stdio tests and a bounded shutdown timer.
 
 **Work items**
 - Audit mutex poisoning and convert it into bounded, explicit adapter errors.

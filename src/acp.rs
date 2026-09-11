@@ -93,7 +93,7 @@ pub struct AcpSession {
 pub type Sessions = Arc<Mutex<HashMap<String, AcpSession>>>;
 
 pub fn send_raw(stdout: &StdoutShared, line: &str) {
-    let mut out = stdout.lock().unwrap();
+    let mut out = stdout.lock().unwrap_or_else(|p| p.into_inner());
     let _ = writeln!(out, "{line}");
     let _ = out.flush();
 }

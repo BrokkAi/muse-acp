@@ -275,18 +275,27 @@ impl MspHost {
             method,
         );
         let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(id.to_string(), tx);
+        self.pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id.to_string(), tx);
         let line = format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"{method}\",\"params\":{params_json}}}"
         );
         if let Err(e) = self.send_raw(&line) {
-            self.pending.lock().unwrap().remove(&id.to_string());
+            self.pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&id.to_string());
             return Err(mk_err(-32603, &format!("serve write failed: {e}")));
         }
         match rx.recv_timeout(timeout) {
             Ok(r) => r,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                self.pending.lock().unwrap().remove(&id.to_string());
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&id.to_string());
                 Err(mk_err(
                     -32603,
                     &format!(
@@ -297,7 +306,10 @@ impl MspHost {
                 ))
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                self.pending.lock().unwrap().remove(&id.to_string());
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .remove(&id.to_string());
                 Err(mk_err(-32603, "serve host closed the connection"))
             }
         }
@@ -312,7 +324,7 @@ impl MspHost {
     }
 
     pub fn send_raw(&self, line: &str) -> std::io::Result<()> {
-        let mut w = self.writer.lock().unwrap();
+        let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
         writeln!(w, "{line}")?;
         w.flush()
     }
@@ -432,7 +444,11 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
         }
         if let Some(idv) = id {
             let key = j_to_string(&idv);
-            let waiter = host.pending.lock().unwrap().remove(&key);
+            let waiter = host
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&key);
             if let Some(tx1) = waiter {
                 if let Some(err) = msg.get("error") {
                     let _ = tx1.send(Err(err.clone()));
