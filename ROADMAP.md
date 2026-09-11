@@ -394,13 +394,15 @@ fetch-through for `outputRef`.
 Keep usage forwarding accurate and make client-local estimates harder to
 misinterpret.
 
-Status: **implemented.** Host usage facts and client-local cost remain
-separate: the `cost` object carries `source: adapter-estimate`,
-`basis: catalog-list-price`, and `billing: false`, replay-once accounting and
-rate-refresh replacement are covered by tests, and historic/unpriceable
-completions are excluded. Cached tokens are charged at the catalog `cached`
-rate (clamped to prompt tokens), using the per-completion
-`usage.cachedTokens` the host already reports.
+Status: **implemented — largely pre-existing.** The usage-forwarding work
+(PR #9, `pzoltowski/usage-forwarding`) already shipped host/derived
+separation, replay-once accounting, rate-refresh replacement, attach-time
+restore, and the scope documentation before this roadmap was written; this
+item existed to protect those semantics. The two genuinely open pieces landed
+afterwards: the explicit estimate labeling (`cost.source: adapter-estimate`,
+`basis: catalog-list-price`, `billing: false`) and cached-input pricing at
+the catalog `cached` rate (clamped to prompt tokens, from the per-completion
+`usage.cachedTokens` the host already reports).
 
 **Work items**
 
