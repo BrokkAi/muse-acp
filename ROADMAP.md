@@ -398,8 +398,9 @@ Status: **implemented.** Host usage facts and client-local cost remain
 separate: the `cost` object carries `source: adapter-estimate`,
 `basis: catalog-list-price`, and `billing: false`, replay-once accounting and
 rate-refresh replacement are covered by tests, and historic/unpriceable
-completions are excluded. Remaining work: cached-input rate separation if the
-host ever exposes cached-token counts per completion.
+completions are excluded. Cached tokens are charged at the catalog `cached`
+rate (clamped to prompt tokens), using the per-completion
+`usage.cachedTokens` the host already reports.
 
 **Work items**
 
@@ -613,8 +614,8 @@ MSP provides `session/compact` (with `CompactionOutcome`
 Status: **items and command implemented.** Compaction items surface as
 think-kind tool calls with `contextCompaction` v1 provenance metadata and
 token facts; a bare `/compact` prompt maps to `session/compact` and settles
-the ACP prompt honestly for both `accepted` and `noop`. Remaining work: carry
-the context pressure level alongside `usage_update` metadata.
+the ACP prompt honestly for both `accepted` and `noop`, and the context pressure level rides
+`usage_update` as `_meta.musePressure`.
 
 **Work items**
 

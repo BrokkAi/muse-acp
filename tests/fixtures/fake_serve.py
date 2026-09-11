@@ -449,6 +449,19 @@ def on_turn_start(params):
             "itemId": "it-1", "kind": "agentMessage",
             "status": "completed", "text": "done"}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "usage_cached":
+        # Cached tokens are a subset of prompt tokens: the estimate must
+        # charge them at the catalog cached rate, not the full input rate.
+        notify("session/contextUsage", context_usage(1500, "cur-1"))
+        notify("session/tokenUsage", {
+            "sessionId": MSP_SID, "turnId": tid,
+            "promptTokens": 1000, "totalTokens": 1500, "modelId": "fake-model",
+            "usage": {"inputTokens": 1000, "outputTokens": 500,
+                      "cachedTokens": 800, "reasoningTokens": 0},
+            "viewCursor": "cur-2", "sourceRange": {"start": 0, "end": 2},
+            "cumulative": {"promptTokens": 1000, "outputTokens": 500,
+                           "totalTokens": 1500}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "usage_gap":
         # cur-3 is delivered twice: once by the view/gap refill page and
         # once on the live stream. Two distinct completions, one price each.

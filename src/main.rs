@@ -71,31 +71,44 @@ fn client_supports_subagents(capabilities: Option<&J>) -> bool {
 /// Rows are (modelId, displayLabel, isDefault).
 static CATALOG: std::sync::OnceLock<Mutex<Vec<(String, String, bool)>>> =
     std::sync::OnceLock::new();
-/// Per-model catalog cost rates by modelId: (input/1M, output/1M, currency).
-/// Decimal strings carried verbatim by MSP; parsed here for client-local math.
-type CostRates = HashMap<String, (f64, f64, String)>;
+/// Per-model catalog rates, parsed once per refresh for client-local math.
+#[derive(Debug, Clone, PartialEq)]
+struct CostRate {
+    input: f64,
+    output: f64,
+    cached: f64,
+    currency: String,
+}
+
+type CostRates = HashMap<String, CostRate>;
 static CATALOG_RATES: std::sync::OnceLock<Mutex<CostRates>> = std::sync::OnceLock::new();
 
-/// Parse one MSP `ModelCost` block into (input/1M, output/1M, currency).
+/// Parse one MSP `ModelCost` block (per-1M input/output/cached + currency).
 /// Rates must be finite and non-negative: `str::parse::<f64>` accepts
 /// `inf`/`NaN` and overflows to infinity, none of which survive as JSON.
 /// A null currency (schema-allowed) leaves the model unpriced.
-fn parse_rates(cost: &J) -> Option<(f64, f64, String)> {
+fn parse_rates(cost: &J) -> Option<CostRate> {
     let rate = |key: &str| -> Option<f64> {
         let v: f64 = cost.get(key)?.as_str()?.trim().parse().ok()?;
         (v.is_finite() && v >= 0.0).then_some(v)
     };
     let input = rate("input")?;
     let output = rate("output")?;
+    let cached = rate("cached")?;
     let currency = cost.get("currency")?.as_str()?.to_string();
     if currency.len() != 3 || !currency.bytes().all(|b| b.is_ascii_uppercase()) {
         return None;
     }
-    Some((input, output, currency))
+    Some(CostRate {
+        input,
+        output,
+        cached,
+        currency,
+    })
 }
 
 /// Look up a model's catalog rates, if `model/list` priced it.
-fn catalog_rates(model: &str) -> Option<(f64, f64, String)> {
+fn catalog_rates(model: &str) -> Option<CostRate> {
     CATALOG_RATES
         .get_or_init(|| Mutex::new(HashMap::new()))
         .lock()
@@ -3492,14 +3505,28 @@ fn handle_msp(
                     let prompt = params.get("promptTokens").and_then(|v| v.as_u64());
                     let total = params.get("totalTokens").and_then(|v| v.as_u64());
                     if let (Some(m), Some(p), Some(t)) = (model, prompt, total)
-                        && let Some((input_rate, output_rate, currency)) = catalog_rates(m)
+                        && let Some(rate) = catalog_rates(m)
                     {
                         let o = t.saturating_sub(p);
-                        let leg = (p as f64 * input_rate + o as f64 * output_rate) / 1_000_000.0;
+                        // Cached tokens are a subset of prompt tokens: charge
+                        // them at the catalog cached rate and only the rest at
+                        // the full input rate. A host reporting more cached
+                        // than prompt tokens is clamped, never negative-priced.
+                        let cached = params
+                            .get("usage")
+                            .and_then(|u| u.get("cachedTokens"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0)
+                            .min(p);
+                        let uncached = p - cached;
+                        let leg = (uncached as f64 * rate.input
+                            + cached as f64 * rate.cached
+                            + o as f64 * rate.output)
+                            / 1_000_000.0;
                         match &mut s.cost_amount {
-                            Some((amount, cur)) if *cur == currency => *amount += leg,
+                            Some((amount, cur)) if *cur == rate.currency => *amount += leg,
                             Some(_) => {}
-                            None => s.cost_amount = Some((leg, currency)),
+                            None => s.cost_amount = Some((leg, rate.currency)),
                         }
                     }
                     acp::send_usage(stdout, s, None);
@@ -4183,7 +4210,7 @@ fn complete_elicitation(
 
 #[cfg(test)]
 mod tests {
-    use super::{env_flag_enabled, parse_rates, v1_init, v2_init};
+    use super::{CostRate, env_flag_enabled, parse_rates, v1_init, v2_init};
     use crate::acp;
     use crate::json::{J, parse_json};
     use std::path::{Path, PathBuf};
@@ -4252,7 +4279,7 @@ mod tests {
         );
     }
 
-    fn rates(input: &str, output: &str, currency: &str) -> Option<(f64, f64, String)> {
+    fn rates(input: &str, output: &str, currency: &str) -> Option<CostRate> {
         let cost = parse_json(&format!(
             "{{\"input\":{input},\"output\":{output},\"cached\":\"0.1\",\"currency\":{currency}}}"
         ))
@@ -4260,16 +4287,48 @@ mod tests {
         parse_rates(&cost)
     }
 
+    fn assert_rates(parsed: Option<CostRate>, input: f64, output: f64, cached: f64, cur: &str) {
+        let Some(r) = parsed else {
+            panic!("expected rates");
+        };
+        assert_eq!(r.input, input);
+        assert_eq!(r.output, output);
+        assert_eq!(r.cached, cached);
+        assert_eq!(r.currency, cur);
+    }
+
     #[test]
     fn catalog_rates_parse_decimal_strings_with_iso_currency() {
-        assert_eq!(
+        assert_rates(
             rates("\"3.00\"", "\"15.00\"", "\"USD\""),
-            Some((3.0, 15.0, "USD".to_string()))
+            3.0,
+            15.0,
+            0.1,
+            "USD",
         );
-        assert_eq!(
-            rates("\"0\"", "\" 2.5 \"", "\"EUR\""),
-            Some((0.0, 2.5, "EUR".to_string()))
-        );
+        assert_rates(rates("\"0\"", "\" 2.5 \"", "\"EUR\""), 0.0, 2.5, 0.1, "EUR");
+    }
+
+    #[test]
+    fn catalog_rates_reject_an_unusable_cached_rate() {
+        for bad in [
+            "\"inf\"",
+            "\"-inf\"",
+            "\"NaN\"",
+            "\"1e400\"",
+            "\"-1\"",
+            "null",
+            "3",
+        ] {
+            let cost = parse_json(&format!(
+                "{{\"input\":\"1\",\"output\":\"1\",\"cached\":{bad},\"currency\":\"USD\"}}"
+            ))
+            .unwrap();
+            assert!(
+                parse_rates(&cost).is_none(),
+                "cached {bad} must unprice the model"
+            );
+        }
     }
 
     #[test]

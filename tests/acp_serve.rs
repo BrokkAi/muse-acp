@@ -3112,3 +3112,18 @@ fn debug_tracing_names_methods_without_payloads() {
     );
     c.finish();
 }
+
+#[test]
+fn cached_input_tokens_price_at_the_catalog_cached_rate() {
+    // Rates: input 3.00, cached 0.30, output 15.00 per 1M.
+    // Leg = 200*3 + 800*0.30 + 500*15 = 8340 per 1M => 0.00834.
+    let mut c = Client::spawn("usage_cached", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "with cache");
+    let update = c.wait_for("\"cost\":{\"amount\":0.00834", Duration::from_secs(15));
+    assert!(
+        update.contains("\"used\":1500"),
+        "occupancy drifted in the priced frame: {update}"
+    );
+    c.finish();
+}
