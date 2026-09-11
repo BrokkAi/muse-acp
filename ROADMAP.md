@@ -777,6 +777,10 @@ reaping.
 
 Use Cargo package metadata for all adapter version strings.
 
+Status: **implemented.** All adapter version strings derive from
+`env!("CARGO_PKG_VERSION")`, and a regression test rejects hardcoded release
+literals.
+
 **Work items**
 
 - Replace literal `0.2.5` strings in initialization payloads with
