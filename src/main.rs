@@ -3317,14 +3317,73 @@ fn handle_msp(
             }
             log(&format!("turn/started turn={turn_id} sess={msp_sid}"));
         }
-        "turn/retracted" | "turn/retryScheduled" => {
+        "turn/retracted" => {
+            // A durably retracted submission never runs to a normal
+            // terminal: settle the tracked prompt now as cancelled (like
+            // turn/unqueued) so it cannot hang or falsely succeed. A late
+            // turn/completed then finds no tracked prompt left to settle.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
             log(&format!(
-                "{method} turn={} sess={}",
+                "turn/retracted turn={turn_id} sess={msp_sid} command={}",
+                params
+                    .get("commandId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?")
+            ));
+            let acp_sid = match find_acp_sid(sessions, msp_sid) {
+                Some(s) => s,
+                None => return,
+            };
+            let settled = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&acp_sid)
+                .map(|s| {
+                    if s.active_turn.as_deref() == Some(turn_id) {
+                        s.active_turn = None;
+                    }
+                    let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id)?;
+                    let ver = s.ver;
+                    Some((s.in_flight.remove(pos).req_id, ver, s.in_flight.len()))
+                });
+            if let Some((req_id, ver, rest)) = settled.flatten() {
+                if ver == 2 {
+                    if rest == 0 {
+                        acp::send_state(stdout, &acp_sid, "idle", Some("cancelled"));
+                    }
+                } else {
+                    acp::send_result(stdout, &Some(req_id), "{\"stopReason\":\"cancelled\"}");
+                }
+                let _ = req_id;
+            }
+        }
+        "turn/retryScheduled" => {
+            // Non-terminal by schema: it never resolves a turn-wait, so never
+            // settle here. Record the attempt facts for diagnostics; the
+            // turn's own turn/completed still settles it exactly once.
+            let num = |key: &str| {
+                params
+                    .get(key)
+                    .and_then(|v| v.as_u64())
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "?".to_string())
+            };
+            log(&format!(
+                "turn/retryScheduled turn={} sess={} attempt={} next={} max={} delayMs={} reason={}",
                 params.get("turnId").and_then(|v| v.as_str()).unwrap_or("?"),
                 params
                     .get("sessionId")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("?")
+                    .unwrap_or("?"),
+                num("attempt"),
+                num("nextAttempt"),
+                num("maxAttempts"),
+                num("retryDelayMs"),
+                params.get("reason").and_then(|v| v.as_str()).unwrap_or("?")
             ));
         }
         "session/approvalModeChanged" => {

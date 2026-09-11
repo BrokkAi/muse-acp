@@ -503,12 +503,16 @@ supplies no summary.
 
 Surface session-level state without corrupting prompt settlement.
 
-Status: **goal and branch display implemented.** `session/goalChanged`
+Status: **implemented (display plus settlement).** `session/goalChanged`
 (including explicit `null` clears) publishes the provider-neutral `_meta.goal`
 presentation on `session_info_update`; `session/branchChanged` publishes a
 namespaced branch observation; both are restored from the resume snapshot.
-Goal control stays deferred (experimental upstream). Remaining work:
-retry/retract settlement race tests.
+`turn/retracted` settles the tracked prompt as cancelled (v1 result, v2 idle)
+and clears the active turn, so a late `turn/completed` finds nothing left to
+settle; `turn/retryScheduled` stays non-settling per schema (it never resolves
+a turn-wait) and records attempt facts in diagnostics. Race tests pin
+retract-then-completed and retry-then-completed settle-exactly-once.
+Goal control stays deferred (experimental upstream).
 
 **Work items**
 - Represent branch changes (`BranchState { branch, vcs, workspaceRoot }` from
@@ -523,9 +527,9 @@ retry/retract settlement race tests.
   absent from the stable v1 method index and masked in the transcript corpus,
   i.e. experimental; revisit only when the adapter deliberately opts into
   `experimentalApi`.
-- Ensure retry/retract notifications settle or supersede affected queued ACP
-  prompts.
-- Add race tests against terminal `turn/completed` events.
+- ~~Ensure retry/retract notifications settle or supersede affected queued ACP
+  prompts.~~
+- ~~Add race tests against terminal `turn/completed` events.~~
 
 **Acceptance criteria**
 - No queued ACP request hangs or falsely reports success because a turn was
@@ -772,6 +776,10 @@ reaping.
 ### 23. Single-source version metadata
 
 Use Cargo package metadata for all adapter version strings.
+
+Status: **implemented.** All adapter version strings derive from
+`env!("CARGO_PKG_VERSION")`, and a regression test rejects hardcoded release
+literals.
 
 **Work items**
 
