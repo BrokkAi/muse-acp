@@ -694,6 +694,16 @@ These reduce long-term maintenance cost as the protocol and test matrix grow.
 
 The dependency-free parser is a security- and reliability-critical component.
 
+Status: **property and differential testing implemented.** A deterministic
+xorshift generator round-trips 20,000 random values (control characters,
+quotes, backslashes, multi-byte scalar values, boundary numbers) through
+serialize→parse→serialize with identity, and a base64-framed corpus is
+classified by Python's `json` module with the adapter's verdicts required to
+match. The differential corpus immediately caught and fixed a real bug:
+trailing commas were accepted. Python-only extensions (`NaN`, `Infinity`) and
+lone surrogates stay intentionally stricter and are pinned by dedicated tests.
+Remaining work: coverage-guided fuzzing if a fuzzer is ever allowed in CI.
+
 **Work items**
 
 - Add parser/serializer fuzzing.

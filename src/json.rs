@@ -237,6 +237,10 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Some(b',') => {
                     self.pos += 1;
+                    self.skip_ws();
+                    if self.peek() == Some(b']') {
+                        return Err(format!("trailing comma in array at {}", self.pos));
+                    }
                 }
                 Some(b']') => {
                     self.pos += 1;
@@ -270,6 +274,10 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Some(b',') => {
                     self.pos += 1;
+                    self.skip_ws();
+                    if self.peek() == Some(b'}') {
+                        return Err(format!("trailing comma in object at {}", self.pos));
+                    }
                 }
                 Some(b'}') => {
                     self.pos += 1;
@@ -405,6 +413,15 @@ mod tests {
         }
     }
 
+    /// Trailing commas are a common emitter bug; Python and strict JSON
+    /// reject them, and so must we (found by the Python differential corpus).
+    #[test]
+    fn trailing_commas_are_rejected() {
+        for bad in ["[1,]", "[1,2,]", "{\"a\":1,}", "[[1,],2]", "{\"a\":[1,]},"] {
+            assert!(parse_json(bad).is_err(), "must reject {bad}");
+        }
+    }
+
     /// Nesting is bounded so hostile frames cannot overflow the stack.
     #[test]
     fn nesting_is_bounded() {
@@ -426,6 +443,236 @@ mod tests {
             r#""\ud83dx""#,
         ] {
             assert!(parse_json(bad).is_err(), "must reject {bad}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod property_tests {
+    use super::{J, j_to_string, parse_json};
+
+    /// Deterministic xorshift64*: reproducible fuzz without a runtime
+    /// dependency or an external fuzzer in CI.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545F4914F6CDD1D)
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    fn random_string(rng: &mut Rng) -> String {
+        let len = rng.below(24) as usize;
+        let mut out = String::new();
+        for _ in 0..len {
+            match rng.below(8) {
+                // Structure-sensitive ASCII.
+                0 => out.push((b'"' + rng.below(6) as u8) as char),
+                // Control characters must be escaped by the serializer.
+                1 => out.push((rng.below(0x20) as u8) as char),
+                2 => out.push('\\'),
+                3 => out.push('\u{7f}'),
+                // Multi-byte UTF-8 (all valid scalar values).
+                4 => out.push(char::from_u32(0x80 + rng.below(0x7ff) as u32).unwrap()),
+                // 0x800..=0xD7FF: stays below the surrogate block.
+                5 => out.push(char::from_u32(0x800 + rng.below(0xd000) as u32).unwrap()),
+                6 => out.push(char::from_u32(0x10000 + rng.below(0xffff) as u32).unwrap()),
+                _ => out.push((b'a' + rng.below(26) as u8) as char),
+            }
+        }
+        out
+    }
+
+    fn random_value(rng: &mut Rng, depth: u64) -> J {
+        match rng.below(if depth == 0 { 4 } else { 6 }) {
+            0 => J::Null,
+            1 => J::Bool(rng.below(2) == 1),
+            2 => J::Num(match rng.below(5) {
+                0 => "0".to_string(),
+                1 => format!("-{}", rng.below(1_000_000)),
+                2 => format!("{}.{}", rng.below(1000), rng.below(1000)),
+                3 => format!("{}e-{}", rng.below(1000), rng.below(30)),
+                _ => format!("-{}.{}e+{}", rng.below(100), rng.below(100), rng.below(9)),
+            }),
+            3 => J::Str(random_string(rng)),
+            4 => J::Arr(
+                (0..rng.below(5))
+                    .map(|_| random_value(rng, depth - 1))
+                    .collect(),
+            ),
+            _ => J::Obj(
+                (0..rng.below(5))
+                    .map(|_| (random_string(rng), random_value(rng, depth - 1)))
+                    .collect(),
+            ),
+        }
+    }
+
+    /// Serialize → parse → serialize must be an identity for every generated
+    /// value: no panic, no drift, no accepted-but-mangled payload.
+    #[test]
+    fn random_values_round_trip_identically() {
+        let mut rng = Rng(0x9E3779B97F4A7C15);
+        for _ in 0..20_000 {
+            let value = random_value(&mut rng, 5);
+            let once = j_to_string(&value);
+            let parsed =
+                parse_json(&once).unwrap_or_else(|e| panic!("parse failed for {once}: {e}"));
+            let twice = j_to_string(&parsed);
+            assert_eq!(once, twice, "round trip drifted for {once}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod differential_tests {
+    use super::b64;
+    use super::parse_json;
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    fn corpus() -> Vec<&'static str> {
+        vec![
+            // Valid: scalars, numbers, escapes, whitespace, nesting.
+            "null",
+            "true",
+            "false",
+            "0",
+            "-0",
+            "42",
+            "-17",
+            "3.25",
+            "-0.5",
+            "1e10",
+            "1E-3",
+            "123.456e+7",
+            "\"\"",
+            "\"a\\\"b\"",
+            "\"tab\\tnl\\n\"",
+            "\"back\\\\slash\"",
+            "\"\\ud83d\\ude00\"",
+            "\"\\u00e9\"",
+            "\"\\ud834\\udd1e\"",
+            "\"\\u0000\"",
+            "\"\\u001f\"",
+            "\"\\u007f\"",
+            "\"汉字\"",
+            "\"\\u0020\"",
+            "[]",
+            "{}",
+            "[1,2,3]",
+            "{\"a\":1,\"b\":null}",
+            " [ 1 , 2 ] ",
+            "\t{\n\t\"k\"\r:\t[ true , false ]\n}\n",
+            "[[[[[[[[\"deep\"]]]]]]]]",
+            "{\"outer\":{\"inner\":[{\"leaf\":\"value\"}]}}",
+            // Invalid: things a hostile or buggy emitter might send.
+            "",
+            "   ",
+            "tru",
+            "nul",
+            "01",
+            "+1",
+            ".5",
+            "1.",
+            "-",
+            "1e",
+            "1e+",
+            "[1.2.3]",
+            "[1,]",
+            "{,}",
+            "{\"a\":1,}",
+            "{'a':1}",
+            "{a:1}",
+            "[1 2]",
+            "// comment",
+            "/* comment */",
+            "{} trailing",
+            "[1] junk",
+            "\"unterminated",
+            "\"bad\\escape\"",
+            "\"raw\nnewline\"",
+            "\"raw\ttab\"",
+            "[",
+            "]",
+            "{",
+            "}",
+            "{\"a\"}",
+            "{\"a\":}",
+            "[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[0]",
+            "]",
+            "[,]",
+            "{\"a\":1}{\"b\":2}",
+        ]
+    }
+
+    /// Python's `json` module classifies the corpus; the adapter must accept
+    /// every Python-valid document and reject the rest. Lone surrogates are
+    /// deliberately absent: Python accepts them and strict RFC 8259 does not
+    /// (covered by `unicode_surrogate_pairs_are_decoded_strictly`).
+    #[test]
+    fn acceptance_agrees_with_python_json() {
+        let docs = corpus();
+        let mut child = Command::new("python3")
+            .arg("-c")
+            .arg(concat!(
+                "import base64, json, sys\n",
+                "for line in sys.stdin:\n",
+                "    doc = base64.b64decode(line.strip()).decode('utf-8')\n",
+                "    try:\n",
+                "        json.loads(doc)\n",
+                "        print(1)\n",
+                "    except Exception:\n",
+                "        print(0)\n"
+            ))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("python3 is required by the test suite");
+        {
+            let stdin = child.stdin.as_mut().expect("python stdin");
+            for doc in &docs {
+                // Base64 keeps raw newlines inside documents framed as one
+                // line each, so the classifier sees exactly the corpus.
+                writeln!(stdin, "{}", b64(doc.as_bytes())).expect("write corpus");
+            }
+        }
+        let out = child.wait_with_output().expect("python completes");
+        assert!(out.status.success(), "python classifier failed: {out:?}");
+        let verdicts: Vec<bool> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim() == "1")
+            .collect();
+        assert_eq!(verdicts.len(), docs.len(), "classifier line count");
+        let (mut valid, mut invalid) = (0usize, 0usize);
+        for (doc, python_ok) in docs.iter().zip(&verdicts) {
+            let ours = parse_json(doc).is_ok();
+            assert_eq!(
+                ours, *python_ok,
+                "divergence from Python json on {doc:?}: python={python_ok} adapter={ours}"
+            );
+            if *python_ok {
+                valid += 1;
+            } else {
+                invalid += 1;
+            }
+        }
+        assert!(valid > 20 && invalid > 20, "corpus lost its edge cases");
+
+        // Python's json module accepts IEEE extension constants that strict
+        // RFC 8259 forbids; the adapter must keep rejecting them.
+        for doc in ["NaN", "Infinity", "-Infinity"] {
+            assert!(
+                parse_json(doc).is_err(),
+                "adapter must stay strict against Python extension {doc}"
+            );
         }
     }
 }
