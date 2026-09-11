@@ -726,11 +726,49 @@ fn intellij_command(command: &str) -> Result<String, String> {
         .map_err(|_| "IntelliJ agent executable path is not valid UTF-8".to_string())
 }
 
+fn backup_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(".bak");
+    path.with_file_name(name)
+}
+
+/// Write via a same-directory temp file plus rename, so readers (and a crash
+/// mid-write) can never observe a truncated settings file. The temp file is
+/// best-effort cleaned on failure.
+fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    let mut tmp = dir.join(format!(
+        ".{}.muse-acp.tmp.{}",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    let mut n = 0u32;
+    loop {
+        match std::fs::write(&tmp, contents) {
+            Ok(()) => break,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 8 => {
+                n += 1;
+                tmp = dir.join(format!(
+                    ".{}.muse-acp.tmp.{}.{n}",
+                    path.file_name().unwrap_or_default().to_string_lossy(),
+                    std::process::id()
+                ));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 fn write_backup(path: &std::path::Path) {
-    let mut bak = path.as_os_str().to_owned();
-    bak.push(".bak");
-    let bak_path = std::path::Path::new(&bak);
-    match std::fs::copy(path, bak_path) {
+    let bak_path = backup_path(path);
+    match std::fs::copy(path, &bak_path) {
         Ok(_) => println!("muse-acp: backup: {}", bak_path.display()),
         Err(e) => eprintln!(
             "muse-acp: warning: cannot write backup {}: {e}",
@@ -802,8 +840,16 @@ fn cmd_install(client: Client, o: &InstallerOpts) -> i32 {
         eprintln!("muse-acp: cannot create {}: {e}", parent.display());
         return 1;
     }
-    if let Err(e) = std::fs::write(&settings_path, &updated) {
+    if let Err(e) = write_atomic(&settings_path, &updated) {
         eprintln!("muse-acp: cannot write {}: {e}", settings_path.display());
+        // Roll back to the pre-edit content so a failed install never
+        // leaves a half-replaced settings file.
+        if !original.is_empty() && std::fs::write(&settings_path, &original).is_err() {
+            eprintln!(
+                "muse-acp: warning: rollback failed; restore from {}",
+                backup_path(&settings_path).display()
+            );
+        }
         return 1;
     }
     println!(
@@ -881,8 +927,16 @@ fn cmd_uninstall(client: Client, o: &InstallerOpts) -> i32 {
     if !o.no_backup {
         write_backup(&settings_path);
     }
-    if let Err(e) = std::fs::write(&settings_path, &updated) {
+    if let Err(e) = write_atomic(&settings_path, &updated) {
         eprintln!("muse-acp: cannot write {}: {e}", settings_path.display());
+        // Roll back to the pre-edit content so a failed install never
+        // leaves a half-replaced settings file.
+        if !original.is_empty() && std::fs::write(&settings_path, &original).is_err() {
+            eprintln!(
+                "muse-acp: warning: rollback failed; restore from {}",
+                backup_path(&settings_path).display()
+            );
+        }
         return 1;
     }
     println!(
@@ -958,6 +1012,43 @@ mod tests {
         assert!(path.is_absolute());
         assert!(path.is_file());
         assert!(intellij_command("relative/muse-acp").is_err());
+    }
+
+    fn temp_settings_path(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("muse-acp-atomic-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("tmpdir");
+        dir.join("settings.json")
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_files_and_creates_backup() {
+        let path = temp_settings_path("atomic");
+        std::fs::write(&path, "{\"theme\":\"x\"}").expect("seed settings");
+        let (updated, _) = install_settings_edit(
+            "{\"theme\":\"x\"}",
+            "muse-acp",
+            "/bin/muse-acp",
+            &env1(),
+            Client::Zed,
+        )
+        .unwrap();
+        write_backup(&path);
+        write_atomic(&path, &updated).expect("atomic write");
+
+        assert!(path.is_file(), "settings written");
+        assert!(backup_path(&path).is_file(), "backup written");
+        let dir = path.parent().unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".muse-acp.tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic write leaked temp files: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]

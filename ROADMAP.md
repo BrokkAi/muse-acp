@@ -784,6 +784,14 @@ Use Cargo package metadata for all adapter version strings.
 
 Keep editor installation conservative while expanding supported environments.
 
+Status: **atomic writes and rollback implemented.** Editor settings are
+replaced through a same-directory temp file plus rename, failed writes roll
+back to the pre-edit content (with the `.bak` path named if rollback itself
+fails), and a test pins that no temp files leak. Comment/sibling preservation,
+idempotency, and existing-file shapes were already covered; the README states
+the macOS/Linux installer scope and the Windows manual path. Remaining work:
+Windows installer automation when Muse supports it.
+
 **Work items**
 
 - Preserve comments, sibling settings, and rollback behavior.

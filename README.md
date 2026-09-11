@@ -228,8 +228,11 @@ the host supports the platform, and re-check `muse serve --help` on newer builds
 ## Editor setup
 
 Both installers preserve existing agent entries, are safe to re-run, and write
-a `.bak` file before changing an existing configuration. Use `--dry-run` to
-preview an edit.
+a `.bak` file before changing an existing configuration. Settings are replaced
+atomically (same-directory temp file plus rename) with rollback to the
+pre-edit content if the write fails. Use `--dry-run` to preview an edit.
+The installers target macOS and Linux; on Windows, place the binary on `PATH`
+and add the equivalent agent-server JSON by hand.
 
 ### IntelliJ IDEA and other JetBrains IDEs
 
