@@ -603,6 +603,47 @@ fn cli_readiness_lines() -> Vec<String> {
     vec![line]
 }
 
+/// A redacted support bundle: static diagnostics only. It deliberately
+/// never reads the environment wholesale or any workspace file, so users can
+/// paste it without leaking tokens or source. Secrets-bearing env vars are
+/// reported by name only when they are set.
+fn support_bundle() -> i32 {
+    println!("[muse-acp] support adapter={}", env!("CARGO_PKG_VERSION"));
+    for line in compat::selftest_lines(env!("CARGO_PKG_VERSION")) {
+        println!("[muse-acp] {line}");
+    }
+    for line in cli_readiness_lines() {
+        println!("[muse-acp] {line}");
+    }
+    // Adapter-relevant configuration, values shown only when they cannot be
+    // credentials. Unknown MUSE_* variables are listed by name, redacted.
+    let safe = [
+        "MUSE_CLI",
+        "MUSE_SERVE_ARGS",
+        "MUSE_APPROVAL_MODE",
+        "MUSE_COMMAND_TIMEOUT_MS",
+        "MUSE_TOOL_OUTPUT_LIMIT",
+        "MUSE_LOG",
+    ];
+    for key in safe {
+        let value = std::env::var(key).unwrap_or_default();
+        println!(
+            "[muse-acp] support-env {key}={}",
+            if value.is_empty() { "(unset)" } else { &value }
+        );
+    }
+    let mut others: Vec<String> = std::env::vars()
+        .map(|(k, _)| k)
+        .filter(|k| k.starts_with("MUSE_") && !safe.contains(&k.as_str()))
+        .collect();
+    others.sort();
+    for key in others {
+        println!("[muse-acp] support-env {key}=<redacted>");
+    }
+    println!("[muse-acp] support note=no tokens, credentials, or workspace files are included");
+    0
+}
+
 /// Restart a dead durable host and re-attach every known session.
 ///
 /// The Muse SDK's durability contract says a durable session's pending
@@ -772,6 +813,9 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.as_slice() == ["--selftest"] {
         std::process::exit(selftest());
+    }
+    if args.as_slice() == ["--support"] {
+        std::process::exit(support_bundle());
     }
     if let Some(exit_code) = zed::dispatch(&args) {
         std::process::exit(exit_code);
@@ -973,6 +1017,9 @@ fn steering_prompt_required(params: Option<&J>) -> Result<bool, String> {
 }
 
 fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, msg: &J) {
+    if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
+        msp::trace_method("acp<-client", method);
+    }
     let method = msg
         .get("method")
         .and_then(|v| v.as_str())

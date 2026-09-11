@@ -178,7 +178,8 @@ will be revisited.
 
 ```sh
 cargo build
-./target/debug/muse-acp --selftest
+./target/debug/muse-acp --selftest   # static + schema-compat + CLI probe
+./target/debug/muse-acp --support    # redacted support bundle (no secrets)
 ```
 
 `--selftest` validates the adapter's static payloads, prints the MSP schema
@@ -195,6 +196,7 @@ MUSE_SERVE_ARGS="--trust-workspace" # host-lifetime flags (see `muse serve --hel
 MUSE_APPROVAL_MODE=promptUnmatched  # allowAll|promptUnmatched|onRequest|denyUnmatched
 MUSE_COMMAND_TIMEOUT_MS=60000       # override host admission-ack timeout (milliseconds)
 MUSE_TOOL_OUTPUT_LIMIT=8000         # editor-facing tool output bound (characters)
+MUSE_LOG=debug                     # per-method protocol tracing (no payloads)
 # MUSE_ALLOW_UNSCOPED_READS=1       # DANGEROUS: allow local reads outside session cwd
 ```
 

@@ -801,6 +801,13 @@ Keep editor installation conservative while expanding supported environments.
 
 Make support reports reproducible without exposing secrets or workspace data.
 
+Status: **implemented.** `muse-acp --support` emits a redacted bundle
+(adapter version, compatibility table, CLI readiness, safe `MUSE_*`
+configuration; unknown `MUSE_*` variables by name only) and never reads the
+environment wholesale or workspace files. `MUSE_LOG=debug` adds per-method
+tracing in both directions (names only — never payloads, ids, or content);
+tests pin that prompt text cannot leak into trace output.
+
 **Work items**
 
 - Define concise default logs and richer opt-in diagnostics.

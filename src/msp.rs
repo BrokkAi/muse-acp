@@ -47,8 +47,25 @@ impl HandshakeInfo {
     }
 }
 
+/// Diagnostic level from `MUSE_LOG`: `normal` (default) or `debug`.
+/// Debug adds per-method tracing for protocol drift investigations; there is
+/// deliberately no payload logging, so tracing cannot leak file contents or
+/// credentials.
+pub fn debug_enabled() -> bool {
+    std::env::var("MUSE_LOG")
+        .map(|v| v.eq_ignore_ascii_case("debug"))
+        .unwrap_or(false)
+}
+
 pub fn log(msg: &str) {
     eprintln!("[muse-acp] {msg}");
+}
+
+/// Opt-in method tracing: names and ids only, never payloads.
+pub fn trace_method(direction: &str, method: &str) {
+    if debug_enabled() {
+        eprintln!("[muse-acp] trace {direction} method={method}");
+    }
 }
 
 pub enum MspEvent {
@@ -461,6 +478,7 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
             continue;
         }
         if !method.is_empty() {
+            trace_method("msp<-host", &method);
             let params = msg.get("params").cloned().unwrap_or(J::Null);
             if tx.send(MspEvent::Notification { method, params }).is_err() {
                 break;

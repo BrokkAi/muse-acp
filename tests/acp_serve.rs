@@ -3045,3 +3045,70 @@ fn client_disconnect_exits_promptly_with_a_turn_in_flight() {
         started.elapsed()
     );
 }
+
+#[test]
+fn support_bundle_redacts_unknown_muse_env_values() {
+    let out = std::process::Command::new(adapter_bin())
+        .arg("--support")
+        .env("MUSE_SECRET_TOKEN", "super-secret-value")
+        .env("MUSE_TOOL_OUTPUT_LIMIT", "1234")
+        .output()
+        .expect("support bundle");
+    assert!(out.status.success(), "support must succeed: {out:?}");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("support adapter="), "version missing: {text}");
+    assert!(
+        text.contains("schema-compat"),
+        "compat table missing: {text}"
+    );
+    assert!(
+        text.contains("cli-ready binary="),
+        "cli probe missing: {text}"
+    );
+    assert!(
+        text.contains("MUSE_TOOL_OUTPUT_LIMIT=1234"),
+        "safe values must be visible: {text}"
+    );
+    assert!(
+        text.contains("MUSE_SECRET_TOKEN=<redacted>"),
+        "unknown MUSE_* values must be redacted: {text}"
+    );
+    assert!(
+        !text.contains("super-secret-value"),
+        "secret leaked into bundle: {text}"
+    );
+    assert!(
+        text.contains("no tokens, credentials, or workspace files"),
+        "redaction note missing: {text}"
+    );
+}
+
+#[test]
+fn debug_tracing_names_methods_without_payloads() {
+    let mut c = Client::spawn("happy", &[("MUSE_LOG", "debug")]);
+    let sid = c.new_session(1, "");
+    c.wait_stderr(
+        "trace acp<-client method=initialize",
+        Duration::from_secs(10),
+    );
+    c.wait_stderr(
+        "trace acp<-client method=session/new",
+        Duration::from_secs(10),
+    );
+    // The prompt text must never appear in trace output.
+    let _pid = c.prompt(&sid, "totally-private-prompt-text");
+    c.wait_stderr(
+        "trace acp<-client method=session/prompt",
+        Duration::from_secs(10),
+    );
+    c.wait_stderr(
+        "trace msp<-host method=turn/completed",
+        Duration::from_secs(10),
+    );
+    let log = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
+    assert!(
+        !log.contains("totally-private-prompt-text"),
+        "tracing leaked payload text: {log}"
+    );
+    c.finish();
+}
