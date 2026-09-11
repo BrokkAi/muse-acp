@@ -10,3 +10,8 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+
+[dev-dependencies]
+# Test-only schema validation against the vendored MSP bundle; the shipped
+# binary remains dependency-free.
+serde_json = "1"

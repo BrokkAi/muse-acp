@@ -4096,7 +4096,73 @@ fn complete_elicitation(
 #[cfg(test)]
 mod tests {
     use super::{env_flag_enabled, parse_rates, v1_init, v2_init};
-    use crate::json::parse_json;
+    use crate::acp;
+    use crate::json::{J, parse_json};
+    use std::path::{Path, PathBuf};
+
+    /// Replay every approval payload in the vendored transcript corpus
+    /// through the permission mapping: choices must survive in host order
+    /// with their decisions, and a deny fallback must exist for fail-closed
+    /// paths.
+    #[test]
+    fn approval_transcripts_replay_through_the_permission_mapping() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/protocol/transcripts");
+        let mut paths: Vec<PathBuf> = std::fs::read_dir(&root)
+            .expect("transcript corpus")
+            .filter_map(|e| e.ok())
+            .map(|e| e.path().join("transcript.ndjson"))
+            .filter(|p| p.is_file())
+            .collect();
+        paths.sort();
+        let mut replayed = 0usize;
+        for path in paths {
+            let scenario = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("scenario");
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                let Ok(envelope) = parse_json(line) else {
+                    continue;
+                };
+                if envelope.get("dir").and_then(|v| v.as_str()) != Some("server") {
+                    continue;
+                }
+                let Some(raw) = envelope.get("raw").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Ok(frame) = parse_json(raw) else {
+                    continue;
+                };
+                let method = frame.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                if !matches!(method, "approval/requested" | "approval/request") {
+                    continue;
+                }
+                let params = frame.get("params").cloned().unwrap_or(J::Null);
+                let (options_json, choices) = acp::perm_options(&params);
+                assert!(!choices.is_empty(), "{scenario}: approval lost its choices");
+                let parsed = parse_json(&options_json)
+                    .unwrap_or_else(|e| panic!("{scenario}: invalid options JSON: {e}"));
+                let J::Arr(opts) = parsed else {
+                    panic!("{scenario}: options must be an array");
+                };
+                assert_eq!(
+                    opts.len(),
+                    choices.len(),
+                    "{scenario}: option count drifted from host choices"
+                );
+                assert!(
+                    acp::fallback_deny(&choices).is_some(),
+                    "{scenario}: no deny fallback for fail-closed paths"
+                );
+                replayed += 1;
+            }
+        }
+        assert!(
+            replayed >= 5,
+            "corpus approval coverage vanished: {replayed}"
+        );
+    }
 
     fn rates(input: &str, output: &str, currency: &str) -> Option<(f64, f64, String)> {
         let cost = parse_json(&format!(

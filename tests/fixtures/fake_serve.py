@@ -715,6 +715,12 @@ def main():
         method = msg.get("method", "")
         ident = msg.get("id")
         log_method(method or "(response)")
+        # Every client->host request frame, method-tagged, for conformance
+        # validation against the vendored schema bundle.
+        if method and LOG:
+            with open(os.environ.get("FAKE_FRAMES", ""), "a") as f:
+                f.write(json.dumps({"method": method,
+                                    "params": msg.get("params", {})}) + "\n")
         if not method and ident == "srv-77":
             # The adapter's reply to the fixture's unknown server request.
             log_method("unknown-request-reply:" + json.dumps(msg))

@@ -54,6 +54,7 @@ impl Client {
         cmd.env("FAKE_SCENARIO", scenario);
         cmd.env("FAKE_LOG", &fake_log);
         cmd.env("FAKE_INPUT", format!("{fake_log}.input"));
+        cmd.env("FAKE_FRAMES", format!("{fake_log}.frames"));
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -2775,4 +2776,160 @@ fn host_restart_settles_orphaned_in_flight_turns() {
     );
     c.finish();
     let _ = std::fs::remove_file(&marker);
+}
+
+/// Validate every adapter→host request frame against the vendored MSP schema
+/// bundle: required fields must be present and property types must match.
+/// This is the CI gate that catches protocol drift in what we emit, not just
+/// what we receive.
+#[test]
+fn emitted_frames_conform_to_the_vendored_schema() {
+    let schema_text = std::fs::read_to_string(format!(
+        "{}/tests/protocol/stable/msp.schema.json",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("vendored schema bundle");
+    let schema: serde_json::Value = serde_json::from_str(&schema_text).expect("schema JSON");
+    let defs = schema["$defs"].as_object().expect("$defs");
+
+    let def_for = |method: &str| -> Option<&serde_json::Value> {
+        let name = match method {
+            "initialize" => "InitializeParams",
+            "session/start" => "SessionStartParams",
+            "session/resume" => "SessionResumeParams",
+            "session/list" => "SessionListParams",
+            "session/read" => "SessionReadParams",
+            "session/fork" => "SessionForkParams",
+            "session/compact" => "SessionCompactParams",
+            "session/setModel" => "SessionSetModelParams",
+            "session/setApprovalMode" => "SessionSetApprovalModeParams",
+            "session/userShell" => "SessionUserShellParams",
+            "model/list" => "ModelListParams",
+            "turn/start" => "TurnStartParams",
+            "turn/steer" => "TurnSteerParams",
+            "turn/cancel" => "TurnCancelParams",
+            "turn/unqueue" => "TurnUnqueueParams",
+            "approval/decide" => "ApprovalDecideParams",
+            "approval/listPending" => "ApprovalListPendingParams",
+            "userInput/answer" => "UserInputAnswerParams",
+            "userInput/cancel" => "UserInputCancelParams",
+            "userInput/clarify" => "UserInputClarifyParams",
+            "view/page" => "ViewPageParams",
+            "view/unsubscribe" => "ViewUnsubscribeParams",
+            "subagent/sendMessage" | "subagent/followupTask" => "SubagentInputParams",
+            "subagent/interrupt" | "subagent/stop" | "subagent/close" => {
+                "SubagentOwnerReasonParams"
+            }
+            "subagent/resume" | "subagent/reopen" | "subagent/readResult" => "SubagentTargetParams",
+            _ => return None,
+        };
+        defs.get(name)
+    };
+
+    let type_matches = |value: &serde_json::Value, schema_type: &str| -> bool {
+        match schema_type {
+            "string" => value.is_string(),
+            "boolean" => value.is_boolean(),
+            "integer" => value.is_i64() || value.is_u64(),
+            "number" => value.is_number(),
+            "array" => value.is_array(),
+            "object" => value.is_object(),
+            "null" => value.is_null(),
+            _ => true, // unknown/future schema vocabulary: tolerate
+        }
+    };
+
+    // Drive one broad session touching the main command families.
+    let mut c = Client::spawn("approval", &[]);
+    let caps = ",\"capabilities\":{\"elicitation\":{\"form\":{}},\"subagents\":{}}";
+    let sid = c.new_session(2, caps);
+    let _pid = c.prompt(&sid, "needs approval");
+    c.wait_for("session/request_permission", Duration::from_secs(15));
+    // Answer the permission (approval/decide) via the fail-closed deny path.
+    {
+        let frames = c.frames.lock().unwrap().clone();
+        let frame = frames
+            .iter()
+            .find(|f| f.contains("session/request_permission"))
+            .expect("permission frame");
+        let perm_id = extract_str(frame, "id").expect("permission request id");
+        c.respond_error(&perm_id);
+    }
+    c.wait_for("\"idle\"", Duration::from_secs(15));
+
+    // Reattach + fork + compact + selectors round out the method coverage.
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    let fid = c.req(
+        "session/fork",
+        &format!("{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageId\":\"msg-fork\"}}}}}}}}}}"),
+    );
+    c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
+    let cid = c.prompt(&sid, "/compact");
+    c.wait_for(&format!("\"id\":{cid}"), Duration::from_secs(15));
+    let oid = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"model\",\"value\":\"fake-model\"}}"),
+    );
+    c.wait_for(&format!("\"id\":{oid}"), Duration::from_secs(15));
+    c.req("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frames_path = format!("{}.frames", c.fake_log);
+    c.finish();
+
+    let frames_text = std::fs::read_to_string(&frames_path).expect("adapter frame log");
+    let mut validated = 0usize;
+    let mut methods = std::collections::BTreeSet::new();
+    for line in frames_text.lines().filter(|l| !l.is_empty()) {
+        let frame: serde_json::Value = serde_json::from_str(line)
+            .unwrap_or_else(|e| panic!("frame log line is not JSON ({e}): {line}"));
+        let method = frame["method"].as_str().expect("method");
+        let params = &frame["params"];
+        methods.insert(method.to_string());
+        let Some(def) = def_for(method) else {
+            // Unknown-to-us methods must still be valid JSON objects.
+            assert!(params.is_object(), "{method} params must be an object");
+            continue;
+        };
+        if let Some(required) = def["required"].as_array() {
+            for field in required {
+                let name = field.as_str().expect("required field name");
+                assert!(
+                    params.get(name).is_some(),
+                    "{method} is missing required field {name}: {params}"
+                );
+            }
+        }
+        if let Some(props) = def["properties"].as_object() {
+            for (name, prop) in props {
+                if let Some(value) = params.get(name)
+                    && let Some(t) = prop["type"].as_str()
+                {
+                    assert!(
+                        type_matches(value, t),
+                        "{method}.{name} must be {t}: {params}"
+                    );
+                }
+            }
+        }
+        validated += 1;
+    }
+    // The session must have exercised a meaningful command surface.
+    for expected in [
+        "initialize",
+        "session/start",
+        "session/resume",
+        "session/fork",
+        "session/read",
+        "session/compact",
+        "session/setModel",
+        "turn/start",
+        "approval/decide",
+        "approval/listPending",
+    ] {
+        assert!(
+            methods.contains(expected),
+            "conformance flow never emitted {expected}; methods: {methods:?}"
+        );
+    }
+    assert!(validated >= 10, "too few frames validated: {validated}");
 }
