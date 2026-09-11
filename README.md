@@ -155,10 +155,24 @@ used to have. Only a failed refresh retains the previous rates. Completions
 already added to a session's running estimate keep the price they were charged
 at; a rate change never re-prices history.
 
+### Client-provided MCP policy
+
 JetBrains may attach its integrated stdio MCP server to `session/new` even when
-the agent advertises no optional MCP transports. The adapter currently ignores
-client-provided MCP servers because Muse owns its tool runtime; their presence
-does not prevent the session or its selectors from starting.
+the agent advertises no optional MCP transports (stdio, HTTP, and SSE are all
+reported unsupported). This adapter deliberately does not forward client MCP
+configuration:
+
+- Muse owns its tool runtime, approval flow, and sandbox; a forwarded client
+  server would run tools outside Muse's permission system.
+- MSP v1 has no method to register foreign tool providers, so any forwarding
+  would be an emulation rather than a protocol mapping.
+- Ignoring the configuration is logged (`ignoring client-provided MCP
+  servers`) so the absence of those tools is diagnosable rather than silent.
+
+Their presence never blocks the session or its selectors. To use MCP tools,
+configure them in Muse itself; if MSP later gains a native foreign-tool
+surface that preserves Muse approvals and workspace confinement, this policy
+will be revisited.
 
 ## Run
 

@@ -257,6 +257,12 @@ and browserless-login guidance.
 Client MCP configuration is currently tolerated but not forwarded. This should
 be an explicit product decision.
 
+Status: **policy decided and documented.** Client MCP servers are tolerated
+but never forwarded: Muse owns the tool runtime, approvals, and sandbox, and
+MSP v1 exposes no foreign-tool registration. Every drop is logged, the README
+states the policy and its reasoning, and forwarding stays a non-goal until MSP
+offers a path that cannot widen permissions.
+
 **Work items**
 
 - Document why client-provided MCP is ignored.
