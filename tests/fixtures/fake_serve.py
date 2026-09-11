@@ -242,6 +242,10 @@ def on_turn_start(params):
             "args": {"path": "/tmp/ht"}, "result": "short bounded text",
             "truncated": True}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "host_exit_quiet":
+        # Crash immediately after the turn/start ack: the turn is in flight
+        # when the host dies, and the replacement host reports an idle fold.
+        CRASH_AFTER_ACK[0] = True
     elif SCENARIO == "host_exit":
         # Complete the turn, then die like a crashed host once the ack is on
         # the wire: the adapter must restart, re-attach, and keep serving.
@@ -688,7 +692,7 @@ def scenario_after_restart():
     """host_exit is a one-shot: the first process creates the marker and
     crashes; the replacement process sees the marker and behaves sanely."""
     marker = os.environ.get("FAKE_RESTART_MARKER", "")
-    if SCENARIO == "host_exit" and marker:
+    if SCENARIO in ("host_exit", "host_exit_quiet") and marker:
         if os.path.exists(marker):
             return "happy"
         with open(marker, "w") as f:

@@ -550,9 +550,77 @@ fn cli_readiness_lines() -> Vec<String> {
 /// The Muse SDK's durability contract says a durable session's pending
 /// terminals arrive on resume, so in-flight ACP prompts are deliberately left
 /// open: the re-attached view settles them. Returns the new host on success.
+/// After a reattach, every in-flight ACP prompt must correspond to a turn the
+/// host still knows (the active turn or a queued one) or settle explicitly.
+/// A prompt whose turn vanished from the folded state is settled `cancelled`
+/// with a log line — never left hanging and never reported as success.
+fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str, r: &J) {
+    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(active) = r
+        .get("session")
+        .and_then(|s| s.get("activeTurnId"))
+        .and_then(|v| v.as_str())
+        && !active.is_empty()
+    {
+        known.insert(active.to_string());
+    }
+    if let Some(state) = snapshot_state(r) {
+        if let Some(turn) = state.get("activeTurn").and_then(|t| t.get("turnId"))
+            && let Some(id) = turn.as_str().filter(|s| !s.is_empty())
+        {
+            known.insert(id.to_string());
+        }
+        if let Some(J::Arr(queued)) = state.get("queuedTurns") {
+            for t in queued {
+                if let Some(id) = t
+                    .get("turnId")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    known.insert(id.to_string());
+                }
+            }
+        }
+    }
+    let (settled, rest, ver) = {
+        let mut map = sessions.lock().unwrap();
+        match map.get_mut(acp_sid) {
+            Some(sess) => {
+                let mut settled = Vec::new();
+                let mut kept = Vec::new();
+                for f in sess.in_flight.drain(..) {
+                    if known.contains(&f.msp_turn) {
+                        kept.push(f);
+                    } else {
+                        settled.push(f);
+                    }
+                }
+                sess.in_flight = kept;
+                let rest = sess.in_flight.len();
+                (settled, rest, sess.ver)
+            }
+            None => (Vec::new(), 0, 1),
+        }
+    };
+    for f in settled {
+        log(&format!(
+            "reattach reconciliation: turn {} absent from the folded state; prompt settled as cancelled",
+            f.msp_turn
+        ));
+        if ver == 2 {
+            if rest == 0 {
+                acp::send_state(stdout, acp_sid, "idle", Some("cancelled"));
+            }
+        } else {
+            acp::send_result(stdout, &Some(f.req_id), "{\"stopReason\":\"cancelled\"}");
+        }
+    }
+}
+
 fn restart_durable_host(
     old: &Arc<MspHost>,
     tx: &mpsc::Sender<LoopMsg>,
+    stdout: &StdoutShared,
     sessions: &Sessions,
 ) -> Result<Arc<MspHost>, String> {
     // Snapshot the attach list first; host calls must happen unlocked.
@@ -613,6 +681,9 @@ fn restart_durable_host(
                                     }
                                 }
                             }
+                            // Prompts whose turns no longer exist in the
+                            // reattached fold must settle, not hang forever.
+                            reconcile_in_flight(stdout, sessions, msp_sid, &r);
                         }
                         Err(e) => failures.push(format!("{msp_sid}: {}", err_message(&e))),
                     }
@@ -744,7 +815,7 @@ fn main() {
                 // terminals arrive on resume. Ephemeral or unrecognized
                 // profiles get no such guarantee, so they fail closed.
                 if host.handshake().restartable() {
-                    match restart_durable_host(&host, &tx, &sessions) {
+                    match restart_durable_host(&host, &tx, &stdout, &sessions) {
                         Ok(new_host) => {
                             host = new_host;
                             // Reissued requests arrive on the new view; pull
@@ -1323,6 +1394,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         }
                         acp::send_usage(stdout, entry, pressure.as_deref());
                     }
+                    // One-to-one with the folded active/queued turns, or an
+                    // explicit cancelled settlement for anything orphaned.
+                    reconcile_in_flight(stdout, sessions, &sid, &r);
                     // Outside the lock: this reads back from the host.
                     backfill_usage(host, stdout, sessions, &sid);
                     // Reissued server requests are the primary pending

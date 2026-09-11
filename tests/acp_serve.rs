@@ -2618,3 +2618,63 @@ fn selftest_reports_cli_readiness_without_gating() {
         "unready probe missing: {text}"
     );
 }
+
+#[test]
+fn reattach_settles_prompts_whose_turns_left_the_fold() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "orphan me");
+    // Leave the prompt open, then reattach: the folded state reports neither
+    // an active nor a queued turn, so the prompt must settle explicitly.
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let resume_frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(
+        resume_frame.contains("\"result\""),
+        "resume failed: {resume_frame}"
+    );
+    let settled = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        settled.contains("\"stopReason\":\"cancelled\""),
+        "orphaned prompt must settle cancelled: {settled}"
+    );
+    c.wait_stderr(
+        "absent from the folded state; prompt settled as cancelled",
+        Duration::from_secs(10),
+    );
+    c.finish();
+}
+
+#[test]
+fn host_restart_settles_orphaned_in_flight_turns() {
+    let marker = std::env::temp_dir().join(format!(
+        "muse-acp-restart-quiet-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let marker_str = marker.to_str().unwrap().to_string();
+    let mut c = Client::spawn(
+        "host_exit_quiet",
+        &[("FAKE_RESTART_MARKER", marker_str.as_str())],
+    );
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "in flight when we crash");
+    // The host dies with the turn unresolved; the replacement reports idle.
+    c.wait_stderr(
+        "host-restarted attempt=1 sessions=1 failures=0",
+        Duration::from_secs(10),
+    );
+    let settled = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        settled.contains("\"stopReason\":\"cancelled\""),
+        "restart must settle orphaned prompts: {settled}"
+    );
+    c.wait_stderr(
+        "absent from the folded state; prompt settled as cancelled",
+        Duration::from_secs(10),
+    );
+    c.finish();
+    let _ = std::fs::remove_file(&marker);
+}
