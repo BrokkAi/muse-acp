@@ -88,9 +88,178 @@ pub struct AcpSession {
     /// Per-child folds for negotiated native subagent sessions, keyed by the
     /// MSP child session id. Holds replayed child history dedup state.
     pub child_folds: HashMap<String, SessionFold>,
+    /// Per-turn `session/tokenUsage` legs, keyed by MSP turn id. Drained when
+    /// the turn settles; bounded so turns that never settle cannot grow it
+    /// without limit.
+    pub turn_usage: Vec<TurnUsage>,
 }
 
 pub type Sessions = Arc<Mutex<HashMap<String, AcpSession>>>;
+
+/// How many unsettled turns keep their accumulated legs.
+const TURN_USAGE_KEEP: usize = 16;
+
+/// One turn's token counters in ACP v1 `Usage` terms.
+///
+/// `input` is MSP's counted-once `promptTokens` (cached input already inside
+/// it, under the provider's own cache convention) and `output` is
+/// `totalTokens - promptTokens`, so reasoning tokens are already inside
+/// `output`. The optional members stay `None` until a leg reports them: an
+/// absent counter is never sent as zero.
+#[derive(Default, Clone)]
+pub struct UsageTotals {
+    pub total: u64,
+    pub input: u64,
+    pub output: u64,
+    pub thought: Option<u64>,
+    pub cached_read: Option<u64>,
+    pub cached_write: Option<u64>,
+}
+
+fn add_opt(slot: &mut Option<u64>, add: Option<u64>) {
+    if let Some(v) = add {
+        *slot = Some(slot.unwrap_or(0).saturating_add(v));
+    }
+}
+
+impl UsageTotals {
+    fn add(&mut self, leg: &UsageTotals) {
+        self.total = self.total.saturating_add(leg.total);
+        self.input = self.input.saturating_add(leg.input);
+        self.output = self.output.saturating_add(leg.output);
+        add_opt(&mut self.thought, leg.thought);
+        add_opt(&mut self.cached_read, leg.cached_read);
+        add_opt(&mut self.cached_write, leg.cached_write);
+    }
+
+    /// The ACP `Usage` members, without the surrounding braces.
+    fn members(&self) -> String {
+        let mut s = format!(
+            "\"totalTokens\":{},\"inputTokens\":{},\"outputTokens\":{}",
+            self.total, self.input, self.output
+        );
+        for (key, value) in [
+            ("thoughtTokens", self.thought),
+            ("cachedReadTokens", self.cached_read),
+            ("cachedWriteTokens", self.cached_write),
+        ] {
+            if let Some(v) = value {
+                s.push_str(&format!(",\"{key}\":{v}"));
+            }
+        }
+        s
+    }
+}
+
+/// Accumulated `session/tokenUsage` legs for one MSP turn.
+pub struct TurnUsage {
+    pub turn_id: String,
+    /// Model completions folded in (view-cursor replays excluded).
+    pub calls: u64,
+    /// Summed `durationMs`; `None` until a leg reports one.
+    pub duration_ms: Option<u64>,
+    pub totals: UsageTotals,
+    /// Per-model breakdown in first-seen order. A leg with no `modelId` is
+    /// counted in `totals` and left out here — the adapter never invents a
+    /// model name for it.
+    pub by_model: Vec<(String, UsageTotals)>,
+}
+
+impl TurnUsage {
+    pub fn new(turn_id: &str) -> Self {
+        Self {
+            turn_id: turn_id.to_string(),
+            calls: 0,
+            duration_ms: None,
+            totals: UsageTotals::default(),
+            by_model: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, model: Option<&str>, duration_ms: Option<u64>, leg: &UsageTotals) {
+        self.calls = self.calls.saturating_add(1);
+        add_opt(&mut self.duration_ms, duration_ms);
+        self.totals.add(leg);
+        if let Some(m) = model.filter(|m| !m.is_empty()) {
+            match self.by_model.iter_mut().find(|(id, _)| id == m) {
+                Some((_, totals)) => totals.add(leg),
+                None => self.by_model.push((m.to_string(), leg.clone())),
+            }
+        }
+    }
+
+    /// The `"usage":{...}` member for a v1 prompt result, comma-prefixed.
+    /// Empty when no leg landed: a turn with no reported usage carries no
+    /// usage at all rather than a row of zeros.
+    pub fn result_member(&self) -> String {
+        if self.calls == 0 {
+            return String::new();
+        }
+        let mut muse = format!("\"modelCalls\":{}", self.calls);
+        if let Some(ms) = self.duration_ms {
+            muse.push_str(&format!(",\"apiDurationMs\":{ms}"));
+        }
+        if !self.by_model.is_empty() {
+            let per = self
+                .by_model
+                .iter()
+                .map(|(id, t)| format!("{}:{{{}}}", esc(id), t.members()))
+                .collect::<Vec<_>>()
+                .join(",");
+            muse.push_str(&format!(",\"modelUsage\":{{{per}}}"));
+        }
+        format!(
+            ",\"usage\":{{{},\"_meta\":{{\"mjolnir.dev/usage-scope\":\"turn\",\"muse\":{{{muse}}}}}}}",
+            self.totals.members()
+        )
+    }
+}
+
+/// Fold one `session/tokenUsage` leg into its turn's accumulator.
+///
+/// Totals use the server-derived counted-once `promptTokens`/`totalTokens`
+/// (MSP SS4.6.5: clients sum these and never re-derive the provider's cache
+/// convention); the raw `usage` block supplies only the reasoning and cache
+/// counters. `cachedReadTokens` prefers `cacheReadTokens` and falls back to
+/// `cachedTokens` for providers that do not split reads from writes; MSP has
+/// no second cache-write counter, so `cachedWriteTokens` stays absent unless
+/// the host reports one.
+pub fn record_turn_leg(s: &mut AcpSession, turn_id: &str, params: &J) {
+    if turn_id.is_empty() {
+        return;
+    }
+    let num = |v: Option<&J>| v.and_then(|v| v.as_u64());
+    let prompt = num(params.get("promptTokens")).unwrap_or(0);
+    let total = num(params.get("totalTokens")).unwrap_or(0);
+    let raw = params.get("usage");
+    let raw_num = |key: &str| num(raw.and_then(|u| u.get(key)));
+    let leg = UsageTotals {
+        total,
+        input: prompt,
+        output: total.saturating_sub(prompt),
+        thought: raw_num("reasoningTokens"),
+        cached_read: raw_num("cacheReadTokens").or_else(|| raw_num("cachedTokens")),
+        cached_write: raw_num("cacheWriteTokens"),
+    };
+    let model = params.get("modelId").and_then(|v| v.as_str());
+    let duration = num(params.get("durationMs"));
+    if let Some(entry) = s.turn_usage.iter_mut().find(|t| t.turn_id == turn_id) {
+        entry.record(model, duration, &leg);
+        return;
+    }
+    let mut entry = TurnUsage::new(turn_id);
+    entry.record(model, duration, &leg);
+    s.turn_usage.push(entry);
+    if s.turn_usage.len() > TURN_USAGE_KEEP {
+        s.turn_usage.remove(0);
+    }
+}
+
+/// Take a settled turn's accumulated legs, if any arrived.
+pub fn take_turn_usage(s: &mut AcpSession, turn_id: &str) -> Option<TurnUsage> {
+    let pos = s.turn_usage.iter().position(|t| t.turn_id == turn_id)?;
+    Some(s.turn_usage.remove(pos))
+}
 
 pub fn send_raw(stdout: &StdoutShared, line: &str) {
     let mut out = stdout.lock().unwrap_or_else(|p| p.into_inner());

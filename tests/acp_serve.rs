@@ -370,6 +370,75 @@ fn usage_events_forward_msp_usage_as_acp_usage_update() {
 }
 
 #[test]
+fn prompt_result_reports_the_turns_summed_token_usage() {
+    // The ACP client reports usage per turn, which the session cumulative
+    // cannot give it: the v1 prompt result carries the turn's own legs.
+    let mut c = Client::spawn("usage_turn", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"end_turn\""),
+        "terminal: {done}"
+    );
+    // 1500 + 700 counted once; the replayed cur-3 leg must not be added.
+    assert!(
+        done.contains("\"totalTokens\":2200")
+            && done.contains("\"inputTokens\":1400")
+            && done.contains("\"outputTokens\":800"),
+        "summed turn totals: {done}"
+    );
+    assert!(
+        done.contains("\"thoughtTokens\":60")
+            && done.contains("\"cachedReadTokens\":200")
+            && done.contains("\"cachedWriteTokens\":30"),
+        "optional counters summed from the raw MSP block: {done}"
+    );
+    assert!(
+        done.contains("\"mjolnir.dev/usage-scope\":\"turn\"")
+            && done.contains("\"modelCalls\":2")
+            && done.contains("\"apiDurationMs\":2000"),
+        "turn-scope meta with the model-call count and wall time: {done}"
+    );
+    assert!(
+        done.contains(
+            "\"modelUsage\":{\"fake-model\":{\"totalTokens\":1500,\"inputTokens\":1000,\"outputTokens\":500,\"thoughtTokens\":50,\"cachedReadTokens\":200,\"cachedWriteTokens\":30},\"other-model\":{\"totalTokens\":700,\"inputTokens\":400,\"outputTokens\":300,\"thoughtTokens\":10,\"cachedReadTokens\":0}}"
+        ),
+        "per-model breakdown keyed by both models: {done}"
+    );
+    c.finish();
+}
+
+#[test]
+fn a_cancelled_prompt_result_still_reports_what_the_turn_spent() {
+    let mut c = Client::spawn("usage_turn_cancelled", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"cancelled\"") && done.contains("\"totalTokens\":1500"),
+        "cancelled result carries the recorded leg: {done}"
+    );
+    c.finish();
+}
+
+#[test]
+fn a_turn_with_no_reported_usage_carries_no_usage() {
+    // No fabricated zeros: a turn the host never reported usage for settles
+    // with a bare stopReason.
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"end_turn\""),
+        "terminal: {done}"
+    );
+    assert!(!done.contains("\"usage\""), "no usage member: {done}");
+    c.finish();
+}
+
+#[test]
 fn gap_refill_does_not_price_a_replayed_completion_twice() {
     // view/gap pages forward from the last cursor, so a completion in that
     // page can also be queued on the live stream. Cumulative totals are

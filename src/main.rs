@@ -1362,6 +1362,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             goal_meta: None,
                             branch_meta: None,
                             child_folds: HashMap::new(),
+                            turn_usage: Vec::new(),
                         },
                     );
                     // _meta exposes the host session id: pass it back to
@@ -1560,6 +1561,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             goal_meta: None,
                             branch_meta: None,
                             child_folds: HashMap::new(),
+                            turn_usage: Vec::new(),
                         });
                         entry.msp_sid = real_msp;
                         entry.ver = ver;
@@ -1842,6 +1844,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             goal_meta: None,
                             branch_meta: None,
                             child_folds: HashMap::new(),
+                            turn_usage: Vec::new(),
                         });
                         entry.msp_sid = new_msp.clone();
                         entry.ver = ver;
@@ -2654,10 +2657,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                                 .and_then(|e| e.get("mode"))
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string());
-                            let m = folded
-                                .as_deref()
-                                .or(Some(m))
-                                .unwrap_or("promptUnmatched");
+                            let m = folded.as_deref().or(Some(m)).unwrap_or("promptUnmatched");
                             let m = acp::mode_from_msp(m);
                             if let Some(s) = sessions
                                 .lock()
@@ -3360,9 +3360,16 @@ fn handle_msp(
                     let ver = s.ver;
                     let req_id = pos.map(|p| s.in_flight.remove(p).req_id);
                     let rest = s.in_flight.len();
-                    (req_id, ver, rest)
+                    // The turn's model-call legs, summed. Every completion's
+                    // `session/tokenUsage` is folded from a durable record
+                    // that precedes this terminal record, so they have all
+                    // arrived by now; a turn that reported none carries none.
+                    let usage = acp::take_turn_usage(s, turn_id)
+                        .map(|u| u.result_member())
+                        .unwrap_or_default();
+                    (req_id, ver, rest, usage)
                 });
-            if let Some((req_id, ver, rest)) = settled {
+            if let Some((req_id, ver, rest, usage)) = settled {
                 let stop = fold::stop_reason(terminal);
                 let failed = terminal != "completed" && terminal != "cancelled";
                 if ver == 2 {
@@ -3396,7 +3403,7 @@ fn handle_msp(
                             acp::send_result(
                                 stdout,
                                 &Some(req_id),
-                                &format!("{{\"stopReason\":\"{stop}\"}}"),
+                                &format!("{{\"stopReason\":\"{stop}\"{usage}}}"),
                             );
                         } else {
                             acp::send_error(stdout, &Some(req_id), -32603, &terminal_detail);
@@ -3760,6 +3767,16 @@ fn handle_msp(
                     if let Some(c) = params.get("cumulative") {
                         adopt_cumulative(s, c);
                     }
+                    // Per-turn totals for the v1 prompt result: the ACP client
+                    // reports usage per turn, which the session cumulative
+                    // cannot give it. Accumulated here, drained when the turn
+                    // settles.
+                    let usage_turn = params
+                        .get("turnId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    acp::record_turn_leg(s, &usage_turn, params);
                     // Client-local cost math: price *this* completion's
                     // counted-once `promptTokens`/`totalTokens` at the rates
                     // of the model that produced it, and add to the running

@@ -105,7 +105,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | --- | --- |
 | `item/delta` (message text) | `agent_message_chunk` (v2 carries `messageId`) |
 | toolCall `item/started\|updated\|completed` | `tool_call` (v1 create) / `tool_call_update` upsert with kind/title/status/content/rawInput |
-| `turn/completed` | v1 `session/prompt` response `{stopReason}`; v2 `state_update` idle + `stopReason` |
+| `turn/completed` | v1 `session/prompt` response `{stopReason}` plus the turn's `usage` when the host reported any; v2 `state_update` idle + `stopReason` |
 | `turn/cancel` | `session/cancel` (waits for the terminal event; `already_terminal` = success) |
 | `approval/requested` + `approval/request` | `session/request_permission` → `approval/decide` (deny-safe fallback) |
 | `session/resume` + history | `session/resume` (+ `replayFrom: {type:start}` replays messages); usage is restored on attach: from `history.snapshot.state` when a snapshot is served, else by asking for the snapshot rung explicitly, else from one backward `view/page` read for the running totals |
@@ -300,7 +300,20 @@ muse-acp uninstall
 ## Protocol notes
 
 - v2 `session/prompt` replies `{}` on accept; completion is the terminal
-  `state_update`. v1 replies `{stopReason}`.
+  `state_update`. v1 replies `{stopReason}`, plus a `usage` object when the
+  host reported token usage for that turn. `usage` sums the turn's
+  `session/tokenUsage` legs (each counted once, replays excluded) into the
+  ACP v1 shape: `totalTokens`, `inputTokens`, `outputTokens`, and the
+  optional `thoughtTokens`, `cachedReadTokens`, `cachedWriteTokens`.
+  `inputTokens` is MSP's counted-once `promptTokens`, so cached input is
+  already inside it and reasoning tokens are already inside `outputTokens`;
+  a counter the host never reported is omitted rather than sent as zero, and
+  a turn with no reported usage carries no `usage` at all.
+  `usage._meta` adds `"mjolnir.dev/usage-scope": "turn"` and a `muse` block
+  with `modelCalls`, `apiDurationMs` (summed `durationMs`), and `modelUsage`,
+  the same counters per model id. A leg with no `modelId` counts in the
+  totals and is left out of `modelUsage`. v2 sessions are unchanged: they
+  settle through `state_update`, which carries no usage member.
 - v2 initialization advertises steering at `_meta.steering.supported`. The
   `_session/steering` request accepts the same `sessionId` and `prompt` fields
   as `session/prompt`. `_meta.steering.idleBehavior: "promptRequired"` avoids

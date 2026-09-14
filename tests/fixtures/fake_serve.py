@@ -24,6 +24,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   resume_active session/resume reports a running turn (for steering reattach)
   catalog_grows model/list expands after the first snapshot
   catalog_refresh_failure valid catalog, malformed response, RPC error, empty catalog
+  usage_turn   two model legs from two models plus a replayed leg, one turn
+  usage_turn_cancelled one model leg, then a cancelled terminal
   usage_gap    view/gap refill page overlapping a live completion
   usage_rates_dropped priced catalog, then a refresh whose model has no cost
   usage_rates_empty   ... then a refresh returning models: []
@@ -508,6 +510,47 @@ def on_turn_start(params):
             "cumulative": {"promptTokens": 1000, "outputTokens": 500,
                            "totalTokens": 1500}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "usage_turn":
+        # Two model calls in one turn, from two models, plus a replay of the
+        # second leg's view cursor. The prompt result must carry the sum of
+        # the two distinct legs, the replay counted once.
+        notify("session/contextUsage", context_usage(1500, "cur-1"))
+        leg_a = {
+            "sessionId": MSP_SID, "turnId": tid,
+            "promptTokens": 1000, "totalTokens": 1500, "modelId": "fake-model",
+            "durationMs": 1200,
+            "usage": {"inputTokens": 1000, "outputTokens": 500,
+                      "cachedTokens": 200, "reasoningTokens": 50,
+                      "cacheReadTokens": 200, "cacheWriteTokens": 30},
+            "viewCursor": "cur-2", "sourceRange": {"start": 0, "end": 2},
+            "cumulative": {"promptTokens": 1000, "outputTokens": 500,
+                           "totalTokens": 1500}}
+        leg_b = {
+            "sessionId": MSP_SID, "turnId": tid,
+            "promptTokens": 400, "totalTokens": 700, "modelId": "other-model",
+            "durationMs": 800,
+            "usage": {"inputTokens": 400, "outputTokens": 300,
+                      "cachedTokens": 0, "reasoningTokens": 10},
+            "viewCursor": "cur-3", "sourceRange": {"start": 0, "end": 3},
+            "cumulative": {"promptTokens": 1400, "outputTokens": 800,
+                           "totalTokens": 2200}}
+        notify("session/tokenUsage", leg_a)
+        notify("session/tokenUsage", leg_b)
+        notify("session/tokenUsage", dict(leg_b))
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "usage_turn_cancelled":
+        # One leg, then a cancelled terminal: the settled prompt result still
+        # reports what the turn spent.
+        notify("session/tokenUsage", {
+            "sessionId": MSP_SID, "turnId": tid,
+            "promptTokens": 1000, "totalTokens": 1500, "modelId": "fake-model",
+            "durationMs": 700,
+            "usage": {"inputTokens": 1000, "outputTokens": 500,
+                      "cachedTokens": 0, "reasoningTokens": 0},
+            "viewCursor": "cur-2", "sourceRange": {"start": 0, "end": 2},
+            "cumulative": {"promptTokens": 1000, "outputTokens": 500,
+                           "totalTokens": 1500}})
+        notify("turn/completed", {**base, "terminal": "cancelled"})
     elif SCENARIO == "usage_gap":
         # cur-3 is delivered twice: once by the view/gap refill page and
         # once on the live stream. Two distinct completions, one price each.
