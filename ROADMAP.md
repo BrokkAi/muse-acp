@@ -74,7 +74,12 @@ the verdict into richer support bundles.
   `sha256:03312c213efd14277a0e0a102f70adeae497a469ca4edf7242f479953ed758b7`
   (host 1.0.2), while the SDK manifest at `fbce769` publishes
   `sha256:cfd31ee77d78fdada9febc4edccd29b0434ff8f6bf157c7c03fd0ecfcbc29f5a`
-  (schema version 1). Transcript fixtures intentionally carry their own
+  (schema version 1). Host 1.2.1 reports
+  `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
+  (schema version 1; stable surface verified additive against the vendored
+  bundle via the binary's own `muse schema` export, plus a live 1.2.1
+  handshake, session lifecycle, and full turn). Transcript fixtures
+  intentionally carry their own
   fingerprint (`sha256:c8d1a2a1866814e220fd396d382a9a75861412feee884b5021b2ee359bd3dc59`)
   and must not be conflated with either surface.
 - Record tested schema version/fingerprint pairs.

@@ -1287,12 +1287,14 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     acp::send_result(stdout, &id, &result);
                     acp::send_available_commands(stdout, &sid, ver);
                 }
-                Err(e) => acp::send_error(
-                    stdout,
-                    &id,
-                    -32603,
-                    &format!("session/start failed: {}", err_message(&e)),
-                ),
+                Err(e) => {
+                    let msg = err_message(&e);
+                    let mut text = format!("session/start failed: {msg}");
+                    if let Some(hint) = msp::session_profile_hint(&msg) {
+                        text.push_str(&hint);
+                    }
+                    acp::send_error(stdout, &id, -32603, &text);
+                }
             }
         }
         "session/resume" | "session/load" => {
@@ -1580,12 +1582,14 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     acp::send_result(stdout, &id, &result);
                     acp::send_available_commands(stdout, &sid, ver);
                 }
-                Err(e) => acp::send_error(
-                    stdout,
-                    &id,
-                    -32602,
-                    &format!("resume failed: {}", err_message(&e)),
-                ),
+                Err(e) => {
+                    let msg = err_message(&e);
+                    let mut text = format!("resume failed: {msg}");
+                    if let Some(hint) = msp::session_profile_hint(&msg) {
+                        text.push_str(&hint);
+                    }
+                    acp::send_error(stdout, &id, -32602, &text);
+                }
             }
         }
         "session/fork" => {
@@ -2365,7 +2369,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             stdout,
                             &id,
                             -32602,
-                            "reasoning_effort must be none|minimal|low|medium|high|xhigh|ultra",
+                            "reasoning_effort must be none|minimal|low|medium|high|xhigh|max|ultra",
                         );
                         return;
                     }
