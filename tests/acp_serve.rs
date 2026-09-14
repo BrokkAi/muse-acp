@@ -1401,6 +1401,25 @@ fn v1_advertises_config_options_and_slash_commands() {
 }
 
 #[test]
+fn legacy_set_mode_adopts_the_folded_host_mode() {
+    // A host that downgrades the requested mode must not desync the legacy
+    // v1 mode state: the reply follows the folded effectiveMode, mirroring
+    // session/set_config_option.
+    let mut c = Client::spawn("quiet", &[("FAKE_FOLDED_MODE", "promptUnmatched")]);
+    let sid = c.new_session(1, "");
+    let mode_id = c.req(
+        "session/set_mode",
+        &format!("{{\"sessionId\":\"{sid}\",\"modeId\":\"allowAll\"}}"),
+    );
+    let mode_done = c.wait_for(&format!("\"id\":{mode_id}"), Duration::from_secs(15));
+    assert!(
+        mode_done.contains("\"result\":{\"mode\":\"promptUnmatched\"}"),
+        "legacy set_mode must report the folded host mode, not the request: {mode_done}"
+    );
+    c.finish();
+}
+
+#[test]
 fn v1_jetbrains_mcp_attachment_does_not_hide_config_options() {
     let mut c = Client::spawn("quiet", &[]);
     let init = c.req("initialize", "{\"protocolVersion\":1}");

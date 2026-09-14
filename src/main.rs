@@ -2613,7 +2613,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             }
         }
         "session/set_mode" => {
-            // v1 operating mode switch, same ask|auto|deny vocabulary.
+            // v1 operating mode switch, same MSP ApprovalMode vocabulary.
             let sid = params
                 .as_ref()
                 .and_then(|p| p.get("sessionId"))
@@ -2645,13 +2645,26 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             esc(m)
                         ),
                     ) {
-                        Ok(_) => {
+                        Ok(res) => {
+                            // The host echoes the folded mode; prefer it over
+                            // the request so a downgraded apply cannot desync
+                            // the legacy mode state.
+                            let folded = res
+                                .get("effectiveMode")
+                                .and_then(|e| e.get("mode"))
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string());
+                            let m = folded
+                                .as_deref()
+                                .or(Some(m))
+                                .unwrap_or("promptUnmatched");
+                            let m = acp::mode_from_msp(m);
                             if let Some(s) = sessions
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
                                 .get_mut(&sid)
                             {
-                                s.mode_value = acp::mode_from_msp(m).to_string();
+                                s.mode_value = m.to_string();
                             }
                             acp::send_result(stdout, &id, &format!("{{\"mode\":{}}}", esc(m)))
                         }

@@ -45,6 +45,9 @@ SCHEMA = {"fingerprint": FP, "version": 1}
 MSP_SID = "msp-sess-1"
 SCENARIO = os.environ.get("FAKE_SCENARIO", "happy")
 MODE = os.environ.get("FAKE_MODE", "promptUnmatched")
+# When set, session/setApprovalMode folds to this mode instead of echoing the
+# request, modelling a host that downgrades or pins the effective mode.
+FOLDED_MODE = os.environ.get("FAKE_FOLDED_MODE", "")
 LOG = os.environ.get("FAKE_LOG", "")
 TURNS = [0]
 CATALOG_READS = [0]
@@ -639,7 +642,7 @@ def result_for(method, msg):
         return {"sessions": [live, old], "nextCursor": None}
     if method == "session/setApprovalMode":
         # The real host applies the selected mode and echoes it back.
-        mode = msg.get("params", {}).get("mode", MODE)
+        mode = FOLDED_MODE or msg.get("params", {}).get("mode", MODE)
         return {"commandId": "x", "status": "ok", "applyOutcome": "applied",
                 "effectiveMode": {"lastCommandId": "x", "mode": mode,
                                   "source": "explicit"}}
