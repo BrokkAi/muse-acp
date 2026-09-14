@@ -20,6 +20,15 @@ pub const TESTED_FINGERPRINT: &str =
 pub const SDK_MANIFEST_FINGERPRINT: &str =
     "sha256:cfd31ee77d78fdada9febc4edccd29b0434ff8f6bf157c7c03fd0ecfcbc29f5a";
 
+/// Stable-surface fingerprint of the Muse 1.2.1 host (schema version 1).
+/// The `initialize` reply carries this fingerprint (it is the stable-surface
+/// digest, not a build hash), and it matches the binary's own `muse schema`
+/// export, which was diffed against the vendored bundle (purely additive
+/// surface growth). Validated against a live `muse serve` 1.2.1: handshake,
+/// session lifecycle, and a full turn (`end_turn`, `terminal=completed`).
+pub const HOST_121_FINGERPRINT: &str =
+    "sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b";
+
 /// Fingerprint embedded in the SDK conformance-transcript fixtures. It is
 /// deliberately distinct from every host fingerprint and must never be
 /// classified as host compatibility.
@@ -87,6 +96,7 @@ fn table_entry(fingerprint: &str) -> Option<(Status, &'static str)> {
             Status::Degraded,
             "SDK manifest fbce769 schema v1; no live-host verification recorded",
         ),
+        HOST_121_FINGERPRINT => (Status::Tested, "validated against live host 1.2.1"),
         TRANSCRIPT_FIXTURE_FINGERPRINT => (
             Status::Fixture,
             "transcript fixture fingerprint; never a live-host result",
@@ -142,6 +152,7 @@ pub fn selftest_lines(adapter_version: &str) -> Vec<String> {
     for (fp, kind) in [
         (TESTED_FINGERPRINT, "tested-host"),
         (SDK_MANIFEST_FINGERPRINT, "sdk-manifest"),
+        (HOST_121_FINGERPRINT, "host-1.2.1"),
         (TRANSCRIPT_FIXTURE_FINGERPRINT, "transcript-fixture"),
     ] {
         let c = classify(Some(SUPPORTED_SCHEMA_VERSION), fp);
@@ -170,6 +181,13 @@ mod tests {
     fn sdk_manifest_is_degraded_not_tested() {
         let c = classify(Some(1), SDK_MANIFEST_FINGERPRINT);
         assert_eq!(c.status, Status::Degraded);
+        assert!(!c.is_fatal());
+    }
+
+    #[test]
+    fn host_121_fingerprint_is_tested() {
+        let c = classify(Some(1), HOST_121_FINGERPRINT);
+        assert_eq!(c.status, Status::Tested);
         assert!(!c.is_fatal());
     }
 
@@ -216,8 +234,9 @@ mod tests {
         let lines = selftest_lines("0.2.5");
         assert!(lines[0].contains("adapter=0.2.5"));
         assert!(lines[0].contains("host=offline"));
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 5);
         assert!(lines.iter().any(|l| l.contains("kind=sdk-manifest")));
+        assert!(lines.iter().any(|l| l.contains("kind=host-1.2.1")));
         assert!(lines.iter().any(|l| l.contains("kind=transcript-fixture")));
     }
 }

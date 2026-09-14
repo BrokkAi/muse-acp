@@ -284,7 +284,7 @@ pub fn resolve_mode(value: &str) -> Option<&'static str> {
 pub fn is_reasoning_effort(value: &str) -> bool {
     matches!(
         value,
-        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "ultra"
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
     )
 }
 
@@ -314,7 +314,7 @@ pub fn config_options(
         _ => String::new(),
     };
     format!(
-        "[{{\"{id_key}\":\"mode\",\"name\":\"Session Mode\",\"description\":\"How the agent handles tool approvals\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"ask\",\"name\":\"Ask\",\"description\":\"Request permission for unmatched tools\"}},{{\"value\":\"auto\",\"name\":\"Auto\",\"description\":\"Allow all tools without asking\"}},{{\"value\":\"deny\",\"name\":\"Deny\",\"description\":\"Deny unmatched tools\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Reasoning effort sent with each prompt and steering message\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]}}]",
+        "[{{\"{id_key}\":\"mode\",\"name\":\"Session Mode\",\"description\":\"How the agent handles tool approvals\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"ask\",\"name\":\"Ask\",\"description\":\"Request permission for unmatched tools\"}},{{\"value\":\"auto\",\"name\":\"Auto\",\"description\":\"Allow all tools without asking\"}},{{\"value\":\"deny\",\"name\":\"Deny\",\"description\":\"Deny unmatched tools\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Reasoning effort sent with each prompt and steering message\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]}}]",
         esc(current_mode),
         esc(current_model),
         model_opts.join(","),
@@ -498,5 +498,22 @@ mod tests {
             assert_eq!(items.len(), 7);
         }
         assert!(crate::json::parse_json(&session_modes("ask")).is_ok());
+    }
+
+    #[test]
+    fn reasoning_effort_admits_the_121_max_tier() {
+        for tier in [
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ] {
+            assert!(is_reasoning_effort(tier), "{tier} must be selectable");
+        }
+        assert!(!is_reasoning_effort("extreme"));
+        let models = vec![("fake-model".to_string(), "Fake".to_string(), true)];
+        let options = config_options(1, "ask", "fake-model", "max", &models, None);
+        crate::json::parse_json(&options).expect("config options JSON");
+        assert!(
+            options.contains("\"value\":\"max\""),
+            "max tier must be advertised: {options}"
+        );
     }
 }

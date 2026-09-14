@@ -777,6 +777,15 @@ def main():
                     send({"jsonrpc": "2.0", "id": ident,
                           "error": {"code": -32603, "message": "catalog unavailable"}})
                     continue
+                if (method == "session/start"
+                        and os.environ.get("FAKE_START_ERROR", "") == "profile"):
+                    # Mirrors the live 1.2.1 refusal when the user's default
+                    # permission profile needs an unavailable reviewer.
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32603,
+                                    "message": "internal error: compose session permission profile: permission profile ':auto-review' cannot be used: the automated reviewer is unavailable on this host",
+                                    "data": {"kind": "internal"}}})
+                    continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
                 if CRASH_AFTER_ACK[0]:

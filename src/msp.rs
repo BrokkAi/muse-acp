@@ -119,6 +119,28 @@ pub fn command_timeout(env_override: Option<&str>, method: &str) -> std::time::D
     std::time::Duration::from_millis(method_timeout_ms(method))
 }
 
+/// Guidance for a host that refuses to open a session over its permission
+/// profile (seen live on 1.2.1: `compose session permission profile:
+/// ... ':auto-review' ... reviewer is unavailable`). Profiles compose
+/// host-side from the user's Muse settings — nothing on the MSP wire
+/// selects one — so the fix is the settings key, never a retry. Returns
+/// None for unrelated errors; the caller keeps the host text either way.
+pub fn session_profile_hint(host_message: &str) -> Option<String> {
+    if !host_message.contains("permission profile") {
+        return None;
+    }
+    let profile = host_message
+        .split("permission profile '")
+        .nth(1)
+        .and_then(|rest| rest.split('\'').next())
+        .filter(|name| !name.is_empty())
+        .map(|name| format!(" ({name})"))
+        .unwrap_or_default();
+    Some(format!(
+        " Hint: the host refused its own permission profile{profile}. That profile is composed from Muse settings (`permissions.default_profile`) and nothing on the wire overrides it — remove or change that setting; a profile whose reviewer is unavailable to `muse serve` refuses every session."
+    ))
+}
+
 /// Turn a host spawn failure into the next user action. MSP exposes no
 /// auth/health probe, so the readiness diagnosis starts at "can we even run
 /// the CLI"; session errors carry host text from there.
@@ -489,8 +511,35 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
 
 #[cfg(test)]
 mod tests {
-    use super::{command_timeout, known_server_request, session_suffix};
+    use super::{command_timeout, known_server_request, session_profile_hint, session_suffix};
     use std::time::Duration;
+
+    #[test]
+    fn profile_refusal_names_the_settings_key_and_profile() {
+        let host = "internal error: compose session permission profile: permission profile ':auto-review' cannot be used: the automated reviewer is unavailable on this host";
+        let hint = session_profile_hint(host).expect("profile refusal must hint");
+        assert!(hint.contains("permissions.default_profile"), "{hint}");
+        assert!(hint.contains(":auto-review"), "{hint}");
+        assert!(hint.contains("muse serve"), "{hint}");
+    }
+
+    #[test]
+    fn profile_refusal_without_a_quoted_name_still_hints() {
+        let hint = session_profile_hint("cannot compose permission profile")
+            .expect("unquoted refusal must hint");
+        assert!(hint.contains("permissions.default_profile"), "{hint}");
+    }
+
+    #[test]
+    fn unrelated_session_errors_get_no_hint() {
+        for msg in [
+            "session not found",
+            "approval mode exceeds or is incomparable",
+            "",
+        ] {
+            assert!(session_profile_hint(msg).is_none(), "{msg:?} must not hint");
+        }
+    }
 
     #[test]
     fn only_deliberately_handled_server_requests_are_forwarded() {

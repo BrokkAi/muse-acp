@@ -1526,8 +1526,18 @@ fn reasoning_effort_is_selected_and_sent_to_msp() {
         "updated reasoning value reflected: {set}"
     );
 
+    let max_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"max\"}}"),
+    );
+    let maxed = c.wait_for(&format!("\"id\":{max_id}"), Duration::from_secs(15));
+    assert!(
+        maxed.contains("\"currentValue\":\"max\""),
+        "1.2.1 max tier not selectable: {maxed}"
+    );
+
     let _pid = c.prompt(&sid, "think carefully");
-    c.wait_input("\"reasoningEffort\": \"high\"", Duration::from_secs(15));
+    c.wait_input("\"reasoningEffort\": \"max\"", Duration::from_secs(15));
     c.finish();
 }
 
@@ -1860,6 +1870,50 @@ fn sdk_manifest_fingerprint_is_degraded_not_tested() {
     let init = c.req("initialize", "{\"protocolVersion\":1}");
     let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     assert!(frame.contains("\"result\""), "init failed: {frame}");
+    c.finish();
+}
+
+#[test]
+fn host_121_fingerprint_is_tested() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[(
+            "FAKE_FINGERPRINT",
+            "sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b",
+        )],
+    );
+    c.wait_stderr("status=tested", Duration::from_secs(10));
+    c.wait_stderr(
+        "fingerprint=sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b",
+        Duration::from_secs(10),
+    );
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "init failed: {frame}");
+    c.finish();
+}
+
+#[test]
+fn unusable_permission_profile_fails_with_settings_guidance() {
+    let mut c = Client::spawn("quiet", &[("FAKE_START_ERROR", "profile")]);
+    let id = c.req("session/new", "{\"cwd\":\"/tmp\"}");
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"error\""),
+        "profile refusal must fail, not hang: {frame}"
+    );
+    assert!(
+        frame.contains("session/start failed: internal error: compose session permission profile"),
+        "host text must be preserved: {frame}"
+    );
+    assert!(
+        frame.contains("permissions.default_profile"),
+        "guidance must name the settings key: {frame}"
+    );
+    assert!(
+        frame.contains(":auto-review"),
+        "guidance must name the refused profile: {frame}"
+    );
     c.finish();
 }
 
