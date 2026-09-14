@@ -80,6 +80,8 @@ if os.environ.get("FAKE_APPROVAL", "") == "all-approve":
         {"choiceId": "c-always", "label": "Always",
          "decision": "approved", "scope": "session"},
     ]
+if os.environ.get("FAKE_APPROVAL_CHOICES", "") == "empty":
+    APPROVAL_PARAMS["availableChoices"] = []
 
 
 def log_method(method):

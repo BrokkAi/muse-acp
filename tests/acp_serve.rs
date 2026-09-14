@@ -1692,6 +1692,105 @@ fn all_approve_cancellation_fails_closed() {
 }
 
 #[test]
+fn prompt_while_approval_pending_is_held_locally() {
+    // A follow-up prompt (the screenshot's "try again") sent before the
+    // permission is answered must not reach the host as a second
+    // turn/start: fresh human input against an unresolved decision stage is
+    // exactly what the host rejects as an unrecorded human resolution.
+    let mut c = Client::spawn("approval_hang", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "do it");
+    let perm = c.wait_for("request_permission", Duration::from_secs(15));
+    assert!(perm.contains(&sid), "permission for our session: {perm}");
+    let retry = c.prompt(&sid, "try again");
+    let err = c.wait_for(&format!("\"id\":{retry}"), Duration::from_secs(15));
+    assert!(err.contains("\"error\""), "held prompt must fail: {err}");
+    assert!(
+        err.contains("still pending") && err.contains("permission"),
+        "held prompt must name the approval layer: {err}"
+    );
+    assert!(
+        err.contains("ap-1"),
+        "held prompt must name the blocking approval: {err}"
+    );
+    // The hold must be self-diagnosing on stderr, naming the approval.
+    c.wait_stderr("held session/prompt", Duration::from_secs(15));
+    let held = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        held.contains("ap-1"),
+        "hold log must name the blocking approval: {held}"
+    );
+    // Give the adapter a beat to (not) forward the prompt, then check.
+    std::thread::sleep(Duration::from_millis(500));
+    let seen = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+    assert_eq!(
+        seen.lines().filter(|l| *l == "turn/start").count(),
+        1,
+        "second turn/start must never reach the host; host saw:\n{seen}"
+    );
+    c.finish();
+}
+
+#[test]
+fn steering_while_approval_pending_is_held_locally() {
+    // Steered input is still fresh human input against the decision stage.
+    let mut c = Client::spawn("approval_hang", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "do it");
+    let perm = c.wait_for("request_permission", Duration::from_secs(15));
+    assert!(perm.contains(&sid), "permission for our session: {perm}");
+    let steer = c.req(
+        "_session/steering",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"try again\"}}]}}"
+        ),
+    );
+    let err = c.wait_for(&format!("\"id\":{steer}"), Duration::from_secs(15));
+    assert!(err.contains("\"error\""), "held steering must fail: {err}");
+    assert!(
+        err.contains("still pending") && err.contains("permission"),
+        "held steering must name the approval layer: {err}"
+    );
+    c.wait_stderr("held _session/steering", Duration::from_secs(15));
+    std::thread::sleep(Duration::from_millis(500));
+    let seen = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+    assert_eq!(
+        seen.lines().filter(|l| *l == "turn/start").count(),
+        1,
+        "steering must not start a second turn at the host; host saw:\n{seen}"
+    );
+    c.finish();
+}
+
+#[test]
+fn approval_without_choices_fails_closed_without_surfacing() {
+    // No choices means nothing the client could honestly answer: the
+    // adapter must cancel the turn rather than strand the host approval
+    // with no verdict and no visible permission.
+    let mut c = Client::spawn("approval_hang", &[("FAKE_APPROVAL_CHOICES", "empty")]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "do it");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("cancelled"),
+        "choiceless approval must cancel the turn, not hang: {done}"
+    );
+    c.wait_log("turn/cancel", Duration::from_secs(15));
+    // An unanswerable permission must never be shown.
+    std::thread::sleep(Duration::from_millis(500));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("request_permission"),
+        "must not surface an unanswerable permission: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
 fn resource_link_inlines_workspace_text() {
     let mut c = Client::spawn("quiet", &[]);
     let dir = std::env::temp_dir().join(format!("acp-res-{}", std::process::id()));

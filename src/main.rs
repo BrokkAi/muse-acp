@@ -117,6 +117,32 @@ fn catalog_rates(model: &str) -> Option<CostRate> {
         .cloned()
 }
 
+/// Translate backend decision-stage rejection jargon into an actionable
+/// error. The host guards its decision-stage audit log: a turn submitted
+/// while an approval still needs its recorded verdict — or after a verdict
+/// went missing — is rejected as an approval-replay / unrecorded-human-
+/// resolution failure. Retrying the same prompt never helps; the fix is
+/// always at the approval layer, so say that and keep the host text.
+fn friendly_turn_error(prefix: &str, host_message: &str) -> String {
+    let lower = host_message.to_lowercase();
+    let is_approval_replay = [
+        "approval replay",
+        "unrecorded human",
+        "decision stage",
+        "pending approval",
+        "approval still pending",
+    ]
+    .iter()
+    .any(|n| lower.contains(n));
+    if is_approval_replay {
+        format!(
+            "{prefix}: the host rejected the follow-up because a tool approval was left unresolved (host: {host_message}). Answer the outstanding permission request — or cancel the turn/session — then retry as a new prompt"
+        )
+    } else {
+        format!("{prefix}: {host_message}")
+    }
+}
+
 /// Folded host approval mode: `session.approvalMode.mode`
 /// (EffectiveApprovalModeState; additive-optional, may be absent).
 fn host_mode(res: &J) -> Option<String> {
@@ -215,7 +241,7 @@ fn reconcile_pending(
                 });
             if !known {
                 n_approvals += 1;
-                open_approval(stdout, sessions, &a);
+                open_approval(host, stdout, sessions, &a);
             }
         }
     }
@@ -911,7 +937,7 @@ fn main() {
                 // Reissued server requests (multi-stage approvals, resumed
                 // questions) carry their own payloads: bridge them too.
                 match method.as_str() {
-                    "approval/request" => open_approval(&stdout, &sessions, &params),
+                    "approval/request" => open_approval(&host, &stdout, &sessions, &params),
                     "userInput/request" => {
                         handle_msp(&host, &stdout, &sessions, "userInput/requested", &params);
                     }
@@ -1792,14 +1818,47 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let (msp_sid, cwd, reasoning_effort) =
+            let (msp_sid, cwd, reasoning_effort, pending_approval) =
                 match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
-                    Some(s) => (s.msp_sid.clone(), s.cwd.clone(), s.reasoning_effort.clone()),
+                    Some(s) => (
+                        s.msp_sid.clone(),
+                        s.cwd.clone(),
+                        s.reasoning_effort.clone(),
+                        s.pending_perm
+                            .as_ref()
+                            .map(|p| p.approval_id.clone())
+                            .or_else(|| {
+                                s.perm_queue
+                                    .first()
+                                    .and_then(|q| q.get("approvalId"))
+                                    .and_then(|v| v.as_str())
+                                    .map(str::to_string)
+                            }),
+                    ),
                     None => {
                         acp::send_error(stdout, &id, -32602, "unknown sessionId");
                         return;
                     }
                 };
+            // A new turn while an approval needs its recorded verdict would
+            // submit fresh human input against an unresolved decision stage:
+            // the host rejects that as an unrecorded human resolution. Hold
+            // the prompt locally with an actionable error instead of sending
+            // a turn/start that is guaranteed to fail.
+            if let Some(approval_id) = pending_approval {
+                log(&format!(
+                    "held session/prompt for {sid}: approval {approval_id} still pending; not sent to host"
+                ));
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32603,
+                    &format!(
+                        "tool approval {approval_id} is still pending: answer the outstanding permission request (approve or deny) before sending another prompt; the follow-up was not sent to the host. If no permission prompt is visible, cancel the turn and retry"
+                    ),
+                );
+                return;
+            }
             let (parts, acp_content) = match extract_prompt_parts(params.as_ref(), &cwd) {
                 Ok((p, c)) if !p.is_empty() => (p, c),
                 Ok(_) => {
@@ -1949,7 +2008,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             stdout,
                             &id,
                             -32603,
-                            &format!("turn/start failed: {}", err_message(&e)),
+                            &friendly_turn_error("turn/start failed", &err_message(&e)),
                         );
                     }
                 }
@@ -1985,19 +2044,35 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let (msp_sid, cwd, reasoning_effort, active_turn) =
+            let (msp_sid, cwd, reasoning_effort, active_turn, pending_approval) =
                 match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
                     Some(s) => (
                         s.msp_sid.clone(),
                         s.cwd.clone(),
                         s.reasoning_effort.clone(),
                         s.active_turn.clone(),
+                        s.pending_perm.is_some() || !s.perm_queue.is_empty(),
                     ),
                     None => {
                         acp::send_error(stdout, &id, -32602, "unknown sessionId");
                         return;
                     }
                 };
+            // Steered input is still fresh human input against the decision
+            // stage: hold it like a prompt while an approval needs its
+            // recorded verdict.
+            if pending_approval {
+                log(&format!(
+                    "held _session/steering for {sid}: an approval is still pending; not sent to host"
+                ));
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32603,
+                    "a tool approval is still pending: answer the outstanding permission request (approve or deny) before steering; the steering input was not sent to the host",
+                );
+                return;
+            }
             let (parts, acp_content) = match extract_prompt_parts(params.as_ref(), &cwd) {
                 Ok((parts, content)) if !parts.is_empty() => (parts, content),
                 Ok(_) => {
@@ -2049,7 +2124,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         stdout,
                         &id,
                         -32603,
-                        &format!("steering failed: {}", err_message(&error)),
+                        &friendly_turn_error("steering failed", &err_message(&error)),
                     );
                     return;
                 }
@@ -3237,7 +3312,7 @@ fn handle_msp(
             }
         }
         "approval/requested" => {
-            open_approval(stdout, sessions, params);
+            open_approval(host, stdout, sessions, params);
         }
         "approval/resolved" | "approval/updated" => {
             // Authoritative outcome: if session work continues, re-assert
@@ -3605,15 +3680,22 @@ fn handle_msp(
 
 /// Open an ACP permission request for MSP approval params (from either the
 /// `approval/requested` event or a reissued `approval/request`). Dedupes by
-/// approval id so multi-stage/resumed flows bridge exactly once.
-fn open_approval(stdout: &StdoutShared, sessions: &Sessions, params: &J) {
+/// approval id so multi-stage/resumed flows bridge exactly once. Never leaves
+/// an approval silently unresolved: without displayable choices there is
+/// nothing the client could answer, so fail closed by cancelling the turn.
+fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, params: &J) {
     let msp_sid = params
         .get("sessionId")
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let acp_sid = match find_acp_sid(sessions, msp_sid) {
         Some(s) => s,
-        None => return,
+        None => {
+            log(&format!(
+                "approval dropped: no ACP session for host session {msp_sid}"
+            ));
+            return;
+        }
     };
     let approval_id = params
         .get("approvalId")
@@ -3621,6 +3703,7 @@ fn open_approval(stdout: &StdoutShared, sessions: &Sessions, params: &J) {
         .unwrap_or("")
         .to_string();
     if approval_id.is_empty() {
+        log("approval dropped: missing approvalId");
         return;
     }
     let already = sessions
@@ -3711,9 +3794,12 @@ fn open_approval(stdout: &StdoutShared, sessions: &Sessions, params: &J) {
     };
     let (options_json, choices) = acp::perm_options(params);
     if choices.is_empty() {
+        // Nothing the client could answer: fail closed by cancelling the
+        // turn rather than stranding the host approval with no verdict.
         log(&format!(
-            "approval {approval_id} has no choices; leaving unresolved"
+            "approval {approval_id} has no choices; cancelling the turn instead of leaving it unresolved"
         ));
+        cancel_session_turns(host, sessions, &acp_sid);
         return;
     }
     let req_id = J::Str(mint_id("perm-", &ID_COUNTER));
@@ -3883,15 +3969,23 @@ fn complete_permission(
                 }
             }
         }
-        Err(e) => log(&format!("approval/decide failed: {}", err_message(&e))),
+        Err(e) => log(&format!(
+            "approval/decide for {approval_id} failed: {}",
+            err_message(&e)
+        )),
     }
     // Whether or not the decide was admitted, the displayed permission is
     // settled from the client's perspective; show the next queued approval.
-    pop_queued_approval(stdout, sessions, &acp_sid);
+    pop_queued_approval(host, stdout, sessions, &acp_sid);
 }
 
 /// Display the next queued approval for a session, if any.
-fn pop_queued_approval(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
+fn pop_queued_approval(
+    host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+) {
     let next = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -3905,7 +3999,7 @@ fn pop_queued_approval(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
         });
     if let Some(params) = next {
         log("displaying next queued approval");
-        open_approval(stdout, sessions, &params);
+        open_approval(host, stdout, sessions, &params);
     }
 }
 
@@ -4273,7 +4367,7 @@ fn complete_elicitation(
 
 #[cfg(test)]
 mod tests {
-    use super::{CostRate, env_flag_enabled, parse_rates, v1_init, v2_init};
+    use super::{CostRate, env_flag_enabled, friendly_turn_error, parse_rates, v1_init, v2_init};
     use crate::acp;
     use crate::json::{J, parse_json};
     use std::path::{Path, PathBuf};
@@ -4340,6 +4434,35 @@ mod tests {
             replayed >= 5,
             "corpus approval coverage vanished: {replayed}"
         );
+    }
+
+    #[test]
+    fn approval_replay_rejections_translate_to_an_actionable_error() {
+        let host = "turn/start runtime submit failed: approval replay failed: decision stage evidence contains an unrecorded human resolution";
+        let out = friendly_turn_error("turn/start failed", host);
+        assert!(
+            out.contains("left unresolved") && out.contains("permission"),
+            "must name the approval layer: {out}"
+        );
+        assert!(
+            out.contains(host),
+            "must preserve the host text for diagnostics: {out}"
+        );
+    }
+
+    #[test]
+    fn approval_replay_matching_is_case_insensitive() {
+        let out = friendly_turn_error("steering failed", "Approval Replay Failed: stale verdict");
+        assert!(
+            out.starts_with("steering failed: the host rejected"),
+            "steering prefix survives translation: {out}"
+        );
+    }
+
+    #[test]
+    fn unrelated_turn_errors_pass_through_untouched() {
+        let out = friendly_turn_error("turn/start failed", "boom");
+        assert_eq!(out, "turn/start failed: boom");
     }
 
     fn rates(input: &str, output: &str, currency: &str) -> Option<CostRate> {
