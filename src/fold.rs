@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
-use crate::json::{J, esc, j_to_string, mint_id};
+use crate::json::{J, esc, j_to_string, mint_id, parse_json};
 
 const DEFAULT_MAX_CONTENT: usize = 8000;
 const MIN_MAX_CONTENT: usize = 200;
@@ -621,14 +621,63 @@ impl SessionFold {
         Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
     }
 
+    fn args_detail(item: &J) -> Option<String> {
+        let args = item.get("args")?;
+        // `args` is usually a JSON-encoded string (`"{\"command\":\"...\"}"`);
+        // it can also arrive as an already-decoded object in replays.
+        let parsed;
+        let obj = match args {
+            J::Str(s) => match parse_json(s) {
+                Ok(obj @ J::Obj(_)) => {
+                    parsed = obj;
+                    &parsed
+                }
+                // A plain non-JSON string beats a bare tool name.
+                _ => return (!s.trim().is_empty() && s.trim() != "{}").then(|| s.clone()),
+            },
+            J::Obj(_) => args,
+            _ => return None,
+        };
+        for key in [
+            "command",
+            "cmd",
+            "commandText",
+            "displayText",
+            "summary",
+            "task",
+            "objective",
+            "query",
+            "pattern",
+            "path",
+            "file",
+            "filePath",
+            "target",
+            "url",
+            "question",
+            "prompt",
+        ] {
+            if let Some(s) = obj.get(key).and_then(|v| v.as_str())
+                && !s.trim().is_empty()
+            {
+                return Some(s.to_string());
+            }
+        }
+        None
+    }
+
     fn tool_title(item: &J) -> (String, String) {
         let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("tool");
-        let detail = item
+        let top = item
             .get("commandText")
             .or_else(|| item.get("displayText"))
             .or_else(|| item.get("summary"))
             .and_then(|v| v.as_str())
             .unwrap_or("");
+        let detail = if !top.is_empty() {
+            top.to_string()
+        } else {
+            Self::args_detail(item).unwrap_or_default()
+        };
         let title = if detail.is_empty() {
             tool.to_string()
         } else {
@@ -1223,5 +1272,56 @@ mod corpus_tests {
             "too few item events replayed: {item_events}"
         );
         assert!(emitted >= 30, "fold emitted too little: {emitted}");
+    }
+
+    #[test]
+    fn tool_title_uses_args_command_instead_of_bare_tool() {
+        let mut fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"it-1","kind":"toolCall","status":"inProgress","tool":"bash","callId":"call-1","args":"{\"command\":\"cargo test --help\"}"}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 1, &item, &mut out);
+        assert_eq!(out.len(), 1, "snapshot should announce: {out:?}");
+        assert!(
+            out[0].contains("bash: cargo test --help"),
+            "title should carry the command, not bare tool: {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn tool_title_uses_args_path_for_file_tools() {
+        let mut fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"it-2","kind":"toolCall","status":"inProgress","tool":"read_file","callId":"call-2","args":"{\"path\":\"Cargo.toml\"}"}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 1, &item, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].contains("read_file: Cargo.toml"),
+            "title should carry the path: {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn tool_title_prefers_top_level_display_text_over_args() {
+        let mut fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"it-3","kind":"toolCall","status":"inProgress","tool":"bash","callId":"call-3","commandText":"ls -la","args":"{\"command\":\"ignored\"}"}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 1, &item, &mut out);
+        assert_eq!(out.len(), 1);
+        assert!(
+            out[0].contains("bash: ls -la"),
+            "host display text stays authoritative: {}",
+            out[0]
+        );
     }
 }
