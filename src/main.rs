@@ -1251,7 +1251,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             stdout,
                             &id,
                             -32602,
-                            "MUSE_APPROVAL_MODE must be ask|auto|deny or a host mode",
+                            &format!("MUSE_APPROVAL_MODE must be {}", acp::MODE_HELP),
                         );
                         return;
                     }
@@ -1544,7 +1544,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
-                            mode_value: "ask".to_string(),
+                            mode_value: "promptUnmatched".to_string(),
                             model_value: String::new(),
                             reasoning_effort: "medium".to_string(),
                             active_turn: None,
@@ -1810,7 +1810,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     } else {
                         fork_cwd.clone()
                     };
-                    let mut mode_value = "ask".to_string();
+                    let mut mode_value = "promptUnmatched".to_string();
                     if let Some(m) = host_mode(&r) {
                         mode_value = acp::mode_from_msp(&m).to_string();
                     }
@@ -2515,7 +2515,12 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         ),
                     ),
                     None => {
-                        acp::send_error(stdout, &id, -32602, "mode must be ask|auto|deny");
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32602,
+                            &format!("mode must be {}", acp::MODE_HELP),
+                        );
                         return;
                     }
                 },
@@ -2648,7 +2653,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             {
                                 s.mode_value = acp::mode_from_msp(m).to_string();
                             }
-                            acp::send_result(stdout, &id, &format!("{{\"mode\":{}}}", esc(&value)))
+                            acp::send_result(stdout, &id, &format!("{{\"mode\":{}}}", esc(m)))
                         }
                         Err(e) => acp::send_error(
                             stdout,
@@ -2658,7 +2663,12 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         ),
                     }
                 }
-                None => acp::send_error(stdout, &id, -32602, "mode must be ask|auto|deny"),
+                None => acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    &format!("mode must be {}", acp::MODE_HELP),
+                ),
             }
         }
         "session/set_model" => {

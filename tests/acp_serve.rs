@@ -1333,8 +1333,8 @@ fn host_default_mode_is_reflected() {
         .expect("config in session/new")
         .to_string();
     assert!(
-        cfg.contains("\"currentValue\":\"auto\""),
-        "host allowAll shows as auto, not ask: {cfg}"
+        cfg.contains("\"currentValue\":\"allowAll\""),
+        "host allowAll is reported verbatim: {cfg}"
     );
     c.finish();
 }
@@ -1357,7 +1357,7 @@ fn v1_advertises_config_options_and_slash_commands() {
         cfg.contains("\"id\":\"mode\"")
             && cfg.contains("\"id\":\"model\"")
             && cfg.contains("\"id\":\"reasoning_effort\"")
-            && cfg.contains("\"modes\":{\"currentModeId\":\"ask\""),
+            && cfg.contains("\"modes\":{\"currentModeId\":\"promptUnmatched\""),
         "v1 selectors use the legacy id field and mode fallback: {cfg}"
     );
     assert!(
@@ -1389,12 +1389,12 @@ fn v1_advertises_config_options_and_slash_commands() {
 
     let mode_id = c.req(
         "session/set_mode",
-        &format!("{{\"sessionId\":\"{sid}\",\"modeId\":\"deny\"}}"),
+        &format!("{{\"sessionId\":\"{sid}\",\"modeId\":\"denyUnmatched\"}}"),
     );
     let mode_done = c.wait_for(&format!("\"id\":{mode_id}"), Duration::from_secs(15));
     assert!(
-        mode_done.contains("\"result\":{\"mode\":\"deny\"}"),
-        "legacy v1 modeId is accepted: {mode_done}"
+        mode_done.contains("\"result\":{\"mode\":\"denyUnmatched\"}"),
+        "legacy v1 modeId uses the MSP spelling: {mode_done}"
     );
     c.wait_log("session/setApprovalMode", Duration::from_secs(15));
     c.finish();
@@ -1511,12 +1511,12 @@ fn set_config_option_returns_full_state() {
     let sid = c.new_session(2, "");
     let id = c.req(
         "session/set_config_option",
-        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"mode\",\"value\":\"ask\"}}"),
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"mode\",\"value\":\"onRequest\"}}"),
     );
     let done = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(done.contains("\"configOptions\""), "full state: {done}");
     assert!(
-        done.contains("\"currentValue\":\"ask\""),
+        done.contains("\"currentValue\":\"onRequest\""),
         "updated value reflected: {done}"
     );
     c.finish();
@@ -1964,7 +1964,7 @@ fn invalid_session_roots_are_rejected() {
 fn approval_mode_mismatch_fails_session_new() {
     // Operator asked for auto but the host folded promptUnmatched: the
     // session must fail, not silently run under the wrong posture.
-    let mut c = Client::spawn("quiet", &[("MUSE_APPROVAL_MODE", "auto")]);
+    let mut c = Client::spawn("quiet", &[("MUSE_APPROVAL_MODE", "allowAll")]);
     let init = c.req("initialize", "{\"protocolVersion\":1}");
     let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     assert!(frame.contains("\"result\""), "init failed: {frame}");

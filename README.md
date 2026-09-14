@@ -113,7 +113,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `turn/start` `ifBusy` (queue default) | concurrent prompts per session; each completes its own response; `session/cancel` stops all of them |
 | `TurnInputPart` image | image blocks (inline base64 or local `file://` path); advertised in caps |
 | `userInput/requested` | `elicitation/create` form bridge (needs client `elicitation.form` caps), else auto-cancel |
-| `session/setApprovalMode` | `configOptions` mode selector (`ask`/`auto`/`deny`) + `session/set_config_option`; legacy v1 `modes` / `session/set_mode` |
+| `session/setApprovalMode` | `configOptions` mode selector using the MSP names verbatim (`allowAll`/`promptUnmatched`/`onRequest`/`denyUnmatched`) + `session/set_config_option`; legacy v1 `modes` / `session/set_mode` |
 | `model/list` + `session/setModel` | `configOptions` model selector + `session/set_config_option`; legacy v1 `session/set_model` |
 | `reasoningEffort` on `turn/start` / `turn/steer` | `configOptions` reasoning selector (`none` through `ultra`) |
 | `turn/steer` | v2 `_session/steering` extension with exact-turn targeting and race-safe idle behavior |

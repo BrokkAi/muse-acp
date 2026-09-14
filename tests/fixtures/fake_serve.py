@@ -638,8 +638,10 @@ def result_for(method, msg):
         live["updatedAt"] = "2026-09-04T00:00:00Z"
         return {"sessions": [live, old], "nextCursor": None}
     if method == "session/setApprovalMode":
+        # The real host applies the selected mode and echoes it back.
+        mode = msg.get("params", {}).get("mode", MODE)
         return {"commandId": "x", "status": "ok", "applyOutcome": "applied",
-                "effectiveMode": {"lastCommandId": "x", "mode": MODE,
+                "effectiveMode": {"lastCommandId": "x", "mode": mode,
                                   "source": "explicit"}}
     if method == "model/list":
         CATALOG_READS[0] += 1

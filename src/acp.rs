@@ -246,39 +246,57 @@ pub fn fallback_deny(choices: &[(String, String)]) -> Option<String> {
     None
 }
 
-/// Our mode vocabulary -> MSP ApprovalMode.
-pub fn mode_to_msp(mode: &str) -> Option<&'static str> {
-    match mode {
-        "ask" => Some("promptUnmatched"),
-        "auto" => Some("allowAll"),
-        "deny" => Some("denyUnmatched"),
-        _ => None,
-    }
-}
+/// The MSP `ApprovalMode` enum, in the order the selector lists it. The ACP
+/// mode ids ARE these names: a client selects one of the host's
+/// preconfigured modes and never authors a policy, so renaming them on the
+/// editor side only hid one mode (`onRequest`) and confused the other three.
+pub const APPROVAL_MODES: [(&str, &str, &str); 4] = [
+    ("allowAll", "Allow all", "Allow everything"),
+    (
+        "promptUnmatched",
+        "Prompt unmatched",
+        "Prompt on unmatched subjects",
+    ),
+    ("onRequest", "On request", "Approve only on request"),
+    ("denyUnmatched", "Deny unmatched", "Deny unmatched subjects"),
+];
 
-/// MSP ApprovalMode -> our mode vocabulary.
+/// Host-reported ApprovalMode -> the id we show the client. Identity for
+/// the four known modes; an unknown spelling (a future host) falls back to
+/// the conservative prompting mode rather than claiming `allowAll`.
 pub fn mode_from_msp(mode: &str) -> &'static str {
-    match mode {
-        "allowAll" => "auto",
-        "denyUnmatched" => "deny",
-        _ => "ask",
-    }
+    APPROVAL_MODES
+        .iter()
+        .find(|(id, _, _)| *id == mode)
+        .map(|(id, _, _)| *id)
+        .unwrap_or("promptUnmatched")
 }
 
-/// Resolve a configured mode in either vocabulary to the host enum.
+/// Validate a requested mode: only the MSP `ApprovalMode` spellings are
+/// accepted. There is no adapter-side vocabulary.
 pub fn resolve_mode(value: &str) -> Option<&'static str> {
-    if let Some(m) = mode_to_msp(value) {
-        return Some(m);
-    }
-    match value {
-        "allowAll" | "promptUnmatched" | "onRequest" | "denyUnmatched" => Some(match value {
-            "allowAll" => "allowAll",
-            "promptUnmatched" => "promptUnmatched",
-            "onRequest" => "onRequest",
-            _ => "denyUnmatched",
-        }),
-        _ => None,
-    }
+    APPROVAL_MODES
+        .iter()
+        .find(|(id, _, _)| *id == value)
+        .map(|(id, _, _)| *id)
+}
+
+/// Human-readable list of accepted mode ids for error text.
+pub const MODE_HELP: &str = "allowAll|promptUnmatched|onRequest|denyUnmatched";
+
+fn mode_options_json(key: &str) -> String {
+    APPROVAL_MODES
+        .iter()
+        .map(|(id, name, desc)| {
+            format!(
+                "{{\"{key}\":{},\"name\":{},\"description\":{}}}",
+                esc(id),
+                esc(name),
+                esc(desc)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 pub fn is_reasoning_effort(value: &str) -> bool {
@@ -314,8 +332,9 @@ pub fn config_options(
         _ => String::new(),
     };
     format!(
-        "[{{\"{id_key}\":\"mode\",\"name\":\"Session Mode\",\"description\":\"How the agent handles tool approvals\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"ask\",\"name\":\"Ask\",\"description\":\"Request permission for unmatched tools\"}},{{\"value\":\"auto\",\"name\":\"Auto\",\"description\":\"Allow all tools without asking\"}},{{\"value\":\"deny\",\"name\":\"Deny\",\"description\":\"Deny unmatched tools\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Reasoning effort sent with each prompt and steering message\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]}}]",
+        "[{{\"{id_key}\":\"mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Reasoning effort sent with each prompt and steering message\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]}}]",
         esc(current_mode),
+        mode_options_json("value"),
         esc(current_model),
         model_opts.join(","),
         esc(reasoning_effort)
@@ -325,8 +344,9 @@ pub fn config_options(
 /// Legacy v1 mode state for clients which predate `configOptions`.
 pub fn session_modes(current_mode: &str) -> String {
     format!(
-        "{{\"currentModeId\":{},\"availableModes\":[{{\"id\":\"ask\",\"name\":\"Ask\",\"description\":\"Request permission for unmatched tools\"}},{{\"id\":\"auto\",\"name\":\"Auto\",\"description\":\"Allow all tools without asking\"}},{{\"id\":\"deny\",\"name\":\"Deny\",\"description\":\"Deny unmatched tools\"}}]}}",
-        esc(current_mode)
+        "{{\"currentModeId\":{},\"availableModes\":[{}]}}",
+        esc(current_mode),
+        mode_options_json("id")
     )
 }
 
@@ -483,7 +503,14 @@ mod tests {
     fn selector_and_command_literals_are_valid_json() {
         let models = vec![("fake-model".to_string(), "Fake".to_string(), true)];
         for ver in [1, 2] {
-            let options = config_options(ver, "ask", "fake-model", "medium", &models, None);
+            let options = config_options(
+                ver,
+                "promptUnmatched",
+                "fake-model",
+                "medium",
+                &models,
+                None,
+            );
             let parsed = crate::json::parse_json(&options).expect("config options JSON");
             let J::Arr(items) = parsed else {
                 panic!("config options must be an array");
@@ -497,7 +524,7 @@ mod tests {
             };
             assert_eq!(items.len(), 7);
         }
-        assert!(crate::json::parse_json(&session_modes("ask")).is_ok());
+        assert!(crate::json::parse_json(&session_modes("promptUnmatched")).is_ok());
     }
 
     #[test]
@@ -509,7 +536,7 @@ mod tests {
         }
         assert!(!is_reasoning_effort("extreme"));
         let models = vec![("fake-model".to_string(), "Fake".to_string(), true)];
-        let options = config_options(1, "ask", "fake-model", "max", &models, None);
+        let options = config_options(1, "promptUnmatched", "fake-model", "max", &models, None);
         crate::json::parse_json(&options).expect("config options JSON");
         assert!(
             options.contains("\"value\":\"max\""),
