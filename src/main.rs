@@ -117,6 +117,98 @@ fn catalog_rates(model: &str) -> Option<CostRate> {
         .cloned()
 }
 
+/// True when host failure text looks like a network/offline failure
+/// (DNS, connection, TLS, timeouts, fetch failures, 5xx, offline).
+/// Matched case-insensitively against the combined host detail; display
+/// only, never branched for control flow beyond the hint.
+fn is_network_error(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    [
+        "network",
+        "offline",
+        "dns",
+        "eai_again",
+        "enotfound",
+        "econn",
+        "etimedout",
+        "timed out",
+        "timeout",
+        "connection",
+        "unreachable",
+        "socket",
+        "tls",
+        "ssl",
+        "certificate",
+        "fetch failed",
+        "failed to fetch",
+        "502",
+        "503",
+        "504",
+        "gateway",
+        "proxy",
+        "internet",
+        "no route",
+        "broken pipe",
+        "reset by peer",
+        "host unreachable",
+        "network unreachable",
+    ]
+    .iter()
+    .any(|n| lower.contains(n))
+}
+
+/// Build an actionable message for a `turn/completed` failure terminal.
+/// Per the MSP schema, mid-turn failures arrive here (never as JSON-RPC
+/// errors) as `error: {kind, message, retryable}` plus a free-text
+/// `reason`. The old code dropped all of it and reported only
+/// `turn ended with terminal 'failed'`, which is useless when the network
+/// is cut (e.g. `git fetch` failing while offline). Preserve the host
+/// detail verbatim, name the failure kind, surface the retryable judgment,
+/// and add a network hint when the text looks like an offline failure.
+fn friendly_terminal_error(terminal: &str, params: &J) -> String {
+    let err = params.get("error");
+    let kind = err
+        .and_then(|e| e.get("kind"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let message = err
+        .and_then(|e| e.get("message"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let reason = params.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+    let retryable = matches!(err.and_then(|e| e.get("retryable")), Some(J::Bool(true)));
+    let non_retryable = matches!(err.and_then(|e| e.get("retryable")), Some(J::Bool(false)));
+    let detail = if !message.is_empty() {
+        message.to_string()
+    } else if !reason.is_empty() {
+        reason.to_string()
+    } else {
+        String::new()
+    };
+    let mut out = if detail.is_empty() {
+        format!("turn ended with terminal '{terminal}'")
+    } else if kind.is_empty() {
+        format!("turn failed (terminal '{terminal}'): {detail}")
+    } else {
+        format!("turn failed (terminal '{terminal}', kind '{kind}'): {detail}")
+    };
+    if !reason.is_empty() && reason != detail {
+        out.push_str(&format!(" (reason: {reason})"));
+    }
+    if retryable {
+        out.push_str(". The host marks this retryable: retry the same prompt");
+    } else if non_retryable {
+        out.push_str(". The host marks this non-retryable");
+    }
+    let combined = format!("{kind} {message} {reason}");
+    if is_network_error(&combined) {
+        out.push_str(
+            ". This looks like a network/offline failure (e.g. `git fetch` failing while offline): check your network connection, then retry; any tool results above are preserved",
+        );
+    }
+    out
+}
+
 /// Translate backend decision-stage rejection jargon into an actionable
 /// error. The host guards its decision-stage audit log: a turn submitted
 /// while an approval still needs its recorded verdict — or after a verdict
@@ -3225,8 +3317,9 @@ fn handle_msp(
                 .get("terminal")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let terminal_detail = friendly_terminal_error(terminal, params);
             log(&format!(
-                "turn/completed turn={turn_id} terminal={terminal}"
+                "turn/completed turn={turn_id} terminal={terminal} detail={terminal_detail}"
             ));
             let acp_sid = match find_acp_sid(sessions, msp_sid) {
                 Some(s) => s,
@@ -3248,7 +3341,24 @@ fn handle_msp(
                 });
             if let Some((req_id, ver, rest)) = settled {
                 let stop = fold::stop_reason(terminal);
+                let failed = terminal != "completed" && terminal != "cancelled";
                 if ver == 2 {
+                    // A failed terminal otherwise surfaces as a bare idle
+                    // with `_failed` and an empty transcript (the reported
+                    // offline bug). Emit the host detail as an agent message
+                    // first so the transcript explains what happened.
+                    if failed {
+                        let msg_id = mint_id("msg-", &ID_COUNTER);
+                        acp::send_raw(
+                            stdout,
+                            &format!(
+                                "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
+                                esc(&acp_sid),
+                                esc(&msg_id),
+                                esc(&terminal_detail),
+                            ),
+                        );
+                    }
                     // Idle only when no session work remains; otherwise
                     // re-assert running so queued work isn't misreported.
                     if rest == 0 {
@@ -3266,12 +3376,7 @@ fn handle_msp(
                                 &format!("{{\"stopReason\":\"{stop}\"}}"),
                             );
                         } else {
-                            acp::send_error(
-                                stdout,
-                                &Some(req_id),
-                                -32603,
-                                &format!("turn ended with terminal '{terminal}'"),
-                            );
+                            acp::send_error(stdout, &Some(req_id), -32603, &terminal_detail);
                         }
                     }
                 } else {
@@ -4367,7 +4472,10 @@ fn complete_elicitation(
 
 #[cfg(test)]
 mod tests {
-    use super::{CostRate, env_flag_enabled, friendly_turn_error, parse_rates, v1_init, v2_init};
+    use super::{
+        CostRate, env_flag_enabled, friendly_terminal_error, friendly_turn_error, is_network_error,
+        parse_rates, v1_init, v2_init,
+    };
     use crate::acp;
     use crate::json::{J, parse_json};
     use std::path::{Path, PathBuf};
@@ -4463,6 +4571,50 @@ mod tests {
     fn unrelated_turn_errors_pass_through_untouched() {
         let out = friendly_turn_error("turn/start failed", "boom");
         assert_eq!(out, "turn/start failed: boom");
+    }
+
+    #[test]
+    fn terminal_failure_preserves_host_detail_and_retryable() {
+        let params = parse_json(
+            "{\"terminal\":\"failed\",\"error\":{\"kind\":\"modelError\",\"message\":\"boom\",\"retryable\":true}}",
+        )
+        .unwrap();
+        let out = friendly_terminal_error("failed", &params);
+        assert!(out.contains("boom"), "host message survives: {out}");
+        assert!(out.contains("modelError"), "kind survives: {out}");
+        assert!(out.contains("retryable"), "retryable survives: {out}");
+        assert!(
+            !is_network_error("boom"),
+            "plain failure is not a network failure"
+        );
+        assert!(
+            !out.contains("network/offline"),
+            "no offline hint for plain failure: {out}"
+        );
+    }
+
+    #[test]
+    fn terminal_network_failure_adds_offline_hint() {
+        let params = parse_json(
+            "{\"terminal\":\"failed\",\"error\":{\"kind\":\"environmentError\",\"message\":\"git fetch failed for origin/main: network unreachable\",\"retryable\":true},\"reason\":\"network unreachable\"}",
+        )
+        .unwrap();
+        let out = friendly_terminal_error("failed", &params);
+        assert!(
+            out.contains("git fetch failed for origin/main"),
+            "tool failure survives: {out}"
+        );
+        assert!(
+            out.contains("check your network"),
+            "offline hint present: {out}"
+        );
+    }
+
+    #[test]
+    fn terminal_failure_without_detail_falls_back_to_terminal() {
+        let params = parse_json("{\"terminal\":\"failed\"}").unwrap();
+        let out = friendly_terminal_error("failed", &params);
+        assert_eq!(out, "turn ended with terminal 'failed'");
     }
 
     fn rates(input: &str, output: &str, currency: &str) -> Option<CostRate> {

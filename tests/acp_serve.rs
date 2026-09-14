@@ -677,6 +677,80 @@ fn v1_failed_terminal_is_an_error_never_completed() {
 }
 
 #[test]
+fn v1_failed_terminal_surfaces_host_detail_with_network_hint() {
+    // Offline regression: cutting the network ends the turn with terminal
+    // 'failed' plus error detail (e.g. `git fetch` failing). The adapter
+    // must not swallow that into `turn ended with terminal 'failed'` — it
+    // must surface the host message, kind, retryable judgment, and a
+    // network hint.
+    let mut c = Client::spawn(
+        "failed",
+        &[
+            ("FAKE_TURN_ERROR_KIND", "environmentError"),
+            (
+                "FAKE_TURN_ERROR_MESSAGE",
+                "git fetch failed for origin/main: network unreachable",
+            ),
+            ("FAKE_TURN_ERROR_RETRYABLE", "true"),
+            ("FAKE_TURN_REASON", "network unreachable"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("\"error\""), "failed turn errors: {done}");
+    assert!(
+        done.contains("git fetch failed for origin/main"),
+        "host detail survives: {done}"
+    );
+    assert!(
+        done.contains("environmentError"),
+        "failure kind survives: {done}"
+    );
+    assert!(
+        done.contains("retryable"),
+        "retryable judgment survives: {done}"
+    );
+    assert!(
+        done.to_lowercase().contains("network")
+            && (done.contains("check your network") || done.contains("offline")),
+        "offline hint present: {done}"
+    );
+    c.finish();
+}
+
+#[test]
+fn v2_failed_terminal_emits_detail_before_idle() {
+    // v2 otherwise idles with bare `_failed` and an empty transcript. The
+    // host detail must arrive as an agent message before the idle frame.
+    let mut c = Client::spawn(
+        "failed",
+        &[
+            ("FAKE_TURN_ERROR_KIND", "environmentError"),
+            (
+                "FAKE_TURN_ERROR_MESSAGE",
+                "git fetch failed for origin/main: network unreachable",
+            ),
+            ("FAKE_TURN_ERROR_RETRYABLE", "true"),
+        ],
+    );
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "hi");
+    let msg = c.wait_for("agent_message_chunk", Duration::from_secs(15));
+    assert!(
+        msg.contains("git fetch failed for origin/main"),
+        "v2 transcript carries host detail: {msg}"
+    );
+    let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+    assert!(idle.contains(&sid), "idle for our session: {idle}");
+    assert!(
+        idle.contains("_failed"),
+        "failed terminal keeps its stop reason: {idle}"
+    );
+    c.finish();
+}
+
+#[test]
 fn v2_prompt_accepts_then_echoes_and_idles() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(2, "");

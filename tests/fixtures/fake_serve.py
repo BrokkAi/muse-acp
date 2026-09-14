@@ -207,7 +207,28 @@ def on_turn_start(params):
             "status": "completed", "text": "hello from fake host"}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "failed":
-        notify("turn/completed", {**base, "terminal": "failed"})
+        failed_params = {**base, "terminal": "failed"}
+        err_kind = os.environ.get("FAKE_TURN_ERROR_KIND", "")
+        err_msg = os.environ.get("FAKE_TURN_ERROR_MESSAGE", "")
+        err_retry = os.environ.get("FAKE_TURN_ERROR_RETRYABLE", "")
+        turn_reason = os.environ.get("FAKE_TURN_REASON", "")
+        if err_kind or err_msg or err_retry:
+            err_obj = {}
+            if err_kind:
+                err_obj["kind"] = err_kind
+            else:
+                err_obj["kind"] = "modelError"
+            err_obj["message"] = err_msg if err_msg else "boom"
+            if err_retry == "true":
+                err_obj["retryable"] = True
+            elif err_retry == "false":
+                err_obj["retryable"] = False
+            else:
+                err_obj["retryable"] = False
+            failed_params["error"] = err_obj
+        if turn_reason:
+            failed_params["reason"] = turn_reason
+        notify("turn/completed", failed_params)
     elif SCENARIO == "tool":
         notify("item/completed", {**base, "item": {
             "itemId": "it-t1", "kind": "toolCall", "callId": "call-1",
