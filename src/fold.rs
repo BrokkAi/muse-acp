@@ -82,9 +82,36 @@ fn msp_status(s: &str) -> &'static str {
     match s {
         "completed" => "completed",
         "failed" => "failed",
-        "cancelled" => "cancelled",
+        // ACP (v1 and v2) has no `cancelled` tool status; emitting one makes the
+        // whole session/update unparseable on the client, which strands the
+        // tool card in_progress. Map it to the nearest legal terminal.
+        "cancelled" => "failed",
         "in_progress" | "inProgress" | "running" | "started" => "in_progress",
         _ => "pending",
+    }
+}
+
+/// A readable title for a host card whose terminal snapshot carries none, so an
+/// announced card still settles instead of stranding in_progress. Splits a
+/// camelCase item kind, e.g. `reminderChild` -> `Reminder child`.
+fn fallback_card_title(kind: &str) -> String {
+    let mut title = String::new();
+    for (i, ch) in kind.chars().enumerate() {
+        if ch.is_ascii_uppercase() {
+            if i != 0 {
+                title.push(' ');
+            }
+            title.push(ch.to_ascii_lowercase());
+        } else if i == 0 {
+            title.extend(ch.to_uppercase());
+        } else {
+            title.push(ch);
+        }
+    }
+    if title.is_empty() {
+        "Item".to_string()
+    } else {
+        title
     }
 }
 
@@ -1145,15 +1172,26 @@ impl SessionFold {
                 self.items.remove(&item_id);
             }
             _ => {
+                // A reminderChild and other unknown kinds land here. If a card
+                // was announced at start (it is tracked as a Tool role) but this
+                // terminal snapshot carries no title, still settle it with a
+                // fallback title so the tool never stays in_progress (#1007).
+                let announced_card =
+                    matches!(self.items.get(&item_id), Some(ItemRole::Tool { .. }));
+                let (tc_id, announced) = self.host_item_role(&item_id, "item-");
                 let (title, content, meta) = Self::host_card_parts(kind, item);
-                if !title.is_empty() {
-                    let (tc_id, announced) = self.host_item_role(&item_id, "item-");
+                if !title.is_empty() || announced_card {
+                    let card_title = if title.is_empty() {
+                        fallback_card_title(kind)
+                    } else {
+                        title.clone()
+                    };
                     out.push(Self::card_line(
                         acp_sid,
                         ver,
                         !announced,
                         &tc_id,
-                        &title,
+                        &card_title,
                         "other",
                         msp_status(status),
                         content.as_deref(),
@@ -1323,5 +1361,62 @@ mod corpus_tests {
             "host display text stays authoritative: {}",
             out[0]
         );
+    }
+
+    #[test]
+    fn cancelled_maps_to_a_legal_acp_status() {
+        // ACP has no `cancelled` tool status; emitting one strands the card.
+        assert_eq!(super::msp_status("cancelled"), "failed");
+        assert_eq!(super::msp_status("completed"), "completed");
+        assert_eq!(super::msp_status("in_progress"), "in_progress");
+    }
+
+    #[test]
+    fn fallback_card_title_humanizes_a_camel_case_kind() {
+        assert_eq!(super::fallback_card_title("reminderChild"), "Reminder child");
+        assert_eq!(super::fallback_card_title("workflow"), "Workflow");
+        assert_eq!(super::fallback_card_title(""), "Item");
+    }
+
+    #[test]
+    fn an_announced_reminder_child_settles_even_without_a_terminal_title() {
+        let mut fold = SessionFold::new();
+
+        // The card is announced at start with a title.
+        let started = parse_json(
+            r#"{"itemId":"r1","kind":"reminderChild","status":"in_progress","fallbackText":"Reminder child session"}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 1, &started, &mut out);
+        assert!(
+            out.iter().any(|line| line.contains("Reminder child session")),
+            "the start announces the card: {out:?}"
+        );
+
+        // The terminal snapshot carries no title, yet the card must settle
+        // instead of staying in_progress (#1007).
+        let completed =
+            parse_json(r#"{"item":{"itemId":"r1","kind":"reminderChild","status":"completed"}}"#)
+                .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_completed("sid", 1, &completed, &mut out);
+        assert!(
+            out.iter()
+                .any(|line| line.contains("\"toolCallId\"") && line.contains("\"completed\"")),
+            "the reminder-child card settles to completed: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_unannounced_titleless_item_emits_nothing() {
+        // Never announced and no title: there is nothing honest to settle.
+        let mut fold = SessionFold::new();
+        let completed =
+            parse_json(r#"{"item":{"itemId":"x9","kind":"reminderChild","status":"completed"}}"#)
+                .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_completed("sid", 1, &completed, &mut out);
+        assert!(out.is_empty(), "nothing to settle: {out:?}");
     }
 }

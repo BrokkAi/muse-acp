@@ -3111,9 +3111,12 @@ fn local_file_text(uri: &str, cwd: Option<&str>) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 fn find_acp_sid(sessions: &Sessions, msp_sid: &str) -> Option<String> {
+    // Tolerate a poisoned lock like every other site: a panic while another
+    // thread held this mutex must not take down the routing thread, which also
+    // delivers the session/prompt result.
     sessions
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .iter()
         .find(|(_, s)| s.msp_sid == msp_sid)
         .map(|(k, _)| k.clone())
@@ -3156,37 +3159,49 @@ fn drill_down_subagent_child(
     if !needs_read {
         return;
     }
-    let read = host.command(
-        "session/read",
-        &format!("{{\"sessionId\":{},\"excludeItems\":false}}", esc(child)),
-    );
-    match read {
-        Ok(r) => {
-            let mut out = Vec::new();
-            {
-                let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-                if let Some(s) = map.get_mut(acp_sid)
-                    && let Some(fold) = s.child_folds.get_mut(child)
-                    && let Some(J::Arr(items)) = r.get("history").and_then(|h| h.get("items"))
+    // The session/read blocks until the child transcript returns or the method
+    // timeout (minutes) elapses. Run it and the replay on a dedicated thread so
+    // it never stalls the routing thread, which also delivers later card
+    // updates and the session/prompt result. A blocking read here hung whole
+    // turns (#1007).
+    let host = Arc::clone(host);
+    let stdout = Arc::clone(stdout);
+    let sessions = Arc::clone(sessions);
+    let acp_sid = acp_sid.to_string();
+    let child = child.to_string();
+    std::thread::spawn(move || {
+        let read = host.command(
+            "session/read",
+            &format!("{{\"sessionId\":{},\"excludeItems\":false}}", esc(&child)),
+        );
+        match read {
+            Ok(r) => {
+                let mut out = Vec::new();
                 {
-                    for it in items.clone() {
-                        let wrap = J::Obj(vec![("item".to_string(), it)]);
-                        fold.on_item_completed(child, ver, &wrap, &mut out);
+                    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(s) = map.get_mut(&acp_sid)
+                        && let Some(fold) = s.child_folds.get_mut(&child)
+                        && let Some(J::Arr(items)) = r.get("history").and_then(|h| h.get("items"))
+                    {
+                        for it in items.clone() {
+                            let wrap = J::Obj(vec![("item".to_string(), it)]);
+                            fold.on_item_completed(&child, ver, &wrap, &mut out);
+                        }
                     }
                 }
+                for line in out {
+                    acp::send_raw(&stdout, &line);
+                }
+                log(&format!("subagent child {child} transcript replayed"));
             }
-            for line in out {
-                acp::send_raw(stdout, &line);
+            Err(e) => {
+                log(&format!(
+                    "subagent child {child} transcript read failed: {}",
+                    err_message(&e)
+                ));
             }
-            log(&format!("subagent child {child} transcript replayed"));
         }
-        Err(e) => {
-            log(&format!(
-                "subagent child {child} transcript read failed: {}",
-                err_message(&e)
-            ));
-        }
-    }
+    });
 }
 
 fn handle_msp(
