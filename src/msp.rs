@@ -156,6 +156,81 @@ pub fn describe_spawn_error(bin: &str, e: &std::io::Error) -> String {
     }
 }
 
+/// MSP v1 has no auth method or stable auth error kind. Match explicit login
+/// diagnostics only; a bare 401/403 or permission denial may belong to a tool.
+/// Never echo raw authentication errors: they can contain credentials.
+pub fn auth_failure(message: &str) -> Option<&'static str> {
+    let lower = message.to_ascii_lowercase();
+    if [
+        "session expired",
+        "session has expired",
+        "token expired",
+        "token has expired",
+        "credentials expired",
+        "credentials have expired",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+    {
+        Some("Muse session expired")
+    } else if [
+        "not authenticated",
+        "unauthenticated",
+        "not logged in",
+        "not signed in",
+        "authentication required",
+        "please log in",
+        "please login",
+        "run `muse login`",
+        "run muse login",
+    ]
+    .iter()
+    .any(|s| lower.contains(s))
+    {
+        Some("Muse is not authenticated")
+    } else {
+        None
+    }
+}
+
+pub fn auth_diagnostic(message: &str, host: &HandshakeInfo) -> Option<String> {
+    let failure = auth_failure(message)?;
+    let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".into());
+    let host_label = if host.server_version.is_empty() {
+        "unreported (initialize did not complete)".to_string()
+    } else {
+        host.host_label()
+    };
+    Some(format!(
+        "{failure}. Run `muse login` using the configured Muse executable ({bin}) on the machine and OS account running muse-acp, then restart the editor agent and retry. Host: {}. For browserless/remote login options, run `muse login --help` in that environment.",
+        host_label
+    ))
+}
+
+/// Turn failures can describe tools and other services used by the model.
+/// Generic auth text is attributable to Muse only for model failures; other
+/// failure classes need to name Muse explicitly so service guidance survives.
+pub fn turn_auth_diagnostic(
+    message: &str,
+    error_kind: &str,
+    host: &HandshakeInfo,
+) -> Option<String> {
+    if error_kind != "modelError" && !message.to_ascii_lowercase().contains("muse") {
+        return None;
+    }
+    auth_diagnostic(message, host)
+}
+
+/// ACP reserves -32000 for authentication required. Other MSP errors retain
+/// the caller's existing ACP mapping; MSP numeric codes are not ACP codes.
+pub fn acp_error_code(error: &J, fallback: i64) -> i64 {
+    if auth_failure(&err_message(error)).is_some() {
+        -32000
+    } else {
+        fallback
+    }
+}
+
 pub struct MspHost {
     writer: Arc<Mutex<std::process::ChildStdin>>,
     next_id: AtomicU64,
@@ -329,7 +404,11 @@ impl MspHost {
             return Err(mk_err(-32603, &format!("serve write failed: {e}")));
         }
         match rx.recv_timeout(timeout) {
-            Ok(r) => r,
+            Ok(r) => r.map_err(|e| {
+                auth_diagnostic(&err_message(&e), &self.handshake())
+                    .map(|message| mk_err(-32000, &message))
+                    .unwrap_or(e)
+            }),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 self.pending
                     .lock()
@@ -641,5 +720,41 @@ mod readiness_tests {
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let msg = describe_spawn_error("/opt/muse", &denied);
         assert!(msg.contains("not executable"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod authentication_tests {
+    use super::*;
+
+    #[test]
+    fn unrelated_failures_do_not_request_muse_login() {
+        for message in [
+            "HTTP 401 Unauthorized",
+            "HTTP 403 Forbidden",
+            "permission denied",
+            "session not found",
+            "connection timed out",
+            "unsupported schema version",
+            "compose session permission profile: reviewer unavailable",
+        ] {
+            assert_eq!(auth_failure(message), None, "{message}");
+            assert_eq!(acp_error_code(&mk_err(-32603, message), -32602), -32602);
+        }
+    }
+
+    #[test]
+    fn external_turn_auth_failures_keep_their_service_diagnostic() {
+        let host = HandshakeInfo::default();
+        let message = "turn failed (kind 'environmentError'): AWS credentials have expired";
+
+        assert_eq!(
+            turn_auth_diagnostic(message, "environmentError", &host),
+            None
+        );
+        assert!(turn_auth_diagnostic(message, "modelError", &host).is_some());
+        assert!(
+            turn_auth_diagnostic("Muse session has expired", "environmentError", &host).is_some()
+        );
     }
 }
