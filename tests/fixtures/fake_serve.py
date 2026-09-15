@@ -122,9 +122,14 @@ ACTIVE_SESSION = [MSP_SID]
 CRASH_AFTER_ACK = [False]
 
 
-def session_obj(session_id=None, workspace_root="/tmp/fake-ws"):
+ACTIVE_WORKSPACE = ["/tmp/fake-ws"]
+
+
+def session_obj(session_id=None, workspace_root=None):
     if session_id is None:
         session_id = ACTIVE_SESSION[0]
+    if workspace_root is None:
+        workspace_root = ACTIVE_WORKSPACE[0]
     return {"sessionId": session_id, "modelId": "fake-model",
             "workspaceRoot": workspace_root,
             "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
@@ -615,7 +620,10 @@ def result_for(method, msg):
             return {"approvals": [dict(APPROVAL_PARAMS)], "userInputs": []}
         return {"approvals": [], "userInputs": []}
     if method == "session/start":
-        return {"session": session_obj(), "viewCursor": "cur-0"}
+        workspace_root = msg.get("params", {}).get("workspaceRoot", "/tmp/fake-ws")
+        ACTIVE_WORKSPACE[0] = workspace_root
+        return {"session": session_obj(workspace_root=workspace_root),
+                "viewCursor": "cur-0"}
     if method == "session/resume":
         params = msg.get("params", {})
         log_input(params)
@@ -652,7 +660,8 @@ def result_for(method, msg):
                 history["snapshot"]["state"]["pendingUserInputs"] = [
                     {"userInputId": "ui-1", "itemId": "item-ui-1",
                      "viewCursor": "cur-8"}]
-        return {"session": session_obj(params.get("sessionId", MSP_SID)),
+        workspace_root = "/tmp" if SCENARIO == "resume_active" else None
+        return {"session": session_obj(params.get("sessionId", MSP_SID), workspace_root),
                 "viewCursor": "cur-9",
                 "pendingRequests": pending,
                 "history": history}
