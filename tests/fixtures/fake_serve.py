@@ -22,6 +22,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   quiet        turn/start answers only; nothing follows (for close/cancel)
   load         session/resume serves inline history (for session/load replay)
   resume_active session/resume reports a running turn (for steering reattach)
+  async_resume session/resume reports running background work
   catalog_grows model/list expands after the first snapshot
   catalog_refresh_failure valid catalog, malformed response, RPC error, empty catalog
   usage_turn   two model legs from two models plus a replayed leg, one turn
@@ -639,6 +640,19 @@ def result_for(method, msg):
                 "workspaceRoot": "/home/me/src/proj"}
         elif SCENARIO == "usage_snapshot_null":
             history = usage_snapshot_history(context=False)
+        elif SCENARIO == "async_resume":
+            history = {"mode": "inline", "snapshot": None, "items": [
+                {"itemId": "bg-resumed", "kind": "toolCall",
+                 "callId": "call-bg-resumed", "status": "inProgress",
+                 "tool": "workspace-shell", "args": {"command": "npm watch"},
+                 "background": True, "backgroundInitiator": "timeout"},
+                {"itemId": "shell-resumed", "kind": "userShell",
+                 "status": "inProgress", "turnId": None,
+                 "commandText": "cargo watch"},
+                {"itemId": "shell-done", "kind": "userShell",
+                 "status": "completed", "turnId": None,
+                 "commandText": "old command", "exitCode": 0},
+            ]}
         elif SCENARIO in ("usage_inline", "questions_resume") and snapshot_rung:
             history = usage_snapshot_history(cumulative=(300, 60))
         else:
