@@ -207,6 +207,20 @@ pub fn auth_diagnostic(message: &str, host: &HandshakeInfo) -> Option<String> {
     ))
 }
 
+/// Turn failures can describe tools and other services used by the model.
+/// Generic auth text is attributable to Muse only for model failures; other
+/// failure classes need to name Muse explicitly so service guidance survives.
+pub fn turn_auth_diagnostic(
+    message: &str,
+    error_kind: &str,
+    host: &HandshakeInfo,
+) -> Option<String> {
+    if error_kind != "modelError" && !message.to_ascii_lowercase().contains("muse") {
+        return None;
+    }
+    auth_diagnostic(message, host)
+}
+
 /// ACP reserves -32000 for authentication required. Other MSP errors retain
 /// the caller's existing ACP mapping; MSP numeric codes are not ACP codes.
 pub fn acp_error_code(error: &J, fallback: i64) -> i64 {
@@ -727,5 +741,20 @@ mod authentication_tests {
             assert_eq!(auth_failure(message), None, "{message}");
             assert_eq!(acp_error_code(&mk_err(-32603, message), -32602), -32602);
         }
+    }
+
+    #[test]
+    fn external_turn_auth_failures_keep_their_service_diagnostic() {
+        let host = HandshakeInfo::default();
+        let message = "turn failed (kind 'environmentError'): AWS credentials have expired";
+
+        assert_eq!(
+            turn_auth_diagnostic(message, "environmentError", &host),
+            None
+        );
+        assert!(turn_auth_diagnostic(message, "modelError", &host).is_some());
+        assert!(
+            turn_auth_diagnostic("Muse session has expired", "environmentError", &host).is_some()
+        );
     }
 }

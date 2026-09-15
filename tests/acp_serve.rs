@@ -3607,6 +3607,46 @@ fn expired_authentication_mid_turn_surfaces_in_both_protocols() {
 }
 
 #[test]
+fn external_authentication_failure_mid_turn_keeps_service_context() {
+    for version in [1, 2] {
+        let mut c = Client::spawn(
+            "failed",
+            &[
+                ("FAKE_TURN_ERROR_KIND", "environmentError"),
+                (
+                    "FAKE_TURN_ERROR_MESSAGE",
+                    "AWS credentials have expired; refresh the workspace AWS profile",
+                ),
+                ("FAKE_TURN_ERROR_RETRYABLE", "false"),
+            ],
+        );
+        let sid = c.new_session(version, "");
+        let id = c.prompt(&sid, "hi");
+        let frame = if version == 1 {
+            c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15))
+        } else {
+            c.wait_for("AWS credentials", Duration::from_secs(15))
+        };
+        assert!(
+            frame.contains("AWS credentials have expired")
+                && frame.contains("environmentError")
+                && frame.contains("workspace AWS profile"),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("Muse session expired") && !frame.contains("muse login"),
+            "{frame}"
+        );
+        if version == 1 {
+            assert!(frame.contains("\"code\":-32603"), "{frame}");
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        c.finish();
+    }
+}
+
+#[test]
 fn authentication_initialize_failure_has_external_login_guidance() {
     let output = Command::new(adapter_bin())
         .env("MUSE_CLI", fixture())

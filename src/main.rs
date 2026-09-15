@@ -3364,11 +3364,16 @@ fn handle_msp(
                 .get("terminal")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let terminal_detail = msp::auth_diagnostic(
-                &friendly_terminal_error(terminal, params),
-                &host.handshake(),
-            )
-            .unwrap_or_else(|| friendly_terminal_error(terminal, params));
+            let original_terminal_detail = friendly_terminal_error(terminal, params);
+            let error_kind = params
+                .get("error")
+                .and_then(|e| e.get("kind"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let auth_detail =
+                msp::turn_auth_diagnostic(&original_terminal_detail, error_kind, &host.handshake());
+            let auth_required = auth_detail.is_some();
+            let terminal_detail = auth_detail.unwrap_or(original_terminal_detail);
             log(&format!(
                 "turn/completed turn={turn_id} terminal={terminal} detail={terminal_detail}"
             ));
@@ -3437,11 +3442,7 @@ fn handle_msp(
                             acp::send_error(
                                 stdout,
                                 &Some(req_id),
-                                if msp::auth_failure(&terminal_detail).is_some() {
-                                    -32000
-                                } else {
-                                    -32603
-                                },
+                                if auth_required { -32000 } else { -32603 },
                                 &terminal_detail,
                             );
                         }
