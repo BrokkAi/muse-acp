@@ -1373,7 +1373,10 @@ mod corpus_tests {
 
     #[test]
     fn fallback_card_title_humanizes_a_camel_case_kind() {
-        assert_eq!(super::fallback_card_title("reminderChild"), "Reminder child");
+        assert_eq!(
+            super::fallback_card_title("reminderChild"),
+            "Reminder child"
+        );
         assert_eq!(super::fallback_card_title("workflow"), "Workflow");
         assert_eq!(super::fallback_card_title(""), "Item");
     }
@@ -1390,7 +1393,8 @@ mod corpus_tests {
         let mut out = Vec::new();
         fold.on_item_snapshot("sid", 1, &started, &mut out);
         assert!(
-            out.iter().any(|line| line.contains("Reminder child session")),
+            out.iter()
+                .any(|line| line.contains("Reminder child session")),
             "the start announces the card: {out:?}"
         );
 

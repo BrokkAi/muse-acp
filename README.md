@@ -204,10 +204,40 @@ MUSE_LOG=debug                     # per-method protocol tracing (no payloads)
 to the host default; set `MUSE_APPROVAL_MODE=promptUnmatched` to force every
 unmatched tool call through `session/request_permission`.
 
-Local image and resource reads are confined to the session workspace by
-default. `MUSE_ALLOW_UNSCOPED_READS` disables that boundary only when its value
-is explicitly `1`, `true`, `yes`, or `on` (case-insensitive). Do not enable it
-for untrusted sessions or workspaces.
+### Workspace roots and local resources
+
+ACP `cwd` is the primary workspace root and the base for relative resource
+paths. The adapter passes it to Muse as MSP's single `workspaceRoot`. When a
+client supplies `additionalDirectories`, each entry must be an absolute path;
+the adapter treats `[cwd, ...additionalDirectories]` as the ordered set of
+roots approved for local image and textual `resource_link` expansion. MSP v1
+has no additional-root field, so these extra roots do not change Muse's own
+tool workspace or sandbox policy.
+
+The adapter accepts nested, unrelated, and symlinked roots and removes exact
+duplicates while preserving first occurrence order. It resolves the requested
+path and every root through the filesystem before checking containment. This
+means `..`, percent-encoded separators, path spelling differences on a
+case-normalizing filesystem, and symlinks cannot escape the union of approved
+roots. A symlink supplied as a root authorizes its resolved target. Hard links
+are path entries rather than redirects: a hard-link name inside a root is in
+scope, while another name for the same inode outside every root is not.
+
+Only valid UTF-8 text without binary control bytes is expanded as text, with a
+256 KiB limit. Malformed `file://` percent escapes are rejected, remote file
+hosts are rejected, and non-file resource links remain mentions. Embedded
+non-image blobs remain unsupported.
+
+On `session/load`, `session/resume`, and `session/fork`, the request's complete
+additional-directory list becomes active. Omitting it or sending an empty list
+activates no extra roots, so old filesystem scope is never restored implicitly.
+Live `session/list` entries report that active list; Muse sessions discovered
+after an adapter restart have only their persisted MSP `workspaceRoot`.
+
+Local reads are confined to this root set by default.
+`MUSE_ALLOW_UNSCOPED_READS` disables that boundary only when its value is
+explicitly `1`, `true`, `yes`, or `on` (case-insensitive). Do not enable it for
+untrusted sessions or workspaces.
 
 ### Linux arm64 sandbox advisory
 
