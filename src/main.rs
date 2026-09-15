@@ -2507,7 +2507,14 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .unwrap_or("")
                 .to_string();
             let filter_additional = match additional_directories(params.as_ref()) {
-                Ok(roots) => roots,
+                Ok(mut roots) => {
+                    // session/new removes an exact duplicate of cwd from the
+                    // effective additional roots. Apply the same
+                    // normalization to list filters so callers can reuse the
+                    // accepted creation parameters.
+                    roots.retain(|root| root != &filter_root);
+                    roots
+                }
                 Err(message) => {
                     acp::send_error(stdout, &id, -32602, &message);
                     return;
@@ -3069,8 +3076,7 @@ fn extract_prompt_parts(
                         if uri.is_empty() {
                             return Err("resource_link block needs uri".to_string());
                         }
-                        let textual = mime.starts_with("text/")
-                            || (mime.is_empty() && looks_textual(uri));
+                        let textual = mime.starts_with("text/") || looks_textual(uri);
                         let local_text = if textual {
                             local_file_text(uri, roots)?
                         } else {
@@ -3250,10 +3256,7 @@ fn read_image_uri(uri: &str, roots: &[String]) -> Result<(Vec<u8>, String), Stri
     let path = confined_path(&requested, roots)?;
     let bytes =
         std::fs::read(&path).map_err(|e| format!("cannot read image {}: {e}", path.display()))?;
-    Ok((
-        bytes,
-        mime_for(path.to_str().unwrap_or(&requested)).to_string(),
-    ))
+    Ok((bytes, mime_for(&requested).to_string()))
 }
 
 /// Read a small text file for resource_link inlining (None = mention only).

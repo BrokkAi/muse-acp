@@ -1998,7 +1998,9 @@ fn resource_link_inlines_workspace_text() {
     std::fs::create_dir_all(&dir).expect("tmpdir");
     // Percent-encoded name exercises URI decoding + workspace confinement.
     std::fs::write(dir.join("sp ace.txt"), "secret file text").expect("write");
+    std::fs::write(dir.join("context.json"), "json resource text").expect("write");
     let uri = format!("file://{}", dir.join("sp%20ace.txt").to_str().unwrap());
+    let json_uri = format!("file://{}", dir.join("context.json").to_str().unwrap());
     let init = c.req("initialize", "{\"protocolVersion\":1}");
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
@@ -2021,13 +2023,46 @@ fn resource_link_inlines_workspace_text() {
     let pid = c.req(
         "session/prompt",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource_link\",\"uri\":\"{uri}\",\"name\":\"notes\"}}]}}"
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[\
+             {{\"type\":\"resource_link\",\"uri\":\"{uri}\",\"name\":\"notes\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"{json_uri}\",\"name\":\"context\",\"mimeType\":\"application/json\"}}]}}"
         ),
     );
     // Prompt accepted (v1 answers at the terminal, which never comes in
     // quiet mode); the host must have received the inlined text.
     let _pid = pid;
     c.wait_input("secret file text", Duration::from_secs(15));
+    c.wait_input("json resource text", Duration::from_secs(15));
+    c.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn image_symlink_uses_the_requested_filename_for_mime() {
+    use std::os::unix::fs::symlink;
+
+    let mut c = Client::spawn("quiet", &[]);
+    let primary = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent")
+        .join("workspace");
+    std::fs::create_dir_all(&primary).expect("workspace");
+    std::fs::write(primary.join("image-target"), b"fake jpeg bytes").expect("image target");
+    symlink(primary.join("image-target"), primary.join("photo.jpg")).expect("image symlink");
+    let sid = c.new_session_at(1, &primary, &[]);
+    c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"image\",\"uri\":\"{}\"}}]}}",
+            primary.join("photo.jpg").display()
+        ),
+    );
+    c.wait_input("image/jpeg", Duration::from_secs(15));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert!(
+        input.contains("\"mediaType\": \"image/jpeg\""),
+        "image MIME did not follow the requested .jpg name: {input}"
+    );
     c.finish();
 }
 
@@ -2081,9 +2116,11 @@ fn additional_roots_are_confined_consistently_across_protocol_versions() {
         let list_id = c.req(
             "session/list",
             &format!(
-                "{{\"cwd\":\"{}\",\"additionalDirectories\":[\"{}\",\"{}\",\"{}\"]}}",
+                "{{\"cwd\":\"{}\",\"additionalDirectories\":[\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"]}}",
                 primary.display(),
                 nested.display(),
+                nested.display(),
+                primary.display(),
                 unrelated.display(),
                 linked_root.display()
             ),
