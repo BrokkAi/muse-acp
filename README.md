@@ -209,6 +209,42 @@ default. `MUSE_ALLOW_UNSCOPED_READS` disables that boundary only when its value
 is explicitly `1`, `true`, `yes`, or `on` (case-insensitive). Do not enable it
 for untrusted sessions or workspaces.
 
+### Authentication and remote environments
+
+`cli-ready` only means the CLI can be invoked; it does not verify a login.
+When Muse explicitly reports that it is not authenticated or that a session or
+credential has expired, the adapter supplies login guidance and the configured
+executable and handshake version (when available). Session creation, resume,
+and prompt rejections use ACP's `-32000` authentication-required error instead
+of a generic internal error. Mid-turn failures use that error in ACP v1 and an
+explanatory transcript message in v2, whose prompt has already been accepted.
+Raw recognized authentication error text is omitted because it may contain
+credentials. Generic HTTP 401/403, permission errors, and unknown host errors
+are not enough to identify a Muse login failure. MSP v1 defines no stable auth
+error category, so recognition is best-effort based on explicit login/expiry
+wording; an unexplained host error still needs investigation.
+
+Run `muse login` with the executable selected by `MUSE_CLI`, then restart the
+editor agent and retry. For SSH, containers, remote IDE backends, or another OS
+account, run login **where the adapter runs, as the same OS user**. A login on
+your local desktop does not establish credentials for a remote host. GUI
+editors may also have a different `PATH`; set `MUSE_CLI` to an absolute path
+when the editor cannot find the CLI that works in your terminal.
+
+The adapter never opens a browser, prompts for credentials over ACP stdio, or
+copies credentials between machines. In a browserless environment, inspect
+`muse login --help` on that host and use only the remote/browserless flow
+supported by that installed Muse version. If it requires a browser or callback
+that the environment cannot provide, complete the supported login setup before
+starting the adapter; there is no adapter-provided headless login bypass.
+
+The [vendored MSP schema](tests/protocol/PROVENANCE.md) exposes no compatible
+login, logout, credential-refresh, or auth-status method. Accordingly,
+`authMethods` remains empty and ACP authentication requests return an
+unsupported-method error with external-login guidance. The adapter does not
+advertise an authentication flow it cannot complete. Error-code semantics follow
+the [ACP schema](https://agentclientprotocol.com/protocol/v1/schema#errorcode).
+
 ### Linux arm64 sandbox advisory
 
 Muse 1.0.2 may fail to start its sandbox on Linux arm64 because a required

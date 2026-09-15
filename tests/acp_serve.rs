@@ -3514,3 +3514,135 @@ fn cached_input_tokens_price_at_the_catalog_cached_rate() {
     );
     c.finish();
 }
+
+#[test]
+fn authentication_rejections_are_actionable_acp_errors() {
+    for method in [
+        "session/start",
+        "session/resume",
+        "turn/start",
+        "session/list",
+    ] {
+        for (message, expected) in [
+            (
+                "Not authenticated; run muse login. secret-sentinel",
+                "Muse is not authenticated",
+            ),
+            (
+                "Access token has expired: secret-sentinel",
+                "Muse session expired",
+            ),
+        ] {
+            let mut c = Client::spawn(
+                "quiet",
+                &[
+                    ("FAKE_ERROR_METHOD", method),
+                    ("FAKE_ERROR_MESSAGE", message),
+                ],
+            );
+            let id = match method {
+                "session/start" => c.req("session/new", r#"{"cwd":"/tmp"}"#),
+                "session/resume" => {
+                    c.req("session/load", r#"{"sessionId":"existing","cwd":"/tmp"}"#)
+                }
+                "session/list" => c.req("session/list", "{}"),
+                _ => {
+                    let sid = c.new_session(1, "");
+                    c.prompt(&sid, "hi")
+                }
+            };
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            assert!(frame.contains("\"code\":-32000"), "{method}: {frame}");
+            assert!(frame.contains(expected), "{frame}");
+            assert!(
+                frame.contains("muse login") && frame.contains("restart"),
+                "{frame}"
+            );
+            assert!(
+                frame.contains("fake_serve.py") && frame.contains("0.0.0-fixture"),
+                "{frame}"
+            );
+            assert!(!frame.contains("secret-sentinel"), "{frame}");
+            c.finish();
+        }
+    }
+}
+
+#[test]
+fn expired_authentication_mid_turn_surfaces_in_both_protocols() {
+    for version in [1, 2] {
+        let mut c = Client::spawn(
+            "failed",
+            &[
+                ("FAKE_TURN_ERROR_KIND", "modelError"),
+                (
+                    "FAKE_TURN_ERROR_MESSAGE",
+                    "Session has expired: secret-sentinel",
+                ),
+                ("FAKE_TURN_ERROR_RETRYABLE", "true"),
+            ],
+        );
+        let sid = c.new_session(version, "");
+        let id = c.prompt(&sid, "hi");
+        let frame = if version == 1 {
+            c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15))
+        } else {
+            c.wait_for("Muse session expired", Duration::from_secs(15))
+        };
+        assert!(
+            frame.contains("Muse session expired") && frame.contains("muse login"),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("secret-sentinel") && !frame.contains("retry the same prompt"),
+            "{frame}"
+        );
+        if version == 1 {
+            assert!(frame.contains("\"code\":-32000"), "{frame}");
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn authentication_initialize_failure_has_external_login_guidance() {
+    let output = Command::new(adapter_bin())
+        .env("MUSE_CLI", fixture())
+        .env("FAKE_SCENARIO", "quiet")
+        .env("FAKE_ERROR_METHOD", "initialize")
+        .env("FAKE_ERROR_MESSAGE", "Not logged in: secret-sentinel")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run adapter");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Muse is not authenticated") && stderr.contains("muse login"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("unreported") && stderr.contains("fake_serve.py"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("secret-sentinel"), "{stderr}");
+}
+
+#[test]
+fn authentication_remains_external() {
+    let mut c = Client::spawn("quiet", &[]);
+    let id = c.req(
+        "initialize",
+        r#"{"protocolVersion":1,"clientCapabilities":{}}"#,
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"authMethods\":[]"), "{frame}");
+    let id = c.req("authenticate", r#"{"methodId":"login"}"#);
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32601") && frame.contains("muse login"),
+        "{frame}"
+    );
+    c.finish();
+}
