@@ -22,6 +22,9 @@ Muse's session engine, tools, authentication, and approval flow.
 
 See [ROADMAP.md](ROADMAP.md) for protocol-compatibility, reliability, feature,
 and release priorities.
+The [MSP event compatibility matrix](docs/event-compatibility.md) records the
+ACP mapping or intentional disposition of every notification in the pinned
+schema, plus observed host extensions and server-initiated requests.
 
 ## Why MSP instead of `muse exec`?
 
