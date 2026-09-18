@@ -713,6 +713,93 @@ impl SessionFold {
         (title, tool.to_string())
     }
 
+    fn replay_message_line(acp_sid: &str, ver: u8, kind: &str, msg_id: &str, text: &str) -> String {
+        let content = format!("[{{\"type\":\"text\",\"text\":{}}}]", esc(text));
+        let update = match (kind, ver) {
+            ("userMessage", 2) => format!(
+                "{{\"sessionUpdate\":\"user_message\",\"messageId\":{},\"content\":{}}}",
+                esc(msg_id),
+                content
+            ),
+            ("agentMessage", 2) => format!(
+                "{{\"sessionUpdate\":\"agent_message\",\"messageId\":{},\"content\":{}}}",
+                esc(msg_id),
+                content
+            ),
+            ("userMessage", _) => format!(
+                "{{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}",
+                esc(msg_id),
+                esc(text)
+            ),
+            ("agentMessage", _) => format!(
+                "{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}",
+                esc(msg_id),
+                esc(text)
+            ),
+            _ => unreachable!("replay_message_line called for {kind}"),
+        };
+        Self::update_line(acp_sid, &update)
+    }
+
+    fn replay_is_in_flight(item: &J) -> bool {
+        matches!(
+            item.get("status").and_then(|v| v.as_str()),
+            Some("pending" | "inProgress" | "in_progress" | "running" | "started")
+        )
+    }
+
+    /// Seed the fold from one history item without turning an in-flight item
+    /// into a settled item. Snapshot items are the latest state at the
+    /// history cursor, so the live stream may still deliver their deltas and
+    /// terminal completion after attach.
+    pub fn replay_item(&mut self, acp_sid: &str, ver: u8, item: &J, out: &mut Vec<String>) {
+        let item_id = match item.get("itemId").and_then(|v| v.as_str()) {
+            Some(s) => s.to_string(),
+            None => return,
+        };
+        if self.known(&item_id) {
+            return;
+        }
+        let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        if Self::replay_is_in_flight(item) {
+            match kind {
+                "toolCall" => self.on_item_snapshot(acp_sid, ver, item, out),
+                "agentMessage" | "userMessage" => {
+                    self.on_item_snapshot(acp_sid, ver, item, out);
+                    let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    if text.is_empty() {
+                        return;
+                    }
+                    if let Some(ItemRole::Message { msg_id, streamed }) =
+                        self.items.get_mut(&item_id)
+                        && *streamed == 0
+                    {
+                        *streamed = text.len();
+                        out.push(Self::replay_message_line(acp_sid, ver, kind, msg_id, text));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match kind {
+            "toolCall" => {
+                let wrap = J::Obj(vec![("item".to_string(), item.clone())]);
+                self.on_item_completed(acp_sid, ver, &wrap, out);
+            }
+            "agentMessage" | "userMessage" => {
+                self.done.insert(item_id);
+                let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                if !text.is_empty() {
+                    let msg_id = mint_id("msg-", &self.idc);
+                    out.push(Self::replay_message_line(acp_sid, ver, kind, &msg_id, text));
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// item/started and item/updated share snapshotting.
     pub fn on_item_snapshot(&mut self, acp_sid: &str, ver: u8, item: &J, out: &mut Vec<String>) {
         let item_id = match item.get("itemId").and_then(|v| v.as_str()) {
@@ -1360,6 +1447,91 @@ mod corpus_tests {
             out[0].contains("bash: ls -la"),
             "host display text stays authoritative: {}",
             out[0]
+        );
+    }
+
+    #[test]
+    fn replayed_in_flight_tool_stays_open_for_live_completion() {
+        let mut fold = SessionFold::new();
+        let snapshot = parse_json(
+            r#"{"itemId":"it-run","kind":"toolCall","status":"inProgress","tool":"run","callId":"call-run","args":{"command":"work"}}"#,
+        )
+        .unwrap();
+        let mut replay = Vec::new();
+        fold.replay_item("sid", 1, &snapshot, &mut replay);
+        assert!(
+            replay.iter().any(|line| line.contains("\"in_progress\"")),
+            "snapshot announces the running call: {replay:?}"
+        );
+
+        let completed = parse_json(
+            r#"{"item":{"itemId":"it-run","kind":"toolCall","status":"completed","tool":"run","callId":"call-run","result":"running tool finished"}}"#,
+        )
+        .unwrap();
+        let mut live = Vec::new();
+        fold.on_item_completed("sid", 1, &completed, &mut live);
+        assert_eq!(live.len(), 1, "live completion is forwarded: {live:?}");
+        assert!(
+            live[0].contains("running tool finished") && live[0].contains("\"completed\""),
+            "live completion settles the replayed call: {}",
+            live[0]
+        );
+    }
+
+    #[test]
+    fn replayed_in_flight_message_continues_into_live_completion() {
+        let mut fold = SessionFold::new();
+        let snapshot = parse_json(
+            r#"{"itemId":"it-msg","kind":"agentMessage","status":"inProgress","text":"the answer is fo"}"#,
+        )
+        .unwrap();
+        let mut replay = Vec::new();
+        fold.replay_item("sid", 2, &snapshot, &mut replay);
+        assert_eq!(
+            replay.len(),
+            1,
+            "snapshot prefix is emitted once: {replay:?}"
+        );
+        assert!(replay[0].contains("the answer is fo"));
+
+        let delta = parse_json(r#"{"itemId":"it-msg","field":"text","delta":"rty-two"}"#).unwrap();
+        let mut live = Vec::new();
+        fold.on_item_delta("sid", 2, &delta, &mut live);
+        assert_eq!(live.len(), 1, "live delta is forwarded: {live:?}");
+        assert!(live[0].contains("rty-two"));
+
+        let completed = parse_json(
+            r#"{"item":{"itemId":"it-msg","kind":"agentMessage","status":"completed","text":"the answer is forty-two"}}"#,
+        )
+        .unwrap();
+        let mut terminal = Vec::new();
+        fold.on_item_completed("sid", 2, &completed, &mut terminal);
+        assert!(
+            terminal.is_empty(),
+            "completion does not resend the full message: {terminal:?}"
+        );
+    }
+
+    #[test]
+    fn replayed_terminal_message_is_deduplicated_by_later_refill() {
+        let mut fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"it-done","kind":"agentMessage","status":"completed","text":"already shown"}"#,
+        )
+        .unwrap();
+        let mut replay = Vec::new();
+        fold.replay_item("sid", 1, &item, &mut replay);
+        assert_eq!(replay.len(), 1);
+
+        let refill = parse_json(
+            r#"{"item":{"itemId":"it-done","kind":"agentMessage","status":"completed","text":"already shown"}}"#,
+        )
+        .unwrap();
+        let mut duplicate = Vec::new();
+        fold.on_item_completed("sid", 1, &refill, &mut duplicate);
+        assert!(
+            duplicate.is_empty(),
+            "refill does not duplicate replay: {duplicate:?}"
         );
     }
 

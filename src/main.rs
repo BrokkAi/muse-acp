@@ -2770,8 +2770,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
 }
 
 /// History replay for `session/load` (always) and v2 `session/resume` with
-/// `replayFrom`. Messages replay as message updates/chunks; tool calls replay
-/// as completed tool updates (history carries args but no output text).
+/// `replayFrom`. Completed items replay as settled updates; in-flight snapshot
+/// items seed the fold so their live deltas and completion remain deliverable.
 /// Inline items are preferred; snapshot-backed histories keep them under
 /// `history.snapshot.state.items`. Unknown shapes resume without replay
 /// (logged), never fail.
@@ -2799,48 +2799,8 @@ fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) 
     for it in &items {
         let kind = it.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
-            "toolCall" => {
-                // Fold replays the call (title/kind/status/args, no content).
-                let wrap = J::Obj(vec![("item".to_string(), it.clone())]);
-                sess.fold
-                    .on_item_completed(&sess.acp_sid, sess.ver, &wrap, &mut out);
-            }
-            "userMessage" | "agentMessage" => {
-                let text = it.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                if text.is_empty() {
-                    continue;
-                }
-                let msg_id = mint_id("msg-", &ID_COUNTER);
-                let content = format!("[{{\"type\":\"text\",\"text\":{}}}]", esc(text));
-                // v1 replays stream chunks; v2 replays full message upserts.
-                let update = match (kind, sess.ver) {
-                    ("userMessage", 2) => format!(
-                        "{{\"sessionUpdate\":\"user_message\",\"messageId\":{},\"content\":{}}}",
-                        esc(&msg_id),
-                        content
-                    ),
-                    ("agentMessage", 2) => format!(
-                        "{{\"sessionUpdate\":\"agent_message\",\"messageId\":{},\"content\":{}}}",
-                        esc(&msg_id),
-                        content
-                    ),
-                    _ => format!(
-                        "{{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}",
-                        esc(&msg_id),
-                        esc(text)
-                    ),
-                };
-                // v1 agent messages replay as agent chunks.
-                let update = if kind == "agentMessage" && sess.ver != 2 {
-                    format!(
-                        "{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}",
-                        esc(&msg_id),
-                        esc(text)
-                    )
-                } else {
-                    update
-                };
-                out.push(format!("{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{}}}}}", esc(&sess.acp_sid), update));
+            "toolCall" | "userMessage" | "agentMessage" => {
+                sess.fold.replay_item(&sess.acp_sid, sess.ver, it, &mut out)
             }
             _ => {}
         }
