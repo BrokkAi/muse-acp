@@ -85,7 +85,7 @@ fn msp_status(s: &str) -> &'static str {
         // ACP (v1 and v2) has no `cancelled` tool status; emitting one makes the
         // whole session/update unparseable on the client, which strands the
         // tool card in_progress. Map it to the nearest legal terminal.
-        "cancelled" => "failed",
+        "cancelled" | "rejected" | "timedOut" => "failed",
         "in_progress" | "inProgress" | "running" | "started" => "in_progress",
         _ => "pending",
     }
@@ -1364,11 +1364,46 @@ mod corpus_tests {
     }
 
     #[test]
-    fn cancelled_maps_to_a_legal_acp_status() {
-        // ACP has no `cancelled` tool status; emitting one strands the card.
+    fn terminal_failure_statuses_map_to_legal_acp_statuses() {
+        // ACP has no statuses for these MSP terminal failures; emitting one
+        // unchanged strands the card.
         assert_eq!(super::msp_status("cancelled"), "failed");
+        assert_eq!(super::msp_status("rejected"), "failed");
+        assert_eq!(super::msp_status("timedOut"), "failed");
         assert_eq!(super::msp_status("completed"), "completed");
         assert_eq!(super::msp_status("in_progress"), "in_progress");
+    }
+
+    #[test]
+    fn rejected_and_timed_out_tool_completions_settle_cards() {
+        for ver in [1, 2] {
+            for terminal in ["rejected", "timedOut"] {
+                let mut fold = SessionFold::new();
+                let started = parse_json(
+                    r#"{"itemId":"it-t1","kind":"toolCall","callId":"call-1","revision":1,"status":"inProgress","tool":"read_file","args":"{}"}"#,
+                )
+                .unwrap();
+                let mut out = Vec::new();
+                fold.on_item_snapshot("sid", ver, &started, &mut out);
+                assert!(
+                    out[0].contains("\"status\":\"in_progress\""),
+                    "tool starts in progress for v{ver} {terminal}: {out:?}"
+                );
+
+                let completed = parse_json(&format!(
+                    r#"{{"item":{{"itemId":"it-t1","kind":"toolCall","callId":"call-1","revision":2,"status":"{terminal}","tool":"read_file","args":"{{}}","visibleOutput":"Tool did not execute","failureReason":"Tool did not execute"}}}}"#
+                ))
+                .unwrap();
+                out.clear();
+                fold.on_item_completed("sid", ver, &completed, &mut out);
+                assert_eq!(out.len(), 1, "terminal update for v{ver} {terminal}");
+                assert!(
+                    out[0].contains("\"toolCallId\":\"call-1\"")
+                        && out[0].contains("\"status\":\"failed\""),
+                    "tool settles as failed for v{ver} {terminal}: {out:?}"
+                );
+            }
+        }
     }
 
     #[test]
