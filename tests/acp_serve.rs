@@ -55,6 +55,7 @@ impl Client {
         cmd.env("FAKE_LOG", &fake_log);
         cmd.env("FAKE_INPUT", format!("{fake_log}.input"));
         cmd.env("FAKE_FRAMES", format!("{fake_log}.frames"));
+        cmd.env("FAKE_PID", format!("{fake_log}.pid"));
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -187,6 +188,22 @@ impl Client {
         }
     }
 
+    fn wait_for_pid(&self, path: &str, timeout: Duration) -> u32 {
+        let start = Instant::now();
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && let Some(first) = raw.lines().find(|line| !line.trim().is_empty())
+                && let Ok(pid) = first.trim().parse()
+            {
+                return pid;
+            }
+            if start.elapsed() > timeout {
+                panic!("fake host never wrote its pid");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Raw client->server notification (e.g. initialized).
     fn notify(&mut self, method: &str, params: &str) {
         let frame =
@@ -291,6 +308,15 @@ impl Client {
 
 trait WaitTimeout {
     fn wait_timeout(&mut self, t: Duration) -> std::io::Result<Option<std::process::ExitStatus>>;
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 impl WaitTimeout for Child {
@@ -3429,6 +3455,104 @@ fn client_disconnect_exits_promptly_with_a_turn_in_flight() {
         started.elapsed() < Duration::from_secs(5),
         "adapter lingered after client EOF: {:?}",
         started.elapsed()
+    );
+}
+
+#[test]
+fn closed_host_stdin_does_not_strand_a_request() {
+    let marker = std::env::temp_dir().join(format!(
+        "muse-acp-closed-stdin-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let marker_str = marker.to_str().unwrap().to_string();
+    let mut c = Client::spawn(
+        "close_stdin",
+        &[("FAKE_RESTART_MARKER", marker_str.as_str())],
+    );
+    let started = Instant::now();
+    let sid = c.new_session(1, "");
+    let prompt = c.prompt(&sid, "after host stdin closed");
+    let frame = c.wait_for(&format!("\"id\":{prompt}"), Duration::from_secs(5));
+    assert!(
+        frame.contains("stopReason") || frame.contains("error"),
+        "request must settle after host stdin closure: {frame}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "closed host stdin left the ACP request waiting"
+    );
+    c.finish();
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_host_stdout_reaps_the_child_without_waiting_for_process_exit() {
+    let marker = std::env::temp_dir().join(format!(
+        "muse-acp-closed-stdout-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let marker_str = marker.to_str().unwrap().to_string();
+    let mut c = Client::spawn(
+        "stdout_close_stays_alive",
+        &[("FAKE_RESTART_MARKER", marker_str.as_str())],
+    );
+    let _sid = c.new_session(1, "");
+    c.wait_stderr(
+        "host-restarted attempt=1 sessions=1 failures=0",
+        Duration::from_secs(10),
+    );
+    let pid_path = format!("{}.pid", c.fake_log);
+    let pid = c.wait_for_pid(&pid_path, Duration::from_secs(5));
+    assert!(
+        !process_alive(pid),
+        "host whose stdout closed was left running: pid={pid}"
+    );
+    c.finish();
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
+fn closed_editor_stdout_does_not_block_adapter_shutdown() {
+    let mut cmd = Command::new(adapter_bin());
+    cmd.env("MUSE_CLI", fixture())
+        .env("FAKE_SCENARIO", "quiet")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn adapter");
+    let mut stdin = child.stdin.take().expect("adapter stdin");
+    drop(child.stdout.take());
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}\n")
+        .expect("write initialize");
+    stdin.flush().expect("flush initialize");
+    drop(stdin);
+    let status = child
+        .wait_timeout(Duration::from_secs(5))
+        .expect("wait")
+        .expect("adapter exits after stdout closes");
+    assert!(status.success(), "closed stdout exit: {status}");
+}
+
+#[test]
+fn host_stderr_is_drained_while_the_host_is_running() {
+    let mut c = Client::spawn("stderr_flood", &[]);
+    let _sid = c.new_session(1, "");
+    let stderr_path = c.stderr_log.clone();
+    c.finish();
+    let stderr = std::fs::read_to_string(stderr_path).expect("adapter stderr");
+    assert!(
+        stderr.contains("serve stderr captured 32768 bytes"),
+        "bounded host stderr capture missing: {stderr}"
     );
 }
 
