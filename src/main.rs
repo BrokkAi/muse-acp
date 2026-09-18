@@ -1039,6 +1039,7 @@ fn main() {
                 }
             }
             LoopMsg::AcpEof => {
+                host.shutdown();
                 std::process::exit(0);
             }
             LoopMsg::Msp(MspEvent::Eof(why)) => {
@@ -2759,6 +2760,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             if method == "shutdown" {
                 acp::send_result(stdout, &id, "null");
             }
+            host.shutdown();
             std::process::exit(0);
         }
         _ => {
