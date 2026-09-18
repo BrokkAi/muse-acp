@@ -115,6 +115,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `userInput/requested` | `elicitation/create` form bridge (needs client `elicitation.form` caps), else auto-cancel |
 | `session/setApprovalMode` | `configOptions` mode selector using the MSP names verbatim (`allowAll`/`promptUnmatched`/`onRequest`/`denyUnmatched`) + `session/set_config_option`; legacy v1 `modes` / `session/set_mode` |
 | `model/list` + `session/setModel` | `configOptions` model selector + `session/set_config_option`; legacy v1 `session/set_model` |
+| `session/goalChanged` | provider-neutral goal metadata in `session_info_update`; goal mutation remains host/TUI-driven because ACP has no negotiated goal-control capability |
 | `reasoningEffort` on `turn/start` / `turn/steer` | `configOptions` reasoning selector (`none` through `ultra`) |
 | `turn/steer` | v2 `_session/steering` extension with exact-turn targeting and race-safe idle behavior |
 | backgrounded `toolCall` + `userShell` items | negotiated AIR async tasks: `async_task_spawned`/`async_task_state_update` plus the backgrounded marker on the owning command card; `canStop` is false until MSP exposes a stop primitive |
@@ -133,6 +134,14 @@ Repeated deliveries of a pending question reuse its existing form, including
 requests reissued during session resume.
 Without that capability, the adapter cancels the question so the turn can
 continue; it does not emit an unsupported request.
+
+Goal control stays with the Muse host/TUI. The adapter does not invent an ACP
+editor request for `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, or
+`goal/clear` because ACP has no standard negotiated goal-control capability.
+When the host issues one of those stable MSP commands, the resulting
+`session/goalChanged` is folded and published to the editor. MSP's wake gates
+therefore remain authoritative: set/edit/resume may wake an idle unfinished
+goal, while pause/clear never wake.
 
 Model choices are refreshed from Muse when creating, loading, or resuming a
 session and after a config option changes. The adapter does not permanently
