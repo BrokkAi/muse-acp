@@ -2620,10 +2620,54 @@ fn workflow_items_render_children_state() {
         card.contains("triage issue #1: started (triage)"),
         "child state missing: {card}"
     );
+    assert!(
+        card.contains("ACP exposes no workflow child skip/retry surface"),
+        "unsupported child control reason missing: {card}"
+    );
     let done = c.wait_for("triage issue #1: completed", Duration::from_secs(15));
     assert!(
         done.contains("\"workflowRunId\":\"wfr-1\""),
         "run id meta missing: {done}"
+    );
+    c.finish();
+}
+
+#[test]
+fn workflow_async_task_stop_admits_cancel_and_waits_for_view_terminal() {
+    let mut c = Client::spawn("workflow_control", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    let _pid = c.prompt(&sid, "run workflow");
+    let spawned = c.wait_for("async_task_spawned", Duration::from_secs(15));
+    assert!(
+        spawned.contains("\"asyncTaskId\":\"wfr-control\""),
+        "workflow run id must be the async task id: {spawned}"
+    );
+    assert!(
+        spawned.contains("\"canStop\":true"),
+        "workflow task must advertise the stop surface: {spawned}"
+    );
+    let stop_id = c.req(
+        "_session/async_task/stop",
+        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"wfr-control\"}}"),
+    );
+    let ack = c.wait_for(&format!("\"id\":{stop_id}"), Duration::from_secs(15));
+    assert!(
+        ack.contains("\"status\":\"accepted\""),
+        "cancel is admission-only: {ack}"
+    );
+    c.wait_log("workflow/cancel", Duration::from_secs(15));
+    let stopped = c.wait_for("\"state\":\"stopped\"", Duration::from_secs(15));
+    assert!(
+        stopped.contains("wfr-control"),
+        "workflow view terminal must settle the async task: {stopped}"
+    );
+    let idle = c.wait_for("\"stopReason\":\"cancelled\"", Duration::from_secs(15));
+    assert!(
+        idle.contains("\"state\":\"idle\""),
+        "launching turn must settle from the later view terminal: {idle}"
     );
     c.finish();
 }

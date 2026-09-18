@@ -159,6 +159,10 @@ pub struct SessionFold {
     pub air_async_tasks: bool,
     /// Async task ids already announced (spawned updates are idempotent).
     pub announced_tasks: std::collections::HashSet<String>,
+    /// Workflow async task ids, keyed by the AIR task id (workflowRunId).
+    workflow_tasks: HashMap<String, String>,
+    /// Last terminal state sent for each async task.
+    async_task_states: HashMap<String, String>,
 }
 
 impl SessionFold {
@@ -171,7 +175,17 @@ impl SessionFold {
             spawned_subagents: std::collections::HashSet::new(),
             air_async_tasks: false,
             announced_tasks: std::collections::HashSet::new(),
+            workflow_tasks: HashMap::new(),
+            async_task_states: HashMap::new(),
         }
+    }
+
+    /// Resolve an AIR async task to a workflow run. Shell task ids do not
+    /// resolve here.
+    pub fn workflow_run_id_for_task(&self, task_id: &str) -> Option<String> {
+        self.air_async_tasks
+            .then_some(())
+            .and_then(|_| self.workflow_tasks.get(task_id).cloned())
     }
 
     fn known(&self, item_id: &str) -> bool {
@@ -432,6 +446,10 @@ impl SessionFold {
                             "triggerSource",
                             item.get("triggerSource").unwrap_or(&J::Null),
                         ),
+                        (
+                            "childControlUnavailableReason",
+                            &J::Str("ACP exposes no workflow child skip/retry surface".to_string()),
+                        ),
                     ],
                 );
                 (title, content, meta)
@@ -519,24 +537,48 @@ impl SessionFold {
         )
     }
 
-    /// AIR async-task extension. MSP v1 has no stop primitive for background
-    /// work, so `canStop` is honestly false; the task card still owns output.
+    /// AIR async-task extension. Workflow runs are stoppable through
+    /// workflow/cancel; shell and user-shell tasks remain admission-only
+    /// observations because MSP has no stop primitive for them.
     fn async_task_spawned_line(
         acp_sid: &str,
         task_id: &str,
         name: &str,
+        task_type: &str,
+        can_stop: bool,
         tool_call_id: Option<&str>,
     ) -> String {
         let mut update = format!(
-            "{{\"sessionUpdate\":\"async_task_spawned\",\"asyncTaskId\":{},\"name\":{},\"taskType\":\"shell\",\"showInTranscript\":false,\"canStop\":false",
+            "{{\"sessionUpdate\":\"async_task_spawned\",\"asyncTaskId\":{},\"name\":{},\"taskType\":{},\"showInTranscript\":false,\"canStop\":{}",
             esc(task_id),
-            esc(name)
+            esc(name),
+            esc(task_type),
+            can_stop
         );
         if let Some(tc) = tool_call_id {
             update.push_str(&format!(",\"toolCallId\":{}", esc(tc)));
         }
         update.push('}');
         Self::update_line(acp_sid, &update)
+    }
+
+    fn async_task_state_once(
+        &mut self,
+        acp_sid: &str,
+        task_id: &str,
+        state: &str,
+        out: &mut Vec<String>,
+    ) {
+        if self
+            .async_task_states
+            .get(task_id)
+            .is_some_and(|previous| previous == state)
+        {
+            return;
+        }
+        self.async_task_states
+            .insert(task_id.to_string(), state.to_string());
+        out.push(Self::async_task_state_line(acp_sid, task_id, state));
     }
 
     fn async_task_state_line(acp_sid: &str, task_id: &str, state: &str) -> String {
@@ -780,6 +822,8 @@ impl SessionFold {
                         acp_sid,
                         &tc_id,
                         &title,
+                        "shell",
+                        false,
                         Some(&tc_id),
                     ));
                 }
@@ -888,8 +932,34 @@ impl SessionFold {
                         acp_sid,
                         &tc_id,
                         &title,
+                        "shell",
+                        false,
                         Some(&tc_id),
                     ));
+                } else if kind == "workflow"
+                    && self.air_async_tasks
+                    && let Some(run_id) = item
+                        .get("workflowRunId")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                {
+                    self.workflow_tasks
+                        .entry(run_id.to_string())
+                        .or_insert_with(|| run_id.to_string());
+                    if !self.announced_tasks.contains(run_id) {
+                        self.announced_tasks.insert(run_id.to_string());
+                        out.push(Self::async_task_spawned_line(
+                            acp_sid,
+                            run_id,
+                            &title,
+                            "workflow",
+                            true,
+                            Some(&tc_id),
+                        ));
+                    }
+                    if let Some(state) = Self::async_task_state(item) {
+                        self.async_task_state_once(acp_sid, run_id, state, out);
+                    }
                 }
             }
             _ => {
@@ -1037,6 +1107,8 @@ impl SessionFold {
                             acp_sid,
                             &tc_id,
                             &title,
+                            "shell",
+                            false,
                             Some(&tc_id),
                         ));
                     }
@@ -1162,11 +1234,38 @@ impl SessionFold {
                             acp_sid,
                             &tc_id,
                             &title,
+                            "shell",
+                            false,
                             Some(&tc_id),
                         ));
                     }
                     if let Some(state) = Self::async_task_state(item) {
                         out.push(Self::async_task_state_line(acp_sid, &tc_id, state));
+                    }
+                }
+                if kind == "workflow"
+                    && self.air_async_tasks
+                    && let Some(run_id) = item
+                        .get("workflowRunId")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                {
+                    self.workflow_tasks
+                        .entry(run_id.to_string())
+                        .or_insert_with(|| run_id.to_string());
+                    if !self.announced_tasks.contains(run_id) {
+                        self.announced_tasks.insert(run_id.to_string());
+                        out.push(Self::async_task_spawned_line(
+                            acp_sid,
+                            run_id,
+                            &title,
+                            "workflow",
+                            true,
+                            Some(&tc_id),
+                        ));
+                    }
+                    if let Some(state) = Self::async_task_state(item) {
+                        self.async_task_state_once(acp_sid, run_id, state, out);
                     }
                 }
                 self.items.remove(&item_id);
