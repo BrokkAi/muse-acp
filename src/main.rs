@@ -3020,7 +3020,21 @@ fn file_uri_path(uri: &str, cwd: &str) -> Result<String, String> {
         }
         None => return Err(format!("bad file URI {uri}")),
     };
-    Ok(percent_decode(&path))
+    let decoded = percent_decode(&path);
+    // Local Windows file URIs spell drive paths as /C:/path. The leading
+    // URI slash is not part of the native absolute drive path.
+    if cfg!(windows)
+        && decoded.starts_with('/')
+        && decoded
+            .as_bytes()
+            .get(1)
+            .is_some_and(u8::is_ascii_alphabetic)
+        && decoded.as_bytes().get(2) == Some(&b':')
+        && decoded.as_bytes().get(3) == Some(&b'/')
+    {
+        return Ok(decoded[1..].to_string());
+    }
+    Ok(decoded)
 }
 
 fn percent_decode(s: &str) -> String {
@@ -4780,6 +4794,24 @@ mod tests {
             );
         }
         assert!(!env_flag_enabled(None));
+    }
+
+    #[test]
+    fn local_file_uris_preserve_platform_absolute_paths() {
+        assert_eq!(
+            super::file_uri_path("file:///tmp/sp%20ace.txt", "/").unwrap(),
+            "/tmp/sp ace.txt"
+        );
+        let drive = super::file_uri_path("file:///C:/workspace/sp%20ace.txt", "/").unwrap();
+        assert_eq!(
+            drive,
+            if cfg!(windows) {
+                "C:/workspace/sp ace.txt"
+            } else {
+                "/C:/workspace/sp ace.txt"
+            }
+        );
+        assert!(super::file_uri_path("file://remote/share/file.txt", "/").is_err());
     }
 
     #[test]
