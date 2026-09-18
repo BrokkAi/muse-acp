@@ -3499,11 +3499,13 @@ fn closed_host_stdin_does_not_strand_a_request() {
         &[("FAKE_RESTART_MARKER", marker_str.as_str())],
     );
     let started = Instant::now();
-    let sid = c.new_session(1, "");
-    let prompt = c.prompt(&sid, "after host stdin closed");
-    let frame = c.wait_for(&format!("\"id\":{prompt}"), Duration::from_secs(5));
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let request = c.req("session/new", "{\"cwd\":\"/tmp\"}");
+    let frame = c.wait_for(&format!("\"id\":{request}"), Duration::from_secs(5));
     assert!(
-        frame.contains("stopReason") || frame.contains("error"),
+        frame.contains("\"result\"") || frame.contains("\"error\""),
         "request must settle after host stdin closure: {frame}"
     );
     assert!(
