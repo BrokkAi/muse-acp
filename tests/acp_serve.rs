@@ -16,7 +16,20 @@ use std::time::{Duration, Instant};
 
 fn fixture() -> String {
     let dir = env!("CARGO_MANIFEST_DIR");
-    format!("{dir}/tests/fixtures/fake_serve.py")
+    let extension = if cfg!(windows) { "cmd" } else { "py" };
+    format!("{dir}/tests/fixtures/fake_serve.{extension}")
+}
+
+fn temp_cwd_json() -> String {
+    serde_json::to_string(&std::env::temp_dir()).expect("serialize temporary path")
+}
+
+fn fixture_name() -> &'static str {
+    if cfg!(windows) {
+        "fake_serve.cmd"
+    } else {
+        "fake_serve.py"
+    }
 }
 
 fn adapter_bin() -> String {
@@ -1543,7 +1556,7 @@ fn model_catalog_refreshes_after_initial_partial_snapshot() {
             assert!(initial.contains("\"value\":\"fake-model\""));
             assert!(!initial.contains("second-model"));
             let params = if method == "session/new" {
-                "{\"cwd\":\"/tmp\",\"mcpServers\":[]}".to_string()
+                format!("{{\"cwd\":{},\"mcpServers\":[]}}", temp_cwd_json())
             } else if method == "session/set_config_option" {
                 format!(
                     "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
@@ -1792,7 +1805,10 @@ fn steering_targets_a_turn_rehydrated_by_resume() {
     c.notify("initialized", "{}");
     let resume_id = c.req(
         "session/resume",
-        "{\"sessionId\":\"existing-session\",\"cwd\":\"/tmp\"}",
+        &format!(
+            "{{\"sessionId\":\"existing-session\",\"cwd\":{}}}",
+            temp_cwd_json()
+        ),
     );
     let resumed = c.wait_for(&format!("\"id\":{resume_id}"), Duration::from_secs(15));
     assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
@@ -1959,12 +1975,21 @@ fn resource_link_inlines_workspace_text() {
     std::fs::create_dir_all(&dir).expect("tmpdir");
     // Percent-encoded name exercises URI decoding + workspace confinement.
     std::fs::write(dir.join("sp ace.txt"), "secret file text").expect("write");
-    let uri = format!("file://{}", dir.join("sp%20ace.txt").to_str().unwrap());
+    let path = dir
+        .join("sp%20ace.txt")
+        .to_str()
+        .unwrap()
+        .replace('\\', "/");
+    let uri = if cfg!(windows) {
+        format!("file:///{path}")
+    } else {
+        format!("file://{path}")
+    };
     let init = c.req("initialize", "{\"protocolVersion\":1}");
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
-    let cwd = dir.to_str().unwrap();
-    let id = c.req("session/new", &format!("{{\"cwd\":\"{cwd}\"}}"));
+    let cwd = serde_json::to_string(&dir).expect("serialize workspace path");
+    let id = c.req("session/new", &format!("{{\"cwd\":{cwd}}}"));
     c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     // Re-read the session id from the accumulated frames.
     let log = c
@@ -2057,7 +2082,7 @@ fn approval_mode_mismatch_fails_session_new() {
     let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     assert!(frame.contains("\"result\""), "init failed: {frame}");
     c.notify("initialized", "{}");
-    let id = c.req("session/new", "{\"cwd\":\"/tmp\"}");
+    let id = c.req("session/new", &format!("{{\"cwd\":{}}}", temp_cwd_json()));
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(
         frame.contains("not applied"),
@@ -2073,7 +2098,7 @@ fn bogus_approval_mode_fails_session_new_atomically() {
     let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     assert!(frame.contains("\"result\""), "init failed: {frame}");
     c.notify("initialized", "{}");
-    let id = c.req("session/new", "{\"cwd\":\"/tmp\"}");
+    let id = c.req("session/new", &format!("{{\"cwd\":{}}}", temp_cwd_json()));
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(
         frame.contains("\"error\""),
@@ -2157,7 +2182,7 @@ fn host_121_fingerprint_is_tested() {
 #[test]
 fn unusable_permission_profile_fails_with_settings_guidance() {
     let mut c = Client::spawn("quiet", &[("FAKE_START_ERROR", "profile")]);
-    let id = c.req("session/new", "{\"cwd\":\"/tmp\"}");
+    let id = c.req("session/new", &format!("{{\"cwd\":{}}}", temp_cwd_json()));
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(
         frame.contains("\"error\""),
@@ -2659,7 +2684,7 @@ fn session_fork_advertises_and_copies_without_a_cut_point() {
     );
     let fid = c.req(
         "session/fork",
-        &format!("{{\"sessionId\":\"{sid}\",\"cwd\":\"/tmp\"}}"),
+        &format!("{{\"sessionId\":\"{sid}\",\"cwd\":{}}}", temp_cwd_json()),
     );
     let frame = c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
     assert!(frame.contains("\"result\""), "fork failed: {frame}");
@@ -3075,7 +3100,7 @@ fn missing_cli_failure_names_the_next_action() {
 fn selftest_reports_cli_readiness_without_gating() {
     let ok = std::process::Command::new(adapter_bin())
         .arg("--selftest")
-        .env("MUSE_CLI", "/bin/echo")
+        .env("MUSE_CLI", adapter_bin())
         .output()
         .expect("selftest");
     let text = String::from_utf8_lossy(&ok.stdout);
@@ -3084,7 +3109,7 @@ fn selftest_reports_cli_readiness_without_gating() {
         "selftest must stay a diagnostic: {ok:?}"
     );
     assert!(
-        text.contains("cli-ready binary=/bin/echo"),
+        text.contains(&format!("cli-ready binary={}", adapter_bin())),
         "ready probe missing: {text}"
     );
 
@@ -3436,7 +3461,7 @@ fn client_disconnect_exits_promptly_with_a_turn_in_flight() {
 fn support_bundle_redacts_unknown_muse_env_values() {
     let out = std::process::Command::new(adapter_bin())
         .arg("--support")
-        .env("MUSE_CLI", "/bin/echo")
+        .env("MUSE_CLI", adapter_bin())
         .env("MUSE_SECRET_TOKEN", "super-secret-value")
         .env("MUSE_TOOL_OUTPUT_LIMIT", "1234")
         .output()
@@ -3541,10 +3566,13 @@ fn authentication_rejections_are_actionable_acp_errors() {
                 ],
             );
             let id = match method {
-                "session/start" => c.req("session/new", r#"{"cwd":"/tmp"}"#),
-                "session/resume" => {
-                    c.req("session/load", r#"{"sessionId":"existing","cwd":"/tmp"}"#)
+                "session/start" => {
+                    c.req("session/new", &format!("{{\"cwd\":{}}}", temp_cwd_json()))
                 }
+                "session/resume" => c.req(
+                    "session/load",
+                    &format!("{{\"sessionId\":\"existing\",\"cwd\":{}}}", temp_cwd_json()),
+                ),
                 "session/list" => c.req("session/list", "{}"),
                 _ => {
                     let sid = c.new_session(1, "");
@@ -3559,7 +3587,7 @@ fn authentication_rejections_are_actionable_acp_errors() {
                 "{frame}"
             );
             assert!(
-                frame.contains("fake_serve.py") && frame.contains("0.0.0-fixture"),
+                frame.contains(fixture_name()) && frame.contains("0.0.0-fixture"),
                 "{frame}"
             );
             assert!(!frame.contains("secret-sentinel"), "{frame}");
@@ -3663,7 +3691,7 @@ fn authentication_initialize_failure_has_external_login_guidance() {
         "{stderr}"
     );
     assert!(
-        stderr.contains("unreported") && stderr.contains("fake_serve.py"),
+        stderr.contains("unreported") && stderr.contains(fixture_name()),
         "{stderr}"
     );
     assert!(!stderr.contains("secret-sentinel"), "{stderr}");
