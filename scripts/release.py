@@ -225,6 +225,10 @@ def authorization():
     try:
         require(release['draft'], 'Probe must stay a draft')
         api('releases/' + str(release['id']), 'PATCH', {'body': 'Disposable non-publishing permissions check.'})
+        discovered = find_release(probe)
+        require(discovered and discovered['id'] == release['id'] and discovered['draft'], 'Draft discovery failed')
+        readback = api('releases/' + str(release['id']))
+        require(readback['body'] == 'Disposable non-publishing permissions check.' and readback['draft'], 'Draft readback failed')
     finally:
         api('releases/' + str(release['id']), 'DELETE')
     require(optional('git/ref/tags/' + probe) is None, 'Unexpected probe tag')
