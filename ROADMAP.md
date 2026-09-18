@@ -78,7 +78,15 @@ the verdict into richer support bundles.
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
   bundle via the binary's own `muse schema` export, plus a live 1.2.1
-  handshake, session lifecycle, and full turn). Transcript fixtures
+  handshake, session lifecycle, and full turn). Host 1.3.0 reports
+  `sha256:ab69549a7ebb423fce94068762da0b5ff3cdec1f8fc263dcc17248eda117f852`
+  (schema version 1; stable surface verified additive against the vendored
+  bundle, with a live handshake and session lifecycle smoke test). Host
+  builds may expose more than one stable-surface fingerprint under the same
+  release label: Muse 1.3.0-R3401.1 reports
+  `sha256:7469c9e352e67def4a59df7e439984d7194fa351e1c8b7abb34060fd977ced81`
+  (schema version 1; live handshake, session lifecycle, and full turn
+  verified). Transcript fixtures
   intentionally carry their own
   fingerprint (`sha256:c8d1a2a1866814e220fd396d382a9a75861412feee884b5021b2ee359bd3dc59`)
   and must not be conflated with either surface.
