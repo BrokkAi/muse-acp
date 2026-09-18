@@ -62,6 +62,14 @@ pub struct AcpSession {
     /// The foreground MSP turn, excluding queued turns.
     pub active_turn: Option<String>,
     pub view_cursor: String,
+    /// Latest loaded-session status projection. `None` means the host did not
+    /// provide the 1.3.0 Session field; an unknown open-enum value is stored as
+    /// `Some("unknown")` so the editor still receives a generic projection.
+    pub session_status: Option<String>,
+    /// Known attention flags from the latest Session/statusChanged projection.
+    /// `None` means the host did not provide the additive-optional field;
+    /// `Some(empty)` is an authoritative clear from a status event.
+    pub attention: Option<Vec<String>>,
     pub fold: SessionFold,
     /// Last known context occupancy (`session/contextUsage.usedTokens`).
     pub usage_used: Option<u64>,
@@ -653,6 +661,44 @@ pub fn send_session_meta(
     let update = format!(
         "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{{}}}}}",
         meta.join(",")
+    );
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{}}}}}",
+            esc(acp_sid),
+            update
+        ),
+    );
+}
+
+/// Publish the loaded session's status and known attention flags through the
+/// provider namespace of ACP's session-info update. The caller also emits the
+/// standard ACP state when the status or attention projection has one.
+pub fn send_session_status(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    status: Option<&str>,
+    attention: Option<&[String]>,
+) {
+    if status.is_none() && attention.is_none() {
+        return;
+    }
+    let mut muse = Vec::new();
+    if let Some(status) = status {
+        muse.push(format!("\"status\":{}", esc(status)));
+    }
+    if let Some(flags) = attention {
+        let values = flags
+            .iter()
+            .map(|flag| esc(flag))
+            .collect::<Vec<_>>()
+            .join(",");
+        muse.push(format!("\"attention\":[{values}]"));
+    }
+    let update = format!(
+        "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"muse\":{{{}}}}}}}",
+        muse.join(",")
     );
     send_raw(
         stdout,
