@@ -238,12 +238,24 @@ supported by that installed Muse version. If it requires a browser or callback
 that the environment cannot provide, complete the supported login setup before
 starting the adapter; there is no adapter-provided headless login bypass.
 
-The [vendored MSP schema](tests/protocol/PROVENANCE.md) exposes no compatible
-login, logout, credential-refresh, or auth-status method. Accordingly,
-`authMethods` remains empty and ACP authentication requests return an
-unsupported-method error with external-login guidance. The adapter does not
-advertise an authentication flow it cannot complete. Error-code semantics follow
-the [ACP schema](https://agentclientprotocol.com/protocol/v1/schema#errorcode).
+Muse 1.3.0 now publishes an experimental account surface: `account/loginStart`,
+`account/loginCancel`, `account/logout`, and `account/read`, plus the
+`account/changed` and `account/loginCompleted` notifications. It is gated by
+the MSP `experimentalApi` client capability and is absent from the stable
+schema bundle pinned by this adapter. This adapter does not opt into that
+experimental surface or perform adapter-side credential handling, so it
+deliberately keeps `authMethods` empty and ACP authentication requests return
+an unsupported-method error with external-login guidance.
+
+If the adapter adopts the surface later, the device-code branch is the only
+candidate: it returns a verification URL and user code without putting a
+secret on the ACP stdio path. The `apiKey` branch remains out of scope because
+it carries a credential; it must not be accepted unless the adapter also
+defines the required `ACCOUNT_LOGIN_API_KEY_REDACTED` logging and support-bundle
+contract. Until an explicit `experimentalApi` adoption decision is made,
+credentials stay outside ACP and users must complete login in the Muse
+environment. Error-code semantics follow the
+[ACP schema](https://agentclientprotocol.com/protocol/v1/schema#errorcode).
 
 ### Linux arm64 sandbox advisory
 
@@ -357,8 +369,9 @@ muse-acp uninstall
   atomic `ifBusy: "steer"` fallback.
 - Concurrent prompts queue host-side; every turn completes its own response.
 - Images in, audio out: the host input type is closed (`text|image`), so audio
-  blocks are rejected with the reason. Auth has no host surface
-  (`authMethods: []` is the honest answer); muse credentials live outside ACP.
+  blocks are rejected with the reason. The experimental MSP account surface is
+  intentionally deferred (`authMethods: []`); Muse credentials live outside
+  ACP until the adapter makes an explicit `experimentalApi` adoption decision.
 - `session/list` reports durable Muse sessions, including sessions created
   outside the current adapter process, so Zed can import and restore them.
 - Authority for MSP shapes is the schema the host ships
