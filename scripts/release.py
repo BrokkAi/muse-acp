@@ -14,6 +14,7 @@ import tomllib
 import zipfile
 
 REPO = 'BrokkAi/muse-acp'
+INSTALLERS = ['install.sh', 'install.ps1']
 TARGETS = ['x86_64-unknown-linux-gnu', 'aarch64-unknown-linux-gnu',
            'x86_64-apple-darwin', 'aarch64-apple-darwin', 'x86_64-pc-windows-msvc']
 VERSION = tomllib.loads(Path('Cargo.toml').read_text())['package']['version']
@@ -58,7 +59,7 @@ def archive_name(target):
 
 
 def expected_names():
-    return {'install.sh'} | {n for t in TARGETS for n in (archive_name(t), archive_name(t) + '.sha256')}
+    return set(INSTALLERS) | {n for t in TARGETS for n in (archive_name(t), archive_name(t) + '.sha256')}
 
 
 def source_bytes(name):
@@ -139,7 +140,8 @@ def inspect_archive(directory, target):
 
 def validate(directory):
     require({p.name for p in directory.iterdir()} == expected_names(), 'Missing or unexpected release assets')
-    require((directory / 'install.sh').read_bytes() == source_bytes('install.sh'), 'Installer differs')
+    for installer in INSTALLERS:
+        require((directory / installer).read_bytes() == source_bytes(installer), 'Installer differs')
     return {t: inspect_archive(directory, t) for t in TARGETS}
 
 
@@ -189,8 +191,9 @@ def compare_remote(release, staged, complete, resume=False):
                     require(inspect_archive(directory, target) == inspect_archive(staged, target), 'Published payload differs from staged build')
             elif name + '.sha256' in names:
                 require((directory / (name + '.sha256')).read_bytes() == (staged / (name + '.sha256')).read_bytes(), 'Orphan checksum conflict')
-        if 'install.sh' in names:
-            require((directory / 'install.sh').read_bytes() == source_bytes('install.sh'), 'Published installer conflict')
+        for installer in INSTALLERS:
+            if installer in names:
+                require((directory / installer).read_bytes() == source_bytes(installer), 'Published installer conflict')
 
 
 def authorization():
@@ -241,7 +244,8 @@ def evidence(kind):
                         for n in z.namelist():
                             require('/' not in n and n in expected_names(), 'Invalid Actions artifact')
                             Path(d, n).write_bytes(z.read(n))
-                Path(d, 'install.sh').write_bytes(source_bytes('install.sh'))
+                for installer in INSTALLERS:
+                    Path(d, installer).write_bytes(source_bytes(installer))
                 staged = Path(d)
                 validate(staged)
                 if kind == 'publication-inputs':

@@ -29,8 +29,25 @@ class ArchiveValidation(unittest.TestCase):
             manifest = json.loads(entries['release.json'][0])
             self.assertEqual(manifest['commit'], release.SHA)
             self.assertEqual(manifest['target'], target)
-        (self.directory / 'install.sh').write_bytes(Path('install.sh').read_bytes())
-        release.validate(self.directory)
+        for installer in release.INSTALLERS:
+            (self.directory / installer).write_bytes(Path(installer).read_bytes())
+        committed_source_bytes = release.source_bytes
+
+        def source_bytes(name):
+            if name in release.INSTALLERS:
+                return Path(name).read_bytes()
+            return committed_source_bytes(name)
+
+        with patch.object(release, 'source_bytes', side_effect=source_bytes):
+            release.validate(self.directory)
+
+    def test_all_installers_are_required(self):
+        self.build(release.TARGETS[0])
+        for installer in release.INSTALLERS:
+            (self.directory / installer).write_bytes(Path(installer).read_bytes())
+        (self.directory / release.INSTALLERS[-1]).unlink()
+        with self.assertRaisesRegex(RuntimeError, 'Missing'):
+            release.validate(self.directory)
 
     def test_corrupt_archive_fails(self):
         target = release.TARGETS[0]
