@@ -162,7 +162,7 @@ def release_state():
     return release
 
 
-def compare_remote(release, staged, complete):
+def compare_remote(release, staged, complete, resume=False):
     assets = release['assets']
     names = [a['name'] for a in assets]
     require(len(names) == len(set(names)) and set(names) <= expected_names(), 'Conflicting remote assets')
@@ -177,9 +177,14 @@ def compare_remote(release, staged, complete):
         for target in TARGETS:
             name = archive_name(target)
             if name in names:
-                # Missing checksum in a partial draft can be resumed only for exact staged bytes.
                 if name + '.sha256' not in names:
-                    require((directory / name).read_bytes() == (staged / name).read_bytes(), 'Partial archive conflict')
+                    raw = (directory / name).read_bytes()
+                    (directory / (name + '.sha256')).write_text(f'{digest(raw)}  {name}\n')
+                    require(inspect_archive(directory, target) == inspect_archive(staged, target), 'Partial archive payload conflict')
+                    if resume:
+                        # Keep the immutable uploaded archive and add its own checksum.
+                        (staged / name).write_bytes(raw)
+                        (staged / (name + '.sha256')).write_bytes((directory / (name + '.sha256')).read_bytes())
                 else:
                     require(inspect_archive(directory, target) == inspect_archive(staged, target), 'Published payload differs from staged build')
             elif name + '.sha256' in names:
@@ -261,7 +266,7 @@ def publish(staged):
     authorization()  # Fresh credential check immediately before uploads.
     if not release:
         release = api('releases', 'POST', {'tag_name': TAG, 'target_commitish': SHA, 'name': TAG, 'draft': True, 'generate_release_notes': True})
-    compare_remote(release, staged, False)
+    compare_remote(release, staged, False, resume=True)
     existing = {a['name'] for a in release['assets']}
     # Never clobber. Existing archive/checksum pairs are verified as unpacked content.
     for name in sorted(expected_names() - existing):

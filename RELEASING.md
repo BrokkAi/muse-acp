@@ -81,8 +81,9 @@ the release public. No clobber or deletion of conflicting assets is permitted.
 Recovery accepts existing immutable artifacts only after validating their own
 checksums and comparing unpacked bytes, executable permissions and commit/
 version/platform metadata to the staged build. Compression differences alone
-are acceptable; binary differences are not. A partial archive without a
-checksum must match exact staged bytes before its checksum can be added.
+are acceptable; binary differences are not. For a partial draft archive missing its checksum, validate the archive contents
+against the staged build, retain its exact uploaded bytes, and add a checksum
+for those bytes; never replace the archive just because compression differs.
 Already-public releases are verified read-only by the publication command.
 Never move tags or replace assets of a completed release.
 
