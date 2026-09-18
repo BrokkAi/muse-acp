@@ -85,6 +85,9 @@ pub struct AcpSession {
     pub goal_meta: Option<String>,
     /// Latest branch observation as raw MSP JSON (`None` before any fact).
     pub branch_meta: Option<String>,
+    /// Latest authoritative durable MSP session name. `None` also represents
+    /// the host's explicit never-named state; the adapter never derives one.
+    pub session_name: Option<String>,
     /// Per-child folds for negotiated native subagent sessions, keyed by the
     /// MSP child session id. Holds replayed child history dedup state.
     pub child_folds: HashMap<String, SessionFold>,
@@ -654,6 +657,21 @@ pub fn send_session_meta(
         "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{{}}}}}",
         meta.join(",")
     );
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{}}}}}",
+            esc(acp_sid),
+            update
+        ),
+    );
+}
+
+/// Publish the authoritative MSP session name through ACP's standard title
+/// update. A `null` title clears a stale client-side title.
+pub fn send_session_title(stdout: &StdoutShared, acp_sid: &str, name: Option<&str>) {
+    let title = name.map(esc).unwrap_or_else(|| "null".to_string());
+    let update = format!("{{\"sessionUpdate\":\"session_info_update\",\"title\":{title}}}");
     send_raw(
         stdout,
         &format!(
