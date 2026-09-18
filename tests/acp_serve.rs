@@ -240,6 +240,30 @@ impl Client {
         }
     }
 
+    fn elicitation_frames(&self) -> Vec<String> {
+        self.frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|f| f.contains("elicitation/create"))
+            .cloned()
+            .collect()
+    }
+
+    fn wait_for_elicitation_count(&self, count: usize, timeout: Duration) -> Vec<String> {
+        let start = Instant::now();
+        loop {
+            let forms = self.elicitation_frames();
+            if forms.len() >= count {
+                return forms;
+            }
+            if start.elapsed() > timeout {
+                panic!("adapter did not emit {count} elicitation forms: {forms:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// New session via initialize + initialized + session/new. Returns the
     /// ACP session id.
     fn new_session(&mut self, ver: u64, extra_init: &str) -> String {
@@ -942,17 +966,30 @@ fn user_input_options_reach_the_client() {
     let mut c = Client::spawn("questions", &[]);
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
     let _pid = c.prompt(&sid, "ask me");
-    // The bridge announces requires_action, then offers the host options as
-    // an elicitation/create enum schema (there is no user_input update).
+    // The bridge announces requires_action, then offers a route before the
+    // existing enum schema (there is no user_input update).
     let state = c.wait_for("requires_action", Duration::from_secs(15));
     assert!(state.contains(&sid), "state for our session: {state}");
-    let elicit = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let elicit = &forms[0];
     assert!(
         elicit.contains(&sid),
         "elicitation for our session: {elicit}"
     );
-    assert!(elicit.contains("Alpha"), "option Alpha bridged: {elicit}");
-    assert!(elicit.contains("Beta"), "option Beta bridged: {elicit}");
+    assert!(
+        elicit.contains("Answer questions") && elicit.contains("Explain instead"),
+        "route choices bridged: {elicit}"
+    );
+    let route_id = extract_str(elicit, "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+    ));
+    let answer = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    assert!(
+        answer[1].contains("Alpha") && answer[1].contains("Beta"),
+        "option answers bridged after route: {}",
+        answer[1]
+    );
     let log = c
         .frames
         .lock()
@@ -985,14 +1022,7 @@ fn resumed_user_input_is_presented_once_and_remains_answerable() {
         // The fixture reissues ui-1 after both resumes. This stream marker
         // follows the second reissue, so counting forms needs no timing guess.
         c.wait_for("resume questions delivered", Duration::from_secs(15));
-        let forms: Vec<String> = c
-            .frames
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|f| f.contains("elicitation/create"))
-            .cloned()
-            .collect();
+        let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
         assert_eq!(forms.len(), 1, "v{ver} duplicated pending form: {forms:?}");
         let calls = std::fs::read_to_string(&c.fake_log).unwrap();
         assert_eq!(calls.lines().filter(|m| *m == "session/resume").count(), 2);
@@ -1005,9 +1035,14 @@ fn resumed_user_input_is_presented_once_and_remains_answerable() {
             usage.contains("\"used\":120") && usage.contains("\"totalTokens\":360"),
             "v{ver} backfill still restores usage: {usage}"
         );
-        let first_id = extract_str(&forms[0], "id").unwrap();
+        let first_route_id = extract_str(&forms[0], "id").unwrap();
         c.raw(&format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":\"{first_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{first_route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+        ));
+        let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+        let first_answer_id = extract_str(&forms[1], "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{first_answer_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
         ));
         c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
 
@@ -1019,21 +1054,19 @@ fn resumed_user_input_is_presented_once_and_remains_answerable() {
         } else {
             c.wait_for("\"idle\"", Duration::from_secs(15));
         }
-        let forms: Vec<String> = c
-            .frames
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|f| f.contains("elicitation/create"))
-            .cloned()
-            .collect();
+        let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
+        let second_route_id = extract_str(&forms[2], "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{second_route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+        ));
+        let forms = c.wait_for_elicitation_count(4, Duration::from_secs(15));
         assert_eq!(
             forms.len(),
-            2,
+            4,
             "v{ver} one form per distinct question: {forms:?}"
         );
-        let second_id = extract_str(&forms[1], "id").unwrap();
-        assert_ne!(first_id, second_id);
+        let second_id = extract_str(&forms[3], "id").unwrap();
+        assert_ne!(first_answer_id, second_id);
         c.raw(&format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":\"{second_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Beta\"}}}}}}"
         ));
@@ -1055,13 +1088,26 @@ fn v1_questions_use_advertised_client_form_capability() {
     let mut c = Client::spawn("questions", &[]);
     let sid = c.new_session(1, ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}");
     let _pid = c.prompt(&sid, "ask me");
-    let elicit = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let elicit = &forms[0];
     assert!(
         elicit.contains(&sid),
         "elicitation for our session: {elicit}"
     );
-    assert!(elicit.contains("Alpha"), "option Alpha bridged: {elicit}");
-    assert!(elicit.contains("Beta"), "option Beta bridged: {elicit}");
+    assert!(
+        elicit.contains("Explain instead"),
+        "explanation route advertised in v1: {elicit}"
+    );
+    let route_id = extract_str(elicit, "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+    ));
+    let answer = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    assert!(
+        answer[1].contains("Alpha") && answer[1].contains("Beta"),
+        "v1 answer form: {}",
+        answer[1]
+    );
     let frames = c
         .frames
         .lock()
@@ -1071,6 +1117,185 @@ fn v1_questions_use_advertised_client_form_capability() {
         !frames.contains("requires_action"),
         "v1 must not emit v2 state: {frames}"
     );
+    c.finish();
+}
+
+#[test]
+fn explanation_route_sends_one_clarification_for_both_protocol_versions() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("questions", &[]);
+        let caps = if ver == 1 {
+            ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}"
+        } else {
+            ",\"capabilities\":{\"elicitation\":{\"form\":{}}}"
+        };
+        let sid = c.new_session(ver, caps);
+        let _pid = c.prompt(&sid, "ask me");
+        let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+        let route_id = extract_str(&forms[0], "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Explain instead\"}}}}}}"
+        ));
+        let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+        assert!(
+            forms[1].contains("clarification") && forms[1].contains("maxLength\":500"),
+            "v{ver} clarification form: {}",
+            forms[1]
+        );
+        let clarification_id = extract_str(&forms[1], "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{clarification_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"clarification\":\"The premise does not fit my situation.\"}}}}}}"
+        ));
+        c.wait_log("userInput/clarify", Duration::from_secs(15));
+        let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+        assert_eq!(
+            calls.lines().filter(|m| *m == "userInput/clarify").count(),
+            1
+        );
+        assert!(!calls.lines().any(|m| m == "userInput/answer"));
+        assert_eq!(calls.lines().filter(|m| *m == "turn/start").count(), 1);
+        let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        assert!(inputs.contains("\"sessionId\": \"msp-sess-1\""));
+        assert!(inputs.contains("\"userInputId\": \"ui-1\""));
+        assert!(inputs.contains("\"format\": \"text\""));
+        assert!(inputs.contains("The premise does not fit my situation."));
+        c.finish();
+    }
+}
+
+#[test]
+fn invalid_clarifications_are_correctable_without_a_host_command() {
+    for (bad, message) in [
+        ("   ".to_string(), "before submitting"),
+        ("x".repeat(501), "500 characters"),
+    ] {
+        let mut c = Client::spawn("questions", &[]);
+        let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+        let _pid = c.prompt(&sid, "ask me");
+        let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+        let route_id = extract_str(&forms[0], "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Explain instead\"}}}}}}"
+        ));
+        let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+        let clarification_id = extract_str(&forms[1], "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{clarification_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"clarification\":{}}}}}}}",
+            serde_json::to_string(&bad).unwrap()
+        ));
+        let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
+        assert!(
+            forms[2].contains(message),
+            "correctable validation message: {}",
+            forms[2]
+        );
+        let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+        assert!(!calls.lines().any(|m| m == "userInput/clarify"));
+        c.finish();
+    }
+}
+
+#[test]
+fn host_clarification_rejection_is_visible_and_remains_correctable() {
+    let mut c = Client::spawn(
+        "questions",
+        &[
+            ("FAKE_ERROR_METHOD", "userInput/clarify"),
+            ("FAKE_ERROR_MESSAGE", "clarification rejected by fixture"),
+        ],
+    );
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let route_id = extract_str(&forms[0], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Explain instead\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    let clarification_id = extract_str(&forms[1], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{clarification_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"clarification\":\"Please reconsider the premise.\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
+    assert!(
+        forms[2].contains("Muse rejected the clarification")
+            && forms[2].contains("clarification rejected by fixture"),
+        "host rejection is visible in the replacement form: {}",
+        forms[2]
+    );
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert_eq!(
+        calls.lines().filter(|m| *m == "userInput/clarify").count(),
+        1
+    );
+    assert!(!calls.lines().any(|m| m == "userInput/answer"));
+    c.finish();
+}
+
+#[test]
+fn stale_form_replies_cannot_settle_a_later_stage() {
+    let mut c = Client::spawn("questions", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let old_route_id = extract_str(&forms[0], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{old_route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{old_route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Explain instead\"}}}}}}"
+    ));
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(c.elicitation_frames().len(), 2);
+    let answer_id = extract_str(&forms[1], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{answer_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
+    ));
+    c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(!calls.lines().any(|m| m == "userInput/clarify"));
+    c.finish();
+}
+
+#[test]
+fn declining_the_route_cancels_the_pending_question() {
+    let mut c = Client::spawn("questions", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let route_id = extract_str(&forms[0], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"decline\"}}}}"
+    ));
+    c.wait_log("userInput/cancel", Duration::from_secs(15));
+    assert_eq!(c.elicitation_frames().len(), 1);
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(!calls.lines().any(|m| m == "userInput/answer"));
+    assert!(!calls.lines().any(|m| m == "userInput/clarify"));
+    c.finish();
+}
+
+#[test]
+fn structured_question_shapes_keep_the_existing_answer_mapping() {
+    let mut c = Client::spawn("questions", &[("FAKE_QUESTION_SHAPE", "mixed")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let route_id = extract_str(&forms[0], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    assert!(forms[1].contains("q1") && forms[1].contains("q2"));
+    let answer_id = extract_str(&forms[1], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{answer_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\",\"q1\":[\"Red\",\"Blue\"],\"q2\":\"because\"}}}}}}"
+    ));
+    c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert!(inputs.contains("\"selectedLabels\": [\"Red\", \"Blue\"]"));
+    assert!(inputs.contains("\"freeText\": \"because\""));
     c.finish();
 }
 
