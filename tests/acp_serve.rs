@@ -383,6 +383,79 @@ fn usage_events_forward_msp_usage_as_acp_usage_update() {
 }
 
 #[test]
+fn subscription_usage_is_host_observation_separate_from_cost_estimates() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("subscription_usage", &[]);
+        let sid = c.new_session(ver, "");
+        c.wait_log("usage/read", Duration::from_secs(15));
+
+        // `usage/read` has no context window to pair with yet, so the raw
+        // host observation uses session metadata rather than fabricated
+        // usage_update used/size values.
+        let read = c.wait_for("museSubscriptionUsage", Duration::from_secs(15));
+        assert!(
+            read.contains("session_info_update"),
+            "read metadata: {read}"
+        );
+        assert!(read.contains("\"usedPercent\":11"), "read window: {read}");
+        assert!(read.contains("\"usedPercent\":37"), "read weekly: {read}");
+        assert!(read.contains("\"source\":\"msp-host-observation\""));
+        assert!(read.contains("\"billing\":false"));
+        assert!(
+            !read.contains("\"cost\":"),
+            "host usage is not cost: {read}"
+        );
+
+        let _pid = c.prompt(&sid, "hi");
+        let changed = c.wait_for("\"usedPercent\":23", Duration::from_secs(15));
+        assert!(
+            changed.contains("usage_update"),
+            "changed usage update: {changed}"
+        );
+        assert!(
+            changed.contains(&sid),
+            "changed usage for our session: {changed}"
+        );
+        assert!(changed.contains("\"used\":1500") && changed.contains("\"size\":200000"));
+        assert!(
+            changed.contains("\"usedPercent\":61"),
+            "changed weekly: {changed}"
+        );
+        assert!(changed.contains("\"observedAtMs\":1754590990000"));
+        assert!(
+            !changed.contains("\"cost\":"),
+            "no token estimate was reported: {changed}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn subscription_first_observation_is_forwarded_after_an_empty_read() {
+    let mut c = Client::spawn("subscription_first_observation", &[]);
+    let sid = c.new_session(2, "");
+    c.wait_log("usage/read", Duration::from_secs(15));
+    assert!(
+        !c.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame.contains("museSubscriptionUsage"))
+    );
+
+    let _pid = c.prompt(&sid, "hi");
+    let changed = c.wait_for("museSubscriptionUsage", Duration::from_secs(15));
+    assert!(
+        changed.contains("usage_update"),
+        "first observation: {changed}"
+    );
+    assert!(changed.contains("\"usedPercent\":23"));
+    assert!(changed.contains("\"usedPercent\":61"));
+    assert!(changed.contains("\"billing\":false"));
+    c.finish();
+}
+
+#[test]
 fn prompt_result_reports_the_turns_summed_token_usage() {
     // The ACP client reports usage per turn, which the session cumulative
     // cannot give it: the v1 prompt result carries the turn's own legs.

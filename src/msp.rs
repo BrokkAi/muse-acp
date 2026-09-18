@@ -100,7 +100,7 @@ fn method_timeout_ms(method: &str) -> u64 {
         // Lifecycle/history work can page and replay large views.
         "session/start" | "session/resume" | "session/read" | "view/page" => 180_000,
         // Cheap queries.
-        "model/list" | "session/list" | "view/unsubscribe" => 30_000,
+        "model/list" | "session/list" | "usage/read" | "view/unsubscribe" => 30_000,
         // Control-plane decisions should be fast but not flaky.
         "approval/decide" | "userInput/answer" | "userInput/cancel" | "userInput/clarify" => 30_000,
         _ => DEFAULT_TIMEOUT_MS,
