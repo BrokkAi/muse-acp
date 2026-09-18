@@ -62,6 +62,11 @@ pub struct AcpSession {
     /// The foreground MSP turn, excluding queued turns.
     pub active_turn: Option<String>,
     pub view_cursor: String,
+    /// Durable view cursors already delivered to this adapter. An explicit
+    /// re-attach can overlap with the implicit live subscription while the
+    /// resume command is in flight; every notification at a repeated cursor
+    /// is one replay and must be folded once.
+    pub seen_view_cursors: std::collections::HashSet<String>,
     pub fold: SessionFold,
     /// Last known context occupancy (`session/contextUsage.usedTokens`).
     pub usage_used: Option<u64>,

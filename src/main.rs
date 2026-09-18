@@ -847,6 +847,69 @@ fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
     }
 }
 
+/// Re-attach at the last cursor we delivered. `session/resume` also attaches
+/// live delivery, but only from the returned head; the explicit subscribe is
+/// what replays a durable suffix that was appended while this connection was
+/// detached or the host was being restarted. A failed or unavailable
+/// subscribe keeps the resume attachment and leaves a diagnostic rather than
+/// turning a successful session attach into an error.
+fn reattach_view(
+    host: &Arc<MspHost>,
+    sessions: &Sessions,
+    acp_sid: &str,
+    msp_sid: &str,
+    after: &str,
+    resume_head: &str,
+) {
+    if after.is_empty() {
+        return;
+    }
+    let result = host.command(
+        "view/subscribe",
+        &format!(
+            "{{\"after\":{},\"sessionId\":{}}}",
+            esc(after),
+            esc(msp_sid)
+        ),
+    );
+    match result {
+        Ok(r) => {
+            let head = r
+                .get("viewCursor")
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .unwrap_or(resume_head);
+            if !head.is_empty()
+                && let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(acp_sid)
+            {
+                s.view_cursor = head.to_string();
+            }
+            log(&format!(
+                "view re-attached session={msp_sid} after={after} head={head}"
+            ));
+        }
+        Err(e) => {
+            if !resume_head.is_empty()
+                && let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(acp_sid)
+            {
+                // The implicit resume subscription is still live from this
+                // head, so do not keep an obsolete cursor for the next retry.
+                s.view_cursor = resume_head.to_string();
+            }
+            log(&format!(
+                "view re-attach failed session={msp_sid} after={after} resume_head={resume_head}: {}; implicit resume attachment retained",
+                err_message(&e)
+            ));
+        }
+    }
+}
+
 fn restart_durable_host(
     old: &Arc<MspHost>,
     tx: &mpsc::Sender<LoopMsg>,
@@ -854,11 +917,11 @@ fn restart_durable_host(
     sessions: &Sessions,
 ) -> Result<Arc<MspHost>, String> {
     // Snapshot the attach list first; host calls must happen unlocked.
-    let attach: Vec<String> = sessions
+    let attach: Vec<(String, String)> = sessions
         .lock()
         .unwrap()
         .values()
-        .map(|s| s.msp_sid.clone())
+        .map(|s| (s.msp_sid.clone(), s.view_cursor.clone()))
         .collect();
     let max_attempts = 3u32;
     let mut last_err = String::new();
@@ -879,7 +942,7 @@ fn restart_durable_host(
                     }
                 });
                 let mut failures = Vec::new();
-                for msp_sid in &attach {
+                for (msp_sid, after) in &attach {
                     let cmd = host.mint_cmd("cmd-");
                     match host.command(
                         "session/resume",
@@ -890,9 +953,17 @@ fn restart_durable_host(
                         ),
                     ) {
                         Ok(r) => {
+                            let resume_head = r
+                                .get("viewCursor")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
                             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
                                 let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                                 if let Some(s) = map.get_mut(&acp_sid) {
+                                    if !resume_head.is_empty() {
+                                        s.view_cursor = resume_head.clone();
+                                    }
                                     s.active_turn = r
                                         .get("session")
                                         .and_then(|x| x.get("activeTurnId"))
@@ -910,6 +981,15 @@ fn restart_durable_host(
                                         s.model_value = model.to_string();
                                     }
                                 }
+                                drop(map);
+                                reattach_view(
+                                    &host,
+                                    sessions,
+                                    &acp_sid,
+                                    msp_sid,
+                                    after,
+                                    &resume_head,
+                                );
                             }
                             // Prompts whose turns no longer exist in the
                             // reattached fold must settle, not hang forever.
@@ -1351,6 +1431,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             reasoning_effort: "medium".to_string(),
                             active_turn,
                             view_cursor: cur_cursor.clone(),
+                            seen_view_cursors: std::collections::HashSet::new(),
                             fold: fresh_fold(),
                             usage_used: None,
                             usage_size: None,
@@ -1478,6 +1559,15 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .map(|s| s.msp_sid.clone())
                 .or(meta_msp_sid)
                 .unwrap_or_else(|| sid.clone());
+            // Preserve the last delivered cursor before resume updates the
+            // in-memory session. This is the anchor for an explicit suffix
+            // replay on hosts that provide view/subscribe.
+            let previous_cursor = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&sid)
+                .map(|s| s.view_cursor.clone())
+                .filter(|cursor| !cursor.is_empty());
             let cmd = host.mint_cmd("cmd-");
             // Ask for inline history explicitly; the host may still downgrade
             // (history.mode reports what was served).
@@ -1505,7 +1595,17 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                                 "resume: history downgraded to {mode}; replay may be partial"
                             ));
                         }
+                        if let Some(reason) = h.get("noneReason").and_then(|v| v.as_str()) {
+                            log(&format!(
+                                "resume: history unavailable noneReason={reason}; view re-attach may need a fresh cursor"
+                            ));
+                        }
                     }
+                    let resume_head = r
+                        .get("viewCursor")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let real_msp = r
                         .get("session")
                         .and_then(|s| s.get("sessionId"))
@@ -1550,6 +1650,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             reasoning_effort: "medium".to_string(),
                             active_turn: None,
                             view_cursor: String::new(),
+                            seen_view_cursors: std::collections::HashSet::new(),
                             fold: fresh_fold(),
                             usage_used: None,
                             usage_size: None,
@@ -1563,13 +1664,16 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             child_folds: HashMap::new(),
                             turn_usage: Vec::new(),
                         });
-                        entry.msp_sid = real_msp;
+                        entry.msp_sid = real_msp.clone();
                         entry.ver = ver;
                         if !restored_cwd.is_empty() {
                             entry.cwd = restored_cwd;
                         }
                         if !real_model.is_empty() {
                             entry.model_value = real_model;
+                        }
+                        if !resume_head.is_empty() {
+                            entry.view_cursor = resume_head.clone();
                         }
                         entry.active_turn = r
                             .get("session")
@@ -1637,6 +1741,13 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             replay_history(stdout, entry, &r);
                         }
                         acp::send_usage(stdout, entry, pressure.as_deref());
+                    }
+                    // session/load and an explicit v2 replay already deliver
+                    // history to ACP. Replaying the same suffix again through
+                    // view/subscribe would duplicate message chunks, so those
+                    // paths keep the resume attachment from the returned head.
+                    if !replay && let Some(after) = previous_cursor.as_deref() {
+                        reattach_view(host, sessions, &sid, &real_msp, after, &resume_head);
                     }
                     // One-to-one with the folded active/queued turns, or an
                     // explicit cancelled settlement for anything orphaned.
@@ -1833,6 +1944,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             reasoning_effort: "medium".to_string(),
                             active_turn: None,
                             view_cursor: String::new(),
+                            seen_view_cursors: std::collections::HashSet::new(),
                             fold: fresh_fold(),
                             usage_used: None,
                             usage_size: None,
@@ -3234,8 +3346,10 @@ fn handle_msp(
     method: &str,
     params: &J,
 ) {
-    // Track the newest view cursor on every event that carries one, so a
-    // view/gap can page forward without duplicates (fold skips settled ids).
+    // Track the newest view cursor on every event that carries one. Durable
+    // item and usage notifications also use the cursor as a replay key;
+    // approval and user-input requests use their own ids because a host may
+    // legitimately report more than one request at one view cursor.
     if let Some(cur) = params.get("viewCursor").and_then(|v| v.as_str())
         && !cur.is_empty()
     {
@@ -3243,13 +3357,30 @@ fn handle_msp(
             .get("sessionId")
             .and_then(|v| v.as_str())
             .unwrap_or("");
-        if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
-            && let Some(s) = sessions
+        if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+            let cursor_is_replayable = matches!(
+                method,
+                "item/started"
+                    | "item/updated"
+                    | "item/delta"
+                    | "item/completed"
+                    | "session/contextUsage"
+                    | "session/tokenUsage"
+            );
+            let is_new = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .get_mut(&acp_sid)
-        {
-            s.view_cursor = cur.to_string();
+                .map(|s| {
+                    let is_new =
+                        !cursor_is_replayable || s.seen_view_cursors.insert(cur.to_string());
+                    s.view_cursor = cur.to_string();
+                    is_new
+                })
+                .unwrap_or(true);
+            if !is_new {
+                return;
+            }
         }
     }
     match method {
@@ -3769,6 +3900,24 @@ fn handle_msp(
                     branch_meta.as_deref(),
                 );
             }
+        }
+        "session/viewHealthChanged" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let health = params
+                .get("health")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            let reason = params
+                .get("noneReason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unspecified");
+            let acp_sid = find_acp_sid(sessions, msp_sid).unwrap_or_else(|| "?".to_string());
+            log(&format!(
+                "session/viewHealthChanged session={msp_sid} acp_session={acp_sid} health={health} noneReason={reason}; live view delivery is unavailable, resume will re-attach from the head"
+            ));
         }
         "session/contextUsage" => {
             // Context-window pressure: counted-once occupancy at the latest
