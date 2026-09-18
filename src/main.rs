@@ -564,9 +564,11 @@ fn validate_session_roots(stdout: &StdoutShared, id: &Option<J>, params: Option<
     // ACP v1 requires clients to send `mcpServers` with session/new, and
     // JetBrains may attach its integrated stdio MCP server even though our
     // initialize response advertises no optional HTTP/SSE MCP transports.
-    // Muse owns its tool runtime, so these client-provided servers cannot be
-    // forwarded today; tolerate and ignore them instead of aborting the whole
-    // session before its config options can be returned.
+    // MSP 1.3.0 has a native SessionConfig.mcpServers surface and a
+    // sessionMcp capability, but this adapter does not negotiate or translate
+    // ACP client-owned servers into it. Muse owns its tool runtime, so
+    // tolerate and ignore them instead of aborting the whole session before
+    // its config options can be returned.
     ignore_client_mcp_servers(params);
     if has_nonempty_array(params, "additionalDirectories") {
         acp::send_error(
