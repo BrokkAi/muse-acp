@@ -1633,6 +1633,9 @@ fn slash_command_aliases_use_the_muse_skill_grammar() {
         Duration::from_secs(15),
     );
 
+    // The fake host can record its input before the ACP reader receives the echo.
+    c.wait_for("\"text\":\"/plan add dropdowns\"", Duration::from_secs(15));
+
     let log = c
         .frames
         .lock()
