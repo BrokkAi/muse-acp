@@ -122,6 +122,9 @@ class DraftRecovery(unittest.TestCase):
                 release.publish(staged)
             self.assertEqual([c.args[0] for c in api.call_args_list], ['releases/42'] * 4)
             self.assertEqual(compare.call_count, 3)
+            finalization = api.call_args_list[2]
+            self.assertEqual(finalization.args[2]['tag_name'], release.TAG)
+            self.assertEqual(finalization.args[2]['target_commitish'], release.SHA)
 
 
 if __name__ == '__main__':

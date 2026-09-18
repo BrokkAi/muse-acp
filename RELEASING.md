@@ -105,3 +105,7 @@ or treat that incomplete draft as a completed release. Draft discovery uses
 the authenticated paginated release list and GraphQL when REST tag lookup
 returns 404; upload
 readback and final completeness checks use the known release ID.
+
+Release PATCH requests explicitly preserve tag_name; omitting it can rename a
+draft to an untagged placeholder. The publisher probe validates discovery after
+its update, as well as reading the updated body back through the release ID.

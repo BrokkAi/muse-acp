@@ -232,7 +232,7 @@ def authorization():
     release = api('releases', 'POST', {'tag_name': probe, 'target_commitish': SHA, 'name': probe, 'draft': True})
     try:
         require(release['draft'], 'Probe must stay a draft')
-        api('releases/' + str(release['id']), 'PATCH', {'body': 'Disposable non-publishing permissions check.'})
+        api('releases/' + str(release['id']), 'PATCH', {'tag_name': probe, 'draft': True, 'body': 'Disposable non-publishing permissions check.'})
         discovered = find_release(probe)
         require(discovered and discovered['id'] == release['id'] and discovered['draft'], 'Draft discovery failed')
         readback = api('releases/' + str(release['id']))
@@ -305,7 +305,7 @@ def publish(staged):
         raw = gh('api', '--hostname', 'github.com', '-H', 'Accept: application/octet-stream', f'repos/{REPO}/releases/assets/{asset["id"]}')
         require(raw == (staged / name).read_bytes(), 'Upload integrity mismatch')
     compare_remote(api('releases/' + str(release['id'])), staged, True)
-    api('releases/' + str(release['id']), 'PATCH', {'draft': False, 'make_latest': 'true'})
+    api('releases/' + str(release['id']), 'PATCH', {'tag_name': TAG, 'target_commitish': SHA, 'draft': False, 'make_latest': 'true'})
     compare_remote(api('releases/' + str(release['id'])), staged, True)
 
 
