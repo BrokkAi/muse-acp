@@ -261,7 +261,7 @@ impl MspHost {
 }
 
 impl MspHost {
-    pub fn launch() -> Result<(Arc<MspHost>, Receiver<MspEvent>), String> {
+    pub fn launch(user_input_dialogs: bool) -> Result<(Arc<MspHost>, Receiver<MspEvent>), String> {
         let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
         let mut cmd = Command::new(&bin);
         cmd.arg("serve");
@@ -293,8 +293,9 @@ impl MspHost {
         std::thread::spawn(move || reader_loop(reader_host, stdout, tx));
         // Handshake.
         let init_params = format!(
-            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}}}}"#,
-            ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
+            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"userInputDialogs":{user_input_dialogs}}}}}"#,
+            ver = crate::json::esc(env!("CARGO_PKG_VERSION")),
+            user_input_dialogs = user_input_dialogs
         );
         let res = host
             .command("initialize", &init_params)

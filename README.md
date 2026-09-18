@@ -112,7 +112,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `sessionDurability` (default durable) | continuity across turns; Muse's durable session ID is used directly by ACP |
 | `turn/start` `ifBusy` (queue default) | concurrent prompts per session; each completes its own response; `session/cancel` stops all of them |
 | `TurnInputPart` image | image blocks (inline base64 or local `file://` path); advertised in caps |
-| `userInput/requested` | `elicitation/create` form bridge (needs client `elicitation.form` caps), else auto-cancel |
+| `userInput/requested` | `elicitation/create` form bridge (needs client `elicitation.form` caps); MSP `userInputDialogs` is declared from that capability and older/granting hosts still use auto-cancel as a backstop |
 | `session/setApprovalMode` | `configOptions` mode selector using the MSP names verbatim (`allowAll`/`promptUnmatched`/`onRequest`/`denyUnmatched`) + `session/set_config_option`; legacy v1 `modes` / `session/set_mode` |
 | `model/list` + `session/setModel` | `configOptions` model selector + `session/set_config_option`; legacy v1 `session/set_model` |
 | `reasoningEffort` on `turn/start` / `turn/steer` | `configOptions` reasoning selector (`none` through `ultra`) |
@@ -129,10 +129,15 @@ v2 uses `configId`.
 
 Form questions also work in both versions when the client advertises
 `elicitation.form: {}` under `clientCapabilities` (v1) or `capabilities` (v2).
+The adapter waits for this ACP handshake before starting MSP, then declares
+`userInputDialogs: true` or `false` for the connection. A form-less client is
+therefore withheld from MSP user-input requests before a question is created;
+the auto-cancel path remains for hosts that predate or ignore that member.
 Repeated deliveries of a pending question reuse its existing form, including
 requests reissued during session resume.
-Without that capability, the adapter cancels the question so the turn can
-continue; it does not emit an unsupported request.
+For an older or noncompliant host that still sends a question after receiving
+`userInputDialogs: false`, the adapter cancels it so the turn can continue; it
+does not emit an unsupported ACP request.
 
 Model choices are refreshed from Muse when creating, loading, or resuming a
 session and after a config option changes. The adapter does not permanently

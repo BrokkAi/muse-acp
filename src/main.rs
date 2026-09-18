@@ -868,7 +868,7 @@ fn restart_durable_host(
         if attempt > 1 {
             std::thread::sleep(std::time::Duration::from_millis(250u64 << (attempt - 2)));
         }
-        match MspHost::launch() {
+        match MspHost::launch(ELICIT_FORM.load(Ordering::SeqCst) == 1) {
             Ok((host, msp_rx)) => {
                 let fwd_tx = tx.clone();
                 std::thread::spawn(move || {
@@ -940,6 +940,17 @@ fn restart_durable_host(
     Err(last_err)
 }
 
+fn forward_msp_events(tx: &mpsc::Sender<LoopMsg>, msp_rx: mpsc::Receiver<MspEvent>) {
+    let fwd_tx = tx.clone();
+    std::thread::spawn(move || {
+        for ev in msp_rx {
+            if fwd_tx.send(LoopMsg::Msp(ev)).is_err() {
+                break;
+            }
+        }
+    });
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.as_slice() == ["--selftest"] {
@@ -981,34 +992,11 @@ fn main() {
         }
     });
 
-    // Serve host + notification forwarder. `host` is mutable: a durable
-    // host's death is recoverable by relaunching and re-attaching.
-    let (mut host, msp_rx) = match MspHost::launch() {
-        Ok(h) => h,
-        Err(e) => {
-            eprintln!("[muse-acp] fatal: {e}");
-            std::process::exit(1);
-        }
-    };
-    let hi = host.handshake();
-    log(&format!(
-        "host-ready server={} schema_version={} fingerprint={} status={} detail={}",
-        hi.host_label(),
-        hi.schema_version
-            .map(|v| v.to_string())
-            .unwrap_or_else(|| "absent".into()),
-        hi.fingerprint,
-        hi.status,
-        hi.detail
-    ));
-    let fwd_tx = tx.clone();
-    std::thread::spawn(move || {
-        for ev in msp_rx {
-            if fwd_tx.send(LoopMsg::Msp(ev)).is_err() {
-                break;
-            }
-        }
-    });
+    // Defer the MSP launch until ACP initialize has supplied the client
+    // capabilities. `userInputDialogs` is fixed for the MSP connection, so
+    // launching earlier would force a fallback posture before we know whether
+    // form elicitation is available.
+    let mut host: Option<Arc<MspHost>> = None;
 
     for msg in rx {
         match msg {
@@ -1018,24 +1006,78 @@ fn main() {
                     continue;
                 }
                 match parse_json(trimmed) {
-                    Ok(v) => handle_acp(&host, &stdout, &sessions, &v),
+                    Ok(v) => {
+                        if host.is_none() {
+                            let is_initialize =
+                                v.get("method").and_then(|m| m.as_str()) == Some("initialize");
+                            if !is_initialize {
+                                let id = v.get("id").cloned();
+                                acp::send_error(
+                                    &stdout,
+                                    &id,
+                                    -32600,
+                                    "initialize must be the first ACP request",
+                                );
+                                continue;
+                            }
+                            let user_input_dialogs = negotiate_acp(&v);
+                            let (new_host, msp_rx) = match MspHost::launch(user_input_dialogs) {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    eprintln!("[muse-acp] fatal: {e}");
+                                    std::process::exit(1);
+                                }
+                            };
+                            let hi = new_host.handshake();
+                            log(&format!(
+                                "host-ready server={} schema_version={} fingerprint={} status={} detail={}",
+                                hi.host_label(),
+                                hi.schema_version
+                                    .map(|v| v.to_string())
+                                    .unwrap_or_else(|| "absent".into()),
+                                hi.fingerprint,
+                                hi.status,
+                                hi.detail
+                            ));
+                            forward_msp_events(&tx, msp_rx);
+                            host = Some(new_host);
+                        }
+                        handle_acp(
+                            host.as_ref().expect("MSP host initialized"),
+                            &stdout,
+                            &sessions,
+                            &v,
+                        );
+                    }
                     Err(e) => acp::send_error(&stdout, &None, -32700, &format!("parse error: {e}")),
                 }
             }
             LoopMsg::Msp(MspEvent::Notification { method, params }) => {
-                handle_msp(&host, &stdout, &sessions, &method, &params)
+                if let Some(active_host) = host.as_ref() {
+                    handle_msp(active_host, &stdout, &sessions, &method, &params);
+                }
             }
             LoopMsg::Msp(MspEvent::Request { method, params }) => {
                 // Reissued server requests (multi-stage approvals, resumed
                 // questions) carry their own payloads: bridge them too.
-                match method.as_str() {
-                    "approval/request" => open_approval(&host, &stdout, &sessions, &params),
-                    "userInput/request" => {
-                        handle_msp(&host, &stdout, &sessions, "userInput/requested", &params);
+                if let Some(active_host) = host.as_ref() {
+                    match method.as_str() {
+                        "approval/request" => {
+                            open_approval(active_host, &stdout, &sessions, &params)
+                        }
+                        "userInput/request" => {
+                            handle_msp(
+                                active_host,
+                                &stdout,
+                                &sessions,
+                                "userInput/requested",
+                                &params,
+                            );
+                        }
+                        // reader_loop answers unknown methods with methodNotFound
+                        // before forwarding; this arm is defense in depth.
+                        _ => log(&format!("internal: unhandled known MSP request: {method}")),
                     }
-                    // reader_loop answers unknown methods with methodNotFound
-                    // before forwarding; this arm is defense in depth.
-                    _ => log(&format!("internal: unhandled known MSP request: {method}")),
                 }
             }
             LoopMsg::AcpEof => {
@@ -1043,14 +1085,17 @@ fn main() {
             }
             LoopMsg::Msp(MspEvent::Eof(why)) => {
                 log(&format!("serve host gone ({why})"));
-                host.reap();
+                let Some(old_host) = host.as_ref().cloned() else {
+                    continue;
+                };
+                old_host.reap();
                 // Durable sessions recover by re-attaching: their pending
                 // terminals arrive on resume. Ephemeral or unrecognized
                 // profiles get no such guarantee, so they fail closed.
-                if host.handshake().restartable() {
-                    match restart_durable_host(&host, &tx, &stdout, &sessions) {
+                if old_host.handshake().restartable() {
+                    match restart_durable_host(&old_host, &tx, &stdout, &sessions) {
                         Ok(new_host) => {
-                            host = new_host;
+                            host = Some(new_host);
                             // Reissued requests arrive on the new view; pull
                             // reconciliation as the belt-and-braces pass.
                             let ids: Vec<String> = sessions
@@ -1060,7 +1105,12 @@ fn main() {
                                 .cloned()
                                 .collect();
                             for sid in ids {
-                                reconcile_pending(&host, &stdout, &sessions, &sid);
+                                reconcile_pending(
+                                    host.as_ref().expect("restarted MSP host"),
+                                    &stdout,
+                                    &sessions,
+                                    &sid,
+                                );
                             }
                         }
                         Err(e) => {
@@ -1147,6 +1197,49 @@ fn steering_prompt_required(params: Option<&J>) -> Result<bool, String> {
     }
 }
 
+/// Record the ACP connection posture before starting the MSP connection.
+///
+/// MSP's `userInputDialogs` capability is connection-scoped, so it must be
+/// derived from ACP `initialize` before the host's own handshake is sent.
+fn negotiate_acp(msg: &J) -> bool {
+    let params = msg.get("params");
+    let requested = params
+        .and_then(|p| p.get("protocolVersion"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(1);
+    let v = if requested >= 2 { 2 } else { 1 };
+    VER.store(v, Ordering::SeqCst);
+    let capabilities = params.and_then(|p| {
+        p.get(if v == 1 {
+            "clientCapabilities"
+        } else {
+            "capabilities"
+        })
+    });
+    // Both ACP versions can advertise the form elicitation extension.
+    let form = capabilities
+        .and_then(|c| c.get("elicitation"))
+        .and_then(|e| e.get("form"))
+        .is_some_and(|f| matches!(f, J::Obj(_)));
+    ELICIT_FORM.store(u64::from(form), Ordering::SeqCst);
+    let subagents = client_supports_subagents(capabilities);
+    NATIVE_SUBAGENTS.store(u64::from(subagents), Ordering::SeqCst);
+    let async_tasks = client_supports_air(capabilities, "asyncTasks");
+    AIR_ASYNC_TASKS.store(u64::from(async_tasks), Ordering::SeqCst);
+    let recommended = client_supports_air(capabilities, "recommendedValue");
+    AIR_RECOMMENDED.store(u64::from(recommended), Ordering::SeqCst);
+    if async_tasks {
+        log("client negotiated AIR async-task updates");
+    }
+    if recommended {
+        log("client negotiated AIR recommended config values");
+    }
+    if subagents {
+        log("client negotiated native subagent sessions");
+    }
+    form
+}
+
 fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, msg: &J) {
     if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
         msp::trace_method("acp<-client", method);
@@ -1171,55 +1264,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
 
     match method.as_str() {
         "initialize" => {
-            let v = params
-                .as_ref()
-                .and_then(|p| p.get("protocolVersion"))
-                .and_then(|n| n.as_u64())
-                .unwrap_or(1);
-            let v = if v >= 2 { 2 } else { 1 };
-            VER.store(v, Ordering::SeqCst);
-            // Both ACP versions can advertise the form elicitation extension.
-            let form = params
-                .as_ref()
-                .and_then(|p| {
-                    p.get(if v == 1 {
-                        "clientCapabilities"
-                    } else {
-                        "capabilities"
-                    })
-                })
-                .and_then(|c| c.get("elicitation"))
-                .and_then(|e| e.get("form"))
-                .is_some_and(|f| matches!(f, J::Obj(_)));
-            ELICIT_FORM.store(u64::from(form), Ordering::SeqCst);
-            let subagents = client_supports_subagents(params.as_ref().and_then(|p| {
-                p.get(if v == 1 {
-                    "clientCapabilities"
-                } else {
-                    "capabilities"
-                })
-            }));
-            NATIVE_SUBAGENTS.store(u64::from(subagents), Ordering::SeqCst);
-            let air_caps = params.as_ref().and_then(|p| {
-                p.get(if v == 1 {
-                    "clientCapabilities"
-                } else {
-                    "capabilities"
-                })
-            });
-            let async_tasks = client_supports_air(air_caps, "asyncTasks");
-            AIR_ASYNC_TASKS.store(u64::from(async_tasks), Ordering::SeqCst);
-            let recommended = client_supports_air(air_caps, "recommendedValue");
-            AIR_RECOMMENDED.store(u64::from(recommended), Ordering::SeqCst);
-            if async_tasks {
-                log("client negotiated AIR async-task updates");
-            }
-            if recommended {
-                log("client negotiated AIR recommended config values");
-            }
-            if subagents {
-                log("client negotiated native subagent sessions");
-            }
+            let v = negotiated_ver();
             if v == 2 {
                 acp::send_result(stdout, &id, &v2_init());
             } else {
