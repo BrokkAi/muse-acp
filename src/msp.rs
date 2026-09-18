@@ -7,13 +7,15 @@
 //! travels separately via `approval/decide`.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::fmt;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
     mpsc::{self, Receiver, Sender},
 };
+use std::time::{Duration, Instant};
 
 use crate::compat;
 use crate::json::{J, j_to_string, parse_json};
@@ -231,12 +233,241 @@ pub fn acp_error_code(error: &J, fallback: i64) -> i64 {
     }
 }
 
+const STDERR_MAX_BYTES: usize = 8 * 1024;
+const STDERR_MAX_LINES: usize = 100;
+
+/// The reason a `muse serve` child ended. The names and retry posture follow
+/// MSP §2.11; stderr is evidence attached to the surrounding classification,
+/// never an input to this mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExitKind {
+    CleanShutdown,
+    UnhandledError,
+    UsageError,
+    ConfigError,
+    LeaseUnavailable,
+    SdkSurfaceUnavailable,
+    Crash,
+}
+
+/// A process exit observed after the child was successfully spawned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExitClassification {
+    pub kind: ExitKind,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub stderr_tail: String,
+}
+
+impl ExitClassification {
+    /// Whether an automatic durable-host relaunch can reasonably help.
+    pub fn retryable(&self) -> bool {
+        matches!(self.kind, ExitKind::UnhandledError | ExitKind::Crash)
+    }
+
+    pub fn kind_name(&self) -> &'static str {
+        match self.kind {
+            ExitKind::CleanShutdown => "cleanShutdown",
+            ExitKind::UnhandledError => "unhandledError",
+            ExitKind::UsageError => "usageError",
+            ExitKind::ConfigError => "configError",
+            ExitKind::LeaseUnavailable => "leaseUnavailable",
+            ExitKind::SdkSurfaceUnavailable => "sdkSurfaceUnavailable",
+            ExitKind::Crash => "crash",
+        }
+    }
+
+    pub fn retry_advice(&self) -> &'static str {
+        match self.kind {
+            ExitKind::CleanShutdown => "none",
+            ExitKind::UnhandledError | ExitKind::Crash => "retry",
+            ExitKind::UsageError | ExitKind::SdkSurfaceUnavailable => "never",
+            ExitKind::ConfigError => "fix-config",
+            ExitKind::LeaseUnavailable => "after-lease-release",
+        }
+    }
+
+    /// Message suitable for an editor-facing terminal or launch diagnostic.
+    pub fn editor_message(&self) -> String {
+        match self.kind {
+            ExitKind::CleanShutdown => {
+                "Muse serve shut down cleanly after stdin closed; the session was durably closed."
+                    .to_string()
+            }
+            ExitKind::ConfigError => {
+                "Muse serve rejected its configuration (exit code 3). Fix the Muse configuration, then restart muse-acp; retrying without that fix will fail."
+                    .to_string()
+            }
+            ExitKind::SdkSurfaceUnavailable => {
+                "Muse serve is unavailable because the Muse SDK surface is switched off (exit code 5). Enable the Muse serve/SDK surface in Muse, then restart muse-acp; changing serve arguments will not help."
+                    .to_string()
+            }
+            ExitKind::UsageError => {
+                "Muse serve rejected its arguments (exit code 2). Fix MUSE_SERVE_ARGS or the configured launch arguments, then restart muse-acp."
+                    .to_string()
+            }
+            ExitKind::LeaseUnavailable => {
+                "Muse serve could not start because another client holds its session lease (exit code 4). Close that client, then restart muse-acp."
+                    .to_string()
+            }
+            ExitKind::UnhandledError => {
+                "Muse serve stopped with an unhandled error (exit code 1). Check the host diagnostics and restart muse-acp."
+                    .to_string()
+            }
+            ExitKind::Crash => match (self.exit_code, self.signal) {
+                (Some(code), _) => format!(
+                    "Muse serve crashed with exit code {code}. Check the host diagnostics and restart muse-acp."
+                ),
+                (_, Some(signal)) => format!(
+                    "Muse serve was terminated by signal {signal}. Check the host diagnostics and restart muse-acp."
+                ),
+                _ => "Muse serve stopped unexpectedly. Check the host diagnostics and restart muse-acp."
+                    .to_string(),
+            },
+        }
+    }
+
+    pub fn support_lines(&self, prefix: &str) -> Vec<String> {
+        let exit = self
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let signal = self
+            .signal
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "none".to_string());
+        let mut lines = vec![format!(
+            "{prefix} kind={} exit-code={} signal={} retry={}",
+            self.kind_name(),
+            exit,
+            signal,
+            self.retry_advice()
+        )];
+        if self.stderr_tail.is_empty() {
+            lines.push(format!("{prefix} stderr-tail=(empty)"));
+        } else {
+            for line in self.stderr_tail.lines() {
+                lines.push(format!("{prefix} stderr-tail {line}"));
+            }
+        }
+        lines
+    }
+}
+
+impl fmt::Display for ExitClassification {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.editor_message())
+    }
+}
+
+#[derive(Debug)]
+pub enum LaunchError {
+    Spawn(String),
+    Startup(String),
+    HostExit(ExitClassification),
+}
+
+impl LaunchError {
+    pub fn retryable(&self) -> bool {
+        match self {
+            LaunchError::Spawn(_) => false,
+            LaunchError::Startup(_) => true,
+            LaunchError::HostExit(exit) => exit.retryable(),
+        }
+    }
+}
+
+impl fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LaunchError::Spawn(message) | LaunchError::Startup(message) => f.write_str(message),
+            LaunchError::HostExit(exit) => f.write_str(&exit.editor_message()),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct StderrTail {
+    text: Arc<Mutex<String>>,
+}
+
+impl StderrTail {
+    fn push(&self, bytes: &[u8]) {
+        let mut text = self.text.lock().unwrap_or_else(|p| p.into_inner());
+        text.push_str(&String::from_utf8_lossy(bytes));
+        let mut lines = text.matches('\n').count();
+        if !text.ends_with('\n') && !text.is_empty() {
+            lines += 1;
+        }
+        while lines > STDERR_MAX_LINES {
+            let Some(newline) = text.find('\n') else {
+                break;
+            };
+            text.drain(..=newline);
+            lines -= 1;
+        }
+        if text.len() > STDERR_MAX_BYTES {
+            let mut start = text.len() - STDERR_MAX_BYTES;
+            while start < text.len() && !text.is_char_boundary(start) {
+                start += 1;
+            }
+            text.drain(..start);
+        }
+    }
+
+    fn snapshot(&self) -> String {
+        self.text.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
+fn status_parts(status: &ExitStatus) -> (Option<i32>, Option<i32>) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        (status.code(), status.signal())
+    }
+    #[cfg(not(unix))]
+    {
+        (status.code(), None)
+    }
+}
+
+pub fn classify_exit_parts(
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    stderr_tail: String,
+) -> ExitClassification {
+    let kind = match exit_code {
+        Some(0) => ExitKind::CleanShutdown,
+        Some(1) => ExitKind::UnhandledError,
+        Some(2) => ExitKind::UsageError,
+        Some(3) => ExitKind::ConfigError,
+        Some(4) => ExitKind::LeaseUnavailable,
+        Some(5) => ExitKind::SdkSurfaceUnavailable,
+        _ => ExitKind::Crash,
+    };
+    ExitClassification {
+        kind,
+        exit_code,
+        signal,
+        stderr_tail,
+    }
+}
+
+fn classify_status(status: &ExitStatus, stderr_tail: String) -> ExitClassification {
+    let (exit_code, signal) = status_parts(status);
+    classify_exit_parts(exit_code, signal, stderr_tail)
+}
+
 pub struct MspHost {
     writer: Arc<Mutex<std::process::ChildStdin>>,
     next_id: AtomicU64,
     cmd_seq: AtomicU64,
     pending: Mutex<HashMap<String, Sender<Result<J, J>>>>,
     handshake: Mutex<HandshakeInfo>,
+    stderr: StderrTail,
+    stderr_done: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    exit: Mutex<Option<ExitClassification>>,
     _child: Mutex<Child>,
 }
 
@@ -249,19 +480,48 @@ impl MspHost {
             .clone()
     }
 
-    /// Best-effort reap of an exited host child; EOF has already been
-    /// observed, so this only prevents a zombie.
-    pub fn reap(&self) {
-        let _ = self
-            ._child
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .try_wait();
+    /// Best-effort reap of an exited host child and classification of its
+    /// status. EOF has already been observed when the normal caller invokes
+    /// this, so reaping also gives the stderr reader a short bounded drain
+    /// window before the evidence is exposed.
+    pub fn reap(&self) -> Option<ExitClassification> {
+        if let Some(exit) = self.exit.lock().unwrap_or_else(|p| p.into_inner()).clone() {
+            return Some(exit);
+        }
+        // The stdout reader can observe EOF a few milliseconds before the
+        // parent-visible wait status is published. Poll briefly so the
+        // normal EOF path does not discard an otherwise available exit code.
+        let deadline = Instant::now() + Duration::from_millis(250);
+        let status = loop {
+            let result = self
+                ._child
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .try_wait();
+            match result {
+                Ok(Some(status)) => break Some(status),
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(None) | Err(_) => break None,
+            }
+        };
+        let status = status?;
+        self.wait_for_stderr();
+        let exit = classify_status(&status, self.stderr.snapshot());
+        *self.exit.lock().unwrap_or_else(|p| p.into_inner()) = Some(exit.clone());
+        Some(exit)
+    }
+
+    fn wait_for_stderr(&self) {
+        let (done, cv) = &*self.stderr_done;
+        let guard = done.lock().unwrap_or_else(|p| p.into_inner());
+        let _ = cv.wait_timeout_while(guard, Duration::from_millis(250), |finished| !*finished);
     }
 }
 
 impl MspHost {
-    pub fn launch() -> Result<(Arc<MspHost>, Receiver<MspEvent>), String> {
+    pub fn launch() -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
         let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
         let mut cmd = Command::new(&bin);
         cmd.arg("serve");
@@ -275,17 +535,47 @@ impl MspHost {
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| describe_spawn_error(&bin, &e))?;
-        let stdout = child.stdout.take().ok_or("serve: no stdout")?;
-        let stdin = child.stdin.take().ok_or("serve: no stdin")?;
+            .map_err(|e| LaunchError::Spawn(describe_spawn_error(&bin, &e)))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| LaunchError::Startup("serve: no stdout".to_string()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| LaunchError::Startup("serve: no stdin".to_string()))?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| LaunchError::Startup("serve: no stderr".to_string()))?;
+        let stderr_tail = StderrTail::default();
+        let stderr_done = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let reader_tail = stderr_tail.clone();
+        let reader_done = stderr_done.clone();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut buf = [0u8; 4096];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => reader_tail.push(&buf[..n]),
+                }
+            }
+            let (done, cv) = &*reader_done;
+            *done.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            cv.notify_all();
+        });
         let host = Arc::new(MspHost {
             writer: Arc::new(Mutex::new(stdin)),
             next_id: AtomicU64::new(1),
             cmd_seq: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             handshake: Mutex::new(HandshakeInfo::default()),
+            stderr: stderr_tail,
+            stderr_done,
+            exit: Mutex::new(None),
             _child: Mutex::new(child),
         });
         let (tx, rx) = mpsc::channel();
@@ -296,9 +586,16 @@ impl MspHost {
             r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}}}}"#,
             ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
         );
-        let res = host
-            .command("initialize", &init_params)
-            .map_err(|e| format!("serve initialize failed: {}", err_message(&e)))?;
+        let res = match host.command("initialize", &init_params) {
+            Ok(result) => result,
+            Err(error) => {
+                let message = format!("serve initialize failed: {}", err_message(&error));
+                if let Some(exit) = host.reap() {
+                    return Err(LaunchError::HostExit(exit));
+                }
+                return Err(LaunchError::Startup(message));
+            }
+        };
         let schema = res.get("schema").cloned().unwrap_or(J::Null);
         let schema_version = schema.get("version").and_then(|v| v.as_u64());
         let fp = schema
@@ -333,17 +630,22 @@ impl MspHost {
             durability,
         };
         if verdict.is_fatal() {
-            return Err(format!(
+            return Err(LaunchError::Startup(format!(
                 "incompatible host schema: version={} fingerprint={}; upgrade muse-acp",
                 schema_version
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "absent".into()),
                 verdict.fingerprint
-            ));
+            )));
         }
         // Close the handshake (SS1.4.2): no session/turn command is accepted
         // before this notification.
-        host.notify("initialized", "{}")?;
+        if let Err(error) = host.notify("initialized", "{}") {
+            if let Some(exit) = host.reap() {
+                return Err(LaunchError::HostExit(exit));
+            }
+            return Err(LaunchError::Startup(error));
+        }
         Ok((host, rx))
     }
 
@@ -401,7 +703,8 @@ impl MspHost {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&id.to_string());
-            return Err(mk_err(-32603, &format!("serve write failed: {e}")));
+            let fallback = format!("serve write failed: {e}");
+            return Err(mk_err(-32603, &self.host_closed_message(&fallback)));
         }
         match rx.recv_timeout(timeout) {
             Ok(r) => r.map_err(|e| {
@@ -428,9 +731,18 @@ impl MspHost {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .remove(&id.to_string());
-                Err(mk_err(-32603, "serve host closed the connection"))
+                Err(mk_err(
+                    -32603,
+                    &self.host_closed_message("serve host closed the connection"),
+                ))
             }
         }
+    }
+
+    fn host_closed_message(&self, fallback: &str) -> String {
+        self.reap()
+            .map(|exit| exit.editor_message())
+            .unwrap_or_else(|| fallback.to_string())
     }
 
     /// Client-to-server notification (no id, no response).
@@ -463,6 +775,66 @@ impl MspHost {
             j_to_string(id),
             crate::json::esc(&format!("method not found: {method}"))
         ));
+    }
+}
+
+/// Run a bounded, stdin-EOF-only serve probe for `--support`. The probe does
+/// not send protocol frames or inspect stderr; it only records the observed
+/// process status and bounded stderr evidence for a human diagnostic.
+pub fn probe_serve_exit(timeout: Duration) -> Result<Option<ExitClassification>, String> {
+    let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
+    let mut cmd = Command::new(&bin);
+    cmd.arg("serve");
+    for arg in std::env::var("MUSE_SERVE_ARGS")
+        .unwrap_or_default()
+        .split_whitespace()
+    {
+        cmd.arg(arg);
+    }
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| describe_spawn_error(&bin, &error))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "serve support probe: no stderr".to_string())?;
+    let tail = StderrTail::default();
+    let done = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let reader_tail = tail.clone();
+    let reader_done = done.clone();
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => reader_tail.push(&buf[..n]),
+            }
+        }
+        let (finished, cv) = &*reader_done;
+        *finished.lock().unwrap_or_else(|p| p.into_inner()) = true;
+        cv.notify_all();
+    });
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("serve support probe wait failed: {error}"))?
+        {
+            let (finished, cv) = &*done;
+            let guard = finished.lock().unwrap_or_else(|p| p.into_inner());
+            let _ = cv.wait_timeout_while(guard, Duration::from_millis(250), |complete| !*complete);
+            return Ok(Some(classify_status(&status, tail.snapshot())));
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
@@ -512,12 +884,12 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
         line.clear();
         match reader.read_line(&mut line) {
             Ok(0) => {
-                let _ = tx.send(MspEvent::Eof("serve host stdout closed".to_string()));
+                host_closed(&host, &tx, "serve host stdout closed");
                 break;
             }
             Ok(_) => {}
             Err(e) => {
-                let _ = tx.send(MspEvent::Eof(format!("serve stdout error: {e}")));
+                host_closed(&host, &tx, &format!("serve stdout error: {e}"));
                 break;
             }
         }
@@ -588,10 +960,80 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
     }
 }
 
+/// Wake commands that are waiting for a response when the host pipe closes.
+/// Without this, a host that dies during initialization leaves its pending
+/// receiver asleep until the full command timeout, delaying exit
+/// classification and durable-host recovery decisions.
+fn host_closed(host: &MspHost, tx: &Sender<MspEvent>, reason: &str) {
+    let _pending = host
+        .pending
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .drain()
+        .collect::<Vec<_>>();
+    let _ = tx.send(MspEvent::Eof(reason.to_string()));
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{command_timeout, known_server_request, session_profile_hint, session_suffix};
+    use super::{
+        ExitKind, StderrTail, classify_exit_parts, command_timeout, known_server_request,
+        session_profile_hint, session_suffix,
+    };
     use std::time::Duration;
+
+    #[test]
+    fn serve_exit_codes_are_classified_without_consulting_stderr() {
+        let clean = classify_exit_parts(Some(0), None, "exit code 5 in a log line".into());
+        assert_eq!(clean.kind, ExitKind::CleanShutdown);
+        assert!(!clean.retryable());
+
+        let config = classify_exit_parts(Some(3), None, "sdk surface unavailable".into());
+        assert_eq!(config.kind, ExitKind::ConfigError);
+        assert!(!config.retryable());
+        assert!(
+            config
+                .editor_message()
+                .contains("Fix the Muse configuration")
+        );
+
+        let sdk = classify_exit_parts(Some(5), None, "configuration is invalid".into());
+        assert_eq!(sdk.kind, ExitKind::SdkSurfaceUnavailable);
+        assert!(!sdk.retryable());
+        assert!(
+            sdk.editor_message()
+                .contains("changing serve arguments will not help")
+        );
+
+        let signal = classify_exit_parts(None, Some(9), "clean shutdown".into());
+        assert_eq!(signal.kind, ExitKind::Crash);
+        assert!(signal.retryable());
+    }
+
+    #[test]
+    fn stderr_tail_is_bounded_and_keeps_recent_evidence() {
+        let tail = StderrTail::default();
+        for n in 0..150 {
+            tail.push(format!("diagnostic-{n:03}: {}\n", "x".repeat(100)).as_bytes());
+        }
+        let text = tail.snapshot();
+        assert!(
+            text.len() <= super::STDERR_MAX_BYTES,
+            "{} bytes",
+            text.len()
+        );
+        assert!(text.lines().count() <= super::STDERR_MAX_LINES);
+        assert!(text.contains("diagnostic-149"));
+        assert!(!text.contains("diagnostic-000"));
+    }
+
+    #[test]
+    fn support_lines_include_exit_code_and_stderr_tail() {
+        let exit = classify_exit_parts(Some(5), None, "serve gate is off".into());
+        let lines = exit.support_lines("support");
+        assert!(lines[0].contains("exit-code=5"));
+        assert!(lines.iter().any(|line| line.contains("serve gate is off")));
+    }
 
     #[test]
     fn profile_refusal_names_the_settings_key_and_profile() {

@@ -19,7 +19,12 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   retracted    turn/retracted for the turn (no completion follows)
   retract_then_completed retract, then a late turn/completed (settle once)
   retry_then_completed turn/retryScheduled, then a normal completion
+  deferred_launch_error queued admission followed by a launchError terminal
   quiet        turn/start answers only; nothing follows (for close/cancel)
+  host_exit_classified exit after a turn/start ack with FAKE_HOST_EXIT_CODE
+  host_exit_before_ack exit before a turn/start admission response
+  host_exit_relaunch_unavailable first exit is retryable, replacement exits 5
+  support_exit stdin-free serve probe writes stderr and exits with a code
   load         session/resume serves inline history (for session/load replay)
   resume_active session/resume reports a running turn (for steering reattach)
   catalog_grows model/list expands after the first snapshot
@@ -234,6 +239,17 @@ def on_turn_start(params):
         if turn_reason:
             failed_params["reason"] = turn_reason
         notify("turn/completed", failed_params)
+    elif SCENARIO == "deferred_launch_error":
+        notify("turn/completed", {
+            **base,
+            "terminal": "failed",
+            "reason": "queued turn launch failed: provider unavailable",
+            "error": {
+                "kind": "launchError",
+                "message": "queued turn launch failed: provider unavailable",
+                "retryable": True,
+            },
+        })
     elif SCENARIO == "tool":
         notify("item/completed", {**base, "item": {
             "itemId": "it-t1", "kind": "toolCall", "callId": "call-1",
@@ -276,6 +292,10 @@ def on_turn_start(params):
     elif SCENARIO == "host_exit_quiet":
         # Crash immediately after the turn/start ack: the turn is in flight
         # when the host dies, and the replacement host reports an idle fold.
+        CRASH_AFTER_ACK[0] = True
+    elif SCENARIO in ("host_exit_classified", "host_exit_relaunch_unavailable"):
+        # Exit after the admission ack so the adapter can classify the
+        # successful spawn separately from a launch/spawn failure.
         CRASH_AFTER_ACK[0] = True
     elif SCENARIO == "host_exit":
         # Complete the turn, then die like a crashed host once the ack is on
@@ -586,7 +606,12 @@ def on_turn_start(params):
         # contextUsage: only the restored window makes this leg sendable.
         notify("session/tokenUsage", token_usage("cur-10", 100, 20, 200, 40))
         notify("turn/completed", {**base, "terminal": "completed"})
-    disposition = "queued" if SCENARIO == "queued" and TURNS[0] > 1 else "started"
+    disposition = (
+        "queued"
+        if SCENARIO == "deferred_launch_error"
+        or (SCENARIO == "queued" and TURNS[0] > 1)
+        else "started"
+    )
     return {
         "commandId": params.get("commandId", ""),
         "status": "accepted",
@@ -798,8 +823,10 @@ def scenario_after_restart():
     """host_exit is a one-shot: the first process creates the marker and
     crashes; the replacement process sees the marker and behaves sanely."""
     marker = os.environ.get("FAKE_RESTART_MARKER", "")
-    if SCENARIO in ("host_exit", "host_exit_quiet") and marker:
+    if SCENARIO in ("host_exit", "host_exit_quiet", "host_exit_relaunch_unavailable") and marker:
         if os.path.exists(marker):
+            if SCENARIO == "host_exit_relaunch_unavailable":
+                return "support_exit"
             return "happy"
         with open(marker, "w") as f:
             f.write("crashed")
@@ -810,6 +837,18 @@ SCENARIO = scenario_after_restart()
 
 
 def main():
+    if SCENARIO == "support_exit":
+        message = os.environ.get("FAKE_HOST_STDERR", "serve diagnostic")
+        sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))
+        sys.stderr.flush()
+        os._exit(
+            int(
+                os.environ.get(
+                    "FAKE_RESTART_EXIT_CODE",
+                    os.environ.get("FAKE_HOST_EXIT_CODE", "5"),
+                )
+            )
+        )
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -862,11 +901,22 @@ def main():
                                     "message": "internal error: compose session permission profile: permission profile ':auto-review' cannot be used: the automated reviewer is unavailable on this host",
                                     "data": {"kind": "internal"}}})
                     continue
+                if method == "turn/start" and SCENARIO == "host_exit_before_ack":
+                    message = os.environ.get("FAKE_HOST_STDERR", "")
+                    if message:
+                        sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))
+                        sys.stderr.flush()
+                    os._exit(int(os.environ.get("FAKE_HOST_EXIT_CODE", "5")))
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
                 if CRASH_AFTER_ACK[0]:
                     sys.stdout.flush()
-                    os._exit(0)
+                    message = os.environ.get("FAKE_HOST_STDERR", "")
+                    if message:
+                        sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))
+                        sys.stderr.flush()
+                    default_code = "1" if SCENARIO in ("host_exit", "host_exit_quiet") else "0"
+                    os._exit(int(os.environ.get("FAKE_HOST_EXIT_CODE", default_code)))
                 if SCENARIO == "questions_resume" and method == "session/resume":
                     # MSP reissues pending requests after the resume response.
                     send({"jsonrpc": "2.0", "id": 9100 + ident,
