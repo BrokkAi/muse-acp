@@ -28,9 +28,10 @@ paths; Unix archives retain the installer's versioned parent directory.
    'test_*.py'`. Push the topic branch and open a PR to master. `ci.yml` runs on
    pushes and PRs. `release.yml` runs on master and release-topic pushes; these
    runs build/test all five platforms and validate the publisher without
-   publishing. A manual dispatch also only validates.
+   publishing. A manual dispatch also only validates, and additionally compares its rebuilt
+   payloads with a prior successful push preflight at the same commit.
 3. The `publisher` job uses the repository-scoped ephemeral `github.token`, with
-   `contents: write`, and no environment or external secret. It creates,
+   `contents: write` and `actions: read`, and no environment or external secret. It creates,
    updates, and deletes a disposable private draft (no assets or tag), proving
    that the actual job token can manage releases. The evidence survives draft
    deletion. Ref lookups assert no probe tag was created. Organizations must
@@ -38,7 +39,11 @@ paths; Unix archives retain the installer's versioned parent directory.
    token or approval is a blocking error; local gh credentials are not proof.
 4. Merge the PR normally, respecting approvals and checks. Fetch master and
    detach this workspace at the actual merged commit. Wait for both `ci` and
-   `release` push runs at that exact SHA to succeed. Run:
+   `release` push runs at that exact SHA to succeed. Dispatch `release.yml` against a
+   branch still pointing at that exact commit and require its successful
+   conclusion and matching head SHA. This non-publishing rebuild checks payload
+   reproducibility and exercises Actions artifact reads in the publisher job.
+   The authorization check requires this dispatch evidence. Run:
 
    ```sh
    RELEASE_COMMIT=$(git rev-parse HEAD) RELEASE_TAG=v0.4.4 python3 scripts/release.py build
@@ -59,7 +64,14 @@ paths; Unix archives retain the installer's versioned parent directory.
 Only an explicit push of a matching `v*` tag publishes. Push the annotated tag
 from an authorized CLI identity; do not assume tags pushed with GITHUB_TOKEN
 will trigger Actions. Never create/push tags during preflight. The publication
-workflow builds all platforms before its publisher starts. Before the first
+workflow builds all platforms before its publisher starts. Release builds pin
+Rust 1.98.1. Windows uses the MSVC `/Brepro` linker option to avoid changing
+PE timestamps and identifiers (see [LLVM's reproducible-linking notes](https://blog.llvm.org/2019/11/deterministic-builds-with-clang-and-lld.html)).
+Before uploading, the tag run must compare every unpacked payload with the
+successful branch preflight artifacts at the same commit. A runner/toolchain
+change producing different binaries is a blocking error, never an upload
+followed by a failed verification. The publisher's read-only Actions permission
+is used to retrieve that exact-commit evidence. Before the first
 release asset upload, it validates all artifacts, exact version/tag/commit,
 existing release contents, and its own fresh publishing credential. It creates
 missing draft state, uploads only missing assets, reads each new upload back
@@ -69,8 +81,9 @@ the release public. No clobber or deletion of conflicting assets is permitted.
 Recovery accepts existing immutable artifacts only after validating their own
 checksums and comparing unpacked bytes, executable permissions and commit/
 version/platform metadata to the staged build. Compression differences alone
-are acceptable; binary differences are not. A partial archive without a
-checksum must match exact staged bytes before its checksum can be added.
+are acceptable; binary differences are not. For a partial draft archive missing its checksum, validate the archive contents
+against the staged build, retain its exact uploaded bytes, and add a checksum
+for those bytes; never replace the archive just because compression differs.
 Already-public releases are verified read-only by the publication command.
 Never move tags or replace assets of a completed release.
 

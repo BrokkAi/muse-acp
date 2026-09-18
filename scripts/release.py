@@ -162,7 +162,7 @@ def release_state():
     return release
 
 
-def compare_remote(release, staged, complete):
+def compare_remote(release, staged, complete, resume=False):
     assets = release['assets']
     names = [a['name'] for a in assets]
     require(len(names) == len(set(names)) and set(names) <= expected_names(), 'Conflicting remote assets')
@@ -177,9 +177,14 @@ def compare_remote(release, staged, complete):
         for target in TARGETS:
             name = archive_name(target)
             if name in names:
-                # Missing checksum in a partial draft can be resumed only for exact staged bytes.
                 if name + '.sha256' not in names:
-                    require((directory / name).read_bytes() == (staged / name).read_bytes(), 'Partial archive conflict')
+                    raw = (directory / name).read_bytes()
+                    (directory / (name + '.sha256')).write_text(f'{digest(raw)}  {name}\n')
+                    require(inspect_archive(directory, target) == inspect_archive(staged, target), 'Partial archive payload conflict')
+                    if resume:
+                        # Keep the immutable uploaded archive and add its own checksum.
+                        (staged / name).write_bytes(raw)
+                        (staged / (name + '.sha256')).write_bytes((directory / (name + '.sha256')).read_bytes())
                 else:
                     require(inspect_archive(directory, target) == inspect_archive(staged, target), 'Published payload differs from staged build')
             elif name + '.sha256' in names:
@@ -214,8 +219,9 @@ def evidence(kind):
     runs = json.loads(gh('run', 'list', '--repo', 'github.com/' + REPO, '--commit', SHA, '--limit', '100',
                         '--json', 'databaseId,workflowName,headSha,headBranch,event,status,conclusion'))
     for workflow in ['ci', 'release']:
-        candidates = [r for r in runs if r['workflowName'] == workflow and r['headSha'] == SHA and r['event'] == 'push' and not r['headBranch'].startswith('v')]
-        require(candidates, 'Missing exact-commit ' + workflow + ' push run')
+        event = 'workflow_dispatch' if kind == 'authorization' and workflow == 'release' else 'push'
+        candidates = [r for r in runs if r['workflowName'] == workflow and r['headSha'] == SHA and r['event'] == event and not r['headBranch'].startswith('v')]
+        require(candidates, 'Missing exact-commit ' + workflow + ' ' + event + ' run')
         run = max(candidates, key=lambda r: r['databaseId'])
         require(run['status'] == 'completed' and run['conclusion'] == 'success', 'Latest ' + workflow + ' run did not succeed')
         detail = json.loads(gh('run', 'view', str(run['databaseId']), '--repo', 'github.com/' + REPO, '--json', 'headSha,jobs,conclusion'))
@@ -238,6 +244,8 @@ def evidence(kind):
                 Path(d, 'install.sh').write_bytes(source_bytes('install.sh'))
                 staged = Path(d)
                 validate(staged)
+                if kind == 'publication-inputs':
+                    require(validate(staged) == validate(Path('dist')), 'Tag build payload differs from successful preflight; refusing uploads')
                 if kind in ['version', 'published']:
                     release = release_state()
                     if kind == 'published':
@@ -258,7 +266,7 @@ def publish(staged):
     authorization()  # Fresh credential check immediately before uploads.
     if not release:
         release = api('releases', 'POST', {'tag_name': TAG, 'target_commitish': SHA, 'name': TAG, 'draft': True, 'generate_release_notes': True})
-    compare_remote(release, staged, False)
+    compare_remote(release, staged, False, resume=True)
     existing = {a['name'] for a in release['assets']}
     # Never clobber. Existing archive/checksum pairs are verified as unpacked content.
     for name in sorted(expected_names() - existing):
@@ -288,6 +296,11 @@ if __name__ == '__main__':
         elif mode == 'staged':
             metadata()
             validate(Path('dist'))
+            if os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch' or (
+                os.environ.get('GITHUB_EVENT_NAME') == 'push'
+                and os.environ.get('GITHUB_REF', '').startswith('refs/tags/')
+            ):
+                evidence('publication-inputs')
             release = release_state()
             if release:
                 compare_remote(release, Path('dist'), not release['draft'])
