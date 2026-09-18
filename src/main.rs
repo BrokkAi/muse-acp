@@ -2697,7 +2697,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .to_string();
             let value = params
                 .as_ref()
-                .and_then(|p| p.get("model"))
+                .and_then(|p| p.get("modelId"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
@@ -2706,7 +2706,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     stdout,
                     &id,
                     -32602,
-                    "session/set_model requires params.model",
+                    "session/set_model requires params.modelId",
                 );
                 return;
             }
