@@ -508,16 +508,24 @@ supplies no summary.
 
 Surface session-level state without corrupting prompt settlement.
 
-Status: **implemented (display plus settlement).** `session/goalChanged`
-(including explicit `null` clears) publishes the provider-neutral `_meta.goal`
-presentation on `session_info_update`; `session/branchChanged` publishes a
-namespaced branch observation; both are restored from the resume snapshot.
-`turn/retracted` settles the tracked prompt as cancelled (v1 result, v2 idle)
-and clears the active turn, so a late `turn/completed` finds nothing left to
-settle; `turn/retryScheduled` stays non-settling per schema (it never resolves
-a turn-wait) and records attempt facts in diagnostics. Race tests pin
-retract-then-completed and retry-then-completed settle-exactly-once.
-Goal control stays deferred (experimental upstream).
+Status: **implemented (display plus settlement); goal control is host-driven.**
+`session/goalChanged` (including explicit `null` clears) publishes the
+provider-neutral `_meta.goal` presentation on `session_info_update`;
+`session/branchChanged` publishes a namespaced branch observation; both are
+restored from the resume snapshot. `turn/retracted` settles the tracked prompt
+as cancelled (v1 result, v2 idle) and clears the active turn, so a late
+`turn/completed` finds nothing left to settle; `turn/retryScheduled` stays
+non-settling per schema (it never resolves a turn-wait) and records attempt
+facts in diagnostics. Race tests pin retract-then-completed and
+retry-then-completed settle-exactly-once.
+
+The stable MSP `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and
+`goal/clear` methods remain host/TUI controls. ACP has no standard negotiated
+goal-mutation capability, so the adapter does not invent an editor request
+surface or advertise one. Host-issued changes are still folded and published
+with MSP's wake gates intact: set/edit/resume may wake an idle unfinished goal,
+while pause/clear never wake. Revisit this decision if ACP gains a negotiated
+goal-control surface.
 
 **Work items**
 - Represent branch changes (`BranchState { branch, vcs, workspaceRoot }` from
@@ -528,10 +536,8 @@ Goal control stays deferred (experimental upstream).
   (`state.goal`) via `session_info_update`, mirroring the provider-neutral
   goal presentation `codex-acp` uses. Pass through out-of-contract statuses
   and >100 percentages without clamping.
-- Defer goal *control* (`goal/set|pause|resume|clear`): those methods are
-  absent from the stable v1 method index and masked in the transcript corpus,
-  i.e. experimental; revisit only when the adapter deliberately opts into
-  `experimentalApi`.
+- Keep goal control host-driven until ACP provides a negotiated goal-mutation
+  surface; do not route editor requests to MSP under an invented method.
 - ~~Ensure retry/retract notifications settle or supersede affected queued ACP
   prompts.~~
 - ~~Add race tests against terminal `turn/completed` events.~~
