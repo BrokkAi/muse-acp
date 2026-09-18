@@ -20,6 +20,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   retract_then_completed retract, then a late turn/completed (settle once)
   retry_then_completed turn/retryScheduled, then a normal completion
   quiet        turn/start answers only; nothing follows (for close/cancel)
+  subagent_control live native child; FAKE_SUBAGENT_CONTROL_STATUS selects its state
+  subagent_child_approval child approval without displayable choices
   load         session/resume serves inline history (for session/load replay)
   resume_active session/resume reports a running turn (for steering reattach)
   catalog_grows model/list expands after the first snapshot
@@ -336,6 +338,25 @@ def on_turn_start(params):
             "result": {"summary": "native child finished",
                        "evidenceRefs": [], "artifactRefs": []}}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "subagent_control":
+        control = os.environ.get("FAKE_SUBAGENT_CONTROL_STATUS", "running")
+        item_status = os.environ.get("FAKE_SUBAGENT_ITEM_STATUS", "inProgress")
+        notify("item/started", {**base, "item": {
+            "itemId": "it-sub-control", "kind": "subagent",
+            "status": item_status, "revision": 1, "subagentId": "sub-control",
+            "agentPath": "researcher", "depth": 1,
+            "objective": "hold the control test open",
+            "childSessionId": "child-sess-control",
+            "controlStatus": control}})
+    elif SCENARIO == "subagent_child_approval":
+        notify("item/started", {**base, "item": {
+            "itemId": "it-sub-control", "kind": "subagent",
+            "status": "inProgress", "revision": 1, "subagentId": "sub-control",
+            "agentPath": "researcher", "depth": 1,
+            "objective": "hold the approval test open",
+            "childSessionId": "child-sess-control", "controlStatus": "running"}})
+        notify("approval/requested", dict(
+            APPROVAL_PARAMS, sessionId="child-sess-control", availableChoices=[]))
     elif SCENARIO == "subagent":
         sid_item = "it-sub1"
         notify("item/started", {**base, "item": {
@@ -784,6 +805,10 @@ def result_for(method, msg):
             "status": "accepted",
             "turnId": params.get("expectedTurnId", ""),
         }
+    if method.startswith("subagent/"):
+        params = msg.get("params", {})
+        log_input(params)
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
     if method == "turn/cancel":
         # Like the real host: a cancelled turn still reports its terminal.
         params = msg.get("params", {})

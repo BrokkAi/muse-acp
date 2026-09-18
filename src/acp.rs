@@ -24,6 +24,12 @@ pub struct PendingPerm {
     pub requirement: J,
     /// (choiceId, decision) in host order; first reject-ish is the deny fallback.
     pub choices: Vec<(String, String)>,
+    /// MSP session that owns the approval target. This remains the root
+    /// session for a direct child and the immediate parent for a nested one.
+    pub owner_msp_sid: String,
+    /// When the approval came from a child stream, stop only that child if
+    /// the editor cannot answer. An empty value means the owner session.
+    pub child_subagent_id: Option<String>,
 }
 
 pub struct UiQuestion {
@@ -38,6 +44,8 @@ pub struct PendingUi {
     /// ACP `elicitation/create` request id awaiting the client reply.
     pub req_id: J,
     pub user_input_id: String,
+    /// MSP session that owns the question's child target.
+    pub owner_msp_sid: String,
     pub questions: Vec<UiQuestion>,
 }
 
