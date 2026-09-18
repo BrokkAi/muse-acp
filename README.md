@@ -122,6 +122,16 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | Muse skills | ACP `available_commands_update`; aliases such as `/plan` are sent to Muse as `/skill plan` |
 | `session/contextUsage` + `session/tokenUsage` | `usage_update` (`used`/`size` from context occupancy, also restored on attach; `_meta.museCumulative` session totals, `_meta.musePressure`); each completion is counted once, so a `view/gap` refill that replays one already seen does not re-price it; `cost` is a client-local list-price estimate from `model/list` catalog rates, summed per completion — partial in both directions (historic and unpriceable completions are excluded, cached tokens are charged at the catalog cached rate), never a billing figure. The cost object is labeled `source: adapter-estimate`, `basis: catalog-list-price`, and `billing: false` so clients cannot mistake it for Muse billing |
 
+Muse 1.3.0 subscription usage is surfaced under `_meta.museSubscriptionUsage`.
+The adapter reads the host's last observation with `usage/read` and refreshes it
+for every attached session when `usage/changed` arrives. The payload keeps the
+host's `observedAtMs`, `tier`, `window`, and `weekly` values intact and is marked
+`source: msp-host-observation` and `billing: false`; it is an observation as of
+the host arrival stamp, never a cost or billing value. When a context window is
+available it rides the next `usage_update`; otherwise it uses
+`session_info_update` so the adapter does not invent ACP `used`/`size` values.
+An omitted `usage` member remains absent rather than being filled with zeros.
+
 Zed currently initializes custom agents with ACP v1 even though it supports
 config selectors, so the adapter returns `configOptions` in both protocol
 versions: v1 uses the selector field `id` (plus a legacy `modes` fallback), while
