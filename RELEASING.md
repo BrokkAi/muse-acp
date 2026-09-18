@@ -102,5 +102,6 @@ only install.sh (asset 572072007). Its tag remains at
 ea1b57d0d86a242d2837f8b6a768d8ea0a04ae9e. Preparation preserves that tag and
 asset; v0.4.5 includes the repair on a new commit. Do not resume the old workflow
 or treat that incomplete draft as a completed release. Draft discovery uses
-the authenticated paginated release list when tag lookup returns 404; upload
+the authenticated paginated release list and GraphQL when REST tag lookup
+returns 404; upload
 readback and final completeness checks use the known release ID.

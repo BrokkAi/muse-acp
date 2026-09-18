@@ -10,7 +10,6 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import time
 import tomllib
 import zipfile
 
@@ -167,7 +166,15 @@ def find_release(tag):
             break
         page += 1
     require(len(matches) <= 1, 'Multiple releases use the proposed tag')
-    return api('releases/' + str(matches[0]['id'])) if matches else None
+    if matches:
+        return api('releases/' + str(matches[0]['id']))
+    # The CLI's draft lookup also uses GraphQL when REST omits the draft.
+    query = 'query($tag:String!) { repository(owner:"BrokkAi", name:"muse-acp") { release(tagName:$tag) { databaseId } } }'
+    result = json.loads(gh('api', '--hostname', 'github.com', 'graphql',
+                           '-f', 'query=' + query, '-f', 'tag=' + tag))
+    require(not result.get('errors'), 'GraphQL draft lookup failed')
+    found = result['data']['repository']['release']
+    return api('releases/' + str(found['databaseId'])) if found else None
 
 
 def release_state():
@@ -226,13 +233,7 @@ def authorization():
     try:
         require(release['draft'], 'Probe must stay a draft')
         api('releases/' + str(release['id']), 'PATCH', {'body': 'Disposable non-publishing permissions check.'})
-        # Draft listings can lag a successful create/update. Never retry mutations.
-        for attempt in range(7):
-            discovered = find_release(probe)
-            if discovered is not None:
-                break
-            if attempt < 6:
-                time.sleep(5)
+        discovered = find_release(probe)
         require(discovered and discovered['id'] == release['id'] and discovered['draft'], 'Draft discovery failed')
         readback = api('releases/' + str(release['id']))
         require(readback['body'] == 'Disposable non-publishing permissions check.' and readback['draft'], 'Draft readback failed')

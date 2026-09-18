@@ -89,6 +89,15 @@ class DraftRecovery(unittest.TestCase):
             self.assertEqual(release.find_release(release.TAG), draft)
         self.assertEqual(api.call_args_list[-1].args, ('releases/42',))
 
+    def test_rest_hidden_draft_resolves_via_graphql(self):
+        draft = {'id': 42, 'tag_name': release.TAG, 'draft': True}
+        response = {'data': {'repository': {'release': {'databaseId': 42}}}}
+        with patch.object(release, 'optional', return_value=None), patch.object(
+            release, 'api', side_effect=[[], draft]
+        ) as api, patch.object(release, 'gh', return_value=json.dumps(response).encode()):
+            self.assertEqual(release.find_release(release.TAG), draft)
+        self.assertEqual(api.call_args_list[-1].args, ('releases/42',))
+
     def test_duplicate_drafts_fail_closed(self):
         draft = {'id': 42, 'tag_name': release.TAG}
         with patch.object(release, 'optional', return_value=None), patch.object(
