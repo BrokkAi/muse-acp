@@ -583,18 +583,20 @@ MSP v1 publishes `subagent/sendMessage`, `subagent/followupTask`,
 `controlStatus`, `result`, and transitive `usage`; and the transcript corpus
 covers nested lifecycles, steering replay/rejection, and close round-trips.
 
-Status: **native sessions implemented (spawn/state/child replay).** After
-bilateral negotiation (canonical `subagents` capability or AIR's
+Status: **native sessions and controls implemented (spawn/state/child replay).**
+After bilateral negotiation (canonical `subagents` capability or AIR's
 `nativeSubagentSessions`), the adapter advertises the capability in both
 protocol versions, emits idempotent `subagent_spawned` announcements with MSP
 provenance and `subagent_state_update` terminals (`completed`/`failed`/
 `cancelled`/`disconnected` for recovery states), and replays the child
 transcript onto the child session id through one `session/read` drill-down.
-Without negotiation the legacy tool cards remain. Legacy visibility:
-as synthetic tool cards (`agent: objective` titles, result summaries, child
-state lines) carrying `subagentId`, `childSessionId`, `controlStatus`, and
-run provenance in `_meta.muse`, so no child work is silently dropped. Native
-ACP subagent sessions and `subagent/*` controls remain the open work.
+The eight `subagent/*` controls forward the caller's command id through the
+observed owner session, with lifecycle admission and generic item status
+checks that fail closed. Without negotiation the legacy tool cards remain.
+Legacy visibility: as synthetic tool cards (`agent: objective` titles, result
+summaries, child state lines) carrying `subagentId`, `childSessionId`,
+`controlStatus`, and run provenance in `_meta.muse`, so no child work is
+silently dropped.
 
 **Work items**
 
