@@ -24,7 +24,9 @@ use std::sync::{
 use acp::{AcpSession, InFlight, PendingPerm, Sessions, StdoutShared};
 use fold::SessionFold;
 use json::{J, esc, j_to_string, mint_id, parse_json};
-use msp::{MspEvent, MspHost, err_code, err_message, log};
+use msp::{
+    ExitClassification, ExitKind, LaunchError, MspEvent, MspHost, err_code, err_message, log,
+};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static VER: AtomicU64 = AtomicU64::new(0); // negotiated ACP version for the connection
@@ -185,8 +187,15 @@ fn friendly_terminal_error(terminal: &str, params: &J) -> String {
     } else {
         String::new()
     };
+    let launch_error = kind == "launchError";
     let mut out = if detail.is_empty() {
-        format!("turn ended with terminal '{terminal}'")
+        if launch_error {
+            format!("turn could not start (launchError; terminal '{terminal}')")
+        } else {
+            format!("turn ended with terminal '{terminal}'")
+        }
+    } else if launch_error {
+        format!("turn could not start (launchError): {detail}")
     } else if kind.is_empty() {
         format!("turn failed (terminal '{terminal}'): {detail}")
     } else {
@@ -746,6 +755,17 @@ fn support_bundle() -> i32 {
     for line in cli_readiness_lines() {
         println!("[muse-acp] {line}");
     }
+    match msp::probe_serve_exit(std::time::Duration::from_secs(2)) {
+        Ok(Some(exit)) => {
+            for line in exit.support_lines("support-serve-exit") {
+                println!("[muse-acp] {line}");
+            }
+        }
+        Ok(None) => println!(
+            "[muse-acp] support-serve-exit status=timeout (host did not exit within 2000ms)"
+        ),
+        Err(error) => println!("[muse-acp] support-serve-exit status=unavailable error={error}"),
+    }
     // Adapter-relevant configuration, values shown only when they cannot be
     // credentials. Unknown MUSE_* variables are listed by name, redacted.
     let safe = [
@@ -930,10 +950,19 @@ fn restart_durable_host(
                 return Ok(host);
             }
             Err(e) => {
-                last_err = e;
+                let retryable = e.retryable();
+                last_err = e.to_string();
+                if let LaunchError::HostExit(exit) = &e {
+                    for line in exit.support_lines("serve-restart-exit") {
+                        log(&line);
+                    }
+                }
                 log(&format!(
                     "host restart attempt {attempt}/{max_attempts} failed: {last_err}"
                 ));
+                if !retryable {
+                    break;
+                }
             }
         }
     }
@@ -986,6 +1015,11 @@ fn main() {
     let (mut host, msp_rx) = match MspHost::launch() {
         Ok(h) => h,
         Err(e) => {
+            if let LaunchError::HostExit(exit) = &e {
+                for line in exit.support_lines("serve-exit") {
+                    log(&line);
+                }
+            }
             eprintln!("[muse-acp] fatal: {e}");
             std::process::exit(1);
         }
@@ -1043,7 +1077,22 @@ fn main() {
             }
             LoopMsg::Msp(MspEvent::Eof(why)) => {
                 log(&format!("serve host gone ({why})"));
-                host.reap();
+                let observed_exit = host.reap();
+                if let Some(exit) = observed_exit.as_ref() {
+                    for line in exit.support_lines("serve-exit") {
+                        log(&line);
+                    }
+                    if !exit.retryable() {
+                        let message = exit.editor_message();
+                        log(&message);
+                        fail_all_with_message(&stdout, &sessions, &message);
+                        std::process::exit(if exit.kind == ExitKind::CleanShutdown {
+                            0
+                        } else {
+                            1
+                        });
+                    }
+                }
                 // Durable sessions recover by re-attaching: their pending
                 // terminals arrive on resume. Ephemeral or unrecognized
                 // profiles get no such guarantee, so they fail closed.
@@ -1067,7 +1116,7 @@ fn main() {
                             log(&format!(
                                 "host restart exhausted; failing in-flight turns: {e}"
                             ));
-                            fail_all(&stdout, &sessions);
+                            fail_all_with_message(&stdout, &sessions, &e);
                             std::process::exit(1);
                         }
                     }
@@ -1075,7 +1124,14 @@ fn main() {
                     log(
                         "host is not restartable (ephemeral or unknown durability); failing in-flight turns",
                     );
-                    fail_all(&stdout, &sessions);
+                    let message = observed_exit
+                        .as_ref()
+                        .map(ExitClassification::editor_message)
+                        .unwrap_or_else(|| {
+                            "Muse serve stopped and its durability profile does not permit automatic recovery. Restart muse-acp."
+                                .to_string()
+                        });
+                    fail_all_with_message(&stdout, &sessions, &message);
                     std::process::exit(1);
                 }
             }
@@ -3417,14 +3473,24 @@ fn handle_msp(
                     (req_id, ver, rest, usage)
                 });
             if let Some((req_id, ver, rest, usage)) = settled {
-                let stop = fold::stop_reason(terminal);
-                let failed = terminal != "completed" && terminal != "cancelled";
+                let deferred_start_failure = error_kind == "launchError";
+                let stop = if deferred_start_failure {
+                    // A launchError is the terminal for a queued admission
+                    // that never reached turn/started. It is an actionable
+                    // launch problem, but it did not run and must not be
+                    // presented to ACP as a failed model run.
+                    "cancelled"
+                } else {
+                    fold::stop_reason(terminal)
+                };
+                let failed =
+                    terminal != "completed" && terminal != "cancelled" && !deferred_start_failure;
                 if ver == 2 {
                     // A failed terminal otherwise surfaces as a bare idle
                     // with `_failed` and an empty transcript (the reported
                     // offline bug). Emit the host detail as an agent message
                     // first so the transcript explains what happened.
-                    if failed {
+                    if failed || deferred_start_failure {
                         let msg_id = mint_id("msg-", &ID_COUNTER);
                         acp::send_raw(
                             stdout,
@@ -4228,14 +4294,32 @@ fn cancel_session_turns(host: &Arc<MspHost>, sessions: &Sessions, acp_sid: &str)
     }
 }
 
-fn fail_all(stdout: &StdoutShared, sessions: &Sessions) {
+/// Settle prompts that cannot receive an MSP terminal because the host died.
+/// A launch/configuration exit is a host admission problem, so v2 gets an
+/// explanatory transcript message and a cancelled idle state; v1 gets an
+/// error for the prompt that never started.
+fn fail_all_with_message(stdout: &StdoutShared, sessions: &Sessions, message: &str) {
     let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     for s in map.values_mut() {
-        for f in s.in_flight.drain(..) {
-            if s.ver == 2 {
-                acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
-            } else {
-                acp::send_result(stdout, &Some(f.req_id), "{\"stopReason\":\"cancelled\"}");
+        if s.in_flight.is_empty() {
+            continue;
+        }
+        if s.ver == 2 {
+            let msg_id = mint_id("msg-", &ID_COUNTER);
+            acp::send_raw(
+                stdout,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
+                    esc(&s.acp_sid),
+                    esc(&msg_id),
+                    esc(message),
+                ),
+            );
+            s.in_flight.clear();
+            acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
+        } else {
+            for f in s.in_flight.drain(..) {
+                acp::send_error(stdout, &Some(f.req_id), -32603, message);
             }
         }
     }
@@ -4682,6 +4766,34 @@ mod tests {
         assert!(
             !out.contains("network/offline"),
             "no offline hint for plain failure: {out}"
+        );
+    }
+
+    #[test]
+    fn deferred_launch_failure_is_distinct_from_a_model_failure() {
+        let params = parse_json(
+            r#"{"terminal":"failed","reason":"queued turn launch failed: provider unavailable","error":{"kind":"launchError","message":"queued turn launch failed: provider unavailable","retryable":true}}"#,
+        )
+        .unwrap();
+        let out = friendly_terminal_error("failed", &params);
+        assert!(out.contains("launchError"), "launch kind survives: {out}");
+        assert!(
+            out.contains("could not start"),
+            "launch remedy is explicit: {out}"
+        );
+        assert!(
+            !out.contains("turn failed (terminal"),
+            "deferred launch is not described as a model failure: {out}"
+        );
+
+        let model = parse_json(
+            r#"{"terminal":"failed","error":{"kind":"modelError","message":"provider unavailable","retryable":true}}"#,
+        )
+        .unwrap();
+        let model_out = friendly_terminal_error("failed", &model);
+        assert!(
+            model_out.contains("turn failed (terminal"),
+            "model failure keeps its class: {model_out}"
         );
     }
 

@@ -3192,6 +3192,185 @@ fn host_restart_settles_orphaned_in_flight_turns() {
     let _ = std::fs::remove_file(&marker);
 }
 
+#[test]
+fn deferred_launch_error_is_not_reported_as_a_failed_run() {
+    for version in [1, 2] {
+        let mut c = Client::spawn("deferred_launch_error", &[]);
+        let sid = c.new_session(version, "");
+        let pid = c.prompt(&sid, "run the queued work");
+        if version == 1 {
+            let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+            assert!(done.contains("launchError"), "launch kind survives: {done}");
+            assert!(
+                done.contains("could not start"),
+                "launch diagnosis survives: {done}"
+            );
+            assert!(
+                !done.contains("stopReason"),
+                "launch failure is an error: {done}"
+            );
+        } else {
+            let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+            assert!(
+                accepted.contains("\"result\":{}"),
+                "prompt accepted: {accepted}"
+            );
+            let message = c.wait_for("could not start", Duration::from_secs(15));
+            assert!(
+                message.contains("launchError"),
+                "launch kind survives: {message}"
+            );
+            let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+            assert!(
+                idle.contains("\"stopReason\":\"cancelled\""),
+                "not a failed run: {idle}"
+            );
+            assert!(
+                !idle.contains("_failed"),
+                "deferred launch is not failed: {idle}"
+            );
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn host_exit_codes_are_actionable_and_clean_shutdown_is_not_a_crash() {
+    for (code, remedy) in [("3", "Fix the Muse configuration"), ("5", "SDK surface")] {
+        let mut c = Client::spawn(
+            "host_exit_classified",
+            &[
+                ("FAKE_HOST_EXIT_CODE", code),
+                ("FAKE_HOST_STDERR", "host diagnostic tail"),
+            ],
+        );
+        let sid = c.new_session(1, "");
+        let pid = c.prompt(&sid, "start this");
+        let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(done.contains(remedy), "exit {code} remedy missing: {done}");
+        c.wait_stderr(&format!("exit-code={code}"), Duration::from_secs(15));
+        c.wait_stderr(
+            "serve-exit stderr-tail host diagnostic tail",
+            Duration::from_secs(15),
+        );
+        let status = c
+            .child
+            .wait_timeout(Duration::from_secs(10))
+            .expect("wait")
+            .expect("adapter exited");
+        assert!(
+            !status.success(),
+            "exit {code} must fail the adapter: {status}"
+        );
+    }
+
+    let mut c = Client::spawn(
+        "host_exit_classified",
+        &[
+            ("FAKE_HOST_EXIT_CODE", "0"),
+            ("FAKE_HOST_STDERR", "stdin EOF drain"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "start this");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("shut down cleanly"),
+        "clean diagnosis missing: {done}"
+    );
+    assert!(
+        !done.contains("crash"),
+        "clean shutdown must not be a crash: {done}"
+    );
+    c.wait_stderr("exit-code=0", Duration::from_secs(15));
+    let status = c
+        .child
+        .wait_timeout(Duration::from_secs(10))
+        .expect("wait")
+        .expect("adapter exited");
+    assert!(
+        status.success(),
+        "clean host exit should preserve success status: {status}"
+    );
+}
+
+#[test]
+fn durable_relaunch_stops_on_a_non_retryable_host_exit() {
+    let marker = std::env::temp_dir().join(format!(
+        "muse-acp-restart-unavailable-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let marker_str = marker.to_str().unwrap().to_string();
+    let mut c = Client::spawn(
+        "host_exit_relaunch_unavailable",
+        &[
+            ("FAKE_RESTART_MARKER", marker_str.as_str()),
+            ("FAKE_HOST_EXIT_CODE", "1"),
+            ("FAKE_RESTART_EXIT_CODE", "5"),
+            ("FAKE_HOST_STDERR", "replacement gate disabled"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "retry after the host crash");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("SDK surface") && done.contains("changing serve arguments"),
+        "replacement exit remedy missing: {done}"
+    );
+    c.wait_stderr(
+        "serve-restart-exit kind=sdkSurfaceUnavailable exit-code=5",
+        Duration::from_secs(15),
+    );
+    c.wait_stderr("host restart attempt 1/3 failed", Duration::from_secs(15));
+    let status = c
+        .child
+        .wait_timeout(Duration::from_secs(10))
+        .expect("wait")
+        .expect("adapter exited");
+    assert!(
+        !status.success(),
+        "replacement failure must stop recovery: {status}"
+    );
+    let stderr = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
+    assert!(
+        !stderr.contains("host restart attempt 2/3"),
+        "non-retryable replacement exit must not loop: {stderr}"
+    );
+    let _ = std::fs::remove_file(marker);
+}
+
+#[test]
+fn exit_before_turn_admission_still_reaches_the_prompt() {
+    let mut c = Client::spawn(
+        "host_exit_before_ack",
+        &[
+            ("FAKE_HOST_EXIT_CODE", "5"),
+            ("FAKE_HOST_STDERR", "serve gate disabled before ack"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "start this");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("SDK surface") && done.contains("changing serve arguments"),
+        "pre-admission exit remedy missing: {done}"
+    );
+    c.wait_stderr("exit-code=5", Duration::from_secs(15));
+    let status = c
+        .child
+        .wait_timeout(Duration::from_secs(10))
+        .expect("wait")
+        .expect("adapter exited");
+    assert!(
+        !status.success(),
+        "non-retryable host exit must fail: {status}"
+    );
+}
+
 /// Validate every adapter→host request frame against the vendored MSP schema
 /// bundle: required fields must be present and property types must match.
 /// This is the CI gate that catches protocol drift in what we emit, not just
@@ -3464,7 +3643,10 @@ fn client_disconnect_exits_promptly_with_a_turn_in_flight() {
 fn support_bundle_redacts_unknown_muse_env_values() {
     let out = std::process::Command::new(adapter_bin())
         .arg("--support")
-        .env("MUSE_CLI", adapter_bin())
+        .env("MUSE_CLI", fixture())
+        .env("FAKE_SCENARIO", "support_exit")
+        .env("FAKE_HOST_EXIT_CODE", "5")
+        .env("FAKE_HOST_STDERR", "serve gate disabled")
         .env("MUSE_SECRET_TOKEN", "super-secret-value")
         .env("MUSE_TOOL_OUTPUT_LIMIT", "1234")
         .output()
@@ -3479,6 +3661,14 @@ fn support_bundle_redacts_unknown_muse_env_values() {
     assert!(
         text.contains("cli-ready binary="),
         "cli probe missing: {text}"
+    );
+    assert!(
+        text.contains("support-serve-exit") && text.contains("exit-code=5"),
+        "serve exit classification missing: {text}"
+    );
+    assert!(
+        text.contains("stderr-tail serve gate disabled"),
+        "serve stderr evidence missing: {text}"
     );
     assert!(
         text.contains("MUSE_TOOL_OUTPUT_LIMIT=1234"),
