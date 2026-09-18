@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 
 fn fixture() -> String {
     let dir = env!("CARGO_MANIFEST_DIR");
-    format!("{dir}/tests/fixtures/fake_serve.py")
+    let extension = if cfg!(windows) { "cmd" } else { "py" };
+    format!("{dir}/tests/fixtures/fake_serve.{extension}")
 }
 
 fn adapter_bin() -> String {

@@ -19,7 +19,7 @@ class ArchiveValidation(unittest.TestCase):
             if str(path).startswith('target/'):
                 return b'test binary bytes'
             return original(path)
-        with patch.object(release, 'metadata'), patch.object(release.subprocess, 'run'), patch.object(Path, 'read_bytes', read):
+        with patch.object(release, 'metadata'), patch.object(release, 'selftest'), patch.object(Path, 'read_bytes', read):
             release.package(target, self.directory)
 
     def test_all_platform_archives_and_permissions(self):

@@ -61,8 +61,17 @@ def expected_names():
     return {'install.sh'} | {n for t in TARGETS for n in (archive_name(t), archive_name(t) + '.sha256')}
 
 
+def source_bytes(name):
+    # Use committed bytes, independent of Windows checkout newline conversion.
+    return subprocess.check_output(['git', 'show', 'HEAD:' + name])
+
+
 def digest(data):
     return hashlib.sha256(data).hexdigest()
+
+
+def selftest(binary_path):
+    subprocess.run([str(binary_path), '--selftest'], check=True)
 
 
 def package(target, out):
@@ -71,9 +80,9 @@ def package(target, out):
     out.mkdir(parents=True, exist_ok=True)
     binary = 'muse-acp.exe' if 'windows' in target else 'muse-acp'
     binary_path = Path('target') / target / 'release' / binary
-    subprocess.run([str(binary_path), '--selftest'], check=True)
+    selftest(binary_path)
     entries = {binary: (binary_path.read_bytes(), 0o755)}
-    entries.update({n: (Path(n).read_bytes(), 0o644) for n in ['README.md', 'LICENSE', 'NOTICE']})
+    entries.update({n: (source_bytes(n), 0o644) for n in ['README.md', 'LICENSE', 'NOTICE']})
     manifest = {'commit': SHA, 'version': VERSION, 'target': target,
                 'files': {n: {'sha256': digest(b), 'mode': m} for n, (b, m) in entries.items()}}
     entries['release.json'] = (json.dumps(manifest, sort_keys=True).encode(), 0o644)
@@ -124,13 +133,13 @@ def inspect_archive(directory, target):
         require(digest(b) == spec['sha256'] and mode == spec['mode'], 'Payload or permission mismatch')
         require(mode == (0o755 if n == binary else 0o644), 'Unexpected permissions')
         if n != binary:
-            require(b == Path(n).read_bytes(), 'Documentation differs from release commit')
+            require(b == source_bytes(n), 'Documentation differs from release commit')
     return entries
 
 
 def validate(directory):
     require({p.name for p in directory.iterdir()} == expected_names(), 'Missing or unexpected release assets')
-    require((directory / 'install.sh').read_bytes() == Path('install.sh').read_bytes(), 'Installer differs')
+    require((directory / 'install.sh').read_bytes() == source_bytes('install.sh'), 'Installer differs')
     return {t: inspect_archive(directory, t) for t in TARGETS}
 
 
@@ -147,6 +156,8 @@ def release_state():
     tag_check()
     release = optional('releases/tags/' + TAG)
     if release:
+        if not release['draft']:
+            require(optional('git/ref/tags/' + TAG) is not None, 'Published release is missing its tag')
         require(release['target_commitish'] == SHA or optional('git/ref/tags/' + TAG), 'Draft target mismatch')
     return release
 
@@ -174,7 +185,7 @@ def compare_remote(release, staged, complete):
             elif name + '.sha256' in names:
                 require((directory / (name + '.sha256')).read_bytes() == (staged / (name + '.sha256')).read_bytes(), 'Orphan checksum conflict')
         if 'install.sh' in names:
-            require((directory / 'install.sh').read_bytes() == Path('install.sh').read_bytes(), 'Published installer conflict')
+            require((directory / 'install.sh').read_bytes() == source_bytes('install.sh'), 'Published installer conflict')
 
 
 def authorization():
@@ -224,7 +235,7 @@ def evidence(kind):
                         for n in z.namelist():
                             require('/' not in n and n in expected_names(), 'Invalid Actions artifact')
                             Path(d, n).write_bytes(z.read(n))
-                Path(d, 'install.sh').write_bytes(Path('install.sh').read_bytes())
+                Path(d, 'install.sh').write_bytes(source_bytes('install.sh'))
                 staged = Path(d)
                 validate(staged)
                 if kind in ['version', 'published']:

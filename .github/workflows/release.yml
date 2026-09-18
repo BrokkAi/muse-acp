@@ -43,7 +43,7 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
-      - run: cargo test --locked
+      - run: cargo test --locked -- --nocapture
       - run: cargo build --release --locked --target ${{ matrix.target }}
       - run: python scripts/release.py package ${{ matrix.target }}
       - uses: actions/upload-artifact@v4
