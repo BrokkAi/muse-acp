@@ -36,6 +36,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
+  session_list_workspace_filter return no host sessions for an unmatched root
 """
 import json
 import os
@@ -678,6 +679,10 @@ def result_for(method, msg):
         # Every other session pages back to nothing usable.
         return {"events": [], "nextCursor": None}
     if method == "session/list":
+        if SCENARIO == "session_list_workspace_filter":
+            params = msg.get("params", {})
+            if params.get("workspaceRoot") == "/tmp/unrelated-ws":
+                return {"sessions": [], "nextCursor": None}
         live = session_obj()
         old = session_obj("msp-sess-old", "/tmp/old-ws")
         old["updatedAt"] = "2026-08-01T00:00:00Z"

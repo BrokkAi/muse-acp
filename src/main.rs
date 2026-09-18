@@ -2426,6 +2426,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .lock()
                 .unwrap()
                 .values()
+                .filter(|s| filter_root.is_empty() || s.cwd == filter_root)
                 .map(|s| (s.msp_sid.clone(), s.cwd.clone()))
                 .collect();
             match host.command("session/list", &host_params) {
