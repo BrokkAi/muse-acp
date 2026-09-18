@@ -45,15 +45,6 @@ fn trunc(s: &str) -> (String, Option<String>) {
     (format!("{}…[truncated]", &s[..cut]), Some(meta))
 }
 
-/// Build the `_meta` field for tool-call truncation facts. The host flag is
-/// authoritative when both sources apply: its durable log holds the full text.
-fn truncation_meta(adapter_cut: Option<&str>, host_truncated: bool) -> Option<String> {
-    if host_truncated {
-        return Some("\"_meta\":{\"muse\":{\"truncated\":{\"source\":\"host\"}}}".to_string());
-    }
-    adapter_cut.map(|cut| format!("\"_meta\":{{\"muse\":{{\"truncated\":{{{cut}}}}}}}"))
-}
-
 fn tool_kind(tool: &str) -> &'static str {
     let t = tool.to_lowercase();
     if t.contains("read") || t.contains("list") || t.contains("cat") {
@@ -140,6 +131,8 @@ pub struct ToolUpdate<'a> {
     pub status: &'a str,
     pub content_text: Option<&'a str>,
     pub raw_input: Option<&'a str>,
+    /// Host-authored item references and patch facts for the card's `_meta`.
+    pub muse_fields: Option<&'a str>,
     /// The host already saturated this surface (`item.truncated`).
     pub host_truncated: bool,
 }
@@ -273,6 +266,41 @@ impl SessionFold {
             f.push(format!("\"_meta\":{{\"muse\":{{{fields}}}}}"));
         }
         Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
+    }
+
+    /// Preserve stable host references beside the bounded editor surface.
+    /// `outputRef` and `patchRef` are intentionally passed through as JSON so
+    /// clients can use their availability, byte length, and host id.
+    fn item_muse_fields(item: &J) -> Option<String> {
+        let fields = [
+            ("itemId", item.get("itemId")),
+            ("outputRef", item.get("outputRef")),
+            ("patchRef", item.get("patchRef")),
+            ("patchSummary", item.get("patchSummary")),
+        ];
+        let parts: Vec<String> = fields
+            .into_iter()
+            .filter_map(|(key, value)| {
+                value
+                    .filter(|v| !matches!(v, J::Null))
+                    .map(|v| format!("\"{key}\":{}", j_to_string(v)))
+            })
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(","))
+    }
+
+    fn merge_muse_fields(base: Option<&str>, item: Option<&str>) -> Option<String> {
+        let mut fields = String::new();
+        if let Some(item) = item.filter(|value| !value.is_empty()) {
+            fields.push_str(item);
+        }
+        if let Some(base) = base.filter(|value| !value.is_empty()) {
+            if !fields.is_empty() {
+                fields.push(',');
+            }
+            fields.push_str(base);
+        }
+        (!fields.is_empty()).then_some(fields)
     }
 
     /// Compaction is host work the user must see, but it is not a tool the
@@ -632,18 +660,30 @@ impl SessionFold {
             format!("\"kind\":\"{}\"", u.kind),
             format!("\"status\":{}", esc(u.status)),
         ];
+        let mut muse_fields = u.muse_fields.unwrap_or_default().to_string();
         if let Some(t) = u.content_text {
             let (text, adapter_cut) = trunc(t);
             f.push(format!(
                 "\"content\":[{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]",
                 esc(&text)
             ));
-            if let Some(meta) = truncation_meta(adapter_cut.as_deref(), u.host_truncated) {
-                f.push(meta);
+            let truncation = if u.host_truncated {
+                Some("\"source\":\"host\"".to_string())
+            } else {
+                adapter_cut
+            };
+            if let Some(cut) = truncation {
+                if !muse_fields.is_empty() {
+                    muse_fields.push(',');
+                }
+                muse_fields.push_str(&format!("\"truncated\":{{{cut}}}"));
             }
         }
         if let Some(r) = u.raw_input {
             f.push(format!("\"rawInput\":{r}"));
+        }
+        if !muse_fields.is_empty() {
+            f.push(format!("\"_meta\":{{\"muse\":{{{muse_fields}}}}}"));
         }
         Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
     }
@@ -754,6 +794,7 @@ impl SessionFold {
                     .get("args")
                     .map(j_to_string)
                     .unwrap_or_else(|| "{}".to_string());
+                let item_fields = Self::item_muse_fields(item);
                 out.push(Self::tool_line(
                     acp_sid,
                     ver,
@@ -765,6 +806,7 @@ impl SessionFold {
                         status: msp_status(status),
                         content_text: None,
                         raw_input: Some(&raw),
+                        muse_fields: item_fields.as_deref(),
                         host_truncated: false,
                     },
                 ));
@@ -864,6 +906,10 @@ impl SessionFold {
             "subagent" | "workflow" | "userShell" => {
                 let (tc_id, announced) = self.host_item_role(&item_id, kind);
                 let (title, content, meta) = Self::host_card_parts(kind, item);
+                let muse_fields = Self::merge_muse_fields(
+                    meta.as_deref(),
+                    Self::item_muse_fields(item).as_deref(),
+                );
                 if !title.is_empty() {
                     out.push(Self::card_line(
                         acp_sid,
@@ -874,7 +920,7 @@ impl SessionFold {
                         "other",
                         msp_status(status),
                         content.as_deref(),
-                        meta.as_deref(),
+                        muse_fields.as_deref(),
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
@@ -894,6 +940,10 @@ impl SessionFold {
             }
             _ => {
                 let (title, content, meta) = Self::host_card_parts(kind, item);
+                let muse_fields = Self::merge_muse_fields(
+                    meta.as_deref(),
+                    Self::item_muse_fields(item).as_deref(),
+                );
                 if !title.is_empty() {
                     let (tc_id, announced) = self.host_item_role(&item_id, "item-");
                     out.push(Self::card_line(
@@ -905,7 +955,7 @@ impl SessionFold {
                         "other",
                         msp_status(status),
                         content.as_deref(),
-                        meta.as_deref(),
+                        muse_fields.as_deref(),
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
@@ -1009,6 +1059,7 @@ impl SessionFold {
                     .unwrap_or("");
                 let content = if text.is_empty() { None } else { Some(text) };
                 let raw = item.get("args").map(j_to_string);
+                let item_fields = Self::item_muse_fields(item);
                 out.push(Self::tool_line(
                     acp_sid,
                     ver,
@@ -1020,6 +1071,7 @@ impl SessionFold {
                         status: msp_status(status),
                         content_text: content,
                         raw_input: raw.as_deref(),
+                        muse_fields: item_fields.as_deref(),
                         host_truncated: item
                             .get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
@@ -1140,6 +1192,10 @@ impl SessionFold {
             "subagent" | "workflow" | "userShell" => {
                 let (tc_id, announced) = self.host_item_role(&item_id, kind);
                 let (title, content, meta) = Self::host_card_parts(kind, item);
+                let muse_fields = Self::merge_muse_fields(
+                    meta.as_deref(),
+                    Self::item_muse_fields(item).as_deref(),
+                );
                 if !title.is_empty() {
                     out.push(Self::card_line(
                         acp_sid,
@@ -1150,7 +1206,7 @@ impl SessionFold {
                         "other",
                         msp_status(status),
                         content.as_deref(),
-                        meta.as_deref(),
+                        muse_fields.as_deref(),
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
@@ -1180,6 +1236,10 @@ impl SessionFold {
                     matches!(self.items.get(&item_id), Some(ItemRole::Tool { .. }));
                 let (tc_id, announced) = self.host_item_role(&item_id, "item-");
                 let (title, content, meta) = Self::host_card_parts(kind, item);
+                let muse_fields = Self::merge_muse_fields(
+                    meta.as_deref(),
+                    Self::item_muse_fields(item).as_deref(),
+                );
                 if !title.is_empty() || announced_card {
                     let card_title = if title.is_empty() {
                         fallback_card_title(kind)
@@ -1195,7 +1255,7 @@ impl SessionFold {
                         "other",
                         msp_status(status),
                         content.as_deref(),
-                        meta.as_deref(),
+                        muse_fields.as_deref(),
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
