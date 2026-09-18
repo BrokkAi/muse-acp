@@ -15,6 +15,8 @@ pub type StdoutShared = Arc<Mutex<std::io::Stdout>>;
 pub struct InFlight {
     pub msp_turn: String,
     pub req_id: J,
+    /// True until the host announces that a queued turn has launched.
+    pub queued: bool,
 }
 
 pub struct PendingPerm {

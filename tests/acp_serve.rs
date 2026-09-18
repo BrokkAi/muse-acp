@@ -1239,6 +1239,80 @@ fn queued_turns_share_running_until_drained() {
 }
 
 #[test]
+fn cancel_request_unqueues_only_the_targeted_queued_prompt() {
+    let mut c = Client::spawn("cancel_request", &[]);
+    let sid = c.new_session(1, "");
+    let first = c.prompt(&sid, "running");
+    let second = c.prompt(&sid, "reclaim me");
+    let third = c.prompt(&sid, "leave me queued");
+
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"$/cancel_request\",\"params\":{{\"requestId\":{second}}}}}"
+    ));
+    c.wait_log("turn/unqueue", Duration::from_secs(15));
+    let reclaimed = c.wait_for(&format!("\"id\":{second}"), Duration::from_secs(15));
+    assert!(
+        reclaimed.contains("\"stopReason\":\"cancelled\""),
+        "queued prompt settles cancelled: {reclaimed}"
+    );
+
+    let before_cleanup = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !before_cleanup.contains(&format!("\"id\":{first}")),
+        "running prompt remains in flight: {before_cleanup}"
+    );
+    assert!(
+        !before_cleanup.contains(&format!("\"id\":{third}")),
+        "other queued prompt remains in flight: {before_cleanup}"
+    );
+    let methods = std::fs::read_to_string(&c.fake_log).expect("fake method log");
+    assert_eq!(
+        methods
+            .lines()
+            .filter(|line| *line == "turn/unqueue")
+            .count(),
+        1,
+        "one reclaim command: {methods}"
+    );
+    assert!(
+        !methods.lines().any(|line| line == "turn/cancel"),
+        "reclaim never falls through to stop: {methods}"
+    );
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input log");
+    assert!(
+        inputs
+            .lines()
+            .any(|line| line.contains("\"turnId\": \"turn-2\"")),
+        "reclaim addresses the second turn: {inputs}"
+    );
+
+    // Clean up the untouched turns, then verify each original ACP request
+    // received exactly one terminal response.
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_for(&format!("\"id\":{first}"), Duration::from_secs(15));
+    c.wait_for(&format!("\"id\":{third}"), Duration::from_secs(15));
+    {
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+        for request_id in [first, second, third] {
+            let needle = format!("\"id\":{request_id},");
+            assert_eq!(
+                frames
+                    .iter()
+                    .filter(|frame| frame.contains(&needle))
+                    .count(),
+                1,
+                "request {request_id} settles exactly once: {frames:?}"
+            );
+        }
+    }
+    c.finish();
+}
+
+#[test]
 fn session_close_cancels_in_flight() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(1, "");
