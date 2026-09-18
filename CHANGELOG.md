@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.5
+
+- Recover draft releases through authenticated listing and read uploaded assets
+  back by release ID when GitHub hides drafts from the tag endpoint.
+
 ## 0.4.4
 
 - Surface actionable Muse authentication failures in ACP sessions.
