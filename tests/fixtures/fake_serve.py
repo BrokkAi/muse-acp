@@ -36,6 +36,11 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
+  rename_live  session/nameChanged updates a connected session
+  rename_resume Session.name changes between start and resume
+  rename_snapshot SnapshotState.name is the only name on resume
+  rename_clear  resume reports a null name and must clear a stale title
+  rename_list   session/list exposes the authoritative session name
 """
 import json
 import os
@@ -125,11 +130,14 @@ CRASH_AFTER_ACK = [False]
 def session_obj(session_id=None, workspace_root="/tmp/fake-ws"):
     if session_id is None:
         session_id = ACTIVE_SESSION[0]
-    return {"sessionId": session_id, "modelId": "fake-model",
+    result = {"sessionId": session_id, "modelId": "fake-model",
             "workspaceRoot": workspace_root,
             "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
             "approvalMode": {"lastCommandId": None, "mode": MODE,
                              "source": "serverDefault"}}
+    if SCENARIO == "rename_list":
+        result["name"] = "Listed name"
+    return result
 
 
 def history_items():
@@ -615,7 +623,14 @@ def result_for(method, msg):
             return {"approvals": [dict(APPROVAL_PARAMS)], "userInputs": []}
         return {"approvals": [], "userInputs": []}
     if method == "session/start":
-        return {"session": session_obj(), "viewCursor": "cur-0"}
+        result = {"session": session_obj(), "viewCursor": "cur-0"}
+        if SCENARIO == "rename_live":
+            result["session"]["name"] = "Before rename"
+        elif SCENARIO == "rename_resume":
+            result["session"]["name"] = "Before resume"
+        elif SCENARIO == "rename_clear":
+            result["session"]["name"] = "Before clear"
+        return result
     if method == "session/resume":
         params = msg.get("params", {})
         log_input(params)
@@ -639,6 +654,9 @@ def result_for(method, msg):
                 "workspaceRoot": "/home/me/src/proj"}
         elif SCENARIO == "usage_snapshot_null":
             history = usage_snapshot_history(context=False)
+        elif SCENARIO == "rename_snapshot":
+            history = usage_snapshot_history()
+            history["snapshot"]["state"]["name"] = "Snapshot name"
         elif SCENARIO in ("usage_inline", "questions_resume") and snapshot_rung:
             history = usage_snapshot_history(cumulative=(300, 60))
         else:
@@ -652,7 +670,12 @@ def result_for(method, msg):
                 history["snapshot"]["state"]["pendingUserInputs"] = [
                     {"userInputId": "ui-1", "itemId": "item-ui-1",
                      "viewCursor": "cur-8"}]
-        return {"session": session_obj(params.get("sessionId", MSP_SID)),
+        session = session_obj(params.get("sessionId", MSP_SID))
+        if SCENARIO == "rename_resume":
+            session["name"] = "Renamed outside adapter"
+        elif SCENARIO == "rename_clear":
+            session["name"] = None
+        return {"session": session,
                 "viewCursor": "cur-9",
                 "pendingRequests": pending,
                 "history": history}
@@ -864,6 +887,13 @@ def main():
                     continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
+                if SCENARIO == "rename_live" and method == "session/start":
+                    notify("session/nameChanged", {
+                        "sessionId": MSP_SID,
+                        "name": "Renamed elsewhere",
+                        "viewCursor": "cur-1",
+                        "sourceRange": {"start": 1, "end": 1},
+                    })
                 if CRASH_AFTER_ACK[0]:
                     sys.stdout.flush()
                     os._exit(0)
