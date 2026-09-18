@@ -36,6 +36,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
+  status_flags   session/statusChanged status, attention, open-enum, and null
+                 viewCursor handling
 """
 import json
 import os
@@ -125,11 +127,15 @@ CRASH_AFTER_ACK = [False]
 def session_obj(session_id=None, workspace_root="/tmp/fake-ws"):
     if session_id is None:
         session_id = ACTIVE_SESSION[0]
-    return {"sessionId": session_id, "modelId": "fake-model",
-            "workspaceRoot": workspace_root,
-            "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
-            "approvalMode": {"lastCommandId": None, "mode": MODE,
-                             "source": "serverDefault"}}
+    session = {"sessionId": session_id, "modelId": "fake-model",
+               "workspaceRoot": workspace_root,
+               "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
+               "approvalMode": {"lastCommandId": None, "mode": MODE,
+                                "source": "serverDefault"}}
+    if SCENARIO == "status_flags":
+        session.update({"status": "running",
+                        "attention": ["approvalPending", "futureAttention"]})
+    return session
 
 
 def history_items():
@@ -210,6 +216,14 @@ def on_turn_start(params):
         notify("item/completed", {**base, "item": {
             "itemId": "it-1", "kind": "agentMessage",
             "status": "completed", "text": "hello from fake host"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "status_flags":
+        notify("session/statusChanged", {
+            "sessionId": MSP_SID, "status": "paused",
+            "attention": ["futureAttention"], "viewCursor": None})
+        notify("session/statusChanged", {
+            "sessionId": MSP_SID, "status": "idle",
+            "viewCursor": "cur-status-2"})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "failed":
         failed_params = {**base, "terminal": "failed"}
@@ -613,6 +627,9 @@ def result_for(method, msg):
         if SCENARIO == "pending_reconcile_dup":
             # The same approval the adapter is already displaying.
             return {"approvals": [dict(APPROVAL_PARAMS)], "userInputs": []}
+        if SCENARIO == "status_flags":
+            return {"approvals": [dict(APPROVAL_PARAMS, approvalId="ap-status")],
+                    "userInputs": [question_params("ui-status")]}
         return {"approvals": [], "userInputs": []}
     if method == "session/start":
         return {"session": session_obj(), "viewCursor": "cur-0"}
@@ -658,6 +675,7 @@ def result_for(method, msg):
                 "history": history}
     if method == "view/page":
         page = msg.get("params", {})
+        log_input(page)
         if SCENARIO == "usage_gap" and page.get("direction") != "backward":
             # Refill overlaps the live stream: cur-3 is in this page too.
             return {"events": [
@@ -747,6 +765,17 @@ def result_for(method, msg):
                 "history": {"mode": "inline", "items": items,
                             "snapshot": None},
                 "viewCursor": "cur-read", "pendingRequests": []}
+    if method == "approval/decide":
+        log_input(msg.get("params", {}))
+        if SCENARIO == "status_flags":
+            notify("session/statusChanged", {
+                "sessionId": MSP_SID, "status": "paused",
+                "attention": ["futureAttention"], "viewCursor": None})
+            notify("view/gap", {"sessionId": MSP_SID})
+            notify("session/statusChanged", {
+                "sessionId": MSP_SID, "status": "idle",
+                "viewCursor": "cur-status-2"})
+        return {"status": "accepted"}
     if method == "session/fork":
         params = msg.get("params", {})
         log_input(params)
