@@ -30,6 +30,9 @@ pub struct HandshakeInfo {
     /// `sessionDurability` from the handshake. Absent means durable (the
     /// schema's compatibility rule); unknown values are treated as ephemeral.
     pub durability: Option<String>,
+    /// Whether this connection was granted the opt-in live session listing
+    /// stream. An absent grant deliberately means the legacy poll fallback.
+    pub session_list_stream: bool,
 }
 
 impl HandshakeInfo {
@@ -293,7 +296,7 @@ impl MspHost {
         std::thread::spawn(move || reader_loop(reader_host, stdout, tx));
         // Handshake.
         let init_params = format!(
-            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}}}}"#,
+            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"requestedCapabilities":["sessionListStream"]}}}}"#,
             ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
         );
         let res = host
@@ -323,6 +326,10 @@ impl MspHost {
             .get("sessionDurability")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        let session_list_stream = matches!(
+            res.get("grantedCapabilities"),
+            Some(J::Arr(caps)) if caps.iter().any(|cap| cap.as_str() == Some("sessionListStream"))
+        );
         *host.handshake.lock().unwrap_or_else(|p| p.into_inner()) = HandshakeInfo {
             server_name,
             server_version,
@@ -331,6 +338,7 @@ impl MspHost {
             status: verdict.status.as_str(),
             detail: verdict.detail,
             durability,
+            session_list_stream,
         };
         if verdict.is_fatal() {
             return Err(format!(
@@ -691,6 +699,7 @@ mod durability_tests {
             status: "tested",
             detail: "",
             durability: durability.map(str::to_string),
+            session_list_stream: false,
         }
     }
 

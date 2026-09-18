@@ -361,6 +361,12 @@ muse-acp uninstall
   (`authMethods: []` is the honest answer); muse credentials live outside ACP.
 - `session/list` reports durable Muse sessions, including sessions created
   outside the current adapter process, so Zed can import and restore them.
+- When Muse grants `sessionListStream`, `session/started`,
+  `session/listChanged`, and `session/closed` keep the adapter's list rows
+  current. A changed title for an active ACP session is pushed through
+  `session_info_update`; ACP has no list-membership push, so clients still
+  re-ask `session/list` for births and unloads. Hosts that do not grant the
+  capability retain the polling behavior.
 - Authority for MSP shapes is the schema the host ships
   (`muse schema generate-json-schema`); the docs site may describe a newer
   host — a fingerprint mismatch is logged, not fatal.

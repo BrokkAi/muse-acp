@@ -184,6 +184,23 @@ impl Client {
         }
     }
 
+    /// Wait until the fake host captured a request frame containing `want`.
+    fn wait_frame_contains(&self, want: &str, timeout: Duration) {
+        let path = format!("{}.frames", self.fake_log);
+        let start = Instant::now();
+        loop {
+            if let Ok(t) = std::fs::read_to_string(&path)
+                && t.contains(want)
+            {
+                return;
+            }
+            if start.elapsed() > timeout {
+                panic!("fake host never captured frame containing {want:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Wait until the adapter logged a line containing `want`.
     fn wait_stderr(&self, want: &str, timeout: Duration) {
         let start = Instant::now();
@@ -1339,6 +1356,78 @@ fn session_ids_survive_adapter_restart_and_import() {
     let loaded = c.wait_for(&format!("\"id\":{load_id}"), Duration::from_secs(15));
     assert!(loaded.contains("\"result\""), "load failed: {loaded}");
     c.wait_input("\"sessionId\": \"msp-sess-old\"", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn session_list_stream_updates_titles_filters_rows_and_unloads_sessions() {
+    let mut c = Client::spawn("session_list_stream", &[]);
+    let sid = c.new_session(1, "");
+    c.wait_frame_contains("sessionListStream", Duration::from_secs(15));
+
+    let pushed = c.wait_for("Renamed elsewhere", Duration::from_secs(15));
+    assert!(pushed.contains("session_info_update"), "{pushed}");
+    assert!(
+        pushed.contains("\"title\":\"Renamed elsewhere\""),
+        "{pushed}"
+    );
+
+    let filtered_id = c.req("session/list", "{\"cwd\":\"/tmp/unrelated-ws\"}");
+    let filtered = c.wait_for(&format!("\"id\":{filtered_id}"), Duration::from_secs(15));
+    assert!(filtered.contains("\"sessions\":[]"), "{filtered}");
+    assert!(
+        !filtered.contains(&sid),
+        "unrelated streamed row leaked: {filtered}"
+    );
+    c.wait_log("session/closed-sent", Duration::from_secs(15));
+
+    let listed_id = c.req("session/list", "{}");
+    let listed = c.wait_for(&format!("\"id\":{listed_id}"), Duration::from_secs(15));
+    assert!(
+        !listed.contains(&sid),
+        "closed streamed row was resurrected: {listed}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_list_forwards_and_returns_pagination_cursor() {
+    let mut c = Client::spawn("session_list_pagination", &[]);
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+
+    let first_id = c.req("session/list", "{}");
+    let first = c.wait_for(&format!("\"id\":{first_id}"), Duration::from_secs(15));
+    assert!(first.contains("\"sessionId\":\"stored-200\""), "{first}");
+    assert!(!first.contains("\"sessionId\":\"stored-201\""), "{first}");
+    assert!(first.contains("\"nextCursor\":\"page-2\""), "{first}");
+
+    let second_id = c.req("session/list", "{\"cursor\":\"page-2\"}");
+    let second = c.wait_for(&format!("\"id\":{second_id}"), Duration::from_secs(15));
+    assert!(second.contains("\"sessionId\":\"stored-201\""), "{second}");
+    assert!(!second.contains("\"sessionId\":\"stored-1\""), "{second}");
+    assert!(second.contains("\"nextCursor\":null"), "{second}");
+    c.finish();
+}
+
+#[test]
+fn session_list_stream_notifications_are_ignored_without_a_grant() {
+    let mut c = Client::spawn("session_list_stream_denied", &[]);
+    let sid = c.new_session(1, "");
+    c.wait_frame_contains("sessionListStream", Duration::from_secs(15));
+    c.wait_log("session/listChanged-sent", Duration::from_secs(15));
+
+    let list_id = c.req("session/list", "{}");
+    let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
+    assert!(
+        listed.contains(&sid),
+        "fallback listing lost the live row: {listed}"
+    );
+    assert!(
+        !listed.contains("Should be ignored"),
+        "ungranted stream was consumed: {listed}"
+    );
     c.finish();
 }
 
