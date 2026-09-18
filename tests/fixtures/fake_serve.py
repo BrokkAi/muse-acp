@@ -13,6 +13,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   approval     approval/requested notification (two choices), then completed
   approval_req approval/request server-initiated REQUEST (no notification)
   questions    userInput/requested with options, then completed
+  questions_multiple userInput/requested with multiple-selection options
   questions_resume reissue a pending question after both attach and usage backfill
   queued       1st turn/start: silence; 2nd: completed(TURN_1), completed(TURN_2)
   unqueued     turn/unqueued for the turn (never runs)
@@ -192,13 +193,15 @@ TODO_ITEMS = [
 
 
 def question_params(user_input_id="ui-1"):
+    selection = {"mode": "multiple", "minSelections": 1, "maxSelections": 2} \
+        if SCENARIO == "questions_multiple" else {"mode": "single"}
     return {"sessionId": MSP_SID, "userInputId": user_input_id,
             "turnId": "turn-question", "itemId": f"item-{user_input_id}",
             "toolCallId": f"call-{user_input_id}", "toolName": "request_user_input",
             "viewCursor": "cur-8",
             "questions": [{
                 "id": "q0", "header": "Pick", "question": "Which?",
-                "selection": {"mode": "single"},
+                "selection": selection,
                 "options": [{"label": "Alpha"}, {"label": "Beta"}],
             }]}
 
@@ -252,7 +255,7 @@ def on_turn_start(params):
         send({"jsonrpc": "2.0", "id": 9100, "method": "approval/request",
               "params": dict(APPROVAL_PARAMS)})
         notify("turn/completed", {**base, "terminal": "completed"})
-    elif SCENARIO in ("questions", "questions_resume"):
+    elif SCENARIO in ("questions", "questions_multiple", "questions_resume"):
         qid = "ui-2" if SCENARIO == "questions_resume" else "ui-1"
         notify("userInput/requested", question_params(qid))
         if SCENARIO == "questions_resume":
