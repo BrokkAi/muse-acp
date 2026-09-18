@@ -1042,6 +1042,7 @@ impl SessionFold {
                     }
                     if let Some(state) = Self::async_task_state(item) {
                         out.push(Self::async_task_state_line(acp_sid, &tc_id, state));
+                        self.announced_tasks.remove(&tc_id);
                     }
                 }
                 self.items.remove(&item_id);
@@ -1167,6 +1168,7 @@ impl SessionFold {
                     }
                     if let Some(state) = Self::async_task_state(item) {
                         out.push(Self::async_task_state_line(acp_sid, &tc_id, state));
+                        self.announced_tasks.remove(&tc_id);
                     }
                 }
                 self.items.remove(&item_id);
