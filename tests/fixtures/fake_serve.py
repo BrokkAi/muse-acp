@@ -15,6 +15,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   questions    userInput/requested with options, then completed
   questions_resume reissue a pending question after both attach and usage backfill
   queued       1st turn/start: silence; 2nd: completed(TURN_1), completed(TURN_2)
+  cancel_request 1st turn runs; later turns queue until one is reclaimed
   unqueued     turn/unqueued for the turn (never runs)
   retracted    turn/retracted for the turn (no completion follows)
   retract_then_completed retract, then a late turn/completed (settle once)
@@ -441,6 +442,11 @@ def on_turn_start(params):
             notify("turn/completed", {"sessionId": MSP_SID,
                                      "turnId": "turn-2",
                                      "terminal": "completed"})
+    elif SCENARIO == "cancel_request":
+        # Leave the running turn and all queued turns open. The test drives
+        # the targeted reclaim, then uses session/cancel to clean up the
+        # remaining turns and prove they were left alone.
+        pass
     elif SCENARIO == "unqueued":
         notify("turn/unqueued", dict(base))
     elif SCENARIO == "retracted":
@@ -586,7 +592,11 @@ def on_turn_start(params):
         # contextUsage: only the restored window makes this leg sendable.
         notify("session/tokenUsage", token_usage("cur-10", 100, 20, 200, 40))
         notify("turn/completed", {**base, "terminal": "completed"})
-    disposition = "queued" if SCENARIO == "queued" and TURNS[0] > 1 else "started"
+    disposition = (
+        "queued"
+        if SCENARIO in ("queued", "cancel_request") and TURNS[0] > 1
+        else "started"
+    )
     return {
         "commandId": params.get("commandId", ""),
         "status": "accepted",
@@ -716,6 +726,20 @@ def result_for(method, msg):
         params = msg.get("params", {})
         log_input(params)
         return on_turn_start(params)
+    if method == "turn/unqueue":
+        params = msg.get("params", {})
+        log_input(params)
+        if SCENARIO == "cancel_request":
+            notify("turn/unqueued", {
+                "sessionId": MSP_SID,
+                "turnId": params.get("turnId", ""),
+                "commandId": params.get("turnId", ""),
+            })
+        return {
+            "commandId": params.get("commandId", ""),
+            "status": "accepted",
+            "turnId": params.get("turnId", ""),
+        }
     if method == "session/read":
         read_params = msg.get("params", {})
         log_input(read_params)
