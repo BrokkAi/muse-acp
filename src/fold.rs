@@ -1003,9 +1003,12 @@ impl SessionFold {
                 let (title, tool) = Self::tool_title(item);
                 let text = item
                     .get("visibleOutput")
-                    .or_else(|| item.get("result"))
-                    .or_else(|| item.get("failureReason"))
                     .and_then(|v| v.as_str())
+                    .filter(|text| !text.is_empty())
+                    .or_else(|| item.get("result").and_then(|v| v.as_str()))
+                    .filter(|text| !text.is_empty())
+                    .or_else(|| item.get("failureReason").and_then(|v| v.as_str()))
+                    .filter(|text| !text.is_empty())
                     .unwrap_or("");
                 let content = if text.is_empty() { None } else { Some(text) };
                 let raw = item.get("args").map(j_to_string);
@@ -1361,6 +1364,33 @@ mod corpus_tests {
             "host display text stays authoritative: {}",
             out[0]
         );
+    }
+
+    #[test]
+    fn empty_visible_output_falls_back_to_failure_reason() {
+        let completed = parse_json(
+            r#"{"item":{"itemId":"it-fail","kind":"toolCall","status":"failed","tool":"read_file","callId":"call-1","args":{},"visibleOutput":"","failureReason":"file does not exist"}}"#,
+        )
+        .unwrap();
+
+        for version in [1, 2] {
+            let mut fold = SessionFold::new();
+            let mut out = Vec::new();
+            fold.on_item_completed("sid", version, &completed, &mut out);
+
+            assert_eq!(
+                out.len(),
+                1,
+                "v{version} emitted unexpected frames: {out:?}"
+            );
+            assert!(
+                out[0].contains("\"status\":\"failed\"")
+                    && out[0].contains("\"content\"")
+                    && out[0].contains("file does not exist"),
+                "v{version} preserved the failure explanation: {}",
+                out[0]
+            );
+        }
     }
 
     #[test]
