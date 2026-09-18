@@ -214,8 +214,9 @@ def evidence(kind):
     runs = json.loads(gh('run', 'list', '--repo', 'github.com/' + REPO, '--commit', SHA, '--limit', '100',
                         '--json', 'databaseId,workflowName,headSha,headBranch,event,status,conclusion'))
     for workflow in ['ci', 'release']:
-        candidates = [r for r in runs if r['workflowName'] == workflow and r['headSha'] == SHA and r['event'] == 'push' and not r['headBranch'].startswith('v')]
-        require(candidates, 'Missing exact-commit ' + workflow + ' push run')
+        event = 'workflow_dispatch' if kind == 'authorization' and workflow == 'release' else 'push'
+        candidates = [r for r in runs if r['workflowName'] == workflow and r['headSha'] == SHA and r['event'] == event and not r['headBranch'].startswith('v')]
+        require(candidates, 'Missing exact-commit ' + workflow + ' ' + event + ' run')
         run = max(candidates, key=lambda r: r['databaseId'])
         require(run['status'] == 'completed' and run['conclusion'] == 'success', 'Latest ' + workflow + ' run did not succeed')
         detail = json.loads(gh('run', 'view', str(run['databaseId']), '--repo', 'github.com/' + REPO, '--json', 'headSha,jobs,conclusion'))
@@ -238,6 +239,8 @@ def evidence(kind):
                 Path(d, 'install.sh').write_bytes(source_bytes('install.sh'))
                 staged = Path(d)
                 validate(staged)
+                if kind == 'publication-inputs':
+                    require(validate(staged) == validate(Path('dist')), 'Tag build payload differs from successful preflight; refusing uploads')
                 if kind in ['version', 'published']:
                     release = release_state()
                     if kind == 'published':
@@ -288,6 +291,11 @@ if __name__ == '__main__':
         elif mode == 'staged':
             metadata()
             validate(Path('dist'))
+            if os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch' or (
+                os.environ.get('GITHUB_EVENT_NAME') == 'push'
+                and os.environ.get('GITHUB_REF', '').startswith('refs/tags/')
+            ):
+                evidence('publication-inputs')
             release = release_state()
             if release:
                 compare_remote(release, Path('dist'), not release['draft'])
