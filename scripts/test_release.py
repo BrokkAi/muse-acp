@@ -78,6 +78,18 @@ class ArchiveValidation(unittest.TestCase):
             second = release.inspect_archive(self.directory, target)
         self.assertNotEqual(first, second)
 
+    def test_resume_archive_without_checksum_preserves_uploaded_compression(self):
+        target = release.TARGETS[0]
+        self.build(target)
+        name = release.archive_name(target)
+        raw = bytearray((self.directory / name).read_bytes())
+        raw[4:8] = (123456789).to_bytes(4, 'little')  # Different gzip timestamp.
+        remote = {'assets': [{'name': name, 'id': 42}]}
+        with patch.object(release, 'gh', return_value=bytes(raw)):
+            release.compare_remote(remote, self.directory, False, resume=True)
+        self.assertEqual((self.directory / name).read_bytes(), raw)
+        release.inspect_archive(self.directory, target)
+
     def test_authorization_rejects_local_identity(self):
         with patch.dict(release.os.environ, {'GITHUB_ACTIONS': 'false'}):
             with self.assertRaisesRegex(RuntimeError, 'actual Actions'):
