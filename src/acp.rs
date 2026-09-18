@@ -26,6 +26,7 @@ pub struct PendingPerm {
     pub choices: Vec<(String, String)>,
 }
 
+#[derive(Clone)]
 pub struct UiQuestion {
     pub qid: String,
     /// Original host labels (for answers).
@@ -34,11 +35,24 @@ pub struct UiQuestion {
     pub display: Vec<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UiStage {
+    Route,
+    Answers,
+    Clarification,
+}
+
+#[derive(Clone)]
 pub struct PendingUi {
     /// ACP `elicitation/create` request id awaiting the client reply.
     pub req_id: J,
     pub user_input_id: String,
     pub questions: Vec<UiQuestion>,
+    pub stage: UiStage,
+    /// The form shown after choosing structured answers.
+    pub answer_schema: String,
+    pub answer_message: String,
+    pub tool_call_id: String,
 }
 
 pub struct AcpSession {
