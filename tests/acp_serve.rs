@@ -694,6 +694,20 @@ fn load_and_resume_restore_usage_from_the_history_snapshot() {
             attached.contains("\"result\""),
             "{method} failed: {attached}"
         );
+        let replay = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n");
+        assert!(
+            replay.contains("snapshot question") && replay.contains("snapshot answer"),
+            "v{ver} transcript items from the snapshot were replayed: {replay}"
+        );
+        let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+        assert!(
+            !stderr.contains("unrecognized history shape"),
+            "v{ver} snapshot history was recognized: {stderr}"
+        );
         let restored = c.wait_for("usage_update", Duration::from_secs(15));
         assert!(
             restored.contains("\"used\":120") && restored.contains("\"size\":200000"),

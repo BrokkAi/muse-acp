@@ -169,7 +169,14 @@ def usage_snapshot_history(context=True, cumulative=(100, 20)):
     return {"mode": "anchoredSnapshot", "items": None, "snapshot": {
         "schemaVersion": 1, "viewCursor": "cur-9",
         "anchor": {"boundaryCursor": "cur-8", "summarizedThrough": "anchor-8"},
-        "state": {"items": [], "activeTurn": None, "queuedTurns": [],
+        "state": {"items": [
+                    {"itemId": "history-u", "kind": "userMessage",
+                     "revision": 1, "status": "completed",
+                     "text": "snapshot question"},
+                    {"itemId": "history-a", "kind": "agentMessage",
+                     "revision": 1, "status": "completed",
+                     "text": "snapshot answer"},
+                ], "activeTurn": None, "queuedTurns": [],
                   "pendingApprovals": [], "pendingUserInputs": [],
                   "approvalMode": session_obj()["approvalMode"],
                   "effectiveModel": None, "branch": None, "goal": None,

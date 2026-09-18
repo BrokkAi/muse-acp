@@ -2772,14 +2772,28 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
 /// History replay for `session/load` (always) and v2 `session/resume` with
 /// `replayFrom`. Messages replay as message updates/chunks; tool calls replay
 /// as completed tool updates (history carries args but no output text).
-/// Unknown shapes resume without replay (logged), never fail.
+/// Inline items are preferred; snapshot-backed histories keep them under
+/// `history.snapshot.state.items`. Unknown shapes resume without replay
+/// (logged), never fail.
+fn replay_items(resume_res: &J) -> Option<Vec<J>> {
+    let history = resume_res.get("history")?;
+    match history.get("items") {
+        Some(J::Arr(items)) => Some(items.clone()),
+        _ => history
+            .get("snapshot")
+            .and_then(|snapshot| snapshot.get("state"))
+            .and_then(|state| state.get("items"))
+            .and_then(|items| match items {
+                J::Arr(items) => Some(items.clone()),
+                _ => None,
+            }),
+    }
+}
+
 fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) {
-    let items = match resume_res.get("history").and_then(|h| h.get("items")) {
-        Some(J::Arr(v)) => v.clone(),
-        _ => {
-            log("resume: unrecognized history shape; resumed without replay");
-            return;
-        }
+    let Some(items) = replay_items(resume_res) else {
+        log("resume: unrecognized history shape; resumed without replay");
+        return;
     };
     let mut out = Vec::new();
     for it in &items {
