@@ -152,9 +152,26 @@ def tag_check():
         require(obj['type'] == 'commit' and obj['sha'] == SHA, 'Existing tag points at another commit')
 
 
+def find_release(tag):
+    release = optional('releases/tags/' + tag)
+    if release is not None:
+        return release
+    # GitHub's tag endpoint can hide drafts; the authenticated list includes them.
+    matches = []
+    page = 1
+    while True:
+        releases = api(f'releases?per_page=100&page={page}')
+        matches.extend(r for r in releases if r['tag_name'] == tag)
+        if len(releases) < 100:
+            break
+        page += 1
+    require(len(matches) <= 1, 'Multiple releases use the proposed tag')
+    return api('releases/' + str(matches[0]['id'])) if matches else None
+
+
 def release_state():
     tag_check()
-    release = optional('releases/tags/' + TAG)
+    release = find_release(TAG)
     if release:
         if not release['draft']:
             require(optional('git/ref/tags/' + TAG) is not None, 'Published release is missing its tag')
@@ -200,7 +217,7 @@ def authorization():
     # Drafts do not create refs; assert that invariant before and after deletion.
     probe = f'preflight-{os.environ["GITHUB_RUN_ID"]}-{os.environ["GITHUB_RUN_ATTEMPT"]}'
     require(optional('git/ref/tags/' + probe) is None, 'Probe tag already exists')
-    existing = optional('releases/tags/' + probe)
+    existing = find_release(probe)
     if existing:
         require(existing['draft'] and existing['target_commitish'] == SHA, 'Probe conflict')
         api('releases/' + str(existing['id']), 'DELETE')
@@ -271,13 +288,13 @@ def publish(staged):
     # Never clobber. Existing archive/checksum pairs are verified as unpacked content.
     for name in sorted(expected_names() - existing):
         gh('release', 'upload', TAG, str(staged / name), '--repo', 'github.com/' + REPO)
-        uploaded = optional('releases/tags/' + TAG)
+        uploaded = api('releases/' + str(release['id']))
         asset = next(a for a in uploaded['assets'] if a['name'] == name)
         raw = gh('api', '--hostname', 'github.com', '-H', 'Accept: application/octet-stream', f'repos/{REPO}/releases/assets/{asset["id"]}')
         require(raw == (staged / name).read_bytes(), 'Upload integrity mismatch')
-    compare_remote(optional('releases/tags/' + TAG), staged, True)
+    compare_remote(api('releases/' + str(release['id'])), staged, True)
     api('releases/' + str(release['id']), 'PATCH', {'draft': False, 'make_latest': 'true'})
-    compare_remote(optional('releases/tags/' + TAG), staged, True)
+    compare_remote(api('releases/' + str(release['id'])), staged, True)
 
 
 if __name__ == '__main__':

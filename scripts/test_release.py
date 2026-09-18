@@ -79,5 +79,41 @@ class ArchiveValidation(unittest.TestCase):
                 release.authorization()
 
 
+class DraftRecovery(unittest.TestCase):
+    def test_hidden_draft_found_on_later_page_and_read_by_id(self):
+        draft = {'id': 42, 'tag_name': release.TAG, 'draft': True}
+        first = [{'id': i, 'tag_name': f'other-{i}'} for i in range(100)]
+        with patch.object(release, 'optional', return_value=None), patch.object(
+            release, 'api', side_effect=[first, [draft], draft]
+        ) as api:
+            self.assertEqual(release.find_release(release.TAG), draft)
+        self.assertEqual(api.call_args_list[-1].args, ('releases/42',))
+
+    def test_duplicate_drafts_fail_closed(self):
+        draft = {'id': 42, 'tag_name': release.TAG}
+        with patch.object(release, 'optional', return_value=None), patch.object(
+            release, 'api', return_value=[draft, draft]
+        ):
+            with self.assertRaisesRegex(RuntimeError, 'Multiple releases'):
+                release.find_release(release.TAG)
+
+    def test_upload_readback_and_completion_use_release_id(self):
+        draft = {'id': 42, 'draft': True, 'assets': []}
+        uploaded = dict(draft, assets=[{'name': 'install.sh', 'id': 99}])
+        with tempfile.TemporaryDirectory() as temp:
+            staged = Path(temp)
+            (staged / 'install.sh').write_bytes(b'installer')
+            with patch.dict(release.os.environ, {'GITHUB_REF': 'refs/tags/' + release.TAG}), \
+                 patch.object(release, 'metadata'), patch.object(release, 'validate'), \
+                 patch.object(release, 'release_state', return_value=draft), \
+                 patch.object(release, 'authorization'), patch.object(release, 'compare_remote') as compare, \
+                 patch.object(release, 'expected_names', return_value={'install.sh'}), \
+                 patch.object(release, 'gh', return_value=b'installer'), \
+                 patch.object(release, 'api', return_value=uploaded) as api:
+                release.publish(staged)
+            self.assertEqual([c.args[0] for c in api.call_args_list], ['releases/42'] * 4)
+            self.assertEqual(compare.call_count, 3)
+
+
 if __name__ == '__main__':
     unittest.main()
