@@ -1343,6 +1343,63 @@ fn session_ids_survive_adapter_restart_and_import() {
 }
 
 #[test]
+fn host_session_metadata_populates_rows_and_live_title_updates() {
+    let mut c = Client::spawn("session_metadata", &[]);
+    let sid = c.new_session(1, "");
+    let started = c.wait_for(
+        "\"sessionUpdate\":\"session_info_update\",\"title\":\"Host session name\"",
+        Duration::from_secs(15),
+    );
+    assert!(
+        started.contains(&sid),
+        "title update targets the session: {started}"
+    );
+
+    let list_id = c.req("session/list", "{}");
+    let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
+    assert!(
+        listed.contains("\"sessionId\":\"msp-sess-1\"")
+            && listed.contains("\"title\":\"Host session name\""),
+        "adapter-owned row keeps host title: {listed}"
+    );
+    assert!(
+        listed.contains("\"title\":\"Host title fallback\""),
+        "title is used when no name was provided: {listed}"
+    );
+    assert!(
+        listed.contains("\"title\":\"Host first prompt fallback\""),
+        "host firstUserPrompt is the final fallback: {listed}"
+    );
+    assert!(
+        listed.contains("\"sessionId\":\"msp-sess-bare\",\"cwd\":\"/tmp/bare-ws\"}"),
+        "rows without host metadata stay untitled: {listed}"
+    );
+    assert!(
+        listed.contains("\"muse\":{\"branch\":{\"branch\":\"feat/metadata\""),
+        "branch metadata is preserved on the row: {listed}"
+    );
+    assert!(
+        listed.contains("\"attention\":\"needs-review\""),
+        "attention metadata is preserved on the row: {listed}"
+    );
+
+    let _pid = c.prompt(&sid, "transcript text must not become a title");
+    let renamed = c.wait_for(
+        "\"sessionUpdate\":\"session_info_update\",\"title\":\"Renamed by host\"",
+        Duration::from_secs(15),
+    );
+    assert!(
+        renamed.contains(&sid),
+        "rename targets the session: {renamed}"
+    );
+    assert!(
+        !renamed.contains("transcript text"),
+        "title update mined no transcript"
+    );
+    c.finish();
+}
+
+#[test]
 fn new_session_returns_the_durable_host_id() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(1, "");

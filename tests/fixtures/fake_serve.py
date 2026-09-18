@@ -36,6 +36,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
+  session_metadata host-authored title candidates, branch/attention metadata,
+                   and a live session/nameChanged notification
 """
 import json
 import os
@@ -125,11 +127,29 @@ CRASH_AFTER_ACK = [False]
 def session_obj(session_id=None, workspace_root="/tmp/fake-ws"):
     if session_id is None:
         session_id = ACTIVE_SESSION[0]
-    return {"sessionId": session_id, "modelId": "fake-model",
-            "workspaceRoot": workspace_root,
-            "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
-            "approvalMode": {"lastCommandId": None, "mode": MODE,
-                             "source": "serverDefault"}}
+    session = {"sessionId": session_id, "modelId": "fake-model",
+               "workspaceRoot": workspace_root,
+               "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
+               "approvalMode": {"lastCommandId": None, "mode": MODE,
+                                "source": "serverDefault"}}
+    if SCENARIO == "session_metadata":
+        if session_id == MSP_SID:
+            session.update({
+                "name": "Host session name",
+                "title": "Host session title",
+                "firstUserPrompt": "Host first prompt",
+                "branch": {"branch": "feat/metadata", "vcs": "git",
+                            "workspaceRoot": workspace_root},
+                "attention": "needs-review",
+            })
+        elif session_id == "msp-sess-old":
+            session.update({
+                "title": "Host title fallback",
+                "firstUserPrompt": "Host old first prompt",
+            })
+        elif session_id == "msp-sess-untitled":
+            session["firstUserPrompt"] = "Host first prompt fallback"
+    return session
 
 
 def history_items():
@@ -210,6 +230,11 @@ def on_turn_start(params):
         notify("item/completed", {**base, "item": {
             "itemId": "it-1", "kind": "agentMessage",
             "status": "completed", "text": "hello from fake host"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "session_metadata":
+        notify("session/nameChanged", {
+            "sessionId": ACTIVE_SESSION[0], "name": "Renamed by host",
+        })
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "failed":
         failed_params = {**base, "terminal": "failed"}
@@ -680,9 +705,11 @@ def result_for(method, msg):
     if method == "session/list":
         live = session_obj()
         old = session_obj("msp-sess-old", "/tmp/old-ws")
+        untitled = session_obj("msp-sess-untitled", "/tmp/untitled-ws")
+        bare = session_obj("msp-sess-bare", "/tmp/bare-ws")
         old["updatedAt"] = "2026-08-01T00:00:00Z"
         live["updatedAt"] = "2026-09-04T00:00:00Z"
-        return {"sessions": [live, old], "nextCursor": None}
+        return {"sessions": [live, old, untitled, bare], "nextCursor": None}
     if method == "session/setApprovalMode":
         # The real host applies the selected mode and echoes it back.
         mode = FOLDED_MODE or msg.get("params", {}).get("mode", MODE)
