@@ -1666,6 +1666,24 @@ fn leading_space_escapes_a_slash_command() {
 }
 
 #[test]
+fn leading_space_escapes_compact_command() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, " /compact");
+    c.wait_input("\"text\": \" /compact\"", Duration::from_secs(15));
+    let methods = std::fs::read_to_string(&c.fake_log).expect("fake log");
+    assert!(
+        methods.lines().any(|line| line == "turn/start"),
+        "escaped compact text must start a turn: {methods}"
+    );
+    assert!(
+        !methods.lines().any(|line| line == "session/compact"),
+        "escaped compact text must not compact the session: {methods}"
+    );
+    c.finish();
+}
+
+#[test]
 fn reasoning_effort_is_selected_and_sent_to_msp() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
