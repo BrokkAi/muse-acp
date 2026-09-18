@@ -156,9 +156,11 @@ pub fn describe_spawn_error(bin: &str, e: &std::io::Error) -> String {
     }
 }
 
-/// MSP v1 has no auth method or stable auth error kind. Match explicit login
-/// diagnostics only; a bare 401/403 or permission denial may belong to a tool.
-/// Never echo raw authentication errors: they can contain credentials.
+/// The stable MSP v1 bundle has no auth method or stable auth error kind. The
+/// account surface is experimental and this adapter does not opt into it, so
+/// match explicit login diagnostics only; a bare 401/403 or permission denial
+/// may belong to a tool. Never echo raw authentication errors: they can contain
+/// credentials.
 pub fn auth_failure(message: &str) -> Option<&'static str> {
     let lower = message.to_ascii_lowercase();
     if [

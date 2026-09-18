@@ -241,12 +241,15 @@ These items improve day-to-day reliability for existing users.
 Current setup assumes `muse` is installed and authenticated. Make failures
 obvious before the first prompt.
 
-Status: **host-readiness implemented.** Spawn failures distinguish a missing
-CLI (install/PATH/`MUSE_CLI` guidance) from a non-executable one, and
-`--selftest` reports `cli-ready`/`cli-unready` with the binary and version
-without gating the exit status, so support bundles can be collected from
-machines without Muse. Remaining work: an auth probe if MSP ever exposes one,
-and browserless-login guidance.
+Status: **host-readiness and auth diagnostics implemented.** Spawn failures
+distinguish a missing CLI (install/PATH/`MUSE_CLI` guidance) from a
+non-executable one, `--selftest` reports `cli-ready`/`cli-unready` with the
+binary and version without gating the exit status, and explicit host login or
+expiry failures map to actionable ACP diagnostics. Muse 1.3.0 now exposes an
+experimental `account/*` surface, but the adapter deliberately keeps it
+deferred: `experimentalApi` is opt-in, the pinned stable bundle does not
+contain those methods, and the adapter has no credential-handling path.
+Browserless-login guidance remains documented below.
 
 **Work items**
 
@@ -254,8 +257,10 @@ and browserless-login guidance.
   unsupported host version, and host startup failure.
 - Include the executable path and host version where available.
 - Provide the next user action for each failure.
-- Consider advertising a safe ACP auth flow if/when Muse exposes an
-  authentication method compatible with ACP.
+- Revisit ACP authentication only with an explicit `experimentalApi` posture
+  decision. If adopted, expose the device-code branch of `account/loginStart`
+  only; keep the secret-bearing `apiKey` branch out of scope and use
+  `account/read`/`account/changed` to improve readiness diagnostics.
 - Add browserless/remote-environment guidance.
 
 **Acceptance criteria**

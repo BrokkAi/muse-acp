@@ -2746,8 +2746,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             }
         }
         "authenticate" | "auth/login" | "auth/logout" | "logout" => {
-            // The host exposes no auth surface (authMethods is []); there is
-            // nothing to log in to. muse credentials live outside ACP.
+            // The experimental account/* surface is not opted into
+            // (authMethods is []); Muse credentials live outside ACP.
             acp::send_error(
                 stdout,
                 &id,
