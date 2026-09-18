@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 import tomllib
 import zipfile
 
@@ -225,7 +226,13 @@ def authorization():
     try:
         require(release['draft'], 'Probe must stay a draft')
         api('releases/' + str(release['id']), 'PATCH', {'body': 'Disposable non-publishing permissions check.'})
-        discovered = find_release(probe)
+        # Draft listings can lag a successful create/update. Never retry mutations.
+        for attempt in range(7):
+            discovered = find_release(probe)
+            if discovered is not None:
+                break
+            if attempt < 6:
+                time.sleep(5)
         require(discovered and discovered['id'] == release['id'] and discovered['draft'], 'Draft discovery failed')
         readback = api('releases/' + str(release['id']))
         require(readback['body'] == 'Disposable non-publishing permissions check.' and readback['draft'], 'Draft readback failed')
