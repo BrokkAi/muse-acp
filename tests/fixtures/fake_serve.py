@@ -12,6 +12,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   tool         toolCall completion with result text, then completed
   approval     approval/requested notification (two choices), then completed
   approval_req approval/request server-initiated REQUEST (no notification)
+  approval_hang stays pending after the approval so client decisions can be tested
   questions    userInput/requested with options, then completed
   questions_resume reissue a pending question after both attach and usage backfill
   queued       1st turn/start: silence; 2nd: completed(TURN_1), completed(TURN_2)
@@ -87,6 +88,10 @@ if os.environ.get("FAKE_APPROVAL", "") == "all-approve":
     ]
 if os.environ.get("FAKE_APPROVAL_CHOICES", "") == "empty":
     APPROVAL_PARAMS["availableChoices"] = []
+if os.environ.get("FAKE_APPROVAL_FEEDBACK", "") == "deny":
+    for choice in APPROVAL_PARAMS["availableChoices"]:
+        if choice.get("decision") == "denied":
+            choice["acceptsFeedback"] = True
 
 
 def log_method(method):
@@ -774,6 +779,9 @@ def result_for(method, msg):
         return {"commandId": msg["params"].get("commandId", ""),
                 "status": "accepted"}
     if method == "userInput/answer":
+        log_input(msg.get("params", {}))
+        return {}
+    if method == "approval/decide":
         log_input(msg.get("params", {}))
         return {}
     if method == "turn/steer":
