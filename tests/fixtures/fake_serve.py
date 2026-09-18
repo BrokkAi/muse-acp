@@ -36,6 +36,9 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
+  session_list_stream grants sessionListStream and emits row replace/close events
+  session_list_stream_denied sends the notification without granting the capability
+  session_list_pagination returns a second page when its cursor is forwarded
 """
 import json
 import os
@@ -125,11 +128,14 @@ CRASH_AFTER_ACK = [False]
 def session_obj(session_id=None, workspace_root="/tmp/fake-ws"):
     if session_id is None:
         session_id = ACTIVE_SESSION[0]
-    return {"sessionId": session_id, "modelId": "fake-model",
+    row = {"sessionId": session_id, "modelId": "fake-model",
             "workspaceRoot": workspace_root,
             "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
             "approvalMode": {"lastCommandId": None, "mode": MODE,
                              "source": "serverDefault"}}
+    if SCENARIO == "session_list_stream":
+        row["title"] = "Initial title"
+    return row
 
 
 def history_items():
@@ -598,9 +604,14 @@ def on_turn_start(params):
 
 def result_for(method, msg):
     if method == "initialize":
+        requested = (msg.get("params", {}).get("capabilities", {})
+                     .get("requestedCapabilities", []))
+        granted = (["sessionListStream"]
+                   if SCENARIO == "session_list_stream"
+                   and "sessionListStream" in requested else [])
         return {
             "schema": SCHEMA,
-            "capabilities": {},
+            "grantedCapabilities": granted,
             "serverInfo": {
                 "name": "muse-session-server-fixture",
                 "version": "0.0.0-fixture",
@@ -615,7 +626,8 @@ def result_for(method, msg):
             return {"approvals": [dict(APPROVAL_PARAMS)], "userInputs": []}
         return {"approvals": [], "userInputs": []}
     if method == "session/start":
-        return {"session": session_obj(), "viewCursor": "cur-0"}
+        root = msg.get("params", {}).get("workspaceRoot", "/tmp/fake-ws")
+        return {"session": session_obj(workspace_root=root), "viewCursor": "cur-0"}
     if method == "session/resume":
         params = msg.get("params", {})
         log_input(params)
@@ -678,6 +690,13 @@ def result_for(method, msg):
         # Every other session pages back to nothing usable.
         return {"events": [], "nextCursor": None}
     if method == "session/list":
+        if SCENARIO == "session_list_pagination":
+            if msg.get("params", {}).get("cursor") == "page-2":
+                return {"sessions": [session_obj("stored-201", "/tmp/fake-ws")],
+                        "nextCursor": None}
+            return {"sessions": [session_obj(f"stored-{i}", "/tmp/fake-ws")
+                                  for i in range(1, 201)],
+                    "nextCursor": "page-2"}
         live = session_obj()
         old = session_obj("msp-sess-old", "/tmp/old-ws")
         old["updatedAt"] = "2026-08-01T00:00:00Z"
@@ -864,6 +883,22 @@ def main():
                     continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
+                if SCENARIO in ("session_list_stream", "session_list_stream_denied") \
+                        and method == "session/start":
+                    root = msg.get("params", {}).get("workspaceRoot", "/tmp/fake-ws")
+                    log_method("session/listChanged-sent")
+                    send({"jsonrpc": "2.0", "method": "session/started",
+                          "params": {"session": session_obj(workspace_root=root)}})
+                    changed = session_obj(workspace_root=root)
+                    changed["title"] = ("Renamed elsewhere"
+                                        if SCENARIO == "session_list_stream"
+                                        else "Should be ignored")
+                    send({"jsonrpc": "2.0", "method": "session/listChanged",
+                          "params": {"session": changed}})
+                if SCENARIO == "session_list_stream" and method == "session/list":
+                    log_method("session/closed-sent")
+                    send({"jsonrpc": "2.0", "method": "session/closed",
+                          "params": {"sessionId": MSP_SID}})
                 if CRASH_AFTER_ACK[0]:
                     sys.stdout.flush()
                     os._exit(0)

@@ -33,6 +33,81 @@ static NATIVE_SUBAGENTS: AtomicU64 = AtomicU64::new(0); // 1 when subagent sessi
 static AIR_ASYNC_TASKS: AtomicU64 = AtomicU64::new(0); // 1 when the client wants async-task updates
 static AIR_RECOMMENDED: AtomicU64 = AtomicU64::new(0); // 1 when the client wants recommendedValue metadata
 
+/// The host's live `session/list` rows, keyed by durable MSP session id.
+///
+/// A row is always replaced as a whole when `session/listChanged` arrives.
+/// Closed ids stay as tombstones for this adapter connection so a stale paged
+/// `session/list` response cannot resurrect an unloaded session.
+#[derive(Default)]
+struct SessionListCache {
+    rows: HashMap<String, J>,
+    closed: std::collections::HashSet<String>,
+}
+
+type SessionLists = Arc<Mutex<SessionListCache>>;
+
+fn session_row_id(row: &J) -> Option<&str> {
+    row.get("sessionId")
+        .and_then(|v| v.as_str())
+        .filter(|id| !id.is_empty())
+}
+
+fn session_row_workspace(row: &J) -> Option<&str> {
+    row.get("workspaceRoot").and_then(|v| v.as_str())
+}
+
+fn session_row_matches_workspace(row: &J, filter_root: &str) -> bool {
+    filter_root.is_empty() || session_row_workspace(row) == Some(filter_root)
+}
+
+fn cache_session_row(lists: &SessionLists, row: &J) -> Option<(Option<String>, Option<String>)> {
+    let id = session_row_id(row)?.to_string();
+    let title = row
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let mut cache = lists.lock().unwrap_or_else(|p| p.into_inner());
+    cache.closed.remove(&id);
+    let previous_title = cache.rows.insert(id, row.clone()).and_then(|previous| {
+        previous
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    });
+    Some((previous_title, title))
+}
+
+fn cache_session_closed(lists: &SessionLists, msp_sid: &str) {
+    if msp_sid.is_empty() {
+        return;
+    }
+    let mut cache = lists.lock().unwrap_or_else(|p| p.into_inner());
+    cache.rows.remove(msp_sid);
+    cache.closed.insert(msp_sid.to_string());
+}
+
+fn session_list_entry(row: &J) -> Option<String> {
+    let session_id = session_row_id(row)?;
+    let cwd = session_row_workspace(row).unwrap_or("");
+    let mut fields = vec![
+        format!("\"sessionId\":{}", esc(session_id)),
+        format!("\"cwd\":{}", esc(cwd)),
+    ];
+    for key in ["title", "updatedAt"] {
+        if let Some(value) = row.get(key).and_then(|v| v.as_str()) {
+            fields.push(format!("\"{key}\":{}", esc(value)));
+        }
+    }
+    Some(format!("{{{}}}", fields.join(",")))
+}
+
+fn owned_session_row(msp_sid: &str, cwd: &str) -> J {
+    J::Obj(vec![
+        ("sessionId".to_string(), J::Str(msp_sid.to_string())),
+        ("workspaceRoot".to_string(), J::Str(cwd.to_string())),
+    ])
+}
+
 /// True when the client's `_meta.jetbrains.air.capabilities` advertises a key.
 fn client_supports_air(capabilities: Option<&J>, key: &str) -> bool {
     let Some(air) = capabilities
@@ -289,6 +364,7 @@ fn reconcile_pending(
     host: &Arc<MspHost>,
     stdout: &StdoutShared,
     sessions: &Sessions,
+    lists: &SessionLists,
     acp_sid: &str,
 ) {
     let msp_sid = match sessions
@@ -351,7 +427,7 @@ fn reconcile_pending(
                 });
             if !known {
                 n_inputs += 1;
-                handle_msp(host, stdout, sessions, "userInput/requested", &u);
+                handle_msp(host, stdout, sessions, lists, "userInput/requested", &u);
             }
         }
     }
@@ -953,6 +1029,7 @@ fn main() {
     }
     let stdout: StdoutShared = Arc::new(Mutex::new(std::io::stdout()));
     let sessions: Sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let lists: SessionLists = Arc::new(Mutex::new(SessionListCache::default()));
     let (tx, rx) = mpsc::channel::<LoopMsg>();
 
     // ACP stdin pump. EOF ends the adapter: the client is gone, and the
@@ -1018,12 +1095,12 @@ fn main() {
                     continue;
                 }
                 match parse_json(trimmed) {
-                    Ok(v) => handle_acp(&host, &stdout, &sessions, &v),
+                    Ok(v) => handle_acp(&host, &stdout, &sessions, &lists, &v),
                     Err(e) => acp::send_error(&stdout, &None, -32700, &format!("parse error: {e}")),
                 }
             }
             LoopMsg::Msp(MspEvent::Notification { method, params }) => {
-                handle_msp(&host, &stdout, &sessions, &method, &params)
+                handle_msp(&host, &stdout, &sessions, &lists, &method, &params)
             }
             LoopMsg::Msp(MspEvent::Request { method, params }) => {
                 // Reissued server requests (multi-stage approvals, resumed
@@ -1031,7 +1108,14 @@ fn main() {
                 match method.as_str() {
                     "approval/request" => open_approval(&host, &stdout, &sessions, &params),
                     "userInput/request" => {
-                        handle_msp(&host, &stdout, &sessions, "userInput/requested", &params);
+                        handle_msp(
+                            &host,
+                            &stdout,
+                            &sessions,
+                            &lists,
+                            "userInput/requested",
+                            &params,
+                        );
                     }
                     // reader_loop answers unknown methods with methodNotFound
                     // before forwarding; this arm is defense in depth.
@@ -1060,7 +1144,7 @@ fn main() {
                                 .cloned()
                                 .collect();
                             for sid in ids {
-                                reconcile_pending(&host, &stdout, &sessions, &sid);
+                                reconcile_pending(&host, &stdout, &sessions, &lists, &sid);
                             }
                         }
                         Err(e) => {
@@ -1147,7 +1231,13 @@ fn steering_prompt_required(params: Option<&J>) -> Result<bool, String> {
     }
 }
 
-fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, msg: &J) {
+fn handle_acp(
+    host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    lists: &SessionLists,
+    msg: &J,
+) {
     if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
         msp::trace_method("acp<-client", method);
     }
@@ -1646,7 +1736,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     // Reissued server requests are the primary pending
                     // delivery; the pull endpoint is the belt-and-braces
                     // pass so a dropped notification cannot hide a request.
-                    reconcile_pending(host, stdout, sessions, &sid);
+                    reconcile_pending(host, stdout, sessions, lists, &sid);
                     let msp_out = sessions
                         .lock()
                         .unwrap()
@@ -2415,8 +2505,13 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let list_cursor = params.as_ref().and_then(|p| p.get("cursor"));
+            let list_stream = host.handshake().session_list_stream;
             let cmd = host.mint_cmd("cmd-");
             let mut host_params = format!("{{\"commandId\":{},\"limit\":200", esc(&cmd));
+            if let Some(cursor) = list_cursor {
+                host_params.push_str(&format!(",\"cursor\":{}", j_to_string(cursor)));
+            }
             if !filter_root.is_empty() {
                 host_params.push_str(&format!(",\"workspaceRoot\":{}", esc(&filter_root)));
             }
@@ -2424,43 +2519,85 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             // Snapshot adapter state without holding the lock across the host call.
             let owned: Vec<(String, String)> = sessions
                 .lock()
-                .unwrap()
+                .unwrap_or_else(|p| p.into_inner())
                 .values()
+                .filter(|s| filter_root.is_empty() || s.cwd == filter_root)
                 .map(|s| (s.msp_sid.clone(), s.cwd.clone()))
                 .collect();
             match host.command("session/list", &host_params) {
                 Ok(r) => {
-                    let owned_msp: std::collections::HashSet<&str> =
-                        owned.iter().map(|(m, _)| m.as_str()).collect();
-                    let mut entries: Vec<String> = owned
-                        .iter()
-                        .map(|(m, c)| format!("{{\"sessionId\":{},\"cwd\":{}}}", esc(m), esc(c)))
-                        .collect();
+                    let mut entries = Vec::new();
+                    let mut host_ids = std::collections::HashSet::new();
                     if let Some(J::Arr(items)) = r.get("sessions") {
                         for item in items {
-                            let msp_id =
-                                item.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
-                            if msp_id.is_empty() || owned_msp.contains(msp_id) {
-                                continue; // already listed under its ACP id
+                            let Some(msp_id) = session_row_id(item) else {
+                                continue;
+                            };
+                            let row = if list_stream {
+                                let mut cache = lists.lock().unwrap_or_else(|p| p.into_inner());
+                                if cache.closed.contains(msp_id) {
+                                    continue;
+                                }
+                                cache
+                                    .rows
+                                    .entry(msp_id.to_string())
+                                    .or_insert_with(|| item.clone())
+                                    .clone()
+                            } else {
+                                item.clone()
+                            };
+                            if !session_row_matches_workspace(&row, &filter_root) {
+                                continue;
                             }
-                            let cwd = item
-                                .get("workspaceRoot")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            let mut parts = vec![
-                                format!("\"sessionId\":{}", esc(msp_id)),
-                                format!("\"cwd\":{}", esc(cwd)),
-                            ];
-                            if let Some(updated) = item.get("updatedAt").and_then(|v| v.as_str()) {
-                                parts.push(format!("\"updatedAt\":{}", esc(updated)));
+                            if let Some(entry) = session_list_entry(&row) {
+                                host_ids.insert(msp_id.to_string());
+                                entries.push(entry);
                             }
-                            entries.push(format!("{{{}}}", parts.join(",")));
                         }
                     }
+                    // A session started through this adapter may not be in the
+                    // host's current page yet. Add it only when it belongs to
+                    // the requested workspace and was not already served by
+                    // that page; pagination stays owned by the host page.
+                    for (msp_id, cwd) in &owned {
+                        if host_ids.contains(msp_id)
+                            || (list_stream
+                                && lists
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .closed
+                                    .contains(msp_id))
+                        {
+                            continue;
+                        }
+                        let row = if list_stream {
+                            lists
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .rows
+                                .get(msp_id)
+                                .cloned()
+                                .unwrap_or_else(|| owned_session_row(msp_id, cwd))
+                        } else {
+                            owned_session_row(msp_id, cwd)
+                        };
+                        if session_row_matches_workspace(&row, &filter_root)
+                            && let Some(entry) = session_list_entry(&row)
+                        {
+                            entries.push(entry);
+                        }
+                    }
+                    let next_cursor = r
+                        .get("nextCursor")
+                        .map(j_to_string)
+                        .unwrap_or_else(|| "null".to_string());
                     acp::send_result(
                         stdout,
                         &id,
-                        &format!("{{\"sessions\":[{}]}}", entries.join(",")),
+                        &format!(
+                            "{{\"sessions\":[{}],\"nextCursor\":{next_cursor}}}",
+                            entries.join(",")
+                        ),
                     );
                 }
                 Err(e) => {
@@ -2472,12 +2609,38 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     log(&format!("session/list failed: {}", err_message(&e)));
                     let entries: Vec<String> = owned
                         .iter()
-                        .map(|(m, c)| format!("{{\"sessionId\":{},\"cwd\":{}}}", esc(m), esc(c)))
+                        .filter(|(m, _)| {
+                            !list_stream
+                                || !lists
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .closed
+                                    .contains(m)
+                        })
+                        .filter_map(|(m, c)| {
+                            let row = if list_stream {
+                                lists
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .rows
+                                    .get(m)
+                                    .cloned()
+                                    .unwrap_or_else(|| owned_session_row(m, c))
+                            } else {
+                                owned_session_row(m, c)
+                            };
+                            session_row_matches_workspace(&row, &filter_root)
+                                .then(|| session_list_entry(&row))
+                                .flatten()
+                        })
                         .collect();
                     acp::send_result(
                         stdout,
                         &id,
-                        &format!("{{\"sessions\":[{}]}}", entries.join(",")),
+                        &format!(
+                            "{{\"sessions\":[{}],\"nextCursor\":null}}",
+                            entries.join(",")
+                        ),
                     );
                 }
             }
@@ -3231,6 +3394,7 @@ fn handle_msp(
     host: &Arc<MspHost>,
     stdout: &StdoutShared,
     sessions: &Sessions,
+    lists: &SessionLists,
     method: &str,
     params: &J,
 ) {
@@ -3284,7 +3448,7 @@ fn handle_msp(
                             let p = e.get("params").cloned().unwrap_or(J::Null);
                             if !m.is_empty() {
                                 n += 1;
-                                handle_msp(host, stdout, sessions, m, &p);
+                                handle_msp(host, stdout, sessions, lists, m, &p);
                             }
                         }
                     } else if let Some(J::Arr(items)) = r.get("items") {
@@ -3868,7 +4032,57 @@ fn handle_msp(
                 }
             }
         }
-        "initialized" | "session/started" => {}
+        "initialized" => {}
+        "session/started" => {
+            // Streamed listing rows are full replacements. Birth is carried
+            // by session/started, while session/listChanged covers later
+            // metadata changes on the same row.
+            if host.handshake().session_list_stream
+                && let Some(row) = params.get("session")
+            {
+                cache_session_row(lists, row);
+            }
+        }
+        "session/listChanged" => {
+            if !host.handshake().session_list_stream {
+                return;
+            }
+            let Some(row) = params.get("session") else {
+                log("session/listChanged ignored: missing session row");
+                return;
+            };
+            let Some(msp_sid) = session_row_id(row) else {
+                log("session/listChanged ignored: session row has no sessionId");
+                return;
+            };
+            let Some((previous_title, Some(current_title))) = cache_session_row(lists, row) else {
+                return;
+            };
+            if previous_title.as_deref() != Some(current_title.as_str())
+                && let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
+                && sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&acp_sid)
+                    .is_some_and(|s| session_row_workspace(row) == Some(s.cwd.as_str()))
+            {
+                // ACP has a session_info_update for metadata, but no
+                // list-membership notification. Title changes for an active
+                // ACP session can therefore be pushed immediately; clients
+                // still pull membership and other rows through session/list.
+                acp::send_session_info(stdout, &acp_sid, Some(&current_title), None, None);
+            }
+        }
+        "session/closed" => {
+            if host.handshake().session_list_stream {
+                let msp_sid = params
+                    .get("sessionId")
+                    .or_else(|| params.get("session").and_then(|s| s.get("sessionId")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                cache_session_closed(lists, msp_sid);
+            }
+        }
         _ => {
             log(&format!("unhandled MSP notification: {method}"));
         }
