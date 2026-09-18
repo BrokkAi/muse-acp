@@ -5,7 +5,7 @@ sets `publish = false`; there are no registry packages, containers, update feeds
 documentation deployments, signing or notarization services. There is one Rust
 binary with no runtime dependencies and no monorepo package publication order.
 
-Each `v<version>` release has eleven assets: `install.sh`, plus an archive and
+Each `v<version>` release has twelve assets: `install.sh` and `install.ps1`, plus an archive and
 `.sha256` sidecar for each of:
 
 - `x86_64-unknown-linux-gnu` (tar.gz)
@@ -76,7 +76,7 @@ Never move tags or replace assets of a completed release.
 
 After publication, run `python3 scripts/release.py published` with
 `RELEASE_COMMIT` and `RELEASE_TAG` set. It requires a public release, the exact
-tag commit and all eleven assets, validates every checksum and archive member,
+tag commit and all twelve assets, validates every checksum and archive member,
 and compares payloads with the preflight build. Both `ci.yml` and `release.yml`
 must also succeed in the tag push context; branch evidence cannot replace tag
 workflow verification. The installer consumes GitHub's latest release URL;

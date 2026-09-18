@@ -685,10 +685,15 @@ fn uninstall_settings_edit(original: &str, name: &str) -> Result<(String, bool),
 // --- paths + binary install ---
 
 fn home_dir() -> Result<std::path::PathBuf, String> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
+    #[cfg(windows)]
+    let variables = ["USERPROFILE", "HOME"];
+    #[cfg(not(windows))]
+    let variables = ["HOME", "USERPROFILE"];
+    variables
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
         .map(std::path::PathBuf::from)
-        .map_err(|_| {
+        .ok_or_else(|| {
             "cannot determine home directory (HOME/USERPROFILE unset); pass --settings <path>"
                 .to_string()
         })
@@ -735,6 +740,52 @@ fn backup_path(path: &std::path::Path) -> std::path::PathBuf {
 /// Write via a same-directory temp file plus rename, so readers (and a crash
 /// mid-write) can never observe a truncated settings file. The temp file is
 /// best-effort cleaned on failure.
+#[cfg(windows)]
+fn rename_atomic(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        #[link_name = "MoveFileExW"]
+        fn move_file_ex_w(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
+        ) -> i32;
+    }
+
+    let source: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // The temp file and destination are in the same directory. Windows can
+    // replace an existing destination in this same-volume move, unlike the
+    // portable std::fs::rename behavior on Windows.
+    let result = unsafe {
+        move_file_ex_w(
+            source.as_ptr(),
+            destination.as_ptr(),
+            0x00000001 | 0x00000008, // REPLACE_EXISTING | WRITE_THROUGH
+        )
+    };
+    if result == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn rename_atomic(source: &std::path::Path, destination: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(source, destination)
+}
+
 fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     let mut tmp = dir.join(format!(
@@ -757,7 +808,7 @@ fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
             Err(e) => return Err(e),
         }
     }
-    match std::fs::rename(&tmp, path) {
+    match rename_atomic(&tmp, path) {
         Ok(()) => Ok(()),
         Err(e) => {
             let _ = std::fs::remove_file(&tmp);
