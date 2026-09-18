@@ -15,6 +15,20 @@ pub type StdoutShared = Arc<Mutex<std::io::Stdout>>;
 pub struct InFlight {
     pub msp_turn: String,
     pub req_id: J,
+    pub file_report: Option<FileChangeReport>,
+}
+
+/// Host-reported file writes accumulated for one requested turn report.
+pub struct FileChangeReport {
+    pub request_id: String,
+    pub paths: Vec<String>,
+    pub seen_paths: std::collections::HashSet<String>,
+    pub seen_items: std::collections::HashSet<String>,
+    pub encoded_path_bytes: usize,
+    /// False when a successful host tool could have changed files but did not
+    /// carry a typed path the adapter can safely report.
+    pub declared_complete: bool,
+    pub truncated: bool,
 }
 
 pub struct PendingPerm {
