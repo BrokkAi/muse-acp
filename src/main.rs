@@ -1164,6 +1164,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
     if method.is_empty() {
         if id.is_some() {
             complete_permission(host, stdout, sessions, &id, msg);
+            complete_permission_feedback(host, stdout, sessions, &id, msg);
             complete_elicitation(host, stdout, sessions, &id, msg);
         }
         return;
@@ -1343,6 +1344,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
+                            approval_seen: std::collections::HashSet::new(),
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
@@ -1542,6 +1544,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
+                            approval_seen: std::collections::HashSet::new(),
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
@@ -1825,6 +1828,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
+                            approval_seen: std::collections::HashSet::new(),
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
@@ -2349,7 +2353,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         acp::send_error(stdout, &Some(p.req_id), -32800, "session closed");
                     }
                     if let Some(p) = s.pending_perm {
-                        acp::send_error(stdout, &Some(p.req_id), -32800, "session closed");
+                        let request_id = p.feedback.map(|f| f.req_id).unwrap_or(p.req_id);
+                        acp::send_error(stdout, &Some(request_id), -32800, "session closed");
                     }
                     acp::send_result(stdout, &id, "{}");
                 }
@@ -2401,8 +2406,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     }
                 }
             }
-            // Pending permission answers stay open: per ACP the client answers
-            // them Cancelled itself as part of cancellation.
+            // A feedback form belongs to the cancelled turn. End it locally
+            // so a late form response cannot decide a newer host state.
+            invalidate_pending_approval(stdout, sessions, &sid, None, true);
         }
         "session/list" => {
             // Sessions are durable in the host: list them there so existing
@@ -3395,6 +3401,10 @@ fn handle_msp(
                 Some(s) => s,
                 None => return,
             };
+            // A terminal host event makes an optional feedback form stale.
+            // The original permission may still be handled as before, but a
+            // form that was already opened cannot submit a late decision.
+            invalidate_pending_approval(stdout, sessions, &acp_sid, None, true);
             let settled = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -3478,6 +3488,7 @@ fn handle_msp(
                 Some(s) => s,
                 None => return,
             };
+            invalidate_pending_approval(stdout, sessions, &acp_sid, None, true);
             let settled = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -3501,14 +3512,20 @@ fn handle_msp(
         "approval/requested" => {
             open_approval(host, stdout, sessions, params);
         }
-        "approval/resolved" | "approval/updated" => {
-            // Authoritative outcome: if session work continues, re-assert
-            // running (a resolved approval unblocks the turn).
+        "approval/resolved" => {
             let msp_sid = params
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let approval_id = params
+                .get("approvalId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                if invalidate_pending_approval(stdout, sessions, &acp_sid, Some(approval_id), false)
+                {
+                    pop_queued_approval(host, stdout, sessions, &acp_sid);
+                }
                 let (ver, busy) = sessions
                     .lock()
                     .unwrap()
@@ -3519,6 +3536,11 @@ fn handle_msp(
                     acp::send_state(stdout, &acp_sid, "running", None);
                 }
             }
+        }
+        "approval/updated" => {
+            // open_approval compares the requirement snapshot and invalidates
+            // an old permission/form before showing the refreshed choices.
+            open_approval(host, stdout, sessions, params);
         }
         "userInput/requested" => {
             let msp_sid = params
@@ -3604,6 +3626,7 @@ fn handle_msp(
                 Some(s) => s,
                 None => return,
             };
+            invalidate_pending_approval(stdout, sessions, &acp_sid, None, true);
             let settled = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -3875,6 +3898,45 @@ fn handle_msp(
     }
 }
 
+/// Invalidate a pending permission or its optional feedback form. A feedback
+/// form is tied to its original approval and requirement; clearing the whole
+/// permission when it becomes stale prevents a late response from deciding a
+/// newer stage.
+fn invalidate_pending_approval(
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    approval_id: Option<&str>,
+    feedback_only: bool,
+) -> bool {
+    let request_id = {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get_mut(acp_sid) else {
+            return false;
+        };
+        let matches = s.pending_perm.as_ref().is_some_and(|p| {
+            approval_id.is_none_or(|wanted| p.approval_id == wanted)
+                && (!feedback_only || p.feedback.is_some())
+        });
+        if !matches {
+            return false;
+        }
+        let p = s.pending_perm.take().expect("pending permission matched");
+        Some(p.feedback.map(|f| f.req_id).unwrap_or(p.req_id))
+    };
+    if let Some(request_id) = request_id {
+        acp::send_error(
+            stdout,
+            &Some(request_id),
+            -32800,
+            "permission request is no longer current",
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// Open an ACP permission request for MSP approval params (from either the
 /// `approval/requested` event or a reissued `approval/request`). Dedupes by
 /// approval id so multi-stage/resumed flows bridge exactly once. Never leaves
@@ -3903,42 +3965,77 @@ fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions
         log("approval dropped: missing approvalId");
         return;
     }
-    let already = sessions
-        .lock()
-        .unwrap()
-        .get(&acp_sid)
-        .map(|s| match &s.pending_perm {
-            Some(p) => p.approval_id == approval_id,
-            None => false,
-        })
-        .unwrap_or(false);
-    if already {
-        return;
-    }
-    // A second concurrent approval cannot overwrite the one the client is
-    // deciding on; queue it and display it when the current one settles.
-    {
-        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(s) = map.get_mut(&acp_sid)
-            && s.pending_perm.is_some()
-        {
-            if s.perm_queue
-                .iter()
-                .any(|p| p.get("approvalId").and_then(|v| v.as_str()) == Some(&approval_id))
-            {
-                return;
-            }
-            s.perm_queue.push(params.clone());
-            log(&format!(
-                "approval {approval_id} queued behind the displayed permission"
-            ));
-            return;
-        }
-    }
     let requirement = params
         .get("currentRequirementId")
         .cloned()
         .unwrap_or(J::Null);
+    let requirement_json = j_to_string(&requirement);
+    let approval_key = format!("{}:{requirement_json}", approval_id);
+    let mut stale_request = None;
+    let mut duplicate = false;
+    let mut queued = false;
+    // A second concurrent approval cannot overwrite the one the client is
+    // deciding on; queue it and display it when the current one settles.
+    {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(s) = map.get_mut(&acp_sid) {
+            if s.approval_seen.contains(&approval_key) {
+                duplicate = true;
+            } else if let Some(p) = s.pending_perm.as_ref()
+                && p.approval_id == approval_id
+            {
+                if j_to_string(&p.requirement) == requirement_json {
+                    duplicate = true;
+                } else {
+                    stale_request = Some(
+                        p.feedback
+                            .as_ref()
+                            .map(|f| f.req_id.clone())
+                            .unwrap_or_else(|| p.req_id.clone()),
+                    );
+                    s.pending_perm = None;
+                }
+            }
+            if !duplicate
+                && let Some(index) = s.perm_queue.iter().position(|queued| {
+                    queued.get("approvalId").and_then(|v| v.as_str()) == Some(&approval_id)
+                })
+            {
+                let queued_requirement = s.perm_queue[index]
+                    .get("currentRequirementId")
+                    .map(j_to_string)
+                    .unwrap_or_else(|| "null".to_string());
+                if queued_requirement == requirement_json {
+                    duplicate = true;
+                } else {
+                    s.perm_queue.remove(index);
+                }
+            }
+            if !duplicate {
+                s.approval_seen.insert(approval_key);
+                if s.pending_perm.is_some() {
+                    s.perm_queue.push(params.clone());
+                    queued = true;
+                }
+            }
+        }
+    }
+    if let Some(req_id) = stale_request {
+        acp::send_error(
+            stdout,
+            &Some(req_id),
+            -32800,
+            "permission request is no longer current",
+        );
+    }
+    if duplicate || queued {
+        if queued {
+            log(&format!(
+                "approval {approval_id} queued behind the displayed permission"
+            ));
+        }
+        return;
+    }
     let tool_call_id = params
         .get("toolCallId")
         .and_then(|v| v.as_str())
@@ -4008,6 +4105,7 @@ fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions
                 approval_id,
                 requirement,
                 choices,
+                feedback: None,
             });
             s.ver
         } else {
@@ -4044,6 +4142,150 @@ fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions
     );
 }
 
+/// Offer optional guidance after an explicitly selected eligible rejection.
+/// The permission remains pending until this separate request is settled.
+fn offer_permission_feedback(
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    choice_id: &str,
+) -> bool {
+    let req_id = J::Str(mint_id("feedback-", &ID_COUNTER));
+    let ver = {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get_mut(acp_sid) else {
+            return false;
+        };
+        let Some(p) = s.pending_perm.as_mut() else {
+            return false;
+        };
+        if p.feedback.is_some() {
+            return false;
+        }
+        p.feedback = Some(acp::PendingFeedback {
+            req_id: req_id.clone(),
+            choice_id: choice_id.to_string(),
+        });
+        s.ver
+    };
+    if ver == 2 {
+        acp::send_state(stdout, acp_sid, "requires_action", None);
+    }
+    acp::send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"elicitation/create\",\"params\":{{\"sessionId\":{},\"mode\":\"form\",\"message\":\"Optional guidance for rejecting this action\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{{\"feedback\":{{\"type\":\"string\",\"description\":\"Explain the constraint or suggest an alternative (optional)\"}}}}}}}}}}",
+            j_to_string(&req_id),
+            esc(acp_sid),
+        ),
+    );
+    true
+}
+
+/// Report a rejected host decision as an ACP transcript message. In
+/// particular, never say that guidance arrived when the host rejected the
+/// decision carrying it.
+fn report_approval_failure(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    approval_id: &str,
+    included_feedback: bool,
+) {
+    let text = if included_feedback {
+        format!(
+            "Muse rejected the permission decision for {approval_id}; the guidance was not delivered."
+        )
+    } else {
+        format!("Muse rejected the permission decision for {approval_id}.")
+    };
+    let msg_id = mint_id("msg-", &ID_COUNTER);
+    acp::send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
+            esc(acp_sid),
+            esc(&msg_id),
+            esc(&text),
+        ),
+    );
+}
+
+struct PermissionDecision {
+    msp_sid: String,
+    ver: u8,
+    approval_id: String,
+    requirement: J,
+    choice: String,
+    feedback: Option<String>,
+}
+
+/// Send the one MSP decision associated with a completed permission flow.
+fn send_permission_decision(
+    host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    decision: PermissionDecision,
+) {
+    let included_feedback = decision.feedback.is_some();
+    let feedback_f = decision
+        .feedback
+        .as_deref()
+        .map(|value| format!(",\"feedback\":{}", esc(value)))
+        .unwrap_or_default();
+    let cmd = host.mint_cmd("cmd-");
+    match host.command(
+        "approval/decide",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{},\"approvalId\":{},\"requirementId\":{},\"choiceId\":{}{feedback_f}}}",
+            esc(&cmd),
+            esc(&decision.msp_sid),
+            esc(&decision.approval_id),
+            j_to_string(&decision.requirement),
+            esc(&decision.choice),
+        ),
+    ) {
+        Ok(r) => {
+            // Admission is not the outcome: terminal=false means further
+            // requirements remain pending, so stay in requires_action.
+            let terminal = r
+                .get("terminal")
+                .and_then(|v| match v {
+                    J::Bool(b) => Some(*b),
+                    _ => None,
+                })
+                .unwrap_or(true);
+            if decision.ver == 2 && terminal {
+                let busy = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(acp_sid)
+                    .map(|s| !s.in_flight.is_empty())
+                    .unwrap_or(false);
+                if busy {
+                    acp::send_state(stdout, acp_sid, "running", None);
+                }
+            }
+        }
+        Err(e) => {
+            log(&format!(
+                "approval/decide for {} failed: {}",
+                decision.approval_id,
+                err_message(&e)
+            ));
+            report_approval_failure(
+                stdout,
+                acp_sid,
+                &decision.approval_id,
+                included_feedback,
+            );
+        }
+    }
+    // Whether or not the decide was admitted, the displayed permission is
+    // settled from the client's perspective; show the next queued approval.
+    pop_queued_approval(host, stdout, sessions, acp_sid);
+}
+
 /// Client reply to our `session/request_permission` (matched by id).
 /// Fail closed: without an explicit approving choice from the client, never
 /// send an approving decide — cancel the underlying turn instead.
@@ -4071,24 +4313,30 @@ fn complete_permission(
         Some(s) => s,
         None => return, // not ours; ignore (e.g. late duplicate)
     };
-    let (msp_sid, ver, approval_id, requirement, choices) = {
-        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let s = match map.get_mut(&acp_sid) {
+    let (msp_sid, ver, approval_id, requirement, choices, feedback_pending) = {
+        let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let s = match map.get(&acp_sid) {
             Some(s) => s,
             None => return,
         };
-        let p = match s.pending_perm.take() {
+        let p = match s.pending_perm.as_ref() {
             Some(p) => p,
             None => return,
         };
         (
             s.msp_sid.clone(),
             s.ver,
-            p.approval_id,
-            p.requirement,
-            p.choices,
+            p.approval_id.clone(),
+            p.requirement.clone(),
+            p.choices.clone(),
+            p.feedback.is_some(),
         )
     };
+    // The original permission response may arrive again after the optional
+    // form was opened. It must not create another form or decision.
+    if feedback_pending {
+        return;
+    }
     // Outcome -> (choiceId, approved?). Only an explicit client selection of
     // an approving choice may approve. Everything else fails closed: cancel
     // the underlying turn rather than risk an approving decide.
@@ -4100,10 +4348,11 @@ fn complete_permission(
     let is_approving = |cid: &str| {
         choices
             .iter()
-            .find(|(id, _)| id == cid)
-            .map(|(_, d)| d.to_lowercase().starts_with("approv"))
+            .find(|choice| choice.id == cid)
+            .map(|choice| choice.decision.to_lowercase().starts_with("approv"))
             .unwrap_or(false)
     };
+    let mut explicit_choice = false;
     let verdict = if msg.get("error").is_some() {
         log("session/request_permission failed at client; failing closed");
         match acp::fallback_deny(&choices) {
@@ -4114,8 +4363,14 @@ fn complete_permission(
         match msg.get("result").and_then(|r| r.get("outcome")) {
             Some(o) => match o.get("outcome").and_then(|v| v.as_str()).unwrap_or("") {
                 "selected" => match o.get("optionId").and_then(|v| v.as_str()) {
-                    Some(cid) if is_approving(cid) => Verdict::Approve(cid.to_string()),
-                    Some(cid) => Verdict::Deny(cid.to_string()),
+                    Some(cid) if is_approving(cid) => {
+                        explicit_choice = true;
+                        Verdict::Approve(cid.to_string())
+                    }
+                    Some(cid) => {
+                        explicit_choice = true;
+                        Verdict::Deny(cid.to_string())
+                    }
                     None => match acp::fallback_deny(&choices) {
                         Some(c) => Verdict::Deny(c),
                         None => Verdict::FailClosed,
@@ -4132,6 +4387,16 @@ fn complete_permission(
             },
         }
     };
+    if let Verdict::Deny(ref choice) = verdict
+        && explicit_choice
+        && ELICIT_FORM.load(Ordering::SeqCst) == 1
+        && choices
+            .iter()
+            .any(|c| c.id == *choice && c.accepts_feedback)
+        && offer_permission_feedback(stdout, sessions, &acp_sid, choice)
+    {
+        return;
+    }
     let choice = match verdict {
         Verdict::Approve(c) | Verdict::Deny(c) => c,
         Verdict::FailClosed => {
@@ -4140,40 +4405,104 @@ fn complete_permission(
             return;
         }
     };
-    let cmd = host.mint_cmd("cmd-");
-    match host.command(
-        "approval/decide",
-        &format!(
-            "{{\"commandId\":{},\"sessionId\":{},\"approvalId\":{},\"requirementId\":{},\"choiceId\":{}}}",
-            esc(&cmd),
-            esc(&msp_sid),
-            esc(&approval_id),
-            j_to_string(&requirement),
-            esc(&choice)
-        ),
-    ) {
-        Ok(r) => {
-            // Admission is not the outcome: terminal=false means further
-            // requirements remain pending, so stay in requires_action.
-            let terminal = r.get("terminal").and_then(|v| match v {
-                J::Bool(b) => Some(*b),
-                _ => None,
-            }).unwrap_or(true);
-            if ver == 2 && terminal {
-                let busy = sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&acp_sid).map(|s| !s.in_flight.is_empty()).unwrap_or(false);
-                if busy {
-                    acp::send_state(stdout, &acp_sid, "running", None);
-                }
-            }
-        }
-        Err(e) => log(&format!(
-            "approval/decide for {approval_id} failed: {}",
-            err_message(&e)
-        )),
+    let pending = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(&acp_sid)
+        .and_then(|s| s.pending_perm.take());
+    if pending.is_none() {
+        return;
     }
-    // Whether or not the decide was admitted, the displayed permission is
-    // settled from the client's perspective; show the next queued approval.
-    pop_queued_approval(host, stdout, sessions, &acp_sid);
+    send_permission_decision(
+        host,
+        stdout,
+        sessions,
+        &acp_sid,
+        PermissionDecision {
+            msp_sid,
+            ver,
+            approval_id,
+            requirement,
+            choice,
+            feedback: None,
+        },
+    );
+}
+
+/// Client reply to the optional guidance form. The permission is removed only
+/// after this request is matched, so a late response cannot target a newer
+/// requirement or another approval.
+fn complete_permission_feedback(
+    host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    id: &Option<J>,
+    msg: &J,
+) {
+    let idv = match id {
+        Some(v) => v.clone(),
+        None => return,
+    };
+    let acp_sid = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find_map(|(k, s)| {
+            s.pending_perm.as_ref().and_then(|p| {
+                p.feedback.as_ref().and_then(|f| {
+                    (j_to_string(&f.req_id) == j_to_string(&idv)).then_some(k.clone())
+                })
+            })
+        });
+    let acp_sid = match acp_sid {
+        Some(s) => s,
+        None => return,
+    };
+    let (msp_sid, ver, approval_id, requirement, choice_id) = {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get_mut(&acp_sid) else {
+            return;
+        };
+        let Some(p) = s.pending_perm.take() else {
+            return;
+        };
+        let Some(feedback) = p.feedback else {
+            return;
+        };
+        (
+            s.msp_sid.clone(),
+            s.ver,
+            p.approval_id,
+            p.requirement,
+            feedback.choice_id,
+        )
+    };
+    let feedback = if msg.get("error").is_none()
+        && let Some(res) = msg.get("result")
+        && res.get("action").and_then(|v| v.as_str()).unwrap_or("") == "accept"
+    {
+        res.get("content")
+            .and_then(|content| content.get("feedback"))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    } else {
+        None
+    };
+    send_permission_decision(
+        host,
+        stdout,
+        sessions,
+        &acp_sid,
+        PermissionDecision {
+            msp_sid,
+            ver,
+            approval_id,
+            requirement,
+            choice: choice_id,
+            feedback,
+        },
+    );
 }
 
 /// Display the next queued approval for a session, if any.

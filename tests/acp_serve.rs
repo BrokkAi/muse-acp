@@ -901,6 +901,159 @@ fn approval_preserves_all_choices_with_deny_option() {
 }
 
 #[test]
+fn eligible_rejection_collects_optional_feedback_in_both_protocol_versions() {
+    for (ver, caps) in [
+        (1, ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}"),
+        (2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}"),
+    ] {
+        let mut c = Client::spawn("approval_hang", &[("FAKE_APPROVAL_FEEDBACK", "deny")]);
+        let sid = c.new_session(ver, caps);
+        let _pid = c.prompt(&sid, "do it");
+        let permission = c.wait_for("request_permission", Duration::from_secs(15));
+        let permission_id = extract_str(&permission, "id").expect("permission request id");
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{permission_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":\"c-deny\"}}}}}}"
+        ));
+        let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+        assert!(form.contains("Optional guidance"), "guidance form: {form}");
+        assert!(form.contains("feedback"), "feedback field: {form}");
+        assert!(
+            !form.contains("\"required\""),
+            "guidance must remain optional: {form}"
+        );
+        // A duplicate permission response must not create a second form.
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{permission_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":\"c-deny\"}}}}}}"
+        ));
+        std::thread::sleep(Duration::from_millis(100));
+        let form_count = c
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|frame| frame.contains("elicitation/create"))
+            .count();
+        assert_eq!(form_count, 1, "duplicate permission response: {form}");
+        let form_id = extract_str(&form, "id").expect("feedback form id");
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"feedback\":\"Do not modify the manifest\"}}}}}}"
+        ));
+        c.wait_input(
+            "\"feedback\": \"Do not modify the manifest\"",
+            Duration::from_secs(15),
+        );
+        let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        let decisions: Vec<&str> = input
+            .lines()
+            .filter(|line| line.contains("\"approvalId\""))
+            .collect();
+        assert_eq!(decisions.len(), 1, "one decision with feedback: {input}");
+        assert!(decisions[0].contains("\"sessionId\": \"msp-sess-1\""));
+        assert!(decisions[0].contains("\"choiceId\": \"c-deny\""));
+        assert!(decisions[0].contains("\"requirementId\""));
+        c.finish();
+    }
+}
+
+#[test]
+fn declining_optional_feedback_sends_the_original_rejection_without_feedback() {
+    let mut c = Client::spawn("approval_hang", &[("FAKE_APPROVAL_FEEDBACK", "deny")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "do it");
+    let permission = c.wait_for("request_permission", Duration::from_secs(15));
+    let permission_id = extract_str(&permission, "id").expect("permission request id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{permission_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":\"c-deny\"}}}}}}"
+    ));
+    let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let form_id = extract_str(&form, "id").expect("feedback form id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"decline\"}}}}"
+    ));
+    c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    let decisions: Vec<&str> = input
+        .lines()
+        .filter(|line| line.contains("\"approvalId\""))
+        .collect();
+    assert_eq!(
+        decisions.len(),
+        1,
+        "one decision after form decline: {input}"
+    );
+    assert!(
+        !decisions[0].contains("feedback"),
+        "declining the optional form omits feedback: {decisions:?}"
+    );
+    c.finish();
+}
+
+#[test]
+fn rejected_feedback_decision_is_reported_without_echoing_guidance() {
+    let mut c = Client::spawn(
+        "approval_hang",
+        &[
+            ("FAKE_APPROVAL_FEEDBACK", "deny"),
+            ("FAKE_ERROR_METHOD", "approval/decide"),
+            ("FAKE_ERROR_MESSAGE", "decision refused"),
+        ],
+    );
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "do it");
+    let permission = c.wait_for("request_permission", Duration::from_secs(15));
+    let permission_id = extract_str(&permission, "id").expect("permission request id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{permission_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":\"c-deny\"}}}}}}"
+    ));
+    let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let form_id = extract_str(&form, "id").expect("feedback form id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"feedback\":\"private guidance\"}}}}}}"
+    ));
+    let report = c.wait_for("guidance was not delivered", Duration::from_secs(15));
+    assert!(
+        report.contains("permission decision"),
+        "host rejection: {report}"
+    );
+    let frames = c.frames.lock().unwrap().join("\n");
+    assert!(
+        !frames.contains("private guidance"),
+        "guidance leaked to ACP output"
+    );
+    c.finish();
+}
+
+#[test]
+fn cancelling_the_turn_invalidates_a_pending_feedback_form() {
+    let mut c = Client::spawn("approval_hang", &[("FAKE_APPROVAL_FEEDBACK", "deny")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "do it");
+    let permission = c.wait_for("request_permission", Duration::from_secs(15));
+    let permission_id = extract_str(&permission, "id").expect("permission request id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{permission_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":\"c-deny\"}}}}}}"
+    ));
+    let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let form_id = extract_str(&form, "id").expect("feedback form id");
+    c.req("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let stale = c.wait_for(
+        &format!("\"id\":\"{form_id}\",\"error\""),
+        Duration::from_secs(15),
+    );
+    assert!(stale.contains("no longer current"), "stale form: {stale}");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"feedback\":\"late guidance\"}}}}}}"
+    ));
+    std::thread::sleep(Duration::from_millis(200));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap_or_default();
+    assert!(
+        !input.lines().any(|line| line.contains("approvalId")),
+        "late feedback must not decide after cancellation: {input}"
+    );
+    c.finish();
+}
+
+#[test]
 fn v2_permission_uses_the_typed_subject_shape() {
     let mut c = Client::spawn("approval", &[]);
     let sid = c.new_session(2, "");
