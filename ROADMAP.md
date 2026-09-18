@@ -548,20 +548,21 @@ MSP v1 can represent this work: `session/userShell` (gated on the
 `visibleOutput`, and a null `turnId`; and a `toolCall` may be durably
 backgrounded (`background: true`, `backgroundInitiator: user|timeout`).
 
-Status: **AIR async tasks implemented (display-only).** After bilateral AIR
+Status: **AIR async tasks and MSP 1.3.0 task control implemented.** After bilateral AIR
 negotiation, backgrounded tool calls mark their command card
 (`_meta.jetbrains.air.asyncTasks.backgrounded`) and emit
 `async_task_spawned`/`async_task_state_update`; user-shell items map to their
-own shell tasks with exit facts settled from code/signal. `canStop` is
-honestly false and `_session/async_task/stop` fails explicitly because MSP v1
-publishes no stop primitive. Remaining work: the `userShell` host capability
-request, active-task reconciliation, and stop once MSP exposes one.
+own shell tasks with exit facts settled from code/signal. `_session/async_task/stop`
+maps one AIR task to MSP `task/stop`, and `session/cancel` maps all background
+work to `task/stopAll`; item terminal events remain authoritative. Remaining
+work: the `userShell` host capability request, active-task reconciliation, and
+host-shutdown behavior.
 
 **Work items**
 
 - Map backgrounded `toolCall`/`userShell` items to the AIR async-tasks
-  extension (spawned/state updates plus targeted stop) only after bilateral
-  capability negotiation, as `codex-acp` does.
+  extension (spawned/state updates plus targeted and blanket stop) only after
+  bilateral capability negotiation, as `codex-acp` does.
 - Request the `userShell` host capability only when an editor feature needs it,
   and never request it by default.
 - Surface `userShell` exit facts verbatim (code vs signal number); do not
