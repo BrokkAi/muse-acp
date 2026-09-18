@@ -2110,16 +2110,59 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             }
         }
         "_session/async_task/stop" => {
-            // Honest gap: MSP v1 publishes no stop primitive for background
-            // work, and canStop is advertised false. Pretending to stop would
-            // leave a running task the editor believes is dead.
-            log("async-task stop requested; MSP v1 exposes no stop primitive");
-            acp::send_error(
-                stdout,
-                &id,
-                -32601,
-                "background task stop is not supported by the Muse host",
-            );
+            let acp_sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let task_id = params
+                .as_ref()
+                .and_then(|p| p.get("asyncTaskId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let workflow = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&acp_sid)
+                .and_then(|s| {
+                    s.fold
+                        .workflow_run_id_for_task(&task_id)
+                        .map(|run_id| (s.msp_sid.clone(), run_id))
+                });
+            if let Some((msp_sid, workflow_run_id)) = workflow {
+                // workflow/cancel is admission-only. The later workflow item
+                // and turn view events settle the card and any prompt.
+                let command_id = host.mint_cmd("cmd-");
+                match host.command(
+                    "workflow/cancel",
+                    &format!(
+                        "{{\"commandId\":{},\"sessionId\":{},\"workflowRunId\":{}}}",
+                        esc(&command_id),
+                        esc(&msp_sid),
+                        esc(&workflow_run_id)
+                    ),
+                ) {
+                    Ok(result) => acp::send_result(stdout, &id, &j_to_string(&result)),
+                    Err(e) => acp::send_error(
+                        stdout,
+                        &id,
+                        msp::acp_error_code(&e, -32603),
+                        &err_message(&e),
+                    ),
+                }
+            } else {
+                // Shell and user-shell tasks remain honest: MSP 1.3 exposes
+                // workflow cancellation, but no generic background stop.
+                log("async-task stop requested; MSP has no stop surface for this task");
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32601,
+                    "background task stop is not supported by the Muse host",
+                );
+            }
         }
         "_session/steering" => {
             if negotiated_ver() != 2 {
