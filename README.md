@@ -106,7 +106,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `item/delta` (message text) | `agent_message_chunk` (v2 carries `messageId`) |
 | toolCall `item/started\|updated\|completed` | `tool_call` (v1 create) / `tool_call_update` upsert with kind/title/status/content/rawInput |
 | `turn/completed` | v1 `session/prompt` response `{stopReason}` plus the turn's `usage` when the host reported any; v2 `state_update` idle + `stopReason` |
-| `turn/cancel` | `session/cancel` (waits for the terminal event; `already_terminal` = success) |
+| `turn/interrupt` with `retract` | `session/cancel` (priority stop; waits for the terminal event; `already_terminal` = success) |
 | `approval/requested` + `approval/request` | `session/request_permission` → `approval/decide` (deny-safe fallback) |
 | `session/resume` + history | `session/resume` (+ `replayFrom: {type:start}` replays messages); usage is restored on attach: from `history.snapshot.state` when a snapshot is served, else by asking for the snapshot rung explicitly, else from one backward `view/page` read for the running totals |
 | `sessionDurability` (default durable) | continuity across turns; Muse's durable session ID is used directly by ACP |

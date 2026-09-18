@@ -1256,6 +1256,24 @@ fn session_close_cancels_in_flight() {
 }
 
 #[test]
+fn session_cancel_interrupts_exact_turn_with_retract() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    c.wait_log("turn/start", Duration::from_secs(15));
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_log("turn/interrupt", Duration::from_secs(15));
+    c.wait_input("\"turnId\": \"turn-1\"", Duration::from_secs(15));
+    c.wait_input("\"retract\": true", Duration::from_secs(15));
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"cancelled\""),
+        "interrupted prompt settles: {done}"
+    );
+    c.finish();
+}
+
+#[test]
 fn approval_request_without_notification_is_bridged() {
     // Reissued server-initiated approval/request (no notification): the
     // reader acks it AND the bridge still reaches the client.
@@ -3222,6 +3240,7 @@ fn emitted_frames_conform_to_the_vendored_schema() {
             "turn/start" => "TurnStartParams",
             "turn/steer" => "TurnSteerParams",
             "turn/cancel" => "TurnCancelParams",
+            "turn/interrupt" => "TurnInterruptParams",
             "turn/unqueue" => "TurnUnqueueParams",
             "approval/decide" => "ApprovalDecideParams",
             "approval/listPending" => "ApprovalListPendingParams",

@@ -784,9 +784,12 @@ def result_for(method, msg):
             "status": "accepted",
             "turnId": params.get("expectedTurnId", ""),
         }
-    if method == "turn/cancel":
-        # Like the real host: a cancelled turn still reports its terminal.
+    if method in ("turn/cancel", "turn/interrupt"):
+        # Like the real host: a cancelled or interrupted turn still reports
+        # its terminal. Keep the request in the input log so tests can verify
+        # the exact turn and interrupt posture.
         params = msg.get("params", {})
+        log_input(params)
         notify("turn/completed", {"sessionId": MSP_SID,
                                   "turnId": params.get("turnId", ""),
                                   "terminal": "cancelled"})
