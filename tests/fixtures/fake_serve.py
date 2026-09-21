@@ -942,6 +942,9 @@ def main():
                     continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
+                if method == "model/list" and SCENARIO == "pipe_stall":
+                    log_method("pipe-stall-start")
+                    time.sleep(8)
                 if method == "model/list" and SCENARIO == "stdout_close_stays_alive":
                     os.close(1)
                     time.sleep(1.0)

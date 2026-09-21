@@ -4103,6 +4103,27 @@ fn closed_editor_stdout_does_not_block_adapter_shutdown() {
 }
 
 #[test]
+fn timed_out_pipe_write_cannot_be_delivered_later() {
+    let mut c = Client::spawn("pipe_stall", &[]);
+    let sid = c.new_session(1, "");
+    c.wait_log("pipe-stall-start", Duration::from_secs(5));
+    let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"text","text":"x".repeat(1024 * 1024)}]});
+    let id = c.req("session/prompt", &params.to_string());
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(12));
+    assert!(
+        frame.contains("error") && frame.contains("host terminated"),
+        "{frame}"
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    let log = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !log.lines().any(|line| line == "turn/start"),
+        "timed-out command reached host: {log}"
+    );
+    c.finish();
+}
+
+#[test]
 fn host_shutdown_allows_pending_flush_after_stdin_eof() {
     let mut c = Client::spawn("shutdown_flush", &[]);
     c.new_session(1, "");
