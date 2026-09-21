@@ -15,6 +15,20 @@ pub type StdoutShared = Arc<Mutex<std::io::Stdout>>;
 pub struct InFlight {
     pub msp_turn: String,
     pub req_id: J,
+    pub file_report: Option<FileChangeReport>,
+}
+
+/// Host-reported file writes accumulated for one requested turn report.
+pub struct FileChangeReport {
+    pub request_id: String,
+    pub paths: Vec<String>,
+    pub seen_paths: std::collections::HashSet<String>,
+    pub seen_items: std::collections::HashSet<String>,
+    pub encoded_path_bytes: usize,
+    /// False when a successful host tool could have changed files but did not
+    /// carry a typed path the adapter can safely report.
+    pub declared_complete: bool,
+    pub truncated: bool,
 }
 
 pub struct PendingPerm {
@@ -45,6 +59,9 @@ pub struct AcpSession {
     pub acp_sid: String,
     pub msp_sid: String,
     pub cwd: String,
+    /// Ordered ACP workspace scope: `cwd` followed by each explicitly
+    /// supplied additional directory (with exact duplicates removed).
+    pub roots: Vec<String>,
     pub ver: u8,
     pub in_flight: Vec<InFlight>,
     pub pending_perm: Option<PendingPerm>,
@@ -409,10 +426,20 @@ pub fn perm_options(params: &J) -> (String, Vec<(String, String)>) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("once")
                 .to_string();
+            let name = match c
+                .get("rulePreview")
+                .and_then(|v| v.as_str())
+                .filter(|preview| !preview.is_empty())
+            {
+                Some(preview) => {
+                    format!("{label} (host rule preview: {preview}; host scope: {scope})")
+                }
+                None => label,
+            };
             opts.push(format!(
                 "{{\"optionId\":{},\"name\":{},\"kind\":\"{}\"}}",
                 esc(&id),
-                esc(&label),
+                esc(&name),
                 perm_kind(&decision, &scope)
             ));
             choices.push((id, decision));
@@ -710,5 +737,54 @@ mod tests {
             options.contains("\"value\":\"max\""),
             "max tier must be advertised: {options}"
         );
+    }
+
+    #[test]
+    fn permission_options_display_rule_previews_without_changing_mapping() {
+        let params = crate::json::parse_json(
+            r#"{
+                "availableChoices":[
+                    {"choiceId":"c-once","label":"Allow once","decision":"approved","scope":"once"},
+                    {"choiceId":"c-session","label":"Allow for this session","decision":"approvedForSession","scope":"session","rulePreview":"write /workspace/file"},
+                    {"choiceId":"c-local","label":"Allow permanently","decision":"approvedForSession","scope":"localPersistent","rulePreview":"\"quoted\"\n✓"},
+                    {"choiceId":"c-empty","label":"Reject","decision":"denied","scope":"once","rulePreview":""}
+                ]
+            }"#,
+        )
+        .expect("approval choices JSON");
+        let (options_json, choices) = perm_options(&params);
+        assert_eq!(
+            choices,
+            vec![
+                ("c-once".to_string(), "approved".to_string()),
+                ("c-session".to_string(), "approvedForSession".to_string()),
+                ("c-local".to_string(), "approvedForSession".to_string()),
+                ("c-empty".to_string(), "denied".to_string()),
+            ]
+        );
+
+        let J::Arr(options) = crate::json::parse_json(&options_json).expect("options JSON") else {
+            panic!("permission options must be an array");
+        };
+        let expected = [
+            ("c-once", "Allow once", "allow_once"),
+            (
+                "c-session",
+                "Allow for this session (host rule preview: write /workspace/file; host scope: session)",
+                "allow_always",
+            ),
+            (
+                "c-local",
+                "Allow permanently (host rule preview: \"quoted\"\n✓; host scope: localPersistent)",
+                "allow_always",
+            ),
+            ("c-empty", "Reject", "reject_once"),
+        ];
+        assert_eq!(options.len(), expected.len());
+        for (option, (id, name, kind)) in options.iter().zip(expected) {
+            assert_eq!(option.get("optionId").and_then(J::as_str), Some(id));
+            assert_eq!(option.get("name").and_then(J::as_str), Some(name));
+            assert_eq!(option.get("kind").and_then(J::as_str), Some(kind));
+        }
     }
 }

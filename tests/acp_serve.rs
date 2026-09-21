@@ -68,6 +68,7 @@ impl Client {
         cmd.env("FAKE_LOG", &fake_log);
         cmd.env("FAKE_INPUT", format!("{fake_log}.input"));
         cmd.env("FAKE_FRAMES", format!("{fake_log}.frames"));
+        cmd.env("FAKE_PID", format!("{fake_log}.pid"));
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -200,6 +201,22 @@ impl Client {
         }
     }
 
+    fn wait_for_pid(&self, path: &str, timeout: Duration) -> u32 {
+        let start = Instant::now();
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && let Some(first) = raw.lines().find(|line| !line.trim().is_empty())
+                && let Ok(pid) = first.trim().parse()
+            {
+                return pid;
+            }
+            if start.elapsed() > timeout {
+                panic!("fake host never wrote its pid");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Raw client->server notification (e.g. initialized).
     fn notify(&mut self, method: &str, params: &str) {
         let frame =
@@ -282,6 +299,42 @@ impl Client {
         extract_str(&frame, "sessionId").expect("sessionId in result")
     }
 
+    fn new_session_at(
+        &mut self,
+        ver: u64,
+        cwd: &std::path::Path,
+        additional: &[&std::path::Path],
+    ) -> String {
+        let init = self.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        let frame = self.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"additionalDirectories\":{}"),
+            "multi-root support must be advertised in ACP v{ver}: {frame}"
+        );
+        self.notify("initialized", "{}");
+        let escape = |path: &std::path::Path| {
+            path.to_str()
+                .expect("UTF-8 test path")
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        };
+        let additional = additional
+            .iter()
+            .map(|path| format!("\"{}\"", escape(path)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let id = self.req(
+            "session/new",
+            &format!(
+                "{{\"cwd\":\"{}\",\"additionalDirectories\":[{additional}]}}",
+                escape(cwd)
+            ),
+        );
+        let frame = self.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\""), "session/new failed: {frame}");
+        extract_str(&frame, "sessionId").expect("sessionId in result")
+    }
+
     fn prompt(&mut self, sid: &str, text: &str) -> u64 {
         self.req(
             "session/prompt",
@@ -304,6 +357,15 @@ impl Client {
 
 trait WaitTimeout {
     fn wait_timeout(&mut self, t: Duration) -> std::io::Result<Option<std::process::ExitStatus>>;
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 impl WaitTimeout for Child {
@@ -878,6 +940,127 @@ fn tool_call_completion_bridges_with_result_text() {
 }
 
 #[test]
+fn negotiated_file_change_report_uses_successful_host_tool_paths_once() {
+    let caps = ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}";
+    let mut c = Client::spawn("file_changes", &[]);
+    let sid = c.new_session(1, caps);
+    let pid = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"change files\"}}],\"_meta\":{{\"jetbrains\":{{\"air\":{{\"agentFileChangeReportRequest\":{{\"version\":1,\"requestId\":\"report-1\"}}}}}}}}}}"
+        ),
+    );
+    let report = c.wait_for("\"agentFileChangeReport\":{", Duration::from_secs(15));
+    for path in [
+        "added.bin",
+        "src/edited.rs",
+        "deleted.txt",
+        "old.txt",
+        "new.txt",
+    ] {
+        assert!(report.contains(path), "missing {path}: {report}");
+    }
+    assert!(
+        !report.contains("not-written.txt"),
+        "rejected write leaked: {report}"
+    );
+    assert!(
+        report.contains("\"declaredComplete\":true") && report.contains("\"truncated\":false"),
+        "complete bounded report: {report}"
+    );
+    assert_eq!(
+        report.matches("src/edited.rs").count(),
+        1,
+        "replay dedup: {report}"
+    );
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "prompt terminal: {done}");
+    let reports = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|frame| frame.contains("\"agentFileChangeReport\":{"))
+        .count();
+    assert_eq!(reports, 1, "one report per completed turn");
+    c.finish();
+}
+
+#[test]
+fn file_change_report_never_infers_shell_redirection() {
+    let caps = ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}";
+    let mut c = Client::spawn("file_changes_ambiguous", &[]);
+    let sid = c.new_session(1, caps);
+    let _pid = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"run shell\"}}],\"_meta\":{{\"jetbrains\":{{\"air\":{{\"agentFileChangeReportRequest\":{{\"version\":1,\"requestId\":\"report-shell\"}}}}}}}}}}"
+        ),
+    );
+    let report = c.wait_for("\"agentFileChangeReport\":{", Duration::from_secs(15));
+    assert!(
+        report.contains("\"paths\":[]"),
+        "no guessed paths: {report}"
+    );
+    assert!(
+        report.contains("\"declaredComplete\":false"),
+        "ambiguity disclosed: {report}"
+    );
+    assert!(
+        !report.contains("inferred.txt"),
+        "shell text is not path evidence: {report}"
+    );
+    c.finish();
+}
+
+#[test]
+fn file_change_reports_cover_gap_recovery_and_disclose_delegation() {
+    for (scenario, complete, path) in [
+        ("file_changes_subagent", false, None),
+        ("file_changes_gap", true, Some("gap-written.txt")),
+    ] {
+        let mut c = Client::spawn(scenario, &[]);
+        let sid = c.new_session(1, ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}");
+        let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"text","text":"edit"}],"_meta":{"jetbrains":{"air":{"agentFileChangeReportRequest":{"version":1,"requestId":"report-recovery"}}}}});
+        c.req("session/prompt", &params.to_string());
+        let frame = c.wait_for("\"agentFileChangeReport\":{", Duration::from_secs(15));
+        assert!(
+            frame.contains(&format!("\"declaredComplete\":{complete}")),
+            "{frame}"
+        );
+        if let Some(path) = path {
+            assert!(frame.contains(path), "{frame}");
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn file_change_report_requires_bilateral_capability_negotiation() {
+    let mut c = Client::spawn("file_changes", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"change files\"}}],\"_meta\":{{\"jetbrains\":{{\"air\":{{\"agentFileChangeReportRequest\":{{\"version\":1,\"requestId\":\"report-off\"}}}}}}}}}}"
+        ),
+    );
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "prompt terminal: {done}");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("\"agentFileChangeReport\":"),
+        "unnegotiated report emitted: {frames}"
+    );
+    drop(frames);
+    c.finish();
+}
+
+#[test]
 fn approval_preserves_all_choices_with_deny_option() {
     let mut c = Client::spawn("approval", &[]);
     let sid = c.new_session(1, "");
@@ -963,6 +1146,34 @@ fn user_input_options_reach_the_client() {
         "state precedes the offer"
     );
     c.finish();
+}
+
+#[test]
+fn multiple_user_input_schema_is_valid_for_both_protocol_versions() {
+    for (ver, caps) in [
+        (1, ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}"),
+        (2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}"),
+    ] {
+        let mut c = Client::spawn("questions_multiple", &[]);
+        let sid = c.new_session(ver, caps);
+        let _pid = c.prompt(&sid, "ask me");
+        let elicit = c.wait_for("elicitation/create", Duration::from_secs(15));
+        let frame: serde_json::Value =
+            serde_json::from_str(&elicit).expect("multiple-selection elicitation is valid JSON");
+        let schema = &frame["params"]["requestedSchema"]["properties"]["q0"];
+        assert_eq!(
+            schema["type"], "array",
+            "v{ver} question uses an array schema"
+        );
+        assert_eq!(schema["items"]["type"], "string");
+        assert_eq!(
+            schema["items"]["enum"],
+            serde_json::json!(["Alpha", "Beta"])
+        );
+        assert_eq!(schema["minItems"], 1);
+        assert_eq!(schema["maxItems"], 2);
+        c.finish();
+    }
 }
 
 #[test]
@@ -1377,7 +1588,10 @@ fn session_load_rejects_invalid_roots_and_tolerates_mcp() {
         "{\"sessionId\":\"msp-sess-old\",\"cwd\":\"\"}",
         "{\"sessionId\":\"msp-sess-old\",\"cwd\":\"relative\"}",
         "{\"sessionId\":\"msp-sess-old\",\"cwd\":7}",
-        "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":[\"/var/tmp\"]}",
+        "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":null}",
+        "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":[\"relative\"]}",
+        "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":[\"\"]}",
+        "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":[7]}",
     ] {
         let id = c.req("session/load", params);
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
@@ -1483,6 +1697,31 @@ fn v1_advertises_config_options_and_slash_commands() {
 }
 
 #[test]
+fn legacy_set_model_accepts_model_id_and_forwards_to_msp() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let model_id = c.req(
+        "session/set_model",
+        &format!("{{\"sessionId\":\"{sid}\",\"modelId\":\"fake-model\"}}"),
+    );
+    let model_done = c.wait_for(&format!("\"id\":{model_id}"), Duration::from_secs(15));
+    assert!(
+        model_done.contains("\"result\":{\"model\":\"fake-model\"}"),
+        "legacy modelId is accepted: {model_done}"
+    );
+    c.wait_log("session/setModel", Duration::from_secs(15));
+    let frames = std::fs::read_to_string(format!("{}.frames", c.fake_log)).expect("host frames");
+    assert!(
+        frames.lines().any(|line| {
+            line.contains("\"method\": \"session/setModel\"")
+                && line.contains("\"modelId\": \"fake-model\"")
+        }),
+        "MSP setModel receives the requested modelId: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
 fn legacy_set_mode_adopts_the_folded_host_mode() {
     // A host that downgrades the requested mode must not desync the legacy
     // v1 mode state: the reply follows the folded effectiveMode, mirroring
@@ -1502,7 +1741,7 @@ fn legacy_set_mode_adopts_the_folded_host_mode() {
 }
 
 #[test]
-fn v1_jetbrains_mcp_attachment_does_not_hide_config_options() {
+fn v1_jetbrains_mcp_attachment_is_logged_and_not_forwarded() {
     let mut c = Client::spawn("quiet", &[]);
     let init = c.req("initialize", "{\"protocolVersion\":1}");
     let initialized = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
@@ -1534,6 +1773,20 @@ fn v1_jetbrains_mcp_attachment_does_not_hide_config_options() {
         "JetBrains-style session must return v1 selectors: {frame}"
     );
     c.wait_log("session/start", Duration::from_secs(15));
+    c.wait_stderr(
+        "ignoring client-provided MCP servers",
+        Duration::from_secs(15),
+    );
+    let host_frames =
+        std::fs::read_to_string(format!("{}.frames", c.fake_log)).expect("host frames");
+    let start = host_frames
+        .lines()
+        .find(|line| line.contains("\"method\": \"session/start\""))
+        .expect("session/start frame");
+    assert!(
+        !start.contains("\"mcpServers\"") && !start.contains("\"config\""),
+        "client MCP configuration must not cross the MSP boundary: {start}"
+    );
     c.finish();
 }
 
@@ -1721,6 +1974,24 @@ fn leading_space_escapes_a_slash_command() {
 }
 
 #[test]
+fn leading_space_escapes_compact_command() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, " /compact");
+    c.wait_input("\"text\": \" /compact\"", Duration::from_secs(15));
+    let methods = std::fs::read_to_string(&c.fake_log).expect("fake log");
+    assert!(
+        methods.lines().any(|line| line == "turn/start"),
+        "escaped compact text must start a turn: {methods}"
+    );
+    assert!(
+        !methods.lines().any(|line| line == "session/compact"),
+        "escaped compact text must not compact the session: {methods}"
+    );
+    c.finish();
+}
+
+#[test]
 fn reasoning_effort_is_selected_and_sent_to_msp() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
@@ -1865,13 +2136,7 @@ fn steering_targets_a_turn_rehydrated_by_resume() {
     let init = c.req("initialize", "{\"protocolVersion\":2}");
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
-    let resume_id = c.req(
-        "session/resume",
-        &format!(
-            "{{\"sessionId\":\"existing-session\",\"cwd\":{}}}",
-            temp_cwd_json()
-        ),
-    );
+    let resume_id = c.req("session/resume", "{\"sessionId\":\"existing-session\"}");
     let resumed = c.wait_for(&format!("\"id\":{resume_id}"), Duration::from_secs(15));
     assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
 
@@ -2037,6 +2302,7 @@ fn resource_link_inlines_workspace_text() {
     std::fs::create_dir_all(&dir).expect("tmpdir");
     // Percent-encoded name exercises URI decoding + workspace confinement.
     std::fs::write(dir.join("sp ace.txt"), "secret file text").expect("write");
+    std::fs::write(dir.join("context.json"), "json resource text").expect("write");
     let path = dir
         .join("sp%20ace.txt")
         .to_str()
@@ -2047,6 +2313,7 @@ fn resource_link_inlines_workspace_text() {
     } else {
         format!("file://{path}")
     };
+    let json_uri = uri.replace("sp%20ace.txt", "context.json");
     let init = c.req("initialize", "{\"protocolVersion\":1}");
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
@@ -2069,14 +2336,322 @@ fn resource_link_inlines_workspace_text() {
     let pid = c.req(
         "session/prompt",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource_link\",\"uri\":\"{uri}\",\"name\":\"notes\"}}]}}"
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[\
+             {{\"type\":\"resource_link\",\"uri\":\"{uri}\",\"name\":\"notes\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"{json_uri}\",\"name\":\"context\",\"mimeType\":\"application/json\"}}]}}"
         ),
     );
     // Prompt accepted (v1 answers at the terminal, which never comes in
     // quiet mode); the host must have received the inlined text.
     let _pid = pid;
     c.wait_input("secret file text", Duration::from_secs(15));
+    c.wait_input("json resource text", Duration::from_secs(15));
     c.finish();
+}
+
+#[test]
+fn untyped_source_resources_are_inlined() {
+    let mut c = Client::spawn("quiet", &[]);
+    let root = std::path::Path::new(&c.fake_log)
+        .parent()
+        .unwrap()
+        .join("workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    let sid = c.new_session_at(1, &root, &[]);
+    for name in ["notes.go", "Makefile", "page.html", "data.csv"] {
+        let marker = format!("resource-content-{name}");
+        std::fs::write(root.join(name), &marker).unwrap();
+        let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"resource_link","uri":root.join(name),"name":name}]});
+        c.req("session/prompt", &params.to_string());
+        c.wait_input(&marker, Duration::from_secs(15));
+    }
+    c.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn session_list_matches_workspace_symlink_aliases() {
+    let mut c = Client::spawn("quiet", &[]);
+    let base = std::path::Path::new(&c.fake_log)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let root = base.join("workspace");
+    let extra = base.join("extra");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&extra).unwrap();
+    let alias = base.join("alias");
+    std::os::unix::fs::symlink(&base, &alias).unwrap();
+    let sid = c.new_session_at(1, &root, &[&extra]);
+    for (cwd, additional) in [
+        (alias.join("workspace"), extra.clone()),
+        (root, alias.join("extra")),
+    ] {
+        let params = serde_json::json!({"cwd":cwd,"additionalDirectories":[additional]});
+        let id = c.req("session/list", &params.to_string());
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains(&sid),
+            "equivalent workspace filter hid session: {frame}"
+        );
+    }
+    c.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn image_symlink_uses_the_requested_filename_for_mime() {
+    use std::os::unix::fs::symlink;
+
+    let mut c = Client::spawn("quiet", &[]);
+    let primary = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent")
+        .join("workspace");
+    std::fs::create_dir_all(&primary).expect("workspace");
+    std::fs::write(primary.join("image-target"), b"fake jpeg bytes").expect("image target");
+    symlink(primary.join("image-target"), primary.join("photo.jpg")).expect("image symlink");
+    let sid = c.new_session_at(1, &primary, &[]);
+    c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"image\",\"uri\":\"{}\"}}]}}",
+            primary.join("photo.jpg").display()
+        ),
+    );
+    c.wait_input("image/jpeg", Duration::from_secs(15));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert!(
+        input.contains("\"mediaType\": \"image/jpeg\""),
+        "image MIME did not follow the requested .jpg name: {input}"
+    );
+    c.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn additional_roots_are_confined_consistently_across_protocol_versions() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::temp_dir().join(format!(
+        "acp-multi-root-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let primary = base.join("primary");
+    let nested = primary.join("nested");
+    let unrelated = base.join("unrelated");
+    let linked_target = base.join("linked-target");
+    let linked_root = base.join("linked-root");
+    let denied = base.join("denied");
+    for dir in [&nested, &unrelated, &linked_target, &denied] {
+        std::fs::create_dir_all(dir).expect("test root");
+    }
+    std::fs::write(nested.join("nested.txt"), "nested-root-text").unwrap();
+    std::fs::write(primary.join("normalized.txt"), "normalized-root-text").unwrap();
+    std::fs::write(primary.join("CaseFile.txt"), "case-normalized-text").unwrap();
+    std::fs::write(unrelated.join("sp ace.txt"), "unrelated-root-text").unwrap();
+    std::fs::write(linked_target.join("linked.txt"), "symlink-root-text").unwrap();
+    std::fs::write(denied.join("escape.txt"), "must-not-expand").unwrap();
+    std::fs::write(denied.join("hard-source.txt"), "hard-link-text").unwrap();
+    std::fs::write(primary.join("binary.txt"), b"binary-resource-secret\0tail").unwrap();
+    std::fs::write(primary.join("untyped.bin"), b"untyped-binary-secret\0tail").unwrap();
+    symlink(&linked_target, &linked_root).expect("symlinked root");
+    symlink(denied.join("escape.txt"), primary.join("escape-link.txt")).expect("escaping symlink");
+    std::fs::hard_link(
+        denied.join("hard-source.txt"),
+        primary.join("hard-link.txt"),
+    )
+    .expect("hard link into root");
+
+    for ver in [1, 2] {
+        let mut c = Client::spawn("quiet", &[("MUSE_ALLOW_UNSCOPED_READS", "0")]);
+        let sid = c.new_session_at(
+            ver,
+            &primary,
+            // Exercise nested, repeated, unrelated, and symlinked roots.
+            &[&nested, &nested, &primary, &unrelated, &linked_root],
+        );
+        let list_id = c.req(
+            "session/list",
+            &format!(
+                "{{\"cwd\":\"{}\",\"additionalDirectories\":[\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"]}}",
+                primary.display(),
+                nested.display(),
+                nested.display(),
+                primary.display(),
+                unrelated.display(),
+                linked_root.display()
+            ),
+        );
+        let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
+        assert!(
+            listed.contains(&format!("\"sessionId\":\"{sid}\""))
+                && listed.contains("\"additionalDirectories\":["),
+            "ACP v{ver} list omitted its active root set: {listed}"
+        );
+        let encoded_unrelated = unrelated.join("sp%20ace.txt");
+        let prompt = format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[\
+             {{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"nested\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"file://{}/%2E%2E/normalized.txt\",\"name\":\"normalized\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"file://{}\",\"name\":\"unrelated\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"linked-root\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"hard-link\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"binary\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"untyped-binary\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"escape\"}}]}}",
+            nested.join("nested.txt").display(),
+            nested.display(),
+            encoded_unrelated.display(),
+            linked_root.join("linked.txt").display(),
+            primary.join("hard-link.txt").display(),
+            primary.join("binary.txt").display(),
+            primary.join("untyped.bin").display(),
+            primary.join("escape-link.txt").display(),
+        );
+        c.req("session/prompt", &prompt);
+        c.wait_input("hard-link-text", Duration::from_secs(15));
+        let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        for expected in [
+            "nested-root-text",
+            "normalized-root-text",
+            "unrelated-root-text",
+            "symlink-root-text",
+            "hard-link-text",
+        ] {
+            assert!(
+                input.contains(expected),
+                "ACP v{ver} omitted {expected}: {input}"
+            );
+        }
+        assert!(
+            !input.contains("must-not-expand"),
+            "ACP v{ver} followed a symlink outside every approved root: {input}"
+        );
+        assert!(
+            !input.contains("binary-resource-secret"),
+            "ACP v{ver} expanded binary content as text: {input}"
+        );
+        assert!(
+            !input.contains("untyped-binary-secret"),
+            "ACP v{ver} expanded an untyped binary link: {input}"
+        );
+        c.req(
+            "session/prompt",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"outside-hard-link-name\"}}]}}",
+                denied.join("hard-source.txt").display()
+            ),
+        );
+        c.wait_input("outside-hard-link-name", Duration::from_secs(15));
+        let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        let last_prompt = input.lines().last().unwrap_or_default();
+        assert!(
+            !last_prompt.contains("hard-link-text"),
+            "ACP v{ver} authorized an out-of-root hard-link name: {last_prompt}"
+        );
+        let alternate_case = primary.join("casefile.txt");
+        if alternate_case.exists() {
+            c.req(
+                "session/prompt",
+                &format!(
+                    "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"case\"}}]}}",
+                    alternate_case.display()
+                ),
+            );
+            c.wait_input("case-normalized-text", Duration::from_secs(15));
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn malformed_file_uri_percent_escapes_are_rejected() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    for uri in ["file:///tmp/bad%", "file:///tmp/bad%GG"] {
+        let id = c.req(
+            "session/prompt",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource_link\",\"uri\":\"{uri}\",\"name\":\"bad\"}}]}}"
+            ),
+        );
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"error\"") && frame.contains("percent escape"),
+            "malformed URI must fail before reaching the host: {frame}"
+        );
+    }
+    c.finish();
+}
+
+#[test]
+fn resume_omission_drops_previously_active_additional_roots() {
+    let mut c = Client::spawn("quiet", &[]);
+    let base = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent");
+    let primary = base.join("workspace");
+    let additional = base.join("additional");
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::create_dir_all(&additional).unwrap();
+    let sid = c.new_session_at(1, &primary, &[&additional]);
+    let resume_id = c.req(
+        "session/resume",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"cwd\":\"{}\"}}",
+            primary.display()
+        ),
+    );
+    let resumed = c.wait_for(&format!("\"id\":{resume_id}"), Duration::from_secs(15));
+    assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
+    let list_id = c.req(
+        "session/list",
+        &format!("{{\"cwd\":\"{}\"}}", primary.display()),
+    );
+    let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
+    assert!(
+        listed.contains(&format!(
+            "\"sessionId\":\"{sid}\",\"cwd\":\"{}\",\"additionalDirectories\":[]",
+            primary.display()
+        )),
+        "resume implicitly restored an omitted root: {listed}"
+    );
+    c.finish();
+}
+
+#[test]
+fn unscoped_resource_expansion_requires_a_truthy_override() {
+    for (value, expands) in [("0", false), ("true", true)] {
+        let mut c = Client::spawn("quiet", &[("MUSE_ALLOW_UNSCOPED_READS", value)]);
+        let primary = std::path::Path::new(&c.fake_log)
+            .parent()
+            .unwrap()
+            .join("workspace");
+        let outside = primary.parent().unwrap().join("outside.txt");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::write(&outside, "explicit-unscoped-text").unwrap();
+        let sid = c.new_session_at(1, &primary, &[]);
+        c.req(
+            "session/prompt",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"outside-resource\"}}]}}",
+                outside.display()
+            ),
+        );
+        c.wait_input("outside-resource", Duration::from_secs(15));
+        let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        assert_eq!(
+            input.contains("explicit-unscoped-text"),
+            expands,
+            "override value {value:?} produced the wrong confinement behavior: {input}"
+        );
+        c.finish();
+    }
 }
 
 #[test]
@@ -2120,7 +2695,10 @@ fn invalid_session_roots_are_rejected() {
 
     for params in [
         "{\"cwd\":\"relative\"}",
-        "{\"cwd\":\"/tmp\",\"additionalDirectories\":[\"/var/tmp\"]}",
+        "{\"cwd\":\"/tmp\",\"additionalDirectories\":null}",
+        "{\"cwd\":\"/tmp\",\"additionalDirectories\":[\"relative\"]}",
+        "{\"cwd\":\"/tmp\",\"additionalDirectories\":[\"\"]}",
+        "{\"cwd\":\"/tmp\",\"additionalDirectories\":[7]}",
     ] {
         let id = c.req("session/new", params);
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
@@ -2744,9 +3322,16 @@ fn session_fork_advertises_and_copies_without_a_cut_point() {
         init_frame.contains("\"fork\":{}"),
         "fork capability not advertised: {init_frame}"
     );
+    let cwd = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent")
+        .join("workspace");
     let fid = c.req(
         "session/fork",
-        &format!("{{\"sessionId\":\"{sid}\",\"cwd\":{}}}", temp_cwd_json()),
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"cwd\":\"{}\"}}",
+            cwd.to_str().expect("UTF-8 cwd").replace('\\', "\\\\")
+        ),
     );
     let frame = c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
     assert!(frame.contains("\"result\""), "fork failed: {frame}");
@@ -2771,6 +3356,22 @@ fn session_fork_advertises_and_copies_without_a_cut_point() {
     assert!(
         pframe.contains("\"stopReason\":\"end_turn\""),
         "forked session prompt failed: {pframe}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_fork_rejects_a_workspace_the_host_did_not_apply() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(1, "");
+    let fid = c.req(
+        "session/fork",
+        &format!("{{\"sessionId\":\"{sid}\",\"cwd\":\"/\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"error\"") && frame.contains("does not match"),
+        "fork must not widen adapter scope beyond the MSP root: {frame}"
     );
     c.finish();
 }
@@ -3031,8 +3632,8 @@ fn async_task_updates_follow_negotiation() {
         "tool task missing: {tool_task}"
     );
     assert!(
-        tool_task.contains("\"canStop\":false"),
-        "canStop must be honest without a host stop: {tool_task}"
+        tool_task.contains("\"canStop\":true"),
+        "negotiated MSP task control must make background work stoppable: {tool_task}"
     );
 
     // User shell: its own task, spawned once and settled from exit facts.
@@ -3083,6 +3684,45 @@ fn async_task_updates_stay_off_without_negotiation() {
 }
 
 #[test]
+fn async_tasks_reconcile_on_resume() {
+    let mut c = Client::spawn("async_resume", &[]);
+    let init = c.req(
+        "initialize",
+        "{\"protocolVersion\":2,\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}}",
+    );
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let rid = c.req(
+        "session/resume",
+        "{\"sessionId\":\"existing-session\",\"replayFrom\":\"start\"}",
+    );
+    let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
+    c.wait_for("call-bg-resumed", Duration::from_secs(15));
+    c.wait_for("shell-shell-resumed", Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert_eq!(
+        frames.matches("async_task_spawned").count(),
+        2,
+        "only active durable tasks should be restored: {frames}"
+    );
+    assert_eq!(
+        frames
+            .lines()
+            .filter(|line| line.contains("call-bg-resumed")
+                && line.contains("\"status\":\"in_progress\""))
+            .count(),
+        1,
+        "duplicate replayed task: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
 fn async_task_stop_is_rejected_honestly() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
@@ -3095,6 +3735,90 @@ fn async_task_stop_is_rejected_honestly() {
         frame.contains("not supported by the Muse host"),
         "stop must fail explicitly: {frame}"
     );
+    c.finish();
+}
+
+#[test]
+fn async_task_stop_maps_to_msp_task_stop_and_folds_terminal_item_update() {
+    let mut c = Client::spawn("async_task_stop", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    let _pid = c.prompt(&sid, "run in background");
+    c.wait_for("\"asyncTaskId\":\"call-bg-stop\"", Duration::from_secs(15));
+    let rid = c.req(
+        "_session/async_task/stop",
+        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"call-bg-stop\"}}"),
+    );
+    let ack = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(ack.contains("\"stopped\":true"), "stop admitted: {ack}");
+    let state = c.wait_for("\"state\":\"stopped\"", Duration::from_secs(15));
+    assert!(
+        state.contains("call-bg-stop"),
+        "terminal item update settles the owning task: {state}"
+    );
+    let frames_path = format!("{}.frames", c.fake_log);
+    c.finish();
+    let frames = std::fs::read_to_string(frames_path).expect("fake host frames");
+    assert!(
+        frames.contains("\"method\": \"task/stop\"")
+            && frames.contains("\"taskId\": \"it-bg-stop\""),
+        "MSP stop targets the durable item id: {frames}"
+    );
+}
+
+#[test]
+fn async_task_session_cancel_maps_to_msp_stop_all() {
+    let mut c = Client::spawn("async_task_stop_all", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    let _pid = c.prompt(&sid, "run in background");
+    c.wait_for("call-bg-all-1", Duration::from_secs(15));
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_log("task/stopAll", Duration::from_secs(15));
+    let stopped = c.wait_for("\"state\":\"stopped\"", Duration::from_secs(15));
+    assert!(
+        stopped.contains("call-bg-all-"),
+        "stopAll terminal updates settle background cards: {stopped}"
+    );
+    let frames_path = format!("{}.frames", c.fake_log);
+    c.finish();
+    let frames = std::fs::read_to_string(frames_path).expect("fake host frames");
+    assert!(
+        frames.contains("\"method\": \"task/stopAll\"")
+            && !frames
+                .lines()
+                .filter(|line| line.contains("\"method\": \"task/stopAll\""))
+                .any(|line| line.contains("\"taskId\"")),
+        "MSP stopAll has no targeted task id: {frames}"
+    );
+}
+
+#[test]
+fn async_task_stop_host_rejection_does_not_claim_stopped() {
+    let mut c = Client::spawn(
+        "async_task_stop",
+        &[
+            ("FAKE_ERROR_METHOD", "task/stop"),
+            ("FAKE_ERROR_MESSAGE", "method not found"),
+        ],
+    );
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    let _pid = c.prompt(&sid, "run in background");
+    c.wait_for("call-bg-stop", Duration::from_secs(15));
+    let rid = c.req(
+        "_session/async_task/stop",
+        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"call-bg-stop\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"error\"") && frame.contains("method not found"));
+    assert!(!frame.contains("\"stopped\":true"));
     c.finish();
 }
 
@@ -3520,6 +4244,142 @@ fn client_disconnect_exits_promptly_with_a_turn_in_flight() {
 }
 
 #[test]
+fn closed_host_stdin_does_not_strand_a_request() {
+    let marker = std::env::temp_dir().join(format!(
+        "muse-acp-closed-stdin-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let marker_str = marker.to_str().unwrap().to_string();
+    let mut c = Client::spawn(
+        "close_stdin",
+        &[("FAKE_RESTART_MARKER", marker_str.as_str())],
+    );
+    let started = Instant::now();
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let request = c.req("session/new", "{\"cwd\":\"/tmp\"}");
+    let frame = c.wait_for(&format!("\"id\":{request}"), Duration::from_secs(5));
+    assert!(
+        frame.contains("\"result\"") || frame.contains("\"error\""),
+        "request must settle after host stdin closure: {frame}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "closed host stdin left the ACP request waiting"
+    );
+    c.finish();
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_host_stdout_reaps_the_child_without_waiting_for_process_exit() {
+    let marker = std::env::temp_dir().join(format!(
+        "muse-acp-closed-stdout-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let marker_str = marker.to_str().unwrap().to_string();
+    let mut c = Client::spawn(
+        "stdout_close_stays_alive",
+        &[("FAKE_RESTART_MARKER", marker_str.as_str())],
+    );
+    let _sid = c.new_session(1, "");
+    c.wait_stderr(
+        "host-restarted attempt=1 sessions=1 failures=0",
+        Duration::from_secs(10),
+    );
+    let pid_path = format!("{}.pid", c.fake_log);
+    let pid = c.wait_for_pid(&pid_path, Duration::from_secs(5));
+    assert!(
+        !process_alive(pid),
+        "host whose stdout closed was left running: pid={pid}"
+    );
+    c.finish();
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
+fn closed_editor_stdout_does_not_block_adapter_shutdown() {
+    let mut cmd = Command::new(adapter_bin());
+    cmd.env("MUSE_CLI", fixture())
+        .env("FAKE_SCENARIO", "quiet")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn adapter");
+    let mut stdin = child.stdin.take().expect("adapter stdin");
+    drop(child.stdout.take());
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}\n")
+        .expect("write initialize");
+    stdin.flush().expect("flush initialize");
+    drop(stdin);
+    let status = child
+        .wait_timeout(Duration::from_secs(5))
+        .expect("wait")
+        .expect("adapter exits after stdout closes");
+    assert!(status.success(), "closed stdout exit: {status}");
+}
+
+#[test]
+fn timed_out_pipe_write_cannot_be_delivered_later() {
+    let mut c = Client::spawn("pipe_stall", &[]);
+    let sid = c.new_session(1, "");
+    let list = c.req("session/list", "{}");
+    c.wait_for(&format!("\"id\":{list}"), Duration::from_secs(5));
+    c.wait_log("pipe-stall-start", Duration::from_secs(5));
+    let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"text","text":"x".repeat(128 * 1024)}]});
+    let id = c.req("session/prompt", &params.to_string());
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(12));
+    assert!(
+        frame.contains("error") && frame.contains("host terminated"),
+        "{frame}"
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    let log = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !log.lines().any(|line| line == "turn/start"),
+        "timed-out command reached host: {log}"
+    );
+    c.finish();
+}
+
+#[test]
+fn host_shutdown_allows_pending_flush_after_stdin_eof() {
+    let mut c = Client::spawn("shutdown_flush", &[]);
+    c.new_session(1, "");
+    let log = c.fake_log.clone();
+    c.finish();
+    assert!(
+        std::fs::read_to_string(log)
+            .unwrap()
+            .contains("shutdown-flushed")
+    );
+}
+
+#[test]
+fn host_stderr_is_drained_while_the_host_is_running() {
+    let mut c = Client::spawn("stderr_flood", &[]);
+    let _sid = c.new_session(1, "");
+    let stderr_path = c.stderr_log.clone();
+    c.finish();
+    let stderr = std::fs::read_to_string(stderr_path).expect("adapter stderr");
+    assert!(
+        stderr.contains("serve stderr captured 32768 bytes"),
+        "bounded host stderr capture missing: {stderr}"
+    );
+}
+
+#[test]
 fn support_bundle_redacts_unknown_muse_env_values() {
     let out = std::process::Command::new(adapter_bin())
         .arg("--support")
@@ -3686,6 +4546,46 @@ fn expired_authentication_mid_turn_surfaces_in_both_protocols() {
         assert!(
             !frame.contains("secret-sentinel") && !frame.contains("retry the same prompt"),
             "{frame}"
+        );
+        if version == 1 {
+            assert!(frame.contains("\"code\":-32000"), "{frame}");
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn auth_required_turn_kind_surfaces_relogin_guidance_in_both_protocols() {
+    for version in [1, 2] {
+        let mut c = Client::spawn(
+            "failed",
+            &[
+                ("FAKE_TURN_ERROR_KIND", "authRequired"),
+                (
+                    "FAKE_TURN_ERROR_MESSAGE",
+                    "provider rejected the session token: secret-sentinel",
+                ),
+                ("FAKE_TURN_ERROR_RETRYABLE", "false"),
+            ],
+        );
+        let sid = c.new_session(version, "");
+        let id = c.prompt(&sid, "hi");
+        let frame = if version == 1 {
+            c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15))
+        } else {
+            c.wait_for("Muse is not authenticated", Duration::from_secs(15))
+        };
+        assert!(
+            frame.contains("Muse is not authenticated")
+                && frame.contains("muse login")
+                && frame.contains(fixture_name()),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("secret-sentinel") && !frame.contains("terminal 'failed'"),
+            "raw auth detail or generic failure leaked: {frame}"
         );
         if version == 1 {
             assert!(frame.contains("\"code\":-32000"), "{frame}");
