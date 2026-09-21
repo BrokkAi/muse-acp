@@ -21,7 +21,9 @@ use std::sync::{
     mpsc,
 };
 
-use acp::{AcpSession, FileChangeReport, InFlight, PendingPerm, Sessions, StdoutShared};
+use acp::{
+    AcpSession, FileChangeReport, HostTitleFacts, InFlight, PendingPerm, Sessions, StdoutShared,
+};
 use fold::SessionFold;
 use json::{J, esc, j_to_string, mint_id, parse_json};
 use msp::{
@@ -860,10 +862,10 @@ fn backfill_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Session
         adopt_reasoning_effort(s, state);
     }
     if let Some(name) = session_name
-        && s.session_name != name
+        && s.title_facts.name != name
     {
-        s.session_name = name.clone();
-        title_update = Some(name);
+        s.title_facts.name = name.clone();
+        title_update = Some(s.title_facts.selected().map(str::to_string));
     }
     if let Some(name) = title_update {
         acp::send_session_title(stdout, acp_sid, name.as_deref());
@@ -2257,7 +2259,10 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .and_then(|s| s.get("activeTurnId"))
                         .and_then(|v| v.as_str())
                         .map(str::to_string);
-                    let session_name = session_name_from_result(&r);
+                    let host_session = r.get("session");
+                    let initial_title_facts = title_facts(host_session);
+                    let branch_meta = raw_host_fact(host_session, "branch");
+                    let attention_meta = raw_host_fact(host_session, "attention");
                     sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(
                         sid.clone(),
                         AcpSession {
@@ -2289,8 +2294,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             usage_seen: std::collections::HashSet::new(),
                             subscription_usage: None,
                             goal_meta: None,
-                            branch_meta: None,
-                            session_name: session_name.as_ref().and_then(Clone::clone),
+                            branch_meta,
+                            attention_meta,
+                            title_facts: initial_title_facts.clone(),
                             child_folds: HashMap::new(),
                             turn_usage: Vec::new(),
                         },
@@ -2335,8 +2341,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     };
                     let skills = skill_catalog(host, &msp_sid).unwrap_or_default();
                     acp::send_result(stdout, &id, &result);
-                    if let Some(name) = session_name {
-                        acp::send_session_title(stdout, &sid, name.as_deref());
+                    if let Some(title) = initial_title_facts.selected() {
+                        acp::send_session_title(stdout, &sid, Some(title));
                     }
                     acp::send_available_commands(stdout, &sid, ver, &skills);
                     // Subscription usage is host-global and may already be
@@ -2506,6 +2512,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         || (method == "session/resume"
                             && ver == 2
                             && params.as_ref().and_then(|p| p.get("replayFrom")).is_some());
+                    let mut title_update: Option<Option<String>> = None;
                     {
                         let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                         let entry = map.entry(sid.clone()).or_insert_with(|| AcpSession {
@@ -2538,7 +2545,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             subscription_usage: None,
                             goal_meta: None,
                             branch_meta: None,
-                            session_name: None,
+                            attention_meta: None,
+                            title_facts: HostTitleFacts::default(),
                             child_folds: HashMap::new(),
                             turn_usage: Vec::new(),
                         });
@@ -2554,6 +2562,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         if !real_model.is_empty() {
                             entry.model_value = real_model;
                         }
+                        if let Some(host_session) = r.get("session")
+                            && update_host_session_facts(entry, host_session)
+                        {
+                            title_update = Some(entry.title_facts.selected().map(str::to_string));
+                        }
                         if !resume_head.is_empty() {
                             entry.view_cursor = resume_head.clone();
                         }
@@ -2568,8 +2581,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             entry.mode_value = acp::mode_from_msp(&m).to_string();
                         }
                         if let Some(name) = &session_name {
-                            entry.session_name = name.clone();
-                            acp::send_session_title(stdout, &sid, name.as_deref());
+                            entry.title_facts.name = name.clone();
+                            title_update = Some(entry.title_facts.selected().map(str::to_string));
                         }
                         // Usage the host already knows, restored from the
                         // snapshot rather than from message replay: Muse
@@ -2629,6 +2642,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         }
                         reconcile_active_tasks(stdout, entry, &r, replay);
                         acp::send_usage(stdout, entry, pressure.as_deref());
+                    }
+                    if let Some(title) = title_update {
+                        acp::send_session_title(stdout, &sid, title.as_deref());
                     }
                     // session/load and an explicit v2 replay already deliver
                     // history to ACP. Replaying the same suffix again through
@@ -2809,11 +2825,6 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let session_name = new_session.get("name").and_then(|v| match v {
-                        J::Str(name) => Some(Some(name.clone())),
-                        J::Null => Some(None),
-                        _ => None,
-                    });
                     let host_cwd = new_session
                         .get("workspaceRoot")
                         .and_then(|v| v.as_str())
@@ -2847,6 +2858,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     if let Some(m) = host_mode(&r) {
                         mode_value = acp::mode_from_msp(&m).to_string();
                     }
+                    let fork_title_facts = title_facts(Some(&new_session));
+                    let fork_branch_meta = raw_host_fact(Some(&new_session), "branch");
+                    let fork_attention_meta = raw_host_fact(Some(&new_session), "attention");
                     {
                         let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                         let entry = map.entry(new_msp.clone()).or_insert_with(|| AcpSession {
@@ -2884,7 +2898,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             subscription_usage: None,
                             goal_meta: None,
                             branch_meta: None,
-                            session_name: session_name.as_ref().and_then(Clone::clone),
+                            attention_meta: None,
+                            title_facts: HostTitleFacts::default(),
                             child_folds: HashMap::new(),
                             turn_usage: Vec::new(),
                         });
@@ -2898,6 +2913,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         if !mode_value.is_empty() {
                             entry.mode_value = mode_value;
                         }
+                        entry.title_facts = fork_title_facts.clone();
+                        entry.branch_meta = fork_branch_meta.clone();
+                        entry.attention_meta = fork_attention_meta.clone();
                         if let Some(state) = snapshot_state(&r) {
                             adopt_reasoning_effort(entry, state);
                         }
@@ -2947,8 +2965,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     };
                     acp::send_result(stdout, &id, &result);
                     refresh_subscription_usage(host, stdout, sessions, &new_msp);
-                    if let Some(name) = session_name {
-                        acp::send_session_title(stdout, &new_msp, name.as_deref());
+                    if let Some(title) = fork_title_facts.selected() {
+                        acp::send_session_title(stdout, &new_msp, Some(title));
                     }
                 }
                 Err(e) => acp::send_error(
@@ -3670,100 +3688,66 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 host_params.push_str(&format!(",\"workspaceRoot\":{}", esc(&filter_root)));
             }
             host_params.push('}');
-            // Snapshot adapter state without holding the lock across the host call.
-            let owned: Vec<(String, String, Option<String>, Vec<String>)> = sessions
-                .lock()
-                .unwrap()
-                .values()
-                .filter(|s| filter_root.is_empty() || same_workspace_root(&s.cwd, &filter_root))
-                .filter(|s| {
-                    filter_additional.is_empty()
-                        || same_workspace_roots(
-                            s.roots.get(1..).unwrap_or_default(),
-                            &filter_additional,
-                        )
-                })
-                .map(|s| {
-                    (
-                        s.msp_sid.clone(),
-                        s.cwd.clone(),
-                        s.session_name.clone(),
-                        s.roots.get(1..).unwrap_or_default().to_vec(),
-                    )
-                })
-                .collect();
             match host.command("session/list", &host_params) {
                 Ok(r) => {
                     let mut listed = std::collections::HashSet::new();
                     let mut entries = Vec::new();
+                    let mut title_updates = Vec::new();
                     if let Some(J::Arr(items)) = r.get("sessions") {
+                        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                         for item in items {
-                            let msp_id =
-                                item.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
+                            let msp_id = item.get("sessionId").and_then(J::as_str).unwrap_or("");
                             if msp_id.is_empty() {
                                 continue;
                             }
-                            let owned_entry = owned.iter().find(|(m, _, _, _)| m == msp_id);
-                            if owned_entry.is_none() && !filter_additional.is_empty() {
-                                continue;
-                            }
-                            let cwd = item
-                                .get("workspaceRoot")
-                                .and_then(|v| v.as_str())
-                                .or_else(|| owned_entry.map(|(_, c, _, _)| c.as_str()))
-                                .unwrap_or("");
-                            if !filter_root.is_empty() && !same_workspace_root(cwd, &filter_root) {
-                                continue;
-                            }
-                            let mut parts = vec![
-                                format!("\"sessionId\":{}", esc(msp_id)),
-                                format!("\"cwd\":{}", esc(cwd)),
-                            ];
-                            if let Some((_, _, _, additional)) = owned_entry {
-                                parts.push(format!(
-                                    "\"additionalDirectories\":[{}]",
-                                    additional
-                                        .iter()
-                                        .map(|r| esc(r))
-                                        .collect::<Vec<_>>()
-                                        .join(",")
+                            listed.insert(msp_id.to_string());
+                            if let Some(session) = map.values_mut().find(|s| s.msp_sid == msp_id) {
+                                if update_host_session_facts(session, item) {
+                                    title_updates.push((
+                                        session.acp_sid.clone(),
+                                        session.title_facts.selected().map(str::to_string),
+                                    ));
+                                }
+                                if session_matches_filter(session, &filter_root, &filter_additional)
+                                {
+                                    entries.push(owned_session_row(
+                                        session,
+                                        item.get("updatedAt").and_then(J::as_str),
+                                    ));
+                                }
+                            } else {
+                                let cwd =
+                                    item.get("workspaceRoot").and_then(J::as_str).unwrap_or("");
+                                if !filter_additional.is_empty()
+                                    || (!filter_root.is_empty()
+                                        && !same_workspace_root(cwd, &filter_root))
+                                {
+                                    continue;
+                                }
+                                entries.push(session_info_row(
+                                    msp_id,
+                                    cwd,
+                                    title_facts(Some(item)).selected(),
+                                    item.get("updatedAt").and_then(J::as_str),
+                                    raw_host_fact(Some(item), "branch").as_deref(),
+                                    raw_host_fact(Some(item), "attention").as_deref(),
                                 ));
                             }
-                            if let Some(name) = item.get("name").and_then(|v| v.as_str()) {
-                                parts.push(format!("\"title\":{}", esc(name)));
-                            }
-                            if let Some(updated) = item.get("updatedAt").and_then(|v| v.as_str()) {
-                                parts.push(format!("\"updatedAt\":{}", esc(updated)));
-                            }
-                            entries.push(format!("{{{}}}", parts.join(",")));
-                            listed.insert(msp_id.to_string());
+                        }
+                    }
+                    for (sid, title) in title_updates {
+                        acp::send_session_title(stdout, &sid, title.as_deref());
+                    }
+                    for (sid, row) in owned_session_rows(sessions, &filter_root, &filter_additional)
+                    {
+                        if !listed.contains(&sid) {
+                            entries.push(row);
                         }
                     }
                     let next_cursor = r
                         .get("nextCursor")
                         .map(j_to_string)
                         .unwrap_or_else(|| "null".to_string());
-                    for (m, c, name, additional) in &owned {
-                        if listed.contains(m) {
-                            continue;
-                        }
-                        let mut parts = vec![
-                            format!("\"sessionId\":{}", esc(m)),
-                            format!("\"cwd\":{}", esc(c)),
-                        ];
-                        parts.push(format!(
-                            "\"additionalDirectories\":[{}]",
-                            additional
-                                .iter()
-                                .map(|r| esc(r))
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        ));
-                        if let Some(name) = name {
-                            parts.push(format!("\"title\":{}", esc(name)));
-                        }
-                        entries.push(format!("{{{}}}", parts.join(",")));
-                    }
                     acp::send_result(
                         stdout,
                         &id,
@@ -3778,18 +3762,12 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         acp::send_error(stdout, &id, -32000, &err_message(&e));
                         return;
                     }
-                    // A host listing hiccup must not hide live sessions.
                     log(&format!("session/list failed: {}", err_message(&e)));
-                    let entries: Vec<String> = owned
-                        .iter()
-                        .map(|(m, c, name, additional)| {
-                            let title = name
-                                .as_deref()
-                                .map(|n| format!(",\"title\":{}", esc(n)))
-                                .unwrap_or_default();
-                            format!("{{\"sessionId\":{},\"cwd\":{}{title},\"additionalDirectories\":[{}]}}", esc(m), esc(c), additional.iter().map(|r| esc(r)).collect::<Vec<_>>().join(","))
-                        })
-                        .collect();
+                    let entries: Vec<String> =
+                        owned_session_rows(sessions, &filter_root, &filter_additional)
+                            .into_iter()
+                            .map(|(_, row)| row)
+                            .collect();
                     acp::send_result(
                         stdout,
                         &id,
@@ -4571,6 +4549,127 @@ fn local_file_text(uri: &str, roots: &[String]) -> Result<Option<String>, String
 // MSP -> ACP event routing (main thread; the serve reader only forwards)
 // ---------------------------------------------------------------------------
 
+fn host_text_fact(value: Option<&J>) -> Option<String> {
+    value
+        .and_then(J::as_str)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn update_title_facts(facts: &mut HostTitleFacts, host_session: &J) {
+    if let Some(value) = host_session.get("name") {
+        facts.name = host_text_fact(Some(value));
+    }
+    if let Some(value) = host_session.get("title") {
+        facts.title = host_text_fact(Some(value));
+    }
+    if let Some(value) = host_session.get("firstUserPrompt") {
+        facts.first_user_prompt = host_text_fact(Some(value));
+    }
+}
+
+fn title_facts(host_session: Option<&J>) -> HostTitleFacts {
+    let mut facts = HostTitleFacts::default();
+    if let Some(host_session) = host_session {
+        update_title_facts(&mut facts, host_session);
+    }
+    facts
+}
+
+fn raw_host_fact(host_session: Option<&J>, key: &str) -> Option<String> {
+    host_session
+        .and_then(|session| session.get(key))
+        .map(j_to_string)
+}
+
+/// Merge host session metadata into an adapter-owned session and report
+/// whether the selected host-authored title changed.
+fn update_host_session_facts(session: &mut AcpSession, host_session: &J) -> bool {
+    let old_title = session.title_facts.selected().map(str::to_string);
+    update_title_facts(&mut session.title_facts, host_session);
+    if let Some(branch) = host_session.get("branch") {
+        session.branch_meta = Some(j_to_string(branch));
+    }
+    if let Some(attention) = host_session.get("attention") {
+        session.attention_meta = Some(j_to_string(attention));
+    }
+    old_title != session.title_facts.selected().map(str::to_string)
+}
+
+fn session_info_row(
+    session_id: &str,
+    cwd: &str,
+    title: Option<&str>,
+    updated_at: Option<&str>,
+    branch: Option<&str>,
+    attention: Option<&str>,
+) -> String {
+    let mut parts = vec![
+        format!("\"sessionId\":{}", esc(session_id)),
+        format!("\"cwd\":{}", esc(cwd)),
+    ];
+    if let Some(title) = title {
+        parts.push(format!("\"title\":{}", esc(title)));
+    }
+    if let Some(updated_at) = updated_at {
+        parts.push(format!("\"updatedAt\":{}", esc(updated_at)));
+    }
+    let mut muse = Vec::new();
+    if let Some(branch) = branch {
+        muse.push(format!("\"branch\":{branch}"));
+    }
+    if let Some(attention) = attention {
+        muse.push(format!("\"attention\":{attention}"));
+    }
+    if !muse.is_empty() {
+        parts.push(format!("\"_meta\":{{\"muse\":{{{}}}}}", muse.join(",")));
+    }
+    format!("{{{}}}", parts.join(","))
+}
+
+fn session_matches_filter(session: &AcpSession, root: &str, additional: &[String]) -> bool {
+    (root.is_empty() || same_workspace_root(&session.cwd, root))
+        && (additional.is_empty()
+            || same_workspace_roots(session.roots.get(1..).unwrap_or_default(), additional))
+}
+
+fn owned_session_row(session: &AcpSession, updated_at: Option<&str>) -> String {
+    let mut row = session_info_row(
+        &session.msp_sid,
+        &session.cwd,
+        session.title_facts.selected(),
+        updated_at,
+        session.branch_meta.as_deref(),
+        session.attention_meta.as_deref(),
+    );
+    row.pop();
+    row.push_str(&format!(
+        ",\"additionalDirectories\":[{}]}}",
+        session
+            .roots
+            .iter()
+            .skip(1)
+            .map(|r| esc(r))
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
+    row
+}
+
+fn owned_session_rows(
+    sessions: &Sessions,
+    root: &str,
+    additional: &[String],
+) -> Vec<(String, String)> {
+    sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
+        .filter(|s| session_matches_filter(s, root, additional))
+        .map(|s| (s.msp_sid.clone(), owned_session_row(s, None)))
+        .collect()
+}
+
 fn find_acp_sid(sessions: &Sessions, msp_sid: &str) -> Option<String> {
     // Tolerate a poisoned lock like every other site: a panic while another
     // thread held this mutex must not take down the routing thread, which also
@@ -5295,31 +5394,6 @@ fn handle_msp(
                 let _ = acp_sid;
             }
         }
-        "session/nameChanged" => {
-            let msp_sid = params
-                .get("sessionId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let Some(acp_sid) = find_acp_sid(sessions, msp_sid) else {
-                return;
-            };
-            let name = match params.get("name") {
-                Some(J::Str(name)) => Some(name.clone()),
-                // MSP 1.3.0 currently sends a string here. Tolerating an
-                // explicit null lets a future clear operation remove a stale
-                // ACP title without inventing a replacement.
-                Some(J::Null) => None,
-                _ => return,
-            };
-            if let Some(s) = sessions
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get_mut(&acp_sid)
-            {
-                s.session_name = name.clone();
-                acp::send_session_title(stdout, &acp_sid, name.as_deref());
-            }
-        }
         "session/todoListChanged" => {
             let msp_sid = params
                 .get("sessionId")
@@ -5327,6 +5401,29 @@ fn handle_msp(
                 .unwrap_or("");
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
                 acp::send_plan(stdout, &acp_sid, params.get("items"));
+            }
+        }
+        "session/nameChanged" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                let (changed, title) = {
+                    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                    match map.get_mut(&acp_sid) {
+                        Some(session) => {
+                            let old_title = session.title_facts.selected().map(str::to_string);
+                            update_title_facts(&mut session.title_facts, params);
+                            let title = session.title_facts.selected().map(str::to_string);
+                            (old_title != title, title)
+                        }
+                        None => (false, None),
+                    }
+                };
+                if changed {
+                    acp::send_session_title(stdout, &acp_sid, title.as_deref());
+                }
             }
         }
         "session/goalChanged" => {
