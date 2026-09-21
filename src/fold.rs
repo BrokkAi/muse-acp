@@ -174,6 +174,10 @@ impl SessionFold {
         }
     }
 
+    pub fn has_active_item(&self, item_id: &str) -> bool {
+        self.items.contains_key(item_id)
+    }
+
     fn known(&self, item_id: &str) -> bool {
         self.done.contains(item_id)
     }

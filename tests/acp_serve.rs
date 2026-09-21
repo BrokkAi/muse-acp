@@ -3403,7 +3403,7 @@ fn async_tasks_reconcile_on_resume() {
     c.notify("initialized", "{}");
     let rid = c.req(
         "session/resume",
-        "{\"sessionId\":\"existing-session\",\"cwd\":\"/tmp\"}",
+        "{\"sessionId\":\"existing-session\",\"replayFrom\":\"start\"}",
     );
     let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
     assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
@@ -3419,9 +3419,14 @@ fn async_tasks_reconcile_on_resume() {
         2,
         "only active durable tasks should be restored: {frames}"
     );
-    assert!(
-        !frames.contains("old command"),
-        "terminal task was restored: {frames}"
+    assert_eq!(
+        frames
+            .lines()
+            .filter(|line| line.contains("call-bg-resumed")
+                && line.contains("\"status\":\"in_progress\""))
+            .count(),
+        1,
+        "duplicate replayed task: {frames}"
     );
     c.finish();
 }

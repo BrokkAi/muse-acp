@@ -955,7 +955,7 @@ fn restart_durable_host(
                                     {
                                         s.model_value = model.to_string();
                                     }
-                                    reconcile_active_tasks(stdout, s, &r);
+                                    reconcile_active_tasks(stdout, s, &r, false);
                                 }
                             }
                             // Prompts whose turns no longer exist in the
@@ -1721,7 +1721,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         if replay {
                             replay_history(stdout, entry, &r);
                         }
-                        reconcile_active_tasks(stdout, entry, &r);
+                        reconcile_active_tasks(stdout, entry, &r, replay);
                         acp::send_usage(stdout, entry, pressure.as_deref());
                     }
                     // One-to-one with the folded active/queued turns, or an
@@ -3010,7 +3010,12 @@ fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) 
 /// a reconnecting editor still needs controls and status for work that remains
 /// active. Terminal history is deliberately ignored; live completion events
 /// settle tasks that this connection already announced.
-fn reconcile_active_tasks(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) {
+fn reconcile_active_tasks(
+    stdout: &StdoutShared,
+    sess: &mut AcpSession,
+    resume_res: &J,
+    replayed: bool,
+) {
     if !sess.fold.air_async_tasks {
         return;
     }
@@ -3058,7 +3063,7 @@ fn reconcile_active_tasks(stdout: &StdoutShared, sess: &mut AcpSession, resume_r
                 sess.fold
                     .on_item_completed(&sess.acp_sid, sess.ver, &wrapped, &mut out);
             }
-        } else {
+        } else if !replayed || !sess.fold.has_active_item(item_id) {
             sess.fold
                 .on_item_snapshot(&sess.acp_sid, sess.ver, item, &mut out);
         }
