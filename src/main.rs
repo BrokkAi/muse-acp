@@ -5641,6 +5641,73 @@ fn fail_all(stdout: &StdoutShared, sessions: &Sessions) {
     }
 }
 
+const UI_ROUTE_ANSWER: &str = "Answer questions";
+const UI_ROUTE_EXPLAIN: &str = "Explain instead";
+
+/// Send one ACP form request for a pending MSP user-input flow.
+fn send_elicitation_form(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    req_id: &J,
+    tool_call_id: &str,
+    message: &str,
+    schema: &str,
+) {
+    let tool_f = if tool_call_id.is_empty() {
+        String::new()
+    } else {
+        format!(",\"toolCallId\":{}", esc(tool_call_id))
+    };
+    acp::send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"elicitation/create\",\"params\":{{\"sessionId\":{}{},\"mode\":\"form\",\"message\":{},\"requestedSchema\":{}}}}}",
+            j_to_string(req_id),
+            esc(acp_sid),
+            tool_f,
+            esc(message),
+            schema
+        ),
+    );
+}
+
+/// Reissue a pending form after a correctable client or host-side error.
+fn reissue_pending_ui(
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    idx: usize,
+    stage: acp::UiStage,
+    message: String,
+    schema: &str,
+) -> bool {
+    let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
+    let tool_call_id = {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get_mut(acp_sid) else {
+            return false;
+        };
+        let Some(p) = s.pending_ui.get_mut(idx) else {
+            return false;
+        };
+        p.req_id = req_id.clone();
+        p.stage = stage;
+        p.tool_call_id.clone()
+    };
+    send_elicitation_form(stdout, acp_sid, &req_id, &tool_call_id, &message, schema);
+    true
+}
+
+fn remove_pending_ui(sessions: &Sessions, acp_sid: &str, req_id: &J) -> Option<acp::PendingUi> {
+    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+    let s = map.get_mut(acp_sid)?;
+    let idx = s
+        .pending_ui
+        .iter()
+        .position(|p| j_to_string(&p.req_id) == j_to_string(req_id))?;
+    Some(s.pending_ui.remove(idx))
+}
+
 /// Bridge an MSP `userInput/requested` to ACP `elicitation/create` (form mode).
 /// Returns false when there is nothing bridgeable (caller falls back).
 fn bridge_user_input(
@@ -5668,8 +5735,8 @@ fn bridge_user_input(
         return false;
     }
     // Resume reissues and the request/notification pair can repeat the same
-    // pending question. Keep the original ACP request and answer mapping;
-    // returning true also prevents the caller's auto-cancel fallback.
+    // pending question. A seen id also covers a late host delivery after its
+    // answer, clarification, or cancellation was already sent.
     if sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -5678,13 +5745,14 @@ fn bridge_user_input(
             s.pending_ui
                 .iter()
                 .any(|p| p.user_input_id == user_input_id)
+                || s.ui_seen.contains(&user_input_id)
         })
     {
         return true;
     }
     sessions
         .lock()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .get_mut(acp_sid)
         .map(|s| s.ui_seen.insert(user_input_id.clone()));
     let mut props = Vec::new();
@@ -5772,7 +5840,7 @@ fn bridge_user_input(
     if ui_qs.is_empty() {
         return false;
     }
-    let schema = format!(
+    let answer_schema = format!(
         "{{\"type\":\"object\",\"properties\":{{{}}},\"required\":[{}]}}",
         props.join(","),
         required
@@ -5781,6 +5849,26 @@ fn bridge_user_input(
             .collect::<Vec<_>>()
             .join(",")
     );
+    let answer_message = msg.join("\n");
+    let has_options = ui_qs.iter().any(|q| !q.labels.is_empty());
+    let (stage, schema, form_message) = if has_options {
+        let route_schema = format!(
+            "{{\"type\":\"object\",\"properties\":{{\"route\":{{\"type\":\"string\",\"enum\":[{},{}]}}}},\"required\":[\"route\"]}}",
+            esc(UI_ROUTE_ANSWER),
+            esc(UI_ROUTE_EXPLAIN)
+        );
+        (
+            acp::UiStage::Route,
+            route_schema,
+            format!("Choose how to respond to this question:\n{answer_message}"),
+        )
+    } else {
+        (
+            acp::UiStage::Answers,
+            answer_schema.clone(),
+            answer_message.clone(),
+        )
+    };
     let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
     if let Some(s) = sessions
         .lock()
@@ -5791,6 +5879,10 @@ fn bridge_user_input(
             req_id: req_id.clone(),
             user_input_id: user_input_id.clone(),
             questions: ui_qs,
+            stage,
+            answer_schema,
+            answer_message,
+            tool_call_id: tool_call.clone(),
         });
         log(&format!(
             "bridging userInput {user_input_id} to elicitation {}",
@@ -5802,22 +5894,7 @@ fn bridge_user_input(
     } else {
         return false;
     }
-    let tool_f = if tool_call.is_empty() {
-        String::new()
-    } else {
-        format!(",\"toolCallId\":{}", esc(&tool_call))
-    };
-    acp::send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"elicitation/create\",\"params\":{{\"sessionId\":{}{},\"mode\":\"form\",\"message\":{},\"requestedSchema\":{}}}}}",
-            j_to_string(&req_id),
-            esc(acp_sid),
-            tool_f,
-            esc(&msg.join("\n")),
-            schema
-        ),
-    );
+    send_elicitation_form(stdout, acp_sid, &req_id, &tool_call, &form_message, &schema);
     true
 }
 
@@ -5828,6 +5905,55 @@ fn ui_original(q: &acp::UiQuestion, shown: &str) -> Option<String> {
         .position(|d| d == shown)
         .and_then(|i| q.labels.get(i))
         .cloned()
+}
+
+fn ui_answers(questions: &[acp::UiQuestion], content: &J) -> String {
+    let mut parts = Vec::new();
+    for (i, q) in questions.iter().enumerate() {
+        let key = format!("q{i}");
+        match content.get(key.as_str()) {
+            Some(J::Str(v)) => match ui_original(q, v) {
+                Some(orig) => parts.push(format!(
+                    "{{\"questionId\":{},\"selectedLabel\":{}}}",
+                    esc(&q.qid),
+                    esc(&orig)
+                )),
+                None => parts.push(format!(
+                    "{{\"questionId\":{},\"freeText\":{}}}",
+                    esc(&q.qid),
+                    esc(v)
+                )),
+            },
+            Some(J::Arr(vs)) => {
+                let mut matched = Vec::new();
+                let mut free = Vec::new();
+                for v in vs {
+                    match v.as_str().and_then(|s| ui_original(q, s)) {
+                        Some(orig) => matched.push(esc(&orig)),
+                        None => {
+                            if let Some(s) = v.as_str() {
+                                free.push(s.to_string());
+                            }
+                        }
+                    }
+                }
+                let mut f = vec![format!("\"questionId\":{}", esc(&q.qid))];
+                if !matched.is_empty() {
+                    f.push(format!("\"selectedLabels\":[{}]", matched.join(",")));
+                }
+                if !free.is_empty() {
+                    f.push(format!("\"freeText\":{}", esc(&free.join(", "))));
+                }
+                parts.push(format!("{{{}}}", f.join(",")));
+            }
+            _ => {}
+        }
+    }
+    format!("[{}]", parts.join(","))
+}
+
+fn clarification_schema() -> &'static str {
+    "{\"type\":\"object\",\"properties\":{\"clarification\":{\"type\":\"string\",\"maxLength\":500}},\"required\":[\"clarification\"]}"
 }
 
 /// Client reply to our `elicitation/create` (matched by id).
@@ -5856,107 +5982,218 @@ fn complete_elicitation(
         Some(v) => v,
         None => return,
     };
-    let (msp_sid, ver, user_input_id, questions) = {
-        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let s = match map.get_mut(&acp_sid) {
-            Some(s) => s,
-            None => return,
-        };
-        if idx >= s.pending_ui.len() {
+    let pending = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&acp_sid)
+        .and_then(|s| s.pending_ui.get(idx))
+        .cloned();
+    let Some(pending) = pending else { return };
+    let msp_sid = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&acp_sid)
+        .map(|s| s.msp_sid.clone())
+        .unwrap_or_default();
+    let accepted = msg.get("error").is_none()
+        && msg
+            .get("result")
+            .and_then(|r| r.get("action"))
+            .and_then(|v| v.as_str())
+            == Some("accept");
+    if !accepted {
+        let p = remove_pending_ui(sessions, &acp_sid, &idv);
+        if p.is_none() {
             return;
         }
-        let p = s.pending_ui.remove(idx);
-        (s.msp_sid.clone(), s.ver, p.user_input_id, p.questions)
-    };
-    let cmd = host.mint_cmd("cmd-");
-    // accept + content -> answers; anything else -> cancel the question.
-    let mut answers: Option<String> = None;
-    if msg.get("error").is_none()
-        && let Some(res) = msg.get("result")
-        && res.get("action").and_then(|v| v.as_str()).unwrap_or("") == "accept"
-    {
-        let content = res.get("content").cloned().unwrap_or(J::Null);
-        let mut parts = Vec::new();
-        for (i, q) in questions.iter().enumerate() {
-            let key = format!("q{i}");
-            match content.get(key.as_str()) {
-                Some(J::Str(v)) => match ui_original(q, v) {
-                    Some(orig) => parts.push(format!(
-                        "{{\"questionId\":{},\"selectedLabel\":{}}}",
-                        esc(&q.qid),
-                        esc(&orig)
-                    )),
-                    None => parts.push(format!(
-                        "{{\"questionId\":{},\"freeText\":{}}}",
-                        esc(&q.qid),
-                        esc(v)
-                    )),
-                },
-                Some(J::Arr(vs)) => {
-                    let mut matched = Vec::new();
-                    let mut free = Vec::new();
-                    for v in vs {
-                        match v.as_str().and_then(|s| ui_original(q, s)) {
-                            Some(orig) => matched.push(esc(&orig)),
-                            None => {
-                                if let Some(s) = v.as_str() {
-                                    free.push(s.to_string());
-                                }
-                            }
-                        }
-                    }
-                    let mut f = vec![format!("\"questionId\":{}", esc(&q.qid))];
-                    if !matched.is_empty() {
-                        f.push(format!("\"selectedLabels\":[{}]", matched.join(",")));
-                    }
-                    if !free.is_empty() {
-                        f.push(format!("\"freeText\":{}", esc(&free.join(", "))));
-                    }
-                    parts.push(format!("{{{}}}", f.join(",")));
+        let cmd = host.mint_cmd("cmd-");
+        if let Err(e) = host.command(
+            "userInput/cancel",
+            &format!(
+                "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{}}}",
+                esc(&cmd),
+                esc(&msp_sid),
+                esc(&pending.user_input_id)
+            ),
+        ) {
+            log(&format!("userInput/cancel failed: {}", err_message(&e)));
+        } else {
+            log("elicitation declined/cancelled/failed; question cancelled");
+        }
+        return;
+    }
+    let content = msg
+        .get("result")
+        .and_then(|r| r.get("content"))
+        .cloned()
+        .unwrap_or(J::Null);
+    match pending.stage {
+        acp::UiStage::Route => {
+            let route = content.get("route").and_then(|v| v.as_str());
+            match route {
+                Some(UI_ROUTE_ANSWER) => {
+                    reissue_pending_ui(
+                        stdout,
+                        sessions,
+                        &acp_sid,
+                        idx,
+                        acp::UiStage::Answers,
+                        pending.answer_message.clone(),
+                        &pending.answer_schema,
+                    );
                 }
-                _ => {}
+                Some(UI_ROUTE_EXPLAIN) => {
+                    reissue_pending_ui(
+                        stdout,
+                        sessions,
+                        &acp_sid,
+                        idx,
+                        acp::UiStage::Clarification,
+                        format!(
+                            "{}\n\nExplain what you meant instead of choosing an answer.",
+                            pending.answer_message
+                        ),
+                        clarification_schema(),
+                    );
+                }
+                _ => {
+                    reissue_pending_ui(
+                        stdout,
+                        sessions,
+                        &acp_sid,
+                        idx,
+                        acp::UiStage::Route,
+                        "Choose either Answer questions or Explain instead.".to_string(),
+                        "{\"type\":\"object\",\"properties\":{\"route\":{\"type\":\"string\",\"enum\":[\"Answer questions\",\"Explain instead\"]}},\"required\":[\"route\"]}",
+                    );
+                }
             }
         }
-        answers = Some(format!("[{}]", parts.join(",")));
-    }
-    match answers {
-        Some(a) => {
-            if let Err(e) = host.command(
+        acp::UiStage::Answers => {
+            let answers = ui_answers(&pending.questions, &content);
+            let cmd = host.mint_cmd("cmd-");
+            match host.command(
                 "userInput/answer",
                 &format!(
                     "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{},\"answers\":{}}}",
                     esc(&cmd),
                     esc(&msp_sid),
-                    esc(&user_input_id),
-                    a
+                    esc(&pending.user_input_id),
+                    answers
                 ),
             ) {
-                log(&format!("userInput/answer failed: {}", err_message(&e)));
-            } else if ver == 2 {
-                let busy = sessions
-                    .lock()
-                    .unwrap()
-                    .get(&acp_sid)
-                    .map(|s| !s.in_flight.is_empty())
-                    .unwrap_or(false);
-                if busy {
-                    acp::send_state(stdout, &acp_sid, "running", None);
+                Ok(_) => {
+                    remove_pending_ui(sessions, &acp_sid, &idv);
+                    let busy = sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&acp_sid)
+                        .map(|s| s.ver == 2 && !s.in_flight.is_empty())
+                        .unwrap_or(false);
+                    if busy {
+                        acp::send_state(stdout, &acp_sid, "running", None);
+                    }
+                }
+                Err(e) => {
+                    let message = format!("Muse rejected the answer: {}", err_message(&e));
+                    reissue_pending_ui(
+                        stdout,
+                        sessions,
+                        &acp_sid,
+                        idx,
+                        acp::UiStage::Answers,
+                        message,
+                        &pending.answer_schema,
+                    );
                 }
             }
         }
-        None => {
-            if let Err(e) = host.command(
-                "userInput/cancel",
+        acp::UiStage::Clarification => {
+            let Some(clarification) = content.get("clarification").and_then(|v| v.as_str()) else {
+                reissue_pending_ui(
+                    stdout,
+                    sessions,
+                    &acp_sid,
+                    idx,
+                    acp::UiStage::Clarification,
+                    format!(
+                        "{}\n\nEnter a clarification before submitting.",
+                        pending.answer_message
+                    ),
+                    clarification_schema(),
+                );
+                return;
+            };
+            let trimmed = clarification.trim();
+            if trimmed.is_empty() {
+                reissue_pending_ui(
+                    stdout,
+                    sessions,
+                    &acp_sid,
+                    idx,
+                    acp::UiStage::Clarification,
+                    format!(
+                        "{}\n\nEnter a clarification before submitting.",
+                        pending.answer_message
+                    ),
+                    clarification_schema(),
+                );
+                return;
+            }
+            if clarification.chars().count() > 500 {
+                reissue_pending_ui(
+                    stdout,
+                    sessions,
+                    &acp_sid,
+                    idx,
+                    acp::UiStage::Clarification,
+                    format!(
+                        "{}\n\nClarifications must be 500 characters or fewer.",
+                        pending.answer_message
+                    ),
+                    clarification_schema(),
+                );
+                return;
+            }
+            let cmd = host.mint_cmd("cmd-");
+            match host.command(
+                "userInput/clarify",
                 &format!(
-                    "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{}}}",
+                    "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{},\"clarification\":{{\"format\":\"text\",\"content\":{}}}}}",
                     esc(&cmd),
                     esc(&msp_sid),
-                    esc(&user_input_id)
+                    esc(&pending.user_input_id),
+                    esc(clarification)
                 ),
             ) {
-                log(&format!("userInput/cancel failed: {}", err_message(&e)));
-            } else {
-                log("elicitation declined/cancelled/failed; question cancelled");
+                Ok(_) => {
+                    remove_pending_ui(sessions, &acp_sid, &idv);
+                    let busy = sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&acp_sid)
+                        .map(|s| s.ver == 2 && !s.in_flight.is_empty())
+                        .unwrap_or(false);
+                    if busy {
+                        acp::send_state(stdout, &acp_sid, "running", None);
+                    }
+                }
+                Err(e) => {
+                    let message = format!(
+                        "{}\n\nMuse rejected the clarification: {}",
+                        pending.answer_message,
+                        err_message(&e)
+                    );
+                    reissue_pending_ui(
+                        stdout,
+                        sessions,
+                        &acp_sid,
+                        idx,
+                        acp::UiStage::Clarification,
+                        message,
+                        clarification_schema(),
+                    );
+                }
             }
         }
     }

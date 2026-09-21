@@ -252,17 +252,26 @@ TODO_ITEMS = [
 
 
 def question_params(user_input_id="ui-1"):
-    selection = {"mode": "multiple", "minSelections": 1, "maxSelections": 2} \
-        if SCENARIO == "questions_multiple" else {"mode": "single"}
+    questions = [{
+        "id": "q0", "header": "Pick", "question": "Which?",
+        "selection": {"mode": "single"},
+        "options": [{"label": "Alpha"}, {"label": "Beta"}],
+    }]
+    if SCENARIO == "questions_multiple":
+        questions[0]["selection"] = {"mode": "multiple", "minSelections": 1, "maxSelections": 2}
+    if os.environ.get("FAKE_QUESTION_SHAPE", "") == "mixed":
+        questions.extend([
+            {"id": "q1", "header": "Pick many", "question": "Which ones?",
+             "selection": {"mode": "multiple", "minSelections": 1,
+                            "maxSelections": 2},
+             "options": [{"label": "Red"}, {"label": "Blue"}]},
+            {"id": "q2", "header": "Explain", "question": "Why?",
+             "selection": {"mode": "single"}},
+        ])
     return {"sessionId": MSP_SID, "userInputId": user_input_id,
             "turnId": "turn-question", "itemId": f"item-{user_input_id}",
             "toolCallId": f"call-{user_input_id}", "toolName": "request_user_input",
-            "viewCursor": "cur-8",
-            "questions": [{
-                "id": "q0", "header": "Pick", "question": "Which?",
-                "selection": selection,
-                "options": [{"label": "Alpha"}, {"label": "Beta"}],
-            }]}
+            "viewCursor": "cur-8", "questions": questions}
 
 
 def on_turn_start(params):
@@ -1035,6 +1044,9 @@ def result_for(method, msg):
         params = msg.get("params", {})
         return {"commandId": params.get("commandId", ""), "status": "accepted"}
     if method == "userInput/answer":
+        log_input(msg.get("params", {}))
+        return {}
+    if method == "userInput/clarify":
         log_input(msg.get("params", {}))
         return {}
     if method == "turn/steer":
