@@ -1697,6 +1697,31 @@ fn v1_advertises_config_options_and_slash_commands() {
 }
 
 #[test]
+fn legacy_set_model_accepts_model_id_and_forwards_to_msp() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let model_id = c.req(
+        "session/set_model",
+        &format!("{{\"sessionId\":\"{sid}\",\"modelId\":\"fake-model\"}}"),
+    );
+    let model_done = c.wait_for(&format!("\"id\":{model_id}"), Duration::from_secs(15));
+    assert!(
+        model_done.contains("\"result\":{\"model\":\"fake-model\"}"),
+        "legacy modelId is accepted: {model_done}"
+    );
+    c.wait_log("session/setModel", Duration::from_secs(15));
+    let frames = std::fs::read_to_string(format!("{}.frames", c.fake_log)).expect("host frames");
+    assert!(
+        frames.lines().any(|line| {
+            line.contains("\"method\": \"session/setModel\"")
+                && line.contains("\"modelId\": \"fake-model\"")
+        }),
+        "MSP setModel receives the requested modelId: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
 fn legacy_set_mode_adopts_the_folded_host_mode() {
     // A host that downgrades the requested mode must not desync the legacy
     // v1 mode state: the reply follows the folded effectiveMode, mirroring
