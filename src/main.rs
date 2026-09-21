@@ -4667,7 +4667,9 @@ fn native_skill_part(text: &str) -> Option<String> {
 fn file_uri_path(uri: &str, cwd: &str) -> Result<String, String> {
     let rest = match uri.strip_prefix("file://") {
         Some(r) => r,
-        None if uri.starts_with('/') => return Ok(uri.to_string()),
+        None if uri.starts_with('/') || std::path::Path::new(uri).is_absolute() => {
+            return Ok(uri.to_string());
+        }
         None if !uri.contains("://") => {
             return Ok(format!("{}/{}", cwd.trim_end_matches('/'), uri));
         }
@@ -7807,6 +7809,11 @@ mod tests {
 
     #[test]
     fn local_file_uris_preserve_platform_absolute_paths() {
+        let native = std::env::temp_dir().join("sp ace.txt");
+        assert_eq!(
+            super::file_uri_path(native.to_str().unwrap(), "/unrelated").unwrap(),
+            native.to_str().unwrap()
+        );
         assert_eq!(
             super::file_uri_path("file:///tmp/sp%20ace.txt", "/").unwrap(),
             "/tmp/sp ace.txt"
