@@ -31,15 +31,21 @@ class ArchiveValidation(unittest.TestCase):
             self.assertEqual(manifest['target'], target)
         for installer in release.INSTALLERS:
             (self.directory / installer).write_bytes(Path(installer).read_bytes())
-        committed_source_bytes = release.source_bytes
+        release.validate(self.directory)
 
-        def source_bytes(name):
-            if name in release.INSTALLERS:
-                return Path(name).read_bytes()
-            return committed_source_bytes(name)
-
-        with patch.object(release, 'source_bytes', side_effect=source_bytes):
-            release.validate(self.directory)
+    def test_modified_installers_are_rejected(self):
+        for target in release.TARGETS:
+            self.build(target)
+        for installer in release.INSTALLERS:
+            (self.directory / installer).write_bytes(release.source_bytes(installer))
+        for installer in release.INSTALLERS:
+            with self.subTest(installer=installer):
+                staged = self.directory / installer
+                original = staged.read_bytes()
+                staged.write_bytes(original + b'\n# changed after tagging\n')
+                with self.assertRaisesRegex(RuntimeError, 'Installer differs'):
+                    release.validate(self.directory)
+                staged.write_bytes(original)
 
     def test_all_installers_are_required(self):
         self.build(release.TARGETS[0])

@@ -90,7 +90,7 @@ try {
     $releaseBase = "https://github.com/$repo/releases/download/$tag"
 
     $tempDir = Join-Path ([IO.Path]::GetTempPath()) ("muse-acp-" + [Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -LiteralPath $tempDir -Force | Out-Null
+    [IO.Directory]::CreateDirectory($tempDir) | Out-Null
     $archivePath = Join-Path $tempDir $archive
     $checksumPath = "$archivePath.sha256"
 
@@ -117,7 +117,7 @@ try {
         Fail 'the downloaded binary cannot run on this system'
     }
 
-    New-Item -ItemType Directory -LiteralPath $installDir -Force | Out-Null
+    [IO.Directory]::CreateDirectory($installDir) | Out-Null
     $destination = Join-Path $installDir 'muse-acp.exe'
     $stagedBinary = Join-Path $installDir ('.muse-acp.exe.tmp.' + $PID)
     try {
@@ -144,7 +144,7 @@ try {
     Say '  JetBrains: muse-acp install-intellij'
 }
 catch {
-    Write-Error $_.Exception.Message
+    [Console]::Error.WriteLine($_.Exception.Message)
     exit 1
 }
 finally {
