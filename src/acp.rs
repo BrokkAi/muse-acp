@@ -59,6 +59,9 @@ pub struct AcpSession {
     pub acp_sid: String,
     pub msp_sid: String,
     pub cwd: String,
+    /// Ordered ACP workspace scope: `cwd` followed by each explicitly
+    /// supplied additional directory (with exact duplicates removed).
+    pub roots: Vec<String>,
     pub ver: u8,
     pub in_flight: Vec<InFlight>,
     pub pending_perm: Option<PendingPerm>,
