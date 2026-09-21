@@ -29,6 +29,18 @@ pub const SDK_MANIFEST_FINGERPRINT: &str =
 pub const HOST_121_FINGERPRINT: &str =
     "sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b";
 
+/// Stable-surface fingerprint of the Muse 1.3.0 host (schema version 1).
+/// The live-host smoke test verified the handshake and session lifecycle, and
+/// the stable surface was confirmed additive against the vendored bundle.
+pub const HOST_130_FINGERPRINT: &str =
+    "sha256:ab69549a7ebb423fce94068762da0b5ff3cdec1f8fc263dcc17248eda117f852";
+
+/// Stable-surface fingerprint reported by the Muse 1.3.0-R3401.1 host build.
+/// This build was also verified through a live handshake, session lifecycle,
+/// and full turn (`end_turn`, `terminal=completed`).
+pub const HOST_130_R3401_1_FINGERPRINT: &str =
+    "sha256:7469c9e352e67def4a59df7e439984d7194fa351e1c8b7abb34060fd977ced81";
+
 /// Fingerprint embedded in the SDK conformance-transcript fixtures. It is
 /// deliberately distinct from every host fingerprint and must never be
 /// classified as host compatibility.
@@ -97,6 +109,10 @@ fn table_entry(fingerprint: &str) -> Option<(Status, &'static str)> {
             "SDK manifest fbce769 schema v1; no live-host verification recorded",
         ),
         HOST_121_FINGERPRINT => (Status::Tested, "validated against live host 1.2.1"),
+        HOST_130_FINGERPRINT => (Status::Tested, "validated against live host 1.3.0"),
+        HOST_130_R3401_1_FINGERPRINT => {
+            (Status::Tested, "validated against live host 1.3.0-R3401.1")
+        }
         TRANSCRIPT_FIXTURE_FINGERPRINT => (
             Status::Fixture,
             "transcript fixture fingerprint; never a live-host result",
@@ -153,6 +169,8 @@ pub fn selftest_lines(adapter_version: &str) -> Vec<String> {
         (TESTED_FINGERPRINT, "tested-host"),
         (SDK_MANIFEST_FINGERPRINT, "sdk-manifest"),
         (HOST_121_FINGERPRINT, "host-1.2.1"),
+        (HOST_130_FINGERPRINT, "host-1.3.0"),
+        (HOST_130_R3401_1_FINGERPRINT, "host-1.3.0-r3401.1"),
         (TRANSCRIPT_FIXTURE_FINGERPRINT, "transcript-fixture"),
     ] {
         let c = classify(Some(SUPPORTED_SCHEMA_VERSION), fp);
@@ -187,6 +205,20 @@ mod tests {
     #[test]
     fn host_121_fingerprint_is_tested() {
         let c = classify(Some(1), HOST_121_FINGERPRINT);
+        assert_eq!(c.status, Status::Tested);
+        assert!(!c.is_fatal());
+    }
+
+    #[test]
+    fn host_130_fingerprint_is_tested() {
+        let c = classify(Some(1), HOST_130_FINGERPRINT);
+        assert_eq!(c.status, Status::Tested);
+        assert!(!c.is_fatal());
+    }
+
+    #[test]
+    fn host_130_r3401_1_fingerprint_is_tested() {
+        let c = classify(Some(1), HOST_130_R3401_1_FINGERPRINT);
         assert_eq!(c.status, Status::Tested);
         assert!(!c.is_fatal());
     }
@@ -234,9 +266,11 @@ mod tests {
         let lines = selftest_lines("0.2.5");
         assert!(lines[0].contains("adapter=0.2.5"));
         assert!(lines[0].contains("host=offline"));
-        assert_eq!(lines.len(), 5);
+        assert_eq!(lines.len(), 7);
         assert!(lines.iter().any(|l| l.contains("kind=sdk-manifest")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.2.1")));
+        assert!(lines.iter().any(|l| l.contains("kind=host-1.3.0")));
+        assert!(lines.iter().any(|l| l.contains("kind=host-1.3.0-r3401.1")));
         assert!(lines.iter().any(|l| l.contains("kind=transcript-fixture")));
     }
 }
@@ -245,11 +279,16 @@ mod tests {
 mod corpus_tests {
     use super::{SDK_MANIFEST_FINGERPRINT, SUPPORTED_SCHEMA_VERSION};
     use crate::json::parse_json;
+    use std::collections::BTreeSet;
 
     fn protocol_path(rel: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/protocol")
             .join(rel)
+    }
+
+    fn repository_path(rel: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
     }
 
     #[test]
@@ -280,5 +319,57 @@ mod corpus_tests {
         for required in ["Item", "ApprovalRequestParams", "UserInputRequestParams"] {
             assert!(defs.get(required).is_some(), "missing $defs.{required}");
         }
+    }
+
+    #[test]
+    fn every_schema_notification_has_an_explicit_matrix_disposition() {
+        let schema_text = std::fs::read_to_string(protocol_path("stable/msp.schema.json"))
+            .expect("vendored schema bundle");
+        let schema = parse_json(&schema_text).expect("schema bundle JSON");
+        let schema_notifications = match schema.get("notifications").expect("notifications") {
+            crate::json::J::Obj(entries) => entries
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<BTreeSet<_>>(),
+            _ => panic!("schema notifications must be an object"),
+        };
+
+        let matrix = std::fs::read_to_string(repository_path("docs/event-compatibility.md"))
+            .expect("MSP event compatibility matrix");
+        let rows = matrix
+            .split("<!-- schema-notifications:start -->")
+            .nth(1)
+            .and_then(|tail| tail.split("<!-- schema-notifications:end -->").next())
+            .expect("schema notification matrix markers");
+        let dispositions = [
+            "Mapped to ACP",
+            "Internally tracked",
+            "Consumed",
+            "Intentionally ignored",
+            "Unsupported pending protocol decision",
+        ];
+        let mut documented = BTreeSet::new();
+        for line in rows.lines().filter(|line| line.starts_with("| `")) {
+            let cells = line.split('|').map(str::trim).collect::<Vec<_>>();
+            assert!(cells.len() >= 5, "malformed matrix row: {line}");
+            let method = cells[1]
+                .strip_prefix('`')
+                .and_then(|value| value.strip_suffix('`'))
+                .expect("backtick-wrapped notification method");
+            assert!(
+                dispositions.contains(&cells[2]),
+                "invalid disposition for {method}: {}",
+                cells[2]
+            );
+            assert!(
+                documented.insert(method),
+                "duplicate notification matrix row: {method}"
+            );
+        }
+
+        assert_eq!(
+            documented, schema_notifications,
+            "the compatibility matrix must classify every and only published schema notification"
+        );
     }
 }
