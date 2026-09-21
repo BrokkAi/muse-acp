@@ -316,6 +316,23 @@ pub fn send_error(stdout: &StdoutShared, id: &Option<J>, code: i64, message: &st
     );
 }
 
+pub fn send_error_with_data(
+    stdout: &StdoutShared,
+    id: &Option<J>,
+    code: i64,
+    message: &str,
+    data_json: &str,
+) {
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":{code},\"message\":{},\"data\":{data_json}}}}}",
+            id_json(id),
+            esc(message),
+        ),
+    );
+}
+
 /// `usage_update` for both ACP versions (`{used, size}` plus counted-once
 /// session cumulative totals in `_meta`). Emits only when both `used` and
 /// `size` are known; callers stash partial state on the session instead.

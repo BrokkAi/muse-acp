@@ -170,7 +170,7 @@ fn method_timeout_ms(method: &str) -> u64 {
         // Lifecycle/history work can page and replay large views.
         "session/start" | "session/resume" | "session/read" | "view/page" => 180_000,
         // Cheap queries.
-        "model/list" | "session/list" | "view/unsubscribe" => 30_000,
+        "model/list" | "session/list" | "view/unsubscribe" | "item/readOutput" => 30_000,
         // Control-plane decisions should be fast but not flaky.
         "approval/decide" | "userInput/answer" | "userInput/cancel" | "userInput/clarify"
         | "task/background" | "task/stop" | "task/stopAll" => 30_000,
@@ -732,9 +732,34 @@ pub fn err_message(e: &J) -> String {
 
 pub fn err_code(e: &J) -> i64 {
     e.get("code")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as i64)
+        .and_then(|v| match v {
+            J::Num(n) => n.parse::<i64>().ok(),
+            _ => None,
+        })
         .unwrap_or(-32603)
+}
+
+/// Muse 1.3's typed error for a durable output reference that cannot be read.
+pub fn is_output_unavailable(error: &J) -> bool {
+    err_code(error) == -32041
+        || error
+            .get("data")
+            .and_then(|data| data.get("kind"))
+            .and_then(|kind| kind.as_str())
+            == Some("outputUnavailable")
+}
+
+/// Keep the host's typed availability facts intact when forwarding the error
+/// through ACP. Older hosts may omit the `kind`, so add it only in that case.
+pub fn output_unavailable_data(error: &J) -> J {
+    let mut fields = match error.get("data") {
+        Some(J::Obj(values)) => values.clone(),
+        _ => Vec::new(),
+    };
+    if !fields.iter().any(|(key, _)| key == "kind") {
+        fields.push(("kind".to_string(), J::Str("outputUnavailable".to_string())));
+    }
+    J::Obj(fields)
 }
 
 fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender<MspEvent>) {
@@ -882,6 +907,7 @@ mod tests {
         assert_eq!(t("view/page"), Duration::from_millis(180_000));
         assert_eq!(t("model/list"), Duration::from_millis(30_000));
         assert_eq!(t("approval/decide"), Duration::from_millis(30_000));
+        assert_eq!(t("item/readOutput"), Duration::from_millis(30_000));
         assert_eq!(t("task/stop"), Duration::from_millis(30_000));
         assert_eq!(t("task/stopAll"), Duration::from_millis(30_000));
         assert_eq!(t("turn/start"), Duration::from_millis(60_000));
@@ -918,6 +944,22 @@ mod tests {
         );
         assert_eq!(session_suffix(r#"{"commandId":"c"}"#), "");
         assert_eq!(session_suffix("not json"), "");
+    }
+
+    #[test]
+    fn output_unavailable_preserves_negative_code_and_data() {
+        let error = crate::json::parse_json(
+            r#"{"code":-32041,"message":"missing","data":{"kind":"outputUnavailable","availability":"missing","itemId":"item-1","outputRef":"out-1"}}"#,
+        )
+        .expect("error JSON");
+        assert_eq!(super::err_code(&error), -32041);
+        assert!(super::is_output_unavailable(&error));
+        assert_eq!(
+            super::output_unavailable_data(&error)
+                .get("outputRef")
+                .and_then(|value| value.as_str()),
+            Some("out-1")
+        );
     }
 }
 

@@ -139,6 +139,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | --- | --- |
 | `item/delta` (message text) | `agent_message_chunk` (v2 carries `messageId`) |
 | toolCall `item/started\|updated\|completed` | `tool_call` (v1 create) / `tool_call_update` upsert with kind/title/status/content/rawInput |
+| host `item.truncated` + `outputRef`/`patchRef`/`patchSummary` | `_meta.muse` saturation and stored-output metadata; negotiated `_session/readOutput` forwards byte-ranged `item/readOutput` |
 | `turn/completed` | v1 `session/prompt` response `{stopReason}` plus the turn's `usage` when the host reported any; v2 `state_update` idle + `stopReason` |
 | successful native file `toolCall` items | negotiated AIR `agentFileChangeReport` after the owning turn completes; paths come only from explicit host tool arguments and are deduplicated across replay |
 | `turn/cancel` | `session/cancel` (waits for the terminal event; `already_terminal` = success) |
@@ -265,6 +266,16 @@ MUSE_LOG=debug                     # per-method protocol tracing (no payloads)
 `session/new {cwd}` starts a host session in `cwd`. Approval posture defaults
 to the host default; set `MUSE_APPROVAL_MODE=promptUnmatched` to force every
 unmatched tool call through `session/request_permission`.
+
+Tool cards preserve host saturation facts in `_meta.muse`: `source: "host"`
+means the host bounded the streamed surface, while `source: "adapter"` carries
+the adapter's local character counts. Host `itemId`, `outputRef`, `patchRef`,
+and edit-tool `patchSummary` fields are kept beside the bounded card. A client
+may negotiate `_meta.muse.capabilities: ["readOutput"]` during `initialize`
+and then use the adapter extension `_session/readOutput` with `sessionId`,
+`itemId`, `outputRef`, and optional byte offsets and lengths to retrieve the
+stored bytes. The adapter forwards the host's `outputUnavailable` data as the
+typed `-32041` error.
 
 ### Workspace roots and local resources
 

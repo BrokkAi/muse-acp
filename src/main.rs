@@ -32,6 +32,7 @@ static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the client advertis
 static NATIVE_SUBAGENTS: AtomicU64 = AtomicU64::new(0); // 1 when subagent sessions are negotiated
 static AIR_ASYNC_TASKS: AtomicU64 = AtomicU64::new(0); // 1 when the client wants async-task updates
 static AIR_RECOMMENDED: AtomicU64 = AtomicU64::new(0); // 1 when the client wants recommendedValue metadata
+static READ_OUTPUT: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates stored-output reads
 static AIR_FILE_REPORT: AtomicU64 = AtomicU64::new(0); // 1 when per-turn file reports are negotiated
 
 const FILE_REPORT_MAX_PATHS: usize = 1024;
@@ -73,6 +74,29 @@ fn client_supports_subagents(capabilities: Option<&J>) -> bool {
         return true;
     }
     client_supports_air(Some(caps), "nativeSubagentSessions")
+}
+
+/// Stored-output fetch-through is an adapter extension. It is only enabled
+/// when the client explicitly opts into `_meta.muse.capabilities`.
+fn client_supports_read_output(capabilities: Option<&J>) -> bool {
+    let Some(muse) = capabilities
+        .and_then(|c| c.get("_meta"))
+        .and_then(|m| m.get("muse"))
+    else {
+        return false;
+    };
+    if muse
+        .get("readOutput")
+        .is_some_and(|value| matches!(value, J::Bool(true) | J::Obj(_)))
+    {
+        return true;
+    }
+    muse.get("capabilities")
+        .map(|values| match values {
+            J::Arr(values) => values.iter().any(|v| v.as_str() == Some("readOutput")),
+            _ => false,
+        })
+        .unwrap_or(false)
 }
 
 /// Parse the request-scoped AIR v1 file report opt-in. Invalid metadata is
@@ -743,17 +767,13 @@ enum LoopMsg {
 }
 
 fn v2_init() -> String {
-    format!(
-        r#"{{"protocolVersion":2,"capabilities":{{"session":{{"prompt":{{"image":{{}},"embeddedContext":{{}}}},"fork":{{}},"subagents":{{}},"additionalDirectories":{{}}}}}},"info":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}},"authMethods":[],"_meta":{{"steering":{{"supported":true}},"jetbrains":{{"air":{{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}}}}}"#,
-        ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
-    )
+    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":[],"_meta":{"muse":{"capabilities":["readOutput"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
+        .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
 }
 
 fn v1_init() -> String {
-    format!(
-        r#"{{"protocolVersion":1,"authMethods":[],"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}},"fork":{{}},"subagents":{{}},"additionalDirectories":{{}}}},"_meta":{{"jetbrains":{{"air":{{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
-        ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
-    )
+    r#"{"protocolVersion":1,"authMethods":[],"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}},"_meta":{"muse":{"capabilities":["readOutput"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__}}"#
+        .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
 }
 
 fn has_nonempty_array(params: Option<&J>, key: &str) -> bool {
@@ -1478,6 +1498,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             AIR_ASYNC_TASKS.store(u64::from(async_tasks), Ordering::SeqCst);
             let recommended = client_supports_air(air_caps, "recommendedValue");
             AIR_RECOMMENDED.store(u64::from(recommended), Ordering::SeqCst);
+            let read_output = client_supports_read_output(air_caps);
+            READ_OUTPUT.store(u64::from(read_output), Ordering::SeqCst);
             let file_report = client_supports_air(air_caps, "agentFileChangeReport");
             AIR_FILE_REPORT.store(u64::from(file_report), Ordering::SeqCst);
             if async_tasks {
@@ -1491,6 +1513,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             }
             if subagents {
                 log("client negotiated native subagent sessions");
+            }
+            if read_output {
+                log("client negotiated stored-output reads");
             }
             if v == 2 {
                 acp::send_result(stdout, &id, &v2_init());
@@ -2435,6 +2460,112 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         );
                     }
                 }
+            }
+        }
+        "_session/readOutput" => {
+            if READ_OUTPUT.load(Ordering::SeqCst) == 0 {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32601,
+                    "stored-output reads require the muse readOutput capability",
+                );
+                return;
+            }
+            let Some(p) = params.as_ref() else {
+                acp::send_error(stdout, &id, -32602, "readOutput requires params");
+                return;
+            };
+            let required = |key: &str| {
+                p.get(key)
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            };
+            let Some(acp_sid) = required("sessionId") else {
+                acp::send_error(stdout, &id, -32602, "readOutput requires sessionId");
+                return;
+            };
+            let Some(item_id) = required("itemId") else {
+                acp::send_error(stdout, &id, -32602, "readOutput requires itemId");
+                return;
+            };
+            let Some(output_ref) = required("outputRef") else {
+                acp::send_error(stdout, &id, -32602, "readOutput requires outputRef");
+                return;
+            };
+            let msp_sid = match sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&acp_sid)
+            {
+                Some(session) => session.msp_sid.clone(),
+                None => {
+                    acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                    return;
+                }
+            };
+            let optional_u64 = |key: &str| match p.get(key) {
+                None => Ok(None),
+                Some(value) => value
+                    .as_u64()
+                    .map(Some)
+                    .ok_or_else(|| format!("readOutput {key} must be a non-negative integer")),
+            };
+            let offset = match optional_u64("offsetBytes") {
+                Ok(value) => value,
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
+            let length = match optional_u64("lengthBytes") {
+                Ok(value) => value,
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
+            let mut host_params = format!(
+                "{{\"sessionId\":{},\"itemId\":{},\"outputRef\":{}",
+                esc(&msp_sid),
+                esc(&item_id),
+                esc(&output_ref),
+            );
+            if let Some(offset) = offset {
+                host_params.push_str(&format!(",\"offsetBytes\":{offset}"));
+            }
+            if let Some(length) = length {
+                host_params.push_str(&format!(",\"lengthBytes\":{length}"));
+            }
+            host_params.push('}');
+            match host.command("item/readOutput", &host_params) {
+                Ok(result) => acp::send_result(stdout, &id, &j_to_string(&result)),
+                Err(error) if msp::is_output_unavailable(&error) => {
+                    let data = msp::output_unavailable_data(&error);
+                    let availability = data
+                        .get("availability")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or("unknown");
+                    let unavailable_item = data
+                        .get("itemId")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(&item_id);
+                    let unavailable_ref = data
+                        .get("outputRef")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or(&output_ref);
+                    let message = format!(
+                        "item/readOutput unavailable: availability={availability} itemId={unavailable_item} outputRef={unavailable_ref}"
+                    );
+                    acp::send_error_with_data(stdout, &id, -32041, &message, &j_to_string(&data));
+                }
+                Err(error) => acp::send_error(
+                    stdout,
+                    &id,
+                    msp::acp_error_code(&error, -32603),
+                    &format!("item/readOutput failed: {}", err_message(&error)),
+                ),
             }
         }
         "_session/async_task/stop" => {
