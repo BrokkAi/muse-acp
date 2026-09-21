@@ -1854,6 +1854,200 @@ fn steering_prompt_required(params: Option<&J>) -> Result<bool, String> {
     }
 }
 
+#[derive(Clone)]
+struct SubagentControlTarget {
+    /// MSP session that owns the subagent item. For a nested child this is the
+    /// child session itself, never the root session that displayed it.
+    msp_sid: String,
+    subagent_id: String,
+    control_status: String,
+    item_status: String,
+}
+
+/// Resolve a control target only from an observed owner fold. A child session
+/// id is accepted when it names an observed child fold, but it is never
+/// promoted into a root session or used to borrow the root's fold.
+fn subagent_control_target(
+    sessions: &Sessions,
+    session_id: &str,
+    subagent_id: &str,
+) -> Option<SubagentControlTarget> {
+    let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(session) = map.get(session_id)
+        && session.fold.native_subagents
+        && let Some(observation) = session.fold.subagent(subagent_id)
+    {
+        return Some(SubagentControlTarget {
+            msp_sid: session.msp_sid.clone(),
+            subagent_id: subagent_id.to_string(),
+            control_status: observation.control_status,
+            item_status: observation.item_status,
+        });
+    }
+
+    for session in map.values() {
+        if !session.fold.native_subagents {
+            continue;
+        }
+        if let Some(child_fold) = session.child_folds.get(session_id)
+            && let Some(observation) = child_fold.subagent(subagent_id)
+        {
+            return Some(SubagentControlTarget {
+                msp_sid: session_id.to_string(),
+                subagent_id: subagent_id.to_string(),
+                control_status: observation.control_status,
+                item_status: observation.item_status,
+            });
+        }
+    }
+    None
+}
+
+/// MSP's command plane owns lifecycle admission. The adapter mirrors the
+/// lifecycle locally so an editor cannot send a running-child command to a
+/// terminal item or use a child session id to bypass the owner fold. Unknown
+/// future statuses fail closed and are left for a later adapter release.
+fn subagent_control_allowed(method: &str, target: &SubagentControlTarget) -> bool {
+    let control = target.control_status.as_str();
+    if method == "subagent/reopen" {
+        return target.item_status != "inProgress" && control == "closed";
+    }
+    if target.item_status != "inProgress" {
+        return false;
+    }
+    match method {
+        "subagent/sendMessage" | "subagent/interrupt" => control == "running",
+        "subagent/stop" => matches!(control, "accepted" | "starting" | "running"),
+        "subagent/followupTask" => control == "resultReady",
+        "subagent/resume" => control == "recoveryPending",
+        "subagent/close" => matches!(control, "accepted" | "starting" | "running" | "resultReady"),
+        "subagent/readResult" => control == "resultReady",
+        _ => false,
+    }
+}
+
+fn subagent_control(
+    host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    id: &Option<J>,
+    method: &str,
+    params: Option<&J>,
+) {
+    if NATIVE_SUBAGENTS.load(Ordering::SeqCst) == 0 {
+        acp::send_error(
+            stdout,
+            id,
+            -32601,
+            "subagent controls require native subagent session negotiation",
+        );
+        return;
+    }
+    let Some(params) = params else {
+        acp::send_error(stdout, id, -32602, "subagent control requires params");
+        return;
+    };
+    let session_id = params
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let subagent_id = params
+        .get("subagentId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let command_id = params
+        .get("commandId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if session_id.is_empty() || subagent_id.is_empty() || command_id.is_empty() {
+        acp::send_error(
+            stdout,
+            id,
+            -32602,
+            "subagent control requires sessionId, subagentId, and commandId",
+        );
+        return;
+    }
+    let Some(target) = subagent_control_target(sessions, session_id, subagent_id) else {
+        acp::send_error(
+            stdout,
+            id,
+            -32602,
+            "unknown subagent owner session or subagentId",
+        );
+        return;
+    };
+    if !subagent_control_allowed(method, &target) {
+        acp::send_error(
+            stdout,
+            id,
+            -32602,
+            &format!(
+                "{method} is not allowed for subagent {subagent_id} in controlStatus '{}' and status '{}'",
+                target.control_status, target.item_status
+            ),
+        );
+        return;
+    }
+
+    let mut fields = vec![
+        format!("\"commandId\":{}", esc(command_id)),
+        format!("\"sessionId\":{}", esc(&target.msp_sid)),
+        format!("\"subagentId\":{}", esc(&target.subagent_id)),
+    ];
+    match method {
+        "subagent/sendMessage" | "subagent/followupTask" => {
+            let body = params
+                .get("body")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if body.is_empty() {
+                acp::send_error(
+                    stdout,
+                    id,
+                    -32602,
+                    "subagent control body must not be empty",
+                );
+                return;
+            }
+            fields.push(format!("\"body\":{}", esc(body)));
+        }
+        "subagent/interrupt" | "subagent/stop" | "subagent/close" => {
+            if let Some(reason) = params.get("reason") {
+                let Some(reason) = reason.as_str() else {
+                    acp::send_error(
+                        stdout,
+                        id,
+                        -32602,
+                        "subagent control reason must be a string",
+                    );
+                    return;
+                };
+                fields.push(format!("\"reason\":{}", esc(reason)));
+            }
+        }
+        "subagent/resume" | "subagent/reopen" | "subagent/readResult" => {}
+        _ => {
+            acp::send_error(stdout, id, -32601, "method not found");
+            return;
+        }
+    }
+
+    // The caller's commandId is the MSP idempotency key. One adapter request
+    // produces one host command; it is never minted again after an error or
+    // host reconnect, so a duplicate replay remains host-idempotent.
+    match host.command(method, &format!("{{{}}}", fields.join(","))) {
+        Ok(result) => acp::send_result(stdout, id, &j_to_string(&result)),
+        Err(error) => acp::send_error(
+            stdout,
+            id,
+            msp::acp_error_code(&error, -32603),
+            &err_message(&error),
+        ),
+    }
+}
+
 /// Record the ACP connection posture before starting the MSP connection.
 ///
 /// MSP's `userInputDialogs` capability is connection-scoped, so it must be
@@ -3083,6 +3277,16 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
         "_session/async_task/stop" => {
             stop_async_task(host, stdout, sessions, &id, params.as_ref());
         }
+        "subagent/sendMessage"
+        | "subagent/followupTask"
+        | "subagent/interrupt"
+        | "subagent/stop"
+        | "subagent/resume"
+        | "subagent/reopen"
+        | "subagent/close"
+        | "subagent/readResult" => {
+            subagent_control(host, stdout, sessions, &id, &method, params.as_ref());
+        }
         "_session/steering" => {
             if negotiated_ver() != 2 {
                 acp::send_error(stdout, &id, -32601, "steering requires ACP v2");
@@ -3936,7 +4140,7 @@ fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) 
     for it in &items {
         let kind = it.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
-            "toolCall" | "userMessage" | "agentMessage" => {
+            "subagent" | "toolCall" | "userMessage" | "agentMessage" => {
                 sess.fold.replay_item(&sess.acp_sid, sess.ver, it, &mut out)
             }
             _ => {}
@@ -4379,6 +4583,36 @@ fn find_acp_sid(sessions: &Sessions, msp_sid: &str) -> Option<String> {
         .map(|(k, _)| k.clone())
 }
 
+/// Map a view event back to its owning session. Child view streams are
+/// represented by `child_folds` under the owner; they must never be looked up
+/// as standalone root sessions because that would widen their permission
+/// boundary.
+fn owner_for_msp_session(
+    sessions: &Sessions,
+    msp_sid: &str,
+) -> Option<(String, String, Option<String>)> {
+    let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some((acp_sid, session)) = map.iter().find(|(_, s)| s.msp_sid == msp_sid) {
+        return Some((acp_sid.clone(), session.msp_sid.clone(), None));
+    }
+    map.iter().find_map(|(acp_sid, session)| {
+        if session.child_folds.contains_key(msp_sid) {
+            return Some((
+                acp_sid.clone(),
+                session.msp_sid.clone(),
+                session.fold.subagent_id_for_child(msp_sid),
+            ));
+        }
+        if let Some(subagent_id) = session.fold.subagent_id_for_child(msp_sid) {
+            return Some((acp_sid.clone(), session.msp_sid.clone(), Some(subagent_id)));
+        }
+        session.child_folds.iter().find_map(|(parent_sid, fold)| {
+            fold.subagent_id_for_child(msp_sid)
+                .map(|subagent_id| (acp_sid.clone(), parent_sid.clone(), Some(subagent_id)))
+        })
+    })
+}
+
 /// Pull a negotiated child session's transcript once and replay it onto the
 /// child ACP session id. MSP's subagent items name the child session; the
 /// drill-down is a point-in-time `session/read`, exactly what tdd SS4.5.7
@@ -4438,11 +4672,18 @@ fn drill_down_subagent_child(
                     let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                     if let Some(s) = map.get_mut(&acp_sid)
                         && let Some(fold) = s.child_folds.get_mut(&child)
-                        && let Some(J::Arr(items)) = r.get("history").and_then(|h| h.get("items"))
+                        && let Some(items) = replay_items(&r)
                     {
-                        for it in items.clone() {
-                            let wrap = J::Obj(vec![("item".to_string(), it)]);
-                            fold.on_item_completed(&child, ver, &wrap, &mut out);
+                        for it in items {
+                            if matches!(
+                                it.get("kind").and_then(J::as_str),
+                                Some("toolCall" | "subagent" | "agentMessage" | "userMessage")
+                            ) {
+                                fold.replay_item(&child, ver, &it, &mut out);
+                            } else {
+                                let wrap = J::Obj(vec![("item".to_string(), it)]);
+                                fold.on_item_completed(&child, ver, &wrap, &mut out);
+                            }
                         }
                     }
                 }
@@ -4835,11 +5076,18 @@ fn handle_msp(
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let acp_sid = find_acp_sid(sessions, msp_sid);
+            let route = owner_for_msp_session(sessions, msp_sid);
+            let acp_sid = route.as_ref().map(|(acp_sid, _, _)| acp_sid.clone());
+            let owner_msp_sid = route
+                .as_ref()
+                .map(|(_, owner_msp_sid, _)| owner_msp_sid.as_str())
+                .unwrap_or(msp_sid);
             // Bridge to ACP elicitation when the client advertised form mode;
             // otherwise cancel so the turn proceeds instead of hanging.
             let bridged = match (&acp_sid, ELICIT_FORM.load(Ordering::SeqCst)) {
-                (Some(sid), 1) => bridge_user_input(host, stdout, sessions, sid, params),
+                (Some(sid), 1) => {
+                    bridge_user_input(host, stdout, sessions, sid, owner_msp_sid, params)
+                }
                 _ => false,
             };
             if !bridged {
@@ -4851,13 +5099,18 @@ fn handle_msp(
                     "userInput/requested not bridged (elicit_form={}); falling back",
                     ELICIT_FORM.load(Ordering::SeqCst)
                 ));
-                if !msp_sid.is_empty() && !qid.is_empty() {
+                if !owner_msp_sid.is_empty() && !qid.is_empty() {
                     if let Some(acp_sid) = acp_sid.as_ref() {
                         sessions
                             .lock()
                             .unwrap()
                             .get_mut(acp_sid)
                             .map(|s| s.ui_seen.insert(qid.to_string()));
+                    } else {
+                        log(&format!(
+                            "userInput {qid} auto-cancelled locally: no owner session for child stream {msp_sid}"
+                        ));
+                        return;
                     }
                     let cmd = host.mint_cmd("cmd-");
                     let _ = host.command(
@@ -4865,7 +5118,7 @@ fn handle_msp(
                         &format!(
                             "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{}}}",
                             esc(&cmd),
-                            esc(msp_sid),
+                            esc(owner_msp_sid),
                             esc(qid)
                         ),
                     );
@@ -5328,8 +5581,9 @@ fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions
         .get("sessionId")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let acp_sid = match find_acp_sid(sessions, msp_sid) {
-        Some(s) => s,
+    let (acp_sid, owner_msp_sid, child_subagent_id) = match owner_for_msp_session(sessions, msp_sid)
+    {
+        Some(route) => route,
         None => {
             log(&format!(
                 "approval dropped: no ACP session for host session {msp_sid}"
@@ -5475,7 +5729,13 @@ fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions
         log(&format!(
             "approval {approval_id} has no choices; cancelling the turn instead of leaving it unresolved"
         ));
-        cancel_session_turns(host, sessions, &acp_sid);
+        fail_closed_owner_work(
+            host,
+            sessions,
+            &acp_sid,
+            &owner_msp_sid,
+            child_subagent_id.as_deref(),
+        );
         return;
     }
     let req_id = J::Str(mint_id("perm-", &ID_COUNTER));
@@ -5487,6 +5747,8 @@ fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions
                 approval_id,
                 requirement,
                 choices,
+                owner_msp_sid,
+                child_subagent_id,
                 feedback: None,
             });
             s.ver
@@ -5695,7 +5957,15 @@ fn complete_permission(
         Some(s) => s,
         None => return, // not ours; ignore (e.g. late duplicate)
     };
-    let (msp_sid, ver, approval_id, requirement, choices, feedback_pending) = {
+    let (
+        ver,
+        approval_id,
+        requirement,
+        choices,
+        feedback_pending,
+        owner_msp_sid,
+        child_subagent_id,
+    ) = {
         let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
         let s = match map.get(&acp_sid) {
             Some(s) => s,
@@ -5706,12 +5976,13 @@ fn complete_permission(
             None => return,
         };
         (
-            s.msp_sid.clone(),
             s.ver,
             p.approval_id.clone(),
             p.requirement.clone(),
             p.choices.clone(),
             p.feedback.is_some(),
+            p.owner_msp_sid.clone(),
+            p.child_subagent_id.clone(),
         )
     };
     // The original permission response may arrive again after the optional
@@ -5788,7 +6059,13 @@ fn complete_permission(
                 .unwrap_or_else(|p| p.into_inner())
                 .get_mut(&acp_sid)
                 .map(|s| s.pending_perm.take());
-            cancel_session_turns(host, sessions, &acp_sid);
+            fail_closed_owner_work(
+                host,
+                sessions,
+                &acp_sid,
+                &owner_msp_sid,
+                child_subagent_id.as_deref(),
+            );
             return;
         }
     };
@@ -5806,7 +6083,7 @@ fn complete_permission(
         sessions,
         &acp_sid,
         PermissionDecision {
-            msp_sid,
+            msp_sid: owner_msp_sid,
             ver,
             approval_id,
             requirement,
@@ -5857,7 +6134,7 @@ fn complete_permission_feedback(
             return;
         };
         (
-            s.msp_sid.clone(),
+            p.owner_msp_sid,
             s.ver,
             p.approval_id,
             p.requirement,
@@ -5913,6 +6190,51 @@ fn pop_queued_approval(
     if let Some(params) = next {
         log("displaying next queued approval");
         open_approval(host, stdout, sessions, &params);
+    }
+}
+
+/// Fail closed for a permission that belongs to a child. A child approval may
+/// only stop that child; falling back to root turn cancellation would widen
+/// the effect to unrelated work in the owner session.
+fn fail_closed_owner_work(
+    host: &Arc<MspHost>,
+    sessions: &Sessions,
+    acp_sid: &str,
+    owner_msp_sid: &str,
+    child_subagent_id: Option<&str>,
+) {
+    let Some(child_subagent_id) = child_subagent_id else {
+        cancel_session_turns(host, sessions, acp_sid);
+        return;
+    };
+    let Some(target) = subagent_control_target(sessions, owner_msp_sid, child_subagent_id) else {
+        log(&format!(
+            "permission for child {child_subagent_id} could not be presented; no scoped stop target"
+        ));
+        return;
+    };
+    if !subagent_control_allowed("subagent/stop", &target) {
+        log(&format!(
+            "permission for child {child_subagent_id} could not be presented; child stop is not admitted"
+        ));
+        return;
+    }
+    let command_id = host.mint_cmd("cmd-");
+    if let Err(error) = host.command(
+        "subagent/stop",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{},\"subagentId\":{},\"reason\":{}}}",
+            esc(&command_id),
+            esc(&target.msp_sid),
+            esc(&target.subagent_id),
+            esc("permission request could not be presented"),
+        ),
+    ) {
+        log(&format!(
+            "scoped child stop failed for {}: {}",
+            target.subagent_id,
+            err_message(&error)
+        ));
     }
 }
 
@@ -6213,6 +6535,7 @@ fn bridge_user_input(
     stdout: &StdoutShared,
     sessions: &Sessions,
     acp_sid: &str,
+    owner_msp_sid: &str,
     params: &J,
 ) -> bool {
     let user_input_id = params
@@ -6376,6 +6699,7 @@ fn bridge_user_input(
         s.pending_ui.push(acp::PendingUi {
             req_id: req_id.clone(),
             user_input_id: user_input_id.clone(),
+            owner_msp_sid: owner_msp_sid.to_string(),
             questions: ui_qs,
             stage,
             answer_schema,
@@ -6487,12 +6811,7 @@ fn complete_elicitation(
         .and_then(|s| s.pending_ui.get(idx))
         .cloned();
     let Some(pending) = pending else { return };
-    let msp_sid = sessions
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(&acp_sid)
-        .map(|s| s.msp_sid.clone())
-        .unwrap_or_default();
+    let msp_sid = pending.owner_msp_sid.clone();
     let accepted = msg.get("error").is_none()
         && msg
             .get("result")
@@ -6706,6 +7025,76 @@ mod tests {
     use crate::acp;
     use crate::json::{J, parse_json};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn subagent_transcripts_cover_recorded_control_methods() {
+        let required = [
+            "subagent/sendMessage",
+            "subagent/stop",
+            "subagent/close",
+            "subagent/readResult",
+        ];
+        let mut seen = std::collections::BTreeSet::new();
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/protocol/transcripts");
+        for entry in std::fs::read_dir(&root).expect("transcript corpus") {
+            let path = entry
+                .expect("transcript entry")
+                .path()
+                .join("transcript.ndjson");
+            if !path.is_file() {
+                continue;
+            }
+            for line in std::fs::read_to_string(&path).expect("transcript").lines() {
+                let envelope = parse_json(line).expect("transcript envelope");
+                if envelope.get("dir").and_then(|v| v.as_str()) != Some("client") {
+                    continue;
+                }
+                let raw = envelope
+                    .get("raw")
+                    .and_then(|v| v.as_str())
+                    .expect("client raw frame");
+                let frame = parse_json(raw).expect("client frame");
+                let Some(method) = frame
+                    .get("method")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+                else {
+                    continue;
+                };
+                if !required.contains(&method.as_str()) {
+                    continue;
+                }
+                let params = frame.get("params").expect("control params");
+                for field in ["sessionId", "commandId", "subagentId"] {
+                    assert!(
+                        params.get(field).and_then(|v| v.as_str()).is_some(),
+                        "{method} transcript frame is missing string {field}"
+                    );
+                }
+                if matches!(
+                    method.as_str(),
+                    "subagent/sendMessage" | "subagent/followupTask"
+                ) {
+                    assert!(
+                        params.get("body").and_then(|v| v.as_str()).is_some(),
+                        "{method} transcript frame is missing body"
+                    );
+                }
+                if let Some(reason) = params.get("reason") {
+                    assert!(reason.as_str().is_some(), "{method} reason is not a string");
+                }
+                seen.insert(method);
+            }
+        }
+        assert_eq!(
+            seen,
+            required
+                .iter()
+                .map(|method| (*method).to_string())
+                .collect(),
+            "vendored subagent control corpus lost a method"
+        );
+    }
 
     /// Replay every approval payload in the vendored transcript corpus
     /// through the permission mapping: choices must survive in host order

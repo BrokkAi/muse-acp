@@ -4604,6 +4604,231 @@ fn native_subagent_sessions_spawn_state_and_replay_the_child() {
 }
 
 #[test]
+fn native_subagent_controls_forward_owner_scope_and_client_command_ids() {
+    let mut c = Client::spawn("subagent_control", &[("FAKE_CAPS", "subagents")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let _pid = c.prompt(&sid, "hold child");
+    c.wait_for("subagent_spawned", Duration::from_secs(15));
+
+    let send = c.req(
+        "subagent/sendMessage",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-send\",\"subagentId\":\"sub-control\",\"body\":\"  focus on ✓  \"}}"
+        ),
+    );
+    let send_ack = c.wait_for(&format!("\"id\":{send}"), Duration::from_secs(15));
+    assert!(
+        send_ack.contains("\"status\":\"accepted\""),
+        "send rejected: {send_ack}"
+    );
+    c.wait_input("\"body\": \"focus on", Duration::from_secs(15));
+
+    let stop = c.req(
+        "subagent/stop",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-stop\",\"subagentId\":\"sub-control\",\"reason\":\"operator asked\"}}"
+        ),
+    );
+    let stop_ack = c.wait_for(&format!("\"id\":{stop}"), Duration::from_secs(15));
+    assert!(
+        stop_ack.contains("\"status\":\"accepted\""),
+        "stop rejected: {stop_ack}"
+    );
+
+    // A replay retains the caller's idempotency key. The adapter does not
+    // mint a second command id or turn the replay into a second message.
+    let replay = c.req(
+        "subagent/stop",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-stop\",\"subagentId\":\"sub-control\",\"reason\":\"operator asked\"}}"
+        ),
+    );
+    let replay_ack = c.wait_for(&format!("\"id\":{replay}"), Duration::from_secs(15));
+    assert!(
+        replay_ack.contains("\"commandId\":\"cmd-stop\""),
+        "replay must echo the caller command id: {replay_ack}"
+    );
+
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("input log");
+    assert!(
+        input.contains("\"sessionId\": \"msp-sess-1\""),
+        "owner session was not used: {input}"
+    );
+    assert!(
+        input.contains("\"commandId\": \"cmd-send\""),
+        "send command id was replaced: {input}"
+    );
+    assert!(
+        input.contains("\"commandId\": \"cmd-stop\""),
+        "stop command id was replaced: {input}"
+    );
+    c.finish();
+}
+
+#[test]
+fn subagent_controls_are_gated_by_negotiation_and_item_terminal_status() {
+    let mut legacy = Client::spawn("subagent_control", &[]);
+    let legacy_sid = legacy.new_session(2, "");
+    let _pid = legacy.prompt(&legacy_sid, "hold child");
+    legacy.wait_for("subagent-it-sub-control", Duration::from_secs(15));
+    let legacy_stop = legacy.req(
+        "subagent/stop",
+        &format!(
+            "{{\"sessionId\":\"{legacy_sid}\",\"commandId\":\"cmd-legacy\",\"subagentId\":\"sub-control\"}}"
+        ),
+    );
+    let legacy_error = legacy.wait_for(&format!("\"id\":{legacy_stop}"), Duration::from_secs(15));
+    assert!(
+        legacy_error.contains("require native subagent session negotiation"),
+        "legacy clients must remain read-only: {legacy_error}"
+    );
+    let legacy_input =
+        std::fs::read_to_string(format!("{}.input", legacy.fake_log)).expect("input log");
+    assert!(
+        !legacy_input.contains("subagent/stop"),
+        "legacy control reached the host: {legacy_input}"
+    );
+    legacy.finish();
+
+    let mut terminal = Client::spawn(
+        "subagent_control",
+        &[
+            ("FAKE_CAPS", "subagents"),
+            ("FAKE_SUBAGENT_CONTROL_STATUS", "running"),
+            ("FAKE_SUBAGENT_ITEM_STATUS", "completed"),
+        ],
+    );
+    let terminal_sid = terminal.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let _pid = terminal.prompt(&terminal_sid, "finished child");
+    terminal.wait_for("subagent_spawned", Duration::from_secs(15));
+    let terminal_stop = terminal.req(
+        "subagent/stop",
+        &format!(
+            "{{\"sessionId\":\"{terminal_sid}\",\"commandId\":\"cmd-terminal\",\"subagentId\":\"sub-control\"}}"
+        ),
+    );
+    let terminal_error =
+        terminal.wait_for(&format!("\"id\":{terminal_stop}"), Duration::from_secs(15));
+    assert!(
+        terminal_error.contains("not allowed") && terminal_error.contains("status 'completed'"),
+        "generic terminal status must win over controlStatus: {terminal_error}"
+    );
+    let terminal_input =
+        std::fs::read_to_string(format!("{}.input", terminal.fake_log)).expect("input log");
+    assert!(
+        !terminal_input.contains("subagent/stop"),
+        "terminal control reached the host: {terminal_input}"
+    );
+    terminal.finish();
+}
+
+#[test]
+fn child_approval_fails_closed_through_the_owner_session() {
+    let mut c = Client::spawn("subagent_child_approval", &[("FAKE_CAPS", "subagents")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let _pid = c.prompt(&sid, "child needs permission");
+    c.wait_log("subagent/stop", Duration::from_secs(15));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("input log");
+    assert!(
+        input.contains("\"sessionId\": \"msp-sess-1\""),
+        "child stop escaped the owner session: {input}"
+    );
+    assert!(
+        input.contains("\"subagentId\": \"sub-control\""),
+        "child stop lost the scoped child id: {input}"
+    );
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("session/request_permission"),
+        "unanswerable child approval must not be surfaced: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn subagent_control_lifecycle_states_and_rejections_are_single_shot() {
+    let cases = [
+        ("running", "inProgress", "subagent/sendMessage"),
+        ("resultReady", "inProgress", "subagent/followupTask"),
+        ("running", "inProgress", "subagent/interrupt"),
+        ("accepted", "inProgress", "subagent/stop"),
+        ("recoveryPending", "inProgress", "subagent/resume"),
+        ("closed", "completed", "subagent/reopen"),
+        ("running", "inProgress", "subagent/close"),
+        ("resultReady", "inProgress", "subagent/readResult"),
+    ];
+    for (index, (control, status, method)) in cases.into_iter().enumerate() {
+        let mut c = Client::spawn(
+            "subagent_control",
+            &[
+                ("FAKE_CAPS", "subagents"),
+                ("FAKE_SUBAGENT_CONTROL_STATUS", control),
+                ("FAKE_SUBAGENT_ITEM_STATUS", status),
+            ],
+        );
+        let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+        let _pid = c.prompt(&sid, "lifecycle child");
+        c.wait_for("subagent_spawned", Duration::from_secs(15));
+        let req = c.req(
+            method,
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-{index}\",\"subagentId\":\"sub-control\"{}}}",
+                if matches!(method, "subagent/sendMessage" | "subagent/followupTask") {
+                    ",\"body\":\"follow up\""
+                } else {
+                    ""
+                }
+            ),
+        );
+        let ack = c.wait_for(&format!("\"id\":{req}"), Duration::from_secs(15));
+        assert!(
+            ack.contains("\"status\":\"accepted\""),
+            "{method} rejected: {ack}"
+        );
+        c.wait_log(method, Duration::from_secs(15));
+        c.finish();
+    }
+
+    let mut rejected = Client::spawn(
+        "subagent_control",
+        &[
+            ("FAKE_CAPS", "subagents"),
+            ("FAKE_SUBAGENT_CONTROL_STATUS", "resultReady"),
+            ("FAKE_ERROR_METHOD", "subagent/readResult"),
+            (
+                "FAKE_ERROR_MESSAGE",
+                "subagent/readResult rejected: not_ready",
+            ),
+        ],
+    );
+    let sid = rejected.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let _pid = rejected.prompt(&sid, "rejected result");
+    rejected.wait_for("subagent_spawned", Duration::from_secs(15));
+    let req = rejected.req(
+        "subagent/readResult",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-reject\",\"subagentId\":\"sub-control\"}}"
+        ),
+    );
+    let error = rejected.wait_for(&format!("\"id\":{req}"), Duration::from_secs(15));
+    assert!(
+        error.contains("not_ready"),
+        "durable rejection was hidden: {error}"
+    );
+    let input = std::fs::read_to_string(&rejected.fake_log).expect("fake host log");
+    assert_eq!(
+        input.matches("subagent/readResult").count(),
+        1,
+        "rejection was retried: {input}"
+    );
+    rejected.finish();
+}
+
+#[test]
 fn subagent_cards_stay_legacy_without_negotiation() {
     let mut c = Client::spawn("subagent", &[]);
     let sid = c.new_session(2, "");

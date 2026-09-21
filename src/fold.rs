@@ -139,6 +139,10 @@ pub struct ToolUpdate<'a> {
 
 pub struct SessionFold {
     items: HashMap<String, ItemRole>,
+    /// Latest owner-side observation for each durable subagent. Controls use
+    /// this index so a child session id can never become an alternate command
+    /// target.
+    subagents: HashMap<String, SubagentObservation>,
     /// Completed item ids (gap-refill replays must not re-announce).
     done: std::collections::HashSet<String>,
     idc: AtomicU64,
@@ -162,10 +166,18 @@ pub struct SessionFold {
     async_task_states: HashMap<String, String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SubagentObservation {
+    pub item_status: String,
+    pub control_status: String,
+    pub child_session_id: String,
+}
+
 impl SessionFold {
     pub fn new() -> Self {
         Self {
             items: HashMap::new(),
+            subagents: HashMap::new(),
             done: std::collections::HashSet::new(),
             idc: AtomicU64::new(1),
             native_subagents: false,
@@ -176,6 +188,51 @@ impl SessionFold {
             async_task_msp_ids: HashMap::new(),
             async_task_states: HashMap::new(),
         }
+    }
+
+    fn observe_subagent(&mut self, item: &J) {
+        if item.get("kind").and_then(|v| v.as_str()) != Some("subagent") {
+            return;
+        }
+        let Some(subagent_id) = item.get("subagentId").and_then(|v| v.as_str()) else {
+            return;
+        };
+        if subagent_id.is_empty() {
+            return;
+        }
+        self.subagents.insert(
+            subagent_id.to_string(),
+            SubagentObservation {
+                item_status: item
+                    .get("status")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("inProgress")
+                    .to_string(),
+                control_status: item
+                    .get("controlStatus")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                child_session_id: item
+                    .get("childSessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            },
+        );
+    }
+
+    /// Return the latest owner-side observation for a durable child.
+    pub fn subagent(&self, subagent_id: &str) -> Option<SubagentObservation> {
+        self.subagents.get(subagent_id).cloned()
+    }
+
+    /// Find the durable child id for a child transcript session.
+    pub fn subagent_id_for_child(&self, child_session_id: &str) -> Option<String> {
+        self.subagents
+            .iter()
+            .find(|(_, observation)| observation.child_session_id == child_session_id)
+            .map(|(id, _)| id.clone())
     }
 
     /// Resolve an AIR async task to a workflow run. Shell task ids do not
@@ -908,7 +965,7 @@ impl SessionFold {
         let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         if Self::replay_is_in_flight(item) {
             match kind {
-                "toolCall" => self.on_item_snapshot(acp_sid, ver, item, out),
+                "toolCall" | "subagent" => self.on_item_snapshot(acp_sid, ver, item, out),
                 "agentMessage" | "userMessage" => {
                     self.on_item_snapshot(acp_sid, ver, item, out);
                     let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -929,7 +986,7 @@ impl SessionFold {
         }
 
         match kind {
-            "toolCall" => {
+            "toolCall" | "subagent" => {
                 let wrap = J::Obj(vec![("item".to_string(), item.clone())]);
                 self.on_item_completed(acp_sid, ver, &wrap, out);
             }
@@ -951,6 +1008,7 @@ impl SessionFold {
             Some(s) => s.to_string(),
             None => return,
         };
+        self.observe_subagent(item);
         if self.known(&item_id) {
             return; // gap-refill replay of a settled item
         }
@@ -1225,6 +1283,7 @@ impl SessionFold {
             Some(s) => s.to_string(),
             None => return,
         };
+        self.observe_subagent(item);
         if self.known(&item_id) {
             return; // gap-refill replay of a settled item
         }

@@ -26,6 +26,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   retry_then_completed turn/retryScheduled, then a normal completion
   deferred_launch_error queued admission followed by a launchError terminal
   quiet        turn/start answers only; nothing follows (for close/cancel)
+  subagent_control live native child; FAKE_SUBAGENT_CONTROL_STATUS selects its state
+  subagent_child_approval child approval without displayable choices
   host_exit_classified exit after a turn/start ack with FAKE_HOST_EXIT_CODE
   host_exit_before_ack exit before a turn/start admission response
   host_exit_relaunch_unavailable first exit is retryable, replacement exits 5
@@ -503,6 +505,25 @@ def on_turn_start(params):
             "result": {"summary": "native child finished",
                        "evidenceRefs": [], "artifactRefs": []}}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "subagent_control":
+        control = os.environ.get("FAKE_SUBAGENT_CONTROL_STATUS", "running")
+        item_status = os.environ.get("FAKE_SUBAGENT_ITEM_STATUS", "inProgress")
+        notify("item/started", {**base, "item": {
+            "itemId": "it-sub-control", "kind": "subagent",
+            "status": item_status, "revision": 1, "subagentId": "sub-control",
+            "agentPath": "researcher", "depth": 1,
+            "objective": "hold the control test open",
+            "childSessionId": "child-sess-control",
+            "controlStatus": control}})
+    elif SCENARIO == "subagent_child_approval":
+        notify("item/started", {**base, "item": {
+            "itemId": "it-sub-control", "kind": "subagent",
+            "status": "inProgress", "revision": 1, "subagentId": "sub-control",
+            "agentPath": "researcher", "depth": 1,
+            "objective": "hold the approval test open",
+            "childSessionId": "child-sess-control", "controlStatus": "running"}})
+        notify("approval/requested", dict(
+            APPROVAL_PARAMS, sessionId="child-sess-control", availableChoices=[]))
     elif SCENARIO == "subagent":
         sid_item = "it-sub1"
         notify("item/started", {**base, "item": {
@@ -1126,6 +1147,10 @@ def result_for(method, msg):
             "status": "accepted",
             "turnId": params.get("expectedTurnId", ""),
         }
+    if method.startswith("subagent/"):
+        params = msg.get("params", {})
+        log_input(params)
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
     if method == "workflow/cancel":
         params = msg.get("params", {})
         log_input(params)
