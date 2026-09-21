@@ -3594,8 +3594,8 @@ fn async_task_updates_follow_negotiation() {
         "tool task missing: {tool_task}"
     );
     assert!(
-        tool_task.contains("\"canStop\":false"),
-        "canStop must be honest without a host stop: {tool_task}"
+        tool_task.contains("\"canStop\":true"),
+        "negotiated MSP task control must make background work stoppable: {tool_task}"
     );
 
     // User shell: its own task, spawned once and settled from exit facts.
@@ -3697,6 +3697,90 @@ fn async_task_stop_is_rejected_honestly() {
         frame.contains("not supported by the Muse host"),
         "stop must fail explicitly: {frame}"
     );
+    c.finish();
+}
+
+#[test]
+fn async_task_stop_maps_to_msp_task_stop_and_folds_terminal_item_update() {
+    let mut c = Client::spawn("async_task_stop", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    let _pid = c.prompt(&sid, "run in background");
+    c.wait_for("\"asyncTaskId\":\"call-bg-stop\"", Duration::from_secs(15));
+    let rid = c.req(
+        "_session/async_task/stop",
+        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"call-bg-stop\"}}"),
+    );
+    let ack = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(ack.contains("\"stopped\":true"), "stop admitted: {ack}");
+    let state = c.wait_for("\"state\":\"stopped\"", Duration::from_secs(15));
+    assert!(
+        state.contains("call-bg-stop"),
+        "terminal item update settles the owning task: {state}"
+    );
+    let frames_path = format!("{}.frames", c.fake_log);
+    c.finish();
+    let frames = std::fs::read_to_string(frames_path).expect("fake host frames");
+    assert!(
+        frames.contains("\"method\": \"task/stop\"")
+            && frames.contains("\"taskId\": \"it-bg-stop\""),
+        "MSP stop targets the durable item id: {frames}"
+    );
+}
+
+#[test]
+fn async_task_session_cancel_maps_to_msp_stop_all() {
+    let mut c = Client::spawn("async_task_stop_all", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    let _pid = c.prompt(&sid, "run in background");
+    c.wait_for("call-bg-all-1", Duration::from_secs(15));
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_log("task/stopAll", Duration::from_secs(15));
+    let stopped = c.wait_for("\"state\":\"stopped\"", Duration::from_secs(15));
+    assert!(
+        stopped.contains("call-bg-all-"),
+        "stopAll terminal updates settle background cards: {stopped}"
+    );
+    let frames_path = format!("{}.frames", c.fake_log);
+    c.finish();
+    let frames = std::fs::read_to_string(frames_path).expect("fake host frames");
+    assert!(
+        frames.contains("\"method\": \"task/stopAll\"")
+            && !frames
+                .lines()
+                .filter(|line| line.contains("\"method\": \"task/stopAll\""))
+                .any(|line| line.contains("\"taskId\"")),
+        "MSP stopAll has no targeted task id: {frames}"
+    );
+}
+
+#[test]
+fn async_task_stop_host_rejection_does_not_claim_stopped() {
+    let mut c = Client::spawn(
+        "async_task_stop",
+        &[
+            ("FAKE_ERROR_METHOD", "task/stop"),
+            ("FAKE_ERROR_MESSAGE", "method not found"),
+        ],
+    );
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    let _pid = c.prompt(&sid, "run in background");
+    c.wait_for("call-bg-stop", Duration::from_secs(15));
+    let rid = c.req(
+        "_session/async_task/stop",
+        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"call-bg-stop\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"error\"") && frame.contains("method not found"));
+    assert!(!frame.contains("\"stopped\":true"));
     c.finish();
 }
 

@@ -152,6 +152,11 @@ pub struct SessionFold {
     pub air_async_tasks: bool,
     /// Async task ids already announced (spawned updates are idempotent).
     pub announced_tasks: std::collections::HashSet<String>,
+    /// AIR task id -> MSP item id, used when task control targets the host.
+    async_task_msp_ids: HashMap<String, String>,
+    /// Last terminal state emitted for each AIR task, suppressing duplicate
+    /// item/updated + item/completed deliveries.
+    async_task_states: HashMap<String, String>,
 }
 
 impl SessionFold {
@@ -164,7 +169,16 @@ impl SessionFold {
             spawned_subagents: std::collections::HashSet::new(),
             air_async_tasks: false,
             announced_tasks: std::collections::HashSet::new(),
+            async_task_msp_ids: HashMap::new(),
+            async_task_states: HashMap::new(),
         }
+    }
+
+    /// Resolve the adapter-facing AIR task id to MSP's durable item id.
+    pub fn msp_task_id(&self, async_task_id: &str) -> Option<&str> {
+        self.async_task_msp_ids
+            .get(async_task_id)
+            .map(String::as_str)
     }
 
     pub fn has_active_item(&self, item_id: &str) -> bool {
@@ -551,8 +565,8 @@ impl SessionFold {
         )
     }
 
-    /// AIR async-task extension. MSP v1 has no stop primitive for background
-    /// work, so `canStop` is honestly false; the task card still owns output.
+    /// AIR async-task extension. MSP 1.3.0 accepts task control commands; the
+    /// terminal outcome still arrives through the item view.
     fn async_task_spawned_line(
         acp_sid: &str,
         task_id: &str,
@@ -560,7 +574,7 @@ impl SessionFold {
         tool_call_id: Option<&str>,
     ) -> String {
         let mut update = format!(
-            "{{\"sessionUpdate\":\"async_task_spawned\",\"asyncTaskId\":{},\"name\":{},\"taskType\":\"shell\",\"showInTranscript\":false,\"canStop\":false",
+            "{{\"sessionUpdate\":\"async_task_spawned\",\"asyncTaskId\":{},\"name\":{},\"taskType\":\"shell\",\"showInTranscript\":false,\"canStop\":true",
             esc(task_id),
             esc(name)
         );
@@ -579,6 +593,51 @@ impl SessionFold {
                 esc(task_id)
             ),
         )
+    }
+
+    fn announce_async_task(
+        &mut self,
+        acp_sid: &str,
+        item_id: &str,
+        task_id: &str,
+        name: &str,
+        tool_call_id: Option<&str>,
+        out: &mut Vec<String>,
+    ) {
+        self.async_task_msp_ids
+            .entry(task_id.to_string())
+            .or_insert_with(|| item_id.to_string());
+        if self.announced_tasks.insert(task_id.to_string()) {
+            out.push(Self::async_task_spawned_line(
+                acp_sid,
+                task_id,
+                name,
+                tool_call_id,
+            ));
+        }
+    }
+
+    fn emit_async_task_state(
+        &mut self,
+        acp_sid: &str,
+        task_id: &str,
+        item: &J,
+        out: &mut Vec<String>,
+    ) {
+        let Some(state) = Self::async_task_state(item) else {
+            return;
+        };
+        self.async_task_msp_ids.remove(task_id);
+        if self
+            .async_task_states
+            .get(task_id)
+            .is_some_and(|previous| previous == state)
+        {
+            return;
+        }
+        self.async_task_states
+            .insert(task_id.to_string(), state.to_string());
+        out.push(Self::async_task_state_line(acp_sid, task_id, state));
     }
 
     /// AIR marks the owning command card as backgrounded so its output stays
@@ -814,20 +873,16 @@ impl SessionFold {
                         host_truncated: false,
                     },
                 ));
-                if item
+                let backgrounded = item
                     .get("background")
                     .is_some_and(|v| matches!(v, J::Bool(true)))
-                    && self.air_async_tasks
-                    && !self.announced_tasks.contains(&tc_id)
-                {
-                    self.announced_tasks.insert(tc_id.clone());
-                    out.push(Self::backgrounded_tool_line(acp_sid, ver, &tc_id));
-                    out.push(Self::async_task_spawned_line(
-                        acp_sid,
-                        &tc_id,
-                        &title,
-                        Some(&tc_id),
-                    ));
+                    || self.announced_tasks.contains(&tc_id);
+                if backgrounded && self.air_async_tasks {
+                    if !self.announced_tasks.contains(&tc_id) {
+                        out.push(Self::backgrounded_tool_line(acp_sid, ver, &tc_id));
+                    }
+                    self.announce_async_task(acp_sid, &item_id, &tc_id, &title, Some(&tc_id), out);
+                    self.emit_async_task_state(acp_sid, &tc_id, item, out);
                 }
                 if let Some(ItemRole::Tool { announced, .. }) = self.items.get_mut(&item_id) {
                     *announced = true;
@@ -929,17 +984,9 @@ impl SessionFold {
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
                 }
-                if kind == "userShell"
-                    && self.air_async_tasks
-                    && !self.announced_tasks.contains(&tc_id)
-                {
-                    self.announced_tasks.insert(tc_id.clone());
-                    out.push(Self::async_task_spawned_line(
-                        acp_sid,
-                        &tc_id,
-                        &title,
-                        Some(&tc_id),
-                    ));
+                if kind == "userShell" && self.air_async_tasks {
+                    self.announce_async_task(acp_sid, &item_id, &tc_id, &title, Some(&tc_id), out);
+                    self.emit_async_task_state(acp_sid, &tc_id, item, out);
                 }
             }
             _ => {
@@ -1081,25 +1128,16 @@ impl SessionFold {
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     },
                 ));
-                if item
+                let backgrounded = item
                     .get("background")
                     .is_some_and(|v| matches!(v, J::Bool(true)))
-                    && self.air_async_tasks
-                {
+                    || self.announced_tasks.contains(&tc_id);
+                if backgrounded && self.air_async_tasks {
                     if !self.announced_tasks.contains(&tc_id) {
-                        self.announced_tasks.insert(tc_id.clone());
                         out.push(Self::backgrounded_tool_line(acp_sid, ver, &tc_id));
-                        out.push(Self::async_task_spawned_line(
-                            acp_sid,
-                            &tc_id,
-                            &title,
-                            Some(&tc_id),
-                        ));
                     }
-                    if let Some(state) = Self::async_task_state(item) {
-                        out.push(Self::async_task_state_line(acp_sid, &tc_id, state));
-                        self.announced_tasks.remove(&tc_id);
-                    }
+                    self.announce_async_task(acp_sid, &item_id, &tc_id, &title, Some(&tc_id), out);
+                    self.emit_async_task_state(acp_sid, &tc_id, item, out);
                 }
                 self.items.remove(&item_id);
             }
@@ -1217,19 +1255,8 @@ impl SessionFold {
                     ));
                 }
                 if kind == "userShell" && self.air_async_tasks {
-                    if !self.announced_tasks.contains(&tc_id) {
-                        self.announced_tasks.insert(tc_id.clone());
-                        out.push(Self::async_task_spawned_line(
-                            acp_sid,
-                            &tc_id,
-                            &title,
-                            Some(&tc_id),
-                        ));
-                    }
-                    if let Some(state) = Self::async_task_state(item) {
-                        out.push(Self::async_task_state_line(acp_sid, &tc_id, state));
-                        self.announced_tasks.remove(&tc_id);
-                    }
+                    self.announce_async_task(acp_sid, &item_id, &tc_id, &title, Some(&tc_id), out);
+                    self.emit_async_task_state(acp_sid, &tc_id, item, out);
                 }
                 self.items.remove(&item_id);
             }

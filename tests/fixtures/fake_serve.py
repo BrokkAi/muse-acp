@@ -22,6 +22,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   retract_then_completed retract, then a late turn/completed (settle once)
   retry_then_completed turn/retryScheduled, then a normal completion
   quiet        turn/start answers only; nothing follows (for close/cancel)
+  async_task_stop       background task then a targeted task/stop terminal
+  async_task_stop_all   background tasks then task/stopAll terminals
   load         session/resume serves inline history (for session/load replay)
   resume_active session/resume reports a running turn (for steering reattach)
   async_resume session/resume reports running background work
@@ -446,6 +448,26 @@ def on_turn_start(params):
             "exitSignal": 9, "visibleOutput": "watching"},
             "viewCursor": "cur-sh3"})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "async_task_stop":
+        # Leave a background task live so the ACP task-stop path can target it.
+        notify("item/updated", {**base, "item": {
+            "itemId": "it-bg-stop", "kind": "toolCall", "callId": "call-bg-stop",
+            "status": "inProgress", "revision": 1, "tool": "workspace-shell",
+            "args": {"command": "npm watch"}, "background": True,
+            "backgroundInitiator": "user"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "async_task_stop_all":
+        # Keep two background tasks live until ACP session/cancel maps to the
+        # MSP blanket command.
+        for item_id, call_id, command in [
+            ("it-bg-all-1", "call-bg-all-1", "npm watch"),
+            ("it-bg-all-2", "call-bg-all-2", "cargo watch"),
+        ]:
+            notify("item/updated", {**base, "item": {
+                "itemId": item_id, "kind": "toolCall", "callId": call_id,
+                "status": "inProgress", "revision": 1, "tool": "workspace-shell",
+                "args": {"command": command}, "background": True,
+                "backgroundInitiator": "user"}})
     elif SCENARIO == "usershell_item":
         notify("item/completed", {"sessionId": MSP_SID, "item": {
             "itemId": "it-sh1", "kind": "userShell", "status": "completed",
@@ -863,6 +885,27 @@ def result_for(method, msg):
             "trigger": "manual"}, "viewCursor": "cur-c1"})
         return {"commandId": msg["params"].get("commandId", ""),
                 "status": "accepted"}
+    if method == "task/stop" and SCENARIO == "async_task_stop":
+        params = msg.get("params", {})
+        notify("item/updated", {"sessionId": MSP_SID, "item": {
+            "itemId": "it-bg-stop", "kind": "toolCall", "callId": "call-bg-stop",
+            "status": "cancelled", "revision": 2, "tool": "workspace-shell",
+            "args": {"command": "npm watch"}, "background": True,
+            "backgroundInitiator": "user"}})
+        return {"commandId": params.get("commandId", ""),
+                "status": "accepted", "taskId": params.get("taskId", "")}
+    if method == "task/stopAll" and SCENARIO == "async_task_stop_all":
+        for item_id, call_id, command in [
+            ("it-bg-all-1", "call-bg-all-1", "npm watch"),
+            ("it-bg-all-2", "call-bg-all-2", "cargo watch"),
+        ]:
+            notify("item/completed", {"sessionId": MSP_SID, "item": {
+                "itemId": item_id, "kind": "toolCall", "callId": call_id,
+                "status": "cancelled", "revision": 2, "tool": "workspace-shell",
+                "args": {"command": command}, "background": True,
+                "failureReason": "stopped by user"}})
+        params = msg.get("params", {})
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
     if method == "userInput/answer":
         log_input(msg.get("params", {}))
         return {}
