@@ -10,6 +10,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   happy        agentMessage completion, then turn/completed(completed)
   failed       no message, then turn/completed(failed)
   tool         toolCall completion with result text, then completed
+  file_changes successful native file tools, including a replayed completion
+  file_changes_ambiguous a shell tool whose writes cannot be inferred safely
   approval     approval/requested notification (two choices), then completed
   approval_req approval/request server-initiated REQUEST (no notification)
   questions    userInput/requested with options, then completed
@@ -22,6 +24,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   quiet        turn/start answers only; nothing follows (for close/cancel)
   load         session/resume serves inline history (for session/load replay)
   resume_active session/resume reports a running turn (for steering reattach)
+  async_resume session/resume reports running background work
   catalog_grows model/list expands after the first snapshot
   catalog_refresh_failure valid catalog, malformed response, RPC error, empty catalog
   usage_turn   two model legs from two models plus a replayed leg, one turn
@@ -122,9 +125,14 @@ ACTIVE_SESSION = [MSP_SID]
 CRASH_AFTER_ACK = [False]
 
 
-def session_obj(session_id=None, workspace_root="/tmp/fake-ws"):
+ACTIVE_WORKSPACE = ["/tmp/fake-ws"]
+
+
+def session_obj(session_id=None, workspace_root=None):
     if session_id is None:
         session_id = ACTIVE_SESSION[0]
+    if workspace_root is None:
+        workspace_root = ACTIVE_WORKSPACE[0]
     return {"sessionId": session_id, "modelId": "fake-model",
             "workspaceRoot": workspace_root,
             "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
@@ -239,6 +247,41 @@ def on_turn_start(params):
             "itemId": "it-t1", "kind": "toolCall", "callId": "call-1",
             "status": "completed", "tool": "read",
             "args": {"path": "/tmp/x"}, "result": "file bytes"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "file_changes":
+        changes = [
+            ("it-add", "write_file", {"path": "added.bin"}),
+            ("it-edit", "edit_file", {"path": "src/edited.rs"}),
+            ("it-delete", "delete_file", {"path": "deleted.txt"}),
+            ("it-rename", "rename_file",
+             {"oldPath": "old.txt", "newPath": "new.txt"}),
+        ]
+        for item_id, tool, args in changes:
+            event = {**base, "item": {
+                "itemId": item_id, "kind": "toolCall", "callId": "call-" + item_id,
+                "turnId": tid, "status": "completed", "tool": tool,
+                "args": json.dumps(args)}}
+            notify("item/completed", event)
+            if item_id == "it-edit":
+                notify("item/completed", event)  # gap/resume replay
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-rejected", "kind": "toolCall", "callId": "call-no",
+            "turnId": tid, "status": "rejected", "tool": "write_file",
+            "args": json.dumps({"path": "not-written.txt"})}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "file_changes_subagent":
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-child", "kind": "subagent", "turnId": tid,
+            "status": "completed", "childSessionId": "child-session"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "file_changes_gap":
+        notify("view/gap", {**base, "viewCursor": "gap-cursor"})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "file_changes_ambiguous":
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-shell", "kind": "toolCall", "callId": "call-shell",
+            "turnId": tid, "status": "completed", "tool": "shell",
+            "args": json.dumps({"command": "printf data > inferred.txt"})}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO in ("approval", "pending_reconcile_dup"):
         notify("approval/requested", dict(APPROVAL_PARAMS))
@@ -615,7 +658,10 @@ def result_for(method, msg):
             return {"approvals": [dict(APPROVAL_PARAMS)], "userInputs": []}
         return {"approvals": [], "userInputs": []}
     if method == "session/start":
-        return {"session": session_obj(), "viewCursor": "cur-0"}
+        workspace_root = msg.get("params", {}).get("workspaceRoot", "/tmp/fake-ws")
+        ACTIVE_WORKSPACE[0] = workspace_root
+        return {"session": session_obj(workspace_root=workspace_root),
+                "viewCursor": "cur-0"}
     if method == "session/resume":
         params = msg.get("params", {})
         log_input(params)
@@ -639,6 +685,19 @@ def result_for(method, msg):
                 "workspaceRoot": "/home/me/src/proj"}
         elif SCENARIO == "usage_snapshot_null":
             history = usage_snapshot_history(context=False)
+        elif SCENARIO == "async_resume":
+            history = {"mode": "inline", "snapshot": None, "items": [
+                {"itemId": "bg-resumed", "kind": "toolCall",
+                 "callId": "call-bg-resumed", "status": "inProgress",
+                 "tool": "workspace-shell", "args": {"command": "npm watch"},
+                 "background": True, "backgroundInitiator": "timeout"},
+                {"itemId": "shell-resumed", "kind": "userShell",
+                 "status": "inProgress", "turnId": None,
+                 "commandText": "cargo watch"},
+                {"itemId": "shell-done", "kind": "userShell",
+                 "status": "completed", "turnId": None,
+                 "commandText": "old command", "exitCode": 0},
+            ]}
         elif SCENARIO in ("usage_inline", "questions_resume") and snapshot_rung:
             history = usage_snapshot_history(cumulative=(300, 60))
         else:
@@ -652,11 +711,16 @@ def result_for(method, msg):
                 history["snapshot"]["state"]["pendingUserInputs"] = [
                     {"userInputId": "ui-1", "itemId": "item-ui-1",
                      "viewCursor": "cur-8"}]
-        return {"session": session_obj(params.get("sessionId", MSP_SID)),
+        workspace_root = "/tmp" if SCENARIO == "resume_active" else None
+        return {"session": session_obj(params.get("sessionId", MSP_SID), workspace_root),
                 "viewCursor": "cur-9",
                 "pendingRequests": pending,
                 "history": history}
     if method == "view/page":
+        if SCENARIO == "file_changes_gap":
+            return {"items": [{"itemId": "gap-write", "kind": "toolCall",
+                "callId": "gap-call", "turnId": "turn-1", "status": "completed",
+                "tool": "write_file", "args": {"path": "gap-written.txt"}}]}
         page = msg.get("params", {})
         if SCENARIO == "usage_gap" and page.get("direction") != "backward":
             # Refill overlaps the live stream: cur-3 is in this page too.

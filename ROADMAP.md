@@ -319,6 +319,13 @@ local-read confinement.
 Publish a full MSP-to-ACP event matrix so ignored and unsupported notifications
 are intentional.
 
+Status: **implemented.** The authoritative
+[`docs/event-compatibility.md`](docs/event-compatibility.md) matrix classifies
+every notification in the pinned stable schema, observed host extras, and the
+two supported server-initiated requests. A corpus test compares the published
+notification rows to the schema index exactly, so additive or removed schema
+events require an explicit documentation decision before CI passes.
+
 **Initial matrix rows**
 
 - `initialized`
@@ -459,6 +466,14 @@ surface.
 
 Provide an editor-friendly summary of files changed during a turn.
 
+Status: **implemented for authoritative native file tools.** After bilateral
+AIR v1 negotiation, a prompt-scoped request receives one correlated report at
+turn completion. Successful MSP `toolCall` records supply explicit paths;
+rejected calls are excluded, replayed item ids and paths are deduplicated, and
+shell or unknown tools make the report incomplete rather than causing path
+inference. Reports are path-only and bounded, so deletes and binary files do
+not require unsafe content reads.
+
 **Work items**
 
 - Identify the authoritative MSP source for changed paths. No dedicated
@@ -552,10 +567,11 @@ Status: **AIR async tasks implemented (display-only).** After bilateral AIR
 negotiation, backgrounded tool calls mark their command card
 (`_meta.jetbrains.air.asyncTasks.backgrounded`) and emit
 `async_task_spawned`/`async_task_state_update`; user-shell items map to their
-own shell tasks with exit facts settled from code/signal. `canStop` is
+own shell tasks with exit facts settled from code/signal. Durable resume folds
+restore active tasks without replaying old terminal work. `canStop` is
 honestly false and `_session/async_task/stop` fails explicitly because MSP v1
 publishes no stop primitive. Remaining work: the `userShell` host capability
-request, active-task reconciliation, and stop once MSP exposes one.
+request and targeted stop once MSP exposes one.
 
 **Work items**
 

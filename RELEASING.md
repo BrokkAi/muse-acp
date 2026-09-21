@@ -46,9 +46,9 @@ paths; Unix archives retain the installer's versioned parent directory.
    The authorization check requires this dispatch evidence. Run:
 
    ```sh
-   RELEASE_COMMIT=$(git rev-parse HEAD) RELEASE_TAG=v0.4.4 python3 scripts/release.py build
-   RELEASE_COMMIT=$(git rev-parse HEAD) RELEASE_TAG=v0.4.4 python3 scripts/release.py authorization
-   RELEASE_COMMIT=$(git rev-parse HEAD) RELEASE_TAG=v0.4.4 python3 scripts/release.py version
+   RELEASE_COMMIT=$(git rev-parse HEAD) RELEASE_TAG=v0.4.5 python3 scripts/release.py build
+   RELEASE_COMMIT=$(git rev-parse HEAD) RELEASE_TAG=v0.4.5 python3 scripts/release.py authorization
+   RELEASE_COMMIT=$(git rev-parse HEAD) RELEASE_TAG=v0.4.5 python3 scripts/release.py version
    ```
 
    Set the tag to the proposed version. These commands are non-publishing:
@@ -94,3 +94,18 @@ and compares payloads with the preflight build. Both `ci.yml` and `release.yml`
 must also succeed in the tag push context; branch evidence cannot replace tag
 workflow verification. The installer consumes GitHub's latest release URL;
 there is no independently published update feed.
+
+## Preserved partial 0.4.4 release
+
+The unsuccessful v0.4.4 tag run 35319300040 left draft release 391285344 with
+only install.sh (asset 572072007). Its tag remains at
+ea1b57d0d86a242d2837f8b6a768d8ea0a04ae9e. Preparation preserves that tag and
+asset; v0.4.5 includes the repair on a new commit. Do not resume the old workflow
+or treat that incomplete draft as a completed release. Draft discovery uses
+the authenticated paginated release list and GraphQL when REST tag lookup
+returns 404; upload
+readback and final completeness checks use the known release ID.
+
+Release PATCH requests explicitly preserve tag_name; omitting it can rename a
+draft to an untagged placeholder. The publisher probe validates discovery after
+its update, as well as reading the updated body back through the release ID.
