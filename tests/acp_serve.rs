@@ -68,6 +68,7 @@ impl Client {
         cmd.env("FAKE_LOG", &fake_log);
         cmd.env("FAKE_INPUT", format!("{fake_log}.input"));
         cmd.env("FAKE_FRAMES", format!("{fake_log}.frames"));
+        cmd.env("FAKE_PID", format!("{fake_log}.pid"));
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -200,6 +201,22 @@ impl Client {
         }
     }
 
+    fn wait_for_pid(&self, path: &str, timeout: Duration) -> u32 {
+        let start = Instant::now();
+        loop {
+            if let Ok(raw) = std::fs::read_to_string(path)
+                && let Some(first) = raw.lines().find(|line| !line.trim().is_empty())
+                && let Ok(pid) = first.trim().parse()
+            {
+                return pid;
+            }
+            if start.elapsed() > timeout {
+                panic!("fake host never wrote its pid");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Raw client->server notification (e.g. initialized).
     fn notify(&mut self, method: &str, params: &str) {
         let frame =
@@ -235,6 +252,30 @@ impl Client {
                         .unwrap_or_else(|p| p.into_inner())
                         .join("\n")
                 );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn elicitation_frames(&self) -> Vec<String> {
+        self.frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|f| f.contains("elicitation/create"))
+            .cloned()
+            .collect()
+    }
+
+    fn wait_for_elicitation_count(&self, count: usize, timeout: Duration) -> Vec<String> {
+        let start = Instant::now();
+        loop {
+            let forms = self.elicitation_frames();
+            if forms.len() >= count {
+                return forms;
+            }
+            if start.elapsed() > timeout {
+                panic!("adapter did not emit {count} elicitation forms: {forms:?}");
             }
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -282,6 +323,42 @@ impl Client {
         extract_str(&frame, "sessionId").expect("sessionId in result")
     }
 
+    fn new_session_at(
+        &mut self,
+        ver: u64,
+        cwd: &std::path::Path,
+        additional: &[&std::path::Path],
+    ) -> String {
+        let init = self.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        let frame = self.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"additionalDirectories\":{}"),
+            "multi-root support must be advertised in ACP v{ver}: {frame}"
+        );
+        self.notify("initialized", "{}");
+        let escape = |path: &std::path::Path| {
+            path.to_str()
+                .expect("UTF-8 test path")
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        };
+        let additional = additional
+            .iter()
+            .map(|path| format!("\"{}\"", escape(path)))
+            .collect::<Vec<_>>()
+            .join(",");
+        let id = self.req(
+            "session/new",
+            &format!(
+                "{{\"cwd\":\"{}\",\"additionalDirectories\":[{additional}]}}",
+                escape(cwd)
+            ),
+        );
+        let frame = self.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\""), "session/new failed: {frame}");
+        extract_str(&frame, "sessionId").expect("sessionId in result")
+    }
+
     fn prompt(&mut self, sid: &str, text: &str) -> u64 {
         self.req(
             "session/prompt",
@@ -304,6 +381,15 @@ impl Client {
 
 trait WaitTimeout {
     fn wait_timeout(&mut self, t: Duration) -> std::io::Result<Option<std::process::ExitStatus>>;
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 impl WaitTimeout for Child {
@@ -380,6 +466,79 @@ fn usage_events_forward_msp_usage_as_acp_usage_update() {
         }
         c.finish();
     }
+}
+
+#[test]
+fn subscription_usage_is_host_observation_separate_from_cost_estimates() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("subscription_usage", &[]);
+        let sid = c.new_session(ver, "");
+        c.wait_log("usage/read", Duration::from_secs(15));
+
+        // `usage/read` has no context window to pair with yet, so the raw
+        // host observation uses session metadata rather than fabricated
+        // usage_update used/size values.
+        let read = c.wait_for("museSubscriptionUsage", Duration::from_secs(15));
+        assert!(
+            read.contains("session_info_update"),
+            "read metadata: {read}"
+        );
+        assert!(read.contains("\"usedPercent\":11"), "read window: {read}");
+        assert!(read.contains("\"usedPercent\":37"), "read weekly: {read}");
+        assert!(read.contains("\"source\":\"msp-host-observation\""));
+        assert!(read.contains("\"billing\":false"));
+        assert!(
+            !read.contains("\"cost\":"),
+            "host usage is not cost: {read}"
+        );
+
+        let _pid = c.prompt(&sid, "hi");
+        let changed = c.wait_for("\"usedPercent\":23", Duration::from_secs(15));
+        assert!(
+            changed.contains("usage_update"),
+            "changed usage update: {changed}"
+        );
+        assert!(
+            changed.contains(&sid),
+            "changed usage for our session: {changed}"
+        );
+        assert!(changed.contains("\"used\":1500") && changed.contains("\"size\":200000"));
+        assert!(
+            changed.contains("\"usedPercent\":61"),
+            "changed weekly: {changed}"
+        );
+        assert!(changed.contains("\"observedAtMs\":1754590990000"));
+        assert!(
+            !changed.contains("\"cost\":"),
+            "no token estimate was reported: {changed}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn subscription_first_observation_is_forwarded_after_an_empty_read() {
+    let mut c = Client::spawn("subscription_first_observation", &[]);
+    let sid = c.new_session(2, "");
+    c.wait_log("usage/read", Duration::from_secs(15));
+    assert!(
+        !c.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame.contains("museSubscriptionUsage"))
+    );
+
+    let _pid = c.prompt(&sid, "hi");
+    let changed = c.wait_for("museSubscriptionUsage", Duration::from_secs(15));
+    assert!(
+        changed.contains("usage_update"),
+        "first observation: {changed}"
+    );
+    assert!(changed.contains("\"usedPercent\":23"));
+    assert!(changed.contains("\"usedPercent\":61"));
+    assert!(changed.contains("\"billing\":false"));
+    c.finish();
 }
 
 #[test]
@@ -878,6 +1037,127 @@ fn tool_call_completion_bridges_with_result_text() {
 }
 
 #[test]
+fn negotiated_file_change_report_uses_successful_host_tool_paths_once() {
+    let caps = ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}";
+    let mut c = Client::spawn("file_changes", &[]);
+    let sid = c.new_session(1, caps);
+    let pid = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"change files\"}}],\"_meta\":{{\"jetbrains\":{{\"air\":{{\"agentFileChangeReportRequest\":{{\"version\":1,\"requestId\":\"report-1\"}}}}}}}}}}"
+        ),
+    );
+    let report = c.wait_for("\"agentFileChangeReport\":{", Duration::from_secs(15));
+    for path in [
+        "added.bin",
+        "src/edited.rs",
+        "deleted.txt",
+        "old.txt",
+        "new.txt",
+    ] {
+        assert!(report.contains(path), "missing {path}: {report}");
+    }
+    assert!(
+        !report.contains("not-written.txt"),
+        "rejected write leaked: {report}"
+    );
+    assert!(
+        report.contains("\"declaredComplete\":true") && report.contains("\"truncated\":false"),
+        "complete bounded report: {report}"
+    );
+    assert_eq!(
+        report.matches("src/edited.rs").count(),
+        1,
+        "replay dedup: {report}"
+    );
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "prompt terminal: {done}");
+    let reports = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|frame| frame.contains("\"agentFileChangeReport\":{"))
+        .count();
+    assert_eq!(reports, 1, "one report per completed turn");
+    c.finish();
+}
+
+#[test]
+fn file_change_report_never_infers_shell_redirection() {
+    let caps = ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}";
+    let mut c = Client::spawn("file_changes_ambiguous", &[]);
+    let sid = c.new_session(1, caps);
+    let _pid = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"run shell\"}}],\"_meta\":{{\"jetbrains\":{{\"air\":{{\"agentFileChangeReportRequest\":{{\"version\":1,\"requestId\":\"report-shell\"}}}}}}}}}}"
+        ),
+    );
+    let report = c.wait_for("\"agentFileChangeReport\":{", Duration::from_secs(15));
+    assert!(
+        report.contains("\"paths\":[]"),
+        "no guessed paths: {report}"
+    );
+    assert!(
+        report.contains("\"declaredComplete\":false"),
+        "ambiguity disclosed: {report}"
+    );
+    assert!(
+        !report.contains("inferred.txt"),
+        "shell text is not path evidence: {report}"
+    );
+    c.finish();
+}
+
+#[test]
+fn file_change_reports_cover_gap_recovery_and_disclose_delegation() {
+    for (scenario, complete, path) in [
+        ("file_changes_subagent", false, None),
+        ("file_changes_gap", true, Some("gap-written.txt")),
+    ] {
+        let mut c = Client::spawn(scenario, &[]);
+        let sid = c.new_session(1, ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}");
+        let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"text","text":"edit"}],"_meta":{"jetbrains":{"air":{"agentFileChangeReportRequest":{"version":1,"requestId":"report-recovery"}}}}});
+        c.req("session/prompt", &params.to_string());
+        let frame = c.wait_for("\"agentFileChangeReport\":{", Duration::from_secs(15));
+        assert!(
+            frame.contains(&format!("\"declaredComplete\":{complete}")),
+            "{frame}"
+        );
+        if let Some(path) = path {
+            assert!(frame.contains(path), "{frame}");
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn file_change_report_requires_bilateral_capability_negotiation() {
+    let mut c = Client::spawn("file_changes", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"change files\"}}],\"_meta\":{{\"jetbrains\":{{\"air\":{{\"agentFileChangeReportRequest\":{{\"version\":1,\"requestId\":\"report-off\"}}}}}}}}}}"
+        ),
+    );
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "prompt terminal: {done}");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("\"agentFileChangeReport\":"),
+        "unnegotiated report emitted: {frames}"
+    );
+    drop(frames);
+    c.finish();
+}
+
+#[test]
 fn approval_preserves_all_choices_with_deny_option() {
     let mut c = Client::spawn("approval", &[]);
     let sid = c.new_session(1, "");
@@ -1095,17 +1375,30 @@ fn user_input_options_reach_the_client() {
     let mut c = Client::spawn("questions", &[]);
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
     let _pid = c.prompt(&sid, "ask me");
-    // The bridge announces requires_action, then offers the host options as
-    // an elicitation/create enum schema (there is no user_input update).
+    // The bridge announces requires_action, then offers a route before the
+    // existing enum schema (there is no user_input update).
     let state = c.wait_for("requires_action", Duration::from_secs(15));
     assert!(state.contains(&sid), "state for our session: {state}");
-    let elicit = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let elicit = &forms[0];
     assert!(
         elicit.contains(&sid),
         "elicitation for our session: {elicit}"
     );
-    assert!(elicit.contains("Alpha"), "option Alpha bridged: {elicit}");
-    assert!(elicit.contains("Beta"), "option Beta bridged: {elicit}");
+    assert!(
+        elicit.contains("Answer questions") && elicit.contains("Explain instead"),
+        "route choices bridged: {elicit}"
+    );
+    let route_id = extract_str(elicit, "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+    ));
+    let answer = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    assert!(
+        answer[1].contains("Alpha") && answer[1].contains("Beta"),
+        "option answers bridged after route: {}",
+        answer[1]
+    );
     let log = c
         .frames
         .lock()
@@ -1116,6 +1409,37 @@ fn user_input_options_reach_the_client() {
         "state precedes the offer"
     );
     c.finish();
+}
+
+#[test]
+fn multiple_user_input_schema_is_valid_for_both_protocol_versions() {
+    for (ver, caps) in [
+        (1, ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}"),
+        (2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}"),
+    ] {
+        let mut c = Client::spawn("questions_multiple", &[]);
+        let sid = c.new_session(ver, caps);
+        let _pid = c.prompt(&sid, "ask me");
+        let elicit = c.wait_for("elicitation/create", Duration::from_secs(15));
+        let route_id = extract_str(&elicit, "id").unwrap();
+        c.raw(&serde_json::json!({"jsonrpc":"2.0","id":route_id,"result":{"action":"accept","content":{"route":"Answer questions"}}}).to_string());
+        let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+        let frame: serde_json::Value =
+            serde_json::from_str(&forms[1]).expect("multiple-selection elicitation is valid JSON");
+        let schema = &frame["params"]["requestedSchema"]["properties"]["q0"];
+        assert_eq!(
+            schema["type"], "array",
+            "v{ver} question uses an array schema"
+        );
+        assert_eq!(schema["items"]["type"], "string");
+        assert_eq!(
+            schema["items"]["enum"],
+            serde_json::json!(["Alpha", "Beta"])
+        );
+        assert_eq!(schema["minItems"], 1);
+        assert_eq!(schema["maxItems"], 2);
+        c.finish();
+    }
 }
 
 #[test]
@@ -1138,14 +1462,7 @@ fn resumed_user_input_is_presented_once_and_remains_answerable() {
         // The fixture reissues ui-1 after both resumes. This stream marker
         // follows the second reissue, so counting forms needs no timing guess.
         c.wait_for("resume questions delivered", Duration::from_secs(15));
-        let forms: Vec<String> = c
-            .frames
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|f| f.contains("elicitation/create"))
-            .cloned()
-            .collect();
+        let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
         assert_eq!(forms.len(), 1, "v{ver} duplicated pending form: {forms:?}");
         let calls = std::fs::read_to_string(&c.fake_log).unwrap();
         assert_eq!(calls.lines().filter(|m| *m == "session/resume").count(), 2);
@@ -1158,9 +1475,14 @@ fn resumed_user_input_is_presented_once_and_remains_answerable() {
             usage.contains("\"used\":120") && usage.contains("\"totalTokens\":360"),
             "v{ver} backfill still restores usage: {usage}"
         );
-        let first_id = extract_str(&forms[0], "id").unwrap();
+        let first_route_id = extract_str(&forms[0], "id").unwrap();
         c.raw(&format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":\"{first_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{first_route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+        ));
+        let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+        let first_answer_id = extract_str(&forms[1], "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{first_answer_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
         ));
         c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
 
@@ -1172,21 +1494,19 @@ fn resumed_user_input_is_presented_once_and_remains_answerable() {
         } else {
             c.wait_for("\"idle\"", Duration::from_secs(15));
         }
-        let forms: Vec<String> = c
-            .frames
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|f| f.contains("elicitation/create"))
-            .cloned()
-            .collect();
+        let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
+        let second_route_id = extract_str(&forms[2], "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{second_route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+        ));
+        let forms = c.wait_for_elicitation_count(4, Duration::from_secs(15));
         assert_eq!(
             forms.len(),
-            2,
+            4,
             "v{ver} one form per distinct question: {forms:?}"
         );
-        let second_id = extract_str(&forms[1], "id").unwrap();
-        assert_ne!(first_id, second_id);
+        let second_id = extract_str(&forms[3], "id").unwrap();
+        assert_ne!(first_answer_id, second_id);
         c.raw(&format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":\"{second_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Beta\"}}}}}}"
         ));
@@ -1208,13 +1528,26 @@ fn v1_questions_use_advertised_client_form_capability() {
     let mut c = Client::spawn("questions", &[]);
     let sid = c.new_session(1, ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}");
     let _pid = c.prompt(&sid, "ask me");
-    let elicit = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let elicit = &forms[0];
     assert!(
         elicit.contains(&sid),
         "elicitation for our session: {elicit}"
     );
-    assert!(elicit.contains("Alpha"), "option Alpha bridged: {elicit}");
-    assert!(elicit.contains("Beta"), "option Beta bridged: {elicit}");
+    assert!(
+        elicit.contains("Explain instead"),
+        "explanation route advertised in v1: {elicit}"
+    );
+    let route_id = extract_str(elicit, "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+    ));
+    let answer = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    assert!(
+        answer[1].contains("Alpha") && answer[1].contains("Beta"),
+        "v1 answer form: {}",
+        answer[1]
+    );
     let frames = c
         .frames
         .lock()
@@ -1224,6 +1557,185 @@ fn v1_questions_use_advertised_client_form_capability() {
         !frames.contains("requires_action"),
         "v1 must not emit v2 state: {frames}"
     );
+    c.finish();
+}
+
+#[test]
+fn explanation_route_sends_one_clarification_for_both_protocol_versions() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("questions", &[]);
+        let caps = if ver == 1 {
+            ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}"
+        } else {
+            ",\"capabilities\":{\"elicitation\":{\"form\":{}}}"
+        };
+        let sid = c.new_session(ver, caps);
+        let _pid = c.prompt(&sid, "ask me");
+        let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+        let route_id = extract_str(&forms[0], "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Explain instead\"}}}}}}"
+        ));
+        let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+        assert!(
+            forms[1].contains("clarification") && forms[1].contains("maxLength\":500"),
+            "v{ver} clarification form: {}",
+            forms[1]
+        );
+        let clarification_id = extract_str(&forms[1], "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{clarification_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"clarification\":\"The premise does not fit my situation.\"}}}}}}"
+        ));
+        c.wait_log("userInput/clarify", Duration::from_secs(15));
+        let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+        assert_eq!(
+            calls.lines().filter(|m| *m == "userInput/clarify").count(),
+            1
+        );
+        assert!(!calls.lines().any(|m| m == "userInput/answer"));
+        assert_eq!(calls.lines().filter(|m| *m == "turn/start").count(), 1);
+        let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        assert!(inputs.contains("\"sessionId\": \"msp-sess-1\""));
+        assert!(inputs.contains("\"userInputId\": \"ui-1\""));
+        assert!(inputs.contains("\"format\": \"text\""));
+        assert!(inputs.contains("The premise does not fit my situation."));
+        c.finish();
+    }
+}
+
+#[test]
+fn invalid_clarifications_are_correctable_without_a_host_command() {
+    for (bad, message) in [
+        ("   ".to_string(), "before submitting"),
+        ("x".repeat(501), "500 characters"),
+    ] {
+        let mut c = Client::spawn("questions", &[]);
+        let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+        let _pid = c.prompt(&sid, "ask me");
+        let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+        let route_id = extract_str(&forms[0], "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Explain instead\"}}}}}}"
+        ));
+        let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+        let clarification_id = extract_str(&forms[1], "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{clarification_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"clarification\":{}}}}}}}",
+            serde_json::to_string(&bad).unwrap()
+        ));
+        let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
+        assert!(
+            forms[2].contains(message),
+            "correctable validation message: {}",
+            forms[2]
+        );
+        let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+        assert!(!calls.lines().any(|m| m == "userInput/clarify"));
+        c.finish();
+    }
+}
+
+#[test]
+fn host_clarification_rejection_is_visible_and_remains_correctable() {
+    let mut c = Client::spawn(
+        "questions",
+        &[
+            ("FAKE_ERROR_METHOD", "userInput/clarify"),
+            ("FAKE_ERROR_MESSAGE", "clarification rejected by fixture"),
+        ],
+    );
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let route_id = extract_str(&forms[0], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Explain instead\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    let clarification_id = extract_str(&forms[1], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{clarification_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"clarification\":\"Please reconsider the premise.\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
+    assert!(
+        forms[2].contains("Muse rejected the clarification")
+            && forms[2].contains("clarification rejected by fixture"),
+        "host rejection is visible in the replacement form: {}",
+        forms[2]
+    );
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert_eq!(
+        calls.lines().filter(|m| *m == "userInput/clarify").count(),
+        1
+    );
+    assert!(!calls.lines().any(|m| m == "userInput/answer"));
+    c.finish();
+}
+
+#[test]
+fn stale_form_replies_cannot_settle_a_later_stage() {
+    let mut c = Client::spawn("questions", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let old_route_id = extract_str(&forms[0], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{old_route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{old_route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Explain instead\"}}}}}}"
+    ));
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(c.elicitation_frames().len(), 2);
+    let answer_id = extract_str(&forms[1], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{answer_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
+    ));
+    c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(!calls.lines().any(|m| m == "userInput/clarify"));
+    c.finish();
+}
+
+#[test]
+fn declining_the_route_cancels_the_pending_question() {
+    let mut c = Client::spawn("questions", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let route_id = extract_str(&forms[0], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"decline\"}}}}"
+    ));
+    c.wait_log("userInput/cancel", Duration::from_secs(15));
+    assert_eq!(c.elicitation_frames().len(), 1);
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(!calls.lines().any(|m| m == "userInput/answer"));
+    assert!(!calls.lines().any(|m| m == "userInput/clarify"));
+    c.finish();
+}
+
+#[test]
+fn structured_question_shapes_keep_the_existing_answer_mapping() {
+    let mut c = Client::spawn("questions", &[("FAKE_QUESTION_SHAPE", "mixed")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let route_id = extract_str(&forms[0], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    assert!(forms[1].contains("q1") && forms[1].contains("q2"));
+    let answer_id = extract_str(&forms[1], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{answer_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\",\"q1\":[\"Red\",\"Blue\"],\"q2\":\"because\"}}}}}}"
+    ));
+    c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert!(inputs.contains("\"selectedLabels\": [\"Red\", \"Blue\"]"));
+    assert!(inputs.contains("\"freeText\": \"because\""));
     c.finish();
 }
 
@@ -1471,6 +1983,127 @@ fn session_resume_without_cwd_reconnects() {
 }
 
 #[test]
+fn resume_reattaches_at_the_retained_cursor_without_duplicate_replay() {
+    for ver in [1u64, 2] {
+        let mut c = Client::spawn("view_subscribe_gap", &[]);
+        let sid = c.new_session(ver, "");
+        let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+        let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+        assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
+        c.wait_log("view/subscribe", Duration::from_secs(15));
+        c.wait_input("\"after\": \"cur-0\"", Duration::from_secs(15));
+        c.wait_for("replayed after cursor", Duration::from_secs(15));
+        c.wait_for(
+            "\"sessionUpdate\":\"usage_update\"",
+            Duration::from_secs(15),
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let frames = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n");
+        assert_eq!(
+            frames.matches("replayed after cursor").count(),
+            1,
+            "v{ver} duplicate cursor replay escaped the fold: {frames}"
+        );
+        assert_eq!(
+            frames.matches("\"sessionUpdate\":\"usage_update\"").count(),
+            1,
+            "v{ver} duplicate cursor replay escaped usage forwarding: {frames}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn live_session_rename_updates_the_acp_title() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("rename_live", &[]);
+        let sid = c.new_session(ver, "");
+        let renamed = c.wait_for("\"title\":\"Renamed elsewhere\"", Duration::from_secs(15));
+        assert!(
+            renamed.contains("\"sessionUpdate\":\"session_info_update\"") && renamed.contains(&sid),
+            "v{ver} live rename must reach ACP: {renamed}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn view_health_failure_is_logged_with_reconnect_context() {
+    let mut c = Client::spawn("view_health", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "health probe");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"end_turn\""),
+        "turn failed: {done}"
+    );
+    c.wait_stderr("session/viewHealthChanged", Duration::from_secs(15));
+    c.wait_stderr("health=unavailable", Duration::from_secs(15));
+    c.wait_stderr("noneReason=projectionUnavailable", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn resume_restores_the_authoritative_session_name() {
+    for (scenario, expected) in [
+        ("rename_resume", "Renamed outside adapter"),
+        ("rename_snapshot", "Snapshot name"),
+    ] {
+        for (ver, method) in [(1, "session/load"), (2, "session/resume")] {
+            let mut c = Client::spawn(scenario, &[]);
+            let sid = c.new_session(ver, "");
+            let rid = c.req(method, &format!("{{\"sessionId\":\"{sid}\"}}"));
+            let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+            assert!(resumed.contains("\"result\""), "{method} failed: {resumed}");
+            let title = c.wait_for(
+                &format!("\"title\":\"{expected}\""),
+                Duration::from_secs(15),
+            );
+            assert!(
+                title.contains("\"sessionUpdate\":\"session_info_update\"") && title.contains(&sid),
+                "v{ver} {scenario} title update: {title}"
+            );
+            c.finish();
+        }
+    }
+}
+
+#[test]
+fn resume_clears_a_stale_title_when_the_host_reports_never_named() {
+    let mut c = Client::spawn("rename_clear", &[]);
+    let sid = c.new_session(1, "");
+    let rid = c.req("session/load", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(resumed.contains("\"result\""), "load failed: {resumed}");
+    let cleared = c.wait_for("\"title\":null", Duration::from_secs(15));
+    assert!(
+        cleared.contains("\"sessionUpdate\":\"session_info_update\"") && cleared.contains(&sid),
+        "resume must clear the old title: {cleared}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_list_surfaces_the_authoritative_session_name() {
+    let mut c = Client::spawn("rename_list", &[]);
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let lid = c.req("session/list", "{}");
+    let listed = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+    assert!(
+        listed.contains("\"sessionId\":\"msp-sess-1\"")
+            && listed.contains("\"title\":\"Listed name\""),
+        "list must carry the durable name as title: {listed}"
+    );
+    c.finish();
+}
+
+#[test]
 fn session_ids_survive_adapter_restart_and_import() {
     // A new adapter has no in-memory ACP -> MSP map. session/list must expose
     // the durable host id, and session/load must pass that same id to Muse.
@@ -1492,6 +2125,52 @@ fn session_ids_survive_adapter_restart_and_import() {
     let loaded = c.wait_for(&format!("\"id\":{load_id}"), Duration::from_secs(15));
     assert!(loaded.contains("\"result\""), "load failed: {loaded}");
     c.wait_input("\"sessionId\": \"msp-sess-old\"", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn session_list_filters_live_sessions_by_workspace() {
+    for (scenario, extra_env) in [
+        ("session_list_workspace_filter", Vec::new()),
+        (
+            "quiet",
+            vec![
+                ("FAKE_ERROR_METHOD", "session/list"),
+                ("FAKE_ERROR_MESSAGE", "temporary list failure"),
+            ],
+        ),
+    ] {
+        let mut c = Client::spawn(scenario, &extra_env);
+        let sid = c.new_session(1, "");
+        let list_id = c.req("session/list", "{\"cwd\":\"/tmp/unrelated-ws\"}");
+        let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
+        assert!(listed.contains("\"sessions\":[]"), "{scenario}: {listed}");
+        assert!(
+            !listed.contains(&format!("\"sessionId\":\"{sid}\"")),
+            "{scenario}: unrelated live session leaked: {listed}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn session_list_forwards_and_returns_pagination_cursor() {
+    let mut c = Client::spawn("session_list_pagination", &[]);
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+
+    let first_id = c.req("session/list", "{}");
+    let first = c.wait_for(&format!("\"id\":{first_id}"), Duration::from_secs(15));
+    assert!(first.contains("\"sessionId\":\"stored-200\""), "{first}");
+    assert!(!first.contains("\"sessionId\":\"stored-201\""), "{first}");
+    assert!(first.contains("\"nextCursor\":\"page-2\""), "{first}");
+
+    let second_id = c.req("session/list", "{\"cursor\":\"page-2\"}");
+    let second = c.wait_for(&format!("\"id\":{second_id}"), Duration::from_secs(15));
+    assert!(second.contains("\"sessionId\":\"stored-201\""), "{second}");
+    assert!(!second.contains("\"sessionId\":\"stored-1\""), "{second}");
+    assert!(second.contains("\"nextCursor\":null"), "{second}");
     c.finish();
 }
 
@@ -1530,7 +2209,10 @@ fn session_load_rejects_invalid_roots_and_tolerates_mcp() {
         "{\"sessionId\":\"msp-sess-old\",\"cwd\":\"\"}",
         "{\"sessionId\":\"msp-sess-old\",\"cwd\":\"relative\"}",
         "{\"sessionId\":\"msp-sess-old\",\"cwd\":7}",
-        "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":[\"/var/tmp\"]}",
+        "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":null}",
+        "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":[\"relative\"]}",
+        "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":[\"\"]}",
+        "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":[7]}",
     ] {
         let id = c.req("session/load", params);
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
@@ -1636,6 +2318,31 @@ fn v1_advertises_config_options_and_slash_commands() {
 }
 
 #[test]
+fn legacy_set_model_accepts_model_id_and_forwards_to_msp() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let model_id = c.req(
+        "session/set_model",
+        &format!("{{\"sessionId\":\"{sid}\",\"modelId\":\"fake-model\"}}"),
+    );
+    let model_done = c.wait_for(&format!("\"id\":{model_id}"), Duration::from_secs(15));
+    assert!(
+        model_done.contains("\"result\":{\"model\":\"fake-model\"}"),
+        "legacy modelId is accepted: {model_done}"
+    );
+    c.wait_log("session/setModel", Duration::from_secs(15));
+    let frames = std::fs::read_to_string(format!("{}.frames", c.fake_log)).expect("host frames");
+    assert!(
+        frames.lines().any(|line| {
+            line.contains("\"method\": \"session/setModel\"")
+                && line.contains("\"modelId\": \"fake-model\"")
+        }),
+        "MSP setModel receives the requested modelId: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
 fn legacy_set_mode_adopts_the_folded_host_mode() {
     // A host that downgrades the requested mode must not desync the legacy
     // v1 mode state: the reply follows the folded effectiveMode, mirroring
@@ -1655,7 +2362,7 @@ fn legacy_set_mode_adopts_the_folded_host_mode() {
 }
 
 #[test]
-fn v1_jetbrains_mcp_attachment_does_not_hide_config_options() {
+fn v1_jetbrains_mcp_attachment_is_logged_and_not_forwarded() {
     let mut c = Client::spawn("quiet", &[]);
     let init = c.req("initialize", "{\"protocolVersion\":1}");
     let initialized = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
@@ -1687,6 +2394,20 @@ fn v1_jetbrains_mcp_attachment_does_not_hide_config_options() {
         "JetBrains-style session must return v1 selectors: {frame}"
     );
     c.wait_log("session/start", Duration::from_secs(15));
+    c.wait_stderr(
+        "ignoring client-provided MCP servers",
+        Duration::from_secs(15),
+    );
+    let host_frames =
+        std::fs::read_to_string(format!("{}.frames", c.fake_log)).expect("host frames");
+    let start = host_frames
+        .lines()
+        .find(|line| line.contains("\"method\": \"session/start\""))
+        .expect("session/start frame");
+    assert!(
+        !start.contains("\"mcpServers\"") && !start.contains("\"config\""),
+        "client MCP configuration must not cross the MSP boundary: {start}"
+    );
     c.finish();
 }
 
@@ -1777,12 +2498,12 @@ fn set_config_option_returns_full_state() {
 }
 
 #[test]
-fn slash_command_aliases_use_the_muse_skill_grammar() {
+fn slash_command_aliases_use_native_msp_skill_parts() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
     let _pid = c.prompt(&sid, "/plan add dropdowns");
     c.wait_input(
-        "\"text\": \"/skill plan add dropdowns\"",
+        "\"type\": \"skill\", \"selector\": \"plan\", \"arguments\": \"add dropdowns\"",
         Duration::from_secs(15),
     );
 
@@ -1797,6 +2518,61 @@ fn slash_command_aliases_use_the_muse_skill_grammar() {
     assert!(
         log.contains("\"text\":\"/plan add dropdowns\""),
         "the ACP transcript preserves the command the user selected: {log}"
+    );
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    assert!(
+        !input.contains("/skill plan"),
+        "the adapter must not rewrite a slash command into prompt text: {input}"
+    );
+    c.finish();
+}
+
+#[test]
+fn skill_catalog_refreshes_after_host_notification() {
+    let mut c = Client::spawn("skills_changed", &[]);
+    let sid = c.new_session(2, "");
+    let initial = c.wait_for("available_commands_update", Duration::from_secs(15));
+    assert!(
+        initial.contains("\"name\":\"plan\""),
+        "initial catalog: {initial}"
+    );
+    assert!(
+        !initial.contains("\"name\":\"review\""),
+        "initial catalog is stale: {initial}"
+    );
+
+    let refreshed = c.wait_for("\"name\":\"review\"", Duration::from_secs(15));
+    assert!(
+        refreshed.contains(&format!("\"sessionId\":\"{sid}\""))
+            && !refreshed.contains("\"name\":\"plan\""),
+        "skill/changed must replace the catalog: {refreshed}"
+    );
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("host input log");
+    assert_eq!(
+        input.matches("\"sessionId\": \"msp-sess-1\"").count(),
+        2,
+        "session-scoped skill/list is reissued after skill/changed: {input}"
+    );
+    c.finish();
+}
+
+#[test]
+fn unknown_native_skill_preserves_typed_host_error() {
+    let mut c = Client::spawn("skill_not_found", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "/stale use this");
+    let error = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        error.contains("\"code\":-32032"),
+        "typed skill error: {error}"
+    );
+    assert!(
+        error.contains("\"kind\":\"skillNotFound\"") && error.contains("\"selector\":\"stale\""),
+        "skill selector data must reach ACP: {error}"
+    );
+    c.wait_input(
+        "\"type\": \"skill\", \"selector\": \"stale\", \"arguments\": \"use this\"",
+        Duration::from_secs(15),
     );
     c.finish();
 }
@@ -1819,6 +2595,24 @@ fn leading_space_escapes_a_slash_command() {
 }
 
 #[test]
+fn leading_space_escapes_compact_command() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, " /compact");
+    c.wait_input("\"text\": \" /compact\"", Duration::from_secs(15));
+    let methods = std::fs::read_to_string(&c.fake_log).expect("fake log");
+    assert!(
+        methods.lines().any(|line| line == "turn/start"),
+        "escaped compact text must start a turn: {methods}"
+    );
+    assert!(
+        !methods.lines().any(|line| line == "session/compact"),
+        "escaped compact text must not compact the session: {methods}"
+    );
+    c.finish();
+}
+
+#[test]
 fn reasoning_effort_is_selected_and_sent_to_msp() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
@@ -1832,6 +2626,9 @@ fn reasoning_effort_is_selected_and_sent_to_msp() {
             && initial.contains("\"currentValue\":\"medium\""),
         "reasoning selector is initialized: {initial}"
     );
+
+    let _initial_pid = c.prompt(&sid, "use the fallback");
+    c.wait_input("\"reasoningEffort\": \"medium\"", Duration::from_secs(15));
 
     let invalid_id = c.req(
         "session/set_config_option",
@@ -1866,9 +2663,79 @@ fn reasoning_effort_is_selected_and_sent_to_msp() {
         maxed.contains("\"currentValue\":\"max\""),
         "1.2.1 max tier not selectable: {maxed}"
     );
+    c.wait_log("session/setReasoningEffort", Duration::from_secs(15));
+    let changed = c.wait_for(
+        "\"sessionUpdate\":\"config_option_update\",\"configId\":\"reasoning_effort\",\"currentValue\":\"max\"",
+        Duration::from_secs(15),
+    );
+    assert!(
+        changed.contains("\"currentValue\":\"max\""),
+        "host default change updates the selector: {changed}"
+    );
 
     let _pid = c.prompt(&sid, "think carefully");
-    c.wait_input("\"reasoningEffort\": \"max\"", Duration::from_secs(15));
+    c.wait_input("\"text\": \"think carefully\"", Duration::from_secs(15));
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    let turn_inputs: Vec<&str> = inputs
+        .lines()
+        .filter(|line| line.contains("\"input\""))
+        .collect();
+    assert!(
+        turn_inputs
+            .last()
+            .is_some_and(|line| !line.contains("reasoningEffort")),
+        "a host session default must replace the per-turn override: {inputs}"
+    );
+    c.finish();
+}
+
+#[test]
+fn reasoning_effort_default_is_restored_from_resume_snapshot() {
+    let mut c = Client::spawn("reasoning_resume", &[]);
+    let init = c.req("initialize", "{\"protocolVersion\":2}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let rid = c.req(
+        "session/resume",
+        "{\"sessionId\":\"msp-sess-1\",\"replayFrom\":{\"type\":\"start\"}}",
+    );
+    let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(
+        resumed.contains("\"currentValue\":\"high\""),
+        "resume restores the host's standing reasoning effort: {resumed}"
+    );
+
+    let _pid = c.prompt("msp-sess-1", "after resume");
+    c.wait_input("\"text\": \"after resume\"", Duration::from_secs(15));
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    let turn_input = inputs
+        .lines()
+        .find(|line| line.contains("after resume"))
+        .expect("resumed prompt input");
+    assert!(
+        !turn_input.contains("reasoningEffort"),
+        "restored default must be used without a conflicting per-turn override: {turn_input}"
+    );
+    c.finish();
+}
+
+#[test]
+fn reasoning_effort_falls_back_to_per_turn_on_legacy_host() {
+    let mut c = Client::spawn("reasoning_legacy", &[]);
+    let sid = c.new_session(2, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
+        ),
+    );
+    let set = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    assert!(
+        set.contains("\"currentValue\":\"high\""),
+        "legacy host keeps the selector usable: {set}"
+    );
+    let _pid = c.prompt(&sid, "legacy host");
+    c.wait_input("\"reasoningEffort\": \"high\"", Duration::from_secs(15));
     c.finish();
 }
 
@@ -1882,13 +2749,17 @@ fn steering_injects_into_the_exact_active_turn() {
     let steer_id = c.req(
         "_session/steering",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"change course\"}}]}}"
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"/plan prioritize tests\"}}]}}"
         ),
     );
     let response = c.wait_for(&format!("\"id\":{steer_id}"), Duration::from_secs(15));
     assert!(response.contains("\"outcome\":\"injected\""), "{response}");
     c.wait_log("turn/steer", Duration::from_secs(15));
     c.wait_input("\"expectedTurnId\": \"turn-1\"", Duration::from_secs(15));
+    c.wait_input(
+        "\"type\": \"skill\", \"selector\": \"plan\", \"arguments\": \"prioritize tests\"",
+        Duration::from_secs(15),
+    );
 
     let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
     let response_pos = frames
@@ -1897,7 +2768,7 @@ fn steering_injects_into_the_exact_active_turn() {
         .expect("steering response");
     let echo_pos = frames
         .iter()
-        .position(|frame| frame.contains("change course"))
+        .position(|frame| frame.contains("/plan prioritize tests"))
         .expect("steering echo");
     assert!(
         response_pos < echo_pos,
@@ -1959,13 +2830,7 @@ fn steering_targets_a_turn_rehydrated_by_resume() {
     let init = c.req("initialize", "{\"protocolVersion\":2}");
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
-    let resume_id = c.req(
-        "session/resume",
-        &format!(
-            "{{\"sessionId\":\"existing-session\",\"cwd\":{}}}",
-            temp_cwd_json()
-        ),
-    );
+    let resume_id = c.req("session/resume", "{\"sessionId\":\"existing-session\"}");
     let resumed = c.wait_for(&format!("\"id\":{resume_id}"), Duration::from_secs(15));
     assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
 
@@ -2131,6 +2996,7 @@ fn resource_link_inlines_workspace_text() {
     std::fs::create_dir_all(&dir).expect("tmpdir");
     // Percent-encoded name exercises URI decoding + workspace confinement.
     std::fs::write(dir.join("sp ace.txt"), "secret file text").expect("write");
+    std::fs::write(dir.join("context.json"), "json resource text").expect("write");
     let path = dir
         .join("sp%20ace.txt")
         .to_str()
@@ -2141,6 +3007,7 @@ fn resource_link_inlines_workspace_text() {
     } else {
         format!("file://{path}")
     };
+    let json_uri = uri.replace("sp%20ace.txt", "context.json");
     let init = c.req("initialize", "{\"protocolVersion\":1}");
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
@@ -2163,14 +3030,322 @@ fn resource_link_inlines_workspace_text() {
     let pid = c.req(
         "session/prompt",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource_link\",\"uri\":\"{uri}\",\"name\":\"notes\"}}]}}"
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[\
+             {{\"type\":\"resource_link\",\"uri\":\"{uri}\",\"name\":\"notes\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"{json_uri}\",\"name\":\"context\",\"mimeType\":\"application/json\"}}]}}"
         ),
     );
     // Prompt accepted (v1 answers at the terminal, which never comes in
     // quiet mode); the host must have received the inlined text.
     let _pid = pid;
     c.wait_input("secret file text", Duration::from_secs(15));
+    c.wait_input("json resource text", Duration::from_secs(15));
     c.finish();
+}
+
+#[test]
+fn untyped_source_resources_are_inlined() {
+    let mut c = Client::spawn("quiet", &[]);
+    let root = std::path::Path::new(&c.fake_log)
+        .parent()
+        .unwrap()
+        .join("workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    let sid = c.new_session_at(1, &root, &[]);
+    for name in ["notes.go", "Makefile", "page.html", "data.csv"] {
+        let marker = format!("resource-content-{name}");
+        std::fs::write(root.join(name), &marker).unwrap();
+        let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"resource_link","uri":root.join(name),"name":name}]});
+        c.req("session/prompt", &params.to_string());
+        c.wait_input(&marker, Duration::from_secs(15));
+    }
+    c.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn session_list_matches_workspace_symlink_aliases() {
+    let mut c = Client::spawn("quiet", &[]);
+    let base = std::path::Path::new(&c.fake_log)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let root = base.join("workspace");
+    let extra = base.join("extra");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&extra).unwrap();
+    let alias = base.join("alias");
+    std::os::unix::fs::symlink(&base, &alias).unwrap();
+    let sid = c.new_session_at(1, &root, &[&extra]);
+    for (cwd, additional) in [
+        (alias.join("workspace"), extra.clone()),
+        (root, alias.join("extra")),
+    ] {
+        let params = serde_json::json!({"cwd":cwd,"additionalDirectories":[additional]});
+        let id = c.req("session/list", &params.to_string());
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains(&sid),
+            "equivalent workspace filter hid session: {frame}"
+        );
+    }
+    c.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn image_symlink_uses_the_requested_filename_for_mime() {
+    use std::os::unix::fs::symlink;
+
+    let mut c = Client::spawn("quiet", &[]);
+    let primary = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent")
+        .join("workspace");
+    std::fs::create_dir_all(&primary).expect("workspace");
+    std::fs::write(primary.join("image-target"), b"fake jpeg bytes").expect("image target");
+    symlink(primary.join("image-target"), primary.join("photo.jpg")).expect("image symlink");
+    let sid = c.new_session_at(1, &primary, &[]);
+    c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"image\",\"uri\":\"{}\"}}]}}",
+            primary.join("photo.jpg").display()
+        ),
+    );
+    c.wait_input("image/jpeg", Duration::from_secs(15));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert!(
+        input.contains("\"mediaType\": \"image/jpeg\""),
+        "image MIME did not follow the requested .jpg name: {input}"
+    );
+    c.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn additional_roots_are_confined_consistently_across_protocol_versions() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::temp_dir().join(format!(
+        "acp-multi-root-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let primary = base.join("primary");
+    let nested = primary.join("nested");
+    let unrelated = base.join("unrelated");
+    let linked_target = base.join("linked-target");
+    let linked_root = base.join("linked-root");
+    let denied = base.join("denied");
+    for dir in [&nested, &unrelated, &linked_target, &denied] {
+        std::fs::create_dir_all(dir).expect("test root");
+    }
+    std::fs::write(nested.join("nested.txt"), "nested-root-text").unwrap();
+    std::fs::write(primary.join("normalized.txt"), "normalized-root-text").unwrap();
+    std::fs::write(primary.join("CaseFile.txt"), "case-normalized-text").unwrap();
+    std::fs::write(unrelated.join("sp ace.txt"), "unrelated-root-text").unwrap();
+    std::fs::write(linked_target.join("linked.txt"), "symlink-root-text").unwrap();
+    std::fs::write(denied.join("escape.txt"), "must-not-expand").unwrap();
+    std::fs::write(denied.join("hard-source.txt"), "hard-link-text").unwrap();
+    std::fs::write(primary.join("binary.txt"), b"binary-resource-secret\0tail").unwrap();
+    std::fs::write(primary.join("untyped.bin"), b"untyped-binary-secret\0tail").unwrap();
+    symlink(&linked_target, &linked_root).expect("symlinked root");
+    symlink(denied.join("escape.txt"), primary.join("escape-link.txt")).expect("escaping symlink");
+    std::fs::hard_link(
+        denied.join("hard-source.txt"),
+        primary.join("hard-link.txt"),
+    )
+    .expect("hard link into root");
+
+    for ver in [1, 2] {
+        let mut c = Client::spawn("quiet", &[("MUSE_ALLOW_UNSCOPED_READS", "0")]);
+        let sid = c.new_session_at(
+            ver,
+            &primary,
+            // Exercise nested, repeated, unrelated, and symlinked roots.
+            &[&nested, &nested, &primary, &unrelated, &linked_root],
+        );
+        let list_id = c.req(
+            "session/list",
+            &format!(
+                "{{\"cwd\":\"{}\",\"additionalDirectories\":[\"{}\",\"{}\",\"{}\",\"{}\",\"{}\"]}}",
+                primary.display(),
+                nested.display(),
+                nested.display(),
+                primary.display(),
+                unrelated.display(),
+                linked_root.display()
+            ),
+        );
+        let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
+        assert!(
+            listed.contains(&format!("\"sessionId\":\"{sid}\""))
+                && listed.contains("\"additionalDirectories\":["),
+            "ACP v{ver} list omitted its active root set: {listed}"
+        );
+        let encoded_unrelated = unrelated.join("sp%20ace.txt");
+        let prompt = format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[\
+             {{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"nested\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"file://{}/%2E%2E/normalized.txt\",\"name\":\"normalized\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"file://{}\",\"name\":\"unrelated\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"linked-root\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"hard-link\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"binary\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"untyped-binary\"}},\
+             {{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"escape\"}}]}}",
+            nested.join("nested.txt").display(),
+            nested.display(),
+            encoded_unrelated.display(),
+            linked_root.join("linked.txt").display(),
+            primary.join("hard-link.txt").display(),
+            primary.join("binary.txt").display(),
+            primary.join("untyped.bin").display(),
+            primary.join("escape-link.txt").display(),
+        );
+        c.req("session/prompt", &prompt);
+        c.wait_input("hard-link-text", Duration::from_secs(15));
+        let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        for expected in [
+            "nested-root-text",
+            "normalized-root-text",
+            "unrelated-root-text",
+            "symlink-root-text",
+            "hard-link-text",
+        ] {
+            assert!(
+                input.contains(expected),
+                "ACP v{ver} omitted {expected}: {input}"
+            );
+        }
+        assert!(
+            !input.contains("must-not-expand"),
+            "ACP v{ver} followed a symlink outside every approved root: {input}"
+        );
+        assert!(
+            !input.contains("binary-resource-secret"),
+            "ACP v{ver} expanded binary content as text: {input}"
+        );
+        assert!(
+            !input.contains("untyped-binary-secret"),
+            "ACP v{ver} expanded an untyped binary link: {input}"
+        );
+        c.req(
+            "session/prompt",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"outside-hard-link-name\"}}]}}",
+                denied.join("hard-source.txt").display()
+            ),
+        );
+        c.wait_input("outside-hard-link-name", Duration::from_secs(15));
+        let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        let last_prompt = input.lines().last().unwrap_or_default();
+        assert!(
+            !last_prompt.contains("hard-link-text"),
+            "ACP v{ver} authorized an out-of-root hard-link name: {last_prompt}"
+        );
+        let alternate_case = primary.join("casefile.txt");
+        if alternate_case.exists() {
+            c.req(
+                "session/prompt",
+                &format!(
+                    "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"case\"}}]}}",
+                    alternate_case.display()
+                ),
+            );
+            c.wait_input("case-normalized-text", Duration::from_secs(15));
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn malformed_file_uri_percent_escapes_are_rejected() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    for uri in ["file:///tmp/bad%", "file:///tmp/bad%GG"] {
+        let id = c.req(
+            "session/prompt",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource_link\",\"uri\":\"{uri}\",\"name\":\"bad\"}}]}}"
+            ),
+        );
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"error\"") && frame.contains("percent escape"),
+            "malformed URI must fail before reaching the host: {frame}"
+        );
+    }
+    c.finish();
+}
+
+#[test]
+fn resume_omission_drops_previously_active_additional_roots() {
+    let mut c = Client::spawn("quiet", &[]);
+    let base = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent");
+    let primary = base.join("workspace");
+    let additional = base.join("additional");
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::create_dir_all(&additional).unwrap();
+    let sid = c.new_session_at(1, &primary, &[&additional]);
+    let resume_id = c.req(
+        "session/resume",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"cwd\":\"{}\"}}",
+            primary.display()
+        ),
+    );
+    let resumed = c.wait_for(&format!("\"id\":{resume_id}"), Duration::from_secs(15));
+    assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
+    let list_id = c.req(
+        "session/list",
+        &format!("{{\"cwd\":\"{}\"}}", primary.display()),
+    );
+    let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
+    assert!(
+        listed.contains(&format!(
+            "\"sessionId\":\"{sid}\",\"cwd\":\"{}\",\"additionalDirectories\":[]",
+            primary.display()
+        )),
+        "resume implicitly restored an omitted root: {listed}"
+    );
+    c.finish();
+}
+
+#[test]
+fn unscoped_resource_expansion_requires_a_truthy_override() {
+    for (value, expands) in [("0", false), ("true", true)] {
+        let mut c = Client::spawn("quiet", &[("MUSE_ALLOW_UNSCOPED_READS", value)]);
+        let primary = std::path::Path::new(&c.fake_log)
+            .parent()
+            .unwrap()
+            .join("workspace");
+        let outside = primary.parent().unwrap().join("outside.txt");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::write(&outside, "explicit-unscoped-text").unwrap();
+        let sid = c.new_session_at(1, &primary, &[]);
+        c.req(
+            "session/prompt",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"outside-resource\"}}]}}",
+                outside.display()
+            ),
+        );
+        c.wait_input("outside-resource", Duration::from_secs(15));
+        let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        assert_eq!(
+            input.contains("explicit-unscoped-text"),
+            expands,
+            "override value {value:?} produced the wrong confinement behavior: {input}"
+        );
+        c.finish();
+    }
 }
 
 #[test]
@@ -2214,7 +3389,10 @@ fn invalid_session_roots_are_rejected() {
 
     for params in [
         "{\"cwd\":\"relative\"}",
-        "{\"cwd\":\"/tmp\",\"additionalDirectories\":[\"/var/tmp\"]}",
+        "{\"cwd\":\"/tmp\",\"additionalDirectories\":null}",
+        "{\"cwd\":\"/tmp\",\"additionalDirectories\":[\"relative\"]}",
+        "{\"cwd\":\"/tmp\",\"additionalDirectories\":[\"\"]}",
+        "{\"cwd\":\"/tmp\",\"additionalDirectories\":[7]}",
     ] {
         let id = c.req("session/new", params);
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
@@ -2733,6 +3911,44 @@ fn resume_restores_goal_and_branch_from_the_snapshot() {
 }
 
 #[test]
+fn goal_control_remains_host_driven_without_acp_negotiation() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let requests = [
+        ("goal/set", ",\"objective\":\"editor goal\""),
+        ("goal/edit", ",\"objective\":\"edited goal\""),
+        ("goal/pause", ""),
+        ("goal/resume", ""),
+        ("goal/clear", ""),
+    ];
+    for (index, (method, extra)) in requests.into_iter().enumerate() {
+        let id = c.req(
+            method,
+            &format!("{{\"sessionId\":\"{sid}\",\"commandId\":\"editor-goal-{index}\"{extra}}}"),
+        );
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"code\":-32601"),
+            "{method} must stay outside the ACP surface: {frame}"
+        );
+    }
+    let seen = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+    for method in [
+        "goal/set",
+        "goal/edit",
+        "goal/pause",
+        "goal/resume",
+        "goal/clear",
+    ] {
+        assert!(
+            !seen.lines().any(|line| line == method),
+            "{method} must not reach the MSP host: {seen}"
+        );
+    }
+    c.finish();
+}
+
+#[test]
 fn subagent_items_render_as_visible_tool_cards() {
     let mut c = Client::spawn("subagent", &[]);
     let sid = c.new_session(1, "");
@@ -2773,10 +3989,54 @@ fn workflow_items_render_children_state() {
         card.contains("triage issue #1: started (triage)"),
         "child state missing: {card}"
     );
+    assert!(
+        card.contains("ACP exposes no workflow child skip/retry surface"),
+        "unsupported child control reason missing: {card}"
+    );
     let done = c.wait_for("triage issue #1: completed", Duration::from_secs(15));
     assert!(
         done.contains("\"workflowRunId\":\"wfr-1\""),
         "run id meta missing: {done}"
+    );
+    c.finish();
+}
+
+#[test]
+fn workflow_async_task_stop_admits_cancel_and_waits_for_view_terminal() {
+    let mut c = Client::spawn("workflow_control", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    let _pid = c.prompt(&sid, "run workflow");
+    let spawned = c.wait_for("async_task_spawned", Duration::from_secs(15));
+    assert!(
+        spawned.contains("\"asyncTaskId\":\"wfr-control\""),
+        "workflow run id must be the async task id: {spawned}"
+    );
+    assert!(
+        spawned.contains("\"canStop\":true"),
+        "workflow task must advertise the stop surface: {spawned}"
+    );
+    let stop_id = c.req(
+        "_session/async_task/stop",
+        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"wfr-control\"}}"),
+    );
+    let ack = c.wait_for(&format!("\"id\":{stop_id}"), Duration::from_secs(15));
+    assert!(
+        ack.contains("\"status\":\"accepted\""),
+        "cancel is admission-only: {ack}"
+    );
+    c.wait_log("workflow/cancel", Duration::from_secs(15));
+    let stopped = c.wait_for("\"state\":\"stopped\"", Duration::from_secs(15));
+    assert!(
+        stopped.contains("wfr-control"),
+        "workflow view terminal must settle the async task: {stopped}"
+    );
+    let idle = c.wait_for("\"stopReason\":\"cancelled\"", Duration::from_secs(15));
+    assert!(
+        idle.contains("\"state\":\"idle\""),
+        "launching turn must settle from the later view terminal: {idle}"
     );
     c.finish();
 }
@@ -2838,9 +4098,16 @@ fn session_fork_advertises_and_copies_without_a_cut_point() {
         init_frame.contains("\"fork\":{}"),
         "fork capability not advertised: {init_frame}"
     );
+    let cwd = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent")
+        .join("workspace");
     let fid = c.req(
         "session/fork",
-        &format!("{{\"sessionId\":\"{sid}\",\"cwd\":{}}}", temp_cwd_json()),
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"cwd\":\"{}\"}}",
+            cwd.to_str().expect("UTF-8 cwd").replace('\\', "\\\\")
+        ),
     );
     let frame = c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
     assert!(frame.contains("\"result\""), "fork failed: {frame}");
@@ -2865,6 +4132,22 @@ fn session_fork_advertises_and_copies_without_a_cut_point() {
     assert!(
         pframe.contains("\"stopReason\":\"end_turn\""),
         "forked session prompt failed: {pframe}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_fork_rejects_a_workspace_the_host_did_not_apply() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(1, "");
+    let fid = c.req(
+        "session/fork",
+        &format!("{{\"sessionId\":\"{sid}\",\"cwd\":\"/\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"error\"") && frame.contains("does not match"),
+        "fork must not widen adapter scope beyond the MSP root: {frame}"
     );
     c.finish();
 }
@@ -2955,6 +4238,7 @@ fn durable_host_crash_restarts_and_reattaches() {
         "host-restarted attempt=1 sessions=1 failures=0",
         Duration::from_secs(10),
     );
+    c.wait_log("view/subscribe", Duration::from_secs(10));
     c.wait_stderr("host-ready", Duration::from_secs(10));
 
     // The re-attached session must remain usable on the replacement host.
@@ -3006,6 +4290,112 @@ fn host_truncation_is_reported_as_host_sourced() {
     assert!(
         !card.contains("source\":\"adapter\""),
         "short host text must not claim an adapter cut: {card}"
+    );
+    c.finish();
+}
+
+#[test]
+fn stored_output_metadata_and_negotiated_fetch_are_available() {
+    let mut c = Client::spawn("tool_stored_output", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"readOutput\"]}}}",
+    );
+    c.wait_stderr(
+        "client negotiated stored-output reads",
+        Duration::from_secs(10),
+    );
+    let _pid = c.prompt(&sid, "read stored output");
+    let card = c.wait_for("call-stored", Duration::from_secs(15));
+    assert!(
+        card.contains("\"itemId\":\"it-stored\""),
+        "item id missing: {card}"
+    );
+    assert!(
+        card.contains("\"outputRef\":{\"availability\":\"available\""),
+        "output ref missing: {card}"
+    );
+    assert!(
+        card.contains("\"patchRef\":{\"availability\":\"available\""),
+        "patch ref missing: {card}"
+    );
+    assert!(
+        card.contains("\"patchSummary\":{\"files\":2,\"added\":4,\"removed\":1}"),
+        "patch summary missing: {card}"
+    );
+    assert!(
+        card.contains("\"truncated\":{\"source\":\"host\"}"),
+        "host saturation missing: {card}"
+    );
+
+    let read_id = c.req(
+        "_session/readOutput",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"itemId\":\"it-stored\",\"outputRef\":\"out-1\",\"offsetBytes\":0,\"lengthBytes\":4096}}"
+        ),
+    );
+    let read = c.wait_for(&format!("\"id\":{read_id}"), Duration::from_secs(15));
+    assert!(
+        read.contains("\"content\":\"full stored output\""),
+        "read failed: {read}"
+    );
+    assert!(
+        read.contains("\"encoding\":\"utf8\""),
+        "encoding missing: {read}"
+    );
+    c.wait_log("item/readOutput", Duration::from_secs(10));
+    c.finish();
+}
+
+#[test]
+fn stored_output_fetch_requires_capability_negotiation() {
+    let mut c = Client::spawn("tool_stored_output", &[]);
+    let sid = c.new_session(2, "");
+    let read_id = c.req(
+        "_session/readOutput",
+        &format!("{{\"sessionId\":\"{sid}\",\"itemId\":\"it-stored\",\"outputRef\":\"out-1\"}}"),
+    );
+    let response = c.wait_for(&format!("\"id\":{read_id}"), Duration::from_secs(15));
+    assert!(
+        response.contains("\"code\":-32601"),
+        "unexpected response: {response}"
+    );
+    c.finish();
+}
+
+#[test]
+fn output_unavailable_is_forwarded_as_typed_error() {
+    let mut c = Client::spawn("tool_output_unavailable", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"readOutput\"]}}}",
+    );
+    let _pid = c.prompt(&sid, "read missing stored output");
+    let _card = c.wait_for("call-stored", Duration::from_secs(15));
+    let read_id = c.req(
+        "_session/readOutput",
+        &format!("{{\"sessionId\":\"{sid}\",\"itemId\":\"it-stored\",\"outputRef\":\"out-1\"}}"),
+    );
+    let response = c.wait_for(&format!("\"id\":{read_id}"), Duration::from_secs(15));
+    assert!(
+        response.contains("\"code\":-32041"),
+        "wrong error code: {response}"
+    );
+    assert!(
+        response.contains("\"kind\":\"outputUnavailable\""),
+        "kind missing: {response}"
+    );
+    assert!(
+        response.contains("\"availability\":\"missing\""),
+        "availability missing: {response}"
+    );
+    assert!(
+        response.contains("\"itemId\":\"it-stored\""),
+        "item id missing: {response}"
+    );
+    assert!(
+        response.contains("\"outputRef\":\"out-1\""),
+        "output ref missing: {response}"
     );
     c.finish();
 }
@@ -3125,8 +4515,8 @@ fn async_task_updates_follow_negotiation() {
         "tool task missing: {tool_task}"
     );
     assert!(
-        tool_task.contains("\"canStop\":false"),
-        "canStop must be honest without a host stop: {tool_task}"
+        tool_task.contains("\"canStop\":true"),
+        "negotiated MSP task control must make background work stoppable: {tool_task}"
     );
 
     // User shell: its own task, spawned once and settled from exit facts.
@@ -3177,6 +4567,45 @@ fn async_task_updates_stay_off_without_negotiation() {
 }
 
 #[test]
+fn async_tasks_reconcile_on_resume() {
+    let mut c = Client::spawn("async_resume", &[]);
+    let init = c.req(
+        "initialize",
+        "{\"protocolVersion\":2,\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}}",
+    );
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let rid = c.req(
+        "session/resume",
+        "{\"sessionId\":\"existing-session\",\"replayFrom\":\"start\"}",
+    );
+    let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
+    c.wait_for("call-bg-resumed", Duration::from_secs(15));
+    c.wait_for("shell-shell-resumed", Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert_eq!(
+        frames.matches("async_task_spawned").count(),
+        2,
+        "only active durable tasks should be restored: {frames}"
+    );
+    assert_eq!(
+        frames
+            .lines()
+            .filter(|line| line.contains("call-bg-resumed")
+                && line.contains("\"status\":\"in_progress\""))
+            .count(),
+        1,
+        "duplicate replayed task: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
 fn async_task_stop_is_rejected_honestly() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
@@ -3189,6 +4618,90 @@ fn async_task_stop_is_rejected_honestly() {
         frame.contains("not supported by the Muse host"),
         "stop must fail explicitly: {frame}"
     );
+    c.finish();
+}
+
+#[test]
+fn async_task_stop_maps_to_msp_task_stop_and_folds_terminal_item_update() {
+    let mut c = Client::spawn("async_task_stop", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    let _pid = c.prompt(&sid, "run in background");
+    c.wait_for("\"asyncTaskId\":\"call-bg-stop\"", Duration::from_secs(15));
+    let rid = c.req(
+        "_session/async_task/stop",
+        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"call-bg-stop\"}}"),
+    );
+    let ack = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(ack.contains("\"stopped\":true"), "stop admitted: {ack}");
+    let state = c.wait_for("\"state\":\"stopped\"", Duration::from_secs(15));
+    assert!(
+        state.contains("call-bg-stop"),
+        "terminal item update settles the owning task: {state}"
+    );
+    let frames_path = format!("{}.frames", c.fake_log);
+    c.finish();
+    let frames = std::fs::read_to_string(frames_path).expect("fake host frames");
+    assert!(
+        frames.contains("\"method\": \"task/stop\"")
+            && frames.contains("\"taskId\": \"it-bg-stop\""),
+        "MSP stop targets the durable item id: {frames}"
+    );
+}
+
+#[test]
+fn async_task_session_cancel_maps_to_msp_stop_all() {
+    let mut c = Client::spawn("async_task_stop_all", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    let _pid = c.prompt(&sid, "run in background");
+    c.wait_for("call-bg-all-1", Duration::from_secs(15));
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_log("task/stopAll", Duration::from_secs(15));
+    let stopped = c.wait_for("\"state\":\"stopped\"", Duration::from_secs(15));
+    assert!(
+        stopped.contains("call-bg-all-"),
+        "stopAll terminal updates settle background cards: {stopped}"
+    );
+    let frames_path = format!("{}.frames", c.fake_log);
+    c.finish();
+    let frames = std::fs::read_to_string(frames_path).expect("fake host frames");
+    assert!(
+        frames.contains("\"method\": \"task/stopAll\"")
+            && !frames
+                .lines()
+                .filter(|line| line.contains("\"method\": \"task/stopAll\""))
+                .any(|line| line.contains("\"taskId\"")),
+        "MSP stopAll has no targeted task id: {frames}"
+    );
+}
+
+#[test]
+fn async_task_stop_host_rejection_does_not_claim_stopped() {
+    let mut c = Client::spawn(
+        "async_task_stop",
+        &[
+            ("FAKE_ERROR_METHOD", "task/stop"),
+            ("FAKE_ERROR_MESSAGE", "method not found"),
+        ],
+    );
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    let _pid = c.prompt(&sid, "run in background");
+    c.wait_for("call-bg-stop", Duration::from_secs(15));
+    let rid = c.req(
+        "_session/async_task/stop",
+        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"call-bg-stop\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"error\"") && frame.contains("method not found"));
+    assert!(!frame.contains("\"stopped\":true"));
     c.finish();
 }
 
@@ -3614,6 +5127,142 @@ fn client_disconnect_exits_promptly_with_a_turn_in_flight() {
 }
 
 #[test]
+fn closed_host_stdin_does_not_strand_a_request() {
+    let marker = std::env::temp_dir().join(format!(
+        "muse-acp-closed-stdin-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let marker_str = marker.to_str().unwrap().to_string();
+    let mut c = Client::spawn(
+        "close_stdin",
+        &[("FAKE_RESTART_MARKER", marker_str.as_str())],
+    );
+    let started = Instant::now();
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let request = c.req("session/new", "{\"cwd\":\"/tmp\"}");
+    let frame = c.wait_for(&format!("\"id\":{request}"), Duration::from_secs(5));
+    assert!(
+        frame.contains("\"result\"") || frame.contains("\"error\""),
+        "request must settle after host stdin closure: {frame}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "closed host stdin left the ACP request waiting"
+    );
+    c.finish();
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[cfg(unix)]
+#[test]
+fn closed_host_stdout_reaps_the_child_without_waiting_for_process_exit() {
+    let marker = std::env::temp_dir().join(format!(
+        "muse-acp-closed-stdout-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let marker_str = marker.to_str().unwrap().to_string();
+    let mut c = Client::spawn(
+        "stdout_close_stays_alive",
+        &[("FAKE_RESTART_MARKER", marker_str.as_str())],
+    );
+    let _sid = c.new_session(1, "");
+    c.wait_stderr(
+        "host-restarted attempt=1 sessions=1 failures=0",
+        Duration::from_secs(10),
+    );
+    let pid_path = format!("{}.pid", c.fake_log);
+    let pid = c.wait_for_pid(&pid_path, Duration::from_secs(5));
+    assert!(
+        !process_alive(pid),
+        "host whose stdout closed was left running: pid={pid}"
+    );
+    c.finish();
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
+fn closed_editor_stdout_does_not_block_adapter_shutdown() {
+    let mut cmd = Command::new(adapter_bin());
+    cmd.env("MUSE_CLI", fixture())
+        .env("FAKE_SCENARIO", "quiet")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().expect("spawn adapter");
+    let mut stdin = child.stdin.take().expect("adapter stdin");
+    drop(child.stdout.take());
+    stdin
+        .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":1}}\n")
+        .expect("write initialize");
+    stdin.flush().expect("flush initialize");
+    drop(stdin);
+    let status = child
+        .wait_timeout(Duration::from_secs(5))
+        .expect("wait")
+        .expect("adapter exits after stdout closes");
+    assert!(status.success(), "closed stdout exit: {status}");
+}
+
+#[test]
+fn timed_out_pipe_write_cannot_be_delivered_later() {
+    let mut c = Client::spawn("pipe_stall", &[]);
+    let sid = c.new_session(1, "");
+    let list = c.req("session/list", "{}");
+    c.wait_for(&format!("\"id\":{list}"), Duration::from_secs(5));
+    c.wait_log("pipe-stall-start", Duration::from_secs(5));
+    let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"text","text":"x".repeat(128 * 1024)}]});
+    let id = c.req("session/prompt", &params.to_string());
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(12));
+    assert!(
+        frame.contains("error") && frame.contains("host terminated"),
+        "{frame}"
+    );
+    std::thread::sleep(Duration::from_secs(4));
+    let log = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !log.lines().any(|line| line == "turn/start"),
+        "timed-out command reached host: {log}"
+    );
+    c.finish();
+}
+
+#[test]
+fn host_shutdown_allows_pending_flush_after_stdin_eof() {
+    let mut c = Client::spawn("shutdown_flush", &[]);
+    c.new_session(1, "");
+    let log = c.fake_log.clone();
+    c.finish();
+    assert!(
+        std::fs::read_to_string(log)
+            .unwrap()
+            .contains("shutdown-flushed")
+    );
+}
+
+#[test]
+fn host_stderr_is_drained_while_the_host_is_running() {
+    let mut c = Client::spawn("stderr_flood", &[]);
+    let _sid = c.new_session(1, "");
+    let stderr_path = c.stderr_log.clone();
+    c.finish();
+    let stderr = std::fs::read_to_string(stderr_path).expect("adapter stderr");
+    assert!(
+        stderr.contains("serve stderr captured 32768 bytes"),
+        "bounded host stderr capture missing: {stderr}"
+    );
+}
+
+#[test]
 fn support_bundle_redacts_unknown_muse_env_values() {
     let out = std::process::Command::new(adapter_bin())
         .arg("--support")
@@ -3791,6 +5440,46 @@ fn expired_authentication_mid_turn_surfaces_in_both_protocols() {
 }
 
 #[test]
+fn auth_required_turn_kind_surfaces_relogin_guidance_in_both_protocols() {
+    for version in [1, 2] {
+        let mut c = Client::spawn(
+            "failed",
+            &[
+                ("FAKE_TURN_ERROR_KIND", "authRequired"),
+                (
+                    "FAKE_TURN_ERROR_MESSAGE",
+                    "provider rejected the session token: secret-sentinel",
+                ),
+                ("FAKE_TURN_ERROR_RETRYABLE", "false"),
+            ],
+        );
+        let sid = c.new_session(version, "");
+        let id = c.prompt(&sid, "hi");
+        let frame = if version == 1 {
+            c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15))
+        } else {
+            c.wait_for("Muse is not authenticated", Duration::from_secs(15))
+        };
+        assert!(
+            frame.contains("Muse is not authenticated")
+                && frame.contains("muse login")
+                && frame.contains(fixture_name()),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("secret-sentinel") && !frame.contains("terminal 'failed'"),
+            "raw auth detail or generic failure leaked: {frame}"
+        );
+        if version == 1 {
+            assert!(frame.contains("\"code\":-32000"), "{frame}");
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        c.finish();
+    }
+}
+
+#[test]
 fn external_authentication_failure_mid_turn_keeps_service_context() {
     for version in [1, 2] {
         let mut c = Client::spawn(
@@ -3868,5 +5557,40 @@ fn authentication_remains_external() {
         frame.contains("\"code\":-32601") && frame.contains("muse login"),
         "{frame}"
     );
+    c.finish();
+}
+
+#[test]
+fn queued_approval_is_displayed_after_the_first_decision() {
+    let mut c = Client::spawn("approval_queue", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "do it");
+    let first = c.wait_for("request_permission", Duration::from_secs(15));
+    c.wait_stderr("approval approval-second queued", Duration::from_secs(15));
+    let first_id = extract_str(&first, "id").unwrap();
+    c.raw(&serde_json::json!({"jsonrpc":"2.0","id":first_id,"result":{"outcome":{"outcome":"selected","optionId":"c-deny"}}}).to_string());
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let second = loop {
+        let forms: Vec<String> = c
+            .frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f.contains("request_permission"))
+            .cloned()
+            .collect();
+        if forms.len() == 2 {
+            break forms[1].clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "queued permission was never displayed: {forms:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let second_id = extract_str(&second, "id").unwrap();
+    assert_ne!(first_id, second_id);
+    c.raw(&serde_json::json!({"jsonrpc":"2.0","id":second_id,"result":{"outcome":{"outcome":"selected","optionId":"c-deny"}}}).to_string());
+    c.wait_input("approval-second", Duration::from_secs(15));
     c.finish();
 }
