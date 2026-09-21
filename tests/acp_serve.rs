@@ -185,6 +185,22 @@ impl Client {
         }
     }
 
+    fn wait_frame_contains(&self, want: &str, timeout: Duration) {
+        let path = format!("{}.frames", self.fake_log);
+        let start = Instant::now();
+        loop {
+            if let Ok(t) = std::fs::read_to_string(&path)
+                && t.contains(want)
+            {
+                return;
+            }
+            if start.elapsed() > timeout {
+                panic!("fake host never captured frame containing {want:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     /// Wait until the adapter logged a line containing `want`.
     fn wait_stderr(&self, want: &str, timeout: Duration) {
         let start = Instant::now();
@@ -6291,6 +6307,87 @@ fn resumed_active_prompt_cannot_be_unqueued() {
     assert!(
         !methods.lines().any(|line| line == "turn/unqueue"),
         "{methods}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_list_stream_updates_titles_filters_rows_and_unloads_sessions() {
+    let mut c = Client::spawn("session_list_stream", &[]);
+    let sid = c.new_session(1, "");
+    c.wait_frame_contains("sessionListStream", Duration::from_secs(15));
+
+    let pushed = c.wait_for("Renamed elsewhere", Duration::from_secs(15));
+    assert!(pushed.contains("session_info_update"), "{pushed}");
+    assert!(
+        pushed.contains("\"title\":\"Renamed elsewhere\""),
+        "{pushed}"
+    );
+
+    let filtered_id = c.req("session/list", "{\"cwd\":\"/tmp/unrelated-ws\"}");
+    let filtered = c.wait_for(&format!("\"id\":{filtered_id}"), Duration::from_secs(15));
+    assert!(filtered.contains("\"sessions\":[]"), "{filtered}");
+    assert!(
+        !filtered.contains(&sid),
+        "unrelated streamed row leaked: {filtered}"
+    );
+    c.wait_log("session/closed-sent", Duration::from_secs(15));
+
+    let listed_id = c.req("session/list", "{}");
+    let listed = c.wait_for(&format!("\"id\":{listed_id}"), Duration::from_secs(15));
+    assert!(
+        !listed.contains(&sid),
+        "closed streamed row was resurrected: {listed}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_list_stream_notifications_are_ignored_without_a_grant() {
+    let mut c = Client::spawn("session_list_stream_denied", &[]);
+    let sid = c.new_session(1, "");
+    c.wait_frame_contains("sessionListStream", Duration::from_secs(15));
+    c.wait_log("session/listChanged-sent", Duration::from_secs(15));
+
+    let list_id = c.req("session/list", "{}");
+    let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
+    assert!(
+        listed.contains(&sid),
+        "fallback listing lost the live row: {listed}"
+    );
+    assert!(
+        !listed.contains("Should be ignored"),
+        "ungranted stream was consumed: {listed}"
+    );
+    c.finish();
+}
+
+#[test]
+fn streamed_rows_preserve_metadata_priority_and_clear_omitted_fields() {
+    let mut c = Client::spawn("session_list_stream", &[("FAKE_STREAM_METADATA", "1")]);
+    c.new_session(1, "");
+    c.wait_for("\"title\":\"Streamed name\"", Duration::from_secs(15));
+    let id = c.req("session/list", "{}");
+    let listed = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        listed.contains("Streamed name")
+            && listed.contains("live-branch")
+            && listed.contains("inputPending"),
+        "{listed}"
+    );
+    assert!(
+        !listed.contains("Lower priority") && !listed.contains("Initial title"),
+        "{listed}"
+    );
+    c.wait_for("\"title\":null", Duration::from_secs(15));
+    let id = c.req("session/list", "{}");
+    let cleared = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        !cleared.contains("Streamed name")
+            && !cleared.contains("live-branch")
+            && !cleared.contains("inputPending")
+            && !cleared.contains("Initial title"),
+        "{cleared}"
     );
     c.finish();
 }

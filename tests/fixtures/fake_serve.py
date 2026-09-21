@@ -56,6 +56,9 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
+  session_list_stream grants sessionListStream and emits row replace/close events
+  session_list_stream_denied sends the notification without granting the capability
+  session_list_pagination returns a second page when its cursor is forwarded
   status_flags   session/statusChanged status, attention, open-enum, and null
                  viewCursor handling
   session_metadata host-authored title candidates, branch/attention metadata,
@@ -211,6 +214,8 @@ def session_obj(session_id=None, workspace_root=None):
             session["firstUserPrompt"] = "Host first prompt fallback"
     if SCENARIO == "rename_list":
         session["name"] = "Listed name"
+    if SCENARIO == "session_list_stream" and session_id == MSP_SID:
+        session["title"] = "Initial title"
     return session
 
 
@@ -870,11 +875,16 @@ def on_turn_start(params):
 
 def result_for(method, msg):
     if method == "initialize":
+        requested = (msg.get("params", {}).get("capabilities", {})
+                     .get("requestedCapabilities", []))
+        granted = (["sessionListStream"]
+                   if SCENARIO == "session_list_stream"
+                   and "sessionListStream" in requested else [])
         USER_INPUT_DIALOGS[0] = msg.get("params", {}).get("capabilities", {}).get(
             "userInputDialogs", True) is not False
         return {
             "schema": SCHEMA,
-            "capabilities": {},
+            "grantedCapabilities": granted,
             "serverInfo": {
                 "name": "muse-session-server-fixture",
                 "version": "0.0.0-fixture",
@@ -1364,6 +1374,32 @@ def main():
                     continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
+                if SCENARIO in ("session_list_stream", "session_list_stream_denied") \
+                        and method == "session/start":
+                    root = msg.get("params", {}).get("workspaceRoot", "/tmp/fake-ws")
+                    log_method("session/listChanged-sent")
+                    send({"jsonrpc": "2.0", "method": "session/started",
+                          "params": {"session": session_obj(workspace_root=root)}})
+                    changed = session_obj(workspace_root=root)
+                    changed["title"] = ("Renamed elsewhere"
+                                        if SCENARIO == "session_list_stream"
+                                        else "Should be ignored")
+                    if os.environ.get("FAKE_STREAM_METADATA") == "1":
+                        changed.update({"name": "Streamed name", "title": "Lower priority",
+                                        "branch": {"branch": "live-branch"},
+                                        "attention": ["inputPending"]})
+                    send({"jsonrpc": "2.0", "method": "session/listChanged",
+                          "params": {"session": changed}})
+                if SCENARIO == "session_list_stream" and method == "session/list" \
+                        and os.environ.get("FAKE_STREAM_METADATA") == "1":
+                    send({"jsonrpc": "2.0", "method": "session/listChanged",
+                          "params": {"session": {"sessionId": MSP_SID,
+                                                 "workspaceRoot": ACTIVE_WORKSPACE[0]}}})
+                if SCENARIO == "session_list_stream" and method == "session/list" \
+                        and os.environ.get("FAKE_STREAM_METADATA") != "1":
+                    log_method("session/closed-sent")
+                    send({"jsonrpc": "2.0", "method": "session/closed",
+                          "params": {"sessionId": MSP_SID}})
                 if method == "session/setReasoningEffort":
                     notify("session/reasoningEffortChanged", {
                         "sessionId": msg.get("params", {}).get("sessionId", MSP_SID),

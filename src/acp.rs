@@ -800,6 +800,23 @@ pub fn send_session_meta(
     goal: Option<&str>,
     branch: Option<&str>,
 ) {
+    send_session_info(stdout, acp_sid, None, goal, branch);
+}
+
+/// Push ACP session metadata. Titles are the one standard list-row field that
+/// has a matching ACP update; list membership remains pull-only because ACP
+/// has no session-list change notification.
+pub fn send_session_info(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    title: Option<&str>,
+    goal: Option<&str>,
+    branch: Option<&str>,
+) {
+    let mut fields = vec!["\"sessionUpdate\":\"session_info_update\"".to_string()];
+    if let Some(title) = title {
+        fields.push(format!("\"title\":{}", esc(title)));
+    }
     let mut meta = Vec::new();
     if let Some(goal) = goal {
         meta.push(format!("\"goal\":{goal}"));
@@ -807,13 +824,13 @@ pub fn send_session_meta(
     if let Some(branch) = branch {
         meta.push(format!("\"muse\":{{\"branch\":{branch}}}"));
     }
-    if meta.is_empty() {
+    if !meta.is_empty() {
+        fields.push(format!("\"_meta\":{{{}}}", meta.join(",")));
+    }
+    if fields.len() == 1 {
         return;
     }
-    let update = format!(
-        "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{{}}}}}",
-        meta.join(",")
-    );
+    let update = format!("{{{}}}", fields.join(","));
     send_raw(
         stdout,
         &format!(
