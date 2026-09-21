@@ -46,6 +46,10 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
+  subscription_usage  usage/read returns the host snapshot and usage/changed
+                      sends a changed subscription observation
+  subscription_first_observation  usage/read is absent before the first
+                                  usage/changed notification
   rename_live  session/nameChanged updates a connected session
   rename_resume Session.name changes between start and resume
   rename_snapshot SnapshotState.name is the only name on resume
@@ -73,6 +77,7 @@ FOLDED_MODE = os.environ.get("FAKE_FOLDED_MODE", "")
 LOG = os.environ.get("FAKE_LOG", "")
 TURNS = [0]
 CATALOG_READS = [0]
+USAGE_READS = [0]
 SKILL_READS = [0]
 
 # Compatibility-diagnostics knobs: the fixture defaults to the validated
@@ -189,6 +194,18 @@ def context_usage(used, cursor):
     return {"sessionId": MSP_SID, "usedTokens": used, "windowTokens": 200000,
             "pressure": "normal", "viewCursor": cursor,
             "sourceRange": {"start": 0, "end": int(cursor.split("-")[1])}}
+
+
+def subscription_usage(window_percent, weekly_percent, observed_at=1754590990000):
+    return {
+        "observedAtMs": observed_at,
+        "tier": "pro",
+        "window": {"resetsAtMs": 1754608990000,
+                    "usedPercent": window_percent,
+                    "windowDurationMins": 300},
+        "weekly": {"resetsAtMs": 1755200000000,
+                    "usedPercent": weekly_percent},
+    }
 
 
 def usage_snapshot_history(context=True, cumulative=(100, 20)):
@@ -618,6 +635,13 @@ def on_turn_start(params):
             "cumulative": {"promptTokens": 1000, "outputTokens": 500,
                            "totalTokens": 1500}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO in ("subscription_usage", "subscription_first_observation"):
+        # The notification is host-global and carries no sessionId. The
+        # adapter must attach it to every ACP session without treating it as
+        # token usage or a local cost estimate.
+        notify("session/contextUsage", context_usage(1500, "cur-1"))
+        notify("usage/changed", subscription_usage(23, 61))
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "usage_turn":
         # Two model calls in one turn, from two models, plus a replay of the
         # second leg's view cursor. The prompt result must carry the sum of
@@ -722,6 +746,11 @@ def result_for(method, msg):
             # The same approval the adapter is already displaying.
             return {"approvals": [dict(APPROVAL_PARAMS)], "userInputs": []}
         return {"approvals": [], "userInputs": []}
+    if method == "usage/read":
+        USAGE_READS[0] += 1
+        if SCENARIO == "subscription_usage":
+            return {"usage": subscription_usage(11, 37)}
+        return {}
     if method == "session/start":
         workspace_root = msg.get("params", {}).get("workspaceRoot", "/tmp/fake-ws")
         ACTIVE_WORKSPACE[0] = workspace_root

@@ -100,6 +100,9 @@ pub struct AcpSession {
     /// View cursors of completions already folded into the totals above.
     /// `view/gap` recovery can replay a completion that also arrives live.
     pub usage_seen: std::collections::HashSet<String>,
+    /// Latest host-observed subscription usage, as the raw MSP
+    /// `SubscriptionUsage` object. This is a host fact, never a cost figure.
+    pub subscription_usage: Option<String>,
     /// Latest goal block as raw MSP JSON (`"null"` after an explicit clear;
     /// `None` before any fact arrives).
     pub goal_meta: Option<String>,
@@ -358,6 +361,11 @@ pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>)
     if let Some(p) = pressure {
         meta.push_str(&format!(",\"musePressure\":{}", esc(p)));
     }
+    if let Some(usage) = s.subscription_usage.as_deref() {
+        meta.push_str(&format!(
+            ",\"museSubscriptionUsage\":{{\"source\":\"msp-host-observation\",\"billing\":false,\"usage\":{usage}}}"
+        ));
+    }
     // `amount` must be a JSON number: Rust's Display prints `inf`/`NaN`
     // verbatim, which would corrupt the whole frame.
     let cost_f = match &s.cost_amount {
@@ -371,6 +379,26 @@ pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>)
         stdout,
         &format!(
             "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"usage_update\",\"used\":{used},\"size\":{size}{cost_f},\"_meta\":{{{meta}}}}}}}}}",
+            esc(&s.acp_sid),
+        ),
+    );
+}
+
+/// Publish a host subscription observation when ACP has no context window yet.
+/// `usage_update` requires numeric `used` and `size`, so this metadata-only
+/// update keeps the host fact visible without inventing an occupancy pair.
+pub fn send_subscription_usage(stdout: &StdoutShared, s: &AcpSession, clear: bool) {
+    if s.subscription_usage.is_none() && !clear {
+        return;
+    }
+    let usage = s.subscription_usage.as_deref().unwrap_or("null");
+    let update = format!(
+        "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"museSubscriptionUsage\":{{\"source\":\"msp-host-observation\",\"billing\":false,\"usage\":{usage}}}}}}}"
+    );
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{update}}}}}}}",
             esc(&s.acp_sid),
         ),
     );

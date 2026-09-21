@@ -567,6 +567,96 @@ fn adopt_cumulative(s: &mut AcpSession, c: &J) {
     s.cum_total = c.get("totalTokens").and_then(|v| v.as_u64());
 }
 
+/// Validate the stable fields of the Muse 1.3.0 `SubscriptionUsage` object
+/// while preserving the complete host object, including future fields.
+fn valid_subscription_usage(v: &J) -> bool {
+    let Some(weekly) = v.get("weekly") else {
+        return false;
+    };
+    let Some(window) = v.get("window") else {
+        return false;
+    };
+    v.get("observedAtMs").and_then(|n| n.as_u64()).is_some()
+        && v.get("tier").and_then(|t| t.as_str()).is_some()
+        && weekly.get("resetsAtMs").and_then(|n| n.as_u64()).is_some()
+        && weekly.get("usedPercent").and_then(|n| n.as_u64()).is_some()
+        && window.get("resetsAtMs").and_then(|n| n.as_u64()).is_some()
+        && window.get("usedPercent").and_then(|n| n.as_u64()).is_some()
+        && window
+            .get("windowDurationMins")
+            .and_then(|n| n.as_u64())
+            .is_some()
+}
+
+/// Read the host-global subscription snapshot. `Some(None)` is a successful
+/// truthful absence; `None` means the host does not implement the optional
+/// 1.3.0 surface or returned a malformed response, so existing state stays.
+fn read_subscription_usage(host: &Arc<MspHost>) -> Option<Option<String>> {
+    let r = match host.command("usage/read", "{}") {
+        Ok(r) => r,
+        Err(e) => {
+            log(&format!("usage/read unavailable: {}", err_message(&e)));
+            return None;
+        }
+    };
+    match r.get("usage") {
+        None => Some(None),
+        Some(usage) if valid_subscription_usage(usage) => Some(Some(j_to_string(usage))),
+        Some(_) => {
+            log("usage/read returned an invalid SubscriptionUsage object");
+            None
+        }
+    }
+}
+
+/// Store a subscription snapshot and expose it on the next valid ACP usage
+/// frame. A session without context occupancy gets a metadata-only update so
+/// the adapter never invents `used` or `size` just to show the host fact.
+fn adopt_subscription_usage(stdout: &StdoutShared, s: &mut AcpSession, next: Option<String>) {
+    if s.subscription_usage == next {
+        return;
+    }
+    let clear = s.subscription_usage.is_some() && next.is_none();
+    s.subscription_usage = next;
+    if s.usage_used.is_some() && s.usage_size.is_some() {
+        if clear {
+            acp::send_subscription_usage(stdout, s, true);
+        }
+        acp::send_usage(stdout, s, None);
+    } else {
+        acp::send_subscription_usage(stdout, s, clear);
+    }
+}
+
+/// Refresh one ACP session from the host-global `usage/read` surface.
+fn refresh_subscription_usage(
+    host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+) {
+    let Some(next) = read_subscription_usage(host) else {
+        return;
+    };
+    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(s) = map.get_mut(acp_sid) {
+        adopt_subscription_usage(stdout, s, next);
+    }
+}
+
+/// Refresh all attached sessions after a host restart. Subscription usage is
+/// host-global, so one read is enough and every session receives the same
+/// observation.
+fn refresh_all_subscription_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions) {
+    let Some(next) = read_subscription_usage(host) else {
+        return;
+    };
+    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+    for s in map.values_mut() {
+        adopt_subscription_usage(stdout, s, next.clone());
+    }
+}
+
 /// Latest usage for a resumed session whose history carried none.
 ///
 /// Two reads, because the host exposes the two halves in different places.
@@ -1336,6 +1426,9 @@ fn restart_durable_host(
                         Err(e) => failures.push(format!("{msp_sid}: {}", err_message(&e))),
                     }
                 }
+                if !attach.is_empty() {
+                    refresh_all_subscription_usage(&host, stdout, sessions);
+                }
                 log(&format!(
                     "host-restarted attempt={attempt} sessions={} failures={}",
                     attach.len(),
@@ -1807,6 +1900,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             cum_total: None,
                             cost_amount: None,
                             usage_seen: std::collections::HashSet::new(),
+                            subscription_usage: None,
                             goal_meta: None,
                             branch_meta: None,
                             session_name: session_name.as_ref().and_then(Clone::clone),
@@ -1858,6 +1952,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         acp::send_session_title(stdout, &sid, name.as_deref());
                     }
                     acp::send_available_commands(stdout, &sid, ver, &skills);
+                    // Subscription usage is host-global and may already be
+                    // known before the first session usage event arrives.
+                    refresh_subscription_usage(host, stdout, sessions, &sid);
                 }
                 Err(e) => {
                     let msg = err_message(&e);
@@ -2030,6 +2127,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             cum_total: None,
                             cost_amount: None,
                             usage_seen: std::collections::HashSet::new(),
+                            subscription_usage: None,
                             goal_meta: None,
                             branch_meta: None,
                             session_name: None,
@@ -2126,6 +2224,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     reconcile_in_flight(stdout, sessions, &sid, &r);
                     // Outside the lock: this reads back from the host.
                     backfill_usage(host, stdout, sessions, &sid);
+                    refresh_subscription_usage(host, stdout, sessions, &sid);
                     // Reissued server requests are the primary pending
                     // delivery; the pull endpoint is the belt-and-braces
                     // pass so a dropped notification cannot hide a request.
@@ -2362,6 +2461,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             cum_total: None,
                             cost_amount: None,
                             usage_seen: std::collections::HashSet::new(),
+                            subscription_usage: None,
                             goal_meta: None,
                             branch_meta: None,
                             session_name: session_name.as_ref().and_then(Clone::clone),
@@ -2426,6 +2526,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         )
                     };
                     acp::send_result(stdout, &id, &result);
+                    refresh_subscription_usage(host, stdout, sessions, &new_msp);
                     if let Some(name) = session_name {
                         acp::send_session_title(stdout, &new_msp, name.as_deref());
                     }
@@ -4726,6 +4827,20 @@ fn handle_msp(
                     goal_meta.as_deref(),
                     branch_meta.as_deref(),
                 );
+            }
+        }
+        "usage/changed" => {
+            // Subscription usage is host-global in MSP 1.3.0: the
+            // notification intentionally has no sessionId. Broadcast the
+            // same raw host observation to every attached ACP session.
+            if !valid_subscription_usage(params) {
+                log("usage/changed carried an invalid SubscriptionUsage object");
+                return;
+            }
+            let next = Some(j_to_string(params));
+            let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+            for s in map.values_mut() {
+                adopt_subscription_usage(stdout, s, next.clone());
             }
         }
         "session/contextUsage" => {

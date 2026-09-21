@@ -364,6 +364,8 @@ events require an explicit documentation decision before CI passes.
 - `userInput/settled`
 - `session/contextUsage`
 - `session/tokenUsage`
+- `usage/read` (host query; mapped to `_meta.museSubscriptionUsage`)
+- `usage/changed` (host-global notification; mapped to `_meta.museSubscriptionUsage`)
 
 `approval/request` and `userInput/request` are server-initiated *requests*, not
 notifications; list them in a separate section with their response policy.
@@ -491,6 +493,17 @@ afterwards: the explicit estimate labeling (`cost.source: adapter-estimate`,
 the catalog `cached` rate (clamped to prompt tokens, from the per-completion
 `usage.cachedTokens` the host already reports).
 
+Muse 1.3.0 subscription usage is **mapped to ACP**. The adapter queries
+`usage/read` when a session is attached and adopts `usage/changed` as a
+host-global observation for every attached session. It carries the raw
+`SubscriptionUsage` object in `_meta.museSubscriptionUsage`, labeled
+`source: msp-host-observation` and `billing: false`, so the `observedAtMs`,
+tier, 5h-class window, and weekly block cannot be mistaken for the adapter's
+token estimate or for billing. The adapter preserves truthful absence, emits
+the observation alongside `usage_update` when ACP context usage is available,
+and uses `session_info_update` when it is not; it never fabricates `used` or
+`size` values and never reprices replayed history.
+
 **Work items**
 
 - Keep host-provided context/cumulative usage separate from derived values.
@@ -498,6 +511,8 @@ the catalog `cached` rate (clamped to prompt tokens, from the per-completion
 - Omit numeric cost unless all required rate fields are available.
 - Preserve replay-once accounting.
 - Handle model catalog updates without resurrecting stale rates.
+- Surface host-observed subscription usage without merging it into token totals
+  or local cost estimates.
 - Document exclusions: historic completions, unavailable rates, cached-input
   differences, taxes/discounts, regional pricing, and actual billing.
 
