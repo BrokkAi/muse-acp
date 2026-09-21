@@ -121,7 +121,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `model/list` + `session/setModel` | `configOptions` model selector + `session/set_config_option`; legacy v1 `session/set_model` |
 | `reasoningEffort` on `turn/start` / `turn/steer` | `configOptions` reasoning selector (`none` through `ultra`) |
 | `turn/steer` | v2 `_session/steering` extension with exact-turn targeting and race-safe idle behavior |
-| backgrounded `toolCall` + `userShell` items | negotiated AIR async tasks: `async_task_spawned`/`async_task_state_update` plus the backgrounded marker on the owning command card; `canStop` is false until MSP exposes a stop primitive |
+| backgrounded `toolCall` + `userShell` items | negotiated AIR async tasks: `async_task_spawned`/`async_task_state_update` plus the backgrounded marker on the owning command card; active tasks are restored from durable resume history; `canStop` is false until MSP exposes a stop primitive |
 | `subagent` items | negotiated: `subagent_spawned` + `subagent_state_update` on the parent and the child transcript replayed from `session/read` onto the child session id; otherwise a synthetic tool card with `_meta.muse` provenance |
 | Muse skills | ACP `available_commands_update`; aliases such as `/plan` are sent to Muse as `/skill plan` |
 | `session/contextUsage` + `session/tokenUsage` | `usage_update` (`used`/`size` from context occupancy, also restored on attach; `_meta.museCumulative` session totals, `_meta.musePressure`); each completion is counted once, so a `view/gap` refill that replays one already seen does not re-price it; `cost` is a client-local list-price estimate from `model/list` catalog rates, summed per completion — partial in both directions (historic and unpriceable completions are excluded, cached tokens are charged at the catalog cached rate), never a billing figure. The cost object is labeled `source: adapter-estimate`, `basis: catalog-list-price`, and `billing: false` so clients cannot mistake it for Muse billing |
@@ -137,6 +137,15 @@ Repeated deliveries of a pending question reuse its existing form, including
 requests reissued during session resume.
 Without that capability, the adapter cancels the question so the turn can
 continue; it does not emit an unsupported request.
+
+A resumed client receives the running AIR task set from the latest durable
+item fold even when it did not request transcript replay; completed historical
+shell commands are not re-announced. Closing the ACP connection ends the
+adapter and its host child. If a durable host restarts in place, the adapter
+reattaches each session and reconciles task items from the returned fold; a
+terminal item settles a task that was already announced. MSP v1 has no
+targeted background-work stop primitive, so task updates remain display-only
+and advertise `canStop: false`.
 
 Per-turn file reports are available when the client advertises AIR v1
 `agentFileChangeReport` and places a valid `agentFileChangeReportRequest` on

@@ -3514,6 +3514,45 @@ fn async_task_updates_stay_off_without_negotiation() {
 }
 
 #[test]
+fn async_tasks_reconcile_on_resume() {
+    let mut c = Client::spawn("async_resume", &[]);
+    let init = c.req(
+        "initialize",
+        "{\"protocolVersion\":2,\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}}",
+    );
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let rid = c.req(
+        "session/resume",
+        "{\"sessionId\":\"existing-session\",\"replayFrom\":\"start\"}",
+    );
+    let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
+    c.wait_for("call-bg-resumed", Duration::from_secs(15));
+    c.wait_for("shell-shell-resumed", Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert_eq!(
+        frames.matches("async_task_spawned").count(),
+        2,
+        "only active durable tasks should be restored: {frames}"
+    );
+    assert_eq!(
+        frames
+            .lines()
+            .filter(|line| line.contains("call-bg-resumed")
+                && line.contains("\"status\":\"in_progress\""))
+            .count(),
+        1,
+        "duplicate replayed task: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
 fn async_task_stop_is_rejected_honestly() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
