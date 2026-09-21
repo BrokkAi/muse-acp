@@ -36,8 +36,25 @@ pub struct PendingPerm {
     pub req_id: J,
     pub approval_id: String,
     pub requirement: J,
-    /// (choiceId, decision) in host order; first reject-ish is the deny fallback.
-    pub choices: Vec<(String, String)>,
+    /// Choices in host order; first reject-ish is the deny fallback.
+    pub choices: Vec<PermChoice>,
+    /// The optional ACP form currently collecting guidance for a selected
+    /// rejection. Keeping it under the permission preserves the original
+    /// approval and requirement while the second client request is open.
+    pub feedback: Option<PendingFeedback>,
+}
+
+#[derive(Clone)]
+pub struct PermChoice {
+    pub id: String,
+    pub decision: String,
+    pub accepts_feedback: bool,
+}
+
+pub struct PendingFeedback {
+    /// ACP `elicitation/create` request id awaiting optional guidance.
+    pub req_id: J,
+    pub choice_id: String,
 }
 
 #[derive(Clone)]
@@ -79,6 +96,10 @@ pub struct AcpSession {
     pub ver: u8,
     pub in_flight: Vec<InFlight>,
     pub pending_perm: Option<PendingPerm>,
+    /// Approval ids and requirement snapshots already opened on this
+    /// connection. This suppresses duplicate delivery after a decision while
+    /// still allowing a later requirement stage to open.
+    pub approval_seen: std::collections::HashSet<String>,
     /// Approvals awaiting display while another permission is shown. Raw MSP
     /// `approval/request` params; drained one at a time because the adapter
     /// shows one ACP permission request per session at a time.
@@ -469,7 +490,7 @@ fn perm_kind(decision: &str, scope: &str) -> &'static str {
 
 /// Build ACP permission `options` from MSP `availableChoices`; returns
 /// (options_json, choices) for later decision mapping.
-pub fn perm_options(params: &J) -> (String, Vec<(String, String)>) {
+pub fn perm_options(params: &J) -> (String, Vec<PermChoice>) {
     let mut opts = Vec::new();
     let mut choices = Vec::new();
     if let J::Arr(items) = params.get("availableChoices").cloned().unwrap_or(J::Null) {
@@ -513,7 +534,18 @@ pub fn perm_options(params: &J) -> (String, Vec<(String, String)>) {
                 esc(&name),
                 perm_kind(&decision, &scope)
             ));
-            choices.push((id, decision));
+            let accepts_feedback = c
+                .get("acceptsFeedback")
+                .and_then(|v| match v {
+                    J::Bool(value) => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or(false);
+            choices.push(PermChoice {
+                id,
+                decision,
+                accepts_feedback,
+            });
         }
     }
     (format!("[{}]", opts.join(",")), choices)
@@ -522,10 +554,10 @@ pub fn perm_options(params: &J) -> (String, Vec<(String, String)>) {
 /// Deny-safe fallback choice: first non-approved decision, else None. A
 /// client cancellation/error must never resolve to an approving choice,
 /// so an all-approve (or empty) list fails closed upstream.
-pub fn fallback_deny(choices: &[(String, String)]) -> Option<String> {
-    for (id, d) in choices {
-        if !d.to_lowercase().starts_with("approv") {
-            return Some(id.clone());
+pub fn fallback_deny(choices: &[PermChoice]) -> Option<String> {
+    for choice in choices {
+        if !choice.decision.to_lowercase().starts_with("approv") {
+            return Some(choice.id.clone());
         }
     }
     None
@@ -840,7 +872,10 @@ mod tests {
         .expect("approval choices JSON");
         let (options_json, choices) = perm_options(&params);
         assert_eq!(
-            choices,
+            choices
+                .iter()
+                .map(|c| (c.id.clone(), c.decision.clone()))
+                .collect::<Vec<_>>(),
             vec![
                 ("c-once".to_string(), "approved".to_string()),
                 ("c-session".to_string(), "approvedForSession".to_string()),

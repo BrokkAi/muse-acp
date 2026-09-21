@@ -14,6 +14,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   file_changes_ambiguous a shell tool whose writes cannot be inferred safely
   approval     approval/requested notification (two choices), then completed
   approval_req approval/request server-initiated REQUEST (no notification)
+  approval_hang stays pending after the approval so client decisions can be tested
   questions    userInput/requested with options, then completed
   questions_multiple userInput/requested with multiple-selection options
   questions_resume reissue a pending question after both attach and usage backfill
@@ -119,6 +120,10 @@ if os.environ.get("FAKE_APPROVAL", "") == "all-approve":
     ]
 if os.environ.get("FAKE_APPROVAL_CHOICES", "") == "empty":
     APPROVAL_PARAMS["availableChoices"] = []
+if os.environ.get("FAKE_APPROVAL_FEEDBACK", "") == "deny":
+    for choice in APPROVAL_PARAMS["availableChoices"]:
+        if choice.get("decision") == "denied":
+            choice["acceptsFeedback"] = True
 
 
 def log_method(method):
@@ -349,9 +354,11 @@ def on_turn_start(params):
     elif SCENARIO in ("approval", "pending_reconcile_dup"):
         notify("approval/requested", dict(APPROVAL_PARAMS))
         notify("turn/completed", {**base, "terminal": "completed"})
-    elif SCENARIO == "approval_hang":
+    elif SCENARIO in ("approval_hang", "approval_queue"):
         # The turn stays open until the client answers or cancels.
         notify("approval/requested", dict(APPROVAL_PARAMS))
+        if SCENARIO == "approval_queue":
+            notify("approval/requested", {**APPROVAL_PARAMS, "approvalId": "approval-second"})
     elif SCENARIO == "approval_req":
         # Reissued multi-stage style: a server-initiated REQUEST with its
         # own id, no notification. Adapter must ack it AND bridge it.
@@ -1046,7 +1053,7 @@ def result_for(method, msg):
     if method == "userInput/answer":
         log_input(msg.get("params", {}))
         return {}
-    if method == "userInput/clarify":
+    if method in ("approval/decide", "userInput/clarify"):
         log_input(msg.get("params", {}))
         return {}
     if method == "turn/steer":
