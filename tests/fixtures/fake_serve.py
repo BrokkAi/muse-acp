@@ -46,6 +46,11 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
+  rename_live  session/nameChanged updates a connected session
+  rename_resume Session.name changes between start and resume
+  rename_snapshot SnapshotState.name is the only name on resume
+  rename_clear  resume reports a null name and must clear a stale title
+  rename_list   session/list exposes the authoritative session name
   tool_stored_output tool result with outputRef/patchRef metadata
   tool_output_unavailable outputRef exists but item/readOutput fails
   close_stdin  closes the host's stdin after initialization, then exits
@@ -146,11 +151,14 @@ def session_obj(session_id=None, workspace_root=None):
         session_id = ACTIVE_SESSION[0]
     if workspace_root is None:
         workspace_root = ACTIVE_WORKSPACE[0]
-    return {"sessionId": session_id, "modelId": "fake-model",
+    result = {"sessionId": session_id, "modelId": "fake-model",
             "workspaceRoot": workspace_root,
             "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
             "approvalMode": {"lastCommandId": None, "mode": MODE,
                              "source": "serverDefault"}}
+    if SCENARIO == "rename_list":
+        result["name"] = "Listed name"
+    return result
 
 
 def history_items():
@@ -717,8 +725,14 @@ def result_for(method, msg):
     if method == "session/start":
         workspace_root = msg.get("params", {}).get("workspaceRoot", "/tmp/fake-ws")
         ACTIVE_WORKSPACE[0] = workspace_root
-        return {"session": session_obj(workspace_root=workspace_root),
-                "viewCursor": "cur-0"}
+        result = {"session": session_obj(), "viewCursor": "cur-0"}
+        if SCENARIO == "rename_live":
+            result["session"]["name"] = "Before rename"
+        elif SCENARIO == "rename_resume":
+            result["session"]["name"] = "Before resume"
+        elif SCENARIO == "rename_clear":
+            result["session"]["name"] = "Before clear"
+        return result
     if method == "skill/list":
         log_input(msg.get("params", {}))
         SKILL_READS[0] += 1
@@ -768,6 +782,9 @@ def result_for(method, msg):
                 "workspaceRoot": "/home/me/src/proj"}
         elif SCENARIO == "usage_snapshot_null":
             history = usage_snapshot_history(context=False)
+        elif SCENARIO == "rename_snapshot":
+            history = usage_snapshot_history()
+            history["snapshot"]["state"]["name"] = "Snapshot name"
         elif SCENARIO == "async_resume":
             history = {"mode": "inline", "snapshot": None, "items": [
                 {"itemId": "bg-resumed", "kind": "toolCall",
@@ -795,7 +812,12 @@ def result_for(method, msg):
                     {"userInputId": "ui-1", "itemId": "item-ui-1",
                      "viewCursor": "cur-8"}]
         workspace_root = "/tmp" if SCENARIO == "resume_active" else None
-        return {"session": session_obj(params.get("sessionId", MSP_SID), workspace_root),
+        session = session_obj(params.get("sessionId", MSP_SID), workspace_root)
+        if SCENARIO == "rename_resume":
+            session["name"] = "Renamed outside adapter"
+        elif SCENARIO == "rename_clear":
+            session["name"] = None
+        return {"session": session,
                 "viewCursor": "cur-9",
                 "pendingRequests": pending,
                 "history": history}
@@ -1078,6 +1100,13 @@ def main():
                         "reasoningEffort": msg.get("params", {}).get("reasoningEffort", ""),
                         "source": "user",
                         "viewCursor": "cur-reasoning-1",
+                        "sourceRange": {"start": 1, "end": 1},
+                    })
+                if SCENARIO == "rename_live" and method == "session/start":
+                    notify("session/nameChanged", {
+                        "sessionId": MSP_SID,
+                        "name": "Renamed elsewhere",
+                        "viewCursor": "cur-1",
                         "sourceRange": {"start": 1, "end": 1},
                     })
                 if method == "session/list" and SCENARIO == "pipe_stall":
