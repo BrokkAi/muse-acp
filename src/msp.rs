@@ -94,8 +94,8 @@ const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Shutdown is best-effort, but must never turn an editor disconnect into an
 /// unbounded wait for a child or a poisoned lock.
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-const SHUTDOWN_GRACE: Duration = Duration::from_millis(200);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(7);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 const SHUTDOWN_POLL: Duration = Duration::from_millis(10);
 const STDERR_CAPTURE_LIMIT: usize = 32 * 1024;
 
@@ -136,18 +136,10 @@ fn drain_stderr(stderr: ChildStderr, capture: Arc<Mutex<Vec<u8>>>) {
             Ok(n) => n,
         };
         let mut stored = capture.lock().unwrap_or_else(|p| p.into_inner());
-        let available = STDERR_CAPTURE_LIMIT.saturating_sub(stored.len());
-        if count <= available {
-            stored.extend_from_slice(&buf[..count]);
-        } else {
-            // Keep the tail: shutdown diagnostics are most useful when they
-            // contain the final error rather than the start of a long trace.
-            let keep_from = count - available;
-            stored.extend_from_slice(&buf[keep_from..count]);
-            if stored.len() > STDERR_CAPTURE_LIMIT {
-                let drop_count = stored.len() - STDERR_CAPTURE_LIMIT;
-                stored.drain(..drop_count);
-            }
+        stored.extend_from_slice(&buf[..count]);
+        if stored.len() > STDERR_CAPTURE_LIMIT {
+            let drop_count = stored.len() - STDERR_CAPTURE_LIMIT;
+            stored.drain(..drop_count);
         }
     }
 }
@@ -660,10 +652,18 @@ impl MspHost {
             })?;
         match result_rx.recv_timeout(PIPE_WRITE_TIMEOUT) {
             Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "serve stdin write timed out",
-            )),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // A partially written frame cannot be withdrawn from a pipe.
+                // Terminate this transport before reporting failure so its
+                // writer cannot later deliver an untracked command.
+                self.writer.lock().unwrap_or_else(|p| p.into_inner()).take();
+                kill_and_reap(&mut self._child.lock().unwrap_or_else(|p| p.into_inner()));
+                self.fail_pending("serve stdin write timed out; host terminated");
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "serve stdin write timed out; host terminated",
+                ))
+            }
             Err(mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "serve stdin writer stopped",

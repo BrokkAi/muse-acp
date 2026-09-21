@@ -4064,6 +4064,19 @@ fn closed_editor_stdout_does_not_block_adapter_shutdown() {
 }
 
 #[test]
+fn host_shutdown_allows_pending_flush_after_stdin_eof() {
+    let mut c = Client::spawn("shutdown_flush", &[]);
+    c.new_session(1, "");
+    let log = c.fake_log.clone();
+    c.finish();
+    assert!(
+        std::fs::read_to_string(log)
+            .unwrap()
+            .contains("shutdown-flushed")
+    );
+}
+
+#[test]
 fn host_stderr_is_drained_while_the_host_is_running() {
     let mut c = Client::spawn("stderr_flood", &[]);
     let _sid = c.new_session(1, "");

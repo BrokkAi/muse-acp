@@ -944,5 +944,9 @@ def main():
                             "itemId": "reissue-barrier", "kind": "agentMessage",
                             "status": "completed", "text": "resume questions delivered"}})
 
+    if SCENARIO == "shutdown_flush":
+        time.sleep(0.6)
+        log_method("shutdown-flushed")
+
 
 main()
