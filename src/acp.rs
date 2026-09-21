@@ -15,6 +15,22 @@ pub type StdoutShared = Arc<Mutex<std::io::Stdout>>;
 pub struct InFlight {
     pub msp_turn: String,
     pub req_id: J,
+    /// True until the host announces that a queued turn has launched.
+    pub queued: bool,
+    pub file_report: Option<FileChangeReport>,
+}
+
+/// Host-reported file writes accumulated for one requested turn report.
+pub struct FileChangeReport {
+    pub request_id: String,
+    pub paths: Vec<String>,
+    pub seen_paths: std::collections::HashSet<String>,
+    pub seen_items: std::collections::HashSet<String>,
+    pub encoded_path_bytes: usize,
+    /// False when a successful host tool could have changed files but did not
+    /// carry a typed path the adapter can safely report.
+    pub declared_complete: bool,
+    pub truncated: bool,
 }
 
 pub struct PendingPerm {
@@ -22,10 +38,34 @@ pub struct PendingPerm {
     pub req_id: J,
     pub approval_id: String,
     pub requirement: J,
-    /// (choiceId, decision) in host order; first reject-ish is the deny fallback.
-    pub choices: Vec<(String, String)>,
+    /// Choices in host order; first reject-ish is the deny fallback.
+    pub choices: Vec<PermChoice>,
+    /// The optional ACP form currently collecting guidance for a selected
+    /// rejection. Keeping it under the permission preserves the original
+    /// approval and requirement while the second client request is open.
+    pub feedback: Option<PendingFeedback>,
+    /// MSP session that owns the approval target. This remains the root
+    /// session for a direct child and the immediate parent for a nested one.
+    pub owner_msp_sid: String,
+    /// When the approval came from a child stream, stop only that child if
+    /// the editor cannot answer. An empty value means the owner session.
+    pub child_subagent_id: Option<String>,
 }
 
+#[derive(Clone)]
+pub struct PermChoice {
+    pub id: String,
+    pub decision: String,
+    pub accepts_feedback: bool,
+}
+
+pub struct PendingFeedback {
+    /// ACP `elicitation/create` request id awaiting optional guidance.
+    pub req_id: J,
+    pub choice_id: String,
+}
+
+#[derive(Clone)]
 pub struct UiQuestion {
     pub qid: String,
     /// Original host labels (for answers).
@@ -34,20 +74,60 @@ pub struct UiQuestion {
     pub display: Vec<String>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum UiStage {
+    Route,
+    Answers,
+    Clarification,
+}
+
+#[derive(Clone)]
 pub struct PendingUi {
     /// ACP `elicitation/create` request id awaiting the client reply.
     pub req_id: J,
     pub user_input_id: String,
+    /// MSP session that owns the question's child target.
+    pub owner_msp_sid: String,
     pub questions: Vec<UiQuestion>,
+    pub stage: UiStage,
+    /// The form shown after choosing structured answers.
+    pub answer_schema: String,
+    pub answer_message: String,
+    pub tool_call_id: String,
+}
+
+/// Host-authored title candidates. The adapter never derives a title from
+/// transcript items; it only chooses among facts the host explicitly sends.
+#[derive(Clone, Default)]
+pub struct HostTitleFacts {
+    pub name: Option<String>,
+    pub title: Option<String>,
+    pub first_user_prompt: Option<String>,
+}
+
+impl HostTitleFacts {
+    pub fn selected(&self) -> Option<&str> {
+        self.name
+            .as_deref()
+            .or(self.title.as_deref())
+            .or(self.first_user_prompt.as_deref())
+    }
 }
 
 pub struct AcpSession {
     pub acp_sid: String,
     pub msp_sid: String,
     pub cwd: String,
+    /// Ordered ACP workspace scope: `cwd` followed by each explicitly
+    /// supplied additional directory (with exact duplicates removed).
+    pub roots: Vec<String>,
     pub ver: u8,
     pub in_flight: Vec<InFlight>,
     pub pending_perm: Option<PendingPerm>,
+    /// Approval ids and requirement snapshots already opened on this
+    /// connection. This suppresses duplicate delivery after a decision while
+    /// still allowing a later requirement stage to open.
+    pub approval_seen: std::collections::HashSet<String>,
     /// Approvals awaiting display while another permission is shown. Raw MSP
     /// `approval/request` params; drained one at a time because the adapter
     /// shows one ACP permission request per session at a time.
@@ -59,9 +139,25 @@ pub struct AcpSession {
     pub mode_value: String,
     pub model_value: String,
     pub reasoning_effort: String,
+    /// Source of the host's standing reasoning default. `None` means the
+    /// host has not set one, so the selector remains a per-turn fallback.
+    pub reasoning_effort_source: Option<String>,
     /// The foreground MSP turn, excluding queued turns.
     pub active_turn: Option<String>,
     pub view_cursor: String,
+    /// Latest loaded-session status projection. `None` means the host did not
+    /// provide the 1.3.0 Session field; an unknown open-enum value is stored as
+    /// `Some("unknown")` so the editor still receives a generic projection.
+    pub session_status: Option<String>,
+    /// Known attention flags from the latest Session/statusChanged projection.
+    /// `None` means the host did not provide the additive-optional field;
+    /// `Some(empty)` is an authoritative clear from a status event.
+    pub attention: Option<Vec<String>>,
+    /// Durable view cursors already delivered to this adapter. An explicit
+    /// re-attach can overlap with the implicit live subscription while the
+    /// resume command is in flight; every notification at a repeated cursor
+    /// is one replay and must be folded once.
+    pub seen_view_cursors: std::collections::HashSet<String>,
     pub fold: SessionFold,
     /// Last known context occupancy (`session/contextUsage.usedTokens`).
     pub usage_used: Option<u64>,
@@ -80,11 +176,18 @@ pub struct AcpSession {
     /// View cursors of completions already folded into the totals above.
     /// `view/gap` recovery can replay a completion that also arrives live.
     pub usage_seen: std::collections::HashSet<String>,
+    /// Latest host-observed subscription usage, as the raw MSP
+    /// `SubscriptionUsage` object. This is a host fact, never a cost figure.
+    pub subscription_usage: Option<String>,
     /// Latest goal block as raw MSP JSON (`"null"` after an explicit clear;
     /// `None` before any fact arrives).
     pub goal_meta: Option<String>,
     /// Latest branch observation as raw MSP JSON (`None` before any fact).
     pub branch_meta: Option<String>,
+    /// Latest host attention fact as raw MSP JSON (`None` before any fact).
+    pub attention_meta: Option<String>,
+    /// Host-authored title candidates used for `SessionInfo.title`.
+    pub title_facts: HostTitleFacts,
     /// Per-child folds for negotiated native subagent sessions, keyed by the
     /// MSP child session id. Holds replayed child history dedup state.
     pub child_folds: HashMap<String, SessionFold>,
@@ -299,6 +402,24 @@ pub fn send_error(stdout: &StdoutShared, id: &Option<J>, code: i64, message: &st
     );
 }
 
+/// Send an ACP error while retaining structured data supplied by MSP.
+pub fn send_error_with_data(
+    stdout: &StdoutShared,
+    id: &Option<J>,
+    code: i64,
+    message: &str,
+    data_json: &str,
+) {
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":{code},\"message\":{},\"data\":{data_json}}}}}",
+            id_json(id),
+            esc(message),
+        ),
+    );
+}
+
 /// `usage_update` for both ACP versions (`{used, size}` plus counted-once
 /// session cumulative totals in `_meta`). Emits only when both `used` and
 /// `size` are known; callers stash partial state on the session instead.
@@ -316,6 +437,11 @@ pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>)
     meta.push('}');
     if let Some(p) = pressure {
         meta.push_str(&format!(",\"musePressure\":{}", esc(p)));
+    }
+    if let Some(usage) = s.subscription_usage.as_deref() {
+        meta.push_str(&format!(
+            ",\"museSubscriptionUsage\":{{\"source\":\"msp-host-observation\",\"billing\":false,\"usage\":{usage}}}"
+        ));
     }
     // `amount` must be a JSON number: Rust's Display prints `inf`/`NaN`
     // verbatim, which would corrupt the whole frame.
@@ -335,6 +461,26 @@ pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>)
     );
 }
 
+/// Publish a host subscription observation when ACP has no context window yet.
+/// `usage_update` requires numeric `used` and `size`, so this metadata-only
+/// update keeps the host fact visible without inventing an occupancy pair.
+pub fn send_subscription_usage(stdout: &StdoutShared, s: &AcpSession, clear: bool) {
+    if s.subscription_usage.is_none() && !clear {
+        return;
+    }
+    let usage = s.subscription_usage.as_deref().unwrap_or("null");
+    let update = format!(
+        "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"museSubscriptionUsage\":{{\"source\":\"msp-host-observation\",\"billing\":false,\"usage\":{usage}}}}}}}"
+    );
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{update}}}}}}}",
+            esc(&s.acp_sid),
+        ),
+    );
+}
+
 /// v2 `state_update`. v1 callers use the prompt response instead.
 pub fn send_state(stdout: &StdoutShared, acp_sid: &str, state: &str, stop: Option<&str>) {
     let stop_f = stop
@@ -345,6 +491,24 @@ pub fn send_state(stdout: &StdoutShared, acp_sid: &str, state: &str, stop: Optio
         &format!(
             "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"state_update\",\"state\":\"{state}\"{stop_f}}}}}}}",
             esc(acp_sid),
+        ),
+    );
+}
+
+/// Reflect a host-side configuration change in the client's selector.
+pub fn send_config_option_update(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    config_id: &str,
+    value: &str,
+) {
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"config_option_update\",\"configId\":{},\"currentValue\":{}}}}}}}",
+            esc(acp_sid),
+            esc(config_id),
+            esc(value),
         ),
     );
 }
@@ -363,7 +527,7 @@ fn perm_kind(decision: &str, scope: &str) -> &'static str {
 
 /// Build ACP permission `options` from MSP `availableChoices`; returns
 /// (options_json, choices) for later decision mapping.
-pub fn perm_options(params: &J) -> (String, Vec<(String, String)>) {
+pub fn perm_options(params: &J) -> (String, Vec<PermChoice>) {
     let mut opts = Vec::new();
     let mut choices = Vec::new();
     if let J::Arr(items) = params.get("availableChoices").cloned().unwrap_or(J::Null) {
@@ -391,13 +555,34 @@ pub fn perm_options(params: &J) -> (String, Vec<(String, String)>) {
                 .and_then(|v| v.as_str())
                 .unwrap_or("once")
                 .to_string();
+            let name = match c
+                .get("rulePreview")
+                .and_then(|v| v.as_str())
+                .filter(|preview| !preview.is_empty())
+            {
+                Some(preview) => {
+                    format!("{label} (host rule preview: {preview}; host scope: {scope})")
+                }
+                None => label,
+            };
             opts.push(format!(
                 "{{\"optionId\":{},\"name\":{},\"kind\":\"{}\"}}",
                 esc(&id),
-                esc(&label),
+                esc(&name),
                 perm_kind(&decision, &scope)
             ));
-            choices.push((id, decision));
+            let accepts_feedback = c
+                .get("acceptsFeedback")
+                .and_then(|v| match v {
+                    J::Bool(value) => Some(*value),
+                    _ => None,
+                })
+                .unwrap_or(false);
+            choices.push(PermChoice {
+                id,
+                decision,
+                accepts_feedback,
+            });
         }
     }
     (format!("[{}]", opts.join(",")), choices)
@@ -406,10 +591,10 @@ pub fn perm_options(params: &J) -> (String, Vec<(String, String)>) {
 /// Deny-safe fallback choice: first non-approved decision, else None. A
 /// client cancellation/error must never resolve to an approving choice,
 /// so an all-approve (or empty) list fails closed upstream.
-pub fn fallback_deny(choices: &[(String, String)]) -> Option<String> {
-    for (id, d) in choices {
-        if !d.to_lowercase().starts_with("approv") {
-            return Some(id.clone());
+pub fn fallback_deny(choices: &[PermChoice]) -> Option<String> {
+    for choice in choices {
+        if !choice.decision.to_lowercase().starts_with("approv") {
+            return Some(choice.id.clone());
         }
     }
     None
@@ -519,10 +704,10 @@ pub fn session_modes(current_mode: &str) -> String {
     )
 }
 
-/// Advertise the Muse skills which are useful from an editor session. Commands
-/// still travel as ordinary prompts; short aliases are normalized to Muse's
-/// stable `/skill <id>` spelling before they reach the host.
-fn available_commands_json(ver: u8) -> String {
+/// Build the editor command palette from the host's current skill catalog.
+/// `/compact` is local to the adapter and therefore remains available even
+/// though it is not a host skill.
+fn available_commands_json(ver: u8, skills: &[(String, String, Option<String>)]) -> String {
     let input = |hint: &str| {
         if ver == 1 {
             format!("{{\"hint\":{}}}", esc(hint))
@@ -530,59 +715,34 @@ fn available_commands_json(ver: u8) -> String {
             format!("{{\"type\":\"text\",\"hint\":{}}}", esc(hint))
         }
     };
-    let commands = [
-        (
-            "skill",
-            "Invoke a Muse skill",
-            Some("skill id and optional prompt"),
-        ),
-        (
-            "plan",
-            "Create a grounded plan and stop for approval",
-            Some("what to plan"),
-        ),
-        ("compact", "Compact the session context", None),
-        (
-            "doctor",
-            "Diagnose a Muse runtime or session issue",
-            Some("symptom or session"),
-        ),
-        (
-            "create-skill",
-            "Create a Muse skill",
-            Some("what the skill should do"),
-        ),
-        (
-            "create-plugin",
-            "Create a Muse plugin",
-            Some("what the plugin should do"),
-        ),
-        (
-            "import",
-            "Import another agent's session",
-            Some("transcript, path, or session id"),
-        ),
-    ];
-    let items = commands
-        .into_iter()
-        .map(|(name, description, hint)| {
-            let input = hint
-                .map(|hint| format!(",\"input\":{}", input(hint)))
-                .unwrap_or_default();
-            format!("{{\"name\":\"{name}\",\"description\":\"{description}\"{input}}}")
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{items}]")
+    let mut items =
+        vec!["{\"name\":\"compact\",\"description\":\"Compact the session context\"}".to_string()];
+    items.extend(skills.iter().map(|(name, description, hint)| {
+        let input = hint
+            .as_deref()
+            .map(|hint| format!(",\"input\":{}", input(hint)))
+            .unwrap_or_default();
+        format!(
+            "{{\"name\":{},\"description\":{}{input}}}",
+            esc(name),
+            esc(description),
+        )
+    }));
+    format!("[{}]", items.join(","))
 }
 
-pub fn send_available_commands(stdout: &StdoutShared, acp_sid: &str, ver: u8) {
+pub fn send_available_commands(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    ver: u8,
+    skills: &[(String, String, Option<String>)],
+) {
     send_raw(
         stdout,
         &format!(
             "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":{}}}}}}}",
             esc(acp_sid),
-            available_commands_json(ver)
+            available_commands_json(ver, skills)
         ),
     );
 }
@@ -640,6 +800,23 @@ pub fn send_session_meta(
     goal: Option<&str>,
     branch: Option<&str>,
 ) {
+    send_session_info(stdout, acp_sid, None, goal, branch);
+}
+
+/// Push ACP session metadata. Titles are the one standard list-row field that
+/// has a matching ACP update; list membership remains pull-only because ACP
+/// has no session-list change notification.
+pub fn send_session_info(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    title: Option<&str>,
+    goal: Option<&str>,
+    branch: Option<&str>,
+) {
+    let mut fields = vec!["\"sessionUpdate\":\"session_info_update\"".to_string()];
+    if let Some(title) = title {
+        fields.push(format!("\"title\":{}", esc(title)));
+    }
     let mut meta = Vec::new();
     if let Some(goal) = goal {
         meta.push(format!("\"goal\":{goal}"));
@@ -647,12 +824,50 @@ pub fn send_session_meta(
     if let Some(branch) = branch {
         meta.push(format!("\"muse\":{{\"branch\":{branch}}}"));
     }
-    if meta.is_empty() {
+    if !meta.is_empty() {
+        fields.push(format!("\"_meta\":{{{}}}", meta.join(",")));
+    }
+    if fields.len() == 1 {
         return;
     }
+    let update = format!("{{{}}}", fields.join(","));
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{}}}}}",
+            esc(acp_sid),
+            update
+        ),
+    );
+}
+
+/// Publish the loaded session's status and known attention flags through the
+/// provider namespace of ACP's session-info update. The caller also emits the
+/// standard ACP state when the status or attention projection has one.
+pub fn send_session_status(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    status: Option<&str>,
+    attention: Option<&[String]>,
+) {
+    if status.is_none() && attention.is_none() {
+        return;
+    }
+    let mut muse = Vec::new();
+    if let Some(status) = status {
+        muse.push(format!("\"status\":{}", esc(status)));
+    }
+    if let Some(flags) = attention {
+        let values = flags
+            .iter()
+            .map(|flag| esc(flag))
+            .collect::<Vec<_>>()
+            .join(",");
+        muse.push(format!("\"attention\":[{values}]"));
+    }
     let update = format!(
-        "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{{}}}}}",
-        meta.join(",")
+        "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"muse\":{{{}}}}}}}",
+        muse.join(",")
     );
     send_raw(
         stdout,
@@ -660,6 +875,20 @@ pub fn send_session_meta(
             "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{}}}}}",
             esc(acp_sid),
             update
+        ),
+    );
+}
+
+/// Publish a host-authored title change. `None` is an explicit clear so a
+/// client can remove a title after the host renames a session back to blank.
+pub fn send_session_title(stdout: &StdoutShared, acp_sid: &str, title: Option<&str>) {
+    let title = title.map(esc).unwrap_or_else(|| "null".to_string());
+    let update = format!("{{\"sessionUpdate\":\"session_info_update\",\"title\":{title}}}");
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{update}}}}}",
+            esc(acp_sid)
         ),
     );
 }
@@ -686,12 +915,18 @@ mod tests {
             };
             assert_eq!(items.len(), 3);
 
-            let commands = available_commands_json(ver);
+            let skills = vec![(
+                "plan".to_string(),
+                "Create a plan".to_string(),
+                Some("what to plan".to_string()),
+            )];
+            let commands = available_commands_json(ver, &skills);
             let parsed = crate::json::parse_json(&commands).expect("available commands JSON");
             let J::Arr(items) = parsed else {
                 panic!("available commands must be an array");
             };
-            assert_eq!(items.len(), 7);
+            assert_eq!(items.len(), 2);
+            assert!(commands.contains("\"name\":\"plan\""));
         }
         assert!(crate::json::parse_json(&session_modes("promptUnmatched")).is_ok());
     }
@@ -711,5 +946,57 @@ mod tests {
             options.contains("\"value\":\"max\""),
             "max tier must be advertised: {options}"
         );
+    }
+
+    #[test]
+    fn permission_options_display_rule_previews_without_changing_mapping() {
+        let params = crate::json::parse_json(
+            r#"{
+                "availableChoices":[
+                    {"choiceId":"c-once","label":"Allow once","decision":"approved","scope":"once"},
+                    {"choiceId":"c-session","label":"Allow for this session","decision":"approvedForSession","scope":"session","rulePreview":"write /workspace/file"},
+                    {"choiceId":"c-local","label":"Allow permanently","decision":"approvedForSession","scope":"localPersistent","rulePreview":"\"quoted\"\n✓"},
+                    {"choiceId":"c-empty","label":"Reject","decision":"denied","scope":"once","rulePreview":""}
+                ]
+            }"#,
+        )
+        .expect("approval choices JSON");
+        let (options_json, choices) = perm_options(&params);
+        assert_eq!(
+            choices
+                .iter()
+                .map(|c| (c.id.clone(), c.decision.clone()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("c-once".to_string(), "approved".to_string()),
+                ("c-session".to_string(), "approvedForSession".to_string()),
+                ("c-local".to_string(), "approvedForSession".to_string()),
+                ("c-empty".to_string(), "denied".to_string()),
+            ]
+        );
+
+        let J::Arr(options) = crate::json::parse_json(&options_json).expect("options JSON") else {
+            panic!("permission options must be an array");
+        };
+        let expected = [
+            ("c-once", "Allow once", "allow_once"),
+            (
+                "c-session",
+                "Allow for this session (host rule preview: write /workspace/file; host scope: session)",
+                "allow_always",
+            ),
+            (
+                "c-local",
+                "Allow permanently (host rule preview: \"quoted\"\n✓; host scope: localPersistent)",
+                "allow_always",
+            ),
+            ("c-empty", "Reject", "reject_once"),
+        ];
+        assert_eq!(options.len(), expected.len());
+        for (option, (id, name, kind)) in options.iter().zip(expected) {
+            assert_eq!(option.get("optionId").and_then(J::as_str), Some(id));
+            assert_eq!(option.get("name").and_then(J::as_str), Some(name));
+            assert_eq!(option.get("kind").and_then(J::as_str), Some(kind));
+        }
     }
 }
