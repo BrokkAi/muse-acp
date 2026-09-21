@@ -446,8 +446,10 @@ Status: **implemented.** The output bound is configurable through
 both the human `…[truncated]` marker and machine-readable
 `_meta.muse.truncated` with `source`, `originalChars`, and `retainedChars`,
 and a host-saturated surface reports `source: "host"` without claiming an
-adapter cut. Remaining work: head+tail retention and `item/readOutput`
-fetch-through for `outputRef`.
+adapter cut. Negotiated clients can fetch stored bytes through the
+`_session/readOutput` adapter extension, which forwards `item/readOutput` byte
+ranges and preserves typed `outputUnavailable` data. Remaining work:
+head+tail retention.
 
 **Work items**
 
@@ -455,6 +457,10 @@ fetch-through for `outputRef`.
   `item.truncated` marks a saturated streamed surface (`agentMessage.text`,
   `reasoning.summary[*]`, `toolCall/userShell.visibleOutput`), and
   `outputRef` names stored output that can be fetched via `item/readOutput`.
+- Preserve `itemId`, `outputRef`, `patchRef`, and edit-family `patchSummary` on
+  tool cards so clients can identify and retrieve the durable surface.
+- Keep fetch-through behind explicit `_meta.muse.capabilities: ["readOutput"]`
+  negotiation; return the host's `-32041 outputUnavailable` facts distinctly.
 - Add visible truncation metadata and original/retained length.
 - Make the limit configurable.
 - Consider preserving both head and tail for logs and errors.
@@ -465,6 +471,8 @@ fetch-through for `outputRef`.
 **Acceptance criteria**
 
 - Editors can show that output was shortened.
+- A client that negotiates `readOutput` can retrieve a saturated stored surface
+  by byte range, and can distinguish `outputUnavailable` from generic failure.
 - No truncation changes the apparent success or permission semantics of a tool
   call.
 

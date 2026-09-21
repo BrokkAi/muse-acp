@@ -3518,6 +3518,112 @@ fn host_truncation_is_reported_as_host_sourced() {
 }
 
 #[test]
+fn stored_output_metadata_and_negotiated_fetch_are_available() {
+    let mut c = Client::spawn("tool_stored_output", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"readOutput\"]}}}",
+    );
+    c.wait_stderr(
+        "client negotiated stored-output reads",
+        Duration::from_secs(10),
+    );
+    let _pid = c.prompt(&sid, "read stored output");
+    let card = c.wait_for("call-stored", Duration::from_secs(15));
+    assert!(
+        card.contains("\"itemId\":\"it-stored\""),
+        "item id missing: {card}"
+    );
+    assert!(
+        card.contains("\"outputRef\":{\"availability\":\"available\""),
+        "output ref missing: {card}"
+    );
+    assert!(
+        card.contains("\"patchRef\":{\"availability\":\"available\""),
+        "patch ref missing: {card}"
+    );
+    assert!(
+        card.contains("\"patchSummary\":{\"files\":2,\"added\":4,\"removed\":1}"),
+        "patch summary missing: {card}"
+    );
+    assert!(
+        card.contains("\"truncated\":{\"source\":\"host\"}"),
+        "host saturation missing: {card}"
+    );
+
+    let read_id = c.req(
+        "_session/readOutput",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"itemId\":\"it-stored\",\"outputRef\":\"out-1\",\"offsetBytes\":0,\"lengthBytes\":4096}}"
+        ),
+    );
+    let read = c.wait_for(&format!("\"id\":{read_id}"), Duration::from_secs(15));
+    assert!(
+        read.contains("\"content\":\"full stored output\""),
+        "read failed: {read}"
+    );
+    assert!(
+        read.contains("\"encoding\":\"utf8\""),
+        "encoding missing: {read}"
+    );
+    c.wait_log("item/readOutput", Duration::from_secs(10));
+    c.finish();
+}
+
+#[test]
+fn stored_output_fetch_requires_capability_negotiation() {
+    let mut c = Client::spawn("tool_stored_output", &[]);
+    let sid = c.new_session(2, "");
+    let read_id = c.req(
+        "_session/readOutput",
+        &format!("{{\"sessionId\":\"{sid}\",\"itemId\":\"it-stored\",\"outputRef\":\"out-1\"}}"),
+    );
+    let response = c.wait_for(&format!("\"id\":{read_id}"), Duration::from_secs(15));
+    assert!(
+        response.contains("\"code\":-32601"),
+        "unexpected response: {response}"
+    );
+    c.finish();
+}
+
+#[test]
+fn output_unavailable_is_forwarded_as_typed_error() {
+    let mut c = Client::spawn("tool_output_unavailable", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"readOutput\"]}}}",
+    );
+    let _pid = c.prompt(&sid, "read missing stored output");
+    let _card = c.wait_for("call-stored", Duration::from_secs(15));
+    let read_id = c.req(
+        "_session/readOutput",
+        &format!("{{\"sessionId\":\"{sid}\",\"itemId\":\"it-stored\",\"outputRef\":\"out-1\"}}"),
+    );
+    let response = c.wait_for(&format!("\"id\":{read_id}"), Duration::from_secs(15));
+    assert!(
+        response.contains("\"code\":-32041"),
+        "wrong error code: {response}"
+    );
+    assert!(
+        response.contains("\"kind\":\"outputUnavailable\""),
+        "kind missing: {response}"
+    );
+    assert!(
+        response.contains("\"availability\":\"missing\""),
+        "availability missing: {response}"
+    );
+    assert!(
+        response.contains("\"itemId\":\"it-stored\""),
+        "item id missing: {response}"
+    );
+    assert!(
+        response.contains("\"outputRef\":\"out-1\""),
+        "output ref missing: {response}"
+    );
+    c.finish();
+}
+
+#[test]
 fn native_subagent_sessions_spawn_state_and_replay_the_child() {
     let mut c = Client::spawn("subagent_native", &[("FAKE_CAPS", "subagents")]);
     let sid = c

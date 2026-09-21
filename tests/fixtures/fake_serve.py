@@ -44,6 +44,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
+  tool_stored_output tool result with outputRef/patchRef metadata
+  tool_output_unavailable outputRef exists but item/readOutput fails
   close_stdin  closes the host's stdin after initialization, then exits
   stdout_close_stays_alive closes stdout but keeps the child alive briefly
   stderr_flood writes enough stderr to require a concurrent drain
@@ -326,6 +328,21 @@ def on_turn_start(params):
             "status": "completed", "tool": "read",
             "args": {"path": "/tmp/ht"}, "result": "short bounded text",
             "truncated": True}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO in ("tool_stored_output", "tool_output_unavailable"):
+        availability = "missing" if SCENARIO == "tool_output_unavailable" else "available"
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-stored", "kind": "toolCall", "callId": "call-stored",
+            "status": "completed", "tool": "apply_patch",
+            "args": {"path": "/tmp/x"}, "visibleOutput": "bounded prefix",
+            "truncated": True,
+            "outputRef": {"availability": availability, "byteLen": 20,
+                           "id": "out-1", "kind": "tool_output",
+                           "mediaType": "text/plain", "uri": "muse://out-1"},
+            "patchRef": {"availability": availability, "byteLen": 31,
+                          "id": "patch-1", "kind": "tool_patch",
+                          "mediaType": "application/json", "uri": "muse://patch-1"},
+            "patchSummary": {"files": 2, "added": 4, "removed": 1}}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "host_exit_quiet":
         # Crash immediately after the turn/start ack: the turn is in flight
@@ -711,6 +728,12 @@ def result_for(method, msg):
             "argumentHint": "what to plan",
             "source": "bundled",
         }]}
+    if method == "item/readOutput":
+        params = msg.get("params", {})
+        offset = params.get("offsetBytes", 0)
+        return {"byteLen": 18, "content": "full stored output",
+                "encoding": "utf8", "eof": True,
+                "mediaType": "text/plain", "offsetBytes": offset}
     if method == "session/resume":
         params = msg.get("params", {})
         log_input(params)
@@ -997,6 +1020,16 @@ def main():
                     send({"jsonrpc": "2.0", "id": ident,
                           "error": {"code": -32603,
                                     "message": os.environ["FAKE_ERROR_MESSAGE"]}})
+                    continue
+                if (method == "item/readOutput"
+                        and SCENARIO == "tool_output_unavailable"):
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32041,
+                                    "message": "stored output unavailable",
+                                    "data": {"kind": "outputUnavailable",
+                                             "availability": "missing",
+                                             "itemId": "it-stored",
+                                             "outputRef": "out-1"}}})
                     continue
                 if (method == "session/start"
                         and os.environ.get("FAKE_START_ERROR", "") == "profile"):
