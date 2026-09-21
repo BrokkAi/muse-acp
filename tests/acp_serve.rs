@@ -217,6 +217,7 @@ impl Client {
         }
     }
 
+    #[cfg(unix)]
     fn wait_for_pid(&self, path: &str, timeout: Duration) -> u32 {
         let start = Instant::now();
         loop {
@@ -1084,6 +1085,7 @@ fn negotiated_file_change_report_uses_successful_host_tool_paths_once() {
         ),
     );
     let report = c.wait_for("\"agentFileChangeReport\":{", Duration::from_secs(15));
+    let report = report.replace("\\\\", "/");
     for path in [
         "added.bin",
         "src/edited.rs",
@@ -1628,6 +1630,10 @@ fn explanation_route_sends_one_clarification_for_both_protocol_versions() {
             "{{\"jsonrpc\":\"2.0\",\"id\":\"{clarification_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"clarification\":\"The premise does not fit my situation.\"}}}}}}"
         ));
         c.wait_log("userInput/clarify", Duration::from_secs(15));
+        c.wait_input(
+            "The premise does not fit my situation.",
+            Duration::from_secs(15),
+        );
         let calls = std::fs::read_to_string(&c.fake_log).unwrap();
         assert_eq!(
             calls.lines().filter(|m| *m == "userInput/clarify").count(),
@@ -3510,16 +3516,13 @@ fn resume_omission_drops_previously_active_additional_roots() {
     let sid = c.new_session_at(1, &primary, &[&additional]);
     let resume_id = c.req(
         "session/resume",
-        &format!(
-            "{{\"sessionId\":\"{sid}\",\"cwd\":\"{}\"}}",
-            primary.display()
-        ),
+        &serde_json::json!({"sessionId":sid,"cwd":primary}).to_string(),
     );
     let resumed = c.wait_for(&format!("\"id\":{resume_id}"), Duration::from_secs(15));
     assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
     let list_id = c.req(
         "session/list",
-        &format!("{{\"cwd\":\"{}\"}}", primary.display()),
+        &serde_json::json!({"cwd":primary}).to_string(),
     );
     let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
     let frame: serde_json::Value = serde_json::from_str(&listed).unwrap();
@@ -3552,10 +3555,7 @@ fn unscoped_resource_expansion_requires_a_truthy_override() {
         let sid = c.new_session_at(1, &primary, &[]);
         c.req(
             "session/prompt",
-            &format!(
-                "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"resource_link\",\"uri\":\"{}\",\"name\":\"outside-resource\"}}]}}",
-                outside.display()
-            ),
+            &serde_json::json!({"sessionId":sid,"prompt":[{"type":"resource_link","uri":outside,"name":"outside-resource"}]}).to_string(),
         );
         c.wait_input("outside-resource", Duration::from_secs(15));
         let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
@@ -4407,9 +4407,10 @@ fn session_fork_advertises_and_copies_without_a_cut_point() {
 fn session_fork_rejects_a_workspace_the_host_did_not_apply() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(1, "");
+    let different_cwd = std::env::temp_dir().join("unapplied-fork-workspace");
     let fid = c.req(
         "session/fork",
-        &format!("{{\"sessionId\":\"{sid}\",\"cwd\":\"/\"}}"),
+        &serde_json::json!({"sessionId":sid,"cwd":different_cwd}).to_string(),
     );
     let frame = c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
     assert!(

@@ -130,8 +130,37 @@ fn write_loop(mut stdin: ChildStdin, requests: Receiver<WriteRequest>) {
     }
 }
 
-fn kill_and_reap(child: &mut Child) {
+fn terminate_child(child: &mut Child) {
+    // Windows batch launchers keep the actual host in a descendant process.
+    // Kill the tree before the launcher so descendants cannot retain the pipe
+    // and execute a command after its caller has received a timeout.
+    #[cfg(windows)]
+    if matches!(child.try_wait(), Ok(None))
+        && let Ok(mut killer) = Command::new("taskkill.exe")
+            .args(["/PID", &child.id().to_string(), "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+    {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match killer.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) if Instant::now() < deadline => std::thread::sleep(SHUTDOWN_POLL),
+                Ok(None) => {
+                    let _ = killer.kill();
+                    let _ = killer.wait();
+                    break;
+                }
+            }
+        }
+    }
     let _ = child.kill();
+}
+
+fn kill_and_reap(child: &mut Child) {
+    terminate_child(child);
     let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
     loop {
         match child.try_wait() {
@@ -665,7 +694,7 @@ impl MspHost {
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) if !killed && Instant::now() >= kill_at => {
-                    let _ = child.kill();
+                    terminate_child(&mut child);
                     killed = true;
                 }
                 Ok(None) if Instant::now() < deadline => {
@@ -1060,7 +1089,7 @@ pub fn probe_serve_exit(timeout: Duration) -> Result<Option<ExitClassification>,
             return Ok(Some(classify_status(&status, tail.snapshot())));
         }
         if started.elapsed() >= timeout {
-            let _ = child.kill();
+            terminate_child(&mut child);
             let _ = child.wait();
             return Ok(None);
         }
