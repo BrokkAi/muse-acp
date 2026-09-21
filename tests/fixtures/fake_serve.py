@@ -39,6 +39,9 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
+  close_stdin  closes the host's stdin after initialization, then exits
+  stdout_close_stays_alive closes stdout but keeps the child alive briefly
+  stderr_flood writes enough stderr to require a concurrent drain
 """
 import json
 import os
@@ -862,7 +865,8 @@ def scenario_after_restart():
     """host_exit is a one-shot: the first process creates the marker and
     crashes; the replacement process sees the marker and behaves sanely."""
     marker = os.environ.get("FAKE_RESTART_MARKER", "")
-    if SCENARIO in ("host_exit", "host_exit_quiet") and marker:
+    if SCENARIO in ("host_exit", "host_exit_quiet", "close_stdin",
+                    "stdout_close_stays_alive") and marker:
         if os.path.exists(marker):
             return "happy"
         with open(marker, "w") as f:
@@ -874,6 +878,11 @@ SCENARIO = scenario_after_restart()
 
 
 def main():
+    pid_path = os.environ.get("FAKE_PID", "")
+    if pid_path:
+        with open(pid_path, "a") as f:
+            f.write(str(os.getpid()))
+            f.write("\n")
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -896,6 +905,8 @@ def main():
             log_method("unknown-request-reply:" + json.dumps(msg))
             continue
         if method == "initialized":
+            if SCENARIO == "close_stdin":
+                os.close(0)
             if SCENARIO == "unknown_request":
                 send({"jsonrpc": "2.0", "id": "srv-77",
                       "method": "future/request",
@@ -903,6 +914,9 @@ def main():
             continue
         if method:
             if ident is not None:
+                if method == "initialize" and SCENARIO == "stderr_flood":
+                    sys.stderr.buffer.write(b"fixture stderr flood\n" * 32768)
+                    sys.stderr.flush()
                 if (os.environ.get("FAKE_DELAY_METHOD", "") == method
                         and os.environ.get("FAKE_DELAY_MS", "")):
                     time.sleep(int(os.environ["FAKE_DELAY_MS"]) / 1000.0)
@@ -928,6 +942,12 @@ def main():
                     continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
+                if method == "model/list" and SCENARIO == "pipe_stall":
+                    log_method("pipe-stall-start")
+                    time.sleep(8)
+                if method == "model/list" and SCENARIO == "stdout_close_stays_alive":
+                    os.close(1)
+                    time.sleep(1.0)
                 if CRASH_AFTER_ACK[0]:
                     sys.stdout.flush()
                     os._exit(0)
@@ -940,6 +960,10 @@ def main():
                         notify("item/completed", {"sessionId": MSP_SID, "item": {
                             "itemId": "reissue-barrier", "kind": "agentMessage",
                             "status": "completed", "text": "resume questions delivered"}})
+
+    if SCENARIO == "shutdown_flush":
+        time.sleep(0.6)
+        log_method("shutdown-flushed")
 
 
 main()
