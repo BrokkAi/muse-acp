@@ -84,6 +84,10 @@ FOLDED_MODE = os.environ.get("FAKE_FOLDED_MODE", "")
 LOG = os.environ.get("FAKE_LOG", "")
 TURNS = [0]
 CATALOG_READS = [0]
+# The adapter's MSP initialize posture determines whether the host should
+# create a user-input request. An explicit override exercises the backstop for
+# hosts that predate userInputDialogs or ignore it.
+USER_INPUT_DIALOGS = [True]
 USAGE_READS = [0]
 SKILL_READS = [0]
 
@@ -374,11 +378,13 @@ def on_turn_start(params):
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO in ("questions", "questions_multiple", "questions_resume"):
         qid = "ui-2" if SCENARIO == "questions_resume" else "ui-1"
-        notify("userInput/requested", question_params(qid))
-        if SCENARIO == "questions_resume":
-            # The request and view notification also describe the same ask.
-            send({"jsonrpc": "2.0", "id": 9200, "method": "userInput/request",
-                  "params": question_params(qid)})
+        if (USER_INPUT_DIALOGS[0]
+                or os.environ.get("FAKE_IGNORE_USER_INPUT_DIALOGS") == "1"):
+            notify("userInput/requested", question_params(qid))
+            if SCENARIO == "questions_resume":
+                # The request and view notification also describe the same ask.
+                send({"jsonrpc": "2.0", "id": 9200, "method": "userInput/request",
+                      "params": question_params(qid)})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "tool_huge_output":
         notify("item/completed", {**base, "item": {
@@ -775,6 +781,8 @@ def on_turn_start(params):
 
 def result_for(method, msg):
     if method == "initialize":
+        USER_INPUT_DIALOGS[0] = msg.get("params", {}).get("capabilities", {}).get(
+            "userInputDialogs", True) is not False
         return {
             "schema": SCHEMA,
             "capabilities": {},

@@ -283,7 +283,7 @@ impl Client {
 
     /// New session via initialize + initialized + session/new. Returns the
     /// ACP session id.
-    fn new_session(&mut self, ver: u64, extra_init: &str) -> String {
+    fn initialize(&mut self, ver: u64, extra_init: &str) {
         let init = self.req(
             "initialize",
             &format!("{{\"protocolVersion\":{ver}{extra_init}}}"),
@@ -311,6 +311,12 @@ impl Client {
             );
         }
         self.notify("initialized", "{}");
+    }
+
+    /// New session via initialize + initialized + session/new. Returns the
+    /// ACP session id.
+    fn new_session(&mut self, ver: u64, extra_init: &str) -> String {
+        self.initialize(ver, extra_init);
         let dir = std::path::Path::new(&self.fake_log)
             .parent()
             .expect("fake log parent")
@@ -1399,6 +1405,11 @@ fn user_input_options_reach_the_client() {
         elicit.contains(&sid),
         "elicitation for our session: {elicit}"
     );
+    let msp_init = std::fs::read_to_string(format!("{}.frames", c.fake_log)).unwrap();
+    assert!(
+        msp_init.contains("\"userInputDialogs\": true"),
+        "form capability must be declared to MSP: {msp_init}"
+    );
     assert!(
         elicit.contains("Answer questions") && elicit.contains("Explain instead"),
         "route choices bridged: {elicit}"
@@ -1759,7 +1770,7 @@ fn v1_questions_without_form_support_are_cancelled() {
         "",
         ",\"clientCapabilities\":{\"elicitation\":{\"form\":false}}",
     ] {
-        let mut c = Client::spawn("questions", &[]);
+        let mut c = Client::spawn("questions", &[("FAKE_IGNORE_USER_INPUT_DIALOGS", "1")]);
         let sid = c.new_session(1, caps);
         let _pid = c.prompt(&sid, "ask me");
         c.wait_log("userInput/cancel", Duration::from_secs(15));
@@ -1778,7 +1789,7 @@ fn v1_questions_without_form_support_are_cancelled() {
 
 #[test]
 fn false_elicitation_capability_is_not_treated_as_supported() {
-    let mut c = Client::spawn("questions", &[]);
+    let mut c = Client::spawn("questions", &[("FAKE_IGNORE_USER_INPUT_DIALOGS", "1")]);
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":false}}");
     let _pid = c.prompt(&sid, "ask me");
     c.wait_log("userInput/cancel", Duration::from_secs(15));
@@ -1791,6 +1802,30 @@ fn false_elicitation_capability_is_not_treated_as_supported() {
         !frames.contains("elicitation/create"),
         "false form capability must not enable elicitation: {frames}"
     );
+    c.finish();
+}
+
+#[test]
+fn form_less_client_withholds_user_input_dialogs_from_msp() {
+    let mut c = Client::spawn("questions", &[]);
+    let sid = c.new_session(2, "");
+    let prompt = c.prompt(&sid, "ask me");
+    let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+    assert!(
+        idle.contains(&sid),
+        "turn completes without a question: {idle}"
+    );
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !calls.lines().any(|m| m == "userInput/cancel"),
+        "form-less host posture must avoid the cancellation backstop: {calls}"
+    );
+    let frames = std::fs::read_to_string(format!("{}.frames", c.fake_log)).unwrap();
+    assert!(
+        frames.contains("\"userInputDialogs\": false"),
+        "form-less ACP capability must be declared to MSP: {frames}"
+    );
+    assert!(prompt > 0);
     c.finish();
 }
 
@@ -3458,6 +3493,7 @@ fn bogus_approval_mode_fails_session_new_atomically() {
 #[test]
 fn validated_schema_logs_machine_readable_compat_lines() {
     let mut c = Client::spawn("quiet", &[]);
+    c.initialize(1, "");
     c.wait_stderr(
         &format!(
             "schema-compat adapter={} host=muse-session-server-fixture/0.0.0-fixture",
@@ -3471,23 +3507,18 @@ fn validated_schema_logs_machine_readable_compat_lines() {
         "host-ready server=muse-session-server-fixture/0.0.0-fixture",
         Duration::from_secs(10),
     );
-    let init = c.req("initialize", "{\"protocolVersion\":1}");
-    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
-    assert!(frame.contains("\"result\""), "init failed: {frame}");
     c.finish();
 }
 
 #[test]
 fn unknown_schema_fingerprint_degrades_without_blocking() {
     let mut c = Client::spawn("quiet", &[("FAKE_FINGERPRINT", "sha256:deadbeefdeadbeef")]);
+    c.initialize(1, "");
     c.wait_stderr("status=unknown", Duration::from_secs(10));
     c.wait_stderr(
         "fingerprint=sha256:deadbeefdeadbeef",
         Duration::from_secs(10),
     );
-    let init = c.req("initialize", "{\"protocolVersion\":1}");
-    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
-    assert!(frame.contains("\"result\""), "init failed: {frame}");
     c.finish();
 }
 
@@ -3500,10 +3531,8 @@ fn sdk_manifest_fingerprint_is_degraded_not_tested() {
             "sha256:cfd31ee77d78fdada9febc4edccd29b0434ff8f6bf157c7c03fd0ecfcbc29f5a",
         )],
     );
+    c.initialize(1, "");
     c.wait_stderr("status=degraded", Duration::from_secs(10));
-    let init = c.req("initialize", "{\"protocolVersion\":1}");
-    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
-    assert!(frame.contains("\"result\""), "init failed: {frame}");
     c.finish();
 }
 
@@ -3516,20 +3545,19 @@ fn host_121_fingerprint_is_tested() {
             "sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b",
         )],
     );
+    c.initialize(1, "");
     c.wait_stderr("status=tested", Duration::from_secs(10));
     c.wait_stderr(
         "fingerprint=sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b",
         Duration::from_secs(10),
     );
-    let init = c.req("initialize", "{\"protocolVersion\":1}");
-    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
-    assert!(frame.contains("\"result\""), "init failed: {frame}");
     c.finish();
 }
 
 #[test]
 fn unusable_permission_profile_fails_with_settings_guidance() {
     let mut c = Client::spawn("quiet", &[("FAKE_START_ERROR", "profile")]);
+    c.initialize(1, "");
     let id = c.req("session/new", &format!("{{\"cwd\":{}}}", temp_cwd_json()));
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(
@@ -3560,16 +3588,15 @@ fn transcript_fixture_fingerprint_is_never_reported_as_host_compatible() {
             "sha256:c8d1a2a1866814e220fd396d382a9a75861412feee884b5021b2ee359bd3dc59",
         )],
     );
+    c.initialize(1, "");
     c.wait_stderr("status=fixture", Duration::from_secs(10));
-    let init = c.req("initialize", "{\"protocolVersion\":1}");
-    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
-    assert!(frame.contains("\"result\""), "init failed: {frame}");
     c.finish();
 }
 
 #[test]
 fn unsupported_envelope_schema_version_fails_closed() {
     let mut c = Client::spawn("quiet", &[("FAKE_SCHEMA_VERSION", "2")]);
+    let _ = c.req("initialize", "{\"protocolVersion\":1}");
     let status = c
         .child
         .wait_timeout(Duration::from_secs(10))
@@ -3589,6 +3616,7 @@ fn unknown_server_request_gets_method_not_found_and_survives() {
     // success result; the typed methodNotFound reply leaves the connection
     // healthy and the method observable in diagnostics.
     let mut c = Client::spawn("unknown_request", &[]);
+    c.initialize(1, "");
     c.wait_log_contains("unknown-request-reply:", Duration::from_secs(10));
     let seen = std::fs::read_to_string(&c.fake_log).expect("fake log");
     let reply = seen
@@ -3610,9 +3638,6 @@ fn unknown_server_request_gets_method_not_found_and_survives() {
     );
 
     // The stdio connection must remain usable after the unknown request.
-    let init = c.req("initialize", "{\"protocolVersion\":1}");
-    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
-    assert!(frame.contains("\"result\""), "init failed: {frame}");
     c.finish();
 }
 
@@ -3628,6 +3653,7 @@ fn command_timeout_reports_method_id_and_configured_duration() {
             ("MUSE_COMMAND_TIMEOUT_MS", "200"),
         ],
     );
+    let _ = c.req("initialize", "{\"protocolVersion\":1}");
     let status = c
         .child
         .wait_timeout(Duration::from_secs(10))
@@ -4762,6 +4788,7 @@ fn recommended_value_is_omitted_without_negotiation() {
 #[test]
 fn missing_cli_failure_names_the_next_action() {
     let mut c = Client::spawn("happy", &[("MUSE_CLI", "/nonexistent-muse")]);
+    let _ = c.req("initialize", "{\"protocolVersion\":1}");
     let status = c
         .child
         .wait_timeout(Duration::from_secs(10))
@@ -5384,6 +5411,9 @@ fn authentication_rejections_are_actionable_acp_errors() {
                     ("FAKE_ERROR_MESSAGE", message),
                 ],
             );
+            if method != "turn/start" {
+                c.initialize(1, "");
+            }
             let id = match method {
                 "session/start" => {
                     c.req("session/new", &format!("{{\"cwd\":{}}}", temp_cwd_json()))
@@ -5535,16 +5565,21 @@ fn external_authentication_failure_mid_turn_keeps_service_context() {
 
 #[test]
 fn authentication_initialize_failure_has_external_login_guidance() {
-    let output = Command::new(adapter_bin())
-        .env("MUSE_CLI", fixture())
-        .env("FAKE_SCENARIO", "quiet")
-        .env("FAKE_ERROR_METHOD", "initialize")
-        .env("FAKE_ERROR_MESSAGE", "Not logged in: secret-sentinel")
-        .stdin(Stdio::null())
-        .output()
-        .expect("run adapter");
-    assert!(!output.status.success());
-    let stderr = String::from_utf8_lossy(&output.stderr);
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_ERROR_METHOD", "initialize"),
+            ("FAKE_ERROR_MESSAGE", "Not logged in: secret-sentinel"),
+        ],
+    );
+    let _ = c.req("initialize", "{\"protocolVersion\":1}");
+    let status = c
+        .child
+        .wait_timeout(Duration::from_secs(10))
+        .expect("wait")
+        .expect("adapter exited");
+    assert!(!status.success());
+    let stderr = std::fs::read_to_string(&c.stderr_log).expect("adapter stderr");
     assert!(
         stderr.contains("Muse is not authenticated") && stderr.contains("muse login"),
         "{stderr}"
