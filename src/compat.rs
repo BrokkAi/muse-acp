@@ -245,11 +245,16 @@ mod tests {
 mod corpus_tests {
     use super::{SDK_MANIFEST_FINGERPRINT, SUPPORTED_SCHEMA_VERSION};
     use crate::json::parse_json;
+    use std::collections::BTreeSet;
 
     fn protocol_path(rel: &str) -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/protocol")
             .join(rel)
+    }
+
+    fn repository_path(rel: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
     }
 
     #[test]
@@ -280,5 +285,57 @@ mod corpus_tests {
         for required in ["Item", "ApprovalRequestParams", "UserInputRequestParams"] {
             assert!(defs.get(required).is_some(), "missing $defs.{required}");
         }
+    }
+
+    #[test]
+    fn every_schema_notification_has_an_explicit_matrix_disposition() {
+        let schema_text = std::fs::read_to_string(protocol_path("stable/msp.schema.json"))
+            .expect("vendored schema bundle");
+        let schema = parse_json(&schema_text).expect("schema bundle JSON");
+        let schema_notifications = match schema.get("notifications").expect("notifications") {
+            crate::json::J::Obj(entries) => entries
+                .iter()
+                .map(|(method, _)| method.as_str())
+                .collect::<BTreeSet<_>>(),
+            _ => panic!("schema notifications must be an object"),
+        };
+
+        let matrix = std::fs::read_to_string(repository_path("docs/event-compatibility.md"))
+            .expect("MSP event compatibility matrix");
+        let rows = matrix
+            .split("<!-- schema-notifications:start -->")
+            .nth(1)
+            .and_then(|tail| tail.split("<!-- schema-notifications:end -->").next())
+            .expect("schema notification matrix markers");
+        let dispositions = [
+            "Mapped to ACP",
+            "Internally tracked",
+            "Consumed",
+            "Intentionally ignored",
+            "Unsupported pending protocol decision",
+        ];
+        let mut documented = BTreeSet::new();
+        for line in rows.lines().filter(|line| line.starts_with("| `")) {
+            let cells = line.split('|').map(str::trim).collect::<Vec<_>>();
+            assert!(cells.len() >= 5, "malformed matrix row: {line}");
+            let method = cells[1]
+                .strip_prefix('`')
+                .and_then(|value| value.strip_suffix('`'))
+                .expect("backtick-wrapped notification method");
+            assert!(
+                dispositions.contains(&cells[2]),
+                "invalid disposition for {method}: {}",
+                cells[2]
+            );
+            assert!(
+                documented.insert(method),
+                "duplicate notification matrix row: {method}"
+            );
+        }
+
+        assert_eq!(
+            documented, schema_notifications,
+            "the compatibility matrix must classify every and only published schema notification"
+        );
     }
 }

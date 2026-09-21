@@ -152,9 +152,34 @@ def tag_check():
         require(obj['type'] == 'commit' and obj['sha'] == SHA, 'Existing tag points at another commit')
 
 
+def find_release(tag):
+    release = optional('releases/tags/' + tag)
+    if release is not None:
+        return release
+    # GitHub's tag endpoint can hide drafts; the authenticated list includes them.
+    matches = []
+    page = 1
+    while True:
+        releases = api(f'releases?per_page=100&page={page}')
+        matches.extend(r for r in releases if r['tag_name'] == tag)
+        if len(releases) < 100:
+            break
+        page += 1
+    require(len(matches) <= 1, 'Multiple releases use the proposed tag')
+    if matches:
+        return api('releases/' + str(matches[0]['id']))
+    # The CLI's draft lookup also uses GraphQL when REST omits the draft.
+    query = 'query($tag:String!) { repository(owner:"BrokkAi", name:"muse-acp") { release(tagName:$tag) { databaseId } } }'
+    result = json.loads(gh('api', '--hostname', 'github.com', 'graphql',
+                           '-f', 'query=' + query, '-f', 'tag=' + tag))
+    require(not result.get('errors'), 'GraphQL draft lookup failed')
+    found = result['data']['repository']['release']
+    return api('releases/' + str(found['databaseId'])) if found else None
+
+
 def release_state():
     tag_check()
-    release = optional('releases/tags/' + TAG)
+    release = find_release(TAG)
     if release:
         if not release['draft']:
             require(optional('git/ref/tags/' + TAG) is not None, 'Published release is missing its tag')
@@ -162,7 +187,7 @@ def release_state():
     return release
 
 
-def compare_remote(release, staged, complete):
+def compare_remote(release, staged, complete, resume=False):
     assets = release['assets']
     names = [a['name'] for a in assets]
     require(len(names) == len(set(names)) and set(names) <= expected_names(), 'Conflicting remote assets')
@@ -177,9 +202,14 @@ def compare_remote(release, staged, complete):
         for target in TARGETS:
             name = archive_name(target)
             if name in names:
-                # Missing checksum in a partial draft can be resumed only for exact staged bytes.
                 if name + '.sha256' not in names:
-                    require((directory / name).read_bytes() == (staged / name).read_bytes(), 'Partial archive conflict')
+                    raw = (directory / name).read_bytes()
+                    (directory / (name + '.sha256')).write_text(f'{digest(raw)}  {name}\n')
+                    require(inspect_archive(directory, target) == inspect_archive(staged, target), 'Partial archive payload conflict')
+                    if resume:
+                        # Keep the immutable uploaded archive and add its own checksum.
+                        (staged / name).write_bytes(raw)
+                        (staged / (name + '.sha256')).write_bytes((directory / (name + '.sha256')).read_bytes())
                 else:
                     require(inspect_archive(directory, target) == inspect_archive(staged, target), 'Published payload differs from staged build')
             elif name + '.sha256' in names:
@@ -195,14 +225,18 @@ def authorization():
     # Drafts do not create refs; assert that invariant before and after deletion.
     probe = f'preflight-{os.environ["GITHUB_RUN_ID"]}-{os.environ["GITHUB_RUN_ATTEMPT"]}'
     require(optional('git/ref/tags/' + probe) is None, 'Probe tag already exists')
-    existing = optional('releases/tags/' + probe)
+    existing = find_release(probe)
     if existing:
         require(existing['draft'] and existing['target_commitish'] == SHA, 'Probe conflict')
         api('releases/' + str(existing['id']), 'DELETE')
     release = api('releases', 'POST', {'tag_name': probe, 'target_commitish': SHA, 'name': probe, 'draft': True})
     try:
         require(release['draft'], 'Probe must stay a draft')
-        api('releases/' + str(release['id']), 'PATCH', {'body': 'Disposable non-publishing permissions check.'})
+        api('releases/' + str(release['id']), 'PATCH', {'tag_name': probe, 'draft': True, 'body': 'Disposable non-publishing permissions check.'})
+        discovered = find_release(probe)
+        require(discovered and discovered['id'] == release['id'] and discovered['draft'], 'Draft discovery failed')
+        readback = api('releases/' + str(release['id']))
+        require(readback['body'] == 'Disposable non-publishing permissions check.' and readback['draft'], 'Draft readback failed')
     finally:
         api('releases/' + str(release['id']), 'DELETE')
     require(optional('git/ref/tags/' + probe) is None, 'Unexpected probe tag')
@@ -214,8 +248,9 @@ def evidence(kind):
     runs = json.loads(gh('run', 'list', '--repo', 'github.com/' + REPO, '--commit', SHA, '--limit', '100',
                         '--json', 'databaseId,workflowName,headSha,headBranch,event,status,conclusion'))
     for workflow in ['ci', 'release']:
-        candidates = [r for r in runs if r['workflowName'] == workflow and r['headSha'] == SHA and r['event'] == 'push' and not r['headBranch'].startswith('v')]
-        require(candidates, 'Missing exact-commit ' + workflow + ' push run')
+        event = 'workflow_dispatch' if kind == 'authorization' and workflow == 'release' else 'push'
+        candidates = [r for r in runs if r['workflowName'] == workflow and r['headSha'] == SHA and r['event'] == event and not r['headBranch'].startswith('v')]
+        require(candidates, 'Missing exact-commit ' + workflow + ' ' + event + ' run')
         run = max(candidates, key=lambda r: r['databaseId'])
         require(run['status'] == 'completed' and run['conclusion'] == 'success', 'Latest ' + workflow + ' run did not succeed')
         detail = json.loads(gh('run', 'view', str(run['databaseId']), '--repo', 'github.com/' + REPO, '--json', 'headSha,jobs,conclusion'))
@@ -238,6 +273,8 @@ def evidence(kind):
                 Path(d, 'install.sh').write_bytes(source_bytes('install.sh'))
                 staged = Path(d)
                 validate(staged)
+                if kind == 'publication-inputs':
+                    require(validate(staged) == validate(Path('dist')), 'Tag build payload differs from successful preflight; refusing uploads')
                 if kind in ['version', 'published']:
                     release = release_state()
                     if kind == 'published':
@@ -258,18 +295,18 @@ def publish(staged):
     authorization()  # Fresh credential check immediately before uploads.
     if not release:
         release = api('releases', 'POST', {'tag_name': TAG, 'target_commitish': SHA, 'name': TAG, 'draft': True, 'generate_release_notes': True})
-    compare_remote(release, staged, False)
+    compare_remote(release, staged, False, resume=True)
     existing = {a['name'] for a in release['assets']}
     # Never clobber. Existing archive/checksum pairs are verified as unpacked content.
     for name in sorted(expected_names() - existing):
         gh('release', 'upload', TAG, str(staged / name), '--repo', 'github.com/' + REPO)
-        uploaded = optional('releases/tags/' + TAG)
+        uploaded = api('releases/' + str(release['id']))
         asset = next(a for a in uploaded['assets'] if a['name'] == name)
         raw = gh('api', '--hostname', 'github.com', '-H', 'Accept: application/octet-stream', f'repos/{REPO}/releases/assets/{asset["id"]}')
         require(raw == (staged / name).read_bytes(), 'Upload integrity mismatch')
-    compare_remote(optional('releases/tags/' + TAG), staged, True)
-    api('releases/' + str(release['id']), 'PATCH', {'draft': False, 'make_latest': 'true'})
-    compare_remote(optional('releases/tags/' + TAG), staged, True)
+    compare_remote(api('releases/' + str(release['id'])), staged, True)
+    api('releases/' + str(release['id']), 'PATCH', {'tag_name': TAG, 'target_commitish': SHA, 'draft': False, 'make_latest': 'true'})
+    compare_remote(api('releases/' + str(release['id'])), staged, True)
 
 
 if __name__ == '__main__':
@@ -288,6 +325,11 @@ if __name__ == '__main__':
         elif mode == 'staged':
             metadata()
             validate(Path('dist'))
+            if os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch' or (
+                os.environ.get('GITHUB_EVENT_NAME') == 'push'
+                and os.environ.get('GITHUB_REF', '').startswith('refs/tags/')
+            ):
+                evidence('publication-inputs')
             release = release_state()
             if release:
                 compare_remote(release, Path('dist'), not release['draft'])
