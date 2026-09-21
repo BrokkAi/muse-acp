@@ -6235,21 +6235,23 @@ fn authentication_initialize_failure_has_external_login_guidance() {
 }
 
 #[test]
-fn authentication_remains_external() {
-    let mut c = Client::spawn("quiet", &[]);
-    let id = c.req(
-        "initialize",
-        r#"{"protocolVersion":1,"clientCapabilities":{}}"#,
-    );
-    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
-    assert!(frame.contains("\"authMethods\":[]"), "{frame}");
-    let id = c.req("authenticate", r#"{"methodId":"login"}"#);
-    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
-    assert!(
-        frame.contains("\"code\":-32601") && frame.contains("muse login"),
-        "{frame}"
-    );
-    c.finish();
+fn authentication_remains_external_until_experimental_account_surface_is_adopted() {
+    for version in [1, 2] {
+        let mut c = Client::spawn("quiet", &[]);
+        let id = c.req(
+            "initialize",
+            &format!(r#"{{"protocolVersion":{version},"clientCapabilities":{{}}}}"#),
+        );
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"authMethods\":[]"), "v{version}: {frame}");
+        let id = c.req("authenticate", r#"{"methodId":"login"}"#);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"code\":-32601") && frame.contains("muse login"),
+            "v{version}: {frame}"
+        );
+        c.finish();
+    }
 }
 
 #[test]

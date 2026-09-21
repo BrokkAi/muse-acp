@@ -214,6 +214,7 @@ pub fn describe_spawn_error(bin: &str, e: &std::io::Error) -> String {
     }
 }
 
+/// The account surface is experimental and this adapter does not opt into it.
 /// Match explicit login diagnostics in free-text host errors; a bare 401/403
 /// or permission denial may belong to a tool. Never echo raw authentication
 /// errors: they can contain credentials.
