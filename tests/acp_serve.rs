@@ -16,7 +16,20 @@ use std::time::{Duration, Instant};
 
 fn fixture() -> String {
     let dir = env!("CARGO_MANIFEST_DIR");
-    format!("{dir}/tests/fixtures/fake_serve.py")
+    let extension = if cfg!(windows) { "cmd" } else { "py" };
+    format!("{dir}/tests/fixtures/fake_serve.{extension}")
+}
+
+fn temp_cwd_json() -> String {
+    serde_json::to_string(&std::env::temp_dir()).expect("serialize temporary path")
+}
+
+fn fixture_name() -> &'static str {
+    if cfg!(windows) {
+        "fake_serve.cmd"
+    } else {
+        "fake_serve.py"
+    }
 }
 
 fn adapter_bin() -> String {
@@ -1582,7 +1595,7 @@ fn model_catalog_refreshes_after_initial_partial_snapshot() {
             assert!(initial.contains("\"value\":\"fake-model\""));
             assert!(!initial.contains("second-model"));
             let params = if method == "session/new" {
-                "{\"cwd\":\"/tmp\",\"mcpServers\":[]}".to_string()
+                format!("{{\"cwd\":{},\"mcpServers\":[]}}", temp_cwd_json())
             } else if method == "session/set_config_option" {
                 format!(
                     "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
@@ -1658,6 +1671,9 @@ fn slash_command_aliases_use_the_muse_skill_grammar() {
         "\"text\": \"/skill plan add dropdowns\"",
         Duration::from_secs(15),
     );
+
+    // The fake host can record its input before the ACP reader receives the echo.
+    c.wait_for("\"text\":\"/plan add dropdowns\"", Duration::from_secs(15));
 
     let log = c
         .frames
@@ -1829,10 +1845,7 @@ fn steering_targets_a_turn_rehydrated_by_resume() {
     let init = c.req("initialize", "{\"protocolVersion\":2}");
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
-    let resume_id = c.req(
-        "session/resume",
-        "{\"sessionId\":\"existing-session\",\"cwd\":\"/tmp\"}",
-    );
+    let resume_id = c.req("session/resume", "{\"sessionId\":\"existing-session\"}");
     let resumed = c.wait_for(&format!("\"id\":{resume_id}"), Duration::from_secs(15));
     assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
 
@@ -1999,13 +2012,22 @@ fn resource_link_inlines_workspace_text() {
     // Percent-encoded name exercises URI decoding + workspace confinement.
     std::fs::write(dir.join("sp ace.txt"), "secret file text").expect("write");
     std::fs::write(dir.join("context.json"), "json resource text").expect("write");
-    let uri = format!("file://{}", dir.join("sp%20ace.txt").to_str().unwrap());
-    let json_uri = format!("file://{}", dir.join("context.json").to_str().unwrap());
+    let path = dir
+        .join("sp%20ace.txt")
+        .to_str()
+        .unwrap()
+        .replace('\\', "/");
+    let uri = if cfg!(windows) {
+        format!("file:///{path}")
+    } else {
+        format!("file://{path}")
+    };
+    let json_uri = uri.replace("sp%20ace.txt", "context.json");
     let init = c.req("initialize", "{\"protocolVersion\":1}");
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
-    let cwd = dir.to_str().unwrap();
-    let id = c.req("session/new", &format!("{{\"cwd\":\"{cwd}\"}}"));
+    let cwd = serde_json::to_string(&dir).expect("serialize workspace path");
+    let id = c.req("session/new", &format!("{{\"cwd\":{cwd}}}"));
     c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     // Re-read the session id from the accumulated frames.
     let log = c
@@ -2033,6 +2055,55 @@ fn resource_link_inlines_workspace_text() {
     let _pid = pid;
     c.wait_input("secret file text", Duration::from_secs(15));
     c.wait_input("json resource text", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn untyped_source_resources_are_inlined() {
+    let mut c = Client::spawn("quiet", &[]);
+    let root = std::path::Path::new(&c.fake_log)
+        .parent()
+        .unwrap()
+        .join("workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    let sid = c.new_session_at(1, &root, &[]);
+    for name in ["notes.go", "Makefile", "page.html", "data.csv"] {
+        let marker = format!("resource-content-{name}");
+        std::fs::write(root.join(name), &marker).unwrap();
+        let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"resource_link","uri":root.join(name),"name":name}]});
+        c.req("session/prompt", &params.to_string());
+        c.wait_input(&marker, Duration::from_secs(15));
+    }
+    c.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn session_list_matches_workspace_symlink_aliases() {
+    let mut c = Client::spawn("quiet", &[]);
+    let base = std::path::Path::new(&c.fake_log)
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    let root = base.join("workspace");
+    let extra = base.join("extra");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&extra).unwrap();
+    let alias = base.join("alias");
+    std::os::unix::fs::symlink(&base, &alias).unwrap();
+    let sid = c.new_session_at(1, &root, &[&extra]);
+    for (cwd, additional) in [
+        (alias.join("workspace"), extra.clone()),
+        (root, alias.join("extra")),
+    ] {
+        let params = serde_json::json!({"cwd":cwd,"additionalDirectories":[additional]});
+        let id = c.req("session/list", &params.to_string());
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains(&sid),
+            "equivalent workspace filter hid session: {frame}"
+        );
+    }
     c.finish();
 }
 
@@ -2096,7 +2167,7 @@ fn additional_roots_are_confined_consistently_across_protocol_versions() {
     std::fs::write(denied.join("escape.txt"), "must-not-expand").unwrap();
     std::fs::write(denied.join("hard-source.txt"), "hard-link-text").unwrap();
     std::fs::write(primary.join("binary.txt"), b"binary-resource-secret\0tail").unwrap();
-    std::fs::write(primary.join("untyped.bin"), "untyped-binary-secret").unwrap();
+    std::fs::write(primary.join("untyped.bin"), b"untyped-binary-secret\0tail").unwrap();
     symlink(&linked_target, &linked_root).expect("symlinked root");
     symlink(denied.join("escape.txt"), primary.join("escape-link.txt")).expect("escaping symlink");
     std::fs::hard_link(
@@ -2360,7 +2431,7 @@ fn approval_mode_mismatch_fails_session_new() {
     let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     assert!(frame.contains("\"result\""), "init failed: {frame}");
     c.notify("initialized", "{}");
-    let id = c.req("session/new", "{\"cwd\":\"/tmp\"}");
+    let id = c.req("session/new", &format!("{{\"cwd\":{}}}", temp_cwd_json()));
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(
         frame.contains("not applied"),
@@ -2376,7 +2447,7 @@ fn bogus_approval_mode_fails_session_new_atomically() {
     let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     assert!(frame.contains("\"result\""), "init failed: {frame}");
     c.notify("initialized", "{}");
-    let id = c.req("session/new", "{\"cwd\":\"/tmp\"}");
+    let id = c.req("session/new", &format!("{{\"cwd\":{}}}", temp_cwd_json()));
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(
         frame.contains("\"error\""),
@@ -2460,7 +2531,7 @@ fn host_121_fingerprint_is_tested() {
 #[test]
 fn unusable_permission_profile_fails_with_settings_guidance() {
     let mut c = Client::spawn("quiet", &[("FAKE_START_ERROR", "profile")]);
-    let id = c.req("session/new", "{\"cwd\":\"/tmp\"}");
+    let id = c.req("session/new", &format!("{{\"cwd\":{}}}", temp_cwd_json()));
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(
         frame.contains("\"error\""),
@@ -3401,7 +3472,7 @@ fn missing_cli_failure_names_the_next_action() {
 fn selftest_reports_cli_readiness_without_gating() {
     let ok = std::process::Command::new(adapter_bin())
         .arg("--selftest")
-        .env("MUSE_CLI", "/bin/echo")
+        .env("MUSE_CLI", adapter_bin())
         .output()
         .expect("selftest");
     let text = String::from_utf8_lossy(&ok.stdout);
@@ -3410,7 +3481,7 @@ fn selftest_reports_cli_readiness_without_gating() {
         "selftest must stay a diagnostic: {ok:?}"
     );
     assert!(
-        text.contains("cli-ready binary=/bin/echo"),
+        text.contains(&format!("cli-ready binary={}", adapter_bin())),
         "ready probe missing: {text}"
     );
 
@@ -3762,7 +3833,7 @@ fn client_disconnect_exits_promptly_with_a_turn_in_flight() {
 fn support_bundle_redacts_unknown_muse_env_values() {
     let out = std::process::Command::new(adapter_bin())
         .arg("--support")
-        .env("MUSE_CLI", "/bin/echo")
+        .env("MUSE_CLI", adapter_bin())
         .env("MUSE_SECRET_TOKEN", "super-secret-value")
         .env("MUSE_TOOL_OUTPUT_LIMIT", "1234")
         .output()
@@ -3837,6 +3908,181 @@ fn cached_input_tokens_price_at_the_catalog_cached_rate() {
     assert!(
         update.contains("\"used\":1500"),
         "occupancy drifted in the priced frame: {update}"
+    );
+    c.finish();
+}
+
+#[test]
+fn authentication_rejections_are_actionable_acp_errors() {
+    for method in [
+        "session/start",
+        "session/resume",
+        "turn/start",
+        "session/list",
+    ] {
+        for (message, expected) in [
+            (
+                "Not authenticated; run muse login. secret-sentinel",
+                "Muse is not authenticated",
+            ),
+            (
+                "Access token has expired: secret-sentinel",
+                "Muse session expired",
+            ),
+        ] {
+            let mut c = Client::spawn(
+                "quiet",
+                &[
+                    ("FAKE_ERROR_METHOD", method),
+                    ("FAKE_ERROR_MESSAGE", message),
+                ],
+            );
+            let id = match method {
+                "session/start" => {
+                    c.req("session/new", &format!("{{\"cwd\":{}}}", temp_cwd_json()))
+                }
+                "session/resume" => c.req(
+                    "session/load",
+                    &format!("{{\"sessionId\":\"existing\",\"cwd\":{}}}", temp_cwd_json()),
+                ),
+                "session/list" => c.req("session/list", "{}"),
+                _ => {
+                    let sid = c.new_session(1, "");
+                    c.prompt(&sid, "hi")
+                }
+            };
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            assert!(frame.contains("\"code\":-32000"), "{method}: {frame}");
+            assert!(frame.contains(expected), "{frame}");
+            assert!(
+                frame.contains("muse login") && frame.contains("restart"),
+                "{frame}"
+            );
+            assert!(
+                frame.contains(fixture_name()) && frame.contains("0.0.0-fixture"),
+                "{frame}"
+            );
+            assert!(!frame.contains("secret-sentinel"), "{frame}");
+            c.finish();
+        }
+    }
+}
+
+#[test]
+fn expired_authentication_mid_turn_surfaces_in_both_protocols() {
+    for version in [1, 2] {
+        let mut c = Client::spawn(
+            "failed",
+            &[
+                ("FAKE_TURN_ERROR_KIND", "modelError"),
+                (
+                    "FAKE_TURN_ERROR_MESSAGE",
+                    "Session has expired: secret-sentinel",
+                ),
+                ("FAKE_TURN_ERROR_RETRYABLE", "true"),
+            ],
+        );
+        let sid = c.new_session(version, "");
+        let id = c.prompt(&sid, "hi");
+        let frame = if version == 1 {
+            c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15))
+        } else {
+            c.wait_for("Muse session expired", Duration::from_secs(15))
+        };
+        assert!(
+            frame.contains("Muse session expired") && frame.contains("muse login"),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("secret-sentinel") && !frame.contains("retry the same prompt"),
+            "{frame}"
+        );
+        if version == 1 {
+            assert!(frame.contains("\"code\":-32000"), "{frame}");
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn external_authentication_failure_mid_turn_keeps_service_context() {
+    for version in [1, 2] {
+        let mut c = Client::spawn(
+            "failed",
+            &[
+                ("FAKE_TURN_ERROR_KIND", "environmentError"),
+                (
+                    "FAKE_TURN_ERROR_MESSAGE",
+                    "AWS credentials have expired; refresh the workspace AWS profile",
+                ),
+                ("FAKE_TURN_ERROR_RETRYABLE", "false"),
+            ],
+        );
+        let sid = c.new_session(version, "");
+        let id = c.prompt(&sid, "hi");
+        let frame = if version == 1 {
+            c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15))
+        } else {
+            c.wait_for("AWS credentials", Duration::from_secs(15))
+        };
+        assert!(
+            frame.contains("AWS credentials have expired")
+                && frame.contains("environmentError")
+                && frame.contains("workspace AWS profile"),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("Muse session expired") && !frame.contains("muse login"),
+            "{frame}"
+        );
+        if version == 1 {
+            assert!(frame.contains("\"code\":-32603"), "{frame}");
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn authentication_initialize_failure_has_external_login_guidance() {
+    let output = Command::new(adapter_bin())
+        .env("MUSE_CLI", fixture())
+        .env("FAKE_SCENARIO", "quiet")
+        .env("FAKE_ERROR_METHOD", "initialize")
+        .env("FAKE_ERROR_MESSAGE", "Not logged in: secret-sentinel")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run adapter");
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Muse is not authenticated") && stderr.contains("muse login"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("unreported") && stderr.contains(fixture_name()),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("secret-sentinel"), "{stderr}");
+}
+
+#[test]
+fn authentication_remains_external() {
+    let mut c = Client::spawn("quiet", &[]);
+    let id = c.req(
+        "initialize",
+        r#"{"protocolVersion":1,"clientCapabilities":{}}"#,
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"authMethods\":[]"), "{frame}");
+    let id = c.req("authenticate", r#"{"methodId":"login"}"#);
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32601") && frame.contains("muse login"),
+        "{frame}"
     );
     c.finish();
 }

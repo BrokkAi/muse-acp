@@ -534,7 +534,7 @@ fn v2_init() -> String {
 
 fn v1_init() -> String {
     format!(
-        r#"{{"protocolVersion":1,"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}},"fork":{{}},"subagents":{{}},"additionalDirectories":{{}}}},"_meta":{{"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
+        r#"{{"protocolVersion":1,"authMethods":[],"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}},"fork":{{}},"subagents":{{}},"additionalDirectories":{{}}}},"_meta":{{"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
         ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
     )
 }
@@ -587,6 +587,14 @@ fn same_workspace_root(left: &str, right: &str) -> bool {
         (Ok(left), Ok(right)) => left == right,
         _ => left == right,
     }
+}
+
+fn same_workspace_roots(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| same_workspace_root(a, b))
 }
 
 fn ignore_client_mcp_servers(params: Option<&J>) {
@@ -1467,7 +1475,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     if let Some(hint) = msp::session_profile_hint(&msg) {
                         text.push_str(&hint);
                     }
-                    acp::send_error(stdout, &id, -32603, &text);
+                    acp::send_error(stdout, &id, msp::acp_error_code(&e, -32603), &text);
                 }
             }
         }
@@ -1784,7 +1792,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     if let Some(hint) = msp::session_profile_hint(&msg) {
                         text.push_str(&hint);
                     }
-                    acp::send_error(stdout, &id, -32602, &text);
+                    acp::send_error(stdout, &id, msp::acp_error_code(&e, -32602), &text);
                 }
             }
         }
@@ -1991,7 +1999,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 Err(e) => acp::send_error(
                     stdout,
                     &id,
-                    -32602,
+                    msp::acp_error_code(&e, -32602),
                     &format!("fork failed: {}", err_message(&e)),
                 ),
             }
@@ -2107,7 +2115,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     Err(e) => acp::send_error(
                         stdout,
                         &id,
-                        -32603,
+                        msp::acp_error_code(&e, -32603),
                         &format!("session/compact failed: {}", err_message(&e)),
                     ),
                 }
@@ -2186,14 +2194,14 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         acp::send_error(
                             stdout,
                             &id,
-                            -32603,
+                            msp::acp_error_code(&e, -32603),
                             &format!("turn rejected: {}", err_message(&e)),
                         );
                     } else {
                         acp::send_error(
                             stdout,
                             &id,
-                            -32603,
+                            msp::acp_error_code(&e, -32603),
                             &friendly_turn_error("turn/start failed", &err_message(&e)),
                         );
                     }
@@ -2309,7 +2317,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     acp::send_error(
                         stdout,
                         &id,
-                        -32603,
+                        msp::acp_error_code(&error, -32603),
                         &friendly_turn_error("steering failed", &err_message(&error)),
                     );
                     return;
@@ -2512,7 +2520,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     // effective additional roots. Apply the same
                     // normalization to list filters so callers can reuse the
                     // accepted creation parameters.
-                    roots.retain(|root| root != &filter_root);
+                    roots.retain(|root| !same_workspace_root(root, &filter_root));
                     roots
                 }
                 Err(message) => {
@@ -2531,10 +2539,13 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .lock()
                 .unwrap()
                 .values()
-                .filter(|s| filter_root.is_empty() || s.cwd == filter_root)
+                .filter(|s| filter_root.is_empty() || same_workspace_root(&s.cwd, &filter_root))
                 .filter(|s| {
                     filter_additional.is_empty()
-                        || s.roots.get(1..).unwrap_or_default() == filter_additional
+                        || same_workspace_roots(
+                            s.roots.get(1..).unwrap_or_default(),
+                            &filter_additional,
+                        )
                 })
                 .map(|s| {
                     (
@@ -2597,6 +2608,10 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     );
                 }
                 Err(e) => {
+                    if msp::acp_error_code(&e, -32603) == -32000 {
+                        acp::send_error(stdout, &id, -32000, &err_message(&e));
+                        return;
+                    }
                     // A host listing hiccup must not hide live sessions.
                     log(&format!("session/list failed: {}", err_message(&e)));
                     let entries: Vec<String> = owned
@@ -2755,7 +2770,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 Err(e) => acp::send_error(
                     stdout,
                     &id,
-                    -32603,
+                    msp::acp_error_code(&e, -32603),
                     &format!("set failed: {}", err_message(&e)),
                 ),
             }
@@ -2816,7 +2831,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         Err(e) => acp::send_error(
                             stdout,
                             &id,
-                            -32603,
+                            msp::acp_error_code(&e, -32603),
                             &format!("set failed: {}", err_message(&e)),
                         ),
                     }
@@ -2881,7 +2896,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 Err(e) => acp::send_error(
                     stdout,
                     &id,
-                    -32603,
+                    msp::acp_error_code(&e, -32603),
                     &format!("set failed: {}", err_message(&e)),
                 ),
             }
@@ -2889,7 +2904,12 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
         "authenticate" | "auth/login" | "auth/logout" | "logout" => {
             // The host exposes no auth surface (authMethods is []); there is
             // nothing to log in to. muse credentials live outside ACP.
-            acp::send_error(stdout, &id, -32601, "method not supported by this agent");
+            acp::send_error(
+                stdout,
+                &id,
+                -32601,
+                "Muse authentication is managed outside ACP. Run `muse login` with the configured Muse executable on the machine and OS account running muse-acp, then restart the editor agent.",
+            );
         }
         "shutdown" | "exit" => {
             if method == "shutdown" {
@@ -3076,7 +3096,7 @@ fn extract_prompt_parts(
                         if uri.is_empty() {
                             return Err("resource_link block needs uri".to_string());
                         }
-                        let textual = mime.starts_with("text/") || looks_textual(uri);
+                        let textual = mime.starts_with("text/") || mime.is_empty() || looks_textual(uri);
                         let local_text = if textual {
                             local_file_text(uri, roots)?
                         } else {
@@ -3169,7 +3189,21 @@ fn file_uri_path(uri: &str, cwd: &str) -> Result<String, String> {
         }
         None => return Err(format!("bad file URI {uri}")),
     };
-    percent_decode(&path)
+    let decoded = percent_decode(&path)?;
+    // Local Windows file URIs spell drive paths as /C:/path. The leading
+    // URI slash is not part of the native absolute drive path.
+    if cfg!(windows)
+        && decoded.starts_with('/')
+        && decoded
+            .as_bytes()
+            .get(1)
+            .is_some_and(u8::is_ascii_alphabetic)
+        && decoded.as_bytes().get(2) == Some(&b':')
+        && decoded.as_bytes().get(3) == Some(&b'/')
+    {
+        return Ok(decoded[1..].to_string());
+    }
+    Ok(decoded)
 }
 
 fn percent_decode(s: &str) -> Result<String, String> {
@@ -3536,7 +3570,16 @@ fn handle_msp(
                 .get("terminal")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let terminal_detail = friendly_terminal_error(terminal, params);
+            let original_terminal_detail = friendly_terminal_error(terminal, params);
+            let error_kind = params
+                .get("error")
+                .and_then(|e| e.get("kind"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let auth_detail =
+                msp::turn_auth_diagnostic(&original_terminal_detail, error_kind, &host.handshake());
+            let auth_required = auth_detail.is_some();
+            let terminal_detail = auth_detail.unwrap_or(original_terminal_detail);
             log(&format!(
                 "turn/completed turn={turn_id} terminal={terminal} detail={terminal_detail}"
             ));
@@ -3602,7 +3645,12 @@ fn handle_msp(
                                 &format!("{{\"stopReason\":\"{stop}\"{usage}}}"),
                             );
                         } else {
-                            acp::send_error(stdout, &Some(req_id), -32603, &terminal_detail);
+                            acp::send_error(
+                                stdout,
+                                &Some(req_id),
+                                if auth_required { -32000 } else { -32603 },
+                                &terminal_detail,
+                            );
                         }
                     }
                 } else {
@@ -4936,6 +4984,24 @@ mod tests {
             );
         }
         assert!(!env_flag_enabled(None));
+    }
+
+    #[test]
+    fn local_file_uris_preserve_platform_absolute_paths() {
+        assert_eq!(
+            super::file_uri_path("file:///tmp/sp%20ace.txt", "/").unwrap(),
+            "/tmp/sp ace.txt"
+        );
+        let drive = super::file_uri_path("file:///C:/workspace/sp%20ace.txt", "/").unwrap();
+        assert_eq!(
+            drive,
+            if cfg!(windows) {
+                "C:/workspace/sp ace.txt"
+            } else {
+                "/C:/workspace/sp ace.txt"
+            }
+        );
+        assert!(super::file_uri_path("file://remote/share/file.txt", "/").is_err());
     }
 
     #[test]

@@ -857,6 +857,11 @@ def main():
                     send({"jsonrpc": "2.0", "id": ident,
                           "error": {"code": -32603, "message": "catalog unavailable"}})
                     continue
+                if method == os.environ.get("FAKE_ERROR_METHOD"):
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32603,
+                                    "message": os.environ["FAKE_ERROR_MESSAGE"]}})
+                    continue
                 if (method == "session/start"
                         and os.environ.get("FAKE_START_ERROR", "") == "profile"):
                     # Mirrors the live 1.2.1 refusal when the user's default
