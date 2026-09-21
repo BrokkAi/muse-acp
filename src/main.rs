@@ -1312,6 +1312,7 @@ fn support_bundle() -> i32 {
 /// A prompt whose turn vanished from the folded state is settled `cancelled`
 /// with a log line — never left hanging and never reported as success.
 fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str, r: &J) {
+    let mut active_ids = std::collections::HashSet::new();
     let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
     if let Some(active) = r
         .get("session")
@@ -1319,12 +1320,14 @@ fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
         .and_then(|v| v.as_str())
         && !active.is_empty()
     {
+        active_ids.insert(active.to_string());
         known.insert(active.to_string());
     }
     if let Some(state) = snapshot_state(r) {
         if let Some(turn) = state.get("activeTurn").and_then(|t| t.get("turnId"))
             && let Some(id) = turn.as_str().filter(|s| !s.is_empty())
         {
+            active_ids.insert(id.to_string());
             known.insert(id.to_string());
         }
         if let Some(J::Arr(queued)) = state.get("queuedTurns") {
@@ -1345,7 +1348,10 @@ fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
             Some(sess) => {
                 let mut settled = Vec::new();
                 let mut kept = Vec::new();
-                for f in sess.in_flight.drain(..) {
+                for mut f in sess.in_flight.drain(..) {
+                    if active_ids.contains(&f.msp_turn) {
+                        f.queued = false;
+                    }
                     if known.contains(&f.msp_turn) {
                         kept.push(f);
                     } else {
@@ -2914,6 +2920,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         s.in_flight.push(InFlight {
                             msp_turn: turn.clone(),
                             req_id: id.clone().unwrap_or(J::Null),
+                            queued: !started,
                             file_report: report_request.map(new_file_report),
                         });
                         if started {
@@ -3234,6 +3241,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 s.in_flight.push(InFlight {
                     msp_turn: turn,
                     req_id: J::Null,
+                    queued: false,
                     file_report: None,
                 });
             }
@@ -3367,6 +3375,61 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             // A feedback form belongs to the cancelled turn. End it locally
             // so a late form response cannot decide a newer host state.
             invalidate_pending_approval(stdout, sessions, &sid, None, true);
+        }
+        "$/cancel_request" => {
+            // ACP cancellation is scoped to the original request id. A
+            // queued session/prompt can be reclaimed without disturbing the
+            // running turn or any other queued prompts.
+            let Some(request_id) = params.as_ref().and_then(|p| p.get("requestId")) else {
+                log("$/cancel_request ignored: missing requestId");
+                return;
+            };
+            if !matches!(request_id, J::Null | J::Num(_) | J::Str(_)) {
+                log("$/cancel_request ignored: requestId is not a JSON-RPC id");
+                return;
+            }
+            let request_text = j_to_string(request_id);
+            let target = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .values()
+                .find_map(|s| {
+                    s.in_flight
+                        .iter()
+                        .find(|f| j_to_string(&f.req_id) == request_text)
+                        .map(|f| (s.msp_sid.clone(), f.msp_turn.clone(), f.queued))
+                });
+            let Some((msp_sid, turn_id, queued)) = target else {
+                // The ACP request may already have settled; protocol-level
+                // cancellation for an unknown request is intentionally quiet.
+                return;
+            };
+            if !queued {
+                // Once launched, this gesture must not silently become a
+                // stop. The original prompt remains governed by its terminal.
+                log(&format!(
+                    "$/cancel_request rejected: request {request_text} targets launched turn {turn_id}; use session/cancel to stop it"
+                ));
+                return;
+            }
+            let cmd = host.mint_cmd("cmd-");
+            match host.command(
+                "turn/unqueue",
+                &format!(
+                    "{{\"commandId\":{},\"sessionId\":{},\"turnId\":{}}}",
+                    esc(&cmd),
+                    esc(&msp_sid),
+                    esc(&turn_id)
+                ),
+            ) {
+                Ok(_) => log(&format!(
+                    "$/cancel_request reclaimed queued turn {turn_id} for request {request_text}"
+                )),
+                Err(e) => log(&format!(
+                    "$/cancel_request could not reclaim queued turn {turn_id}: {}",
+                    err_message(&e)
+                )),
+            }
         }
         "session/list" => {
             // Sessions are durable in the host: list them there so existing
@@ -4827,6 +4890,9 @@ fn handle_msp(
                     .get_mut(&acp_sid)
             {
                 s.active_turn = Some(turn_id.to_string());
+                if let Some(f) = s.in_flight.iter_mut().find(|f| f.msp_turn == turn_id) {
+                    f.queued = false;
+                }
             }
             log(&format!("turn/started turn={turn_id} sess={msp_sid}"));
         }

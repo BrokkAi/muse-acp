@@ -19,6 +19,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   questions_multiple userInput/requested with multiple-selection options
   questions_resume reissue a pending question after both attach and usage backfill
   queued       1st turn/start: silence; 2nd: completed(TURN_1), completed(TURN_2)
+  cancel_request 1st turn runs; later turns queue until one is reclaimed
   unqueued     turn/unqueued for the turn (never runs)
   retracted    turn/retracted for the turn (no completion follows)
   retract_then_completed retract, then a late turn/completed (settle once)
@@ -637,6 +638,11 @@ def on_turn_start(params):
             notify("turn/completed", {"sessionId": MSP_SID,
                                      "turnId": "turn-2",
                                      "terminal": "completed"})
+    elif SCENARIO == "cancel_request":
+        # Leave the running turn and all queued turns open. The test drives
+        # the targeted reclaim, then uses session/cancel to clean up the
+        # remaining turns and prove they were left alone.
+        pass
     elif SCENARIO == "unqueued":
         notify("turn/unqueued", dict(base))
     elif SCENARIO == "retracted":
@@ -792,7 +798,7 @@ def on_turn_start(params):
     disposition = (
         "queued"
         if SCENARIO == "deferred_launch_error"
-        or (SCENARIO == "queued" and TURNS[0] > 1)
+        or (SCENARIO in ("queued", "cancel_request") and TURNS[0] > 1)
         else "started"
     )
     return {
@@ -920,6 +926,8 @@ def result_for(method, msg):
                      "viewCursor": "cur-8"}]
         workspace_root = "/tmp" if SCENARIO == "resume_active" else None
         session = session_obj(params.get("sessionId", MSP_SID), workspace_root)
+        if SCENARIO == "cancel_request" and os.environ.get("FAKE_RESUME_QUEUED"):
+            session["activeTurnId"] = "turn-2"
         if SCENARIO == "rename_resume":
             session["name"] = "Renamed outside adapter"
         elif SCENARIO == "rename_clear":
@@ -1012,6 +1020,20 @@ def result_for(method, msg):
         params = msg.get("params", {})
         log_input(params)
         return on_turn_start(params)
+    if method == "turn/unqueue":
+        params = msg.get("params", {})
+        log_input(params)
+        if SCENARIO == "cancel_request":
+            notify("turn/unqueued", {
+                "sessionId": MSP_SID,
+                "turnId": params.get("turnId", ""),
+                "commandId": params.get("turnId", ""),
+            })
+        return {
+            "commandId": params.get("commandId", ""),
+            "status": "accepted",
+            "turnId": params.get("turnId", ""),
+        }
     if method == "session/read":
         read_params = msg.get("params", {})
         log_input(read_params)
