@@ -188,6 +188,10 @@ impl SessionFold {
             .map(String::as_str)
     }
 
+    pub fn has_active_item(&self, item_id: &str) -> bool {
+        self.items.contains_key(item_id)
+    }
+
     fn known(&self, item_id: &str) -> bool {
         self.done.contains(item_id)
     }
@@ -595,6 +599,7 @@ impl SessionFold {
         let Some(state) = Self::async_task_state(item) else {
             return;
         };
+        self.async_task_msp_ids.remove(task_id);
         if self
             .async_task_states
             .get(task_id)
