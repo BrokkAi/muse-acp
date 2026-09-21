@@ -2,8 +2,9 @@
 //!
 //! Skipped unless `MUSE_ACP_LIVE_HOST=1` is set, so CI stays hermetic. When
 //! enabled, it drives one real `muse serve` through the adapter's handshake
-//! and session lifecycle. Authentication is required; failures here mean the
-//! host, auth, or protocol drifted — not a flaky unit test.
+//! and session lifecycle, then completes one full turn. Authentication is
+//! required; failures here mean the host, auth, or protocol drifted — not a
+//! flaky unit test.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
@@ -18,6 +19,7 @@ struct LiveClient {
     child: std::process::Child,
     stdin: std::process::ChildStdin,
     frames: Arc<Mutex<Vec<String>>>,
+    logs: Arc<Mutex<Vec<String>>>,
     next_id: u64,
     #[allow(dead_code)]
     _dir: std::path::PathBuf,
@@ -37,12 +39,14 @@ impl LiveClient {
         let mut child = Command::new(adapter_bin())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .expect("spawn adapter against real host");
         let stdin = child.stdin.take().expect("stdin");
         let stdout = child.stdout.take().expect("stdout");
+        let stderr = child.stderr.take().expect("stderr");
         let frames: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let writer = frames.clone();
         std::thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
@@ -60,10 +64,29 @@ impl LiveClient {
                 }
             }
         });
+        let log_writer = logs.clone();
+        std::thread::spawn(move || {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let t = line.trim();
+                        if !t.is_empty() {
+                            eprintln!("{t}");
+                            log_writer.lock().unwrap().push(t.to_string());
+                        }
+                    }
+                }
+            }
+        });
         Self {
             child,
             stdin,
             frames,
+            logs,
             next_id: 1,
             // keep the workspace alive for the session lifetime
             _dir: dir,
@@ -100,6 +123,26 @@ impl LiveClient {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+
+    fn wait_log(&self, want: &str, timeout: Duration) -> String {
+        let start = std::time::Instant::now();
+        loop {
+            if let Some(line) = self
+                .logs
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|line| line.contains(want))
+                .cloned()
+            {
+                return line;
+            }
+            if start.elapsed() > timeout {
+                panic!("adapter never logged {want:?}");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 
 #[test]
@@ -128,6 +171,25 @@ fn live_host_smoke() {
         .and_then(|rest| rest.split('"').next())
         .expect("sessionId")
         .to_string();
+
+    let id = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"Reply with exactly: ready.\"}}]}}"
+        ),
+    );
+    let accepted = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(30));
+    assert!(
+        accepted.contains("\"result\""),
+        "session/prompt failed: {accepted}"
+    );
+    let completed = c.wait_for("\"stopReason\":\"end_turn\"", Duration::from_secs(90));
+    assert!(
+        completed.contains("\"sessionUpdate\":\"state_update\""),
+        "full turn did not settle through v2 state_update: {completed}"
+    );
+    c.wait_log("turn/completed", Duration::from_secs(90));
+    c.wait_log("terminal=completed", Duration::from_secs(1));
 
     let id = c.req("session/close", &format!("{{\"sessionId\":\"{sid}\"}}"));
     let closed = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(30));

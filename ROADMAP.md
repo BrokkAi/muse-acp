@@ -78,7 +78,15 @@ the verdict into richer support bundles.
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
   bundle via the binary's own `muse schema` export, plus a live 1.2.1
-  handshake, session lifecycle, and full turn). Transcript fixtures
+  handshake, session lifecycle, and full turn). Host 1.3.0 reports
+  `sha256:ab69549a7ebb423fce94068762da0b5ff3cdec1f8fc263dcc17248eda117f852`
+  (schema version 1; stable surface verified additive against the vendored
+  bundle, with a live handshake and session lifecycle smoke test). Host
+  builds may expose more than one stable-surface fingerprint under the same
+  release label: Muse 1.3.0-R3401.1 reports
+  `sha256:7469c9e352e67def4a59df7e439984d7194fa351e1c8b7abb34060fd977ced81`
+  (schema version 1; live handshake, session lifecycle, and full turn
+  verified). Transcript fixtures
   intentionally carry their own
   fingerprint (`sha256:c8d1a2a1866814e220fd396d382a9a75861412feee884b5021b2ee359bd3dc59`)
   and must not be conflated with either surface.
@@ -266,14 +274,16 @@ and browserless-login guidance.
 
 ### 7. Explicit client MCP policy
 
-Client MCP configuration is currently tolerated but not forwarded. This should
-be an explicit product decision.
+Client MCP configuration is tolerated but not forwarded under the explicit
+policy below.
 
 Status: **policy decided and documented.** Client MCP servers are tolerated
-but never forwarded: Muse owns the tool runtime, approvals, and sandbox, and
-MSP v1 exposes no foreign-tool registration. Every drop is logged, the README
-states the policy and its reasoning, and forwarding stays a non-goal until MSP
-offers a path that cannot widen permissions.
+but never forwarded. MSP 1.3.0 now exposes typed native session configuration
+(`SessionConfig.mcpServers`, gated by `sessionMcp`), but that wire surface does
+not by itself prove an ACP-to-Muse authorization, workspace-confinement, or
+lifecycle mapping. Every drop is logged, the README states the revised
+reasoning, and forwarding stays a non-goal until those guarantees are
+host-backed and tested.
 
 **Work items**
 
@@ -319,6 +329,13 @@ local-read confinement.
 Publish a full MSP-to-ACP event matrix so ignored and unsupported notifications
 are intentional.
 
+Status: **implemented.** The authoritative
+[`docs/event-compatibility.md`](docs/event-compatibility.md) matrix classifies
+every notification in the pinned stable schema, observed host extras, and the
+two supported server-initiated requests. A corpus test compares the published
+notification rows to the schema index exactly, so additive or removed schema
+events require an explicit documentation decision before CI passes.
+
 **Initial matrix rows**
 
 - `initialized`
@@ -329,6 +346,7 @@ are intentional.
 - `session/branchChanged`
 - `session/modelChanged`
 - `session/approvalModeChanged`
+- `session/statusChanged`
 - `turn/started`
 - `turn/unqueued`
 - `turn/retryScheduled`
@@ -347,6 +365,8 @@ are intentional.
 - `userInput/settled`
 - `session/contextUsage`
 - `session/tokenUsage`
+- `usage/read` (host query; mapped to `_meta.museSubscriptionUsage`)
+- `usage/changed` (host-global notification; mapped to `_meta.museSubscriptionUsage`)
 
 `approval/request` and `userInput/request` are server-initiated *requests*, not
 notifications; list them in a separate section with their response policy.
@@ -355,12 +375,80 @@ notifications; list them in a separate section with their response policy.
 Each row should state whether the event is consumed, mapped to ACP, internally
 tracked, intentionally ignored, or unsupported pending a protocol decision.
 
+`session/statusChanged` is **mapped to ACP and internally tracked**. The
+adapter seeds the same `(status, attention)` projection from each returned
+`Session`, publishes it in `session_info_update._meta.muse`, and emits the
+standard v2 running/idle state for known load states or `requires_action` when
+an attention flag is present. `approvalPending` and `inputPending` target
+`approval/listPending` reconciliation; an explicit clear stops stale request
+reconciliation. Unknown open status values use the generic
+`unknown` projection and unknown attention flags are ignored. Its required
+nullable `viewCursor` is adopted only when it is a string, preserving the last
+usable cursor for the unload fold-failure arm.
+
+**Muse Code 1.3.0 stable-surface additions**
+
+The pinned schema bundle predates the Muse 1.3.0 additions, so this inventory is
+kept beside the notification rows until the bundle is re-pinned. A disposition
+of **Unsupported pending protocol decision** means the adapter does not send or
+surface the entry yet; the linked issue is the planned follow-up. Incoming
+notifications with that disposition remain safe because the notification
+fold's unknown-method path logs and continues.
+
+<!-- msp-1.3.0-matrix:start -->
+| MSP addition | Disposition | Adapter behavior or tracking |
+| --- | --- | --- |
+| `goal/clear` | Unsupported pending protocol decision | Goal control needs an ACP affordance and wake semantics; tracked by [#45](https://github.com/BrokkAi/muse-acp/issues/45). |
+| `goal/edit` | Unsupported pending protocol decision | Goal control needs an ACP affordance and wake semantics; tracked by [#45](https://github.com/BrokkAi/muse-acp/issues/45). |
+| `goal/pause` | Unsupported pending protocol decision | Goal control needs an ACP affordance and wake semantics; tracked by [#45](https://github.com/BrokkAi/muse-acp/issues/45). |
+| `goal/resume` | Unsupported pending protocol decision | Goal control needs an ACP affordance and wake semantics; tracked by [#45](https://github.com/BrokkAi/muse-acp/issues/45). |
+| `goal/set` | Unsupported pending protocol decision | Goal control needs an ACP affordance and wake semantics; tracked by [#45](https://github.com/BrokkAi/muse-acp/issues/45). |
+| `item/readOutput` | Unsupported pending protocol decision | The adapter has no ACP fetch-through surface for host-stored output; tracked by [#39](https://github.com/BrokkAi/muse-acp/issues/39). |
+| `session/rename` | Unsupported pending protocol decision | Rename needs an ACP surface and host-authored title handling; tracked by [#41](https://github.com/BrokkAi/muse-acp/issues/41). |
+| `session/setReasoningEffort` | Unsupported pending protocol decision | Session defaults need to be reconciled with per-turn overrides; tracked by [#42](https://github.com/BrokkAi/muse-acp/issues/42). |
+| `skill/list` | Unsupported pending protocol decision | Native skill discovery and turn parts are deferred; tracked by [#40](https://github.com/BrokkAi/muse-acp/issues/40). |
+| `task/background` | Unsupported pending protocol decision | The adapter observes backgrounded items but does not issue the host control command; tracked by [#38](https://github.com/BrokkAi/muse-acp/issues/38). |
+| `task/stop` | Unsupported pending protocol decision | Async-task stop must be mapped to host admission and terminal item events; tracked by [#38](https://github.com/BrokkAi/muse-acp/issues/38). |
+| `task/stopAll` | Unsupported pending protocol decision | Async-task stop must be mapped to host admission and terminal item events; tracked by [#38](https://github.com/BrokkAi/muse-acp/issues/38). |
+| `usage/read` | Unsupported pending protocol decision | Subscription usage needs a labeled ACP presentation distinct from cost estimates; tracked by [#43](https://github.com/BrokkAi/muse-acp/issues/43). |
+| `view/subscribe` | Unsupported pending protocol decision | Explicit cursor re-attach needs gap and duplicate-replay coverage; tracked by [#44](https://github.com/BrokkAi/muse-acp/issues/44). |
+| `workflow/cancel` | Unsupported pending protocol decision | Workflow control must settle from subsequent view events; tracked by [#46](https://github.com/BrokkAi/muse-acp/issues/46). |
+| `workflow/childControl` | Unsupported pending protocol decision | Child skip/retry needs an ACP affordance and admission-only handling; tracked by [#46](https://github.com/BrokkAi/muse-acp/issues/46). |
+| `session/modelRouteUnserved` | Intentionally ignored | No ACP mapping or adapter state exists for a host routing observation; the unknown-notification path retains a diagnostic. |
+| `session/nameChanged` | Unsupported pending protocol decision | Host-authored names must flow into session information; tracked by [#41](https://github.com/BrokkAi/muse-acp/issues/41) and [#67](https://github.com/BrokkAi/muse-acp/issues/67). |
+| `session/reasoningEffortChanged` | Unsupported pending protocol decision | The session default must be folded and restored without overriding per-turn choices; tracked by [#42](https://github.com/BrokkAi/muse-acp/issues/42). |
+| `session/statusChanged` | Unsupported pending protocol decision | Status and attention flags need per-session tracking and an ACP presentation; tracked by [#68](https://github.com/BrokkAi/muse-acp/issues/68). |
+| `session/viewHealthChanged` | Unsupported pending protocol decision | View availability needs a diagnosable reconnect disposition; tracked by [#44](https://github.com/BrokkAi/muse-acp/issues/44). |
+| `skill/changed` | Unsupported pending protocol decision | A change should refresh the native skill catalog; tracked by [#40](https://github.com/BrokkAi/muse-acp/issues/40). |
+| `usage/changed` | Unsupported pending protocol decision | A change should refresh host-observed subscription usage; tracked by [#43](https://github.com/BrokkAi/muse-acp/issues/43). |
+| `skillNotFound` | Unsupported pending protocol decision | Native selector errors will be surfaced with their typed data when skill support lands; tracked by [#40](https://github.com/BrokkAi/muse-acp/issues/40). |
+| `outputUnavailable` | Unsupported pending protocol decision | Stored-output availability details will be surfaced by fetch-through; tracked by [#39](https://github.com/BrokkAi/muse-acp/issues/39). |
+
+Muse 1.3.0 also publishes a top-level `requests` index. Both entries are
+deliberate server-initiated request paths and return the empty `RequestReceipt`
+object already used by the adapter:
+
+| MSP request | Disposition | Response and ACP behavior |
+| --- | --- | --- |
+| `approval/request` | Mapped to ACP | Reply `{}` as the `RequestReceipt`, then open the deny-safe `session/request_permission` flow. |
+| `userInput/request` | Mapped to ACP | Reply `{}` as the `RequestReceipt`, then open ACP form elicitation or cancel safely when the client lacks that capability. |
+<!-- msp-1.3.0-matrix:end -->
+
+The request index has no additional unhandled entries. Unknown future request
+methods still receive the typed MSP `methodNotFound` response in the reader
+path, preserving the fail-closed policy from §4.
+
 **Acceptance criteria**
 
 - Every schema notification has a documented disposition.
 - CI checks that new schema notifications require an explicit matrix decision.
 - The matrix distinguishes published notifications, host-emitted extras, and
   server-initiated requests.
+- Every Muse 1.3.0 method, notification, error kind, and request entry has a
+  recorded disposition; unsupported adapter surfaces link to their tracking
+  issue.
+- New notification names are tolerated before their follow-up support lands;
+  they are logged and do not terminate the adapter.
 
 ### 10. Truncation and large-output policy
 
@@ -372,8 +460,10 @@ Status: **implemented.** The output bound is configurable through
 both the human `…[truncated]` marker and machine-readable
 `_meta.muse.truncated` with `source`, `originalChars`, and `retainedChars`,
 and a host-saturated surface reports `source: "host"` without claiming an
-adapter cut. Remaining work: head+tail retention and `item/readOutput`
-fetch-through for `outputRef`.
+adapter cut. Negotiated clients can fetch stored bytes through the
+`_session/readOutput` adapter extension, which forwards `item/readOutput` byte
+ranges and preserves typed `outputUnavailable` data. Remaining work:
+head+tail retention.
 
 **Work items**
 
@@ -381,6 +471,10 @@ fetch-through for `outputRef`.
   `item.truncated` marks a saturated streamed surface (`agentMessage.text`,
   `reasoning.summary[*]`, `toolCall/userShell.visibleOutput`), and
   `outputRef` names stored output that can be fetched via `item/readOutput`.
+- Preserve `itemId`, `outputRef`, `patchRef`, and edit-family `patchSummary` on
+  tool cards so clients can identify and retrieve the durable surface.
+- Keep fetch-through behind explicit `_meta.muse.capabilities: ["readOutput"]`
+  negotiation; return the host's `-32041 outputUnavailable` facts distinctly.
 - Add visible truncation metadata and original/retained length.
 - Make the limit configurable.
 - Consider preserving both head and tail for logs and errors.
@@ -391,6 +485,8 @@ fetch-through for `outputRef`.
 **Acceptance criteria**
 
 - Editors can show that output was shortened.
+- A client that negotiates `readOutput` can retrieve a saturated stored surface
+  by byte range, and can distinguish `outputUnavailable` from generic failure.
 - No truncation changes the apparent success or permission semantics of a tool
   call.
 
@@ -409,6 +505,17 @@ afterwards: the explicit estimate labeling (`cost.source: adapter-estimate`,
 the catalog `cached` rate (clamped to prompt tokens, from the per-completion
 `usage.cachedTokens` the host already reports).
 
+Muse 1.3.0 subscription usage is **mapped to ACP**. The adapter queries
+`usage/read` when a session is attached and adopts `usage/changed` as a
+host-global observation for every attached session. It carries the raw
+`SubscriptionUsage` object in `_meta.museSubscriptionUsage`, labeled
+`source: msp-host-observation` and `billing: false`, so the `observedAtMs`,
+tier, 5h-class window, and weekly block cannot be mistaken for the adapter's
+token estimate or for billing. The adapter preserves truthful absence, emits
+the observation alongside `usage_update` when ACP context usage is available,
+and uses `session_info_update` when it is not; it never fabricates `used` or
+`size` values and never reprices replayed history.
+
 **Work items**
 
 - Keep host-provided context/cumulative usage separate from derived values.
@@ -416,6 +523,8 @@ the catalog `cached` rate (clamped to prompt tokens, from the per-completion
 - Omit numeric cost unless all required rate fields are available.
 - Preserve replay-once accounting.
 - Handle model catalog updates without resurrecting stale rates.
+- Surface host-observed subscription usage without merging it into token totals
+  or local cost estimates.
 - Document exclusions: historic completions, unavailable rates, cached-input
   differences, taxes/discounts, regional pricing, and actual billing.
 
@@ -458,6 +567,14 @@ surface.
 ### 13. Per-turn file-change report
 
 Provide an editor-friendly summary of files changed during a turn.
+
+Status: **implemented for authoritative native file tools.** After bilateral
+AIR v1 negotiation, a prompt-scoped request receives one correlated report at
+turn completion. Successful MSP `toolCall` records supply explicit paths;
+rejected calls are excluded, replayed item ids and paths are deduplicated, and
+shell or unknown tools make the report incomplete rather than causing path
+inference. Reports are path-only and bounded, so deletes and binary files do
+not require unsafe content reads.
 
 **Work items**
 
@@ -508,16 +625,24 @@ supplies no summary.
 
 Surface session-level state without corrupting prompt settlement.
 
-Status: **implemented (display plus settlement).** `session/goalChanged`
-(including explicit `null` clears) publishes the provider-neutral `_meta.goal`
-presentation on `session_info_update`; `session/branchChanged` publishes a
-namespaced branch observation; both are restored from the resume snapshot.
-`turn/retracted` settles the tracked prompt as cancelled (v1 result, v2 idle)
-and clears the active turn, so a late `turn/completed` finds nothing left to
-settle; `turn/retryScheduled` stays non-settling per schema (it never resolves
-a turn-wait) and records attempt facts in diagnostics. Race tests pin
-retract-then-completed and retry-then-completed settle-exactly-once.
-Goal control stays deferred (experimental upstream).
+Status: **implemented (display plus settlement); goal control is host-driven.**
+`session/goalChanged` (including explicit `null` clears) publishes the
+provider-neutral `_meta.goal` presentation on `session_info_update`;
+`session/branchChanged` publishes a namespaced branch observation; both are
+restored from the resume snapshot. `turn/retracted` settles the tracked prompt
+as cancelled (v1 result, v2 idle) and clears the active turn, so a late
+`turn/completed` finds nothing left to settle; `turn/retryScheduled` stays
+non-settling per schema (it never resolves a turn-wait) and records attempt
+facts in diagnostics. Race tests pin retract-then-completed and
+retry-then-completed settle-exactly-once.
+
+The stable MSP `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and
+`goal/clear` methods remain host/TUI controls. ACP has no standard negotiated
+goal-mutation capability, so the adapter does not invent an editor request
+surface or advertise one. Host-issued changes are still folded and published
+with MSP's wake gates intact: set/edit/resume may wake an idle unfinished goal,
+while pause/clear never wake. Revisit this decision if ACP gains a negotiated
+goal-control surface.
 
 **Work items**
 - Represent branch changes (`BranchState { branch, vcs, workspaceRoot }` from
@@ -528,10 +653,8 @@ Goal control stays deferred (experimental upstream).
   (`state.goal`) via `session_info_update`, mirroring the provider-neutral
   goal presentation `codex-acp` uses. Pass through out-of-contract statuses
   and >100 percentages without clamping.
-- Defer goal *control* (`goal/set|pause|resume|clear`): those methods are
-  absent from the stable v1 method index and masked in the transcript corpus,
-  i.e. experimental; revisit only when the adapter deliberately opts into
-  `experimentalApi`.
+- Keep goal control host-driven until ACP provides a negotiated goal-mutation
+  surface; do not route editor requests to MSP under an invented method.
 - ~~Ensure retry/retract notifications settle or supersede affected queued ACP
   prompts.~~
 - ~~Add race tests against terminal `turn/completed` events.~~
@@ -548,20 +671,21 @@ MSP v1 can represent this work: `session/userShell` (gated on the
 `visibleOutput`, and a null `turnId`; and a `toolCall` may be durably
 backgrounded (`background: true`, `backgroundInitiator: user|timeout`).
 
-Status: **AIR async tasks implemented (display-only).** After bilateral AIR
+Status: **AIR async tasks and MSP 1.3.0 task control implemented.** After bilateral AIR
 negotiation, backgrounded tool calls mark their command card
 (`_meta.jetbrains.air.asyncTasks.backgrounded`) and emit
 `async_task_spawned`/`async_task_state_update`; user-shell items map to their
-own shell tasks with exit facts settled from code/signal. `canStop` is
-honestly false and `_session/async_task/stop` fails explicitly because MSP v1
-publishes no stop primitive. Remaining work: the `userShell` host capability
-request, active-task reconciliation, and stop once MSP exposes one.
+own shell tasks with exit facts settled from code/signal. Durable resume folds
+restore active tasks without replaying old terminal work. `_session/async_task/stop`
+maps one AIR task to MSP `task/stop`, and `session/cancel` maps background work
+to `task/stopAll`; item terminal events remain authoritative. Remaining work:
+the `userShell` host capability request.
 
 **Work items**
 
 - Map backgrounded `toolCall`/`userShell` items to the AIR async-tasks
-  extension (spawned/state updates plus targeted stop) only after bilateral
-  capability negotiation, as `codex-acp` does.
+  extension (spawned/state updates plus targeted and blanket stop) only after
+  bilateral capability negotiation, as `codex-acp` does.
 - Request the `userShell` host capability only when an editor feature needs it,
   and never request it by default.
 - Surface `userShell` exit facts verbatim (code vs signal number); do not
@@ -583,18 +707,20 @@ MSP v1 publishes `subagent/sendMessage`, `subagent/followupTask`,
 `controlStatus`, `result`, and transitive `usage`; and the transcript corpus
 covers nested lifecycles, steering replay/rejection, and close round-trips.
 
-Status: **native sessions implemented (spawn/state/child replay).** After
-bilateral negotiation (canonical `subagents` capability or AIR's
+Status: **native sessions and controls implemented (spawn/state/child replay).**
+After bilateral negotiation (canonical `subagents` capability or AIR's
 `nativeSubagentSessions`), the adapter advertises the capability in both
 protocol versions, emits idempotent `subagent_spawned` announcements with MSP
 provenance and `subagent_state_update` terminals (`completed`/`failed`/
 `cancelled`/`disconnected` for recovery states), and replays the child
 transcript onto the child session id through one `session/read` drill-down.
-Without negotiation the legacy tool cards remain. Legacy visibility:
-as synthetic tool cards (`agent: objective` titles, result summaries, child
-state lines) carrying `subagentId`, `childSessionId`, `controlStatus`, and
-run provenance in `_meta.muse`, so no child work is silently dropped. Native
-ACP subagent sessions and `subagent/*` controls remain the open work.
+The eight `subagent/*` controls forward the caller's command id through the
+observed owner session, with lifecycle admission and generic item status
+checks that fail closed. Without negotiation the legacy tool cards remain.
+Legacy visibility: as synthetic tool cards (`agent: objective` titles, result
+summaries, child state lines) carrying `subagentId`, `childSessionId`,
+`controlStatus`, and run provenance in `_meta.muse`, so no child work is
+silently dropped.
 
 **Work items**
 
@@ -800,13 +926,14 @@ literals.
 
 Keep editor installation conservative while expanding supported environments.
 
-Status: **atomic writes and rollback implemented.** Editor settings are
+Status: **implemented.** Editor settings are
 replaced through a same-directory temp file plus rename, failed writes roll
 back to the pre-edit content (with the `.bak` path named if rollback itself
 fails), and a test pins that no temp files leak. Comment/sibling preservation,
 idempotency, and existing-file shapes were already covered; the README states
-the macOS/Linux installer scope and the Windows manual path. Remaining work:
-Windows installer automation when Muse supports it.
+the supported OS/architecture/runtime matrix. Releases publish checksum-
+verifying `install.sh` and `install.ps1` installers for the Unix targets and
+Windows x86_64 MSVC target.
 
 **Work items**
 

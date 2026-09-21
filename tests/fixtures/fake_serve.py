@@ -10,18 +10,36 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   happy        agentMessage completion, then turn/completed(completed)
   failed       no message, then turn/completed(failed)
   tool         toolCall completion with result text, then completed
+  file_changes successful native file tools, including a replayed completion
+  file_changes_ambiguous a shell tool whose writes cannot be inferred safely
   approval     approval/requested notification (two choices), then completed
   approval_req approval/request server-initiated REQUEST (no notification)
+  approval_hang stays pending after the approval so client decisions can be tested
   questions    userInput/requested with options, then completed
+  questions_multiple userInput/requested with multiple-selection options
   questions_resume reissue a pending question after both attach and usage backfill
   queued       1st turn/start: silence; 2nd: completed(TURN_1), completed(TURN_2)
+  cancel_request 1st turn runs; later turns queue until one is reclaimed
   unqueued     turn/unqueued for the turn (never runs)
   retracted    turn/retracted for the turn (no completion follows)
   retract_then_completed retract, then a late turn/completed (settle once)
   retry_then_completed turn/retryScheduled, then a normal completion
+  deferred_launch_error queued admission followed by a launchError terminal
   quiet        turn/start answers only; nothing follows (for close/cancel)
+  subagent_control live native child; FAKE_SUBAGENT_CONTROL_STATUS selects its state
+  subagent_child_approval child approval without displayable choices
+  host_exit_classified exit after a turn/start ack with FAKE_HOST_EXIT_CODE
+  host_exit_before_ack exit before a turn/start admission response
+  host_exit_relaunch_unavailable first exit is retryable, replacement exits 5
+  support_exit stdin-free serve probe writes stderr and exits with a code
+  workflow_control live workflow; workflow/cancel emits the later item/turn views
+  skills_changed skill/list changes after a skill/changed notification
+  skill_not_found turn/start rejects the native skill selector
+  async_task_stop       background task then a targeted task/stop terminal
+  async_task_stop_all   background tasks then task/stopAll terminals
   load         session/resume serves inline history (for session/load replay)
   resume_active session/resume reports a running turn (for steering reattach)
+  async_resume session/resume reports running background work
   catalog_grows model/list expands after the first snapshot
   catalog_refresh_failure valid catalog, malformed response, RPC error, empty catalog
   usage_turn   two model legs from two models plus a replayed leg, one turn
@@ -32,6 +50,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_rates_invalid ... then a refresh whose rates do not parse
   usage_rates_failure ... then a FAILED refresh (rates must survive)
   usage_resume session/resume serves an anchoredSnapshot carrying usage
+  reasoning_resume session/resume restores a standing reasoning default
+  reasoning_legacy rejects the 1.3.0 session-default method
   usage_snapshot_null snapshot whose contextUsage is null (the common shape)
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
@@ -39,6 +59,29 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   session_list_stream grants sessionListStream and emits row replace/close events
   session_list_stream_denied sends the notification without granting the capability
   session_list_pagination returns a second page when its cursor is forwarded
+  status_flags   session/statusChanged status, attention, open-enum, and null
+                 viewCursor handling
+  session_metadata host-authored title candidates, branch/attention metadata,
+                   and a live session/nameChanged notification
+  session_list_workspace_filter return no host sessions for an unmatched root
+  session_list_pagination two-page session/list response keyed by its cursor
+  view_subscribe_gap session/resume requires explicit cursor replay; the host
+               sends the replayed item twice to verify adapter deduplication
+  view_health     emits an unavailable live-view health notification
+  subscription_usage  usage/read returns the host snapshot and usage/changed
+                      sends a changed subscription observation
+  subscription_first_observation  usage/read is absent before the first
+                                  usage/changed notification
+  rename_live  session/nameChanged updates a connected session
+  rename_resume Session.name changes between start and resume
+  rename_snapshot SnapshotState.name is the only name on resume
+  rename_clear  resume reports a null name and must clear a stale title
+  rename_list   session/list exposes the authoritative session name
+  tool_stored_output tool result with outputRef/patchRef metadata
+  tool_output_unavailable outputRef exists but item/readOutput fails
+  close_stdin  closes the host's stdin after initialization, then exits
+  stdout_close_stays_alive closes stdout but keeps the child alive briefly
+  stderr_flood writes enough stderr to require a concurrent drain
 """
 import json
 import os
@@ -56,6 +99,12 @@ FOLDED_MODE = os.environ.get("FAKE_FOLDED_MODE", "")
 LOG = os.environ.get("FAKE_LOG", "")
 TURNS = [0]
 CATALOG_READS = [0]
+# The adapter's MSP initialize posture determines whether the host should
+# create a user-input request. An explicit override exercises the backstop for
+# hosts that predate userInputDialogs or ignore it.
+USER_INPUT_DIALOGS = [True]
+USAGE_READS = [0]
+SKILL_READS = [0]
 
 # Compatibility-diagnostics knobs: the fixture defaults to the validated
 # host shape, but tests can present an unknown fingerprint or a future
@@ -90,6 +139,10 @@ if os.environ.get("FAKE_APPROVAL", "") == "all-approve":
     ]
 if os.environ.get("FAKE_APPROVAL_CHOICES", "") == "empty":
     APPROVAL_PARAMS["availableChoices"] = []
+if os.environ.get("FAKE_APPROVAL_FEEDBACK", "") == "deny":
+    for choice in APPROVAL_PARAMS["availableChoices"]:
+        if choice.get("decision") == "denied":
+            choice["acceptsFeedback"] = True
 
 
 def log_method(method):
@@ -123,19 +176,47 @@ def turn_id():
 # started on the forked session complete on the forked session.
 ACTIVE_SESSION = [MSP_SID]
 CRASH_AFTER_ACK = [False]
+WORKFLOW_TURN = [""]
 
 
-def session_obj(session_id=None, workspace_root="/tmp/fake-ws"):
+ACTIVE_WORKSPACE = ["/tmp/fake-ws"]
+
+
+def session_obj(session_id=None, workspace_root=None):
     if session_id is None:
         session_id = ACTIVE_SESSION[0]
-    row = {"sessionId": session_id, "modelId": "fake-model",
-            "workspaceRoot": workspace_root,
-            "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
-            "approvalMode": {"lastCommandId": None, "mode": MODE,
-                             "source": "serverDefault"}}
-    if SCENARIO == "session_list_stream":
-        row["title"] = "Initial title"
-    return row
+    if workspace_root is None:
+        workspace_root = ACTIVE_WORKSPACE[0]
+    session = {"sessionId": session_id, "modelId": "fake-model",
+               "workspaceRoot": workspace_root,
+               "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
+               "approvalMode": {"lastCommandId": None, "mode": MODE,
+                                "source": "serverDefault"}}
+    if SCENARIO == "status_flags":
+        session.update({"status": "running",
+                        "attention": ["approvalPending", "futureAttention"]})
+    if SCENARIO == "session_metadata":
+        if session_id == MSP_SID:
+            session.update({
+                "name": "Host session name",
+                "title": "Host session title",
+                "firstUserPrompt": "Host first prompt",
+                "branch": {"branch": "feat/metadata", "vcs": "git",
+                            "workspaceRoot": workspace_root},
+                "attention": "needs-review",
+            })
+        elif session_id == "msp-sess-old":
+            session.update({
+                "title": "Host title fallback",
+                "firstUserPrompt": "Host old first prompt",
+            })
+        elif session_id == "msp-sess-untitled":
+            session["firstUserPrompt"] = "Host first prompt fallback"
+    if SCENARIO == "rename_list":
+        session["name"] = "Listed name"
+    if SCENARIO == "session_list_stream" and session_id == MSP_SID:
+        session["title"] = "Initial title"
+    return session
 
 
 def history_items():
@@ -168,6 +249,18 @@ def context_usage(used, cursor):
             "sourceRange": {"start": 0, "end": int(cursor.split("-")[1])}}
 
 
+def subscription_usage(window_percent, weekly_percent, observed_at=1754590990000):
+    return {
+        "observedAtMs": observed_at,
+        "tier": "pro",
+        "window": {"resetsAtMs": 1754608990000,
+                    "usedPercent": window_percent,
+                    "windowDurationMins": 300},
+        "weekly": {"resetsAtMs": 1755200000000,
+                    "usedPercent": weekly_percent},
+    }
+
+
 def usage_snapshot_history(context=True, cumulative=(100, 20)):
     """anchoredSnapshot history whose state already knows the usage. MSP
     serves `contextUsage` as null until the fold holds a tracked anchor, so
@@ -175,7 +268,14 @@ def usage_snapshot_history(context=True, cumulative=(100, 20)):
     return {"mode": "anchoredSnapshot", "items": None, "snapshot": {
         "schemaVersion": 1, "viewCursor": "cur-9",
         "anchor": {"boundaryCursor": "cur-8", "summarizedThrough": "anchor-8"},
-        "state": {"items": [], "activeTurn": None, "queuedTurns": [],
+        "state": {"items": [
+                    {"itemId": "history-u", "kind": "userMessage",
+                     "revision": 1, "status": "completed",
+                     "text": "snapshot question"},
+                    {"itemId": "history-a", "kind": "agentMessage",
+                     "revision": 1, "status": "completed",
+                     "text": "snapshot answer"},
+                ], "activeTurn": None, "queuedTurns": [],
                   "pendingApprovals": [], "pendingUserInputs": [],
                   "approvalMode": session_obj()["approvalMode"],
                   "effectiveModel": None, "branch": None, "goal": None,
@@ -185,7 +285,14 @@ def usage_snapshot_history(context=True, cumulative=(100, 20)):
                                     "pressure": "normal"} if context else None),
                   "tokenUsage": {"promptTokens": cumulative[0],
                                  "outputTokens": cumulative[1],
-                                 "totalTokens": sum(cumulative)}}}}
+                           "totalTokens": sum(cumulative)}}}}
+
+
+def reasoning_snapshot_history():
+    history = usage_snapshot_history()
+    history["snapshot"]["state"]["reasoningEffort"] = {
+        "reasoningEffort": "high", "source": "policy"}
+    return history
 
 
 TODO_ITEMS = [
@@ -198,15 +305,26 @@ TODO_ITEMS = [
 
 
 def question_params(user_input_id="ui-1"):
+    questions = [{
+        "id": "q0", "header": "Pick", "question": "Which?",
+        "selection": {"mode": "single"},
+        "options": [{"label": "Alpha"}, {"label": "Beta"}],
+    }]
+    if SCENARIO == "questions_multiple":
+        questions[0]["selection"] = {"mode": "multiple", "minSelections": 1, "maxSelections": 2}
+    if os.environ.get("FAKE_QUESTION_SHAPE", "") == "mixed":
+        questions.extend([
+            {"id": "q1", "header": "Pick many", "question": "Which ones?",
+             "selection": {"mode": "multiple", "minSelections": 1,
+                            "maxSelections": 2},
+             "options": [{"label": "Red"}, {"label": "Blue"}]},
+            {"id": "q2", "header": "Explain", "question": "Why?",
+             "selection": {"mode": "single"}},
+        ])
     return {"sessionId": MSP_SID, "userInputId": user_input_id,
             "turnId": "turn-question", "itemId": f"item-{user_input_id}",
             "toolCallId": f"call-{user_input_id}", "toolName": "request_user_input",
-            "viewCursor": "cur-8",
-            "questions": [{
-                "id": "q0", "header": "Pick", "question": "Which?",
-                "selection": {"mode": "single"},
-                "options": [{"label": "Alpha"}, {"label": "Beta"}],
-            }]}
+            "viewCursor": "cur-8", "questions": questions}
 
 
 def on_turn_start(params):
@@ -216,6 +334,19 @@ def on_turn_start(params):
         notify("item/completed", {**base, "item": {
             "itemId": "it-1", "kind": "agentMessage",
             "status": "completed", "text": "hello from fake host"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "status_flags":
+        notify("session/statusChanged", {
+            "sessionId": MSP_SID, "status": "paused",
+            "attention": ["futureAttention"], "viewCursor": None})
+        notify("session/statusChanged", {
+            "sessionId": MSP_SID, "status": "idle",
+            "viewCursor": "cur-status-2"})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "session_metadata":
+        notify("session/nameChanged", {
+            "sessionId": ACTIVE_SESSION[0], "name": "Renamed by host",
+        })
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "failed":
         failed_params = {**base, "terminal": "failed"}
@@ -240,31 +371,81 @@ def on_turn_start(params):
         if turn_reason:
             failed_params["reason"] = turn_reason
         notify("turn/completed", failed_params)
+    elif SCENARIO == "deferred_launch_error":
+        notify("turn/completed", {
+            **base,
+            "terminal": "failed",
+            "reason": "queued turn launch failed: provider unavailable",
+            "error": {
+                "kind": "launchError",
+                "message": "queued turn launch failed: provider unavailable",
+                "retryable": True,
+            },
+        })
     elif SCENARIO == "tool":
         notify("item/completed", {**base, "item": {
             "itemId": "it-t1", "kind": "toolCall", "callId": "call-1",
             "status": "completed", "tool": "read",
             "args": {"path": "/tmp/x"}, "result": "file bytes"}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "file_changes":
+        changes = [
+            ("it-add", "write_file", {"path": "added.bin"}),
+            ("it-edit", "edit_file", {"path": "src/edited.rs"}),
+            ("it-delete", "delete_file", {"path": "deleted.txt"}),
+            ("it-rename", "rename_file",
+             {"oldPath": "old.txt", "newPath": "new.txt"}),
+        ]
+        for item_id, tool, args in changes:
+            event = {**base, "item": {
+                "itemId": item_id, "kind": "toolCall", "callId": "call-" + item_id,
+                "turnId": tid, "status": "completed", "tool": tool,
+                "args": json.dumps(args)}}
+            notify("item/completed", event)
+            if item_id == "it-edit":
+                notify("item/completed", event)  # gap/resume replay
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-rejected", "kind": "toolCall", "callId": "call-no",
+            "turnId": tid, "status": "rejected", "tool": "write_file",
+            "args": json.dumps({"path": "not-written.txt"})}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "file_changes_subagent":
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-child", "kind": "subagent", "turnId": tid,
+            "status": "completed", "childSessionId": "child-session"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "file_changes_gap":
+        notify("view/gap", {**base, "viewCursor": "gap-cursor"})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "file_changes_ambiguous":
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-shell", "kind": "toolCall", "callId": "call-shell",
+            "turnId": tid, "status": "completed", "tool": "shell",
+            "args": json.dumps({"command": "printf data > inferred.txt"})}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO in ("approval", "pending_reconcile_dup"):
         notify("approval/requested", dict(APPROVAL_PARAMS))
         notify("turn/completed", {**base, "terminal": "completed"})
-    elif SCENARIO == "approval_hang":
+    elif SCENARIO in ("approval_hang", "approval_queue"):
         # The turn stays open until the client answers or cancels.
         notify("approval/requested", dict(APPROVAL_PARAMS))
+        if SCENARIO == "approval_queue":
+            notify("approval/requested", {**APPROVAL_PARAMS, "approvalId": "approval-second"})
     elif SCENARIO == "approval_req":
         # Reissued multi-stage style: a server-initiated REQUEST with its
         # own id, no notification. Adapter must ack it AND bridge it.
         send({"jsonrpc": "2.0", "id": 9100, "method": "approval/request",
               "params": dict(APPROVAL_PARAMS)})
         notify("turn/completed", {**base, "terminal": "completed"})
-    elif SCENARIO in ("questions", "questions_resume"):
+    elif SCENARIO in ("questions", "questions_multiple", "questions_resume"):
         qid = "ui-2" if SCENARIO == "questions_resume" else "ui-1"
-        notify("userInput/requested", question_params(qid))
-        if SCENARIO == "questions_resume":
-            # The request and view notification also describe the same ask.
-            send({"jsonrpc": "2.0", "id": 9200, "method": "userInput/request",
-                  "params": question_params(qid)})
+        if (USER_INPUT_DIALOGS[0]
+                or os.environ.get("FAKE_IGNORE_USER_INPUT_DIALOGS") == "1"):
+            notify("userInput/requested", question_params(qid))
+            if SCENARIO == "questions_resume":
+                # The request and view notification also describe the same ask.
+                send({"jsonrpc": "2.0", "id": 9200, "method": "userInput/request",
+                      "params": question_params(qid)})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "tool_huge_output":
         notify("item/completed", {**base, "item": {
@@ -279,9 +460,28 @@ def on_turn_start(params):
             "args": {"path": "/tmp/ht"}, "result": "short bounded text",
             "truncated": True}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO in ("tool_stored_output", "tool_output_unavailable"):
+        availability = "missing" if SCENARIO == "tool_output_unavailable" else "available"
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-stored", "kind": "toolCall", "callId": "call-stored",
+            "status": "completed", "tool": "apply_patch",
+            "args": {"path": "/tmp/x"}, "visibleOutput": "bounded prefix",
+            "truncated": True,
+            "outputRef": {"availability": availability, "byteLen": 20,
+                           "id": "out-1", "kind": "tool_output",
+                           "mediaType": "text/plain", "uri": "muse://out-1"},
+            "patchRef": {"availability": availability, "byteLen": 31,
+                          "id": "patch-1", "kind": "tool_patch",
+                          "mediaType": "application/json", "uri": "muse://patch-1"},
+            "patchSummary": {"files": 2, "added": 4, "removed": 1}}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "host_exit_quiet":
         # Crash immediately after the turn/start ack: the turn is in flight
         # when the host dies, and the replacement host reports an idle fold.
+        CRASH_AFTER_ACK[0] = True
+    elif SCENARIO in ("host_exit_classified", "host_exit_relaunch_unavailable"):
+        # Exit after the admission ack so the adapter can classify the
+        # successful spawn separately from a launch/spawn failure.
         CRASH_AFTER_ACK[0] = True
     elif SCENARIO == "host_exit":
         # Complete the turn, then die like a crashed host once the ack is on
@@ -291,6 +491,11 @@ def on_turn_start(params):
             "text": "before the crash"}})
         notify("turn/completed", {**base, "terminal": "completed"})
         CRASH_AFTER_ACK[0] = True
+    elif SCENARIO == "view_health":
+        notify("session/viewHealthChanged", {
+            "sessionId": MSP_SID, "health": "unavailable",
+            "noneReason": "projectionUnavailable"})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "todo":
         notify("session/todoListChanged", {
             "sessionId": MSP_SID, "viewCursor": "cur-t1",
@@ -342,6 +547,25 @@ def on_turn_start(params):
             "result": {"summary": "native child finished",
                        "evidenceRefs": [], "artifactRefs": []}}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "subagent_control":
+        control = os.environ.get("FAKE_SUBAGENT_CONTROL_STATUS", "running")
+        item_status = os.environ.get("FAKE_SUBAGENT_ITEM_STATUS", "inProgress")
+        notify("item/started", {**base, "item": {
+            "itemId": "it-sub-control", "kind": "subagent",
+            "status": item_status, "revision": 1, "subagentId": "sub-control",
+            "agentPath": "researcher", "depth": 1,
+            "objective": "hold the control test open",
+            "childSessionId": "child-sess-control",
+            "controlStatus": control}})
+    elif SCENARIO == "subagent_child_approval":
+        notify("item/started", {**base, "item": {
+            "itemId": "it-sub-control", "kind": "subagent",
+            "status": "inProgress", "revision": 1, "subagentId": "sub-control",
+            "agentPath": "researcher", "depth": 1,
+            "objective": "hold the approval test open",
+            "childSessionId": "child-sess-control", "controlStatus": "running"}})
+        notify("approval/requested", dict(
+            APPROVAL_PARAMS, sessionId="child-sess-control", availableChoices=[]))
     elif SCENARIO == "subagent":
         sid_item = "it-sub1"
         notify("item/started", {**base, "item": {
@@ -372,6 +596,16 @@ def on_turn_start(params):
             "children": [{"childId": "c1", "attempt": 1, "status": "completed",
                           "label": "triage issue #1"}]}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "workflow_control":
+        wf = "it-wf-control"
+        WORKFLOW_TURN[0] = tid
+        notify("item/updated", {**base, "item": {
+            "itemId": wf, "kind": "workflow", "status": "inProgress",
+            "revision": 2, "workflowRunId": "wfr-control",
+            "entryId": "triage-batch", "scriptId": "triage@sha256:aa10",
+            "triggerSource": "modelProposal",
+            "children": [{"childId": "c1", "attempt": 1, "status": "started",
+                          "phase": "triage", "label": "triage issue #1"}]}})
     elif SCENARIO == "async_task":
         # A backgrounded toolCall plus a user-shell item: both are async work.
         notify("item/updated", {**base, "item": {
@@ -389,6 +623,26 @@ def on_turn_start(params):
             "exitSignal": 9, "visibleOutput": "watching"},
             "viewCursor": "cur-sh3"})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "async_task_stop":
+        # Leave a background task live so the ACP task-stop path can target it.
+        notify("item/updated", {**base, "item": {
+            "itemId": "it-bg-stop", "kind": "toolCall", "callId": "call-bg-stop",
+            "status": "inProgress", "revision": 1, "tool": "workspace-shell",
+            "args": {"command": "npm watch"}, "background": True,
+            "backgroundInitiator": "user"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "async_task_stop_all":
+        # Keep two background tasks live until ACP session/cancel maps to the
+        # MSP blanket command.
+        for item_id, call_id, command in [
+            ("it-bg-all-1", "call-bg-all-1", "npm watch"),
+            ("it-bg-all-2", "call-bg-all-2", "cargo watch"),
+        ]:
+            notify("item/updated", {**base, "item": {
+                "itemId": item_id, "kind": "toolCall", "callId": call_id,
+                "status": "inProgress", "revision": 1, "tool": "workspace-shell",
+                "args": {"command": command}, "background": True,
+                "backgroundInitiator": "user"}})
     elif SCENARIO == "usershell_item":
         notify("item/completed", {"sessionId": MSP_SID, "item": {
             "itemId": "it-sh1", "kind": "userShell", "status": "completed",
@@ -447,6 +701,11 @@ def on_turn_start(params):
             notify("turn/completed", {"sessionId": MSP_SID,
                                      "turnId": "turn-2",
                                      "terminal": "completed"})
+    elif SCENARIO == "cancel_request":
+        # Leave the running turn and all queued turns open. The test drives
+        # the targeted reclaim, then uses session/cancel to clean up the
+        # remaining turns and prove they were left alone.
+        pass
     elif SCENARIO == "unqueued":
         notify("turn/unqueued", dict(base))
     elif SCENARIO == "retracted":
@@ -515,6 +774,13 @@ def on_turn_start(params):
             "viewCursor": "cur-2", "sourceRange": {"start": 0, "end": 2},
             "cumulative": {"promptTokens": 1000, "outputTokens": 500,
                            "totalTokens": 1500}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO in ("subscription_usage", "subscription_first_observation"):
+        # The notification is host-global and carries no sessionId. The
+        # adapter must attach it to every ACP session without treating it as
+        # token usage or a local cost estimate.
+        notify("session/contextUsage", context_usage(1500, "cur-1"))
+        notify("usage/changed", subscription_usage(23, 61))
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "usage_turn":
         # Two model calls in one turn, from two models, plus a replay of the
@@ -592,7 +858,12 @@ def on_turn_start(params):
         # contextUsage: only the restored window makes this leg sendable.
         notify("session/tokenUsage", token_usage("cur-10", 100, 20, 200, 40))
         notify("turn/completed", {**base, "terminal": "completed"})
-    disposition = "queued" if SCENARIO == "queued" and TURNS[0] > 1 else "started"
+    disposition = (
+        "queued"
+        if SCENARIO == "deferred_launch_error"
+        or (SCENARIO in ("queued", "cancel_request") and TURNS[0] > 1)
+        else "started"
+    )
     return {
         "commandId": params.get("commandId", ""),
         "status": "accepted",
@@ -609,6 +880,8 @@ def result_for(method, msg):
         granted = (["sessionListStream"]
                    if SCENARIO == "session_list_stream"
                    and "sessionListStream" in requested else [])
+        USER_INPUT_DIALOGS[0] = msg.get("params", {}).get("capabilities", {}).get(
+            "userInputDialogs", True) is not False
         return {
             "schema": SCHEMA,
             "grantedCapabilities": granted,
@@ -624,10 +897,50 @@ def result_for(method, msg):
         if SCENARIO == "pending_reconcile_dup":
             # The same approval the adapter is already displaying.
             return {"approvals": [dict(APPROVAL_PARAMS)], "userInputs": []}
+        if SCENARIO == "status_flags":
+            return {"approvals": [dict(APPROVAL_PARAMS, approvalId="ap-status")],
+                    "userInputs": [question_params("ui-status")]}
         return {"approvals": [], "userInputs": []}
+    if method == "usage/read":
+        USAGE_READS[0] += 1
+        if SCENARIO == "subscription_usage":
+            return {"usage": subscription_usage(11, 37)}
+        return {}
     if method == "session/start":
-        root = msg.get("params", {}).get("workspaceRoot", "/tmp/fake-ws")
-        return {"session": session_obj(workspace_root=root), "viewCursor": "cur-0"}
+        workspace_root = msg.get("params", {}).get("workspaceRoot", "/tmp/fake-ws")
+        ACTIVE_WORKSPACE[0] = workspace_root
+        result = {"session": session_obj(), "viewCursor": "cur-0"}
+        if SCENARIO == "rename_live":
+            result["session"]["name"] = "Before rename"
+        elif SCENARIO == "rename_resume":
+            result["session"]["name"] = "Before resume"
+        elif SCENARIO == "rename_clear":
+            result["session"]["name"] = "Before clear"
+        return result
+    if method == "skill/list":
+        log_input(msg.get("params", {}))
+        SKILL_READS[0] += 1
+        if SCENARIO == "skills_changed" and SKILL_READS[0] > 1:
+            return {"skills": [{
+                "selector": "review",
+                "description": "Review the current changes",
+                "displayName": "Review",
+                "argumentHint": "what to review",
+                "source": "project",
+            }]}
+        return {"skills": [{
+            "selector": "plan",
+            "description": "Create a grounded plan",
+            "displayName": "Plan",
+            "argumentHint": "what to plan",
+            "source": "bundled",
+        }]}
+    if method == "item/readOutput":
+        params = msg.get("params", {})
+        offset = params.get("offsetBytes", 0)
+        return {"byteLen": 18, "content": "full stored output",
+                "encoding": "utf8", "eof": True,
+                "mediaType": "text/plain", "offsetBytes": offset}
     if method == "session/resume":
         params = msg.get("params", {})
         log_input(params)
@@ -636,6 +949,8 @@ def result_for(method, msg):
         snapshot_rung = params.get("history") == "snapshot"
         if SCENARIO == "usage_resume":
             history = usage_snapshot_history()
+        elif SCENARIO == "reasoning_resume":
+            history = reasoning_snapshot_history()
         elif SCENARIO == "todo_resume":
             history = usage_snapshot_history()
             history["snapshot"]["state"]["todoList"] = {
@@ -651,6 +966,22 @@ def result_for(method, msg):
                 "workspaceRoot": "/home/me/src/proj"}
         elif SCENARIO == "usage_snapshot_null":
             history = usage_snapshot_history(context=False)
+        elif SCENARIO == "rename_snapshot":
+            history = usage_snapshot_history()
+            history["snapshot"]["state"]["name"] = "Snapshot name"
+        elif SCENARIO == "async_resume":
+            history = {"mode": "inline", "snapshot": None, "items": [
+                {"itemId": "bg-resumed", "kind": "toolCall",
+                 "callId": "call-bg-resumed", "status": "inProgress",
+                 "tool": "workspace-shell", "args": {"command": "npm watch"},
+                 "background": True, "backgroundInitiator": "timeout"},
+                {"itemId": "shell-resumed", "kind": "userShell",
+                 "status": "inProgress", "turnId": None,
+                 "commandText": "cargo watch"},
+                {"itemId": "shell-done", "kind": "userShell",
+                 "status": "completed", "turnId": None,
+                 "commandText": "old command", "exitCode": 0},
+            ]}
         elif SCENARIO in ("usage_inline", "questions_resume") and snapshot_rung:
             history = usage_snapshot_history(cumulative=(300, 60))
         else:
@@ -664,12 +995,29 @@ def result_for(method, msg):
                 history["snapshot"]["state"]["pendingUserInputs"] = [
                     {"userInputId": "ui-1", "itemId": "item-ui-1",
                      "viewCursor": "cur-8"}]
-        return {"session": session_obj(params.get("sessionId", MSP_SID)),
+        workspace_root = "/tmp" if SCENARIO == "resume_active" else None
+        session = session_obj(params.get("sessionId", MSP_SID), workspace_root)
+        if SCENARIO == "cancel_request" and os.environ.get("FAKE_RESUME_QUEUED"):
+            session["activeTurnId"] = "turn-2"
+        if SCENARIO == "rename_resume":
+            session["name"] = "Renamed outside adapter"
+        elif SCENARIO == "rename_clear":
+            session["name"] = None
+        return {"session": session,
                 "viewCursor": "cur-9",
                 "pendingRequests": pending,
                 "history": history}
+    if method == "view/subscribe":
+        params = msg.get("params", {})
+        log_input(params)
+        return {"viewCursor": "cur-9"}
     if method == "view/page":
+        if SCENARIO == "file_changes_gap":
+            return {"items": [{"itemId": "gap-write", "kind": "toolCall",
+                "callId": "gap-call", "turnId": "turn-1", "status": "completed",
+                "tool": "write_file", "args": {"path": "gap-written.txt"}}]}
         page = msg.get("params", {})
+        log_input(page)
         if SCENARIO == "usage_gap" and page.get("direction") != "backward":
             # Refill overlaps the live stream: cur-3 is in this page too.
             return {"events": [
@@ -690,24 +1038,35 @@ def result_for(method, msg):
         # Every other session pages back to nothing usable.
         return {"events": [], "nextCursor": None}
     if method == "session/list":
+        if SCENARIO == "session_list_workspace_filter":
+            params = msg.get("params", {})
+            if params.get("workspaceRoot") == "/tmp/unrelated-ws":
+                return {"sessions": [], "nextCursor": None}
         if SCENARIO == "session_list_pagination":
-            if msg.get("params", {}).get("cursor") == "page-2":
-                return {"sessions": [session_obj("stored-201", "/tmp/fake-ws")],
+            params = msg.get("params", {})
+            if params.get("cursor") == "page-2":
+                return {"sessions": [session_obj("stored-201", "/tmp/page-2")],
                         "nextCursor": None}
-            return {"sessions": [session_obj(f"stored-{i}", "/tmp/fake-ws")
-                                  for i in range(1, 201)],
+            return {"sessions": [
+                        session_obj(f"stored-{n}", f"/tmp/session-{n}")
+                        for n in range(1, 201)],
                     "nextCursor": "page-2"}
         live = session_obj()
         old = session_obj("msp-sess-old", "/tmp/old-ws")
+        untitled = session_obj("msp-sess-untitled", "/tmp/untitled-ws")
+        bare = session_obj("msp-sess-bare", "/tmp/bare-ws")
         old["updatedAt"] = "2026-08-01T00:00:00Z"
         live["updatedAt"] = "2026-09-04T00:00:00Z"
-        return {"sessions": [live, old], "nextCursor": None}
+        return {"sessions": [live, old, untitled, bare], "nextCursor": None}
     if method == "session/setApprovalMode":
         # The real host applies the selected mode and echoes it back.
         mode = FOLDED_MODE or msg.get("params", {}).get("mode", MODE)
         return {"commandId": "x", "status": "ok", "applyOutcome": "applied",
                 "effectiveMode": {"lastCommandId": "x", "mode": mode,
                                   "source": "explicit"}}
+    if method == "session/setReasoningEffort":
+        return {"commandId": msg.get("params", {}).get("commandId", ""),
+                "status": "accepted"}
     if method == "model/list":
         CATALOG_READS[0] += 1
         if SCENARIO == "usage_rates_failure" and CATALOG_READS[0] > 1:
@@ -735,6 +1094,20 @@ def result_for(method, msg):
         params = msg.get("params", {})
         log_input(params)
         return on_turn_start(params)
+    if method == "turn/unqueue":
+        params = msg.get("params", {})
+        log_input(params)
+        if SCENARIO == "cancel_request":
+            notify("turn/unqueued", {
+                "sessionId": MSP_SID,
+                "turnId": params.get("turnId", ""),
+                "commandId": params.get("turnId", ""),
+            })
+        return {
+            "commandId": params.get("commandId", ""),
+            "status": "accepted",
+            "turnId": params.get("turnId", ""),
+        }
     if method == "session/read":
         read_params = msg.get("params", {})
         log_input(read_params)
@@ -766,6 +1139,17 @@ def result_for(method, msg):
                 "history": {"mode": "inline", "items": items,
                             "snapshot": None},
                 "viewCursor": "cur-read", "pendingRequests": []}
+    if method == "approval/decide":
+        log_input(msg.get("params", {}))
+        if SCENARIO == "status_flags":
+            notify("session/statusChanged", {
+                "sessionId": MSP_SID, "status": "paused",
+                "attention": ["futureAttention"], "viewCursor": None})
+            notify("view/gap", {"sessionId": MSP_SID})
+            notify("session/statusChanged", {
+                "sessionId": MSP_SID, "status": "idle",
+                "viewCursor": "cur-status-2"})
+        return {"status": "accepted"}
     if method == "session/fork":
         params = msg.get("params", {})
         log_input(params)
@@ -792,7 +1176,31 @@ def result_for(method, msg):
             "trigger": "manual"}, "viewCursor": "cur-c1"})
         return {"commandId": msg["params"].get("commandId", ""),
                 "status": "accepted"}
+    if method == "task/stop" and SCENARIO == "async_task_stop":
+        params = msg.get("params", {})
+        notify("item/updated", {"sessionId": MSP_SID, "item": {
+            "itemId": "it-bg-stop", "kind": "toolCall", "callId": "call-bg-stop",
+            "status": "cancelled", "revision": 2, "tool": "workspace-shell",
+            "args": {"command": "npm watch"}, "background": True,
+            "backgroundInitiator": "user"}})
+        return {"commandId": params.get("commandId", ""),
+                "status": "accepted", "taskId": params.get("taskId", "")}
+    if method == "task/stopAll" and SCENARIO == "async_task_stop_all":
+        for item_id, call_id, command in [
+            ("it-bg-all-1", "call-bg-all-1", "npm watch"),
+            ("it-bg-all-2", "call-bg-all-2", "cargo watch"),
+        ]:
+            notify("item/completed", {"sessionId": MSP_SID, "item": {
+                "itemId": item_id, "kind": "toolCall", "callId": call_id,
+                "status": "cancelled", "revision": 2, "tool": "workspace-shell",
+                "args": {"command": command}, "background": True,
+                "failureReason": "stopped by user"}})
+        params = msg.get("params", {})
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
     if method == "userInput/answer":
+        log_input(msg.get("params", {}))
+        return {}
+    if method in ("approval/decide", "userInput/clarify"):
         log_input(msg.get("params", {}))
         return {}
     if method == "turn/steer":
@@ -803,9 +1211,36 @@ def result_for(method, msg):
             "status": "accepted",
             "turnId": params.get("expectedTurnId", ""),
         }
-    if method == "turn/cancel":
-        # Like the real host: a cancelled turn still reports its terminal.
+    if method.startswith("subagent/"):
         params = msg.get("params", {})
+        log_input(params)
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
+    if method == "workflow/cancel":
+        params = msg.get("params", {})
+        log_input(params)
+        if SCENARIO == "workflow_control":
+            base = {"sessionId": MSP_SID, "turnId": WORKFLOW_TURN[0]}
+            item = {
+                "itemId": "it-wf-control", "kind": "workflow",
+                "status": "cancelled", "revision": 3,
+                "workflowRunId": "wfr-control", "entryId": "triage-batch",
+                "scriptId": "triage@sha256:aa10",
+                "triggerSource": "modelProposal",
+                "children": [{"childId": "c1", "attempt": 1,
+                              "status": "cancelled", "phase": "triage",
+                              "label": "triage issue #1", "terminal": "cancelled"}],
+                "message": "Workflow triage-batch cancelled: 0/1 children succeeded",
+            }
+            notify("item/updated", {**base, "item": item})
+            notify("item/completed", {**base, "item": item})
+            notify("turn/completed", {**base, "terminal": "cancelled"})
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
+    if method in ("turn/cancel", "turn/interrupt"):
+        # Like the real host: a cancelled or interrupted turn still reports
+        # its terminal. Keep the request in the input log so tests can verify
+        # the exact turn and interrupt posture.
+        params = msg.get("params", {})
+        log_input(params)
         notify("turn/completed", {"sessionId": MSP_SID,
                                   "turnId": params.get("turnId", ""),
                                   "terminal": "cancelled"})
@@ -817,8 +1252,10 @@ def scenario_after_restart():
     """host_exit is a one-shot: the first process creates the marker and
     crashes; the replacement process sees the marker and behaves sanely."""
     marker = os.environ.get("FAKE_RESTART_MARKER", "")
-    if SCENARIO in ("host_exit", "host_exit_quiet") and marker:
+    if SCENARIO in ("host_exit", "host_exit_quiet", "host_exit_relaunch_unavailable", "close_stdin", "stdout_close_stays_alive") and marker:
         if os.path.exists(marker):
+            if SCENARIO == "host_exit_relaunch_unavailable":
+                return "support_exit"
             return "happy"
         with open(marker, "w") as f:
             f.write("crashed")
@@ -829,6 +1266,23 @@ SCENARIO = scenario_after_restart()
 
 
 def main():
+    if SCENARIO == "support_exit":
+        message = os.environ.get("FAKE_HOST_STDERR", "serve diagnostic")
+        sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))
+        sys.stderr.flush()
+        os._exit(
+            int(
+                os.environ.get(
+                    "FAKE_RESTART_EXIT_CODE",
+                    os.environ.get("FAKE_HOST_EXIT_CODE", "5"),
+                )
+            )
+        )
+    pid_path = os.environ.get("FAKE_PID", "")
+    if pid_path:
+        with open(pid_path, "a") as f:
+            f.write(str(os.getpid()))
+            f.write("\n")
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -851,6 +1305,8 @@ def main():
             log_method("unknown-request-reply:" + json.dumps(msg))
             continue
         if method == "initialized":
+            if SCENARIO == "close_stdin":
+                os.close(0)
             if SCENARIO == "unknown_request":
                 send({"jsonrpc": "2.0", "id": "srv-77",
                       "method": "future/request",
@@ -858,6 +1314,9 @@ def main():
             continue
         if method:
             if ident is not None:
+                if method == "initialize" and SCENARIO == "stderr_flood":
+                    sys.stderr.buffer.write(b"fixture stderr flood\n" * 32768)
+                    sys.stderr.flush()
                 if (os.environ.get("FAKE_DELAY_METHOD", "") == method
                         and os.environ.get("FAKE_DELAY_MS", "")):
                     time.sleep(int(os.environ["FAKE_DELAY_MS"]) / 1000.0)
@@ -872,6 +1331,16 @@ def main():
                           "error": {"code": -32603,
                                     "message": os.environ["FAKE_ERROR_MESSAGE"]}})
                     continue
+                if (method == "item/readOutput"
+                        and SCENARIO == "tool_output_unavailable"):
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32041,
+                                    "message": "stored output unavailable",
+                                    "data": {"kind": "outputUnavailable",
+                                             "availability": "missing",
+                                             "itemId": "it-stored",
+                                             "outputRef": "out-1"}}})
+                    continue
                 if (method == "session/start"
                         and os.environ.get("FAKE_START_ERROR", "") == "profile"):
                     # Mirrors the live 1.2.1 refusal when the user's default
@@ -880,6 +1349,28 @@ def main():
                           "error": {"code": -32603,
                                     "message": "internal error: compose session permission profile: permission profile ':auto-review' cannot be used: the automated reviewer is unavailable on this host",
                                     "data": {"kind": "internal"}}})
+                    continue
+                if method == "turn/start" and SCENARIO == "host_exit_before_ack":
+                    message = os.environ.get("FAKE_HOST_STDERR", "")
+                    if message:
+                        sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))
+                        sys.stderr.flush()
+                    os._exit(int(os.environ.get("FAKE_HOST_EXIT_CODE", "5")))
+                if (method == "session/setReasoningEffort"
+                        and SCENARIO == "reasoning_legacy"):
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32601,
+                                    "message": "method not found: session/setReasoningEffort",
+                                    "data": {"kind": "methodNotFound"}}})
+                    continue
+                if (SCENARIO == "skill_not_found"
+                        and method in ("turn/start", "turn/steer")):
+                    log_input(msg.get("params", {}))
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32032,
+                                    "message": "skill selector was not found",
+                                    "data": {"kind": "skillNotFound",
+                                             "selector": "stale"}}})
                     continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
@@ -893,15 +1384,53 @@ def main():
                     changed["title"] = ("Renamed elsewhere"
                                         if SCENARIO == "session_list_stream"
                                         else "Should be ignored")
+                    if os.environ.get("FAKE_STREAM_METADATA") == "1":
+                        changed.update({"name": "Streamed name", "title": "Lower priority",
+                                        "branch": {"branch": "live-branch"},
+                                        "attention": ["inputPending"]})
                     send({"jsonrpc": "2.0", "method": "session/listChanged",
                           "params": {"session": changed}})
-                if SCENARIO == "session_list_stream" and method == "session/list":
+                if SCENARIO == "session_list_stream" and method == "session/list" \
+                        and os.environ.get("FAKE_STREAM_METADATA") == "1":
+                    send({"jsonrpc": "2.0", "method": "session/listChanged",
+                          "params": {"session": {"sessionId": MSP_SID,
+                                                 "workspaceRoot": ACTIVE_WORKSPACE[0]}}})
+                if SCENARIO == "session_list_stream" and method == "session/list" \
+                        and os.environ.get("FAKE_STREAM_METADATA") != "1":
                     log_method("session/closed-sent")
                     send({"jsonrpc": "2.0", "method": "session/closed",
                           "params": {"sessionId": MSP_SID}})
+                if method == "session/setReasoningEffort":
+                    notify("session/reasoningEffortChanged", {
+                        "sessionId": msg.get("params", {}).get("sessionId", MSP_SID),
+                        "reasoningEffort": msg.get("params", {}).get("reasoningEffort", ""),
+                        "source": "user",
+                        "viewCursor": "cur-reasoning-1",
+                        "sourceRange": {"start": 1, "end": 1},
+                    })
+                if SCENARIO == "rename_live" and method == "session/start":
+                    notify("session/nameChanged", {
+                        "sessionId": MSP_SID,
+                        "name": "Renamed elsewhere",
+                        "viewCursor": "cur-1",
+                        "sourceRange": {"start": 1, "end": 1},
+                    })
+                if method == "session/list" and SCENARIO == "pipe_stall":
+                    log_method("pipe-stall-start")
+                    time.sleep(8)
+                if method == "model/list" and SCENARIO == "stdout_close_stays_alive":
+                    os.close(1)
+                    time.sleep(1.0)
                 if CRASH_AFTER_ACK[0]:
                     sys.stdout.flush()
-                    os._exit(0)
+                    message = os.environ.get("FAKE_HOST_STDERR", "")
+                    if message:
+                        sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))
+                        sys.stderr.flush()
+                    default_code = "1" if SCENARIO in ("host_exit", "host_exit_quiet") else "0"
+                    os._exit(int(os.environ.get("FAKE_HOST_EXIT_CODE", default_code)))
+                if SCENARIO == "skills_changed" and method == "session/start":
+                    notify("skill/changed", {"sessionId": MSP_SID})
                 if SCENARIO == "questions_resume" and method == "session/resume":
                     # MSP reissues pending requests after the resume response.
                     send({"jsonrpc": "2.0", "id": 9100 + ident,
@@ -911,6 +1440,23 @@ def main():
                         notify("item/completed", {"sessionId": MSP_SID, "item": {
                             "itemId": "reissue-barrier", "kind": "agentMessage",
                             "status": "completed", "text": "resume questions delivered"}})
+                if SCENARIO == "view_subscribe_gap" and method == "view/subscribe":
+                    replay = {"sessionId": MSP_SID, "viewCursor": "cur-1",
+                              "item": {"itemId": "view-gap-item",
+                                       "kind": "agentMessage", "status": "completed",
+                                       "text": "replayed after cursor"}}
+                    # A duplicate delivery must not duplicate the editor event.
+                    notify("item/completed", replay)
+                    notify("item/completed", replay)
+                    usage = {"sessionId": MSP_SID, "usedTokens": 42,
+                             "windowTokens": 100, "pressure": "warning",
+                             "viewCursor": "cur-2"}
+                    notify("session/contextUsage", usage)
+                    notify("session/contextUsage", usage)
+
+    if SCENARIO == "shutdown_flush":
+        time.sleep(0.6)
+        log_method("shutdown-flushed")
 
 
 main()
