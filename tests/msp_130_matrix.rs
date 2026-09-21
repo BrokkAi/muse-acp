@@ -47,7 +47,10 @@ fn matrix() -> String {
 fn assert_disposition(body: &str, name: &str) {
     let rows: Vec<&str> = body
         .lines()
-        .filter(|line| line.starts_with('|') && line.contains(&format!("`{name}`")))
+        .filter(|line| {
+            line.starts_with('|')
+                && line.split('|').nth(1).map(str::trim) == Some(format!("`{name}`").as_str())
+        })
         .collect();
     assert_eq!(
         rows.len(),
@@ -102,4 +105,19 @@ fn the_muse_130_request_index_records_both_receipts() {
         assert!(body.contains(&format!("| `{request}` | Mapped to ACP |")));
     }
     assert!(body.contains("empty `RequestReceipt`"));
+}
+
+#[test]
+fn cross_references_do_not_count_as_disposition_rows() {
+    let body = "| `skill/list` | Mapped to ACP | list skills |\n| `skill/changed` | Consumed | See `skill/list`. |";
+    assert_disposition(body, "skill/list");
+}
+
+#[test]
+#[should_panic(expected = "expected one matrix row")]
+fn cross_reference_cannot_replace_a_missing_disposition() {
+    assert_disposition(
+        "| `skill/changed` | Consumed | See `skill/list`. |",
+        "skill/list",
+    );
 }
