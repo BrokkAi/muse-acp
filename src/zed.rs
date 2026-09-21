@@ -685,10 +685,15 @@ fn uninstall_settings_edit(original: &str, name: &str) -> Result<(String, bool),
 // --- paths + binary install ---
 
 fn home_dir() -> Result<std::path::PathBuf, String> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
+    #[cfg(windows)]
+    let variables = ["USERPROFILE", "HOME"];
+    #[cfg(not(windows))]
+    let variables = ["HOME", "USERPROFILE"];
+    variables
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
         .map(std::path::PathBuf::from)
-        .map_err(|_| {
+        .ok_or_else(|| {
             "cannot determine home directory (HOME/USERPROFILE unset); pass --settings <path>"
                 .to_string()
         })
