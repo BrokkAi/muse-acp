@@ -46,6 +46,9 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
+  view_subscribe_gap session/resume requires explicit cursor replay; the host
+               sends the replayed item twice to verify adapter deduplication
+  view_health     emits an unavailable live-view health notification
   subscription_usage  usage/read returns the host snapshot and usage/changed
                       sends a changed subscription observation
   subscription_first_observation  usage/read is absent before the first
@@ -390,6 +393,11 @@ def on_turn_start(params):
             "text": "before the crash"}})
         notify("turn/completed", {**base, "terminal": "completed"})
         CRASH_AFTER_ACK[0] = True
+    elif SCENARIO == "view_health":
+        notify("session/viewHealthChanged", {
+            "sessionId": MSP_SID, "health": "unavailable",
+            "noneReason": "projectionUnavailable"})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "todo":
         notify("session/todoListChanged", {
             "sessionId": MSP_SID, "viewCursor": "cur-t1",
@@ -850,6 +858,10 @@ def result_for(method, msg):
                 "viewCursor": "cur-9",
                 "pendingRequests": pending,
                 "history": history}
+    if method == "view/subscribe":
+        params = msg.get("params", {})
+        log_input(params)
+        return {"viewCursor": "cur-9"}
     if method == "view/page":
         if SCENARIO == "file_changes_gap":
             return {"items": [{"itemId": "gap-write", "kind": "toolCall",
@@ -1158,6 +1170,19 @@ def main():
                         notify("item/completed", {"sessionId": MSP_SID, "item": {
                             "itemId": "reissue-barrier", "kind": "agentMessage",
                             "status": "completed", "text": "resume questions delivered"}})
+                if SCENARIO == "view_subscribe_gap" and method == "view/subscribe":
+                    replay = {"sessionId": MSP_SID, "viewCursor": "cur-1",
+                              "item": {"itemId": "view-gap-item",
+                                       "kind": "agentMessage", "status": "completed",
+                                       "text": "replayed after cursor"}}
+                    # A duplicate delivery must not duplicate the editor event.
+                    notify("item/completed", replay)
+                    notify("item/completed", replay)
+                    usage = {"sessionId": MSP_SID, "usedTokens": 42,
+                             "windowTokens": 100, "pressure": "warning",
+                             "viewCursor": "cur-2"}
+                    notify("session/contextUsage", usage)
+                    notify("session/contextUsage", usage)
 
     if SCENARIO == "shutdown_flush":
         time.sleep(0.6)

@@ -144,7 +144,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | successful native file `toolCall` items | negotiated AIR `agentFileChangeReport` after the owning turn completes; paths come only from explicit host tool arguments and are deduplicated across replay |
 | `turn/cancel` | `session/cancel` (waits for the terminal event; `already_terminal` = success) |
 | `approval/requested` + `approval/request` | `session/request_permission` → `approval/decide` (deny-safe fallback) |
-| `session/resume` + history | `session/resume` (+ `replayFrom: {type:start}` replays messages); usage is restored on attach: from `history.snapshot.state` when a snapshot is served, else by asking for the snapshot rung explicitly, else from one backward `view/page` read for the running totals |
+| `session/resume` + history | `session/resume` (+ `replayFrom: {type:start}` replays messages); a retained view cursor is explicitly re-attached with `view/subscribe` so `(after, head]` events are replayed once across detachment or host restart; live-only resume still re-attaches from the returned head; usage is restored on attach: from `history.snapshot.state` when a snapshot is served, else by asking for the snapshot rung explicitly, else from one backward `view/page` read for the running totals; `session/viewHealthChanged` records an actionable stderr diagnostic |
 | `sessionDurability` (default durable) | continuity across turns; Muse's durable session ID is used directly by ACP |
 | `turn/start` `ifBusy` (queue default) | concurrent prompts per session; each completes its own response; `session/cancel` stops all of them |
 | `TurnInputPart` image | image blocks (inline base64 or local `file://` path); advertised in caps |

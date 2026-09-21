@@ -1602,6 +1602,41 @@ fn session_resume_without_cwd_reconnects() {
 }
 
 #[test]
+fn resume_reattaches_at_the_retained_cursor_without_duplicate_replay() {
+    for ver in [1u64, 2] {
+        let mut c = Client::spawn("view_subscribe_gap", &[]);
+        let sid = c.new_session(ver, "");
+        let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+        let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+        assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
+        c.wait_log("view/subscribe", Duration::from_secs(15));
+        c.wait_input("\"after\": \"cur-0\"", Duration::from_secs(15));
+        c.wait_for("replayed after cursor", Duration::from_secs(15));
+        c.wait_for(
+            "\"sessionUpdate\":\"usage_update\"",
+            Duration::from_secs(15),
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        let frames = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n");
+        assert_eq!(
+            frames.matches("replayed after cursor").count(),
+            1,
+            "v{ver} duplicate cursor replay escaped the fold: {frames}"
+        );
+        assert_eq!(
+            frames.matches("\"sessionUpdate\":\"usage_update\"").count(),
+            1,
+            "v{ver} duplicate cursor replay escaped usage forwarding: {frames}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn live_session_rename_updates_the_acp_title() {
     for ver in [1, 2] {
         let mut c = Client::spawn("rename_live", &[]);
@@ -1613,6 +1648,22 @@ fn live_session_rename_updates_the_acp_title() {
         );
         c.finish();
     }
+}
+
+#[test]
+fn view_health_failure_is_logged_with_reconnect_context() {
+    let mut c = Client::spawn("view_health", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "health probe");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"end_turn\""),
+        "turn failed: {done}"
+    );
+    c.wait_stderr("session/viewHealthChanged", Duration::from_secs(15));
+    c.wait_stderr("health=unavailable", Duration::from_secs(15));
+    c.wait_stderr("noneReason=projectionUnavailable", Duration::from_secs(15));
+    c.finish();
 }
 
 #[test]
@@ -3678,6 +3729,7 @@ fn durable_host_crash_restarts_and_reattaches() {
         "host-restarted attempt=1 sessions=1 failures=0",
         Duration::from_secs(10),
     );
+    c.wait_log("view/subscribe", Duration::from_secs(10));
     c.wait_stderr("host-ready", Duration::from_secs(10));
 
     // The re-attached session must remain usable on the replacement host.

@@ -170,9 +170,8 @@ fn method_timeout_ms(method: &str) -> u64 {
         // Lifecycle/history work can page and replay large views.
         "session/start" | "session/resume" | "session/read" | "view/page" => 180_000,
         // Cheap queries.
-        "model/list" | "session/list" | "usage/read" | "view/unsubscribe" | "item/readOutput" => {
-            30_000
-        }
+        "model/list" | "session/list" | "usage/read" | "view/subscribe" | "view/unsubscribe"
+        | "item/readOutput" => 30_000,
         // Control-plane decisions should be fast but not flaky.
         "approval/decide" | "userInput/answer" | "userInput/cancel" | "userInput/clarify"
         | "task/background" | "task/stop" | "task/stopAll" => 30_000,
@@ -937,6 +936,7 @@ mod tests {
         assert_eq!(t("initialize"), Duration::from_millis(30_000));
         assert_eq!(t("session/resume"), Duration::from_millis(180_000));
         assert_eq!(t("view/page"), Duration::from_millis(180_000));
+        assert_eq!(t("view/subscribe"), Duration::from_millis(30_000));
         assert_eq!(t("model/list"), Duration::from_millis(30_000));
         assert_eq!(t("approval/decide"), Duration::from_millis(30_000));
         assert_eq!(t("item/readOutput"), Duration::from_millis(30_000));
