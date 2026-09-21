@@ -22,6 +22,9 @@ Muse's session engine, tools, authentication, and approval flow.
 
 See [ROADMAP.md](ROADMAP.md) for protocol-compatibility, reliability, feature,
 and release priorities.
+The [MSP event compatibility matrix](docs/event-compatibility.md) records the
+ACP mapping or intentional disposition of every notification in the pinned
+schema, plus observed host extensions and server-initiated requests.
 
 ## Why MSP instead of `muse exec`?
 
@@ -106,6 +109,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `item/delta` (message text) | `agent_message_chunk` (v2 carries `messageId`) |
 | toolCall `item/started\|updated\|completed` | `tool_call` (v1 create) / `tool_call_update` upsert with kind/title/status/content/rawInput |
 | `turn/completed` | v1 `session/prompt` response `{stopReason}` plus the turn's `usage` when the host reported any; v2 `state_update` idle + `stopReason` |
+| successful native file `toolCall` items | negotiated AIR `agentFileChangeReport` after the owning turn completes; paths come only from explicit host tool arguments and are deduplicated across replay |
 | `turn/cancel` | `session/cancel` (waits for the terminal event; `already_terminal` = success) |
 | `approval/requested` + `approval/request` | `session/request_permission` → `approval/decide` (deny-safe fallback) |
 | `session/resume` + history | `session/resume` (+ `replayFrom: {type:start}` replays messages); usage is restored on attach: from `history.snapshot.state` when a snapshot is served, else by asking for the snapshot rung explicitly, else from one backward `view/page` read for the running totals |
@@ -117,7 +121,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `model/list` + `session/setModel` | `configOptions` model selector + `session/set_config_option`; legacy v1 `session/set_model` |
 | `reasoningEffort` on `turn/start` / `turn/steer` | `configOptions` reasoning selector (`none` through `ultra`) |
 | `turn/steer` | v2 `_session/steering` extension with exact-turn targeting and race-safe idle behavior |
-| backgrounded `toolCall` + `userShell` items | negotiated AIR async tasks: `async_task_spawned`/`async_task_state_update` plus the backgrounded marker on the owning command card; `canStop` is false until MSP exposes a stop primitive |
+| backgrounded `toolCall` + `userShell` items | negotiated AIR async tasks: `async_task_spawned`/`async_task_state_update` plus the backgrounded marker on the owning command card; active tasks are restored from durable resume history; `canStop` is false until MSP exposes a stop primitive |
 | `subagent` items | negotiated: `subagent_spawned` + `subagent_state_update` on the parent and the child transcript replayed from `session/read` onto the child session id; otherwise a synthetic tool card with `_meta.muse` provenance |
 | Muse skills | ACP `available_commands_update`; aliases such as `/plan` are sent to Muse as `/skill plan` |
 | `session/contextUsage` + `session/tokenUsage` | `usage_update` (`used`/`size` from context occupancy, also restored on attach; `_meta.museCumulative` session totals, `_meta.musePressure`); each completion is counted once, so a `view/gap` refill that replays one already seen does not re-price it; `cost` is a client-local list-price estimate from `model/list` catalog rates, summed per completion — partial in both directions (historic and unpriceable completions are excluded, cached tokens are charged at the catalog cached rate), never a billing figure. The cost object is labeled `source: adapter-estimate`, `basis: catalog-list-price`, and `billing: false` so clients cannot mistake it for Muse billing |
@@ -133,6 +137,23 @@ Repeated deliveries of a pending question reuse its existing form, including
 requests reissued during session resume.
 Without that capability, the adapter cancels the question so the turn can
 continue; it does not emit an unsupported request.
+
+A resumed client receives the running AIR task set from the latest durable
+item fold even when it did not request transcript replay; completed historical
+shell commands are not re-announced. Closing the ACP connection ends the
+adapter and its host child. If a durable host restarts in place, the adapter
+reattaches each session and reconciles task items from the returned fold; a
+terminal item settles a task that was already announced. MSP v1 has no
+targeted background-work stop primitive, so task updates remain display-only
+and advertise `canStop: false`.
+
+Per-turn file reports are available when the client advertises AIR v1
+`agentFileChangeReport` and places a valid `agentFileChangeReportRequest` on
+the prompt. The adapter reports workspace paths from successful native Muse
+file-tool completions only. It includes both endpoints of a rename and sends
+paths without reading contents, so deleted and binary files are safe. Rejected
+writes are excluded. Shell commands, generators, and unknown tools never cause
+a guessed path; their presence marks `declaredComplete: false` instead.
 
 Model choices are refreshed from Muse when creating, loading, or resuming a
 session and after a config option changes. The adapter does not permanently
@@ -204,10 +225,40 @@ MUSE_LOG=debug                     # per-method protocol tracing (no payloads)
 to the host default; set `MUSE_APPROVAL_MODE=promptUnmatched` to force every
 unmatched tool call through `session/request_permission`.
 
-Local image and resource reads are confined to the session workspace by
-default. `MUSE_ALLOW_UNSCOPED_READS` disables that boundary only when its value
-is explicitly `1`, `true`, `yes`, or `on` (case-insensitive). Do not enable it
-for untrusted sessions or workspaces.
+### Workspace roots and local resources
+
+ACP `cwd` is the primary workspace root and the base for relative resource
+paths. The adapter passes it to Muse as MSP's single `workspaceRoot`. When a
+client supplies `additionalDirectories`, each entry must be an absolute path;
+the adapter treats `[cwd, ...additionalDirectories]` as the ordered set of
+roots approved for local image and textual `resource_link` expansion. MSP v1
+has no additional-root field, so these extra roots do not change Muse's own
+tool workspace or sandbox policy.
+
+The adapter accepts nested, unrelated, and symlinked roots and removes exact
+duplicates while preserving first occurrence order. It resolves the requested
+path and every root through the filesystem before checking containment. This
+means `..`, percent-encoded separators, path spelling differences on a
+case-normalizing filesystem, and symlinks cannot escape the union of approved
+roots. A symlink supplied as a root authorizes its resolved target. Hard links
+are path entries rather than redirects: a hard-link name inside a root is in
+scope, while another name for the same inode outside every root is not.
+
+Only valid UTF-8 text without binary control bytes is expanded as text, with a
+256 KiB limit. Malformed `file://` percent escapes are rejected, remote file
+hosts are rejected, and non-file resource links remain mentions. Embedded
+non-image blobs remain unsupported.
+
+On `session/load`, `session/resume`, and `session/fork`, the request's complete
+additional-directory list becomes active. Omitting it or sending an empty list
+activates no extra roots, so old filesystem scope is never restored implicitly.
+Live `session/list` entries report that active list; Muse sessions discovered
+after an adapter restart have only their persisted MSP `workspaceRoot`.
+
+Local reads are confined to this root set by default.
+`MUSE_ALLOW_UNSCOPED_READS` disables that boundary only when its value is
+explicitly `1`, `true`, `yes`, or `on` (case-insensitive). Do not enable it for
+untrusted sessions or workspaces.
 
 ### Authentication and remote environments
 
