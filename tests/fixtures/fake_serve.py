@@ -47,6 +47,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
+  session_list_pagination two-page session/list response keyed by its cursor
   view_subscribe_gap session/resume requires explicit cursor replay; the host
                sends the replayed item twice to verify adapter deduplication
   view_health     emits an unavailable live-view health notification
@@ -900,6 +901,15 @@ def result_for(method, msg):
         # Every other session pages back to nothing usable.
         return {"events": [], "nextCursor": None}
     if method == "session/list":
+        if SCENARIO == "session_list_pagination":
+            params = msg.get("params", {})
+            if params.get("cursor") == "page-2":
+                return {"sessions": [session_obj("stored-201", "/tmp/page-2")],
+                        "nextCursor": None}
+            return {"sessions": [
+                        session_obj(f"stored-{n}", f"/tmp/session-{n}")
+                        for n in range(1, 201)],
+                    "nextCursor": "page-2"}
         live = session_obj()
         old = session_obj("msp-sess-old", "/tmp/old-ws")
         old["updatedAt"] = "2026-08-01T00:00:00Z"

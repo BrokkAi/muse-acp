@@ -3267,6 +3267,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let list_cursor = params.as_ref().and_then(|p| p.get("cursor"));
             let filter_additional = match additional_directories(params.as_ref()) {
                 Ok(mut roots) => {
                     // session/new removes an exact duplicate of cwd from the
@@ -3283,6 +3284,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             };
             let cmd = host.mint_cmd("cmd-");
             let mut host_params = format!("{{\"commandId\":{},\"limit\":200", esc(&cmd));
+            if let Some(cursor) = list_cursor {
+                host_params.push_str(&format!(",\"cursor\":{}", j_to_string(cursor)));
+            }
             if !filter_root.is_empty() {
                 host_params.push_str(&format!(",\"workspaceRoot\":{}", esc(&filter_root)));
             }
@@ -3356,6 +3360,10 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             listed.insert(msp_id.to_string());
                         }
                     }
+                    let next_cursor = r
+                        .get("nextCursor")
+                        .map(j_to_string)
+                        .unwrap_or_else(|| "null".to_string());
                     for (m, c, name, additional) in &owned {
                         if listed.contains(m) {
                             continue;
@@ -3380,7 +3388,10 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     acp::send_result(
                         stdout,
                         &id,
-                        &format!("{{\"sessions\":[{}]}}", entries.join(",")),
+                        &format!(
+                            "{{\"sessions\":[{}],\"nextCursor\":{next_cursor}}}",
+                            entries.join(",")
+                        ),
                     );
                 }
                 Err(e) => {
@@ -3403,7 +3414,10 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     acp::send_result(
                         stdout,
                         &id,
-                        &format!("{{\"sessions\":[{}]}}", entries.join(",")),
+                        &format!(
+                            "{{\"sessions\":[{}],\"nextCursor\":null}}",
+                            entries.join(",")
+                        ),
                     );
                 }
             }

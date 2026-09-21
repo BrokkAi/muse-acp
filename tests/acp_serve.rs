@@ -1748,6 +1748,27 @@ fn session_ids_survive_adapter_restart_and_import() {
 }
 
 #[test]
+fn session_list_forwards_and_returns_pagination_cursor() {
+    let mut c = Client::spawn("session_list_pagination", &[]);
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+
+    let first_id = c.req("session/list", "{}");
+    let first = c.wait_for(&format!("\"id\":{first_id}"), Duration::from_secs(15));
+    assert!(first.contains("\"sessionId\":\"stored-200\""), "{first}");
+    assert!(!first.contains("\"sessionId\":\"stored-201\""), "{first}");
+    assert!(first.contains("\"nextCursor\":\"page-2\""), "{first}");
+
+    let second_id = c.req("session/list", "{\"cursor\":\"page-2\"}");
+    let second = c.wait_for(&format!("\"id\":{second_id}"), Duration::from_secs(15));
+    assert!(second.contains("\"sessionId\":\"stored-201\""), "{second}");
+    assert!(!second.contains("\"sessionId\":\"stored-1\""), "{second}");
+    assert!(second.contains("\"nextCursor\":null"), "{second}");
+    c.finish();
+}
+
+#[test]
 fn new_session_returns_the_durable_host_id() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(1, "");
