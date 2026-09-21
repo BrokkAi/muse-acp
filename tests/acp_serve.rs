@@ -1748,6 +1748,31 @@ fn session_ids_survive_adapter_restart_and_import() {
 }
 
 #[test]
+fn session_list_filters_live_sessions_by_workspace() {
+    for (scenario, extra_env) in [
+        ("session_list_workspace_filter", Vec::new()),
+        (
+            "quiet",
+            vec![
+                ("FAKE_ERROR_METHOD", "session/list"),
+                ("FAKE_ERROR_MESSAGE", "temporary list failure"),
+            ],
+        ),
+    ] {
+        let mut c = Client::spawn(scenario, &extra_env);
+        let sid = c.new_session(1, "");
+        let list_id = c.req("session/list", "{\"cwd\":\"/tmp/unrelated-ws\"}");
+        let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
+        assert!(listed.contains("\"sessions\":[]"), "{scenario}: {listed}");
+        assert!(
+            !listed.contains(&format!("\"sessionId\":\"{sid}\"")),
+            "{scenario}: unrelated live session leaked: {listed}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn session_list_forwards_and_returns_pagination_cursor() {
     let mut c = Client::spawn("session_list_pagination", &[]);
     let init = c.req("initialize", "{\"protocolVersion\":1}");
