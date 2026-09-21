@@ -74,7 +74,7 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
-      - run: cp install.sh dist/install.sh
+      - run: cp install.sh install.ps1 dist/
       - name: Check publisher authorization
         run: python scripts/release.py authorize
       - name: Validate version and all staged assets

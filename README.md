@@ -79,11 +79,42 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   | MUSE_ACP_INSTALL_DIR="$HOME/bin" MUSE_ACP_VERSION=v0.2.2 sh
 ```
 
-Linux release binaries require glibc. On Windows, or for a manual install,
-download the archive for your platform from [GitHub Releases](https://github.com/BrokkAi/muse-acp/releases),
-verify it with the adjacent `.sha256` file, and place `muse-acp` (or
-`muse-acp.exe` on Windows) on `PATH`. To build and install from a checkout, run
-`cargo install --path .`.
+On supported Windows x86_64 systems, run the PowerShell installer for the MSVC
+release:
+
+```powershell
+irm https://github.com/BrokkAi/muse-acp/releases/latest/download/install.ps1 | iex
+```
+
+It verifies the ZIP's SHA-256 checksum and installs `muse-acp.exe` to
+`$env:LOCALAPPDATA\Programs\muse-acp`. Set `MUSE_ACP_VERSION` or
+`MUSE_ACP_INSTALL_DIR` before running the command to pin a version or choose
+another absolute directory. The installer leaves `PATH` unchanged; add the
+reported directory to the user PATH and restart PowerShell. For a manual
+install, download the Windows archive and adjacent `.sha256` file from
+[GitHub Releases](https://github.com/BrokkAi/muse-acp/releases).
+
+Linux release binaries require glibc. To build and install from a checkout,
+run `cargo install --path .`.
+
+### Supported release targets
+
+The release and installer support matrix is explicit about the adapter binary,
+the host runtime, and the install path:
+
+| OS | Architecture | Runtime / host requirement | Release installer | Status |
+| --- | --- | --- | --- | --- |
+| macOS | x86_64 | macOS host and Muse Code for macOS | `install.sh` | Supported |
+| macOS | arm64 | macOS host and Muse Code for macOS | `install.sh` | Supported |
+| Linux | x86_64 | glibc; Muse Code for Linux | `install.sh` | Supported |
+| Linux | arm64 | glibc; Muse 1.0.2 may need sandbox support or `--disable-sandbox` | `install.sh` | Adapter supported; see the sandbox advisory below |
+| Windows | x86_64 | MSVC release target and Muse Code for Windows | `install.ps1` | Supported |
+
+Windows arm64, Linux musl, 32-bit systems, and other operating systems have no
+published release target. The editor registration commands use `HOME` on Unix
+and `USERPROFILE` on Windows for their default settings paths; IntelliJ still
+requires the installed executable's absolute path when `--command` is
+supplied.
 
 ### 3. Connect your editor
 
@@ -314,12 +345,15 @@ the host supports the platform, and re-check `muse serve --help` on newer builds
 
 ## Editor setup
 
-Both installers preserve existing agent entries, are safe to re-run, and write
-a `.bak` file before changing an existing configuration. Settings are replaced
+The editor registration commands preserve existing agent entries, are safe to
+re-run, and write a `.bak` file before changing an existing configuration.
+Settings are replaced
 atomically (same-directory temp file plus rename) with rollback to the
 pre-edit content if the write fails. Use `--dry-run` to preview an edit.
-The installers target macOS and Linux; on Windows, place the binary on `PATH`
-and add the equivalent agent-server JSON by hand.
+The Unix installer targets macOS and Linux, and the PowerShell installer
+targets Windows x86_64. Both binary installers verify release checksums. The
+Windows installer stores the executable under
+`$env:LOCALAPPDATA\Programs\muse-acp` by default and does not edit `PATH`.
 
 ### IntelliJ IDEA and other JetBrains IDEs
 
