@@ -174,6 +174,10 @@ impl SessionFold {
         }
     }
 
+    pub fn has_active_item(&self, item_id: &str) -> bool {
+        self.items.contains_key(item_id)
+    }
+
     fn known(&self, item_id: &str) -> bool {
         self.done.contains(item_id)
     }
@@ -1042,6 +1046,7 @@ impl SessionFold {
                     }
                     if let Some(state) = Self::async_task_state(item) {
                         out.push(Self::async_task_state_line(acp_sid, &tc_id, state));
+                        self.announced_tasks.remove(&tc_id);
                     }
                 }
                 self.items.remove(&item_id);
@@ -1167,6 +1172,7 @@ impl SessionFold {
                     }
                     if let Some(state) = Self::async_task_state(item) {
                         out.push(Self::async_task_state_line(acp_sid, &tc_id, state));
+                        self.announced_tasks.remove(&tc_id);
                     }
                 }
                 self.items.remove(&item_id);

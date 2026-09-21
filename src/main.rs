@@ -1172,6 +1172,7 @@ fn restart_durable_host(
                                     {
                                         s.model_value = model.to_string();
                                     }
+                                    reconcile_active_tasks(stdout, s, &r, false);
                                 }
                             }
                             // Prompts whose turns no longer exist in the
@@ -1943,6 +1944,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         if replay {
                             replay_history(stdout, entry, &r);
                         }
+                        reconcile_active_tasks(stdout, entry, &r, replay);
                         acp::send_usage(stdout, entry, pressure.as_deref());
                     }
                     // One-to-one with the folded active/queued turns, or an
@@ -3169,10 +3171,21 @@ fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) 
         let kind = it.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
             "toolCall" => {
-                // Fold replays the call (title/kind/status/args, no content).
-                let wrap = J::Obj(vec![("item".to_string(), it.clone())]);
-                sess.fold
-                    .on_item_completed(&sess.acp_sid, sess.ver, &wrap, &mut out);
+                // Fold terminal calls as completed history. A durable fold can
+                // also contain a still-running background call; snapshot it as
+                // active so its later completion is not mistaken for a replay.
+                let status = it.get("status").and_then(J::as_str).unwrap_or("");
+                if matches!(
+                    status,
+                    "completed" | "failed" | "rejected" | "cancelled" | "timedOut"
+                ) {
+                    let wrap = J::Obj(vec![("item".to_string(), it.clone())]);
+                    sess.fold
+                        .on_item_completed(&sess.acp_sid, sess.ver, &wrap, &mut out);
+                } else {
+                    sess.fold
+                        .on_item_snapshot(&sess.acp_sid, sess.ver, it, &mut out);
+                }
             }
             "userMessage" | "agentMessage" => {
                 let text = it.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -3212,6 +3225,74 @@ fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) 
                 out.push(format!("{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{}}}}}", esc(&sess.acp_sid), update));
             }
             _ => {}
+        }
+    }
+    for line in out {
+        acp::send_raw(stdout, &line);
+    }
+}
+
+/// Rebuild the observable AIR task set from the durable fold returned by
+/// `session/resume`. This runs even when ACP did not request transcript replay:
+/// a reconnecting editor still needs controls and status for work that remains
+/// active. Terminal history is deliberately ignored; live completion events
+/// settle tasks that this connection already announced.
+fn reconcile_active_tasks(
+    stdout: &StdoutShared,
+    sess: &mut AcpSession,
+    resume_res: &J,
+    replayed: bool,
+) {
+    if !sess.fold.air_async_tasks {
+        return;
+    }
+    let items = resume_res
+        .get("history")
+        .and_then(|h| h.get("items"))
+        .filter(|items| matches!(items, J::Arr(_)))
+        .or_else(|| snapshot_state(resume_res).and_then(|s| s.get("items")));
+    let Some(J::Arr(items)) = items else {
+        log("resume: no item fold available for active async-task reconciliation");
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        let item_id = item.get("itemId").and_then(J::as_str).unwrap_or("");
+        if item_id.is_empty() || !seen.insert(item_id) {
+            continue;
+        }
+        let status = item.get("status").and_then(J::as_str).unwrap_or("");
+        let terminal = matches!(
+            status,
+            "completed" | "failed" | "rejected" | "cancelled" | "timedOut"
+        );
+        let kind = item.get("kind").and_then(J::as_str).unwrap_or("");
+        let qualifies = kind == "userShell"
+            || (kind == "toolCall" && matches!(item.get("background"), Some(J::Bool(true))));
+        if !qualifies {
+            continue;
+        }
+        if terminal {
+            // On an in-process host restart, consume a durable terminal for a
+            // task this editor already saw. A fresh adapter has an empty set,
+            // so old completed history does not flood the Async Tasks panel.
+            let task_id = if kind == "userShell" {
+                format!("shell-{item_id}")
+            } else {
+                item.get("callId")
+                    .and_then(J::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            if sess.fold.announced_tasks.contains(&task_id) {
+                let wrapped = J::Obj(vec![("item".to_string(), item.clone())]);
+                sess.fold
+                    .on_item_completed(&sess.acp_sid, sess.ver, &wrapped, &mut out);
+            }
+        } else if !replayed || !sess.fold.has_active_item(item_id) {
+            sess.fold
+                .on_item_snapshot(&sess.acp_sid, sess.ver, item, &mut out);
         }
     }
     for line in out {

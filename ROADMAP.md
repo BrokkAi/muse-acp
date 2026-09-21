@@ -567,10 +567,11 @@ Status: **AIR async tasks implemented (display-only).** After bilateral AIR
 negotiation, backgrounded tool calls mark their command card
 (`_meta.jetbrains.air.asyncTasks.backgrounded`) and emit
 `async_task_spawned`/`async_task_state_update`; user-shell items map to their
-own shell tasks with exit facts settled from code/signal. `canStop` is
+own shell tasks with exit facts settled from code/signal. Durable resume folds
+restore active tasks without replaying old terminal work. `canStop` is
 honestly false and `_session/async_task/stop` fails explicitly because MSP v1
 publishes no stop primitive. Remaining work: the `userShell` host capability
-request, active-task reconciliation, and stop once MSP exposes one.
+request and targeted stop once MSP exposes one.
 
 **Work items**
 
