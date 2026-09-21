@@ -5459,9 +5459,10 @@ fn stop_async_task(
                 s.fold.air_async_tasks,
                 s.msp_sid.clone(),
                 s.fold.msp_task_id(async_task_id).map(str::to_string),
+                s.fold.workflow_run_id_for_task(async_task_id),
             )
         });
-    let Some((negotiated, msp_sid, msp_task_id)) = target else {
+    let Some((negotiated, msp_sid, msp_task_id, workflow_run_id)) = target else {
         acp::send_error(stdout, id, -32602, "unknown sessionId");
         return;
     };
@@ -5473,6 +5474,27 @@ fn stop_async_task(
             -32601,
             "background task stop is not supported by the Muse host",
         );
+        return;
+    }
+    if let Some(workflow_run_id) = workflow_run_id {
+        let command_id = host.mint_cmd("cmd-");
+        match host.command(
+            "workflow/cancel",
+            &format!(
+                "{{\"commandId\":{},\"sessionId\":{},\"workflowRunId\":{}}}",
+                esc(&command_id),
+                esc(&msp_sid),
+                esc(&workflow_run_id)
+            ),
+        ) {
+            Ok(result) => acp::send_result(stdout, id, &j_to_string(&result)),
+            Err(e) => acp::send_error(
+                stdout,
+                id,
+                msp::acp_error_code(&e, -32603),
+                &err_message(&e),
+            ),
+        }
         return;
     }
     let Some(msp_task_id) = msp_task_id else {

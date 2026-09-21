@@ -23,6 +23,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   retract_then_completed retract, then a late turn/completed (settle once)
   retry_then_completed turn/retryScheduled, then a normal completion
   quiet        turn/start answers only; nothing follows (for close/cancel)
+  workflow_control live workflow; workflow/cancel emits the later item/turn views
   skills_changed skill/list changes after a skill/changed notification
   skill_not_found turn/start rejects the native skill selector
   async_task_stop       background task then a targeted task/stop terminal
@@ -149,6 +150,7 @@ def turn_id():
 # started on the forked session complete on the forked session.
 ACTIVE_SESSION = [MSP_SID]
 CRASH_AFTER_ACK = [False]
+WORKFLOW_TURN = [""]
 
 
 ACTIVE_WORKSPACE = ["/tmp/fake-ws"]
@@ -479,6 +481,16 @@ def on_turn_start(params):
             "children": [{"childId": "c1", "attempt": 1, "status": "completed",
                           "label": "triage issue #1"}]}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "workflow_control":
+        wf = "it-wf-control"
+        WORKFLOW_TURN[0] = tid
+        notify("item/updated", {**base, "item": {
+            "itemId": wf, "kind": "workflow", "status": "inProgress",
+            "revision": 2, "workflowRunId": "wfr-control",
+            "entryId": "triage-batch", "scriptId": "triage@sha256:aa10",
+            "triggerSource": "modelProposal",
+            "children": [{"childId": "c1", "attempt": 1, "status": "started",
+                          "phase": "triage", "label": "triage issue #1"}]}})
     elif SCENARIO == "async_task":
         # A backgrounded toolCall plus a user-shell item: both are async work.
         notify("item/updated", {**base, "item": {
@@ -1018,6 +1030,26 @@ def result_for(method, msg):
             "status": "accepted",
             "turnId": params.get("expectedTurnId", ""),
         }
+    if method == "workflow/cancel":
+        params = msg.get("params", {})
+        log_input(params)
+        if SCENARIO == "workflow_control":
+            base = {"sessionId": MSP_SID, "turnId": WORKFLOW_TURN[0]}
+            item = {
+                "itemId": "it-wf-control", "kind": "workflow",
+                "status": "cancelled", "revision": 3,
+                "workflowRunId": "wfr-control", "entryId": "triage-batch",
+                "scriptId": "triage@sha256:aa10",
+                "triggerSource": "modelProposal",
+                "children": [{"childId": "c1", "attempt": 1,
+                              "status": "cancelled", "phase": "triage",
+                              "label": "triage issue #1", "terminal": "cancelled"}],
+                "message": "Workflow triage-batch cancelled: 0/1 children succeeded",
+            }
+            notify("item/updated", {**base, "item": item})
+            notify("item/completed", {**base, "item": item})
+            notify("turn/completed", {**base, "terminal": "cancelled"})
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
     if method == "turn/cancel":
         # Like the real host: a cancelled turn still reports its terminal.
         params = msg.get("params", {})
