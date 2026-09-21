@@ -11,3 +11,7 @@
 .vscode/
 __pycache__/
 *.py[cod]
+
+.claude/
+.muse/
+.brokk/

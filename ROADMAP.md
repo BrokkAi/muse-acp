@@ -319,6 +319,13 @@ local-read confinement.
 Publish a full MSP-to-ACP event matrix so ignored and unsupported notifications
 are intentional.
 
+Status: **implemented.** The authoritative
+[`docs/event-compatibility.md`](docs/event-compatibility.md) matrix classifies
+every notification in the pinned stable schema, observed host extras, and the
+two supported server-initiated requests. A corpus test compares the published
+notification rows to the schema index exactly, so additive or removed schema
+events require an explicit documentation decision before CI passes.
+
 **Initial matrix rows**
 
 - `initialized`

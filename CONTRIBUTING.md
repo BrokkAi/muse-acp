@@ -35,9 +35,5 @@ section 5 of [LICENSE](LICENSE).
 
 ## Maintainer releases
 
-1. Update the version in `Cargo.toml` and `Cargo.lock`, then merge the tested
-   change to `master`.
-2. Create and push an annotated `v<version>` tag that points at that commit.
-3. The release workflow verifies the version, builds Linux x86-64/ARM64,
-   macOS Intel/Apple Silicon, and Windows x86-64 archives, uploads SHA-256
-   checksums, and publishes the release only after every build succeeds.
+See [RELEASING.md](RELEASING.md) for preparation, exact-commit checks, publication
+and recovery. Preflight branch pushes and manual dispatches do not publish.
