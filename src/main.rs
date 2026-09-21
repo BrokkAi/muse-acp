@@ -787,6 +787,63 @@ fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
     out
 }
 
+/// Read the session-scoped skill palette. The host returns one row for each
+/// shortcut spelling that it can resolve, so this is also the source of truth
+/// for the ACP command catalog.
+fn skill_catalog(
+    host: &Arc<MspHost>,
+    msp_sid: &str,
+) -> Option<Vec<(String, String, Option<String>)>> {
+    let params = format!("{{\"sessionId\":{}}}", esc(msp_sid));
+    let result = match host.command("skill/list", &params) {
+        Ok(result) => result,
+        Err(error) => {
+            log(&format!(
+                "skill/list failed: {}; retaining the current command catalog",
+                err_message(&error)
+            ));
+            return None;
+        }
+    };
+    let Some(J::Arr(rows)) = result.get("skills") else {
+        log("skill/list returned no skills array; retaining the current command catalog");
+        return None;
+    };
+    let mut skills = Vec::new();
+    for row in rows {
+        let selector = row
+            .get("selector")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if selector.is_empty() {
+            continue;
+        }
+        let description = row
+            .get("description")
+            .and_then(|v| v.as_str())
+            .or_else(|| row.get("displayName").and_then(|v| v.as_str()))
+            .unwrap_or(selector)
+            .to_string();
+        let argument_hint = row
+            .get("argumentHint")
+            .and_then(|v| v.as_str())
+            .filter(|hint| !hint.is_empty())
+            .map(str::to_string);
+        skills.push((selector.to_string(), description, argument_hint));
+    }
+    Some(skills)
+}
+
+fn send_host_error(stdout: &StdoutShared, id: &Option<J>, error: &J, fallback: i64, message: &str) {
+    let code = msp::acp_error_code(error, fallback);
+    if let Some(data) = msp::skill_error_data(error) {
+        acp::send_error_with_data(stdout, id, code, message, &data);
+    } else {
+        acp::send_error(stdout, id, code, message);
+    }
+}
+
 enum LoopMsg {
     AcpLine(String),
     AcpEof,
@@ -1746,11 +1803,12 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             acp::session_modes(acp::mode_from_msp(&cur_mode))
                         )
                     };
+                    let skills = skill_catalog(host, &msp_sid).unwrap_or_default();
                     acp::send_result(stdout, &id, &result);
                     if let Some(name) = session_name {
                         acp::send_session_title(stdout, &sid, name.as_deref());
                     }
-                    acp::send_available_commands(stdout, &sid, ver);
+                    acp::send_available_commands(stdout, &sid, ver, &skills);
                 }
                 Err(e) => {
                     let msg = err_message(&e);
@@ -2073,8 +2131,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             acp::session_modes(&mode_v)
                         )
                     };
+                    let skills = skill_catalog(host, &msp_out).unwrap_or_default();
                     acp::send_result(stdout, &id, &result);
-                    acp::send_available_commands(stdout, &sid, ver);
+                    acp::send_available_commands(stdout, &sid, ver, &skills);
                 }
                 Err(e) => {
                     let msg = err_message(&e);
@@ -2492,17 +2551,19 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 Err(e) => {
                     let code = err_code(&e);
                     if code == -32000 || err_message(&e).contains("already_terminal") {
-                        acp::send_error(
+                        send_host_error(
                             stdout,
                             &id,
-                            msp::acp_error_code(&e, -32603),
+                            &e,
+                            -32603,
                             &format!("turn rejected: {}", err_message(&e)),
                         );
                     } else {
-                        acp::send_error(
+                        send_host_error(
                             stdout,
                             &id,
-                            msp::acp_error_code(&e, -32603),
+                            &e,
+                            -32603,
                             &friendly_turn_error("turn/start failed", &err_message(&e)),
                         );
                     }
@@ -2712,10 +2773,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             let result = match result {
                 Ok(result) => result,
                 Err(error) => {
-                    acp::send_error(
+                    send_host_error(
                         stdout,
                         &id,
-                        msp::acp_error_code(&error, -32603),
+                        &error,
+                        -32603,
                         &friendly_turn_error("steering failed", &err_message(&error)),
                     );
                     return;
@@ -3514,10 +3576,10 @@ fn image_part(data_b64: &str, mime: &str) -> String {
     )
 }
 
-/// Build MSP turn input parts: text (+ inlined resource text) and images.
+/// Build MSP turn input parts: text, native skill invocations, and images.
 /// Image sources: inline base64 `data`, or a local `file://`/`/` path which
 /// is read and encoded here (same machine). Audio has no host surface
-/// (TurnInputPartType is closed: text|image) and is rejected.
+/// (TurnInputPartType is closed: text|image|skill) and is rejected.
 ///
 /// Returns `(msp_parts, acp_content)`: the host input and the accepted prompt
 /// re-serialized as ACP content for the user-message echo.
@@ -3544,8 +3606,12 @@ fn extract_prompt_parts(
         if texts.is_empty() {
             return;
         }
-        let text = normalize_muse_slash_command(&texts.join("\n"));
-        parts.push(format!("{{\"type\":\"text\",\"text\":{}}}", esc(&text)));
+        let text = texts.join("\n");
+        if let Some(skill) = native_skill_part(&text) {
+            parts.push(skill);
+        } else {
+            parts.push(format!("{{\"type\":\"text\",\"text\":{}}}", esc(&text)));
+        }
         texts.clear();
     };
     for b in &blocks {
@@ -3642,28 +3708,43 @@ fn extract_prompt_parts(
     Ok((parts, format!("[{}]", content.join(","))))
 }
 
-/// Short editor commands map to Muse's stable skill invocation syntax. The ACP
-/// user-message echo keeps what the client sent; only host input is normalized.
-fn normalize_muse_slash_command(text: &str) -> String {
-    // ACP clients use a leading space to escape slash-command execution and
-    // send the text literally. Only normalize a slash in byte position zero.
+/// Convert an editor slash command into the native MSP skill part. The host
+/// resolves the selector against its current catalog, so a stale or unknown
+/// name reaches MSP and produces its typed `skillNotFound` error.
+fn native_skill_part(text: &str) -> Option<String> {
+    // A leading space intentionally escapes command handling in ACP clients.
     if !text.starts_with('/') {
-        return text.to_string();
+        return None;
     }
-    let mut words = text.splitn(2, char::is_whitespace);
-    let command = words.next().unwrap_or_default();
-    let argument = words.next().unwrap_or_default().trim();
-    match command {
-        "/plan" | "/doctor" | "/create-skill" | "/create-plugin" | "/import" => {
-            let skill = command.trim_start_matches('/');
-            if argument.is_empty() {
-                format!("/skill {skill}")
-            } else {
-                format!("/skill {skill} {argument}")
-            }
+    let body = &text[1..];
+    let mut words = body.splitn(2, char::is_whitespace);
+    let mut selector = words.next().unwrap_or_default().to_string();
+    if selector.is_empty() {
+        return None;
+    }
+    let mut arguments = words.next().unwrap_or_default().trim_start().to_string();
+
+    // Keep accepting the adapter's former `/skill <selector> <arguments>`
+    // spelling while submitting the same selector natively.
+    if selector == "skill" {
+        let mut skill_words = arguments.splitn(2, char::is_whitespace);
+        let nested = skill_words.next().unwrap_or_default();
+        if !nested.is_empty() {
+            selector = nested.to_string();
+            arguments = skill_words
+                .next()
+                .unwrap_or_default()
+                .trim_start()
+                .to_string();
         }
-        _ => text.to_string(),
     }
+
+    let mut part = format!("{{\"type\":\"skill\",\"selector\":{}", esc(&selector));
+    if !arguments.is_empty() {
+        part.push_str(&format!(",\"arguments\":{}", esc(&arguments)));
+    }
+    part.push('}');
+    Some(part)
 }
 
 /// Decode a `file://` URI to a local path. Rejects hosts, non-file schemes,
@@ -3944,6 +4025,28 @@ fn handle_msp(
         }
     }
     match method {
+        "skill/changed" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let Some(acp_sid) = find_acp_sid(sessions, msp_sid) else {
+                return;
+            };
+            let ver = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&acp_sid)
+                .map(|s| s.ver)
+                .unwrap_or(1);
+            if let Some(skills) = skill_catalog(host, msp_sid) {
+                log(&format!(
+                    "skill catalog refreshed for session {msp_sid}: {} row(s)",
+                    skills.len()
+                ));
+                acp::send_available_commands(stdout, &acp_sid, ver, &skills);
+            }
+        }
         "view/gap" => {
             let msp_sid = params
                 .get("sessionId")

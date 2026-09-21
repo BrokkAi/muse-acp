@@ -23,6 +23,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   retract_then_completed retract, then a late turn/completed (settle once)
   retry_then_completed turn/retryScheduled, then a normal completion
   quiet        turn/start answers only; nothing follows (for close/cancel)
+  skills_changed skill/list changes after a skill/changed notification
+  skill_not_found turn/start rejects the native skill selector
   async_task_stop       background task then a targeted task/stop terminal
   async_task_stop_all   background tasks then task/stopAll terminals
   load         session/resume serves inline history (for session/load replay)
@@ -69,6 +71,7 @@ FOLDED_MODE = os.environ.get("FAKE_FOLDED_MODE", "")
 LOG = os.environ.get("FAKE_LOG", "")
 TURNS = [0]
 CATALOG_READS = [0]
+SKILL_READS = [0]
 
 # Compatibility-diagnostics knobs: the fixture defaults to the validated
 # host shape, but tests can present an unknown fingerprint or a future
@@ -721,6 +724,24 @@ def result_for(method, msg):
         elif SCENARIO == "rename_clear":
             result["session"]["name"] = "Before clear"
         return result
+    if method == "skill/list":
+        log_input(msg.get("params", {}))
+        SKILL_READS[0] += 1
+        if SCENARIO == "skills_changed" and SKILL_READS[0] > 1:
+            return {"skills": [{
+                "selector": "review",
+                "description": "Review the current changes",
+                "displayName": "Review",
+                "argumentHint": "what to review",
+                "source": "project",
+            }]}
+        return {"skills": [{
+            "selector": "plan",
+            "description": "Create a grounded plan",
+            "displayName": "Plan",
+            "argumentHint": "what to plan",
+            "source": "bundled",
+        }]}
     if method == "item/readOutput":
         params = msg.get("params", {})
         offset = params.get("offsetBytes", 0)
@@ -1041,6 +1062,15 @@ def main():
                                     "message": "internal error: compose session permission profile: permission profile ':auto-review' cannot be used: the automated reviewer is unavailable on this host",
                                     "data": {"kind": "internal"}}})
                     continue
+                if (SCENARIO == "skill_not_found"
+                        and method in ("turn/start", "turn/steer")):
+                    log_input(msg.get("params", {}))
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32032,
+                                    "message": "skill selector was not found",
+                                    "data": {"kind": "skillNotFound",
+                                             "selector": "stale"}}})
+                    continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
                 if SCENARIO == "rename_live" and method == "session/start":
@@ -1050,7 +1080,7 @@ def main():
                         "viewCursor": "cur-1",
                         "sourceRange": {"start": 1, "end": 1},
                     })
-                if method == "model/list" and SCENARIO == "pipe_stall":
+                if method == "session/list" and SCENARIO == "pipe_stall":
                     log_method("pipe-stall-start")
                     time.sleep(8)
                 if method == "model/list" and SCENARIO == "stdout_close_stays_alive":
@@ -1059,6 +1089,8 @@ def main():
                 if CRASH_AFTER_ACK[0]:
                     sys.stdout.flush()
                     os._exit(0)
+                if SCENARIO == "skills_changed" and method == "session/start":
+                    notify("skill/changed", {"sessionId": MSP_SID})
                 if SCENARIO == "questions_resume" and method == "session/resume":
                     # MSP reissues pending requests after the resume response.
                     send({"jsonrpc": "2.0", "id": 9100 + ident,

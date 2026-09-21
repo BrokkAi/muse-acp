@@ -1947,12 +1947,12 @@ fn set_config_option_returns_full_state() {
 }
 
 #[test]
-fn slash_command_aliases_use_the_muse_skill_grammar() {
+fn slash_command_aliases_use_native_msp_skill_parts() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
     let _pid = c.prompt(&sid, "/plan add dropdowns");
     c.wait_input(
-        "\"text\": \"/skill plan add dropdowns\"",
+        "\"type\": \"skill\", \"selector\": \"plan\", \"arguments\": \"add dropdowns\"",
         Duration::from_secs(15),
     );
 
@@ -1967,6 +1967,61 @@ fn slash_command_aliases_use_the_muse_skill_grammar() {
     assert!(
         log.contains("\"text\":\"/plan add dropdowns\""),
         "the ACP transcript preserves the command the user selected: {log}"
+    );
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    assert!(
+        !input.contains("/skill plan"),
+        "the adapter must not rewrite a slash command into prompt text: {input}"
+    );
+    c.finish();
+}
+
+#[test]
+fn skill_catalog_refreshes_after_host_notification() {
+    let mut c = Client::spawn("skills_changed", &[]);
+    let sid = c.new_session(2, "");
+    let initial = c.wait_for("available_commands_update", Duration::from_secs(15));
+    assert!(
+        initial.contains("\"name\":\"plan\""),
+        "initial catalog: {initial}"
+    );
+    assert!(
+        !initial.contains("\"name\":\"review\""),
+        "initial catalog is stale: {initial}"
+    );
+
+    let refreshed = c.wait_for("\"name\":\"review\"", Duration::from_secs(15));
+    assert!(
+        refreshed.contains(&format!("\"sessionId\":\"{sid}\""))
+            && !refreshed.contains("\"name\":\"plan\""),
+        "skill/changed must replace the catalog: {refreshed}"
+    );
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("host input log");
+    assert_eq!(
+        input.matches("\"sessionId\": \"msp-sess-1\"").count(),
+        2,
+        "session-scoped skill/list is reissued after skill/changed: {input}"
+    );
+    c.finish();
+}
+
+#[test]
+fn unknown_native_skill_preserves_typed_host_error() {
+    let mut c = Client::spawn("skill_not_found", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "/stale use this");
+    let error = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        error.contains("\"code\":-32032"),
+        "typed skill error: {error}"
+    );
+    assert!(
+        error.contains("\"kind\":\"skillNotFound\"") && error.contains("\"selector\":\"stale\""),
+        "skill selector data must reach ACP: {error}"
+    );
+    c.wait_input(
+        "\"type\": \"skill\", \"selector\": \"stale\", \"arguments\": \"use this\"",
+        Duration::from_secs(15),
     );
     c.finish();
 }
@@ -2070,13 +2125,17 @@ fn steering_injects_into_the_exact_active_turn() {
     let steer_id = c.req(
         "_session/steering",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"change course\"}}]}}"
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"/plan prioritize tests\"}}]}}"
         ),
     );
     let response = c.wait_for(&format!("\"id\":{steer_id}"), Duration::from_secs(15));
     assert!(response.contains("\"outcome\":\"injected\""), "{response}");
     c.wait_log("turn/steer", Duration::from_secs(15));
     c.wait_input("\"expectedTurnId\": \"turn-1\"", Duration::from_secs(15));
+    c.wait_input(
+        "\"type\": \"skill\", \"selector\": \"plan\", \"arguments\": \"prioritize tests\"",
+        Duration::from_secs(15),
+    );
 
     let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
     let response_pos = frames
@@ -2085,7 +2144,7 @@ fn steering_injects_into_the_exact_active_turn() {
         .expect("steering response");
     let echo_pos = frames
         .iter()
-        .position(|frame| frame.contains("change course"))
+        .position(|frame| frame.contains("/plan prioritize tests"))
         .expect("steering echo");
     assert!(
         response_pos < echo_pos,
@@ -4451,6 +4510,8 @@ fn closed_editor_stdout_does_not_block_adapter_shutdown() {
 fn timed_out_pipe_write_cannot_be_delivered_later() {
     let mut c = Client::spawn("pipe_stall", &[]);
     let sid = c.new_session(1, "");
+    let list = c.req("session/list", "{}");
+    c.wait_for(&format!("\"id\":{list}"), Duration::from_secs(5));
     c.wait_log("pipe-stall-start", Duration::from_secs(5));
     let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"text","text":"x".repeat(128 * 1024)}]});
     let id = c.req("session/prompt", &params.to_string());
