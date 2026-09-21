@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
@@ -88,6 +88,57 @@ pub enum MspEvent {
 /// Default admission-ack budget in milliseconds for unclassified commands.
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
 
+/// A pipe write is separate from the host's admission-ack budget. The host
+/// may stop reading stdin while it is shutting down; waiting synchronously on
+/// `ChildStdin` would otherwise strand the ACP loop before that budget starts.
+const PIPE_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Shutdown is best-effort, but must never turn an editor disconnect into an
+/// unbounded wait for a child or a poisoned lock.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(7);
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+const SHUTDOWN_POLL: Duration = Duration::from_millis(10);
+
+struct WriteRequest {
+    line: String,
+    result: Sender<std::io::Result<()>>,
+}
+
+fn write_loop(mut stdin: ChildStdin, requests: Receiver<WriteRequest>) {
+    while let Ok(request) = requests.recv() {
+        let result = (|| {
+            writeln!(stdin, "{}", request.line)?;
+            stdin.flush()
+        })();
+        let failed = result.as_ref().err().map(|e| (e.kind(), e.to_string()));
+        let _ = request.result.send(result);
+        let Some((kind, message)) = failed else {
+            continue;
+        };
+
+        // Every queued writer must settle when the host closes its stdin. Do
+        // not leave later sends waiting for the write timeout one by one.
+        while let Ok(queued) = requests.try_recv() {
+            let _ = queued
+                .result
+                .send(Err(std::io::Error::new(kind, message.clone())));
+        }
+        break;
+    }
+}
+
+fn kill_and_reap(child: &mut Child) {
+    let _ = child.kill();
+    let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(SHUTDOWN_POLL),
+            Ok(None) => return,
+        }
+    }
+}
+
 /// Method-aware admission-ack budgets. Acks are admission-only, not outcomes:
 /// a turn may legitimately run for minutes after `turn/start` accepts.
 ///
@@ -102,9 +153,11 @@ fn method_timeout_ms(method: &str) -> u64 {
         // Lifecycle/history work can page and replay large views.
         "session/start" | "session/resume" | "session/read" | "view/page" => 180_000,
         // Cheap queries.
-        "model/list" | "session/list" | "view/unsubscribe" => 30_000,
+        "model/list" | "session/list" | "usage/read" | "view/subscribe" | "view/unsubscribe"
+        | "item/readOutput" => 30_000,
         // Control-plane decisions should be fast but not flaky.
-        "approval/decide" | "userInput/answer" | "userInput/cancel" | "userInput/clarify" => 30_000,
+        "approval/decide" | "userInput/answer" | "userInput/cancel" | "userInput/clarify"
+        | "task/background" | "task/stop" | "task/stopAll" => 30_000,
         _ => DEFAULT_TIMEOUT_MS,
     }
 }
@@ -158,9 +211,9 @@ pub fn describe_spawn_error(bin: &str, e: &std::io::Error) -> String {
     }
 }
 
-/// MSP v1 has no auth method or stable auth error kind. Match explicit login
-/// diagnostics only; a bare 401/403 or permission denial may belong to a tool.
-/// Never echo raw authentication errors: they can contain credentials.
+/// Match explicit login diagnostics in free-text host errors; a bare 401/403
+/// or permission denial may belong to a tool. Never echo raw authentication
+/// errors: they can contain credentials.
 pub fn auth_failure(message: &str) -> Option<&'static str> {
     let lower = message.to_ascii_lowercase();
     if [
@@ -210,24 +263,40 @@ pub fn auth_diagnostic(message: &str, host: &HandshakeInfo) -> Option<String> {
 }
 
 /// Turn failures can describe tools and other services used by the model.
-/// Generic auth text is attributable to Muse only for model failures; other
-/// failure classes need to name Muse explicitly so service guidance survives.
+/// The stable MSP 1.3.0 `authRequired` kind is authoritative; older hosts
+/// still need explicit Muse wording (or the model-error default) so service
+/// authentication failures keep their own diagnostic.
 pub fn turn_auth_diagnostic(
     message: &str,
     error_kind: &str,
     host: &HandshakeInfo,
 ) -> Option<String> {
+    if error_kind == "authRequired" {
+        // The kind itself is the authentication signal, so do not depend on
+        // the host's free-text detail containing a recognizable phrase. Use
+        // the same redacted guidance as other Muse auth failures.
+        return auth_diagnostic("authentication required", host);
+    }
     if error_kind != "modelError" && !message.to_ascii_lowercase().contains("muse") {
         return None;
     }
     auth_diagnostic(message, host)
 }
 
-/// ACP reserves -32000 for authentication required. Other MSP errors retain
-/// the caller's existing ACP mapping; MSP numeric codes are not ACP codes.
+/// ACP reserves -32000 for authentication required. The MSP skill lookup
+/// error is also stable across the two protocols, so preserve its registry
+/// code; other MSP errors retain the caller's existing ACP mapping.
 pub fn acp_error_code(error: &J, fallback: i64) -> i64 {
     if auth_failure(&err_message(error)).is_some() {
         -32000
+    } else if err_code(error) == -32032
+        || error
+            .get("data")
+            .and_then(|data| data.get("kind"))
+            .and_then(|kind| kind.as_str())
+            == Some("skillNotFound")
+    {
+        -32032
     } else {
         fallback
     }
@@ -459,8 +528,16 @@ fn classify_status(status: &ExitStatus, stderr_tail: String) -> ExitClassificati
     classify_exit_parts(exit_code, signal, stderr_tail)
 }
 
+/// Structured data for the only MSP request error that ACP clients need to
+/// branch on here. In particular, keep the rejected selector visible.
+pub fn skill_error_data(error: &J) -> Option<String> {
+    let data = error.get("data")?;
+    (data.get("kind").and_then(|kind| kind.as_str()) == Some("skillNotFound"))
+        .then(|| j_to_string(data))
+}
+
 pub struct MspHost {
-    writer: Arc<Mutex<std::process::ChildStdin>>,
+    writer: Mutex<Option<Sender<WriteRequest>>>,
     next_id: AtomicU64,
     cmd_seq: AtomicU64,
     pending: Mutex<HashMap<String, Sender<Result<J, J>>>>,
@@ -518,10 +595,102 @@ impl MspHost {
         let guard = done.lock().unwrap_or_else(|p| p.into_inner());
         let _ = cv.wait_timeout_while(guard, Duration::from_millis(250), |finished| !*finished);
     }
+
+    /// Settle every command waiter as soon as the host reader loses stdout.
+    /// Leaving the senders in `pending` would make callers wait for their
+    /// individual admission timeout even though the connection is already
+    /// known to be dead.
+    fn fail_pending(&self, reason: &str) {
+        // Reject new commands before draining waiters. Otherwise a command
+        // can be queued between the drain and shutdown after stdout is gone.
+        self.writer.lock().unwrap_or_else(|p| p.into_inner()).take();
+        let waiters = self
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .drain()
+            .map(|(_, waiter)| waiter)
+            .collect::<Vec<_>>();
+        for waiter in waiters {
+            let _ = waiter.send(Err(mk_err(-32603, reason)));
+        }
+    }
+
+    /// Close the host input, give it a short chance to exit cleanly, then kill
+    /// and reap it. Lock acquisition and child progress are both bounded so a
+    /// broken host cannot strand adapter shutdown.
+    pub fn shutdown(&self) {
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let writer = loop {
+            match self.writer.try_lock() {
+                Ok(mut guard) => break Some(guard.take()),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    break Some(poisoned.into_inner().take());
+                }
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(SHUTDOWN_POLL);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => break None,
+            }
+        };
+        if writer.is_none() {
+            log("serve shutdown timed out waiting for writer lock");
+        }
+        drop(writer);
+
+        let kill_at = Instant::now() + SHUTDOWN_GRACE;
+        let mut child = loop {
+            match self._child.try_lock() {
+                Ok(guard) => break Some(guard),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    break Some(poisoned.into_inner());
+                }
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(SHUTDOWN_POLL);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => break None,
+            }
+        };
+        let Some(mut child) = child.take() else {
+            log("serve shutdown timed out waiting for child lock");
+            return;
+        };
+
+        let mut killed = false;
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) if !killed && Instant::now() >= kill_at => {
+                    let _ = child.kill();
+                    killed = true;
+                }
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(SHUTDOWN_POLL);
+                }
+                Ok(None) => {
+                    log("serve shutdown timed out waiting for child exit");
+                    break;
+                }
+                Err(e) => {
+                    log(&format!("serve shutdown wait failed: {e}"));
+                    break;
+                }
+            }
+        }
+
+        let stderr_bytes = self.stderr.snapshot().len();
+        if stderr_bytes > 0 {
+            // Keep host diagnostics captured without echoing arbitrary host
+            // stderr, which may contain credentials or workspace contents.
+            log(&format!("serve stderr captured {stderr_bytes} bytes"));
+        }
+    }
 }
 
 impl MspHost {
-    pub fn launch() -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
+    pub fn launch(
+        user_input_dialogs: bool,
+    ) -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
         let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
         let mut cmd = Command::new(&bin);
         cmd.arg("serve");
@@ -538,18 +707,29 @@ impl MspHost {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| LaunchError::Spawn(describe_spawn_error(&bin, &e)))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| LaunchError::Startup("serve: no stdout".to_string()))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| LaunchError::Startup("serve: no stdin".to_string()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| LaunchError::Startup("serve: no stderr".to_string()))?;
+        let stdout = match child.stdout.take() {
+            Some(stdout) => stdout,
+            None => {
+                kill_and_reap(&mut child);
+                return Err(LaunchError::Startup("serve: no stdout".to_string()));
+            }
+        };
+        let stdin = match child.stdin.take() {
+            Some(stdin) => stdin,
+            None => {
+                kill_and_reap(&mut child);
+                return Err(LaunchError::Startup("serve: no stdin".to_string()));
+            }
+        };
+        let stderr = match child.stderr.take() {
+            Some(stderr) => stderr,
+            None => {
+                kill_and_reap(&mut child);
+                return Err(LaunchError::Startup("serve: no stderr".to_string()));
+            }
+        };
+        let (writer_tx, writer_rx) = mpsc::channel();
+        std::thread::spawn(move || write_loop(stdin, writer_rx));
         let stderr_tail = StderrTail::default();
         let stderr_done = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
         let reader_tail = stderr_tail.clone();
@@ -568,7 +748,7 @@ impl MspHost {
             cv.notify_all();
         });
         let host = Arc::new(MspHost {
-            writer: Arc::new(Mutex::new(stdin)),
+            writer: Mutex::new(Some(writer_tx)),
             next_id: AtomicU64::new(1),
             cmd_seq: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
@@ -583,8 +763,9 @@ impl MspHost {
         std::thread::spawn(move || reader_loop(reader_host, stdout, tx));
         // Handshake.
         let init_params = format!(
-            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}}}}"#,
-            ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
+            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"userInputDialogs":{user_input_dialogs}}}}}"#,
+            ver = crate::json::esc(env!("CARGO_PKG_VERSION")),
+            user_input_dialogs = user_input_dialogs
         );
         let res = match host.command("initialize", &init_params) {
             Ok(result) => result,
@@ -593,6 +774,7 @@ impl MspHost {
                 if let Some(exit) = host.reap() {
                     return Err(LaunchError::HostExit(exit));
                 }
+                host.shutdown();
                 return Err(LaunchError::Startup(message));
             }
         };
@@ -630,6 +812,7 @@ impl MspHost {
             durability,
         };
         if verdict.is_fatal() {
+            host.shutdown();
             return Err(LaunchError::Startup(format!(
                 "incompatible host schema: version={} fingerprint={}; upgrade muse-acp",
                 schema_version
@@ -644,6 +827,7 @@ impl MspHost {
             if let Some(exit) = host.reap() {
                 return Err(LaunchError::HostExit(exit));
             }
+            host.shutdown();
             return Err(LaunchError::Startup(error));
         }
         Ok((host, rx))
@@ -704,6 +888,9 @@ impl MspHost {
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&id.to_string());
             let fallback = format!("serve write failed: {e}");
+            if e.kind() == std::io::ErrorKind::TimedOut {
+                return Err(mk_err(-32603, &fallback));
+            }
             return Err(mk_err(-32603, &self.host_closed_message(&fallback)));
         }
         match rx.recv_timeout(timeout) {
@@ -754,9 +941,43 @@ impl MspHost {
     }
 
     pub fn send_raw(&self, line: &str) -> std::io::Result<()> {
-        let mut w = self.writer.lock().unwrap_or_else(|p| p.into_inner());
-        writeln!(w, "{line}")?;
-        w.flush()
+        let sender = self
+            .writer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "serve is shut down")
+            })?;
+        let (result_tx, result_rx) = mpsc::channel();
+        sender
+            .send(WriteRequest {
+                line: line.to_string(),
+                result: result_tx,
+            })
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "serve stdin closed")
+            })?;
+        match result_rx.recv_timeout(PIPE_WRITE_TIMEOUT) {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // A partially written frame cannot be withdrawn from a pipe.
+                // Terminate this transport before reporting failure so its
+                // writer cannot later deliver an untracked command.
+                self.writer.lock().unwrap_or_else(|p| p.into_inner()).take();
+                kill_and_reap(&mut self._child.lock().unwrap_or_else(|p| p.into_inner()));
+                self.fail_pending("serve stdin write timed out; host terminated");
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "serve stdin write timed out; host terminated",
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "serve stdin writer stopped",
+            )),
+        }
     }
 
     /// Reply `{}` to a server-initiated request ("a client is handling this").
@@ -870,11 +1091,49 @@ pub fn err_message(e: &J) -> String {
         .to_string()
 }
 
+/// Older Muse hosts do not know the 1.3.0 session-default method. Keep the
+/// existing per-turn reasoning path usable on those hosts.
+pub fn is_method_not_found(e: &J) -> bool {
+    matches!(e.get("code"), Some(J::Num(code)) if code == "-32601")
+        || e.get("data")
+            .and_then(|data| data.get("kind"))
+            .and_then(|kind| kind.as_str())
+            == Some("methodNotFound")
+        || err_message(e)
+            .to_ascii_lowercase()
+            .contains("method not found")
+}
+
 pub fn err_code(e: &J) -> i64 {
     e.get("code")
-        .and_then(|v| v.as_u64())
-        .map(|n| n as i64)
+        .and_then(|v| match v {
+            J::Num(n) => n.parse::<i64>().ok(),
+            _ => None,
+        })
         .unwrap_or(-32603)
+}
+
+/// Muse 1.3's typed error for a durable output reference that cannot be read.
+pub fn is_output_unavailable(error: &J) -> bool {
+    err_code(error) == -32041
+        || error
+            .get("data")
+            .and_then(|data| data.get("kind"))
+            .and_then(|kind| kind.as_str())
+            == Some("outputUnavailable")
+}
+
+/// Keep the host's typed availability facts intact when forwarding the error
+/// through ACP. Older hosts may omit the `kind`, so add it only in that case.
+pub fn output_unavailable_data(error: &J) -> J {
+    let mut fields = match error.get("data") {
+        Some(J::Obj(values)) => values.clone(),
+        _ => Vec::new(),
+    };
+    if !fields.iter().any(|(key, _)| key == "kind") {
+        fields.push(("kind".to_string(), J::Str("outputUnavailable".to_string())));
+    }
+    J::Obj(fields)
 }
 
 fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender<MspEvent>) {
@@ -921,6 +1180,8 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
                 host.reply_ok(idv);
                 let params = msg.get("params").cloned().unwrap_or(J::Null);
                 if tx.send(MspEvent::Request { method, params }).is_err() {
+                    host.fail_pending("serve event loop closed");
+                    host.shutdown();
                     break;
                 }
                 continue;
@@ -954,6 +1215,8 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
             trace_method("msp<-host", &method);
             let params = msg.get("params").cloned().unwrap_or(J::Null);
             if tx.send(MspEvent::Notification { method, params }).is_err() {
+                host.fail_pending("serve event loop closed");
+                host.shutdown();
                 break;
             }
         }
@@ -965,6 +1228,7 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
 /// receiver asleep until the full command timeout, delaying exit
 /// classification and durable-host recovery decisions.
 fn host_closed(host: &MspHost, tx: &Sender<MspEvent>, reason: &str) {
+    host.writer.lock().unwrap_or_else(|p| p.into_inner()).take();
     let _pending = host
         .pending
         .lock()
@@ -1081,8 +1345,12 @@ mod tests {
         assert_eq!(t("initialize"), Duration::from_millis(30_000));
         assert_eq!(t("session/resume"), Duration::from_millis(180_000));
         assert_eq!(t("view/page"), Duration::from_millis(180_000));
+        assert_eq!(t("view/subscribe"), Duration::from_millis(30_000));
         assert_eq!(t("model/list"), Duration::from_millis(30_000));
         assert_eq!(t("approval/decide"), Duration::from_millis(30_000));
+        assert_eq!(t("item/readOutput"), Duration::from_millis(30_000));
+        assert_eq!(t("task/stop"), Duration::from_millis(30_000));
+        assert_eq!(t("task/stopAll"), Duration::from_millis(30_000));
         assert_eq!(t("turn/start"), Duration::from_millis(60_000));
         assert_eq!(t("future/method"), Duration::from_millis(60_000));
     }
@@ -1117,6 +1385,22 @@ mod tests {
         );
         assert_eq!(session_suffix(r#"{"commandId":"c"}"#), "");
         assert_eq!(session_suffix("not json"), "");
+    }
+
+    #[test]
+    fn output_unavailable_preserves_negative_code_and_data() {
+        let error = crate::json::parse_json(
+            r#"{"code":-32041,"message":"missing","data":{"kind":"outputUnavailable","availability":"missing","itemId":"item-1","outputRef":"out-1"}}"#,
+        )
+        .expect("error JSON");
+        assert_eq!(super::err_code(&error), -32041);
+        assert!(super::is_output_unavailable(&error));
+        assert_eq!(
+            super::output_unavailable_data(&error)
+                .get("outputRef")
+                .and_then(|value| value.as_str()),
+            Some("out-1")
+        );
     }
 }
 
@@ -1198,5 +1482,20 @@ mod authentication_tests {
         assert!(
             turn_auth_diagnostic("Muse session has expired", "environmentError", &host).is_some()
         );
+    }
+
+    #[test]
+    fn stable_auth_required_turn_kind_always_gets_muse_login_guidance() {
+        let host = HandshakeInfo::default();
+        let detail = turn_auth_diagnostic(
+            "provider rejected the session token: secret-sentinel",
+            "authRequired",
+            &host,
+        )
+        .expect("authRequired is an authoritative Muse auth failure");
+        assert!(detail.contains("Muse is not authenticated"), "{detail}");
+        assert!(detail.contains("muse login"), "{detail}");
+        assert!(detail.contains("restart"), "{detail}");
+        assert!(!detail.contains("secret-sentinel"), "{detail}");
     }
 }
