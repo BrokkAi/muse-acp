@@ -351,6 +351,9 @@ impl MspHost {
     /// individual admission timeout even though the connection is already
     /// known to be dead.
     fn fail_pending(&self, reason: &str) {
+        // Reject new commands before draining waiters. Otherwise a command
+        // can be queued between the drain and shutdown after stdout is gone.
+        self.writer.lock().unwrap_or_else(|p| p.into_inner()).take();
         let waiters = self
             .pending
             .lock()
