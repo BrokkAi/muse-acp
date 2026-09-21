@@ -1529,6 +1529,76 @@ fn session_resume_without_cwd_reconnects() {
 }
 
 #[test]
+fn live_session_rename_updates_the_acp_title() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("rename_live", &[]);
+        let sid = c.new_session(ver, "");
+        let renamed = c.wait_for("\"title\":\"Renamed elsewhere\"", Duration::from_secs(15));
+        assert!(
+            renamed.contains("\"sessionUpdate\":\"session_info_update\"") && renamed.contains(&sid),
+            "v{ver} live rename must reach ACP: {renamed}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn resume_restores_the_authoritative_session_name() {
+    for (scenario, expected) in [
+        ("rename_resume", "Renamed outside adapter"),
+        ("rename_snapshot", "Snapshot name"),
+    ] {
+        for (ver, method) in [(1, "session/load"), (2, "session/resume")] {
+            let mut c = Client::spawn(scenario, &[]);
+            let sid = c.new_session(ver, "");
+            let rid = c.req(method, &format!("{{\"sessionId\":\"{sid}\"}}"));
+            let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+            assert!(resumed.contains("\"result\""), "{method} failed: {resumed}");
+            let title = c.wait_for(
+                &format!("\"title\":\"{expected}\""),
+                Duration::from_secs(15),
+            );
+            assert!(
+                title.contains("\"sessionUpdate\":\"session_info_update\"") && title.contains(&sid),
+                "v{ver} {scenario} title update: {title}"
+            );
+            c.finish();
+        }
+    }
+}
+
+#[test]
+fn resume_clears_a_stale_title_when_the_host_reports_never_named() {
+    let mut c = Client::spawn("rename_clear", &[]);
+    let sid = c.new_session(1, "");
+    let rid = c.req("session/load", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(resumed.contains("\"result\""), "load failed: {resumed}");
+    let cleared = c.wait_for("\"title\":null", Duration::from_secs(15));
+    assert!(
+        cleared.contains("\"sessionUpdate\":\"session_info_update\"") && cleared.contains(&sid),
+        "resume must clear the old title: {cleared}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_list_surfaces_the_authoritative_session_name() {
+    let mut c = Client::spawn("rename_list", &[]);
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let lid = c.req("session/list", "{}");
+    let listed = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+    assert!(
+        listed.contains("\"sessionId\":\"msp-sess-1\"")
+            && listed.contains("\"title\":\"Listed name\""),
+        "list must carry the durable name as title: {listed}"
+    );
+    c.finish();
+}
+
+#[test]
 fn session_ids_survive_adapter_restart_and_import() {
     // A new adapter has no in-memory ACP -> MSP map. session/list must expose
     // the durable host id, and session/load must pass that same id to Muse.
