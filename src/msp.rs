@@ -227,9 +227,9 @@ pub fn describe_spawn_error(bin: &str, e: &std::io::Error) -> String {
     }
 }
 
-/// MSP v1 has no auth method or stable auth error kind. Match explicit login
-/// diagnostics only; a bare 401/403 or permission denial may belong to a tool.
-/// Never echo raw authentication errors: they can contain credentials.
+/// Match explicit login diagnostics in free-text host errors; a bare 401/403
+/// or permission denial may belong to a tool. Never echo raw authentication
+/// errors: they can contain credentials.
 pub fn auth_failure(message: &str) -> Option<&'static str> {
     let lower = message.to_ascii_lowercase();
     if [
@@ -279,13 +279,20 @@ pub fn auth_diagnostic(message: &str, host: &HandshakeInfo) -> Option<String> {
 }
 
 /// Turn failures can describe tools and other services used by the model.
-/// Generic auth text is attributable to Muse only for model failures; other
-/// failure classes need to name Muse explicitly so service guidance survives.
+/// The stable MSP 1.3.0 `authRequired` kind is authoritative; older hosts
+/// still need explicit Muse wording (or the model-error default) so service
+/// authentication failures keep their own diagnostic.
 pub fn turn_auth_diagnostic(
     message: &str,
     error_kind: &str,
     host: &HandshakeInfo,
 ) -> Option<String> {
+    if error_kind == "authRequired" {
+        // The kind itself is the authentication signal, so do not depend on
+        // the host's free-text detail containing a recognizable phrase. Use
+        // the same redacted guidance as other Muse auth failures.
+        return auth_diagnostic("authentication required", host);
+    }
     if error_kind != "modelError" && !message.to_ascii_lowercase().contains("muse") {
         return None;
     }
@@ -992,5 +999,20 @@ mod authentication_tests {
         assert!(
             turn_auth_diagnostic("Muse session has expired", "environmentError", &host).is_some()
         );
+    }
+
+    #[test]
+    fn stable_auth_required_turn_kind_always_gets_muse_login_guidance() {
+        let host = HandshakeInfo::default();
+        let detail = turn_auth_diagnostic(
+            "provider rejected the session token: secret-sentinel",
+            "authRequired",
+            &host,
+        )
+        .expect("authRequired is an authoritative Muse auth failure");
+        assert!(detail.contains("Muse is not authenticated"), "{detail}");
+        assert!(detail.contains("muse login"), "{detail}");
+        assert!(detail.contains("restart"), "{detail}");
+        assert!(!detail.contains("secret-sentinel"), "{detail}");
     }
 }

@@ -300,10 +300,11 @@ and prompt rejections use ACP's `-32000` authentication-required error instead
 of a generic internal error. Mid-turn failures use that error in ACP v1 and an
 explanatory transcript message in v2, whose prompt has already been accepted.
 Raw recognized authentication error text is omitted because it may contain
-credentials. Generic HTTP 401/403, permission errors, and unknown host errors
-are not enough to identify a Muse login failure. MSP v1 defines no stable auth
-error category, so recognition is best-effort based on explicit login/expiry
-wording; an unexplained host error still needs investigation.
+credentials. MSP 1.3.0's `TurnErrorKind.authRequired` is treated as an
+authoritative Muse login failure. Older hosts without that kind still require
+explicit login/expiry wording; generic HTTP 401/403, permission errors, and
+unknown host errors are not enough to identify a Muse login failure, so an
+unexplained host error still needs investigation.
 
 Run `muse login` with the executable selected by `MUSE_CLI`, then restart the
 editor agent and retry. For SSH, containers, remote IDE backends, or another OS

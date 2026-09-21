@@ -4411,6 +4411,46 @@ fn expired_authentication_mid_turn_surfaces_in_both_protocols() {
 }
 
 #[test]
+fn auth_required_turn_kind_surfaces_relogin_guidance_in_both_protocols() {
+    for version in [1, 2] {
+        let mut c = Client::spawn(
+            "failed",
+            &[
+                ("FAKE_TURN_ERROR_KIND", "authRequired"),
+                (
+                    "FAKE_TURN_ERROR_MESSAGE",
+                    "provider rejected the session token: secret-sentinel",
+                ),
+                ("FAKE_TURN_ERROR_RETRYABLE", "false"),
+            ],
+        );
+        let sid = c.new_session(version, "");
+        let id = c.prompt(&sid, "hi");
+        let frame = if version == 1 {
+            c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15))
+        } else {
+            c.wait_for("Muse is not authenticated", Duration::from_secs(15))
+        };
+        assert!(
+            frame.contains("Muse is not authenticated")
+                && frame.contains("muse login")
+                && frame.contains(fixture_name()),
+            "{frame}"
+        );
+        assert!(
+            !frame.contains("secret-sentinel") && !frame.contains("terminal 'failed'"),
+            "raw auth detail or generic failure leaked: {frame}"
+        );
+        if version == 1 {
+            assert!(frame.contains("\"code\":-32000"), "{frame}");
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        c.finish();
+    }
+}
+
+#[test]
 fn external_authentication_failure_mid_turn_keeps_service_context() {
     for version in [1, 2] {
         let mut c = Client::spawn(
