@@ -14,14 +14,14 @@ mod zed;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
     mpsc,
 };
 
-use acp::{AcpSession, InFlight, PendingPerm, Sessions, StdoutShared};
+use acp::{AcpSession, FileChangeReport, InFlight, PendingPerm, Sessions, StdoutShared};
 use fold::SessionFold;
 use json::{J, esc, j_to_string, mint_id, parse_json};
 use msp::{MspEvent, MspHost, err_code, err_message, log};
@@ -33,6 +33,13 @@ static NATIVE_SUBAGENTS: AtomicU64 = AtomicU64::new(0); // 1 when subagent sessi
 static AIR_ASYNC_TASKS: AtomicU64 = AtomicU64::new(0); // 1 when the client wants async-task updates
 static AIR_RECOMMENDED: AtomicU64 = AtomicU64::new(0); // 1 when the client wants recommendedValue metadata
 static READ_OUTPUT: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates stored-output reads
+static AIR_FILE_REPORT: AtomicU64 = AtomicU64::new(0); // 1 when per-turn file reports are negotiated
+
+const FILE_REPORT_MAX_PATHS: usize = 1024;
+const FILE_REPORT_MAX_PATH_LENGTH: usize = 4096;
+// Leave room inside AIR's 256 KiB report-object limit for fixed fields and the
+// bounded request id. Count JSON-escaped path bytes, not raw path bytes.
+const FILE_REPORT_MAX_ENCODED_PATH_BYTES: usize = 255 * 1024;
 
 /// True when the client's `_meta.jetbrains.air.capabilities` advertises a key.
 fn client_supports_air(capabilities: Option<&J>, key: &str) -> bool {
@@ -90,6 +97,216 @@ fn client_supports_read_output(capabilities: Option<&J>) -> bool {
             _ => false,
         })
         .unwrap_or(false)
+}
+
+/// Parse the request-scoped AIR v1 file report opt-in. Invalid metadata is
+/// ignored; an extension must never affect an ordinary ACP prompt.
+fn file_report_request(params: Option<&J>) -> Option<String> {
+    if AIR_FILE_REPORT.load(Ordering::SeqCst) == 0 {
+        return None;
+    }
+    let request = params?
+        .get("_meta")?
+        .get("jetbrains")?
+        .get("air")?
+        .get("agentFileChangeReportRequest")?;
+    let J::Obj(fields) = request else {
+        return None;
+    };
+    if fields.len() != 2 || request.get("version").and_then(J::as_u64) != Some(1) {
+        return None;
+    }
+    let id = request.get("requestId").and_then(J::as_str)?;
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn new_file_report(request_id: String) -> FileChangeReport {
+    FileChangeReport {
+        request_id,
+        paths: Vec::new(),
+        seen_paths: std::collections::HashSet::new(),
+        seen_items: std::collections::HashSet::new(),
+        encoded_path_bytes: 0,
+        declared_complete: true,
+        truncated: false,
+    }
+}
+
+/// Resolve a host-reported path without touching the filesystem. The AIR
+/// report is workspace-scoped and path-only, so deleted and binary files are
+/// safe. Parent traversal and paths outside the session cwd are rejected.
+fn normalize_file_report_path(cwd: &str, raw: &str) -> Option<String> {
+    if raw.is_empty()
+        || raw.len() > FILE_REPORT_MAX_PATH_LENGTH
+        || raw.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let cwd = Path::new(cwd);
+    if !cwd.is_absolute() {
+        return None;
+    }
+    let candidate = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        cwd.join(raw)
+    };
+    let mut normalized = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized == cwd || !normalized.starts_with(cwd) {
+        return None;
+    }
+    normalized.to_str().map(str::to_string)
+}
+
+fn tool_args(item: &J) -> Option<J> {
+    match item.get("args")? {
+        J::Obj(_) => item.get("args").cloned(),
+        J::Str(raw) => parse_json(raw).ok(),
+        _ => None,
+    }
+}
+
+/// Fold one authoritative, successful MSP tool completion into its turn's
+/// requested report. Exact native write tools provide explicit path fields.
+/// Other successful tools make completeness uncertain but never create a
+/// guessed path (notably shell redirections and generators).
+fn observe_file_change(sessions: &Sessions, acp_sid: &str, item: &J) {
+    let kind = item.get("kind").and_then(J::as_str).unwrap_or("");
+    let delegated = matches!(kind, "subagent" | "workflow" | "userShell");
+    if !delegated
+        && (kind != "toolCall" || item.get("status").and_then(J::as_str) != Some("completed"))
+    {
+        return;
+    }
+    let Some(turn_id) = item.get("turnId").and_then(J::as_str) else {
+        return;
+    };
+    let item_id = item.get("itemId").and_then(J::as_str).unwrap_or("");
+    let tool = if delegated { None } else { item.get("tool") }
+        .and_then(J::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let args = tool_args(item);
+    let path_groups: &[&[&str]] = match tool.as_str() {
+        "write_file" | "create_file" | "edit_file" | "delete_file" | "remove_file" => {
+            &[&["path", "filePath"]]
+        }
+        "move_file" | "rename_file" => &[
+            &["oldPath", "from", "sourcePath"],
+            &["newPath", "to", "destinationPath"],
+        ],
+        // These known host tools do not write workspace files.
+        "read_file" | "list_files" | "search" | "request_user_input" => &[],
+        _ => {
+            let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(report) = map
+                .get_mut(acp_sid)
+                .and_then(|s| s.in_flight.iter_mut().find(|f| f.msp_turn == turn_id))
+                .and_then(|f| f.file_report.as_mut())
+            {
+                report.declared_complete = false;
+            }
+            return;
+        }
+    };
+    if path_groups.is_empty() {
+        return;
+    }
+    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(session) = map.get_mut(acp_sid) else {
+        return;
+    };
+    let cwd = session.cwd.clone();
+    let Some(report) = session
+        .in_flight
+        .iter_mut()
+        .find(|f| f.msp_turn == turn_id)
+        .and_then(|f| f.file_report.as_mut())
+    else {
+        return;
+    };
+    if item_id.is_empty() || !report.seen_items.insert(item_id.to_string()) {
+        return;
+    }
+    let Some(args) = args else {
+        report.declared_complete = false;
+        return;
+    };
+    for keys in path_groups {
+        let Some(raw) = keys
+            .iter()
+            .find_map(|key| args.get(key).and_then(J::as_str))
+        else {
+            report.declared_complete = false;
+            continue;
+        };
+        let Some(path) = normalize_file_report_path(&cwd, raw) else {
+            report.declared_complete = false;
+            continue;
+        };
+        if report.seen_paths.contains(&path) {
+            continue;
+        }
+        let encoded_bytes = esc(&path).len() + usize::from(!report.paths.is_empty());
+        if report.paths.len() >= FILE_REPORT_MAX_PATHS
+            || report.encoded_path_bytes.saturating_add(encoded_bytes)
+                > FILE_REPORT_MAX_ENCODED_PATH_BYTES
+        {
+            report.truncated = true;
+            report.declared_complete = false;
+            continue;
+        }
+        report.seen_paths.insert(path.clone());
+        report.paths.push(path);
+        report.encoded_path_bytes += encoded_bytes;
+    }
+}
+
+fn send_file_report(stdout: &StdoutShared, acp_sid: &str, report: FileChangeReport) {
+    let paths = report
+        .paths
+        .iter()
+        .map(|path| esc(path))
+        .collect::<Vec<_>>()
+        .join(",");
+    let value = format!(
+        "{{\"version\":1,\"requestId\":{},\"status\":\"reported\",\"paths\":[{}],\"declaredComplete\":{},\"truncated\":{}}}",
+        esc(&report.request_id),
+        paths,
+        report.declared_complete,
+        report.truncated,
+    );
+    let update = "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"agentFileChangeReport\":".to_string()
+        + &value
+        + "}}}}";
+    let line = "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":"
+        .to_string()
+        + &esc(acp_sid)
+        + ",\"update\":"
+        + &update
+        + "}}";
+    acp::send_raw(stdout, &line);
 }
 /// Last successful model catalog, used only when a refresh fails.
 /// Rows are (modelId, displayLabel, isDefault).
@@ -550,12 +767,12 @@ enum LoopMsg {
 }
 
 fn v2_init() -> String {
-    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},"fork":{},"subagents":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":[],"_meta":{"muse":{"capabilities":["readOutput"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
+    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":[],"_meta":{"muse":{"capabilities":["readOutput"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
 }
 
 fn v1_init() -> String {
-    r#"{"protocolVersion":1,"authMethods":[],"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{}},"_meta":{"muse":{"capabilities":["readOutput"]},"jetbrains":{"air":{"version":1,"capabilities":["nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__}}"#
+    r#"{"protocolVersion":1,"authMethods":[],"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}},"_meta":{"muse":{"capabilities":["readOutput"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
 }
 
@@ -564,6 +781,57 @@ fn has_nonempty_array(params: Option<&J>, key: &str) -> bool {
         params.and_then(|p| p.get(key)),
         Some(J::Arr(values)) if !values.is_empty()
     )
+}
+
+/// Validate and assemble ACP's ordered effective workspace root set. `cwd`
+/// remains first and is the base for relative paths. Exact duplicate strings
+/// are removed without canonicalizing here; access checks canonicalize both
+/// the requested path and every root so symlinks cannot widen the boundary.
+fn additional_directories(params: Option<&J>) -> Result<Vec<String>, String> {
+    let mut roots = Vec::new();
+    let Some(value) = params.and_then(|p| p.get("additionalDirectories")) else {
+        return Ok(roots);
+    };
+    let J::Arr(additional) = value else {
+        return Err("params.additionalDirectories must be an array of absolute paths".to_string());
+    };
+    for value in additional {
+        let Some(path) = value.as_str() else {
+            return Err("params.additionalDirectories entries must be absolute paths".to_string());
+        };
+        if path.is_empty() || !Path::new(path).is_absolute() {
+            return Err("params.additionalDirectories entries must be absolute paths".to_string());
+        }
+        if !roots.iter().any(|root| root == path) {
+            roots.push(path.to_string());
+        }
+    }
+    Ok(roots)
+}
+
+fn session_roots(params: Option<&J>, cwd: &str) -> Result<Vec<String>, String> {
+    let mut roots = vec![cwd.to_string()];
+    for path in additional_directories(params)? {
+        if !roots.iter().any(|root| root == &path) {
+            roots.push(path);
+        }
+    }
+    Ok(roots)
+}
+
+fn same_workspace_root(left: &str, right: &str) -> bool {
+    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn same_workspace_roots(left: &[String], right: &[String]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(a, b)| same_workspace_root(a, b))
 }
 
 fn ignore_client_mcp_servers(params: Option<&J>) {
@@ -588,13 +856,8 @@ fn validate_session_roots(stdout: &StdoutShared, id: &Option<J>, params: Option<
     // forwarded today; tolerate and ignore them instead of aborting the whole
     // session before its config options can be returned.
     ignore_client_mcp_servers(params);
-    if has_nonempty_array(params, "additionalDirectories") {
-        acp::send_error(
-            stdout,
-            id,
-            -32602,
-            "additional directories are not supported",
-        );
+    if let Err(message) = session_roots(params, cwd) {
+        acp::send_error(stdout, id, -32602, &message);
         return false;
     }
     true
@@ -929,6 +1192,7 @@ fn restart_durable_host(
                                     {
                                         s.model_value = model.to_string();
                                     }
+                                    reconcile_active_tasks(stdout, s, &r, false);
                                 }
                             }
                             // Prompts whose turns no longer exist in the
@@ -1059,6 +1323,7 @@ fn main() {
                 }
             }
             LoopMsg::AcpEof => {
+                host.shutdown();
                 std::process::exit(0);
             }
             LoopMsg::Msp(MspEvent::Eof(why)) => {
@@ -1233,11 +1498,16 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             AIR_RECOMMENDED.store(u64::from(recommended), Ordering::SeqCst);
             let read_output = client_supports_read_output(air_caps);
             READ_OUTPUT.store(u64::from(read_output), Ordering::SeqCst);
+            let file_report = client_supports_air(air_caps, "agentFileChangeReport");
+            AIR_FILE_REPORT.store(u64::from(file_report), Ordering::SeqCst);
             if async_tasks {
                 log("client negotiated AIR async-task updates");
             }
             if recommended {
                 log("client negotiated AIR recommended config values");
+            }
+            if file_report {
+                log("client negotiated AIR per-turn file-change reports");
             }
             if subagents {
                 log("client negotiated native subagent sessions");
@@ -1262,6 +1532,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let roots = session_roots(params.as_ref(), &cwd)
+                .expect("session roots were validated before starting the session");
             // Optional approval posture, applied atomically at start: an
             // operator-specified posture must not silently fall back.
             let mode_env = std::env::var("MUSE_APPROVAL_MODE").unwrap_or_default();
@@ -1294,6 +1566,20 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             );
             match res {
                 Ok(r) => {
+                    if let Some(host_root) = r
+                        .get("session")
+                        .and_then(|s| s.get("workspaceRoot"))
+                        .and_then(|v| v.as_str())
+                        && !same_workspace_root(&cwd, host_root)
+                    {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32603,
+                            "session/start returned a different workspace root",
+                        );
+                        return;
+                    }
                     let msp_sid = match r
                         .get("session")
                         .and_then(|s| s.get("sessionId"))
@@ -1365,6 +1651,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             acp_sid: sid.clone(),
                             msp_sid: msp_sid.clone(),
                             cwd: cwd.clone(),
+                            roots: roots.clone(),
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
@@ -1455,13 +1742,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 }
             }
             ignore_client_mcp_servers(params.as_ref());
-            if has_nonempty_array(params.as_ref(), "additionalDirectories") {
-                acp::send_error(
-                    stdout,
-                    &id,
-                    -32602,
-                    "additional directories are not supported",
-                );
+            if let Err(message) = additional_directories(params.as_ref()) {
+                acp::send_error(stdout, &id, -32602, &message);
                 return;
             }
             let resume_cwd = params
@@ -1543,14 +1825,35 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let host_cwd = r
+                        .get("session")
+                        .and_then(|s| s.get("workspaceRoot"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !resume_cwd.is_empty()
+                        && !host_cwd.is_empty()
+                        && !same_workspace_root(&resume_cwd, &host_cwd)
+                    {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32602,
+                            "params.cwd does not match the resumed session workspace",
+                        );
+                        return;
+                    }
                     let restored_cwd = if resume_cwd.is_empty() {
-                        r.get("session")
-                            .and_then(|s| s.get("workspaceRoot"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string()
+                        host_cwd
                     } else {
                         resume_cwd.clone()
+                    };
+                    let roots = match session_roots(params.as_ref(), &restored_cwd) {
+                        Ok(roots) => roots,
+                        Err(message) => {
+                            acp::send_error(stdout, &id, -32602, &message);
+                            return;
+                        }
                     };
                     // v1 session/load always replays; v2 resumes replay only
                     // with replayFrom; v1 session/resume reconnects silently.
@@ -1564,6 +1867,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             acp_sid: sid.clone(),
                             msp_sid: real_msp.clone(),
                             cwd: restored_cwd.clone(),
+                            roots: roots.clone(),
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
@@ -1593,6 +1897,10 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         if !restored_cwd.is_empty() {
                             entry.cwd = restored_cwd;
                         }
+                        // Resume/load roots are request-scoped. Omitting the
+                        // additional list explicitly drops previously active
+                        // extra roots instead of silently restoring access.
+                        entry.roots = roots;
                         if !real_model.is_empty() {
                             entry.model_value = real_model;
                         }
@@ -1661,6 +1969,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         if replay {
                             replay_history(stdout, entry, &r);
                         }
+                        reconcile_active_tasks(stdout, entry, &r, replay);
                         acp::send_usage(stdout, entry, pressure.as_deref());
                     }
                     // One-to-one with the folded active/queued turns, or an
@@ -1767,13 +2076,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 return;
             }
             ignore_client_mcp_servers(params.as_ref());
-            if has_nonempty_array(params.as_ref(), "additionalDirectories") {
-                acp::send_error(
-                    stdout,
-                    &id,
-                    -32602,
-                    "additional directories are not supported",
-                );
+            if let Err(message) = additional_directories(params.as_ref()) {
+                acp::send_error(stdout, &id, -32602, &message);
                 return;
             }
             // Resolve the source MSP session: known ACP session first, then
@@ -1828,14 +2132,34 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    let host_cwd = new_session
+                        .get("workspaceRoot")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if !fork_cwd.is_empty()
+                        && !host_cwd.is_empty()
+                        && !same_workspace_root(&fork_cwd, &host_cwd)
+                    {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32602,
+                            "params.cwd does not match the forked session workspace",
+                        );
+                        return;
+                    }
                     let restored_cwd = if fork_cwd.is_empty() {
-                        new_session
-                            .get("workspaceRoot")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("")
-                            .to_string()
+                        host_cwd
                     } else {
                         fork_cwd.clone()
+                    };
+                    let roots = match session_roots(params.as_ref(), &restored_cwd) {
+                        Ok(roots) => roots,
+                        Err(message) => {
+                            acp::send_error(stdout, &id, -32602, &message);
+                            return;
+                        }
                     };
                     let mut mode_value = "promptUnmatched".to_string();
                     if let Some(m) = host_mode(&r) {
@@ -1847,6 +2171,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             acp_sid: new_msp.clone(),
                             msp_sid: new_msp.clone(),
                             cwd: restored_cwd.clone(),
+                            roots: roots.clone(),
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
@@ -1873,9 +2198,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         });
                         entry.msp_sid = new_msp.clone();
                         entry.ver = ver;
-                        if !restored_cwd.is_empty() {
-                            entry.cwd = restored_cwd;
-                        }
+                        entry.cwd = restored_cwd;
+                        entry.roots = roots;
                         if !new_model.is_empty() {
                             entry.model_value = new_model;
                         }
@@ -1932,17 +2256,18 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
         }
         "session/prompt" => {
             let ver = negotiated_ver();
+            let report_request = file_report_request(params.as_ref());
             let sid = params
                 .as_ref()
                 .and_then(|p| p.get("sessionId"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let (msp_sid, cwd, reasoning_effort, pending_approval) =
+            let (msp_sid, roots, reasoning_effort, pending_approval) =
                 match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
                     Some(s) => (
                         s.msp_sid.clone(),
-                        s.cwd.clone(),
+                        s.roots.clone(),
                         s.reasoning_effort.clone(),
                         s.pending_perm
                             .as_ref()
@@ -1979,7 +2304,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 );
                 return;
             }
-            let (parts, acp_content) = match extract_prompt_parts(params.as_ref(), &cwd) {
+            let (parts, acp_content) = match extract_prompt_parts(params.as_ref(), &roots) {
                 Ok((p, c)) if !p.is_empty() => (p, c),
                 Ok(_) => {
                     acp::send_error(stdout, &id, -32602, "session/prompt requires content");
@@ -2084,6 +2409,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         s.in_flight.push(InFlight {
                             msp_turn: turn.clone(),
                             req_id: id.clone().unwrap_or(J::Null),
+                            file_report: report_request.map(new_file_report),
                         });
                         if started {
                             s.active_turn = Some(turn);
@@ -2270,11 +2596,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let (msp_sid, cwd, reasoning_effort, active_turn, pending_approval) =
+            let (msp_sid, roots, reasoning_effort, active_turn, pending_approval) =
                 match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
                     Some(s) => (
                         s.msp_sid.clone(),
-                        s.cwd.clone(),
+                        s.roots.clone(),
                         s.reasoning_effort.clone(),
                         s.active_turn.clone(),
                         s.pending_perm.is_some() || !s.perm_queue.is_empty(),
@@ -2299,7 +2625,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 );
                 return;
             }
-            let (parts, acp_content) = match extract_prompt_parts(params.as_ref(), &cwd) {
+            let (parts, acp_content) = match extract_prompt_parts(params.as_ref(), &roots) {
                 Ok((parts, content)) if !parts.is_empty() => (parts, content),
                 Ok(_) => {
                     acp::send_error(stdout, &id, -32602, "steering requires content");
@@ -2409,6 +2735,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 s.in_flight.push(InFlight {
                     msp_turn: turn,
                     req_id: J::Null,
+                    file_report: None,
                 });
             }
             // Acknowledge the extension before emitting the synthetic echo.
@@ -2546,6 +2873,20 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            let filter_additional = match additional_directories(params.as_ref()) {
+                Ok(mut roots) => {
+                    // session/new removes an exact duplicate of cwd from the
+                    // effective additional roots. Apply the same
+                    // normalization to list filters so callers can reuse the
+                    // accepted creation parameters.
+                    roots.retain(|root| !same_workspace_root(root, &filter_root));
+                    roots
+                }
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
             let cmd = host.mint_cmd("cmd-");
             let mut host_params = format!("{{\"commandId\":{},\"limit\":200", esc(&cmd));
             if !filter_root.is_empty() {
@@ -2553,21 +2894,52 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             }
             host_params.push('}');
             // Snapshot adapter state without holding the lock across the host call.
-            let owned: Vec<(String, String)> = sessions
+            let owned: Vec<(String, String, Vec<String>)> = sessions
                 .lock()
                 .unwrap()
                 .values()
-                .map(|s| (s.msp_sid.clone(), s.cwd.clone()))
+                .filter(|s| filter_root.is_empty() || same_workspace_root(&s.cwd, &filter_root))
+                .filter(|s| {
+                    filter_additional.is_empty()
+                        || same_workspace_roots(
+                            s.roots.get(1..).unwrap_or_default(),
+                            &filter_additional,
+                        )
+                })
+                .map(|s| {
+                    (
+                        s.msp_sid.clone(),
+                        s.cwd.clone(),
+                        s.roots.get(1..).unwrap_or_default().to_vec(),
+                    )
+                })
                 .collect();
             match host.command("session/list", &host_params) {
                 Ok(r) => {
                     let owned_msp: std::collections::HashSet<&str> =
-                        owned.iter().map(|(m, _)| m.as_str()).collect();
+                        owned.iter().map(|(m, _, _)| m.as_str()).collect();
                     let mut entries: Vec<String> = owned
                         .iter()
-                        .map(|(m, c)| format!("{{\"sessionId\":{},\"cwd\":{}}}", esc(m), esc(c)))
+                        .map(|(m, c, additional)| {
+                            let additional = additional
+                                .iter()
+                                .map(|root| esc(root))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            format!(
+                                "{{\"sessionId\":{},\"cwd\":{},\"additionalDirectories\":[{}]}}",
+                                esc(m),
+                                esc(c),
+                                additional
+                            )
+                        })
                         .collect();
-                    if let Some(J::Arr(items)) = r.get("sessions") {
+                    // MSP persists one workspaceRoot only. A non-empty ACP
+                    // additional-root filter therefore cannot match a host-
+                    // only session from a previous adapter process.
+                    if filter_additional.is_empty()
+                        && let Some(J::Arr(items)) = r.get("sessions")
+                    {
                         for item in items {
                             let msp_id =
                                 item.get("sessionId").and_then(|v| v.as_str()).unwrap_or("");
@@ -2603,7 +2975,19 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     log(&format!("session/list failed: {}", err_message(&e)));
                     let entries: Vec<String> = owned
                         .iter()
-                        .map(|(m, c)| format!("{{\"sessionId\":{},\"cwd\":{}}}", esc(m), esc(c)))
+                        .map(|(m, c, additional)| {
+                            let additional = additional
+                                .iter()
+                                .map(|root| esc(root))
+                                .collect::<Vec<_>>()
+                                .join(",");
+                            format!(
+                                "{{\"sessionId\":{},\"cwd\":{},\"additionalDirectories\":[{}]}}",
+                                esc(m),
+                                esc(c),
+                                additional
+                            )
+                        })
                         .collect();
                     acp::send_result(
                         stdout,
@@ -2890,6 +3274,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             if method == "shutdown" {
                 acp::send_result(stdout, &id, "null");
             }
+            host.shutdown();
             std::process::exit(0);
         }
         _ => {
@@ -2917,10 +3302,21 @@ fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) 
         let kind = it.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
             "toolCall" => {
-                // Fold replays the call (title/kind/status/args, no content).
-                let wrap = J::Obj(vec![("item".to_string(), it.clone())]);
-                sess.fold
-                    .on_item_completed(&sess.acp_sid, sess.ver, &wrap, &mut out);
+                // Fold terminal calls as completed history. A durable fold can
+                // also contain a still-running background call; snapshot it as
+                // active so its later completion is not mistaken for a replay.
+                let status = it.get("status").and_then(J::as_str).unwrap_or("");
+                if matches!(
+                    status,
+                    "completed" | "failed" | "rejected" | "cancelled" | "timedOut"
+                ) {
+                    let wrap = J::Obj(vec![("item".to_string(), it.clone())]);
+                    sess.fold
+                        .on_item_completed(&sess.acp_sid, sess.ver, &wrap, &mut out);
+                } else {
+                    sess.fold
+                        .on_item_snapshot(&sess.acp_sid, sess.ver, it, &mut out);
+                }
             }
             "userMessage" | "agentMessage" => {
                 let text = it.get("text").and_then(|v| v.as_str()).unwrap_or("");
@@ -2967,6 +3363,74 @@ fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) 
     }
 }
 
+/// Rebuild the observable AIR task set from the durable fold returned by
+/// `session/resume`. This runs even when ACP did not request transcript replay:
+/// a reconnecting editor still needs controls and status for work that remains
+/// active. Terminal history is deliberately ignored; live completion events
+/// settle tasks that this connection already announced.
+fn reconcile_active_tasks(
+    stdout: &StdoutShared,
+    sess: &mut AcpSession,
+    resume_res: &J,
+    replayed: bool,
+) {
+    if !sess.fold.air_async_tasks {
+        return;
+    }
+    let items = resume_res
+        .get("history")
+        .and_then(|h| h.get("items"))
+        .filter(|items| matches!(items, J::Arr(_)))
+        .or_else(|| snapshot_state(resume_res).and_then(|s| s.get("items")));
+    let Some(J::Arr(items)) = items else {
+        log("resume: no item fold available for active async-task reconciliation");
+        return;
+    };
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for item in items {
+        let item_id = item.get("itemId").and_then(J::as_str).unwrap_or("");
+        if item_id.is_empty() || !seen.insert(item_id) {
+            continue;
+        }
+        let status = item.get("status").and_then(J::as_str).unwrap_or("");
+        let terminal = matches!(
+            status,
+            "completed" | "failed" | "rejected" | "cancelled" | "timedOut"
+        );
+        let kind = item.get("kind").and_then(J::as_str).unwrap_or("");
+        let qualifies = kind == "userShell"
+            || (kind == "toolCall" && matches!(item.get("background"), Some(J::Bool(true))));
+        if !qualifies {
+            continue;
+        }
+        if terminal {
+            // On an in-process host restart, consume a durable terminal for a
+            // task this editor already saw. A fresh adapter has an empty set,
+            // so old completed history does not flood the Async Tasks panel.
+            let task_id = if kind == "userShell" {
+                format!("shell-{item_id}")
+            } else {
+                item.get("callId")
+                    .and_then(J::as_str)
+                    .unwrap_or("")
+                    .to_string()
+            };
+            if sess.fold.announced_tasks.contains(&task_id) {
+                let wrapped = J::Obj(vec![("item".to_string(), item.clone())]);
+                sess.fold
+                    .on_item_completed(&sess.acp_sid, sess.ver, &wrapped, &mut out);
+            }
+        } else if !replayed || !sess.fold.has_active_item(item_id) {
+            sess.fold
+                .on_item_snapshot(&sess.acp_sid, sess.ver, item, &mut out);
+        }
+    }
+    for line in out {
+        acp::send_raw(stdout, &line);
+    }
+}
+
 fn mime_for(path: &str) -> &'static str {
     let p = path.to_lowercase();
     if p.ends_with(".png") {
@@ -2997,7 +3461,10 @@ fn image_part(data_b64: &str, mime: &str) -> String {
 ///
 /// Returns `(msp_parts, acp_content)`: the host input and the accepted prompt
 /// re-serialized as ACP content for the user-message echo.
-fn extract_prompt_parts(params: Option<&J>, cwd: &str) -> Result<(Vec<String>, String), String> {
+fn extract_prompt_parts(
+    params: Option<&J>,
+    roots: &[String],
+) -> Result<(Vec<String>, String), String> {
     let p = params.ok_or("session/prompt requires params")?;
     let prompt = p.get("prompt").unwrap_or(p);
     let blocks: Vec<J> = match prompt {
@@ -3068,8 +3535,20 @@ fn extract_prompt_parts(params: Option<&J>, cwd: &str) -> Result<(Vec<String>, S
                         if uri.is_empty() {
                             return Err("resource_link block needs uri".to_string());
                         }
-                        match local_file_text(uri, Some(cwd)) {
-                            Some(text) if mime.starts_with("text/") || mime.is_empty() || looks_textual(uri) => {
+                        let textual = mime.starts_with("text/") || mime.is_empty() || looks_textual(uri);
+                        let local_text = if textual {
+                            local_file_text(uri, roots)?
+                        } else {
+                            // Validate local URI syntax without opening a
+                            // resource that was not identified as text.
+                            if uri.starts_with("file://") {
+                                let cwd = roots.first().map(String::as_str).unwrap_or("/");
+                                file_uri_path(uri, cwd)?;
+                            }
+                            None
+                        };
+                        match local_text {
+                            Some(text) => {
                                 texts.push(format!("[{name} {uri}]\n{text}"));
                             }
                             _ => {
@@ -3085,7 +3564,7 @@ fn extract_prompt_parts(params: Option<&J>, cwd: &str) -> Result<(Vec<String>, S
                             parts.push(image_part(d, mime));
                             content.push(j_to_string(b));
                         } else if let Some(uri) = b.get("uri").and_then(|v| v.as_str()) {
-                            let (bytes, mime) = read_image_uri(uri, Some(cwd))?;
+                            let (bytes, mime) = read_image_uri(uri, roots)?;
                             parts.push(image_part(&json::b64(&bytes), &mime));
                             content.push(j_to_string(b));
                         } else {
@@ -3149,7 +3628,7 @@ fn file_uri_path(uri: &str, cwd: &str) -> Result<String, String> {
         }
         None => return Err(format!("bad file URI {uri}")),
     };
-    let decoded = percent_decode(&path);
+    let decoded = percent_decode(&path)?;
     // Local Windows file URIs spell drive paths as /C:/path. The leading
     // URI slash is not part of the native absolute drive path.
     if cfg!(windows)
@@ -3166,23 +3645,26 @@ fn file_uri_path(uri: &str, cwd: &str) -> Result<String, String> {
     Ok(decoded)
 }
 
-fn percent_decode(s: &str) -> String {
+fn percent_decode(s: &str) -> Result<String, String> {
     let mut out = Vec::with_capacity(s.len());
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%'
-            && i + 2 < b.len()
-            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
-        {
+        if b[i] == b'%' {
+            if i + 2 >= b.len() {
+                return Err(format!("truncated percent escape in {s}"));
+            }
+            let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) else {
+                return Err(format!("invalid percent escape in {s}"));
+            };
             out.push(h << 4 | l);
             i += 3;
-            continue;
+        } else {
+            out.push(b[i]);
+            i += 1;
         }
-        out.push(b[i]);
-        i += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    String::from_utf8(out).map_err(|_| format!("file URI path is not valid UTF-8: {s}"))
 }
 
 fn hex(c: u8) -> Option<u8> {
@@ -3194,21 +3676,24 @@ fn hex(c: u8) -> Option<u8> {
     }
 }
 
-/// Confine a path to the session workspace unless explicitly opened up.
-fn confine(path: &str, cwd: &str) -> Result<(), String> {
-    if env_flag_enabled(std::env::var("MUSE_ALLOW_UNSCOPED_READS").ok().as_deref()) {
-        return Ok(());
-    }
+/// Resolve a path and confine it to the union of explicitly approved session
+/// roots. Returning the canonical path also avoids re-opening a final symlink
+/// after checking a different target.
+fn confined_path(path: &str, roots: &[String]) -> Result<std::path::PathBuf, String> {
     let canon = std::fs::canonicalize(path).map_err(|e| format!("cannot resolve {path}: {e}"))?;
-    let root =
-        std::fs::canonicalize(cwd).map_err(|e| format!("cannot resolve workspace {cwd}: {e}"))?;
-    if canon.starts_with(&root) {
-        Ok(())
-    } else {
-        Err(format!(
-            "{path} is outside the session workspace (set MUSE_ALLOW_UNSCOPED_READS=1 to allow)"
-        ))
+    if env_flag_enabled(std::env::var("MUSE_ALLOW_UNSCOPED_READS").ok().as_deref()) {
+        return Ok(canon);
     }
+    for root in roots {
+        if let Ok(root) = std::fs::canonicalize(root)
+            && canon.starts_with(root)
+        {
+            return Ok(canon);
+        }
+    }
+    Err(format!(
+        "{path} is outside all approved workspace roots (set MUSE_ALLOW_UNSCOPED_READS=1 to allow)"
+    ))
 }
 
 /// Explicit opt-in parser for security-sensitive environment flags. Merely
@@ -3238,26 +3723,41 @@ fn looks_textual(path: &str) -> bool {
         || p.ends_with(".log")
 }
 
-fn read_image_uri(uri: &str, cwd: Option<&str>) -> Result<(Vec<u8>, String), String> {
-    let path = file_uri_path(uri, cwd.unwrap_or("/"))?;
-    if let Some(c) = cwd {
-        confine(&path, c)?;
-    }
-    let bytes = std::fs::read(&path).map_err(|e| format!("cannot read image {path}: {e}"))?;
-    Ok((bytes, mime_for(&path).to_string()))
+fn read_image_uri(uri: &str, roots: &[String]) -> Result<(Vec<u8>, String), String> {
+    let cwd = roots.first().map(String::as_str).unwrap_or("/");
+    let requested = file_uri_path(uri, cwd)?;
+    let path = confined_path(&requested, roots)?;
+    let bytes =
+        std::fs::read(&path).map_err(|e| format!("cannot read image {}: {e}", path.display()))?;
+    Ok((bytes, mime_for(&requested).to_string()))
 }
 
 /// Read a small text file for resource_link inlining (None = mention only).
-fn local_file_text(uri: &str, cwd: Option<&str>) -> Option<String> {
-    let path = file_uri_path(uri, cwd.unwrap_or("/")).ok()?;
-    if let Some(c) = cwd {
-        confine(&path, c).ok()?;
+fn local_file_text(uri: &str, roots: &[String]) -> Result<Option<String>, String> {
+    if uri.contains("://") && !uri.starts_with("file://") {
+        return Ok(None);
     }
-    let meta = std::fs::metadata(&path).ok()?;
+    let cwd = roots.first().map(String::as_str).unwrap_or("/");
+    let requested = file_uri_path(uri, cwd)?;
+    let path = match confined_path(&requested, roots) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let meta = match std::fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(_) => return Ok(None),
+    };
     if meta.len() > 262144 {
-        return None;
+        return Ok(None);
     }
-    std::fs::read_to_string(&path).ok()
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(_) => return Ok(None),
+    };
+    Ok((!text
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t')))
+    .then_some(text))
 }
 
 // ---------------------------------------------------------------------------
@@ -3419,6 +3919,9 @@ fn handle_msp(
                             }
                         }
                     } else if let Some(J::Arr(items)) = r.get("items") {
+                        for item in items {
+                            observe_file_change(sessions, &acp_sid, item);
+                        }
                         for it in items.clone() {
                             let wrap = J::Obj(vec![("item".to_string(), it)]);
                             let mut out = Vec::new();
@@ -3485,6 +3988,7 @@ fn handle_msp(
                 .unwrap_or("");
             let item = params.get("item").cloned().unwrap_or(J::Null);
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                observe_file_change(sessions, &acp_sid, &item);
                 let mut out = Vec::new();
                 if let Some(s) = sessions
                     .lock()
@@ -3536,7 +4040,9 @@ fn handle_msp(
                     }
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id);
                     let ver = s.ver;
-                    let req_id = pos.map(|p| s.in_flight.remove(p).req_id);
+                    let finished = pos.map(|p| s.in_flight.remove(p));
+                    let req_id = finished.as_ref().map(|f| f.req_id.clone());
+                    let file_report = finished.and_then(|f| f.file_report);
                     let rest = s.in_flight.len();
                     // The turn's model-call legs, summed. Every completion's
                     // `session/tokenUsage` is folded from a durable record
@@ -3545,11 +4051,14 @@ fn handle_msp(
                     let usage = acp::take_turn_usage(s, turn_id)
                         .map(|u| u.result_member())
                         .unwrap_or_default();
-                    (req_id, ver, rest, usage)
+                    (req_id, ver, rest, usage, file_report)
                 });
-            if let Some((req_id, ver, rest, usage)) = settled {
+            if let Some((req_id, ver, rest, usage, file_report)) = settled {
                 let stop = fold::stop_reason(terminal);
                 let failed = terminal != "completed" && terminal != "cancelled";
+                if let Some(report) = file_report {
+                    send_file_report(stdout, &acp_sid, report);
+                }
                 if ver == 2 {
                     // A failed terminal otherwise surfaces as a bare idle
                     // with `_failed` and an empty transcript (the reported
