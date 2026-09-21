@@ -4107,7 +4107,7 @@ fn timed_out_pipe_write_cannot_be_delivered_later() {
     let mut c = Client::spawn("pipe_stall", &[]);
     let sid = c.new_session(1, "");
     c.wait_log("pipe-stall-start", Duration::from_secs(5));
-    let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"text","text":"x".repeat(1024 * 1024)}]});
+    let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"text","text":"x".repeat(128 * 1024)}]});
     let id = c.req("session/prompt", &params.to_string());
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(12));
     assert!(
