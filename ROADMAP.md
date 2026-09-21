@@ -466,6 +466,14 @@ surface.
 
 Provide an editor-friendly summary of files changed during a turn.
 
+Status: **implemented for authoritative native file tools.** After bilateral
+AIR v1 negotiation, a prompt-scoped request receives one correlated report at
+turn completion. Successful MSP `toolCall` records supply explicit paths;
+rejected calls are excluded, replayed item ids and paths are deduplicated, and
+shell or unknown tools make the report incomplete rather than causing path
+inference. Reports are path-only and bounded, so deletes and binary files do
+not require unsafe content reads.
+
 **Work items**
 
 - Identify the authoritative MSP source for changed paths. No dedicated

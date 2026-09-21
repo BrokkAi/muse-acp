@@ -10,6 +10,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   happy        agentMessage completion, then turn/completed(completed)
   failed       no message, then turn/completed(failed)
   tool         toolCall completion with result text, then completed
+  file_changes successful native file tools, including a replayed completion
+  file_changes_ambiguous a shell tool whose writes cannot be inferred safely
   approval     approval/requested notification (two choices), then completed
   approval_req approval/request server-initiated REQUEST (no notification)
   questions    userInput/requested with options, then completed
@@ -244,6 +246,41 @@ def on_turn_start(params):
             "itemId": "it-t1", "kind": "toolCall", "callId": "call-1",
             "status": "completed", "tool": "read",
             "args": {"path": "/tmp/x"}, "result": "file bytes"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "file_changes":
+        changes = [
+            ("it-add", "write_file", {"path": "added.bin"}),
+            ("it-edit", "edit_file", {"path": "src/edited.rs"}),
+            ("it-delete", "delete_file", {"path": "deleted.txt"}),
+            ("it-rename", "rename_file",
+             {"oldPath": "old.txt", "newPath": "new.txt"}),
+        ]
+        for item_id, tool, args in changes:
+            event = {**base, "item": {
+                "itemId": item_id, "kind": "toolCall", "callId": "call-" + item_id,
+                "turnId": tid, "status": "completed", "tool": tool,
+                "args": json.dumps(args)}}
+            notify("item/completed", event)
+            if item_id == "it-edit":
+                notify("item/completed", event)  # gap/resume replay
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-rejected", "kind": "toolCall", "callId": "call-no",
+            "turnId": tid, "status": "rejected", "tool": "write_file",
+            "args": json.dumps({"path": "not-written.txt"})}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "file_changes_subagent":
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-child", "kind": "subagent", "turnId": tid,
+            "status": "completed", "childSessionId": "child-session"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "file_changes_gap":
+        notify("view/gap", {**base, "viewCursor": "gap-cursor"})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "file_changes_ambiguous":
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-shell", "kind": "toolCall", "callId": "call-shell",
+            "turnId": tid, "status": "completed", "tool": "shell",
+            "args": json.dumps({"command": "printf data > inferred.txt"})}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO in ("approval", "pending_reconcile_dup"):
         notify("approval/requested", dict(APPROVAL_PARAMS))
@@ -666,6 +703,10 @@ def result_for(method, msg):
                 "pendingRequests": pending,
                 "history": history}
     if method == "view/page":
+        if SCENARIO == "file_changes_gap":
+            return {"items": [{"itemId": "gap-write", "kind": "toolCall",
+                "callId": "gap-call", "turnId": "turn-1", "status": "completed",
+                "tool": "write_file", "args": {"path": "gap-written.txt"}}]}
         page = msg.get("params", {})
         if SCENARIO == "usage_gap" and page.get("direction") != "backward":
             # Refill overlaps the live stream: cur-3 is in this page too.
