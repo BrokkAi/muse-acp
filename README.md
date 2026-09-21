@@ -213,17 +213,28 @@ the agent advertises no optional MCP transports (stdio, HTTP, and SSE are all
 reported unsupported). This adapter deliberately does not forward client MCP
 configuration:
 
-- Muse owns its tool runtime, approval flow, and sandbox; a forwarded client
-  server would run tools outside Muse's permission system.
-- MSP v1 has no method to register foreign tool providers, so any forwarding
-  would be an emulation rather than a protocol mapping.
-- Ignoring the configuration is logged (`ignoring client-provided MCP
-  servers`) so the absence of those tools is diagnosable rather than silent.
+- MSP 1.3.0 does expose a native session-scoped surface,
+  `SessionConfig.mcpServers`, with typed `SessionMcpServerConfig` entries and
+  the grantable `sessionMcp` capability. That is a protocol improvement, but
+  it is not by itself an authorization or lifecycle contract for forwarding an
+  ACP client's server definition. Muse still owns the tool runtime, approval
+  flow, and sandbox. Wire typing and validation prove the shape of a request,
+  not that the supplied server is allowed by those approval, sandbox, and
+  workspace policies.
+- This adapter does not negotiate `sessionMcp` or translate client-owned MCP
+  configuration into a Muse session. Forwarding would need to define required
+  versus optional startup failures, disconnects, and behavior across resume,
+  fork, and close while proving that every server and tool remains inside the
+  session workspace and Muse approval flow.
+- Ignoring the configuration cannot widen permissions or introduce a new MCP
+  process/connection. It is logged (`ignoring client-provided MCP servers`) so
+  the absence of those tools is diagnosable rather than silent.
 
 Their presence never blocks the session or its selectors. To use MCP tools,
 configure them in Muse itself; if MSP later gains a native foreign-tool
-surface that preserves Muse approvals and workspace confinement, this policy
-will be revisited.
+surface, this policy will be revisited only after the adapter negotiates the
+capability, uses an exact typed mapping, and has host-backed approval,
+workspace-confinement, lifecycle, failure, and regression-test guarantees.
 
 ## Run
 

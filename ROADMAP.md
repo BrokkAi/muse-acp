@@ -274,14 +274,16 @@ and browserless-login guidance.
 
 ### 7. Explicit client MCP policy
 
-Client MCP configuration is currently tolerated but not forwarded. This should
-be an explicit product decision.
+Client MCP configuration is tolerated but not forwarded under the explicit
+policy below.
 
 Status: **policy decided and documented.** Client MCP servers are tolerated
-but never forwarded: Muse owns the tool runtime, approvals, and sandbox, and
-MSP v1 exposes no foreign-tool registration. Every drop is logged, the README
-states the policy and its reasoning, and forwarding stays a non-goal until MSP
-offers a path that cannot widen permissions.
+but never forwarded. MSP 1.3.0 now exposes typed native session configuration
+(`SessionConfig.mcpServers`, gated by `sessionMcp`), but that wire surface does
+not by itself prove an ACP-to-Muse authorization, workspace-confinement, or
+lifecycle mapping. Every drop is logged, the README states the revised
+reasoning, and forwarding stays a non-goal until those guarantees are
+host-backed and tested.
 
 **Work items**
 

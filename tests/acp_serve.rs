@@ -1688,7 +1688,7 @@ fn legacy_set_mode_adopts_the_folded_host_mode() {
 }
 
 #[test]
-fn v1_jetbrains_mcp_attachment_does_not_hide_config_options() {
+fn v1_jetbrains_mcp_attachment_is_logged_and_not_forwarded() {
     let mut c = Client::spawn("quiet", &[]);
     let init = c.req("initialize", "{\"protocolVersion\":1}");
     let initialized = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
@@ -1720,6 +1720,20 @@ fn v1_jetbrains_mcp_attachment_does_not_hide_config_options() {
         "JetBrains-style session must return v1 selectors: {frame}"
     );
     c.wait_log("session/start", Duration::from_secs(15));
+    c.wait_stderr(
+        "ignoring client-provided MCP servers",
+        Duration::from_secs(15),
+    );
+    let host_frames =
+        std::fs::read_to_string(format!("{}.frames", c.fake_log)).expect("host frames");
+    let start = host_frames
+        .lines()
+        .find(|line| line.contains("\"method\": \"session/start\""))
+        .expect("session/start frame");
+    assert!(
+        !start.contains("\"mcpServers\"") && !start.contains("\"config\""),
+        "client MCP configuration must not cross the MSP boundary: {start}"
+    );
     c.finish();
 }
 
