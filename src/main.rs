@@ -2300,7 +2300,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     let only = &blocks[0];
                     let text = only.get("text").and_then(|v| v.as_str()).unwrap_or("");
                     (only.get("type").and_then(|v| v.as_str()) == Some("text")
-                        && text.trim() == "/compact")
+                        && text == "/compact")
                         .then_some(())
                 }
                 _ => None,
