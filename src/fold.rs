@@ -45,15 +45,6 @@ fn trunc(s: &str) -> (String, Option<String>) {
     (format!("{}…[truncated]", &s[..cut]), Some(meta))
 }
 
-/// Build the `_meta` field for tool-call truncation facts. The host flag is
-/// authoritative when both sources apply: its durable log holds the full text.
-fn truncation_meta(adapter_cut: Option<&str>, host_truncated: bool) -> Option<String> {
-    if host_truncated {
-        return Some("\"_meta\":{\"muse\":{\"truncated\":{\"source\":\"host\"}}}".to_string());
-    }
-    adapter_cut.map(|cut| format!("\"_meta\":{{\"muse\":{{\"truncated\":{{{cut}}}}}}}"))
-}
-
 fn tool_kind(tool: &str) -> &'static str {
     let t = tool.to_lowercase();
     if t.contains("read") || t.contains("list") || t.contains("cat") {
@@ -140,6 +131,8 @@ pub struct ToolUpdate<'a> {
     pub status: &'a str,
     pub content_text: Option<&'a str>,
     pub raw_input: Option<&'a str>,
+    /// Host-authored item references and patch facts for the card's `_meta`.
+    pub muse_fields: Option<&'a str>,
     /// The host already saturated this surface (`item.truncated`).
     pub host_truncated: bool,
 }
@@ -162,6 +155,10 @@ pub struct SessionFold {
     /// Workflow async task ids, keyed by the AIR task id (workflowRunId).
     workflow_tasks: HashMap<String, String>,
     /// Last terminal state sent for each async task.
+    /// AIR task id -> MSP item id, used when task control targets the host.
+    async_task_msp_ids: HashMap<String, String>,
+    /// Last terminal state emitted for each AIR task, suppressing duplicate
+    /// item/updated + item/completed deliveries.
     async_task_states: HashMap<String, String>,
 }
 
@@ -176,6 +173,7 @@ impl SessionFold {
             air_async_tasks: false,
             announced_tasks: std::collections::HashSet::new(),
             workflow_tasks: HashMap::new(),
+            async_task_msp_ids: HashMap::new(),
             async_task_states: HashMap::new(),
         }
     }
@@ -186,6 +184,17 @@ impl SessionFold {
         self.air_async_tasks
             .then_some(())
             .and_then(|_| self.workflow_tasks.get(task_id).cloned())
+    }
+
+    /// Resolve the adapter-facing AIR task id to MSP's durable item id.
+    pub fn msp_task_id(&self, async_task_id: &str) -> Option<&str> {
+        self.async_task_msp_ids
+            .get(async_task_id)
+            .map(String::as_str)
+    }
+
+    pub fn has_active_item(&self, item_id: &str) -> bool {
+        self.items.contains_key(item_id)
     }
 
     fn known(&self, item_id: &str) -> bool {
@@ -287,6 +296,41 @@ impl SessionFold {
             f.push(format!("\"_meta\":{{\"muse\":{{{fields}}}}}"));
         }
         Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
+    }
+
+    /// Preserve stable host references beside the bounded editor surface.
+    /// `outputRef` and `patchRef` are intentionally passed through as JSON so
+    /// clients can use their availability, byte length, and host id.
+    fn item_muse_fields(item: &J) -> Option<String> {
+        let fields = [
+            ("itemId", item.get("itemId")),
+            ("outputRef", item.get("outputRef")),
+            ("patchRef", item.get("patchRef")),
+            ("patchSummary", item.get("patchSummary")),
+        ];
+        let parts: Vec<String> = fields
+            .into_iter()
+            .filter_map(|(key, value)| {
+                value
+                    .filter(|v| !matches!(v, J::Null))
+                    .map(|v| format!("\"{key}\":{}", j_to_string(v)))
+            })
+            .collect();
+        (!parts.is_empty()).then(|| parts.join(","))
+    }
+
+    fn merge_muse_fields(base: Option<&str>, item: Option<&str>) -> Option<String> {
+        let mut fields = String::new();
+        if let Some(item) = item.filter(|value| !value.is_empty()) {
+            fields.push_str(item);
+        }
+        if let Some(base) = base.filter(|value| !value.is_empty()) {
+            if !fields.is_empty() {
+                fields.push(',');
+            }
+            fields.push_str(base);
+        }
+        (!fields.is_empty()).then_some(fields)
     }
 
     /// Compaction is host work the user must see, but it is not a tool the
@@ -537,9 +581,8 @@ impl SessionFold {
         )
     }
 
-    /// AIR async-task extension. Workflow runs are stoppable through
-    /// workflow/cancel; shell and user-shell tasks remain admission-only
-    /// observations because MSP has no stop primitive for them.
+    /// AIR async-task extension. MSP 1.3.0 accepts task control commands; the
+    /// terminal outcome still arrives through the item view.
     fn async_task_spawned_line(
         acp_sid: &str,
         task_id: &str,
@@ -569,6 +612,7 @@ impl SessionFold {
         state: &str,
         out: &mut Vec<String>,
     ) {
+        self.workflow_tasks.remove(task_id);
         if self
             .async_task_states
             .get(task_id)
@@ -589,6 +633,53 @@ impl SessionFold {
                 esc(task_id)
             ),
         )
+    }
+
+    fn announce_async_task(
+        &mut self,
+        acp_sid: &str,
+        item_id: &str,
+        task_id: &str,
+        name: &str,
+        tool_call_id: Option<&str>,
+        out: &mut Vec<String>,
+    ) {
+        self.async_task_msp_ids
+            .entry(task_id.to_string())
+            .or_insert_with(|| item_id.to_string());
+        if self.announced_tasks.insert(task_id.to_string()) {
+            out.push(Self::async_task_spawned_line(
+                acp_sid,
+                task_id,
+                name,
+                "shell",
+                true,
+                tool_call_id,
+            ));
+        }
+    }
+
+    fn emit_async_task_state(
+        &mut self,
+        acp_sid: &str,
+        task_id: &str,
+        item: &J,
+        out: &mut Vec<String>,
+    ) {
+        let Some(state) = Self::async_task_state(item) else {
+            return;
+        };
+        self.async_task_msp_ids.remove(task_id);
+        if self
+            .async_task_states
+            .get(task_id)
+            .is_some_and(|previous| previous == state)
+        {
+            return;
+        }
+        self.async_task_states
+            .insert(task_id.to_string(), state.to_string());
+        out.push(Self::async_task_state_line(acp_sid, task_id, state));
     }
 
     /// AIR marks the owning command card as backgrounded so its output stays
@@ -674,18 +765,30 @@ impl SessionFold {
             format!("\"kind\":\"{}\"", u.kind),
             format!("\"status\":{}", esc(u.status)),
         ];
+        let mut muse_fields = u.muse_fields.unwrap_or_default().to_string();
         if let Some(t) = u.content_text {
             let (text, adapter_cut) = trunc(t);
             f.push(format!(
                 "\"content\":[{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]",
                 esc(&text)
             ));
-            if let Some(meta) = truncation_meta(adapter_cut.as_deref(), u.host_truncated) {
-                f.push(meta);
+            let truncation = if u.host_truncated {
+                Some("\"source\":\"host\"".to_string())
+            } else {
+                adapter_cut
+            };
+            if let Some(cut) = truncation {
+                if !muse_fields.is_empty() {
+                    muse_fields.push(',');
+                }
+                muse_fields.push_str(&format!("\"truncated\":{{{cut}}}"));
             }
         }
         if let Some(r) = u.raw_input {
             f.push(format!("\"rawInput\":{r}"));
+        }
+        if !muse_fields.is_empty() {
+            f.push(format!("\"_meta\":{{\"muse\":{{{muse_fields}}}}}"));
         }
         Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
     }
@@ -796,6 +899,7 @@ impl SessionFold {
                     .get("args")
                     .map(j_to_string)
                     .unwrap_or_else(|| "{}".to_string());
+                let item_fields = Self::item_muse_fields(item);
                 out.push(Self::tool_line(
                     acp_sid,
                     ver,
@@ -807,25 +911,20 @@ impl SessionFold {
                         status: msp_status(status),
                         content_text: None,
                         raw_input: Some(&raw),
+                        muse_fields: item_fields.as_deref(),
                         host_truncated: false,
                     },
                 ));
-                if item
+                let backgrounded = item
                     .get("background")
                     .is_some_and(|v| matches!(v, J::Bool(true)))
-                    && self.air_async_tasks
-                    && !self.announced_tasks.contains(&tc_id)
-                {
-                    self.announced_tasks.insert(tc_id.clone());
-                    out.push(Self::backgrounded_tool_line(acp_sid, ver, &tc_id));
-                    out.push(Self::async_task_spawned_line(
-                        acp_sid,
-                        &tc_id,
-                        &title,
-                        "shell",
-                        false,
-                        Some(&tc_id),
-                    ));
+                    || self.announced_tasks.contains(&tc_id);
+                if backgrounded && self.air_async_tasks {
+                    if !self.announced_tasks.contains(&tc_id) {
+                        out.push(Self::backgrounded_tool_line(acp_sid, ver, &tc_id));
+                    }
+                    self.announce_async_task(acp_sid, &item_id, &tc_id, &title, Some(&tc_id), out);
+                    self.emit_async_task_state(acp_sid, &tc_id, item, out);
                 }
                 if let Some(ItemRole::Tool { announced, .. }) = self.items.get_mut(&item_id) {
                     *announced = true;
@@ -908,6 +1007,10 @@ impl SessionFold {
             "subagent" | "workflow" | "userShell" => {
                 let (tc_id, announced) = self.host_item_role(&item_id, kind);
                 let (title, content, meta) = Self::host_card_parts(kind, item);
+                let muse_fields = Self::merge_muse_fields(
+                    meta.as_deref(),
+                    Self::item_muse_fields(item).as_deref(),
+                );
                 if !title.is_empty() {
                     out.push(Self::card_line(
                         acp_sid,
@@ -918,24 +1021,14 @@ impl SessionFold {
                         "other",
                         msp_status(status),
                         content.as_deref(),
-                        meta.as_deref(),
+                        muse_fields.as_deref(),
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
                 }
-                if kind == "userShell"
-                    && self.air_async_tasks
-                    && !self.announced_tasks.contains(&tc_id)
-                {
-                    self.announced_tasks.insert(tc_id.clone());
-                    out.push(Self::async_task_spawned_line(
-                        acp_sid,
-                        &tc_id,
-                        &title,
-                        "shell",
-                        false,
-                        Some(&tc_id),
-                    ));
+                if kind == "userShell" && self.air_async_tasks {
+                    self.announce_async_task(acp_sid, &item_id, &tc_id, &title, Some(&tc_id), out);
+                    self.emit_async_task_state(acp_sid, &tc_id, item, out);
                 } else if kind == "workflow"
                     && self.air_async_tasks
                     && let Some(run_id) = item
@@ -964,6 +1057,10 @@ impl SessionFold {
             }
             _ => {
                 let (title, content, meta) = Self::host_card_parts(kind, item);
+                let muse_fields = Self::merge_muse_fields(
+                    meta.as_deref(),
+                    Self::item_muse_fields(item).as_deref(),
+                );
                 if !title.is_empty() {
                     let (tc_id, announced) = self.host_item_role(&item_id, "item-");
                     out.push(Self::card_line(
@@ -975,7 +1072,7 @@ impl SessionFold {
                         "other",
                         msp_status(status),
                         content.as_deref(),
-                        meta.as_deref(),
+                        muse_fields.as_deref(),
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
@@ -1073,12 +1170,16 @@ impl SessionFold {
                 let (title, tool) = Self::tool_title(item);
                 let text = item
                     .get("visibleOutput")
-                    .or_else(|| item.get("result"))
-                    .or_else(|| item.get("failureReason"))
                     .and_then(|v| v.as_str())
+                    .filter(|text| !text.is_empty())
+                    .or_else(|| item.get("result").and_then(|v| v.as_str()))
+                    .filter(|text| !text.is_empty())
+                    .or_else(|| item.get("failureReason").and_then(|v| v.as_str()))
+                    .filter(|text| !text.is_empty())
                     .unwrap_or("");
                 let content = if text.is_empty() { None } else { Some(text) };
                 let raw = item.get("args").map(j_to_string);
+                let item_fields = Self::item_muse_fields(item);
                 out.push(Self::tool_line(
                     acp_sid,
                     ver,
@@ -1090,31 +1191,22 @@ impl SessionFold {
                         status: msp_status(status),
                         content_text: content,
                         raw_input: raw.as_deref(),
+                        muse_fields: item_fields.as_deref(),
                         host_truncated: item
                             .get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     },
                 ));
-                if item
+                let backgrounded = item
                     .get("background")
                     .is_some_and(|v| matches!(v, J::Bool(true)))
-                    && self.air_async_tasks
-                {
+                    || self.announced_tasks.contains(&tc_id);
+                if backgrounded && self.air_async_tasks {
                     if !self.announced_tasks.contains(&tc_id) {
-                        self.announced_tasks.insert(tc_id.clone());
                         out.push(Self::backgrounded_tool_line(acp_sid, ver, &tc_id));
-                        out.push(Self::async_task_spawned_line(
-                            acp_sid,
-                            &tc_id,
-                            &title,
-                            "shell",
-                            false,
-                            Some(&tc_id),
-                        ));
                     }
-                    if let Some(state) = Self::async_task_state(item) {
-                        out.push(Self::async_task_state_line(acp_sid, &tc_id, state));
-                    }
+                    self.announce_async_task(acp_sid, &item_id, &tc_id, &title, Some(&tc_id), out);
+                    self.emit_async_task_state(acp_sid, &tc_id, item, out);
                 }
                 self.items.remove(&item_id);
             }
@@ -1212,6 +1304,10 @@ impl SessionFold {
             "subagent" | "workflow" | "userShell" => {
                 let (tc_id, announced) = self.host_item_role(&item_id, kind);
                 let (title, content, meta) = Self::host_card_parts(kind, item);
+                let muse_fields = Self::merge_muse_fields(
+                    meta.as_deref(),
+                    Self::item_muse_fields(item).as_deref(),
+                );
                 if !title.is_empty() {
                     out.push(Self::card_line(
                         acp_sid,
@@ -1222,26 +1318,14 @@ impl SessionFold {
                         "other",
                         msp_status(status),
                         content.as_deref(),
-                        meta.as_deref(),
+                        muse_fields.as_deref(),
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
                 }
                 if kind == "userShell" && self.air_async_tasks {
-                    if !self.announced_tasks.contains(&tc_id) {
-                        self.announced_tasks.insert(tc_id.clone());
-                        out.push(Self::async_task_spawned_line(
-                            acp_sid,
-                            &tc_id,
-                            &title,
-                            "shell",
-                            false,
-                            Some(&tc_id),
-                        ));
-                    }
-                    if let Some(state) = Self::async_task_state(item) {
-                        out.push(Self::async_task_state_line(acp_sid, &tc_id, state));
-                    }
+                    self.announce_async_task(acp_sid, &item_id, &tc_id, &title, Some(&tc_id), out);
+                    self.emit_async_task_state(acp_sid, &tc_id, item, out);
                 }
                 if kind == "workflow"
                     && self.air_async_tasks
@@ -1279,6 +1363,10 @@ impl SessionFold {
                     matches!(self.items.get(&item_id), Some(ItemRole::Tool { .. }));
                 let (tc_id, announced) = self.host_item_role(&item_id, "item-");
                 let (title, content, meta) = Self::host_card_parts(kind, item);
+                let muse_fields = Self::merge_muse_fields(
+                    meta.as_deref(),
+                    Self::item_muse_fields(item).as_deref(),
+                );
                 if !title.is_empty() || announced_card {
                     let card_title = if title.is_empty() {
                         fallback_card_title(kind)
@@ -1294,7 +1382,7 @@ impl SessionFold {
                         "other",
                         msp_status(status),
                         content.as_deref(),
-                        meta.as_deref(),
+                        muse_fields.as_deref(),
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
@@ -1460,6 +1548,33 @@ mod corpus_tests {
             "host display text stays authoritative: {}",
             out[0]
         );
+    }
+
+    #[test]
+    fn empty_visible_output_falls_back_to_failure_reason() {
+        let completed = parse_json(
+            r#"{"item":{"itemId":"it-fail","kind":"toolCall","status":"failed","tool":"read_file","callId":"call-1","args":{},"visibleOutput":"","failureReason":"file does not exist"}}"#,
+        )
+        .unwrap();
+
+        for version in [1, 2] {
+            let mut fold = SessionFold::new();
+            let mut out = Vec::new();
+            fold.on_item_completed("sid", version, &completed, &mut out);
+
+            assert_eq!(
+                out.len(),
+                1,
+                "v{version} emitted unexpected frames: {out:?}"
+            );
+            assert!(
+                out[0].contains("\"status\":\"failed\"")
+                    && out[0].contains("\"content\"")
+                    && out[0].contains("file does not exist"),
+                "v{version} preserved the failure explanation: {}",
+                out[0]
+            );
+        }
     }
 
     #[test]
