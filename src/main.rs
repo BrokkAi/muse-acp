@@ -497,6 +497,114 @@ fn host_mode(res: &J) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// MSP keeps these values open on the wire. Preserve the three values the
+/// adapter understands and project a future value generically so a new host
+/// does not make the session disappear from the editor.
+fn session_status_projection(raw: Option<&str>) -> Option<String> {
+    let raw = raw?;
+    Some(match raw {
+        "notLoaded" | "idle" | "running" => raw.to_string(),
+        _ => {
+            log(&format!(
+                "unknown MSP session status {raw:?}; projecting as unknown"
+            ));
+            "unknown".to_string()
+        }
+    })
+}
+
+/// AttentionFlag is additive-open. Keep only flags this adapter can use to
+/// target reconciliation; unknown additions remain harmless and observable in
+/// the diagnostic log without being mistaken for a pending request class.
+fn attention_projection(value: Option<&J>, session_id: &str) -> Option<Vec<String>> {
+    let Some(J::Arr(flags)) = value else {
+        return None;
+    };
+    let mut known = Vec::new();
+    for flag in flags.iter().filter_map(|v| v.as_str()) {
+        if matches!(flag, "approvalPending" | "inputPending") {
+            if !known.iter().any(|existing| existing == flag) {
+                known.push(flag.to_string());
+            }
+        } else {
+            log(&format!(
+                "unknown MSP attention flag {flag:?} session={session_id}; ignored"
+            ));
+        }
+    }
+    Some(known)
+}
+
+/// Adopt the additive Session facts returned by session/start, session/resume,
+/// or session/fork. An absent field is deliberately retained as unknown: the
+/// protocol says additive-optional attention is not an assertion that nothing
+/// is pending.
+fn adopt_session_projection(s: &mut AcpSession, session: &J) {
+    if session.get("status").is_some() {
+        s.session_status =
+            session_status_projection(session.get("status").and_then(|v| v.as_str()));
+    }
+    if session.get("attention").is_some() {
+        s.attention = attention_projection(session.get("attention"), &s.msp_sid);
+        s.attention_meta = session.get("attention").map(j_to_string);
+    }
+}
+
+/// The status event always carries a status. Its omitted attention member is
+/// the event's representation of an empty flag set, unlike an omitted field on
+/// an older Session object.
+fn adopt_status_changed(s: &mut AcpSession, params: &J) {
+    s.attention_meta = Some(
+        params
+            .get("attention")
+            .map(j_to_string)
+            .unwrap_or_else(|| "[]".to_string()),
+    );
+    s.session_status = session_status_projection(params.get("status").and_then(|v| v.as_str()));
+    s.attention = if params.get("attention").is_some() {
+        attention_projection(params.get("attention"), &s.msp_sid)
+    } else {
+        Some(Vec::new())
+    };
+}
+
+/// Send the standard v2 state for known load states or a parked request, plus
+/// provider-neutral session-info metadata for both ACP versions.
+fn send_session_projection(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    ver: u8,
+    status: Option<&str>,
+    attention: Option<&[String]>,
+) {
+    acp::send_session_status(stdout, acp_sid, status, attention);
+    if ver == 2 {
+        if attention.is_some_and(|flags| !flags.is_empty()) {
+            acp::send_state(stdout, acp_sid, "requires_action", None);
+        } else {
+            match status {
+                Some("running") => acp::send_state(stdout, acp_sid, "running", None),
+                Some("idle") => acp::send_state(stdout, acp_sid, "idle", None),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Return the request classes worth asking `approval/listPending` for. A
+/// missing attention field keeps the pre-1.3.0 blind reconciliation fallback;
+/// a present field lets a status clear stop stale request presentations.
+fn pending_reconciliation_targets(s: &AcpSession) -> (bool, bool, bool) {
+    match &s.attention {
+        Some(flags) => (
+            flags.iter().any(|f| f == "approvalPending"),
+            flags.iter().any(|f| f == "inputPending"),
+            true,
+        ),
+        None => (true, true, false),
+    }
+}
+
 /// Folded session state carried by a resume/load result:
 /// `history.snapshot.state` (SnapshotState; absent for a non-snapshot history).
 fn snapshot_state(res: &J) -> Option<&J> {
@@ -688,14 +796,23 @@ fn reconcile_pending(
     sessions: &Sessions,
     acp_sid: &str,
 ) {
-    let msp_sid = match sessions
+    let (msp_sid, approvals_targeted, inputs_targeted, attention_known) = match sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(acp_sid)
     {
-        Some(s) => s.msp_sid.clone(),
+        Some(s) => {
+            let (approvals, inputs, known) = pending_reconciliation_targets(s);
+            (s.msp_sid.clone(), approvals, inputs, known)
+        }
         None => return,
     };
+    if attention_known && !approvals_targeted && !inputs_targeted {
+        log(&format!(
+            "pending reconciliation skipped: session={msp_sid} attention flags are clear"
+        ));
+        return;
+    }
     // This is a log-fold query: no commandId, no admission record.
     let params = format!("{{\"sessionId\":{}}}", esc(&msp_sid));
     let r = match host.command("approval/listPending", &params) {
@@ -709,7 +826,7 @@ fn reconcile_pending(
         }
     };
     let (mut n_approvals, mut n_inputs) = (0usize, 0usize);
-    if let Some(J::Arr(approvals)) = r.get("approvals") {
+    if approvals_targeted && let Some(J::Arr(approvals)) = r.get("approvals") {
         for a in approvals.clone() {
             let known = sessions
                 .lock()
@@ -734,7 +851,7 @@ fn reconcile_pending(
             }
         }
     }
-    if let Some(J::Arr(inputs)) = r.get("userInputs") {
+    if inputs_targeted && let Some(J::Arr(inputs)) = r.get("userInputs") {
         for u in inputs.clone() {
             let known = sessions
                 .lock()
@@ -1516,8 +1633,22 @@ fn restart_durable_host(
                                         s.model_value = model.to_string();
                                     }
                                     reconcile_active_tasks(stdout, s, &r, false);
+                                    if let Some(session) = r.get("session") {
+                                        adopt_session_projection(s, session);
+                                    }
+                                    let projection =
+                                        (s.ver, s.session_status.clone(), s.attention.clone());
+                                    drop(map);
+                                    send_session_projection(
+                                        stdout,
+                                        &acp_sid,
+                                        projection.0,
+                                        projection.1.as_deref(),
+                                        projection.2.as_deref(),
+                                    );
+                                } else {
+                                    drop(map);
                                 }
-                                drop(map);
                                 reattach_view(
                                     &host,
                                     sessions,
@@ -2283,6 +2414,15 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             reasoning_effort_source: None,
                             active_turn,
                             view_cursor: cur_cursor.clone(),
+                            session_status: session_status_projection(
+                                r.get("session")
+                                    .and_then(|s| s.get("status"))
+                                    .and_then(|v| v.as_str()),
+                            ),
+                            attention: attention_projection(
+                                r.get("session").and_then(|s| s.get("attention")),
+                                &msp_sid,
+                            ),
                             seen_view_cursors: std::collections::HashSet::new(),
                             fold: fresh_fold(),
                             usage_used: None,
@@ -2341,6 +2481,19 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     };
                     let skills = skill_catalog(host, &msp_sid).unwrap_or_default();
                     acp::send_result(stdout, &id, &result);
+                    let (status, attention) = sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&sid)
+                        .map(|s| (s.session_status.clone(), s.attention.clone()))
+                        .unwrap_or_default();
+                    send_session_projection(
+                        stdout,
+                        &sid,
+                        ver,
+                        status.as_deref(),
+                        attention.as_deref(),
+                    );
                     if let Some(title) = initial_title_facts.selected() {
                         acp::send_session_title(stdout, &sid, Some(title));
                     }
@@ -2533,6 +2686,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             reasoning_effort_source: None,
                             active_turn: None,
                             view_cursor: String::new(),
+                            session_status: None,
+                            attention: None,
                             seen_view_cursors: std::collections::HashSet::new(),
                             fold: fresh_fold(),
                             usage_used: None,
@@ -2552,6 +2707,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         });
                         entry.msp_sid = real_msp.clone();
                         entry.ver = ver;
+                        if let Some(session) = r.get("session") {
+                            adopt_session_projection(entry, session);
+                        }
                         if !restored_cwd.is_empty() {
                             entry.cwd = restored_cwd;
                         }
@@ -2643,6 +2801,19 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         reconcile_active_tasks(stdout, entry, &r, replay);
                         acp::send_usage(stdout, entry, pressure.as_deref());
                     }
+                    let (status, attention) = sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&sid)
+                        .map(|s| (s.session_status.clone(), s.attention.clone()))
+                        .unwrap_or_default();
+                    send_session_projection(
+                        stdout,
+                        &sid,
+                        ver,
+                        status.as_deref(),
+                        attention.as_deref(),
+                    );
                     if let Some(title) = title_update {
                         acp::send_session_title(stdout, &sid, title.as_deref());
                     }
@@ -2886,6 +3057,8 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                                 .and_then(|(_, source)| source.clone()),
                             active_turn: None,
                             view_cursor: String::new(),
+                            session_status: None,
+                            attention: None,
                             seen_view_cursors: std::collections::HashSet::new(),
                             fold: fresh_fold(),
                             usage_used: None,
@@ -2905,6 +3078,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         });
                         entry.msp_sid = new_msp.clone();
                         entry.ver = ver;
+                        adopt_session_projection(entry, &new_session);
                         entry.cwd = restored_cwd;
                         entry.roots = roots;
                         if !new_model.is_empty() {
@@ -2964,6 +3138,19 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         )
                     };
                     acp::send_result(stdout, &id, &result);
+                    let (status, attention) = sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&new_msp)
+                        .map(|s| (s.session_status.clone(), s.attention.clone()))
+                        .unwrap_or_default();
+                    send_session_projection(
+                        stdout,
+                        &new_msp,
+                        ver,
+                        status.as_deref(),
+                        attention.as_deref(),
+                    );
                     refresh_subscription_usage(host, stdout, sessions, &new_msp);
                     if let Some(title) = fork_title_facts.selected() {
                         acp::send_session_title(stdout, &new_msp, Some(title));
@@ -4585,6 +4772,7 @@ fn raw_host_fact(host_session: Option<&J>, key: &str) -> Option<String> {
 /// Merge host session metadata into an adapter-owned session and report
 /// whether the selected host-authored title changed.
 fn update_host_session_facts(session: &mut AcpSession, host_session: &J) -> bool {
+    adopt_session_projection(session, host_session);
     let old_title = session.title_facts.selected().map(str::to_string);
     update_title_facts(&mut session.title_facts, host_session);
     if let Some(branch) = host_session.get("branch") {
@@ -5392,6 +5580,33 @@ fn handle_msp(
                     s.model_value = model.to_string();
                 }
                 let _ = acp_sid;
+            }
+        }
+        "session/statusChanged" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                let projection = {
+                    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                    let Some(s) = map.get_mut(&acp_sid) else {
+                        return;
+                    };
+                    // `viewCursor` is required-nullable: null is the unload
+                    // fold-failure arm and must preserve the last usable
+                    // cursor. The common cursor tracker above already adopts
+                    // only definite strings.
+                    adopt_status_changed(s, params);
+                    (s.ver, s.session_status.clone(), s.attention.clone())
+                };
+                send_session_projection(
+                    stdout,
+                    &acp_sid,
+                    projection.0,
+                    projection.1.as_deref(),
+                    projection.2.as_deref(),
+                );
             }
         }
         "session/todoListChanged" => {

@@ -56,6 +56,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
+  status_flags   session/statusChanged status, attention, open-enum, and null
+                 viewCursor handling
   session_metadata host-authored title candidates, branch/attention metadata,
                    and a live session/nameChanged notification
   session_list_workspace_filter return no host sessions for an unmatched root
@@ -187,6 +189,9 @@ def session_obj(session_id=None, workspace_root=None):
                "activeTurnId": "turn-resumed" if SCENARIO == "resume_active" else None,
                "approvalMode": {"lastCommandId": None, "mode": MODE,
                                 "source": "serverDefault"}}
+    if SCENARIO == "status_flags":
+        session.update({"status": "running",
+                        "attention": ["approvalPending", "futureAttention"]})
     if SCENARIO == "session_metadata":
         if session_id == MSP_SID:
             session.update({
@@ -324,6 +329,14 @@ def on_turn_start(params):
         notify("item/completed", {**base, "item": {
             "itemId": "it-1", "kind": "agentMessage",
             "status": "completed", "text": "hello from fake host"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "status_flags":
+        notify("session/statusChanged", {
+            "sessionId": MSP_SID, "status": "paused",
+            "attention": ["futureAttention"], "viewCursor": None})
+        notify("session/statusChanged", {
+            "sessionId": MSP_SID, "status": "idle",
+            "viewCursor": "cur-status-2"})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "session_metadata":
         notify("session/nameChanged", {
@@ -874,6 +887,9 @@ def result_for(method, msg):
         if SCENARIO == "pending_reconcile_dup":
             # The same approval the adapter is already displaying.
             return {"approvals": [dict(APPROVAL_PARAMS)], "userInputs": []}
+        if SCENARIO == "status_flags":
+            return {"approvals": [dict(APPROVAL_PARAMS, approvalId="ap-status")],
+                    "userInputs": [question_params("ui-status")]}
         return {"approvals": [], "userInputs": []}
     if method == "usage/read":
         USAGE_READS[0] += 1
@@ -991,6 +1007,7 @@ def result_for(method, msg):
                 "callId": "gap-call", "turnId": "turn-1", "status": "completed",
                 "tool": "write_file", "args": {"path": "gap-written.txt"}}]}
         page = msg.get("params", {})
+        log_input(page)
         if SCENARIO == "usage_gap" and page.get("direction") != "backward":
             # Refill overlaps the live stream: cur-3 is in this page too.
             return {"events": [
@@ -1112,6 +1129,17 @@ def result_for(method, msg):
                 "history": {"mode": "inline", "items": items,
                             "snapshot": None},
                 "viewCursor": "cur-read", "pendingRequests": []}
+    if method == "approval/decide":
+        log_input(msg.get("params", {}))
+        if SCENARIO == "status_flags":
+            notify("session/statusChanged", {
+                "sessionId": MSP_SID, "status": "paused",
+                "attention": ["futureAttention"], "viewCursor": None})
+            notify("view/gap", {"sessionId": MSP_SID})
+            notify("session/statusChanged", {
+                "sessionId": MSP_SID, "status": "idle",
+                "viewCursor": "cur-status-2"})
+        return {"status": "accepted"}
     if method == "session/fork":
         params = msg.get("params", {})
         log_input(params)

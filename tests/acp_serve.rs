@@ -3878,6 +3878,62 @@ fn resume_reconciliation_does_not_duplicate_displayed_approval() {
 }
 
 #[test]
+fn status_changed_seeds_and_targets_session_attention() {
+    let mut c = Client::spawn("status_flags", &[]);
+    let sid = c.new_session(2, "");
+
+    let seeded = c.wait_for(
+        "\"sessionUpdate\":\"session_info_update\"",
+        Duration::from_secs(15),
+    );
+    assert!(
+        seeded.contains("\"status\":\"running\""),
+        "status seed missing: {seeded}"
+    );
+    assert!(
+        seeded.contains("\"attention\":[\"approvalPending\"]"),
+        "known attention seed missing: {seeded}"
+    );
+    assert!(
+        !seeded.contains("futureAttention"),
+        "unknown attention must be ignored: {seeded}"
+    );
+
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
+    let permission = c.wait_for("session/request_permission", Duration::from_secs(15));
+    c.wait_stderr(
+        "pending reconciliation: 1 approval(s), 0 user input(s) presented",
+        Duration::from_secs(10),
+    );
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("ui-status") && !frames.contains("elicitation/create"),
+        "input attention was not targeted: {frames}"
+    );
+
+    let permission_id = extract_str(&permission, "id").expect("permission request id");
+    c.respond_error(&permission_id);
+    c.wait_input("\"cursor\": \"cur-9\"", Duration::from_secs(15));
+    let generic = c.wait_for("\"status\":\"unknown\"", Duration::from_secs(15));
+    assert!(
+        !generic.contains("futureAttention"),
+        "unknown attention leaked into the generic projection: {generic}"
+    );
+    let cleared = c.wait_for("\"status\":\"idle\"", Duration::from_secs(15));
+    assert!(
+        cleared.contains("\"attention\":[]"),
+        "cleared attention was not rendered: {cleared}"
+    );
+    c.finish();
+}
+
+#[test]
 fn todo_list_changed_maps_to_an_acp_plan() {
     let mut c = Client::spawn("todo", &[]);
     let sid = c.new_session(1, "");

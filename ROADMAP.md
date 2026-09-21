@@ -346,6 +346,7 @@ events require an explicit documentation decision before CI passes.
 - `session/branchChanged`
 - `session/modelChanged`
 - `session/approvalModeChanged`
+- `session/statusChanged`
 - `turn/started`
 - `turn/unqueued`
 - `turn/retryScheduled`
@@ -373,6 +374,17 @@ notifications; list them in a separate section with their response policy.
 
 Each row should state whether the event is consumed, mapped to ACP, internally
 tracked, intentionally ignored, or unsupported pending a protocol decision.
+
+`session/statusChanged` is **mapped to ACP and internally tracked**. The
+adapter seeds the same `(status, attention)` projection from each returned
+`Session`, publishes it in `session_info_update._meta.muse`, and emits the
+standard v2 running/idle state for known load states or `requires_action` when
+an attention flag is present. `approvalPending` and `inputPending` target
+`approval/listPending` reconciliation; an explicit clear stops stale request
+reconciliation. Unknown open status values use the generic
+`unknown` projection and unknown attention flags are ignored. Its required
+nullable `viewCursor` is adopted only when it is a string, preserving the last
+usable cursor for the unload fold-failure arm.
 
 **Muse Code 1.3.0 stable-surface additions**
 

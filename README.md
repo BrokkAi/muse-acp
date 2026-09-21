@@ -145,6 +145,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | successful native file `toolCall` items | negotiated AIR `agentFileChangeReport` after the owning turn completes; paths come only from explicit host tool arguments and are deduplicated across replay |
 | `approval/requested` + `approval/request` | `session/request_permission` → `approval/decide` (deny-safe fallback) |
 | `session/resume` + history | `session/resume` (+ `replayFrom: {type:start}` replays messages); a retained view cursor is explicitly re-attached with `view/subscribe` so `(after, head]` events are replayed once across detachment or host restart; live-only resume still re-attaches from the returned head; usage is restored on attach: from `history.snapshot.state` when a snapshot is served, else by asking for the snapshot rung explicitly, else from one backward `view/page` read for the running totals; `session/viewHealthChanged` records an actionable stderr diagnostic |
+| `session/statusChanged` + `Session.status` / `.attention` | tracked per session; `session_info_update._meta.muse` exposes status and known attention flags, v2 receives running/idle or requires-action state; attention targets pending reconciliation |
 | `sessionDurability` (default durable) | continuity across turns; Muse's durable session ID is used directly by ACP |
 | `turn/start` `ifBusy` (queue default) | concurrent prompts per session; each completes its own response; `session/cancel` stops all of them |
 | `TurnInputPart` image | image blocks (inline base64 or local `file://` path); advertised in caps |
@@ -214,6 +215,14 @@ file-tool completions only. It includes both endpoints of a rename and sends
 paths without reading contents, so deleted and binary files are safe. Rejected
 writes are excluded. Shell commands, generators, and unknown tools never cause
 a guessed path; their presence marks `declaredComplete: false` instead.
+
+Session status is seeded from the `Session` object on start, resume, and fork,
+then updated from `session/statusChanged` without polling. Known
+`approvalPending` and `inputPending` flags select which pending-request class
+is reconciled; an explicit clear suppresses stale reconciliation. Unknown open
+status values are rendered as `unknown`, while unknown attention flags are
+ignored. A nullable status-event `viewCursor` preserves the last usable cursor
+when the host reports the unload fold-failure arm.
 
 Model choices are refreshed from Muse when creating, loading, or resuming a
 session and after a config option changes. The adapter does not permanently
