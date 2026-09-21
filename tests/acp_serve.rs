@@ -1149,6 +1149,34 @@ fn user_input_options_reach_the_client() {
 }
 
 #[test]
+fn multiple_user_input_schema_is_valid_for_both_protocol_versions() {
+    for (ver, caps) in [
+        (1, ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}"),
+        (2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}"),
+    ] {
+        let mut c = Client::spawn("questions_multiple", &[]);
+        let sid = c.new_session(ver, caps);
+        let _pid = c.prompt(&sid, "ask me");
+        let elicit = c.wait_for("elicitation/create", Duration::from_secs(15));
+        let frame: serde_json::Value =
+            serde_json::from_str(&elicit).expect("multiple-selection elicitation is valid JSON");
+        let schema = &frame["params"]["requestedSchema"]["properties"]["q0"];
+        assert_eq!(
+            schema["type"], "array",
+            "v{ver} question uses an array schema"
+        );
+        assert_eq!(schema["items"]["type"], "string");
+        assert_eq!(
+            schema["items"]["enum"],
+            serde_json::json!(["Alpha", "Beta"])
+        );
+        assert_eq!(schema["minItems"], 1);
+        assert_eq!(schema["maxItems"], 2);
+        c.finish();
+    }
+}
+
+#[test]
 fn resumed_user_input_is_presented_once_and_remains_answerable() {
     for (ver, method, caps) in [
         (1, "session/load", "clientCapabilities"),

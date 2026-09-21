@@ -4999,7 +4999,7 @@ fn bridge_user_input(
                 esc(&key),
                 en.join(",")
             );
-            sch.push_str(&format!("}},\"minItems\":{min}"));
+            sch.push_str(&format!(",\"minItems\":{min}"));
             if let Some(m) = max {
                 sch.push_str(&format!(",\"maxItems\":{m}"));
             }
