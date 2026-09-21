@@ -3484,6 +3484,44 @@ fn resume_restores_goal_and_branch_from_the_snapshot() {
 }
 
 #[test]
+fn goal_control_remains_host_driven_without_acp_negotiation() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let requests = [
+        ("goal/set", ",\"objective\":\"editor goal\""),
+        ("goal/edit", ",\"objective\":\"edited goal\""),
+        ("goal/pause", ""),
+        ("goal/resume", ""),
+        ("goal/clear", ""),
+    ];
+    for (index, (method, extra)) in requests.into_iter().enumerate() {
+        let id = c.req(
+            method,
+            &format!("{{\"sessionId\":\"{sid}\",\"commandId\":\"editor-goal-{index}\"{extra}}}"),
+        );
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"code\":-32601"),
+            "{method} must stay outside the ACP surface: {frame}"
+        );
+    }
+    let seen = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+    for method in [
+        "goal/set",
+        "goal/edit",
+        "goal/pause",
+        "goal/resume",
+        "goal/clear",
+    ] {
+        assert!(
+            !seen.lines().any(|line| line == method),
+            "{method} must not reach the MSP host: {seen}"
+        );
+    }
+    c.finish();
+}
+
+#[test]
 fn subagent_items_render_as_visible_tool_cards() {
     let mut c = Client::spawn("subagent", &[]);
     let sid = c.new_session(1, "");
