@@ -172,7 +172,8 @@ fn method_timeout_ms(method: &str) -> u64 {
         // Cheap queries.
         "model/list" | "session/list" | "view/unsubscribe" => 30_000,
         // Control-plane decisions should be fast but not flaky.
-        "approval/decide" | "userInput/answer" | "userInput/cancel" | "userInput/clarify" => 30_000,
+        "approval/decide" | "userInput/answer" | "userInput/cancel" | "userInput/clarify"
+        | "task/background" | "task/stop" | "task/stopAll" => 30_000,
         _ => DEFAULT_TIMEOUT_MS,
     }
 }
@@ -874,6 +875,8 @@ mod tests {
         assert_eq!(t("view/page"), Duration::from_millis(180_000));
         assert_eq!(t("model/list"), Duration::from_millis(30_000));
         assert_eq!(t("approval/decide"), Duration::from_millis(30_000));
+        assert_eq!(t("task/stop"), Duration::from_millis(30_000));
+        assert_eq!(t("task/stopAll"), Duration::from_millis(30_000));
         assert_eq!(t("turn/start"), Duration::from_millis(60_000));
         assert_eq!(t("future/method"), Duration::from_millis(60_000));
     }

@@ -2436,16 +2436,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             }
         }
         "_session/async_task/stop" => {
-            // Honest gap: MSP v1 publishes no stop primitive for background
-            // work, and canStop is advertised false. Pretending to stop would
-            // leave a running task the editor believes is dead.
-            log("async-task stop requested; MSP v1 exposes no stop primitive");
-            acp::send_error(
-                stdout,
-                &id,
-                -32601,
-                "background task stop is not supported by the Muse host",
-            );
+            stop_async_task(host, stdout, sessions, &id, params.as_ref());
         }
         "_session/steering" => {
             if negotiated_ver() != 2 {
@@ -2693,6 +2684,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             if sid.is_empty() {
                 return; // notification: nothing to acknowledge
             }
+            // `session/cancel` is the ACP all-work gesture. MSP separates
+            // background task admission from foreground turn cancellation.
+            stop_all_background_tasks(host, sessions, &sid);
             let turns = sessions
                 .lock()
                 .unwrap()
@@ -4706,6 +4700,148 @@ fn pop_queued_approval(
     if let Some(params) = next {
         log("displaying next queued approval");
         open_approval(host, stdout, sessions, &params);
+    }
+}
+
+/// Stop one AIR async task through MSP's admission-only task command.
+fn stop_async_task(
+    host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    id: &Option<J>,
+    params: Option<&J>,
+) {
+    let sid = params
+        .and_then(|p| p.get("sessionId"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+    let async_task_id = params
+        .and_then(|p| p.get("asyncTaskId"))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+    if sid.is_empty() || async_task_id.is_empty() {
+        acp::send_error(
+            stdout,
+            id,
+            -32602,
+            "background task stop requires sessionId and asyncTaskId",
+        );
+        return;
+    }
+
+    let target = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(sid)
+        .map(|s| {
+            (
+                s.fold.air_async_tasks,
+                s.msp_sid.clone(),
+                s.fold.msp_task_id(async_task_id).map(str::to_string),
+            )
+        });
+    let Some((negotiated, msp_sid, msp_task_id)) = target else {
+        acp::send_error(stdout, id, -32602, "unknown sessionId");
+        return;
+    };
+    if !negotiated {
+        log("async-task stop rejected: AIR async tasks were not negotiated");
+        acp::send_error(
+            stdout,
+            id,
+            -32601,
+            "background task stop is not supported by the Muse host",
+        );
+        return;
+    }
+    let Some(msp_task_id) = msp_task_id else {
+        acp::send_error(stdout, id, -32602, "unknown or non-stoppable asyncTaskId");
+        return;
+    };
+
+    let command_id = host.mint_cmd("cmd-");
+    let result = host.command(
+        "task/stop",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{},\"taskId\":{}}}",
+            esc(&command_id),
+            esc(&msp_sid),
+            esc(&msp_task_id)
+        ),
+    );
+    match result {
+        Ok(ack) if ack.get("status").and_then(|v| v.as_str()) == Some("accepted") => {
+            // The MSP ack only admits the stop. The item terminal event will
+            // emit async_task_state_update with the authoritative outcome.
+            acp::send_result(stdout, id, "{\"stopped\":true}");
+        }
+        Ok(ack) => {
+            let status = ack
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("missing");
+            acp::send_error(
+                stdout,
+                id,
+                -32603,
+                &format!("background task stop was not accepted by the Muse host: {status}"),
+            );
+        }
+        Err(e) => {
+            acp::send_error(
+                stdout,
+                id,
+                msp::acp_error_code(&e, -32603),
+                &format!("background task stop failed: {}", err_message(&e)),
+            );
+        }
+    }
+}
+
+/// Stop all background work admitted by the host for one negotiated session.
+/// MSP's acknowledgement is not a task outcome; item events settle each card.
+fn stop_all_background_tasks(host: &Arc<MspHost>, sessions: &Sessions, acp_sid: &str) {
+    let target = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(acp_sid)
+        .map(|s| (s.fold.air_async_tasks, s.msp_sid.clone()));
+    let Some((negotiated, msp_sid)) = target else {
+        log(&format!(
+            "async-task stopAll skipped: unknown session {acp_sid}"
+        ));
+        return;
+    };
+    if !negotiated {
+        return;
+    }
+
+    let command_id = host.mint_cmd("cmd-");
+    match host.command(
+        "task/stopAll",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{}}}",
+            esc(&command_id),
+            esc(&msp_sid)
+        ),
+    ) {
+        Ok(ack) if ack.get("status").and_then(|v| v.as_str()) == Some("accepted") => {
+            log(&format!(
+                "async-task stopAll admitted for session {acp_sid}"
+            ));
+        }
+        Ok(ack) => log(&format!(
+            "async-task stopAll was not accepted for session {acp_sid}: {}",
+            ack.get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("missing")
+        )),
+        Err(e) => log(&format!(
+            "async-task stopAll failed for session {acp_sid}: {}",
+            err_message(&e)
+        )),
     }
 }
 
