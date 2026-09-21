@@ -3339,13 +3339,15 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
-            // session/cancel stops all session work: cancel every in-flight turn.
+            // session/cancel is the editor's stop gesture: interrupt every
+            // in-flight turn on the priority lane and ask the host to retract
+            // a submission when it has produced no assistant output yet.
             for (msp_sid, turn_id) in turns {
                 let cmd = host.mint_cmd("cmd-");
                 match host.command(
-                    "turn/cancel",
+                    "turn/interrupt",
                     &format!(
-                        "{{\"commandId\":{},\"sessionId\":{},\"turnId\":{}}}",
+                        "{{\"commandId\":{},\"sessionId\":{},\"turnId\":{},\"retract\":true}}",
                         esc(&cmd),
                         esc(&msp_sid),
                         esc(&turn_id)
@@ -3357,7 +3359,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         // its way (or arrived); anything else is real.
                         if !(err_message(&e).contains("already_terminal") || err_code(&e) == -32000)
                         {
-                            log(&format!("turn/cancel failed: {}", err_message(&e)));
+                            log(&format!("turn/interrupt failed: {}", err_message(&e)));
                         }
                     }
                 }
