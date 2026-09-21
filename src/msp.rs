@@ -747,6 +747,19 @@ pub fn err_message(e: &J) -> String {
         .to_string()
 }
 
+/// Older Muse hosts do not know the 1.3.0 session-default method. Keep the
+/// existing per-turn reasoning path usable on those hosts.
+pub fn is_method_not_found(e: &J) -> bool {
+    matches!(e.get("code"), Some(J::Num(code)) if code == "-32601")
+        || e.get("data")
+            .and_then(|data| data.get("kind"))
+            .and_then(|kind| kind.as_str())
+            == Some("methodNotFound")
+        || err_message(e)
+            .to_ascii_lowercase()
+            .contains("method not found")
+}
+
 pub fn err_code(e: &J) -> i64 {
     e.get("code")
         .and_then(|v| match v {

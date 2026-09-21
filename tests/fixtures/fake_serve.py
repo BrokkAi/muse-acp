@@ -40,6 +40,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_rates_invalid ... then a refresh whose rates do not parse
   usage_rates_failure ... then a FAILED refresh (rates must survive)
   usage_resume session/resume serves an anchoredSnapshot carrying usage
+  reasoning_resume session/resume restores a standing reasoning default
+  reasoning_legacy rejects the 1.3.0 session-default method
   usage_snapshot_null snapshot whose contextUsage is null (the common shape)
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
@@ -206,7 +208,14 @@ def usage_snapshot_history(context=True, cumulative=(100, 20)):
                                     "pressure": "normal"} if context else None),
                   "tokenUsage": {"promptTokens": cumulative[0],
                                  "outputTokens": cumulative[1],
-                                 "totalTokens": sum(cumulative)}}}}
+                           "totalTokens": sum(cumulative)}}}}
+
+
+def reasoning_snapshot_history():
+    history = usage_snapshot_history()
+    history["snapshot"]["state"]["reasoningEffort"] = {
+        "reasoningEffort": "high", "source": "policy"}
+    return history
 
 
 TODO_ITEMS = [
@@ -756,6 +765,8 @@ def result_for(method, msg):
         snapshot_rung = params.get("history") == "snapshot"
         if SCENARIO == "usage_resume":
             history = usage_snapshot_history()
+        elif SCENARIO == "reasoning_resume":
+            history = reasoning_snapshot_history()
         elif SCENARIO == "todo_resume":
             history = usage_snapshot_history()
             history["snapshot"]["state"]["todoList"] = {
@@ -847,6 +858,9 @@ def result_for(method, msg):
         return {"commandId": "x", "status": "ok", "applyOutcome": "applied",
                 "effectiveMode": {"lastCommandId": "x", "mode": mode,
                                   "source": "explicit"}}
+    if method == "session/setReasoningEffort":
+        return {"commandId": msg.get("params", {}).get("commandId", ""),
+                "status": "accepted"}
     if method == "model/list":
         CATALOG_READS[0] += 1
         if SCENARIO == "usage_rates_failure" and CATALOG_READS[0] > 1:
@@ -1062,6 +1076,13 @@ def main():
                                     "message": "internal error: compose session permission profile: permission profile ':auto-review' cannot be used: the automated reviewer is unavailable on this host",
                                     "data": {"kind": "internal"}}})
                     continue
+                if (method == "session/setReasoningEffort"
+                        and SCENARIO == "reasoning_legacy"):
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32601,
+                                    "message": "method not found: session/setReasoningEffort",
+                                    "data": {"kind": "methodNotFound"}}})
+                    continue
                 if (SCENARIO == "skill_not_found"
                         and method in ("turn/start", "turn/steer")):
                     log_input(msg.get("params", {}))
@@ -1073,6 +1094,14 @@ def main():
                     continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
+                if method == "session/setReasoningEffort":
+                    notify("session/reasoningEffortChanged", {
+                        "sessionId": msg.get("params", {}).get("sessionId", MSP_SID),
+                        "reasoningEffort": msg.get("params", {}).get("reasoningEffort", ""),
+                        "source": "user",
+                        "viewCursor": "cur-reasoning-1",
+                        "sourceRange": {"start": 1, "end": 1},
+                    })
                 if SCENARIO == "rename_live" and method == "session/start":
                     notify("session/nameChanged", {
                         "sessionId": MSP_SID,

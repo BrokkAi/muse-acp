@@ -76,6 +76,9 @@ pub struct AcpSession {
     pub mode_value: String,
     pub model_value: String,
     pub reasoning_effort: String,
+    /// Source of the host's standing reasoning default. `None` means the
+    /// host has not set one, so the selector remains a per-turn fallback.
+    pub reasoning_effort_source: Option<String>,
     /// The foreground MSP turn, excluding queued turns.
     pub active_turn: Option<String>,
     pub view_cursor: String,
@@ -383,6 +386,24 @@ pub fn send_state(stdout: &StdoutShared, acp_sid: &str, state: &str, stop: Optio
         &format!(
             "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"state_update\",\"state\":\"{state}\"{stop_f}}}}}}}",
             esc(acp_sid),
+        ),
+    );
+}
+
+/// Reflect a host-side configuration change in the client's selector.
+pub fn send_config_option_update(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    config_id: &str,
+    value: &str,
+) {
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"config_option_update\",\"configId\":{},\"currentValue\":{}}}}}}}",
+            esc(acp_sid),
+            esc(config_id),
+            esc(value),
         ),
     );
 }

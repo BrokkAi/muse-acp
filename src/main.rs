@@ -492,6 +492,45 @@ fn snapshot_state(res: &J) -> Option<&J> {
     res.get("history")?.get("snapshot")?.get("state")
 }
 
+/// Adopt the optional standing reasoning default from `SnapshotState`.
+/// Returning false keeps malformed or future values on the per-turn fallback
+/// path instead of allowing an invalid host value into a turn request.
+fn adopt_reasoning_effort(s: &mut AcpSession, state: &J) -> bool {
+    let Some(reasoning) = state.get("reasoningEffort") else {
+        return false;
+    };
+    let Some(effort) = reasoning.get("reasoningEffort").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    if !acp::is_reasoning_effort(effort) {
+        return false;
+    }
+    let source = reasoning
+        .get("source")
+        .and_then(|v| v.as_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    s.reasoning_effort = effort.to_string();
+    s.reasoning_effort_source = Some(source);
+    true
+}
+
+/// The standing default is authoritative once the host reports one. Before
+/// that, retain the original adapter behavior of sending the selected tier as
+/// a per-turn override for older hosts and unset 1.3.0 sessions.
+fn reasoning_effort_override(s: &AcpSession) -> Option<String> {
+    s.reasoning_effort_source
+        .is_none()
+        .then(|| s.reasoning_effort.clone())
+}
+
+fn reasoning_effort_param(effort: Option<&str>) -> String {
+    effort
+        .map(|value| format!(",\"reasoningEffort\":{}", esc(value)))
+        .unwrap_or_default()
+}
+
 /// Read the authoritative durable session name from a lifecycle result.
 /// `Session.name` wins when present; the snapshot carries the same fact for
 /// hosts whose lifecycle projection only exposes it there. The outer `Option`
@@ -619,7 +658,7 @@ fn reconcile_pending(
 
 /// Restores facts, not cost: historic completions stay unpriced.
 fn backfill_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
-    let (msp_sid, want_context, want_totals) = match sessions
+    let (msp_sid, want_context, want_totals, want_reasoning) = match sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(acp_sid)
@@ -628,13 +667,14 @@ fn backfill_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Session
             s.msp_sid.clone(),
             s.usage_used.is_none(),
             s.cum_total.is_none(),
+            s.reasoning_effort_source.is_none(),
         ),
         None => return,
     };
-    if !want_context && !want_totals {
+    if !want_context && !want_totals && !want_reasoning {
         return;
     }
-    let (mut context, mut cumulative, mut session_name) = (None, None, None);
+    let (mut context, mut cumulative, mut reasoning, mut session_name) = (None, None, None, None);
     // The snapshot rung: the one surface that carries occupancy. The host
     // downgrades freely, so an `inline`/`none` answer here is normal and
     // simply leaves the occupancy unknown until the next live event.
@@ -659,6 +699,11 @@ fn backfill_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Session
                     && matches!(tu, J::Obj(_))
                 {
                     cumulative = Some(tu.clone());
+                }
+                if let Some(re) = state.get("reasoningEffort")
+                    && matches!(re, J::Obj(_))
+                {
+                    reasoning = Some(state.clone());
                 }
             }
         }
@@ -711,6 +756,9 @@ fn backfill_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Session
     if want_totals && let Some(c) = &cumulative {
         adopt_cumulative(s, c);
         adopted = true;
+    }
+    if want_reasoning && let Some(state) = &reasoning {
+        adopt_reasoning_effort(s, state);
     }
     if let Some(name) = session_name
         && s.session_name != name
@@ -1748,6 +1796,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             mode_value: acp::mode_from_msp(&cur_mode).to_string(),
                             model_value: cur_model.clone(),
                             reasoning_effort: "medium".to_string(),
+                            reasoning_effort_source: None,
                             active_turn,
                             view_cursor: cur_cursor.clone(),
                             fold: fresh_fold(),
@@ -1970,6 +2019,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             mode_value: "promptUnmatched".to_string(),
                             model_value: String::new(),
                             reasoning_effort: "medium".to_string(),
+                            reasoning_effort_source: None,
                             active_turn: None,
                             view_cursor: String::new(),
                             fold: fresh_fold(),
@@ -2039,6 +2089,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             {
                                 adopt_cumulative(entry, tu);
                             }
+                            adopt_reasoning_effort(entry, state);
                             // The todo list is part of the folded snapshot:
                             // restore the plan so a resumed session shows its
                             // task state before the next live change.
@@ -2195,6 +2246,16 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 .map(|s| s.msp_sid.clone())
                 .or(meta_msp_sid)
                 .unwrap_or_else(|| src_sid.clone());
+            let parent_reasoning = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&src_sid)
+                .map(|s| {
+                    (
+                        s.reasoning_effort.clone(),
+                        s.reasoning_effort_source.clone(),
+                    )
+                });
             let cut_point = match resolve_fork_cut_point(host, &msp_sid, params.as_ref()) {
                 Ok(c) => c,
                 Err(e) => {
@@ -2284,7 +2345,13 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                             ui_seen: std::collections::HashSet::new(),
                             mode_value: mode_value.clone(),
                             model_value: new_model.clone(),
-                            reasoning_effort: "medium".to_string(),
+                            reasoning_effort: parent_reasoning
+                                .as_ref()
+                                .map(|(effort, _)| effort.clone())
+                                .unwrap_or_else(|| "medium".to_string()),
+                            reasoning_effort_source: parent_reasoning
+                                .as_ref()
+                                .and_then(|(_, source)| source.clone()),
                             active_turn: None,
                             view_cursor: String::new(),
                             fold: fresh_fold(),
@@ -2311,12 +2378,21 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         if !mode_value.is_empty() {
                             entry.mode_value = mode_value;
                         }
+                        if let Some(state) = snapshot_state(&r) {
+                            adopt_reasoning_effort(entry, state);
+                        }
                     }
-                    let (mode_out, model_out) = sessions
+                    let (mode_out, model_out, reasoning_out) = sessions
                         .lock()
                         .unwrap()
                         .get(&new_msp)
-                        .map(|s| (s.mode_value.clone(), s.model_value.clone()))
+                        .map(|s| {
+                            (
+                                s.mode_value.clone(),
+                                s.model_value.clone(),
+                                s.reasoning_effort.clone(),
+                            )
+                        })
                         .unwrap_or_default();
                     let models = catalog(host);
                     let result = if ver == 2 {
@@ -2328,7 +2404,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                                 ver,
                                 &mode_out,
                                 &model_out,
-                                "medium",
+                                &reasoning_out,
                                 &models,
                                 recommended_model(&models).as_deref(),
                             )
@@ -2342,7 +2418,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                                 ver,
                                 &mode_out,
                                 &model_out,
-                                "medium",
+                                &reasoning_out,
                                 &models,
                                 recommended_model(&models).as_deref(),
                             ),
@@ -2376,7 +2452,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     Some(s) => (
                         s.msp_sid.clone(),
                         s.roots.clone(),
-                        s.reasoning_effort.clone(),
+                        reasoning_effort_override(s),
                         s.pending_perm
                             .as_ref()
                             .map(|p| p.approval_id.clone())
@@ -2488,11 +2564,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             match host.command(
                 "turn/start",
                 &format!(
-                    "{{\"commandId\":{},\"sessionId\":{},\"input\":{},\"reasoningEffort\":{}}}",
+                    "{{\"commandId\":{},\"sessionId\":{},\"input\":{}{}}}",
                     esc(&cmd),
                     esc(&msp_sid),
                     input,
-                    esc(&reasoning_effort)
+                    reasoning_effort_param(reasoning_effort.as_deref())
                 ),
             ) {
                 Ok(r) => {
@@ -2702,7 +2778,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     Some(s) => (
                         s.msp_sid.clone(),
                         s.roots.clone(),
-                        s.reasoning_effort.clone(),
+                        reasoning_effort_override(s),
                         s.active_turn.clone(),
                         s.pending_perm.is_some() || !s.perm_queue.is_empty(),
                     ),
@@ -2751,22 +2827,22 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 Some(expected_turn) => host.command(
                     "turn/steer",
                     &format!(
-                        "{{\"commandId\":{},\"sessionId\":{},\"expectedTurnId\":{},\"input\":{},\"reasoningEffort\":{}}}",
+                        "{{\"commandId\":{},\"sessionId\":{},\"expectedTurnId\":{},\"input\":{}{}}}",
                         esc(&cmd),
                         esc(&msp_sid),
                         esc(expected_turn),
                         input,
-                        esc(&reasoning_effort)
+                        reasoning_effort_param(reasoning_effort.as_deref())
                     ),
                 ),
                 None => host.command(
                     "turn/start",
                     &format!(
-                        "{{\"commandId\":{},\"sessionId\":{},\"input\":{},\"ifBusy\":\"steer\",\"reasoningEffort\":{}}}",
+                        "{{\"commandId\":{},\"sessionId\":{},\"input\":{},\"ifBusy\":\"steer\"{}}}",
                         esc(&cmd),
                         esc(&msp_sid),
                         input,
-                        esc(&reasoning_effort)
+                        reasoning_effort_param(reasoning_effort.as_deref())
                     ),
                 ),
             };
@@ -3120,7 +3196,9 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             }
         }
         "session/set_config_option" => {
-            // Config selectors: approval posture, model, and per-turn reasoning.
+            // Config selectors: approval posture, model, and the session's
+            // standing reasoning default (with a per-turn fallback for hosts
+            // that predate MSP 1.3.0).
             let sid = params
                 .as_ref()
                 .and_then(|p| p.get("sessionId"))
@@ -3179,7 +3257,15 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 ),
                 "reasoning_effort" => {
                     if acp::is_reasoning_effort(&value) {
-                        Ok(J::Null)
+                        host.command(
+                            "session/setReasoningEffort",
+                            &format!(
+                                "{{\"commandId\":{},\"sessionId\":{},\"reasoningEffort\":{}}}",
+                                esc(&cmd),
+                                esc(&msp_sid),
+                                esc(&value)
+                            ),
+                        )
                     } else {
                         acp::send_error(
                             stdout,
@@ -3200,6 +3286,13 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                     return;
                 }
             };
+            // MSP 1.2.x has no session default method. Preserve the previous
+            // selector behavior there: the value remains a per-turn override.
+            let reasoning_fallback = match &r {
+                Err(e) => key == "reasoning_effort" && msp::is_method_not_found(e),
+                Ok(_) => false,
+            };
+            let r = if reasoning_fallback { Ok(J::Null) } else { r };
             match r {
                 Ok(res) => {
                     // Return the full updated option set, not just the delta.
@@ -3225,7 +3318,11 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                                 s.mode_value = acp::mode_from_msp(m).to_string();
                             }
                             "model" => s.model_value = value.clone(),
-                            "reasoning_effort" => s.reasoning_effort = value.clone(),
+                            "reasoning_effort" => {
+                                s.reasoning_effort = value.clone();
+                                s.reasoning_effort_source =
+                                    (!reasoning_fallback).then(|| "user".to_string());
+                            }
                             _ => unreachable!(),
                         }
                         let models = catalog(host);
@@ -4473,6 +4570,39 @@ fn handle_msp(
                     s.mode_value = acp::mode_from_msp(mode).to_string();
                 }
                 let _ = acp_sid;
+            }
+        }
+        "session/reasoningEffortChanged" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let effort = params
+                .get("reasoningEffort")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if !acp::is_reasoning_effort(effort) {
+                log(&format!(
+                    "ignoring invalid session/reasoningEffortChanged effort={effort:?}"
+                ));
+                return;
+            }
+            let source = params
+                .get("source")
+                .and_then(|v| v.as_str())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown")
+                .to_string();
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                if let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&acp_sid)
+                {
+                    s.reasoning_effort = effort.to_string();
+                    s.reasoning_effort_source = Some(source);
+                }
+                acp::send_config_option_update(stdout, &acp_sid, "reasoning_effort", effort);
             }
         }
         "session/modelChanged" => {

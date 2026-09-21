@@ -151,7 +151,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `userInput/requested` | `elicitation/create` form bridge (needs client `elicitation.form` caps), else auto-cancel |
 | `session/setApprovalMode` | `configOptions` mode selector using the MSP names verbatim (`allowAll`/`promptUnmatched`/`onRequest`/`denyUnmatched`) + `session/set_config_option`; legacy v1 `modes` / `session/set_mode` |
 | `model/list` + `session/setModel` | `configOptions` model selector + `session/set_config_option`; legacy v1 `session/set_model` |
-| `reasoningEffort` on `turn/start` / `turn/steer` | `configOptions` reasoning selector (`none` through `ultra`) |
+| `session/setReasoningEffort` + `session/reasoningEffortChanged` + `SnapshotState.reasoningEffort` | `configOptions` reasoning selector as the standing session default; an unset default keeps the per-turn override fallback (`none` through `ultra`) |
 | `turn/steer` | v2 `_session/steering` extension with exact-turn targeting and race-safe idle behavior |
 | backgrounded `toolCall` + `userShell` items | negotiated AIR async tasks: `async_task_spawned`/`async_task_state_update` plus the backgrounded marker on the owning command card; `_session/async_task/stop` maps to MSP `task/stop`, while `session/cancel` maps to `task/stopAll`; terminal item events settle the task state |
 | `subagent` items | negotiated: `subagent_spawned` + `subagent_state_update` on the parent and the child transcript replayed from `session/read` onto the child session id; otherwise a synthetic tool card with `_meta.muse` provenance |
@@ -191,6 +191,13 @@ session and after a config option changes. The adapter does not permanently
 cache the first nonempty catalog. If a refresh fails, it retains the last
 successful catalog; stderr records failures and each snapshot's source and
 model count. An open selector does not itself trigger a refresh.
+
+The reasoning selector sets Muse's session-wide default on hosts that support
+`session/setReasoningEffort`. The adapter folds
+`session/reasoningEffortChanged` and restores `SnapshotState.reasoningEffort`
+on resume. Until a host reports a standing default, including on older hosts
+that do not implement the setter, the selected tier remains a per-turn
+`reasoningEffort` override for compatibility.
 
 Restoring usage on attach takes up to two extra reads, and only when the
 resume itself carried none. `session/contextUsage` is not durable-sourced, so

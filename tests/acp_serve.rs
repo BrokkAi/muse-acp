@@ -2076,6 +2076,9 @@ fn reasoning_effort_is_selected_and_sent_to_msp() {
         "reasoning selector is initialized: {initial}"
     );
 
+    let _initial_pid = c.prompt(&sid, "use the fallback");
+    c.wait_input("\"reasoningEffort\": \"medium\"", Duration::from_secs(15));
+
     let invalid_id = c.req(
         "session/set_config_option",
         &format!(
@@ -2109,9 +2112,79 @@ fn reasoning_effort_is_selected_and_sent_to_msp() {
         maxed.contains("\"currentValue\":\"max\""),
         "1.2.1 max tier not selectable: {maxed}"
     );
+    c.wait_log("session/setReasoningEffort", Duration::from_secs(15));
+    let changed = c.wait_for(
+        "\"sessionUpdate\":\"config_option_update\",\"configId\":\"reasoning_effort\",\"currentValue\":\"max\"",
+        Duration::from_secs(15),
+    );
+    assert!(
+        changed.contains("\"currentValue\":\"max\""),
+        "host default change updates the selector: {changed}"
+    );
 
     let _pid = c.prompt(&sid, "think carefully");
-    c.wait_input("\"reasoningEffort\": \"max\"", Duration::from_secs(15));
+    c.wait_input("\"text\": \"think carefully\"", Duration::from_secs(15));
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    let turn_inputs: Vec<&str> = inputs
+        .lines()
+        .filter(|line| line.contains("\"input\""))
+        .collect();
+    assert!(
+        turn_inputs
+            .last()
+            .is_some_and(|line| !line.contains("reasoningEffort")),
+        "a host session default must replace the per-turn override: {inputs}"
+    );
+    c.finish();
+}
+
+#[test]
+fn reasoning_effort_default_is_restored_from_resume_snapshot() {
+    let mut c = Client::spawn("reasoning_resume", &[]);
+    let init = c.req("initialize", "{\"protocolVersion\":2}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let rid = c.req(
+        "session/resume",
+        "{\"sessionId\":\"msp-sess-1\",\"replayFrom\":{\"type\":\"start\"}}",
+    );
+    let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(
+        resumed.contains("\"currentValue\":\"high\""),
+        "resume restores the host's standing reasoning effort: {resumed}"
+    );
+
+    let _pid = c.prompt("msp-sess-1", "after resume");
+    c.wait_input("\"text\": \"after resume\"", Duration::from_secs(15));
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    let turn_input = inputs
+        .lines()
+        .find(|line| line.contains("after resume"))
+        .expect("resumed prompt input");
+    assert!(
+        !turn_input.contains("reasoningEffort"),
+        "restored default must be used without a conflicting per-turn override: {turn_input}"
+    );
+    c.finish();
+}
+
+#[test]
+fn reasoning_effort_falls_back_to_per_turn_on_legacy_host() {
+    let mut c = Client::spawn("reasoning_legacy", &[]);
+    let sid = c.new_session(2, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
+        ),
+    );
+    let set = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    assert!(
+        set.contains("\"currentValue\":\"high\""),
+        "legacy host keeps the selector usable: {set}"
+    );
+    let _pid = c.prompt(&sid, "legacy host");
+    c.wait_input("\"reasoningEffort\": \"high\"", Duration::from_secs(15));
     c.finish();
 }
 
