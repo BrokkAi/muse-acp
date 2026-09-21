@@ -14,14 +14,14 @@ mod zed;
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
     mpsc,
 };
 
-use acp::{AcpSession, InFlight, PendingPerm, Sessions, StdoutShared};
+use acp::{AcpSession, FileChangeReport, InFlight, PendingPerm, Sessions, StdoutShared};
 use fold::SessionFold;
 use json::{J, esc, j_to_string, mint_id, parse_json};
 use msp::{MspEvent, MspHost, err_code, err_message, log};
@@ -32,6 +32,13 @@ static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the client advertis
 static NATIVE_SUBAGENTS: AtomicU64 = AtomicU64::new(0); // 1 when subagent sessions are negotiated
 static AIR_ASYNC_TASKS: AtomicU64 = AtomicU64::new(0); // 1 when the client wants async-task updates
 static AIR_RECOMMENDED: AtomicU64 = AtomicU64::new(0); // 1 when the client wants recommendedValue metadata
+static AIR_FILE_REPORT: AtomicU64 = AtomicU64::new(0); // 1 when per-turn file reports are negotiated
+
+const FILE_REPORT_MAX_PATHS: usize = 1024;
+const FILE_REPORT_MAX_PATH_LENGTH: usize = 4096;
+// Leave room inside AIR's 256 KiB report-object limit for fixed fields and the
+// bounded request id. Count JSON-escaped path bytes, not raw path bytes.
+const FILE_REPORT_MAX_ENCODED_PATH_BYTES: usize = 255 * 1024;
 
 /// True when the client's `_meta.jetbrains.air.capabilities` advertises a key.
 fn client_supports_air(capabilities: Option<&J>, key: &str) -> bool {
@@ -66,6 +73,216 @@ fn client_supports_subagents(capabilities: Option<&J>) -> bool {
         return true;
     }
     client_supports_air(Some(caps), "nativeSubagentSessions")
+}
+
+/// Parse the request-scoped AIR v1 file report opt-in. Invalid metadata is
+/// ignored; an extension must never affect an ordinary ACP prompt.
+fn file_report_request(params: Option<&J>) -> Option<String> {
+    if AIR_FILE_REPORT.load(Ordering::SeqCst) == 0 {
+        return None;
+    }
+    let request = params?
+        .get("_meta")?
+        .get("jetbrains")?
+        .get("air")?
+        .get("agentFileChangeReportRequest")?;
+    let J::Obj(fields) = request else {
+        return None;
+    };
+    if fields.len() != 2 || request.get("version").and_then(J::as_u64) != Some(1) {
+        return None;
+    }
+    let id = request.get("requestId").and_then(J::as_str)?;
+    if id.is_empty()
+        || id.len() > 128
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn new_file_report(request_id: String) -> FileChangeReport {
+    FileChangeReport {
+        request_id,
+        paths: Vec::new(),
+        seen_paths: std::collections::HashSet::new(),
+        seen_items: std::collections::HashSet::new(),
+        encoded_path_bytes: 0,
+        declared_complete: true,
+        truncated: false,
+    }
+}
+
+/// Resolve a host-reported path without touching the filesystem. The AIR
+/// report is workspace-scoped and path-only, so deleted and binary files are
+/// safe. Parent traversal and paths outside the session cwd are rejected.
+fn normalize_file_report_path(cwd: &str, raw: &str) -> Option<String> {
+    if raw.is_empty()
+        || raw.len() > FILE_REPORT_MAX_PATH_LENGTH
+        || raw.chars().any(char::is_control)
+    {
+        return None;
+    }
+    let cwd = Path::new(cwd);
+    if !cwd.is_absolute() {
+        return None;
+    }
+    let candidate = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        cwd.join(raw)
+    };
+    let mut normalized = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            Component::RootDir => normalized.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+            Component::Normal(part) => normalized.push(part),
+        }
+    }
+    if normalized == cwd || !normalized.starts_with(cwd) {
+        return None;
+    }
+    normalized.to_str().map(str::to_string)
+}
+
+fn tool_args(item: &J) -> Option<J> {
+    match item.get("args")? {
+        J::Obj(_) => item.get("args").cloned(),
+        J::Str(raw) => parse_json(raw).ok(),
+        _ => None,
+    }
+}
+
+/// Fold one authoritative, successful MSP tool completion into its turn's
+/// requested report. Exact native write tools provide explicit path fields.
+/// Other successful tools make completeness uncertain but never create a
+/// guessed path (notably shell redirections and generators).
+fn observe_file_change(sessions: &Sessions, acp_sid: &str, item: &J) {
+    let kind = item.get("kind").and_then(J::as_str).unwrap_or("");
+    let delegated = matches!(kind, "subagent" | "workflow" | "userShell");
+    if !delegated
+        && (kind != "toolCall" || item.get("status").and_then(J::as_str) != Some("completed"))
+    {
+        return;
+    }
+    let Some(turn_id) = item.get("turnId").and_then(J::as_str) else {
+        return;
+    };
+    let item_id = item.get("itemId").and_then(J::as_str).unwrap_or("");
+    let tool = if delegated { None } else { item.get("tool") }
+        .and_then(J::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let args = tool_args(item);
+    let path_groups: &[&[&str]] = match tool.as_str() {
+        "write_file" | "create_file" | "edit_file" | "delete_file" | "remove_file" => {
+            &[&["path", "filePath"]]
+        }
+        "move_file" | "rename_file" => &[
+            &["oldPath", "from", "sourcePath"],
+            &["newPath", "to", "destinationPath"],
+        ],
+        // These known host tools do not write workspace files.
+        "read_file" | "list_files" | "search" | "request_user_input" => &[],
+        _ => {
+            let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(report) = map
+                .get_mut(acp_sid)
+                .and_then(|s| s.in_flight.iter_mut().find(|f| f.msp_turn == turn_id))
+                .and_then(|f| f.file_report.as_mut())
+            {
+                report.declared_complete = false;
+            }
+            return;
+        }
+    };
+    if path_groups.is_empty() {
+        return;
+    }
+    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(session) = map.get_mut(acp_sid) else {
+        return;
+    };
+    let cwd = session.cwd.clone();
+    let Some(report) = session
+        .in_flight
+        .iter_mut()
+        .find(|f| f.msp_turn == turn_id)
+        .and_then(|f| f.file_report.as_mut())
+    else {
+        return;
+    };
+    if item_id.is_empty() || !report.seen_items.insert(item_id.to_string()) {
+        return;
+    }
+    let Some(args) = args else {
+        report.declared_complete = false;
+        return;
+    };
+    for keys in path_groups {
+        let Some(raw) = keys
+            .iter()
+            .find_map(|key| args.get(key).and_then(J::as_str))
+        else {
+            report.declared_complete = false;
+            continue;
+        };
+        let Some(path) = normalize_file_report_path(&cwd, raw) else {
+            report.declared_complete = false;
+            continue;
+        };
+        if report.seen_paths.contains(&path) {
+            continue;
+        }
+        let encoded_bytes = esc(&path).len() + usize::from(!report.paths.is_empty());
+        if report.paths.len() >= FILE_REPORT_MAX_PATHS
+            || report.encoded_path_bytes.saturating_add(encoded_bytes)
+                > FILE_REPORT_MAX_ENCODED_PATH_BYTES
+        {
+            report.truncated = true;
+            report.declared_complete = false;
+            continue;
+        }
+        report.seen_paths.insert(path.clone());
+        report.paths.push(path);
+        report.encoded_path_bytes += encoded_bytes;
+    }
+}
+
+fn send_file_report(stdout: &StdoutShared, acp_sid: &str, report: FileChangeReport) {
+    let paths = report
+        .paths
+        .iter()
+        .map(|path| esc(path))
+        .collect::<Vec<_>>()
+        .join(",");
+    let value = format!(
+        "{{\"version\":1,\"requestId\":{},\"status\":\"reported\",\"paths\":[{}],\"declaredComplete\":{},\"truncated\":{}}}",
+        esc(&report.request_id),
+        paths,
+        report.declared_complete,
+        report.truncated,
+    );
+    let update = "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"agentFileChangeReport\":".to_string()
+        + &value
+        + "}}}}";
+    let line = "{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":"
+        .to_string()
+        + &esc(acp_sid)
+        + ",\"update\":"
+        + &update
+        + "}}";
+    acp::send_raw(stdout, &line);
 }
 /// Last successful model catalog, used only when a refresh fails.
 /// Rows are (modelId, displayLabel, isDefault).
@@ -527,14 +744,14 @@ enum LoopMsg {
 
 fn v2_init() -> String {
     format!(
-        r#"{{"protocolVersion":2,"capabilities":{{"session":{{"prompt":{{"image":{{}},"embeddedContext":{{}}}},"fork":{{}},"subagents":{{}},"additionalDirectories":{{}}}}}},"info":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}},"authMethods":[],"_meta":{{"steering":{{"supported":true}},"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}}}}}"#,
+        r#"{{"protocolVersion":2,"capabilities":{{"session":{{"prompt":{{"image":{{}},"embeddedContext":{{}}}},"fork":{{}},"subagents":{{}},"additionalDirectories":{{}}}}}},"info":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}},"authMethods":[],"_meta":{{"steering":{{"supported":true}},"jetbrains":{{"air":{{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}}}}}"#,
         ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
     )
 }
 
 fn v1_init() -> String {
     format!(
-        r#"{{"protocolVersion":1,"authMethods":[],"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}},"fork":{{}},"subagents":{{}},"additionalDirectories":{{}}}},"_meta":{{"jetbrains":{{"air":{{"version":1,"capabilities":["nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
+        r#"{{"protocolVersion":1,"authMethods":[],"agentCapabilities":{{"promptCapabilities":{{"text":true,"image":true,"audio":false,"embeddedContext":true}},"mcpCapabilities":{{"http":false,"sse":false}},"loadSession":true,"sessionCapabilities":{{"list":{{}},"resume":{{}},"close":{{}},"fork":{{}},"subagents":{{}},"additionalDirectories":{{}}}},"_meta":{{"jetbrains":{{"air":{{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}}}}},"agentInfo":{{"name":"muse-acp","title":"Muse ACP","version":{ver}}}}}"#,
         ver = crate::json::esc(env!("CARGO_PKG_VERSION"))
     )
 }
@@ -1258,11 +1475,16 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
             AIR_ASYNC_TASKS.store(u64::from(async_tasks), Ordering::SeqCst);
             let recommended = client_supports_air(air_caps, "recommendedValue");
             AIR_RECOMMENDED.store(u64::from(recommended), Ordering::SeqCst);
+            let file_report = client_supports_air(air_caps, "agentFileChangeReport");
+            AIR_FILE_REPORT.store(u64::from(file_report), Ordering::SeqCst);
             if async_tasks {
                 log("client negotiated AIR async-task updates");
             }
             if recommended {
                 log("client negotiated AIR recommended config values");
+            }
+            if file_report {
+                log("client negotiated AIR per-turn file-change reports");
             }
             if subagents {
                 log("client negotiated native subagent sessions");
@@ -2008,6 +2230,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
         }
         "session/prompt" => {
             let ver = negotiated_ver();
+            let report_request = file_report_request(params.as_ref());
             let sid = params
                 .as_ref()
                 .and_then(|p| p.get("sessionId"))
@@ -2160,6 +2383,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                         s.in_flight.push(InFlight {
                             msp_turn: turn.clone(),
                             req_id: id.clone().unwrap_or(J::Null),
+                            file_report: report_request.map(new_file_report),
                         });
                         if started {
                             s.active_turn = Some(turn);
@@ -2379,6 +2603,7 @@ fn handle_acp(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, m
                 s.in_flight.push(InFlight {
                     msp_turn: turn,
                     req_id: J::Null,
+                    file_report: None,
                 });
             }
             // Acknowledge the extension before emitting the synthetic echo.
@@ -3561,6 +3786,9 @@ fn handle_msp(
                             }
                         }
                     } else if let Some(J::Arr(items)) = r.get("items") {
+                        for item in items {
+                            observe_file_change(sessions, &acp_sid, item);
+                        }
                         for it in items.clone() {
                             let wrap = J::Obj(vec![("item".to_string(), it)]);
                             let mut out = Vec::new();
@@ -3627,6 +3855,7 @@ fn handle_msp(
                 .unwrap_or("");
             let item = params.get("item").cloned().unwrap_or(J::Null);
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                observe_file_change(sessions, &acp_sid, &item);
                 let mut out = Vec::new();
                 if let Some(s) = sessions
                     .lock()
@@ -3678,7 +3907,9 @@ fn handle_msp(
                     }
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id);
                     let ver = s.ver;
-                    let req_id = pos.map(|p| s.in_flight.remove(p).req_id);
+                    let finished = pos.map(|p| s.in_flight.remove(p));
+                    let req_id = finished.as_ref().map(|f| f.req_id.clone());
+                    let file_report = finished.and_then(|f| f.file_report);
                     let rest = s.in_flight.len();
                     // The turn's model-call legs, summed. Every completion's
                     // `session/tokenUsage` is folded from a durable record
@@ -3687,11 +3918,14 @@ fn handle_msp(
                     let usage = acp::take_turn_usage(s, turn_id)
                         .map(|u| u.result_member())
                         .unwrap_or_default();
-                    (req_id, ver, rest, usage)
+                    (req_id, ver, rest, usage, file_report)
                 });
-            if let Some((req_id, ver, rest, usage)) = settled {
+            if let Some((req_id, ver, rest, usage, file_report)) = settled {
                 let stop = fold::stop_reason(terminal);
                 let failed = terminal != "completed" && terminal != "cancelled";
+                if let Some(report) = file_report {
+                    send_file_report(stdout, &acp_sid, report);
+                }
                 if ver == 2 {
                     // A failed terminal otherwise surfaces as a bare idle
                     // with `_failed` and an empty transcript (the reported

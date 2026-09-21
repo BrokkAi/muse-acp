@@ -914,6 +914,127 @@ fn tool_call_completion_bridges_with_result_text() {
 }
 
 #[test]
+fn negotiated_file_change_report_uses_successful_host_tool_paths_once() {
+    let caps = ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}";
+    let mut c = Client::spawn("file_changes", &[]);
+    let sid = c.new_session(1, caps);
+    let pid = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"change files\"}}],\"_meta\":{{\"jetbrains\":{{\"air\":{{\"agentFileChangeReportRequest\":{{\"version\":1,\"requestId\":\"report-1\"}}}}}}}}}}"
+        ),
+    );
+    let report = c.wait_for("\"agentFileChangeReport\":{", Duration::from_secs(15));
+    for path in [
+        "added.bin",
+        "src/edited.rs",
+        "deleted.txt",
+        "old.txt",
+        "new.txt",
+    ] {
+        assert!(report.contains(path), "missing {path}: {report}");
+    }
+    assert!(
+        !report.contains("not-written.txt"),
+        "rejected write leaked: {report}"
+    );
+    assert!(
+        report.contains("\"declaredComplete\":true") && report.contains("\"truncated\":false"),
+        "complete bounded report: {report}"
+    );
+    assert_eq!(
+        report.matches("src/edited.rs").count(),
+        1,
+        "replay dedup: {report}"
+    );
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "prompt terminal: {done}");
+    let reports = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|frame| frame.contains("\"agentFileChangeReport\":{"))
+        .count();
+    assert_eq!(reports, 1, "one report per completed turn");
+    c.finish();
+}
+
+#[test]
+fn file_change_report_never_infers_shell_redirection() {
+    let caps = ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}";
+    let mut c = Client::spawn("file_changes_ambiguous", &[]);
+    let sid = c.new_session(1, caps);
+    let _pid = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"run shell\"}}],\"_meta\":{{\"jetbrains\":{{\"air\":{{\"agentFileChangeReportRequest\":{{\"version\":1,\"requestId\":\"report-shell\"}}}}}}}}}}"
+        ),
+    );
+    let report = c.wait_for("\"agentFileChangeReport\":{", Duration::from_secs(15));
+    assert!(
+        report.contains("\"paths\":[]"),
+        "no guessed paths: {report}"
+    );
+    assert!(
+        report.contains("\"declaredComplete\":false"),
+        "ambiguity disclosed: {report}"
+    );
+    assert!(
+        !report.contains("inferred.txt"),
+        "shell text is not path evidence: {report}"
+    );
+    c.finish();
+}
+
+#[test]
+fn file_change_reports_cover_gap_recovery_and_disclose_delegation() {
+    for (scenario, complete, path) in [
+        ("file_changes_subagent", false, None),
+        ("file_changes_gap", true, Some("gap-written.txt")),
+    ] {
+        let mut c = Client::spawn(scenario, &[]);
+        let sid = c.new_session(1, ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}");
+        let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"text","text":"edit"}],"_meta":{"jetbrains":{"air":{"agentFileChangeReportRequest":{"version":1,"requestId":"report-recovery"}}}}});
+        c.req("session/prompt", &params.to_string());
+        let frame = c.wait_for("\"agentFileChangeReport\":{", Duration::from_secs(15));
+        assert!(
+            frame.contains(&format!("\"declaredComplete\":{complete}")),
+            "{frame}"
+        );
+        if let Some(path) = path {
+            assert!(frame.contains(path), "{frame}");
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn file_change_report_requires_bilateral_capability_negotiation() {
+    let mut c = Client::spawn("file_changes", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"change files\"}}],\"_meta\":{{\"jetbrains\":{{\"air\":{{\"agentFileChangeReportRequest\":{{\"version\":1,\"requestId\":\"report-off\"}}}}}}}}}}"
+        ),
+    );
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "prompt terminal: {done}");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("\"agentFileChangeReport\":"),
+        "unnegotiated report emitted: {frames}"
+    );
+    drop(frames);
+    c.finish();
+}
+
+#[test]
 fn approval_preserves_all_choices_with_deny_option() {
     let mut c = Client::spawn("approval", &[]);
     let sid = c.new_session(1, "");

@@ -109,6 +109,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `item/delta` (message text) | `agent_message_chunk` (v2 carries `messageId`) |
 | toolCall `item/started\|updated\|completed` | `tool_call` (v1 create) / `tool_call_update` upsert with kind/title/status/content/rawInput |
 | `turn/completed` | v1 `session/prompt` response `{stopReason}` plus the turn's `usage` when the host reported any; v2 `state_update` idle + `stopReason` |
+| successful native file `toolCall` items | negotiated AIR `agentFileChangeReport` after the owning turn completes; paths come only from explicit host tool arguments and are deduplicated across replay |
 | `turn/cancel` | `session/cancel` (waits for the terminal event; `already_terminal` = success) |
 | `approval/requested` + `approval/request` | `session/request_permission` → `approval/decide` (deny-safe fallback) |
 | `session/resume` + history | `session/resume` (+ `replayFrom: {type:start}` replays messages); usage is restored on attach: from `history.snapshot.state` when a snapshot is served, else by asking for the snapshot rung explicitly, else from one backward `view/page` read for the running totals |
@@ -145,6 +146,14 @@ reattaches each session and reconciles task items from the returned fold; a
 terminal item settles a task that was already announced. MSP v1 has no
 targeted background-work stop primitive, so task updates remain display-only
 and advertise `canStop: false`.
+
+Per-turn file reports are available when the client advertises AIR v1
+`agentFileChangeReport` and places a valid `agentFileChangeReportRequest` on
+the prompt. The adapter reports workspace paths from successful native Muse
+file-tool completions only. It includes both endpoints of a rename and sends
+paths without reading contents, so deleted and binary files are safe. Rejected
+writes are excluded. Shell commands, generators, and unknown tools never cause
+a guessed path; their presence marks `declaredComplete: false` instead.
 
 Model choices are refreshed from Muse when creating, loading, or resuming a
 session and after a config option changes. The adapter does not permanently
