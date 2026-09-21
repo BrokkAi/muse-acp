@@ -299,14 +299,31 @@ pub fn turn_auth_diagnostic(
     auth_diagnostic(message, host)
 }
 
-/// ACP reserves -32000 for authentication required. Other MSP errors retain
-/// the caller's existing ACP mapping; MSP numeric codes are not ACP codes.
+/// ACP reserves -32000 for authentication required. The MSP skill lookup
+/// error is also stable across the two protocols, so preserve its registry
+/// code; other MSP errors retain the caller's existing ACP mapping.
 pub fn acp_error_code(error: &J, fallback: i64) -> i64 {
     if auth_failure(&err_message(error)).is_some() {
         -32000
+    } else if err_code(error) == -32032
+        || error
+            .get("data")
+            .and_then(|data| data.get("kind"))
+            .and_then(|kind| kind.as_str())
+            == Some("skillNotFound")
+    {
+        -32032
     } else {
         fallback
     }
+}
+
+/// Structured data for the only MSP request error that ACP clients need to
+/// branch on here. In particular, keep the rejected selector visible.
+pub fn skill_error_data(error: &J) -> Option<String> {
+    let data = error.get("data")?;
+    (data.get("kind").and_then(|kind| kind.as_str()) == Some("skillNotFound"))
+        .then(|| j_to_string(data))
 }
 
 pub struct MspHost {

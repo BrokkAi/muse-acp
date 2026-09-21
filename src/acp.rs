@@ -316,6 +316,7 @@ pub fn send_error(stdout: &StdoutShared, id: &Option<J>, code: i64, message: &st
     );
 }
 
+/// Send an ACP error while retaining structured data supplied by MSP.
 pub fn send_error_with_data(
     stdout: &StdoutShared,
     id: &Option<J>,
@@ -563,10 +564,10 @@ pub fn session_modes(current_mode: &str) -> String {
     )
 }
 
-/// Advertise the Muse skills which are useful from an editor session. Commands
-/// still travel as ordinary prompts; short aliases are normalized to Muse's
-/// stable `/skill <id>` spelling before they reach the host.
-fn available_commands_json(ver: u8) -> String {
+/// Build the editor command palette from the host's current skill catalog.
+/// `/compact` is local to the adapter and therefore remains available even
+/// though it is not a host skill.
+fn available_commands_json(ver: u8, skills: &[(String, String, Option<String>)]) -> String {
     let input = |hint: &str| {
         if ver == 1 {
             format!("{{\"hint\":{}}}", esc(hint))
@@ -574,59 +575,34 @@ fn available_commands_json(ver: u8) -> String {
             format!("{{\"type\":\"text\",\"hint\":{}}}", esc(hint))
         }
     };
-    let commands = [
-        (
-            "skill",
-            "Invoke a Muse skill",
-            Some("skill id and optional prompt"),
-        ),
-        (
-            "plan",
-            "Create a grounded plan and stop for approval",
-            Some("what to plan"),
-        ),
-        ("compact", "Compact the session context", None),
-        (
-            "doctor",
-            "Diagnose a Muse runtime or session issue",
-            Some("symptom or session"),
-        ),
-        (
-            "create-skill",
-            "Create a Muse skill",
-            Some("what the skill should do"),
-        ),
-        (
-            "create-plugin",
-            "Create a Muse plugin",
-            Some("what the plugin should do"),
-        ),
-        (
-            "import",
-            "Import another agent's session",
-            Some("transcript, path, or session id"),
-        ),
-    ];
-    let items = commands
-        .into_iter()
-        .map(|(name, description, hint)| {
-            let input = hint
-                .map(|hint| format!(",\"input\":{}", input(hint)))
-                .unwrap_or_default();
-            format!("{{\"name\":\"{name}\",\"description\":\"{description}\"{input}}}")
-        })
-        .collect::<Vec<_>>()
-        .join(",");
-    format!("[{items}]")
+    let mut items =
+        vec!["{\"name\":\"compact\",\"description\":\"Compact the session context\"}".to_string()];
+    items.extend(skills.iter().map(|(name, description, hint)| {
+        let input = hint
+            .as_deref()
+            .map(|hint| format!(",\"input\":{}", input(hint)))
+            .unwrap_or_default();
+        format!(
+            "{{\"name\":{},\"description\":{}{input}}}",
+            esc(name),
+            esc(description),
+        )
+    }));
+    format!("[{}]", items.join(","))
 }
 
-pub fn send_available_commands(stdout: &StdoutShared, acp_sid: &str, ver: u8) {
+pub fn send_available_commands(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    ver: u8,
+    skills: &[(String, String, Option<String>)],
+) {
     send_raw(
         stdout,
         &format!(
             "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":{}}}}}}}",
             esc(acp_sid),
-            available_commands_json(ver)
+            available_commands_json(ver, skills)
         ),
     );
 }
@@ -730,12 +706,18 @@ mod tests {
             };
             assert_eq!(items.len(), 3);
 
-            let commands = available_commands_json(ver);
+            let skills = vec![(
+                "plan".to_string(),
+                "Create a plan".to_string(),
+                Some("what to plan".to_string()),
+            )];
+            let commands = available_commands_json(ver, &skills);
             let parsed = crate::json::parse_json(&commands).expect("available commands JSON");
             let J::Arr(items) = parsed else {
                 panic!("available commands must be an array");
             };
-            assert_eq!(items.len(), 7);
+            assert_eq!(items.len(), 2);
+            assert!(commands.contains("\"name\":\"plan\""));
         }
         assert!(crate::json::parse_json(&session_modes("promptUnmatched")).is_ok());
     }
