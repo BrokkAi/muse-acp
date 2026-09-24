@@ -1153,22 +1153,23 @@ fn skill_catalog(
 
 /// Remember which selectors the session's skill catalog resolves, so prompt
 /// text is submitted as a native skill only when it names one of them.
+/// A failed read forgets the previous catalog: after `skill/changed` it is
+/// known to be stale, so the host decides again until a read succeeds.
 fn adopt_skill_catalog(
     sessions: &Sessions,
     acp_sid: &str,
-    skills: &[(String, String, Option<String>)],
+    skills: Option<&[(String, String, Option<String>)]>,
 ) {
     if let Some(s) = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get_mut(acp_sid)
     {
-        s.skill_selectors = Some(
-            skills
-                .iter()
+        s.skill_selectors = skills.map(|rows| {
+            rows.iter()
                 .map(|(selector, _, _)| selector.clone())
-                .collect(),
-        );
+                .collect()
+        });
     }
 }
 
@@ -2562,9 +2563,7 @@ fn handle_acp(
                         )
                     };
                     let skills = skill_catalog(host, &msp_sid);
-                    if let Some(skills) = &skills {
-                        adopt_skill_catalog(sessions, &sid, skills);
-                    }
+                    adopt_skill_catalog(sessions, &sid, skills.as_deref());
                     let skills = skills.unwrap_or_default();
                     acp::send_result(stdout, &id, &result);
                     let (status, attention) = sessions
@@ -2974,9 +2973,7 @@ fn handle_acp(
                         )
                     };
                     let skills = skill_catalog(host, &msp_out);
-                    if let Some(skills) = &skills {
-                        adopt_skill_catalog(sessions, &sid, skills);
-                    }
+                    adopt_skill_catalog(sessions, &sid, skills.as_deref());
                     let skills = skills.unwrap_or_default();
                     acp::send_result(stdout, &id, &result);
                     acp::send_available_commands(stdout, &sid, ver, &skills);
@@ -3247,6 +3244,14 @@ fn handle_acp(
                     if let Some(title) = fork_title_facts.selected() {
                         acp::send_session_title(stdout, &new_msp, Some(title));
                     }
+                    let skills = skill_catalog(host, &new_msp);
+                    adopt_skill_catalog(sessions, &new_msp, skills.as_deref());
+                    acp::send_available_commands(
+                        stdout,
+                        &new_msp,
+                        ver,
+                        &skills.unwrap_or_default(),
+                    );
                 }
                 Err(e) => acp::send_error(
                     stdout,
@@ -3326,8 +3331,10 @@ fn handle_acp(
                 J::Arr(blocks) if blocks.len() == 1 => {
                     let only = &blocks[0];
                     let text = only.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    // A leading space escapes the command; trailing
+                    // whitespace does not.
                     (only.get("type").and_then(|v| v.as_str()) == Some("text")
-                        && text == "/compact")
+                        && text.trim_end() == "/compact")
                         .then_some(())
                 }
                 _ => None,
@@ -4663,10 +4670,12 @@ fn extract_prompt_parts(
 /// Convert an editor slash command into the native MSP skill part. Once the
 /// session's skill catalog is known, only a selector it lists becomes a skill:
 /// other leading-slash text, such as an absolute path at the start of a
-/// question, stays ordinary prompt text instead of failing as `skillNotFound`.
-/// The host still resolves the selector, so a skill removed after the last
-/// catalog read produces its typed error. Without a catalog (the read failed)
-/// every slash command is submitted and the host decides.
+/// question or a mistyped command, stays ordinary prompt text instead of
+/// failing as `skillNotFound`. The explicit `/skill <selector>` spelling and
+/// the adapter's own `compact` command are always submitted. The host still
+/// resolves the selector, so a skill removed after the last catalog read
+/// produces its typed error. Without a catalog (the last read failed) every
+/// slash command is submitted and the host decides.
 fn native_skill_part(
     text: &str,
     skills: Option<&std::collections::HashSet<String>>,
@@ -4685,10 +4694,12 @@ fn native_skill_part(
 
     // Keep accepting the adapter's former `/skill <selector> <arguments>`
     // spelling while submitting the same selector natively.
+    let mut explicit = selector == "compact";
     if selector == "skill" {
         let mut skill_words = arguments.splitn(2, char::is_whitespace);
         let nested = skill_words.next().unwrap_or_default();
         if !nested.is_empty() {
+            explicit = true;
             selector = nested.to_string();
             arguments = skill_words
                 .next()
@@ -4698,7 +4709,7 @@ fn native_skill_part(
         }
     }
 
-    if skills.is_some_and(|known| !known.contains(&selector)) {
+    if !explicit && skills.is_some_and(|known| !known.contains(&selector)) {
         return None;
     }
 
@@ -5195,8 +5206,9 @@ fn handle_msp(
                 .get(&acp_sid)
                 .map(|s| s.ver)
                 .unwrap_or(1);
-            if let Some(skills) = skill_catalog(host, msp_sid) {
-                adopt_skill_catalog(sessions, &acp_sid, &skills);
+            let skills = skill_catalog(host, msp_sid);
+            adopt_skill_catalog(sessions, &acp_sid, skills.as_deref());
+            if let Some(skills) = skills {
                 log(&format!(
                     "skill catalog refreshed for session {msp_sid}: {} row(s)",
                     skills.len()

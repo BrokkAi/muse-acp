@@ -34,6 +34,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   support_exit stdin-free serve probe writes stderr and exits with a code
   workflow_control live workflow; workflow/cancel emits the later item/turn views
   skills_changed skill/list changes after a skill/changed notification
+               (FAKE_SKILL_REFRESH_FAILS=1: the re-read has no skills array)
   skill_not_found skill/list still lists `stale`; turn/start rejects it
   async_task_stop       background task then a targeted task/stop terminal
   async_task_stop_all   background tasks then task/stopAll terminals
@@ -920,6 +921,9 @@ def result_for(method, msg):
     if method == "skill/list":
         log_input(msg.get("params", {}))
         SKILL_READS[0] += 1
+        if (SCENARIO == "skills_changed" and SKILL_READS[0] > 1
+                and os.environ.get("FAKE_SKILL_REFRESH_FAILS") == "1"):
+            return {}
         if SCENARIO == "skills_changed" and SKILL_READS[0] > 1:
             return {"skills": [{
                 "selector": "review",

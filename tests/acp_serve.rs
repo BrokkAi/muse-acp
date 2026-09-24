@@ -2824,6 +2824,78 @@ fn leading_slash_text_that_names_no_skill_is_sent_as_text() {
 }
 
 #[test]
+fn explicit_skill_and_compact_spellings_are_still_submitted() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    c.wait_for("available_commands_update", Duration::from_secs(15));
+    // The explicit legacy spelling cannot be a path: the host decides.
+    let _pid = c.prompt(&sid, "/skill nosuch do it");
+    c.wait_input(
+        "\"type\": \"skill\", \"selector\": \"nosuch\", \"arguments\": \"do it\"",
+        Duration::from_secs(15),
+    );
+    // `compact` is the adapter's own command, never a host catalog row.
+    let _pid = c.prompt(&sid, "/compact now");
+    c.wait_input(
+        "\"type\": \"skill\", \"selector\": \"compact\", \"arguments\": \"now\"",
+        Duration::from_secs(15),
+    );
+    let _pid = c.prompt(&sid, "/compact ");
+    c.wait_log("session/compact", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn a_forked_session_reads_its_skill_catalog() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let fid = c.req("session/fork", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let forked = c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
+    assert!(
+        forked.contains("\"sessionId\":\"msp-sess-forked\""),
+        "fork failed: {forked}"
+    );
+    let commands = c.wait_for(
+        "\"sessionId\":\"msp-sess-forked\",\"update\":{\"sessionUpdate\":\"available_commands_update\"",
+        Duration::from_secs(15),
+    );
+    assert!(
+        commands.contains("\"name\":\"plan\""),
+        "fork advertises the host catalog: {commands}"
+    );
+    let text = "/tmp/build.log shows a linker error";
+    let _pid = c.prompt("msp-sess-forked", text);
+    c.wait_input(
+        &format!("\"type\": \"text\", \"text\": \"{text}\""),
+        Duration::from_secs(15),
+    );
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    assert!(
+        !input.contains("\"type\": \"skill\""),
+        "a path in a forked session must not become a skill: {input}"
+    );
+    c.finish();
+}
+
+#[test]
+fn a_failed_catalog_refresh_lets_the_host_decide() {
+    // skill/changed marks the cached catalog stale. If the re-read fails, a
+    // newly added skill must not be demoted to text by the stale catalog.
+    let mut c = Client::spawn("skills_changed", &[("FAKE_SKILL_REFRESH_FAILS", "1")]);
+    let sid = c.new_session(2, "");
+    c.wait_stderr(
+        "skill/list returned no skills array",
+        Duration::from_secs(15),
+    );
+    let _pid = c.prompt(&sid, "/review y");
+    c.wait_input(
+        "\"type\": \"skill\", \"selector\": \"review\", \"arguments\": \"y\"",
+        Duration::from_secs(15),
+    );
+    c.finish();
+}
+
+#[test]
 fn leading_space_escapes_a_slash_command() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
