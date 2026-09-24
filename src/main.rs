@@ -3853,11 +3853,11 @@ fn handle_acp(
                         }
                     }
                     for p in s.pending_ui {
-                        acp::send_error(stdout, &Some(p.req_id), -32800, "session closed");
+                        acp::send_cancel_request(stdout, &p.req_id);
                     }
                     if let Some(p) = s.pending_perm {
                         let request_id = p.feedback.map(|f| f.req_id).unwrap_or(p.req_id);
-                        acp::send_error(stdout, &Some(request_id), -32800, "session closed");
+                        acp::send_cancel_request(stdout, &request_id);
                     }
                     acp::send_result(stdout, &id, "{}");
                 }
@@ -5640,7 +5640,9 @@ fn handle_msp(
                 .get("approvalId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+            // Child-stream approvals open on their owner session, so resolve
+            // them through the same routing or the prompt is never withdrawn.
+            if let Some((acp_sid, _, _)) = owner_for_msp_session(sessions, msp_sid) {
                 if invalidate_pending_approval(stdout, sessions, &acp_sid, Some(approval_id), false)
                 {
                     pop_queued_approval(host, stdout, sessions, &acp_sid);
@@ -5718,7 +5720,45 @@ fn handle_msp(
                 }
             }
         }
-        "userInput/settled" => {}
+        "userInput/settled" => {
+            // Our own answer or cancel already removed the form. One that is
+            // still open was settled elsewhere (another client, an interrupt,
+            // auto-resolution): withdraw it, or every answer would be
+            // rejected as already settled and the form reissued.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let qid = params
+                .get("userInputId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let Some((acp_sid, _, _)) = owner_for_msp_session(sessions, msp_sid) else {
+                return;
+            };
+            if qid.is_empty() {
+                return;
+            }
+            let withdrawn = {
+                let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                map.get_mut(&acp_sid).and_then(|s| {
+                    s.ui_seen.insert(qid.to_string());
+                    let idx = s.pending_ui.iter().position(|p| p.user_input_id == qid)?;
+                    let pending = s.pending_ui.remove(idx);
+                    let resume_running = s.ver == 2
+                        && !s.in_flight.is_empty()
+                        && s.pending_ui.is_empty()
+                        && s.pending_perm.is_none();
+                    Some((pending.req_id, resume_running))
+                })
+            };
+            if let Some((req_id, resume_running)) = withdrawn {
+                acp::send_cancel_request(stdout, &req_id);
+                if resume_running {
+                    acp::send_state(stdout, &acp_sid, "running", None);
+                }
+            }
+        }
         "turn/started" => {
             let msp_sid = params
                 .get("sessionId")
@@ -6224,12 +6264,7 @@ fn invalidate_pending_approval(
         Some(p.feedback.map(|f| f.req_id).unwrap_or(p.req_id))
     };
     if let Some(request_id) = request_id {
-        acp::send_error(
-            stdout,
-            &Some(request_id),
-            -32800,
-            "permission request is no longer current",
-        );
+        acp::send_cancel_request(stdout, &request_id);
         true
     } else {
         false
@@ -6322,12 +6357,7 @@ fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions
         }
     }
     if let Some(req_id) = stale_request {
-        acp::send_error(
-            stdout,
-            &Some(req_id),
-            -32800,
-            "permission request is no longer current",
-        );
+        acp::send_cancel_request(stdout, &req_id);
     }
     if duplicate || queued {
         if queued {

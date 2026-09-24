@@ -15,6 +15,9 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   approval     approval/requested notification (two choices), then completed
   approval_req approval/request server-initiated REQUEST (no notification)
   approval_hang stays pending after the approval so client decisions can be tested
+  approval_resolved_elsewhere approval/requested, then approval/resolved by policy
+  child_approval_resolved a child-stream approval, then approval/resolved on the child
+  question_settled_elsewhere userInput/requested, then userInput/settled by another actor
   questions    userInput/requested with options, then completed
   questions_multiple userInput/requested with multiple-selection options
   questions_resume reissue a pending question after both attach and usage backfill
@@ -442,6 +445,37 @@ def on_turn_start(params):
         notify("approval/requested", dict(APPROVAL_PARAMS))
         if SCENARIO == "approval_queue":
             notify("approval/requested", {**APPROVAL_PARAMS, "approvalId": "approval-second"})
+    elif SCENARIO == "approval_resolved_elsewhere":
+        # Another actor (policy, reviewer, or a second client) decides the
+        # approval while the editor still shows the permission prompt.
+        notify("approval/requested", dict(APPROVAL_PARAMS))
+        notify("approval/resolved", {
+            "sessionId": MSP_SID, "approvalId": "ap-1", "itemId": "it-ap",
+            "turnId": tid, "decision": "approved", "resolvedBy": "policy",
+            "policyResult": "allowed", "stageEvidence": [],
+            "sourceRange": {"start": 0, "end": 1}, "viewCursor": "cur-ap"})
+    elif SCENARIO == "child_approval_resolved":
+        notify("item/started", {**base, "item": {
+            "itemId": "it-sub-control", "kind": "subagent",
+            "status": "inProgress", "revision": 1, "subagentId": "sub-control",
+            "agentPath": "researcher", "depth": 1,
+            "objective": "hold the approval test open",
+            "childSessionId": "child-sess-control", "controlStatus": "running"}})
+        notify("approval/requested", dict(
+            APPROVAL_PARAMS, sessionId="child-sess-control"))
+        notify("approval/resolved", {
+            "sessionId": "child-sess-control", "approvalId": "ap-1",
+            "itemId": "it-ap", "turnId": tid, "decision": "approved",
+            "resolvedBy": "policy", "policyResult": "allowed",
+            "stageEvidence": [], "sourceRange": {"start": 0, "end": 1},
+            "viewCursor": "cur-child-ap"})
+    elif SCENARIO == "question_settled_elsewhere":
+        notify("userInput/requested", question_params("ui-1"))
+        notify("userInput/settled", {
+            "sessionId": MSP_SID, "userInputId": "ui-1", "outcome": "cancelled",
+            "answers": [], "clarification": None, "decidedByCommandId": None,
+            "reason": "answered in another client",
+            "sourceRange": {"start": 0, "end": 1}, "viewCursor": "cur-settled"})
     elif SCENARIO == "approval_req":
         # Reissued multi-stage style: a server-initiated REQUEST with its
         # own id, no notification. Adapter must ack it AND bridge it.

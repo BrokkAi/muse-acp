@@ -1450,10 +1450,14 @@ fn cancelling_the_turn_invalidates_a_pending_feedback_form() {
     let form_id = extract_str(&form, "id").expect("feedback form id");
     c.req("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
     let stale = c.wait_for(
-        &format!("\"id\":\"{form_id}\",\"error\""),
+        &format!("\"requestId\":\"{form_id}\""),
         Duration::from_secs(15),
     );
-    assert!(stale.contains("no longer current"), "stale form: {stale}");
+    assert!(
+        stale.contains("\"method\":\"$/cancel_request\""),
+        "stale form is withdrawn with $/cancel_request: {stale}"
+    );
+    assert_no_response_to_own_request(&c, &form_id);
     c.raw(&format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"feedback\":\"late guidance\"}}}}}}"
     ));
@@ -2140,6 +2144,134 @@ fn cancel_request_unqueues_only_the_targeted_queued_prompt() {
             );
         }
     }
+    c.finish();
+}
+
+/// The adapter withdraws its own outgoing requests with `$/cancel_request`;
+/// it never answers an id it minted as if the client had asked for it.
+fn assert_no_response_to_own_request(c: &Client, request_id: &str) {
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+    let own_response = format!("\"id\":\"{request_id}\",\"error\"");
+    assert!(
+        !frames.iter().any(|frame| frame.contains(&own_response)),
+        "adapter answered its own request {request_id}: {frames:?}"
+    );
+}
+
+#[test]
+fn a_permission_resolved_elsewhere_is_withdrawn_with_cancel_request() {
+    for ver in [1u64, 2] {
+        let mut c = Client::spawn("approval_resolved_elsewhere", &[]);
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "do it");
+        let permission = c.wait_for("request_permission", Duration::from_secs(15));
+        let permission_id = extract_str(&permission, "id").expect("permission request id");
+        let cancel = c.wait_for(
+            &format!("\"requestId\":\"{permission_id}\""),
+            Duration::from_secs(15),
+        );
+        assert!(
+            cancel.contains("\"method\":\"$/cancel_request\""),
+            "v{ver} resolved permission is withdrawn: {cancel}"
+        );
+        assert_no_response_to_own_request(&c, &permission_id);
+        // The client answers the cancelled id; that late answer must not
+        // decide an approval the host already resolved.
+        c.respond_error(&permission_id);
+        std::thread::sleep(Duration::from_millis(200));
+        let log = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line == "approval/decide"),
+            "v{ver} late answer must not decide: {log}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn a_child_approval_resolved_elsewhere_is_withdrawn() {
+    let mut c = Client::spawn("child_approval_resolved", &[("FAKE_CAPS", "subagents")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let _pid = c.prompt(&sid, "child needs permission");
+    let permission = c.wait_for("request_permission", Duration::from_secs(15));
+    let permission_id = extract_str(&permission, "id").expect("permission request id");
+    let cancel = c.wait_for(
+        &format!("\"requestId\":\"{permission_id}\""),
+        Duration::from_secs(15),
+    );
+    assert!(
+        cancel.contains("\"method\":\"$/cancel_request\""),
+        "a resolved child approval is withdrawn: {cancel}"
+    );
+    c.respond_error(&permission_id);
+    std::thread::sleep(Duration::from_millis(200));
+    let log = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+    assert!(
+        !log.lines().any(|line| line == "approval/decide"),
+        "late answer must not decide: {log}"
+    );
+    c.finish();
+}
+
+#[test]
+fn a_question_settled_elsewhere_withdraws_its_form() {
+    for ver in [1u64, 2] {
+        let mut c = Client::spawn("question_settled_elsewhere", &[]);
+        let caps = if ver == 1 {
+            ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}"
+        } else {
+            ",\"capabilities\":{\"elicitation\":{\"form\":{}}}"
+        };
+        let sid = c.new_session(ver, caps);
+        let _pid = c.prompt(&sid, "ask me");
+        let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+        let form_id = extract_str(&forms[0], "id").expect("form request id");
+        let cancel = c.wait_for(
+            &format!("\"requestId\":\"{form_id}\""),
+            Duration::from_secs(15),
+        );
+        assert!(
+            cancel.contains("\"method\":\"$/cancel_request\""),
+            "v{ver} a form settled elsewhere is withdrawn: {cancel}"
+        );
+        // A late answer to the withdrawn form reaches nothing on the host.
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+        ));
+        std::thread::sleep(Duration::from_millis(200));
+        let log = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line.starts_with("userInput/")),
+            "v{ver} late answer must not reach the host: {log}"
+        );
+        assert_eq!(
+            c.elicitation_frames().len(),
+            1,
+            "v{ver} a settled question must not be reissued"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn session_close_withdraws_an_open_permission() {
+    let mut c = Client::spawn("approval_hang", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "do it");
+    let permission = c.wait_for("request_permission", Duration::from_secs(15));
+    let permission_id = extract_str(&permission, "id").expect("permission request id");
+    let cid = c.req("session/close", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let closed = c.wait_for(&format!("\"id\":{cid}"), Duration::from_secs(15));
+    assert!(closed.contains("\"result\":{}"), "close ack: {closed}");
+    let cancel = c.wait_for(
+        &format!("\"requestId\":\"{permission_id}\""),
+        Duration::from_secs(15),
+    );
+    assert!(
+        cancel.contains("\"method\":\"$/cancel_request\""),
+        "closed session withdraws its permission: {cancel}"
+    );
+    assert_no_response_to_own_request(&c, &permission_id);
     c.finish();
 }
 
