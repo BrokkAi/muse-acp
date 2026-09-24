@@ -1714,7 +1714,23 @@ fn restart_durable_host(
                             // reattached fold must settle, not hang forever.
                             reconcile_in_flight(stdout, sessions, acp_sid, &r);
                         }
-                        Err(e) => failures.push(format!("{msp_sid}: {}", err_message(&e))),
+                        Err(e) => {
+                            // The host will never deliver terminals for a
+                            // session it could not re-attach, so its prompts
+                            // must settle here instead of hanging.
+                            let message = format!(
+                                "Muse restarted but could not reattach this session: {}. Resume the session and retry.",
+                                err_message(&e)
+                            );
+                            if let Some(s) = sessions
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get_mut(acp_sid)
+                            {
+                                fail_in_flight(stdout, s, &message);
+                            }
+                            failures.push(format!("{msp_sid}: {}", err_message(&e)));
+                        }
                     }
                 }
                 if !attach.is_empty() {
@@ -6900,26 +6916,32 @@ fn cancel_session_turns(host: &Arc<MspHost>, sessions: &Sessions, acp_sid: &str)
 fn fail_all_with_message(stdout: &StdoutShared, sessions: &Sessions, message: &str) {
     let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     for s in map.values_mut() {
-        if s.in_flight.is_empty() {
-            continue;
-        }
-        if s.ver == 2 {
-            let msg_id = mint_id("msg-", &ID_COUNTER);
-            acp::send_raw(
-                stdout,
-                &format!(
-                    "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
-                    esc(&s.acp_sid),
-                    esc(&msg_id),
-                    esc(message),
-                ),
-            );
-            s.in_flight.clear();
-            acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
-        } else {
-            for f in s.in_flight.drain(..) {
-                acp::send_error(stdout, &Some(f.req_id), -32603, message);
-            }
+        fail_in_flight(stdout, s, message);
+    }
+}
+
+/// Settle every in-flight prompt of one session with an explanation: an error
+/// response in v1, and a transcript message plus a cancelled idle in v2.
+fn fail_in_flight(stdout: &StdoutShared, s: &mut AcpSession, message: &str) {
+    if s.in_flight.is_empty() {
+        return;
+    }
+    if s.ver == 2 {
+        let msg_id = mint_id("msg-", &ID_COUNTER);
+        acp::send_raw(
+            stdout,
+            &format!(
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
+                esc(&s.acp_sid),
+                esc(&msg_id),
+                esc(message),
+            ),
+        );
+        s.in_flight.clear();
+        acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
+    } else {
+        for f in s.in_flight.drain(..) {
+            acp::send_error(stdout, &Some(f.req_id), -32603, message);
         }
     }
 }
