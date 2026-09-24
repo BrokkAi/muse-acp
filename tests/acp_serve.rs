@@ -5640,6 +5640,85 @@ fn host_restart_settles_orphaned_in_flight_turns() {
 }
 
 #[test]
+fn host_restart_settles_orphaned_turns_of_a_legacy_session_id() {
+    // A session resumed under an old adapter-local `sess-*` id is stored
+    // under that ACP id while its MSP id comes from `_meta.mspSessionId`.
+    // Restart reconciliation must still find and settle its prompts.
+    let marker = std::env::temp_dir().join(format!(
+        "muse-acp-restart-legacy-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let marker_str = marker.to_str().unwrap().to_string();
+    let mut c = Client::spawn(
+        "host_exit_quiet",
+        &[("FAKE_RESTART_MARKER", marker_str.as_str())],
+    );
+    let init = c.req("initialize", "{\"protocolVersion\":1}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let rid = c.req(
+        "session/resume",
+        "{\"sessionId\":\"sess-legacy-1\",\"_meta\":{\"mspSessionId\":\"msp-sess-1\"}}",
+    );
+    let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(
+        resumed.contains("\"sessionId\":\"sess-legacy-1\"")
+            && resumed.contains("\"mspSessionId\":\"msp-sess-1\""),
+        "legacy id stays the ACP key: {resumed}"
+    );
+    let pid = c.prompt("sess-legacy-1", "in flight when we crash");
+    c.wait_stderr(
+        "host-restarted attempt=1 sessions=1 failures=0",
+        Duration::from_secs(10),
+    );
+    let settled = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        settled.contains("\"stopReason\":\"cancelled\""),
+        "restart must settle the legacy session's orphaned prompt: {settled}"
+    );
+    c.finish();
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
+fn host_restart_settles_prompts_of_a_session_it_cannot_reattach() {
+    let marker = std::env::temp_dir().join(format!(
+        "muse-acp-restart-unattached-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let marker_str = marker.to_str().unwrap().to_string();
+    let mut c = Client::spawn(
+        "host_exit_quiet",
+        &[
+            ("FAKE_RESTART_MARKER", marker_str.as_str()),
+            ("FAKE_ERROR_METHOD", "session/resume"),
+            ("FAKE_ERROR_MESSAGE", "session not found"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "in flight when we crash");
+    c.wait_stderr(
+        "host-restarted attempt=1 sessions=1 failures=1",
+        Duration::from_secs(10),
+    );
+    let settled = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        settled.contains("\"error\"") && settled.contains("could not reattach"),
+        "a prompt whose session cannot be re-attached must settle: {settled}"
+    );
+    c.finish();
+    let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
 fn deferred_launch_error_is_not_reported_as_a_failed_run() {
     for version in [1, 2] {
         let mut c = Client::spawn("deferred_launch_error", &[]);

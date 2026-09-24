@@ -1641,12 +1641,14 @@ fn restart_durable_host(
     stdout: &StdoutShared,
     sessions: &Sessions,
 ) -> Result<Arc<MspHost>, String> {
-    // Snapshot the attach list first; host calls must happen unlocked.
-    let attach: Vec<(String, String)> = sessions
+    // Snapshot the attach list first; host calls must happen unlocked. Keep
+    // the ACP key: a session resumed under a legacy `sess-*` id is stored
+    // under that id, not under its MSP id.
+    let attach: Vec<(String, String, String)> = sessions
         .lock()
-        .unwrap()
-        .values()
-        .map(|s| (s.msp_sid.clone(), s.view_cursor.clone()))
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|(acp_sid, s)| (acp_sid.clone(), s.msp_sid.clone(), s.view_cursor.clone()))
         .collect();
     let max_attempts = 3u32;
     let mut last_err = String::new();
@@ -1667,7 +1669,7 @@ fn restart_durable_host(
                     }
                 });
                 let mut failures = Vec::new();
-                for (msp_sid, after) in &attach {
+                for (acp_sid, msp_sid, after) in &attach {
                     let cmd = host.mint_cmd("cmd-");
                     match host.command(
                         "session/resume",
@@ -1683,9 +1685,9 @@ fn restart_durable_host(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                            {
                                 let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-                                if let Some(s) = map.get_mut(&acp_sid) {
+                                if let Some(s) = map.get_mut(acp_sid) {
                                     if !resume_head.is_empty() {
                                         s.view_cursor = resume_head.clone();
                                     }
@@ -1714,7 +1716,7 @@ fn restart_durable_host(
                                     drop(map);
                                     send_session_projection(
                                         stdout,
-                                        &acp_sid,
+                                        acp_sid,
                                         projection.0,
                                         projection.1.as_deref(),
                                         projection.2.as_deref(),
@@ -1725,7 +1727,7 @@ fn restart_durable_host(
                                 reattach_view(
                                     &host,
                                     sessions,
-                                    &acp_sid,
+                                    acp_sid,
                                     msp_sid,
                                     after,
                                     &resume_head,
@@ -1733,9 +1735,25 @@ fn restart_durable_host(
                             }
                             // Prompts whose turns no longer exist in the
                             // reattached fold must settle, not hang forever.
-                            reconcile_in_flight(stdout, sessions, msp_sid, &r);
+                            reconcile_in_flight(stdout, sessions, acp_sid, &r);
                         }
-                        Err(e) => failures.push(format!("{msp_sid}: {}", err_message(&e))),
+                        Err(e) => {
+                            // The host will never deliver terminals for a
+                            // session it could not re-attach, so its prompts
+                            // must settle here instead of hanging.
+                            let message = format!(
+                                "Muse restarted but could not reattach this session: {}. Resume the session and retry.",
+                                err_message(&e)
+                            );
+                            if let Some(s) = sessions
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get_mut(acp_sid)
+                            {
+                                fail_in_flight(stdout, s, &message);
+                            }
+                            failures.push(format!("{msp_sid}: {}", err_message(&e)));
+                        }
                     }
                 }
                 if !attach.is_empty() {
@@ -7084,26 +7102,32 @@ fn cancel_session_turns(host: &Arc<MspHost>, sessions: &Sessions, acp_sid: &str)
 fn fail_all_with_message(stdout: &StdoutShared, sessions: &Sessions, message: &str) {
     let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     for s in map.values_mut() {
-        if s.in_flight.is_empty() {
-            continue;
-        }
-        if s.ver == 2 {
-            let msg_id = mint_id("msg-", &ID_COUNTER);
-            acp::send_raw(
-                stdout,
-                &format!(
-                    "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
-                    esc(&s.acp_sid),
-                    esc(&msg_id),
-                    esc(message),
-                ),
-            );
-            s.in_flight.clear();
-            acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
-        } else {
-            for f in s.in_flight.drain(..) {
-                acp::send_error(stdout, &Some(f.req_id), -32603, message);
-            }
+        fail_in_flight(stdout, s, message);
+    }
+}
+
+/// Settle every in-flight prompt of one session with an explanation: an error
+/// response in v1, and a transcript message plus a cancelled idle in v2.
+fn fail_in_flight(stdout: &StdoutShared, s: &mut AcpSession, message: &str) {
+    if s.in_flight.is_empty() {
+        return;
+    }
+    if s.ver == 2 {
+        let msg_id = mint_id("msg-", &ID_COUNTER);
+        acp::send_raw(
+            stdout,
+            &format!(
+                "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
+                esc(&s.acp_sid),
+                esc(&msg_id),
+                esc(message),
+            ),
+        );
+        s.in_flight.clear();
+        acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
+    } else {
+        for f in s.in_flight.drain(..) {
+            acp::send_error(stdout, &Some(f.req_id), -32603, message);
         }
     }
 }
