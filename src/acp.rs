@@ -158,6 +158,12 @@ pub struct AcpSession {
     /// resume command is in flight; every notification at a repeated cursor
     /// is one replay and must be folded once.
     pub seen_view_cursors: std::collections::HashSet<String>,
+    /// Cursors a `view/gap` refill delivered from `view/page` when its walk
+    /// ended without meeting the gap's `next` (an ephemeral `next`, or a host
+    /// that sent no bracket). The live stream may still deliver those events;
+    /// each twin is refused once, whatever its method. A twin that never
+    /// arrives (the event was inside the hole) leaves one short entry.
+    pub refill_twins: std::collections::HashSet<String>,
     pub fold: SessionFold,
     /// Last known context occupancy (`session/contextUsage.usedTokens`).
     pub usage_used: Option<u64>,
