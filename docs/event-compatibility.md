@@ -44,7 +44,7 @@ client-to-server entry; all other rows below are emitted by the MSP host.
 | `turn/started` | Internally tracked | Marks the active MSP turn so steering, cancellation, and reconciliation target the running work. |
 | `turn/unqueued` | Mapped to ACP | Removes the reclaimed queued turn from tracked work and settles its ACP prompt as cancelled. |
 | `userInput/requested` | Mapped to ACP | Opens ACP `elicitation/create` when form elicitation was negotiated; otherwise sends `userInput/cancel` so the turn cannot hang. |
-| `userInput/settled` | Intentionally ignored | The ACP elicitation callback already sent the answer or cancellation and cleared local pending state; this durable outcome requires no second ACP update. |
+| `userInput/settled` | Mapped to ACP | A question this adapter answered or cancelled is already cleared locally. A form still open for a question settled elsewhere (another client, an interrupt, auto-resolution) is withdrawn with `$/cancel_request`. |
 | `view/gap` | Consumed | Pages forward from the last view cursor and recursively processes the missing events, relying on fold and usage deduplication for overlap. |
 <!-- schema-notifications:end -->
 

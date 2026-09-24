@@ -2094,6 +2094,71 @@ fn a_permission_resolved_elsewhere_is_withdrawn_with_cancel_request() {
 }
 
 #[test]
+fn a_child_approval_resolved_elsewhere_is_withdrawn() {
+    let mut c = Client::spawn("child_approval_resolved", &[("FAKE_CAPS", "subagents")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let _pid = c.prompt(&sid, "child needs permission");
+    let permission = c.wait_for("request_permission", Duration::from_secs(15));
+    let permission_id = extract_str(&permission, "id").expect("permission request id");
+    let cancel = c.wait_for(
+        &format!("\"requestId\":\"{permission_id}\""),
+        Duration::from_secs(15),
+    );
+    assert!(
+        cancel.contains("\"method\":\"$/cancel_request\""),
+        "a resolved child approval is withdrawn: {cancel}"
+    );
+    c.respond_error(&permission_id);
+    std::thread::sleep(Duration::from_millis(200));
+    let log = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+    assert!(
+        !log.lines().any(|line| line == "approval/decide"),
+        "late answer must not decide: {log}"
+    );
+    c.finish();
+}
+
+#[test]
+fn a_question_settled_elsewhere_withdraws_its_form() {
+    for ver in [1u64, 2] {
+        let mut c = Client::spawn("question_settled_elsewhere", &[]);
+        let caps = if ver == 1 {
+            ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}"
+        } else {
+            ",\"capabilities\":{\"elicitation\":{\"form\":{}}}"
+        };
+        let sid = c.new_session(ver, caps);
+        let _pid = c.prompt(&sid, "ask me");
+        let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+        let form_id = extract_str(&forms[0], "id").expect("form request id");
+        let cancel = c.wait_for(
+            &format!("\"requestId\":\"{form_id}\""),
+            Duration::from_secs(15),
+        );
+        assert!(
+            cancel.contains("\"method\":\"$/cancel_request\""),
+            "v{ver} a form settled elsewhere is withdrawn: {cancel}"
+        );
+        // A late answer to the withdrawn form reaches nothing on the host.
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+        ));
+        std::thread::sleep(Duration::from_millis(200));
+        let log = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line.starts_with("userInput/")),
+            "v{ver} late answer must not reach the host: {log}"
+        );
+        assert_eq!(
+            c.elicitation_frames().len(),
+            1,
+            "v{ver} a settled question must not be reissued"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn session_close_withdraws_an_open_permission() {
     let mut c = Client::spawn("approval_hang", &[]);
     let sid = c.new_session(1, "");
