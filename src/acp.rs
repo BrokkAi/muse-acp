@@ -659,6 +659,11 @@ fn mode_options_json(key: &str) -> String {
         .join(",")
 }
 
+/// Selector value for "no tier chosen here": Muse applies its own configured
+/// default and the adapter sends no per-turn override. It is not an MSP
+/// `ReasoningEffort` and is never sent to the host.
+pub const REASONING_DEFAULT: &str = "default";
+
 pub fn is_reasoning_effort(value: &str) -> bool {
     matches!(
         value,
@@ -674,6 +679,7 @@ pub fn config_options(
     current_mode: &str,
     current_model: &str,
     reasoning_effort: &str,
+    offer_muse_default: bool,
     models_json: &[(String, String, bool)],
     recommended_model: Option<&str>,
 ) -> String {
@@ -691,8 +697,15 @@ pub fn config_options(
         ),
         _ => String::new(),
     };
+    // MSP cannot clear a standing session default, so "Muse default" is only
+    // offered while no host default is in force.
+    let muse_default = if offer_muse_default {
+        "{\"value\":\"default\",\"name\":\"Muse default\"},"
+    } else {
+        ""
+    };
     format!(
-        "[{{\"{id_key}\":\"mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Reasoning effort sent with each prompt and steering message\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]}}]",
+        "[{{\"{id_key}\":\"mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]}}]",
         esc(current_mode),
         mode_options_json("value"),
         esc(current_model),
@@ -912,6 +925,7 @@ mod tests {
                 "promptUnmatched",
                 "fake-model",
                 "medium",
+                true,
                 &models,
                 None,
             );
@@ -946,7 +960,15 @@ mod tests {
         }
         assert!(!is_reasoning_effort("extreme"));
         let models = vec![("fake-model".to_string(), "Fake".to_string(), true)];
-        let options = config_options(1, "promptUnmatched", "fake-model", "max", &models, None);
+        let options = config_options(
+            1,
+            "promptUnmatched",
+            "fake-model",
+            "max",
+            false,
+            &models,
+            None,
+        );
         crate::json::parse_json(&options).expect("config options JSON");
         assert!(
             options.contains("\"value\":\"max\""),

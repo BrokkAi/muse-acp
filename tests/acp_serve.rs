@@ -2938,12 +2938,27 @@ fn reasoning_effort_is_selected_and_sent_to_msp() {
         .join("\n");
     assert!(
         initial.contains("\"configId\":\"reasoning_effort\"")
-            && initial.contains("\"currentValue\":\"medium\""),
-        "reasoning selector is initialized: {initial}"
+            && initial.contains("\"currentValue\":\"default\"")
+            && initial.contains("{\"value\":\"default\",\"name\":\"Muse default\"}"),
+        "reasoning selector starts at the Muse default: {initial}"
     );
 
-    let _initial_pid = c.prompt(&sid, "use the fallback");
-    c.wait_input("\"reasoningEffort\": \"medium\"", Duration::from_secs(15));
+    // Nothing selected: the host's configured default must apply, so the
+    // turn carries no reasoningEffort that would outrank it.
+    let _initial_pid = c.prompt(&sid, "use the host default");
+    c.wait_input(
+        "\"text\": \"use the host default\"",
+        Duration::from_secs(15),
+    );
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    let first_turn = inputs
+        .lines()
+        .find(|line| line.contains("use the host default"))
+        .expect("first prompt input");
+    assert!(
+        !first_turn.contains("reasoningEffort"),
+        "an unselected tier must not override the host default: {first_turn}"
+    );
 
     let invalid_id = c.req(
         "session/set_config_option",
@@ -2967,6 +2982,10 @@ fn reasoning_effort_is_selected_and_sent_to_msp() {
     assert!(
         set.contains("\"currentValue\":\"high\""),
         "updated reasoning value reflected: {set}"
+    );
+    assert!(
+        !set.contains("{\"value\":\"default\""),
+        "a standing host default cannot be cleared, so it is not offered: {set}"
     );
 
     let max_id = c.req(
@@ -3001,6 +3020,20 @@ fn reasoning_effort_is_selected_and_sent_to_msp() {
             .is_some_and(|line| !line.contains("reasoningEffort")),
         "a host session default must replace the per-turn override: {inputs}"
     );
+
+    // MSP cannot clear a standing session default, so the selector refuses
+    // to pretend it went back to the Muse default.
+    let reset_id = c.req(
+        "session/set_config_option",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"default\"}}"
+        ),
+    );
+    let reset = c.wait_for(&format!("\"id\":{reset_id}"), Duration::from_secs(15));
+    assert!(
+        reset.contains("\"error\"") && reset.contains("cannot be cleared"),
+        "a standing host default cannot be reset: {reset}"
+    );
     c.finish();
 }
 
@@ -3016,7 +3049,8 @@ fn reasoning_effort_default_is_restored_from_resume_snapshot() {
     );
     let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
     assert!(
-        resumed.contains("\"currentValue\":\"high\""),
+        resumed.contains("\"currentValue\":\"high\"")
+            && !resumed.contains("{\"value\":\"default\""),
         "resume restores the host's standing reasoning effort: {resumed}"
     );
 
@@ -3032,6 +3066,42 @@ fn reasoning_effort_default_is_restored_from_resume_snapshot() {
         "restored default must be used without a conflicting per-turn override: {turn_input}"
     );
     c.finish();
+}
+
+#[test]
+fn choosing_the_muse_default_makes_no_host_call() {
+    for ver in [1u64, 2] {
+        let mut c = Client::spawn("quiet", &[]);
+        let sid = c.new_session(ver, "");
+        let id = c.req(
+            "session/set_config_option",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"default\"}}"
+            ),
+        );
+        let done = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            done.contains("\"currentValue\":\"default\"")
+                && done.contains("{\"value\":\"default\",\"name\":\"Muse default\"}"),
+            "v{ver} the Muse default stays selected: {done}"
+        );
+        let _pid = c.prompt(&sid, "after choosing default");
+        c.wait_input(
+            "\"text\": \"after choosing default\"",
+            Duration::from_secs(15),
+        );
+        let log = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+        assert!(
+            !log.lines().any(|line| line == "session/setReasoningEffort"),
+            "v{ver} `default` is never sent to the host: {log}"
+        );
+        let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+        assert!(
+            !inputs.contains("\"reasoningEffort\""),
+            "v{ver} no reasoning tier reaches the host: {inputs}"
+        );
+        c.finish();
+    }
 }
 
 #[test]
@@ -3051,6 +3121,30 @@ fn reasoning_effort_falls_back_to_per_turn_on_legacy_host() {
     );
     let _pid = c.prompt(&sid, "legacy host");
     c.wait_input("\"reasoningEffort\": \"high\"", Duration::from_secs(15));
+
+    // Going back to the Muse default drops the adapter's per-turn override.
+    let reset_id = c.req(
+        "session/set_config_option",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"default\"}}"
+        ),
+    );
+    let reset = c.wait_for(&format!("\"id\":{reset_id}"), Duration::from_secs(15));
+    assert!(
+        reset.contains("\"currentValue\":\"default\""),
+        "legacy host returns to the Muse default: {reset}"
+    );
+    let _pid = c.prompt(&sid, "back to default");
+    c.wait_input("\"text\": \"back to default\"", Duration::from_secs(15));
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    let turn_input = inputs
+        .lines()
+        .find(|line| line.contains("back to default"))
+        .expect("reset prompt input");
+    assert!(
+        !turn_input.contains("reasoningEffort"),
+        "the Muse default sends no per-turn override: {turn_input}"
+    );
     c.finish();
 }
 
