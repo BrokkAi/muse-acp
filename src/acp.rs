@@ -402,6 +402,21 @@ pub fn send_error(stdout: &StdoutShared, id: &Option<J>, code: i64, message: &st
     );
 }
 
+/// Withdraw a request this adapter sent to the client (a permission prompt
+/// or form). ACP cancels an outgoing request with `$/cancel_request`; a
+/// JSON-RPC error with our own id would be a response to a request the
+/// client never made. The client still answers the original id, and that
+/// late answer is ignored because the id is no longer pending.
+pub fn send_cancel_request(stdout: &StdoutShared, request_id: &J) {
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"$/cancel_request\",\"params\":{{\"requestId\":{}}}}}",
+            j_to_string(request_id)
+        ),
+    );
+}
+
 /// Send an ACP error while retaining structured data supplied by MSP.
 pub fn send_error_with_data(
     stdout: &StdoutShared,

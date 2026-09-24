@@ -3780,11 +3780,11 @@ fn handle_acp(
                         }
                     }
                     for p in s.pending_ui {
-                        acp::send_error(stdout, &Some(p.req_id), -32800, "session closed");
+                        acp::send_cancel_request(stdout, &p.req_id);
                     }
                     if let Some(p) = s.pending_perm {
                         let request_id = p.feedback.map(|f| f.req_id).unwrap_or(p.req_id);
-                        acp::send_error(stdout, &Some(request_id), -32800, "session closed");
+                        acp::send_cancel_request(stdout, &request_id);
                     }
                     acp::send_result(stdout, &id, "{}");
                 }
@@ -6020,12 +6020,7 @@ fn invalidate_pending_approval(
         Some(p.feedback.map(|f| f.req_id).unwrap_or(p.req_id))
     };
     if let Some(request_id) = request_id {
-        acp::send_error(
-            stdout,
-            &Some(request_id),
-            -32800,
-            "permission request is no longer current",
-        );
+        acp::send_cancel_request(stdout, &request_id);
         true
     } else {
         false
@@ -6118,12 +6113,7 @@ fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions
         }
     }
     if let Some(req_id) = stale_request {
-        acp::send_error(
-            stdout,
-            &Some(req_id),
-            -32800,
-            "permission request is no longer current",
-        );
+        acp::send_cancel_request(stdout, &req_id);
     }
     if duplicate || queued {
         if queued {
