@@ -673,6 +673,48 @@ fn gap_refill_does_not_price_a_replayed_completion_twice() {
 }
 
 #[test]
+fn gap_refill_pages_from_the_hole_after_next_was_delivered() {
+    // A real host flushes view/gap at its next accepted delivery, so `next`
+    // is already folded and the live cursor is past the hole. The refill
+    // must page from `after` to `next`, deliver only the dropped event, and
+    // leave the live position intact for the next re-attach.
+    for ver in [1u64, 2] {
+        let mut c = Client::spawn("gap_after_next", &[]);
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "hi");
+        if ver == 1 {
+            c.wait_for("\"end_turn\"", Duration::from_secs(15));
+        } else {
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        }
+        c.wait_input("\"cursor\": \"cur-1\"", Duration::from_secs(15));
+        c.wait_input("\"cursor\": \"cur-2\"", Duration::from_secs(15));
+        let frames = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n");
+        for label in ["A", "B", "C"] {
+            assert_eq!(
+                frames.matches(&format!("gap event {label}")).count(),
+                1,
+                "v{ver} gap event {label} must be delivered exactly once: {frames}"
+            );
+        }
+        assert!(
+            !frames.contains("gap event D"),
+            "v{ver} the refill must stop at `next`: {frames}"
+        );
+
+        let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+        let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+        assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
+        c.wait_input("\"after\": \"cur-3\"", Duration::from_secs(15));
+        c.finish();
+    }
+}
+
+#[test]
 fn a_successful_catalog_refresh_drops_stale_rates() {
     // The model list is replaced by each successful snapshot, so pricing must
     // be too: a model that comes back without a usable `cost` goes unpriced

@@ -5160,11 +5160,11 @@ fn handle_msp(
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let (acp_sid, cursor) = match find_acp_sid(sessions, msp_sid) {
+            let (acp_sid, live_cursor) = match find_acp_sid(sessions, msp_sid) {
                 Some(a) => {
                     let c = sessions
                         .lock()
-                        .unwrap()
+                        .unwrap_or_else(|p| p.into_inner())
                         .get(&a)
                         .map(|s| s.view_cursor.clone())
                         .unwrap_or_default();
@@ -5172,45 +5172,121 @@ fn handle_msp(
                 }
                 None => return,
             };
+            // MSP names the hole: `after` is the last cursor delivered before
+            // it and `next` the first one delivered after it. The host flushes
+            // this bracket at its next accepted delivery, so `next` has
+            // usually been folded already and the live cursor is past the
+            // hole: paging from it would skip every dropped event. Hosts that
+            // omit the bracket keep the old single page from the live cursor.
+            let after = params
+                .get("after")
+                .and_then(J::as_str)
+                .filter(|c| !c.is_empty());
+            let next = params
+                .get("next")
+                .and_then(J::as_str)
+                .filter(|c| !c.is_empty());
+            let mut cursor = after.unwrap_or(&live_cursor).to_string();
             if cursor.is_empty() {
                 log("view/gap with no known cursor; cannot refill");
                 return;
             }
-            let cmd = host.mint_cmd("cmd-");
-            match host.command("view/page", &format!("{{\"commandId\":{},\"sessionId\":{},\"cursor\":{},\"direction\":\"forward\",\"limit\":100}}", esc(&cmd), esc(msp_sid), esc(&cursor))) {
-                Ok(r) => {
-                    let mut n = 0;
-                    if let Some(J::Arr(evs)) = r.get("events") {
-                        for e in evs.clone() {
-                            let m = e.get("method").and_then(|v| v.as_str()).unwrap_or("");
-                            let p = e.get("params").cloned().unwrap_or(J::Null);
-                            if !m.is_empty() {
-                                n += 1;
-                                handle_msp(host, stdout, sessions, lists, m, &p);
-                            }
-                        }
-                    } else if let Some(J::Arr(items)) = r.get("items") {
-                        for item in items {
-                            observe_file_change(sessions, &acp_sid, item);
-                        }
-                        for it in items.clone() {
-                            let wrap = J::Obj(vec![("item".to_string(), it)]);
-                            let mut out = Vec::new();
-                            if let Some(s) = sessions.lock().unwrap_or_else(|p| p.into_inner()).get_mut(&acp_sid) {
-                                s.fold.on_item_completed(&acp_sid, s.ver, &wrap, &mut out);
-                            }
-                            for line in out {
-                                acp::send_raw(stdout, &line);
-                            }
-                            n += 1;
-                        }
-                    } else {
-                        log(&format!("view/page returned no events/items: {}", j_to_string(&r)));
+            let mut n = 0;
+            // Page forward until the walk meets `next`. Cursors are opaque, so
+            // the walk stops on equality, at the end of the durable view, or
+            // when a page makes no progress; never on a page count, which
+            // would silently truncate a long hole.
+            loop {
+                let cmd = host.mint_cmd("cmd-");
+                let page = host.command(
+                    "view/page",
+                    &format!(
+                        "{{\"commandId\":{},\"sessionId\":{},\"cursor\":{},\"direction\":\"forward\",\"limit\":100}}",
+                        esc(&cmd),
+                        esc(msp_sid),
+                        esc(&cursor)
+                    ),
+                );
+                let r = match page {
+                    Ok(r) => r,
+                    Err(e) => {
+                        log(&format!("view/page failed: {}", err_message(&e)));
+                        break;
                     }
-                    log(&format!("view/gap refilled {n} events"));
+                };
+                if let Some(J::Arr(evs)) = r.get("events") {
+                    let mut reached = false;
+                    for e in evs.clone() {
+                        let m = e.get("method").and_then(|v| v.as_str()).unwrap_or("");
+                        let p = e.get("params").cloned().unwrap_or(J::Null);
+                        // `next` and everything after it arrive on the live
+                        // stream; the refill only supplies the hole.
+                        if next.is_some() && p.get("viewCursor").and_then(J::as_str) == next {
+                            reached = true;
+                            break;
+                        }
+                        if !m.is_empty() {
+                            n += 1;
+                            handle_msp(host, stdout, sessions, lists, m, &p);
+                        }
+                    }
+                    if reached || next.is_none() {
+                        break;
+                    }
+                    match r.get("nextCursor").and_then(J::as_str) {
+                        // End of the durable view: the rest of the hole was
+                        // ephemeral and cannot be paged.
+                        None => break,
+                        Some(c) if evs.is_empty() || c == cursor => {
+                            log(&format!(
+                                "view/gap refill stalled at {cursor} before reaching {}",
+                                next.unwrap_or("")
+                            ));
+                            break;
+                        }
+                        Some(c) => cursor = c.to_string(),
+                    }
+                } else if let Some(J::Arr(items)) = r.get("items") {
+                    for item in items {
+                        observe_file_change(sessions, &acp_sid, item);
+                    }
+                    for it in items.clone() {
+                        let wrap = J::Obj(vec![("item".to_string(), it)]);
+                        let mut out = Vec::new();
+                        if let Some(s) = sessions
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get_mut(&acp_sid)
+                        {
+                            s.fold.on_item_completed(&acp_sid, s.ver, &wrap, &mut out);
+                        }
+                        for line in out {
+                            acp::send_raw(stdout, &line);
+                        }
+                        n += 1;
+                    }
+                    break;
+                } else {
+                    log(&format!(
+                        "view/page returned no events/items: {}",
+                        j_to_string(&r)
+                    ));
+                    break;
                 }
-                Err(e) => log(&format!("view/page failed: {}", err_message(&e))),
             }
+            // Refilled events carry cursors inside the hole. When live delivery
+            // had already passed it, keep the live position so a later
+            // re-attach does not replay from the middle of the hole.
+            if after.is_some_and(|after| after != live_cursor)
+                && !live_cursor.is_empty()
+                && let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&acp_sid)
+            {
+                s.view_cursor = live_cursor;
+            }
+            log(&format!("view/gap refilled {n} events"));
         }
         "item/started" | "item/updated" => {
             let msp_sid = params
