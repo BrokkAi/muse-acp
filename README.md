@@ -238,8 +238,8 @@ adapter sends no `reasoningEffort`: a per-turn value outranks the tier
 configured in Muse, so the adapter never picks one on the user's behalf. On
 older hosts that do not implement the setter, a tier the user selects remains
 a per-turn `reasoningEffort` override for compatibility, and selecting `Muse
-default` drops it again. MSP cannot clear a standing session default, so that
-choice is refused once the host reports one.
+default` drops it again. MSP cannot clear a standing session default, so once
+the host reports one the selector stops offering `Muse default` and refuses it.
 
 Restoring usage on attach takes up to two extra reads, and only when the
 resume itself carried none. `session/contextUsage` is not durable-sourced, so

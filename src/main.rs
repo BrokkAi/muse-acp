@@ -2520,6 +2520,7 @@ fn handle_acp(
                                 acp::mode_from_msp(&cur_mode),
                                 &cur_model,
                                 acp::REASONING_DEFAULT,
+                                true,
                                 &models,
                                 recommended_model(&models).as_deref(),
                             )
@@ -2534,6 +2535,7 @@ fn handle_acp(
                                 acp::mode_from_msp(&cur_mode),
                                 &cur_model,
                                 acp::REASONING_DEFAULT,
+                                true,
                                 &models,
                                 recommended_model(&models).as_deref(),
                             ),
@@ -2901,7 +2903,7 @@ fn handle_acp(
                         .get(&sid)
                         .map(|s| s.msp_sid.clone())
                         .unwrap_or_default();
-                    let (mode_v, model_v, reasoning_v) = sessions
+                    let (mode_v, model_v, reasoning_v, offer_default_v) = sessions
                         .lock()
                         .unwrap()
                         .get(&sid)
@@ -2910,6 +2912,7 @@ fn handle_acp(
                                 s.mode_value.clone(),
                                 s.model_value.clone(),
                                 s.reasoning_effort.clone(),
+                                s.reasoning_effort_source.is_none(),
                             )
                         })
                         .unwrap_or_default();
@@ -2926,6 +2929,7 @@ fn handle_acp(
                                 &mode_v,
                                 &model_v,
                                 &reasoning_v,
+                                offer_default_v,
                                 &models,
                                 recommended_model(&models).as_deref(),
                             )
@@ -2941,6 +2945,7 @@ fn handle_acp(
                                 &mode_v,
                                 &model_v,
                                 &reasoning_v,
+                                offer_default_v,
                                 &models,
                                 recommended_model(&models).as_deref(),
                             ),
@@ -3155,7 +3160,7 @@ fn handle_acp(
                             adopt_reasoning_effort(entry, state);
                         }
                     }
-                    let (mode_out, model_out, reasoning_out) = sessions
+                    let (mode_out, model_out, reasoning_out, offer_default_out) = sessions
                         .lock()
                         .unwrap()
                         .get(&new_msp)
@@ -3164,6 +3169,7 @@ fn handle_acp(
                                 s.mode_value.clone(),
                                 s.model_value.clone(),
                                 s.reasoning_effort.clone(),
+                                s.reasoning_effort_source.is_none(),
                             )
                         })
                         .unwrap_or_default();
@@ -3178,6 +3184,7 @@ fn handle_acp(
                                 &mode_out,
                                 &model_out,
                                 &reasoning_out,
+                                offer_default_out,
                                 &models,
                                 recommended_model(&models).as_deref(),
                             )
@@ -3192,6 +3199,7 @@ fn handle_acp(
                                 &mode_out,
                                 &model_out,
                                 &reasoning_out,
+                                offer_default_out,
                                 &models,
                                 recommended_model(&models).as_deref(),
                             ),
@@ -4212,6 +4220,7 @@ fn handle_acp(
                                     &s.mode_value,
                                     &s.model_value,
                                     &s.reasoning_effort,
+                                    s.reasoning_effort_source.is_none(),
                                     &models,
                                     recommended_model(&models).as_deref(),
                                 )
