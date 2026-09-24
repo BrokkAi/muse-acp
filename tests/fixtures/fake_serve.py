@@ -34,7 +34,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   support_exit stdin-free serve probe writes stderr and exits with a code
   workflow_control live workflow; workflow/cancel emits the later item/turn views
   skills_changed skill/list changes after a skill/changed notification
-  skill_not_found turn/start rejects the native skill selector
+               (FAKE_SKILL_REFRESH_FAILS=1: the re-read has no skills array)
+  skill_not_found skill/list still lists `stale`; turn/start rejects it
   async_task_stop       background task then a targeted task/stop terminal
   async_task_stop_all   background tasks then task/stopAll terminals
   load         session/resume serves inline history (for session/load replay)
@@ -955,6 +956,9 @@ def result_for(method, msg):
     if method == "skill/list":
         log_input(msg.get("params", {}))
         SKILL_READS[0] += 1
+        if (SCENARIO == "skills_changed" and SKILL_READS[0] > 1
+                and os.environ.get("FAKE_SKILL_REFRESH_FAILS") == "1"):
+            return {}
         if SCENARIO == "skills_changed" and SKILL_READS[0] > 1:
             return {"skills": [{
                 "selector": "review",
@@ -963,13 +967,19 @@ def result_for(method, msg):
                 "argumentHint": "what to review",
                 "source": "project",
             }]}
-        return {"skills": [{
+        skills = [{
             "selector": "plan",
             "description": "Create a grounded plan",
             "displayName": "Plan",
             "argumentHint": "what to plan",
             "source": "bundled",
-        }]}
+        }]
+        if SCENARIO == "skill_not_found":
+            # The catalog read races the skill's removal: the adapter still
+            # lists `stale`, but the host no longer resolves it.
+            skills.append({"selector": "stale", "description": "Removed",
+                           "displayName": "Stale", "source": "project"})
+        return {"skills": skills}
     if method == "item/readOutput":
         params = msg.get("params", {})
         offset = params.get("offsetBytes", 0)
