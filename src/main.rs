@@ -685,11 +685,12 @@ fn adopt_reasoning_effort(s: &mut AcpSession, state: &J) -> bool {
 }
 
 /// The standing default is authoritative once the host reports one. Before
-/// that, retain the original adapter behavior of sending the selected tier as
-/// a per-turn override for older hosts and unset 1.3.0 sessions.
+/// that, a tier the user selected on a host without the session-default
+/// setter rides each turn as an override. Nothing is sent until a tier is
+/// selected: a turn's `reasoningEffort` outranks the host's configured
+/// default, so an adapter-chosen value would silently replace the user's.
 fn reasoning_effort_override(s: &AcpSession) -> Option<String> {
-    s.reasoning_effort_source
-        .is_none()
+    (s.reasoning_effort_source.is_none() && acp::is_reasoning_effort(&s.reasoning_effort))
         .then(|| s.reasoning_effort.clone())
 }
 
@@ -2470,7 +2471,7 @@ fn handle_acp(
                             ui_seen: std::collections::HashSet::new(),
                             mode_value: acp::mode_from_msp(&cur_mode).to_string(),
                             model_value: cur_model.clone(),
-                            reasoning_effort: "medium".to_string(),
+                            reasoning_effort: acp::REASONING_DEFAULT.to_string(),
                             reasoning_effort_source: None,
                             active_turn,
                             view_cursor: cur_cursor.clone(),
@@ -2518,7 +2519,7 @@ fn handle_acp(
                                 ver,
                                 acp::mode_from_msp(&cur_mode),
                                 &cur_model,
-                                "medium",
+                                acp::REASONING_DEFAULT,
                                 &models,
                                 recommended_model(&models).as_deref(),
                             )
@@ -2532,7 +2533,7 @@ fn handle_acp(
                                 ver,
                                 acp::mode_from_msp(&cur_mode),
                                 &cur_model,
-                                "medium",
+                                acp::REASONING_DEFAULT,
                                 &models,
                                 recommended_model(&models).as_deref(),
                             ),
@@ -2742,7 +2743,7 @@ fn handle_acp(
                             ui_seen: std::collections::HashSet::new(),
                             mode_value: "promptUnmatched".to_string(),
                             model_value: String::new(),
-                            reasoning_effort: "medium".to_string(),
+                            reasoning_effort: acp::REASONING_DEFAULT.to_string(),
                             reasoning_effort_source: None,
                             active_turn: None,
                             view_cursor: String::new(),
@@ -3111,7 +3112,7 @@ fn handle_acp(
                             reasoning_effort: parent_reasoning
                                 .as_ref()
                                 .map(|(effort, _)| effort.clone())
-                                .unwrap_or_else(|| "medium".to_string()),
+                                .unwrap_or_else(|| acp::REASONING_DEFAULT.to_string()),
                             reasoning_effort_source: parent_reasoning
                                 .as_ref()
                                 .and_then(|(_, source)| source.clone()),
@@ -4111,7 +4112,26 @@ fn handle_acp(
                     ),
                 ),
                 "reasoning_effort" => {
-                    if acp::is_reasoning_effort(&value) {
+                    if value == acp::REASONING_DEFAULT {
+                        // Dropping the adapter's per-turn override needs no
+                        // host call. MSP has no way to clear a standing
+                        // session default once one is set.
+                        let standing = sessions
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&sid)
+                            .is_some_and(|s| s.reasoning_effort_source.is_some());
+                        if standing {
+                            acp::send_error(
+                                stdout,
+                                &id,
+                                -32602,
+                                "this Muse session already has a reasoning default, which cannot be cleared; choose a tier",
+                            );
+                            return;
+                        }
+                        Ok(J::Null)
+                    } else if acp::is_reasoning_effort(&value) {
                         host.command(
                             "session/setReasoningEffort",
                             &format!(
@@ -4126,7 +4146,7 @@ fn handle_acp(
                             stdout,
                             &id,
                             -32602,
-                            "reasoning_effort must be none|minimal|low|medium|high|xhigh|max|ultra",
+                            "reasoning_effort must be default|none|minimal|low|medium|high|xhigh|max|ultra",
                         );
                         return;
                     }
@@ -4175,8 +4195,9 @@ fn handle_acp(
                             "model" => s.model_value = value.clone(),
                             "reasoning_effort" => {
                                 s.reasoning_effort = value.clone();
-                                s.reasoning_effort_source =
-                                    (!reasoning_fallback).then(|| "user".to_string());
+                                s.reasoning_effort_source = (!reasoning_fallback
+                                    && value != acp::REASONING_DEFAULT)
+                                    .then(|| "user".to_string());
                             }
                             _ => unreachable!(),
                         }

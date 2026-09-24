@@ -153,7 +153,7 @@ auto-subscribes us to the session view, so turns stream in as `item/*` and
 | `session/setApprovalMode` | `configOptions` mode selector using the MSP names verbatim (`allowAll`/`promptUnmatched`/`onRequest`/`denyUnmatched`) + `session/set_config_option`; legacy v1 `modes` / `session/set_mode` |
 | `model/list` + `session/setModel` | `configOptions` model selector + `session/set_config_option`; legacy v1 `session/set_model` |
 | `session/goalChanged` | provider-neutral goal metadata in `session_info_update`; goal mutation remains host/TUI-driven because ACP has no negotiated goal-control capability |
-| `session/setReasoningEffort` + `session/reasoningEffortChanged` + `SnapshotState.reasoningEffort` | `configOptions` reasoning selector as the standing session default; an unset default keeps the per-turn override fallback (`none` through `ultra`) |
+| `session/setReasoningEffort` + `session/reasoningEffortChanged` + `SnapshotState.reasoningEffort` | `configOptions` reasoning selector as the standing session default; it starts at `Muse default` (no override), and a tier chosen on a host without the setter becomes a per-turn override (`none` through `ultra`) |
 | `turn/steer` | v2 `_session/steering` extension with exact-turn targeting and race-safe idle behavior |
 | backgrounded `toolCall` + `userShell` items | negotiated AIR async tasks: `async_task_spawned`/`async_task_state_update` plus the backgrounded marker on the owning command card; `_session/async_task/stop` maps to MSP `task/stop`, while `session/cancel` maps to `task/stopAll`; terminal item events settle the task state |
 | `workflow` items | negotiated AIR async tasks keyed by `workflowRunId`; `_session/async_task/stop` admits MSP `workflow/cancel`, while the later workflow item and turn views settle the task and launching turn; ACP has no workflow child skip/retry surface |
@@ -233,9 +233,13 @@ model count. An open selector does not itself trigger a refresh.
 The reasoning selector sets Muse's session-wide default on hosts that support
 `session/setReasoningEffort`. The adapter folds
 `session/reasoningEffortChanged` and restores `SnapshotState.reasoningEffort`
-on resume. Until a host reports a standing default, including on older hosts
-that do not implement the setter, the selected tier remains a per-turn
-`reasoningEffort` override for compatibility.
+on resume. A session with no standing default shows `Muse default`, and the
+adapter sends no `reasoningEffort`: a per-turn value outranks the tier
+configured in Muse, so the adapter never picks one on the user's behalf. On
+older hosts that do not implement the setter, a tier the user selects remains
+a per-turn `reasoningEffort` override for compatibility, and selecting `Muse
+default` drops it again. MSP cannot clear a standing session default, so that
+choice is refused once the host reports one.
 
 Restoring usage on attach takes up to two extra reads, and only when the
 resume itself carried none. `session/contextUsage` is not durable-sourced, so
