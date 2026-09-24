@@ -1618,12 +1618,14 @@ fn restart_durable_host(
     stdout: &StdoutShared,
     sessions: &Sessions,
 ) -> Result<Arc<MspHost>, String> {
-    // Snapshot the attach list first; host calls must happen unlocked.
-    let attach: Vec<(String, String)> = sessions
+    // Snapshot the attach list first; host calls must happen unlocked. Keep
+    // the ACP key: a session resumed under a legacy `sess-*` id is stored
+    // under that id, not under its MSP id.
+    let attach: Vec<(String, String, String)> = sessions
         .lock()
-        .unwrap()
-        .values()
-        .map(|s| (s.msp_sid.clone(), s.view_cursor.clone()))
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|(acp_sid, s)| (acp_sid.clone(), s.msp_sid.clone(), s.view_cursor.clone()))
         .collect();
     let max_attempts = 3u32;
     let mut last_err = String::new();
@@ -1644,7 +1646,7 @@ fn restart_durable_host(
                     }
                 });
                 let mut failures = Vec::new();
-                for (msp_sid, after) in &attach {
+                for (acp_sid, msp_sid, after) in &attach {
                     let cmd = host.mint_cmd("cmd-");
                     match host.command(
                         "session/resume",
@@ -1660,9 +1662,9 @@ fn restart_durable_host(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                            {
                                 let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-                                if let Some(s) = map.get_mut(&acp_sid) {
+                                if let Some(s) = map.get_mut(acp_sid) {
                                     if !resume_head.is_empty() {
                                         s.view_cursor = resume_head.clone();
                                     }
@@ -1691,7 +1693,7 @@ fn restart_durable_host(
                                     drop(map);
                                     send_session_projection(
                                         stdout,
-                                        &acp_sid,
+                                        acp_sid,
                                         projection.0,
                                         projection.1.as_deref(),
                                         projection.2.as_deref(),
@@ -1702,7 +1704,7 @@ fn restart_durable_host(
                                 reattach_view(
                                     &host,
                                     sessions,
-                                    &acp_sid,
+                                    acp_sid,
                                     msp_sid,
                                     after,
                                     &resume_head,
@@ -1710,7 +1712,7 @@ fn restart_durable_host(
                             }
                             // Prompts whose turns no longer exist in the
                             // reattached fold must settle, not hang forever.
-                            reconcile_in_flight(stdout, sessions, msp_sid, &r);
+                            reconcile_in_flight(stdout, sessions, acp_sid, &r);
                         }
                         Err(e) => failures.push(format!("{msp_sid}: {}", err_message(&e))),
                     }
