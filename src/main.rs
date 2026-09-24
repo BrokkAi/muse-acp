@@ -2484,6 +2484,7 @@ fn handle_acp(
                                 &msp_sid,
                             ),
                             seen_view_cursors: std::collections::HashSet::new(),
+                            refill_twins: std::collections::HashSet::new(),
                             fold: fresh_fold(),
                             usage_used: None,
                             usage_size: None,
@@ -2749,6 +2750,7 @@ fn handle_acp(
                             session_status: None,
                             attention: None,
                             seen_view_cursors: std::collections::HashSet::new(),
+                            refill_twins: std::collections::HashSet::new(),
                             fold: fresh_fold(),
                             usage_used: None,
                             usage_size: None,
@@ -3120,6 +3122,7 @@ fn handle_acp(
                             session_status: None,
                             attention: None,
                             seen_view_cursors: std::collections::HashSet::new(),
+                            refill_twins: std::collections::HashSet::new(),
                             fold: fresh_fold(),
                             usage_used: None,
                             usage_size: None,
@@ -5121,8 +5124,9 @@ fn handle_msp(
                 .unwrap_or_else(|p| p.into_inner())
                 .get_mut(&acp_sid)
                 .map(|s| {
-                    let is_new =
-                        !cursor_is_replayable || s.seen_view_cursors.insert(cur.to_string());
+                    // A gap refill may already have delivered this event.
+                    let is_new = !s.refill_twins.remove(cur)
+                        && (!cursor_is_replayable || s.seen_view_cursors.insert(cur.to_string()));
                     s.view_cursor = cur.to_string();
                     is_new
                 })
@@ -5192,10 +5196,14 @@ fn handle_msp(
                 return;
             }
             let mut n = 0;
+            let mut reached = false;
+            let mut requested = std::collections::HashSet::from([cursor.clone()]);
+            let mut delivered = Vec::new();
             // Page forward until the walk meets `next`. Cursors are opaque, so
             // the walk stops on equality, at the end of the durable view, or
-            // when a page makes no progress; never on a page count, which
-            // would silently truncate a long hole.
+            // when a page makes no progress or returns a cursor it already
+            // asked for; never on a page count, which would silently truncate
+            // a long hole.
             loop {
                 let cmd = host.mint_cmd("cmd-");
                 let page = host.command(
@@ -5215,7 +5223,6 @@ fn handle_msp(
                     }
                 };
                 if let Some(J::Arr(evs)) = r.get("events") {
-                    let mut reached = false;
                     for e in evs.clone() {
                         let m = e.get("method").and_then(|v| v.as_str()).unwrap_or("");
                         let p = e.get("params").cloned().unwrap_or(J::Null);
@@ -5228,23 +5235,29 @@ fn handle_msp(
                         if !m.is_empty() {
                             n += 1;
                             handle_msp(host, stdout, sessions, lists, m, &p);
+                            if let Some(c) = p.get("viewCursor").and_then(J::as_str) {
+                                delivered.push(c.to_string());
+                            }
                         }
                     }
                     if reached || next.is_none() {
                         break;
                     }
                     match r.get("nextCursor").and_then(J::as_str) {
-                        // End of the durable view: the rest of the hole was
-                        // ephemeral and cannot be paged.
+                        // End of the durable view. `next` was ephemeral (an
+                        // item/delta is never paged), so the walk has also
+                        // delivered durable events the live stream still owns.
                         None => break,
-                        Some(c) if evs.is_empty() || c == cursor => {
-                            log(&format!(
-                                "view/gap refill stalled at {cursor} before reaching {}",
-                                next.unwrap_or("")
-                            ));
-                            break;
+                        Some(c) => {
+                            if evs.is_empty() || !requested.insert(c.to_string()) {
+                                log(&format!(
+                                    "view/gap refill stalled at {cursor} before reaching {}",
+                                    next.unwrap_or("")
+                                ));
+                                break;
+                            }
+                            cursor = c.to_string();
                         }
-                        Some(c) => cursor = c.to_string(),
                     }
                 } else if let Some(J::Arr(items)) = r.get("items") {
                     for item in items {
@@ -5274,17 +5287,23 @@ fn handle_msp(
                     break;
                 }
             }
-            // Refilled events carry cursors inside the hole. When live delivery
-            // had already passed it, keep the live position so a later
-            // re-attach does not replay from the middle of the hole.
-            if after.is_some_and(|after| after != live_cursor)
-                && !live_cursor.is_empty()
-                && let Some(s) = sessions
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .get_mut(&acp_sid)
+            if let Some(s) = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&acp_sid)
             {
-                s.view_cursor = live_cursor;
+                // A walk that met `next` delivered only the hole, which the
+                // live stream never carries. Otherwise the page may overlap
+                // events still queued live: refuse those twins once each.
+                if !reached {
+                    s.refill_twins.extend(delivered);
+                }
+                // Refilled events carry cursors inside the hole. When live
+                // delivery had already passed it, keep the live position so a
+                // later re-attach does not replay from the middle of the hole.
+                if after.is_some_and(|after| after != live_cursor) && !live_cursor.is_empty() {
+                    s.view_cursor = live_cursor;
+                }
             }
             log(&format!("view/gap refilled {n} events"));
         }

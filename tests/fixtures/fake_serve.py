@@ -46,6 +46,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_turn_cancelled one model leg, then a cancelled terminal
   usage_gap    view/gap refill page overlapping a live completion
   gap_after_next view/gap flushed after `next` (real host order); two-page refill
+  gap_ephemeral_next the gap's `next` is an item/delta, so paging runs past it
+  gap_cursor_cycle view/page answers with a nextCursor loop
   usage_rates_dropped priced catalog, then a refresh whose model has no cost
   usage_rates_empty   ... then a refresh returning models: []
   usage_rates_invalid ... then a refresh whose rates do not parse
@@ -840,6 +842,22 @@ def on_turn_start(params):
         notify("view/gap", {"sessionId": MSP_SID,
                             "after": "cur-1", "next": "cur-3"})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "gap_ephemeral_next":
+        # `next` names an ephemeral item/delta, which view/page never serves.
+        # The turn's durable terminal follows the gap on the live stream.
+        notify("item/completed", gap_message(tid, "A", "cur-1"))
+        notify("item/delta", {"sessionId": MSP_SID, "itemId": "gap-streaming",
+                              "delta": "partial", "viewCursor": "cur-3"})
+        notify("view/gap", {"sessionId": MSP_SID,
+                            "after": "cur-1", "next": "cur-3"})
+        notify("turn/completed", {**base, "terminal": "completed",
+                                  "viewCursor": "cur-5"})
+    elif SCENARIO == "gap_cursor_cycle":
+        notify("item/completed", gap_message(tid, "A", "cur-1"))
+        notify("item/completed", gap_message(tid, "C", "cur-9"))
+        notify("view/gap", {"sessionId": MSP_SID,
+                            "after": "cur-1", "next": "cur-9"})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "usage_gap":
         # cur-3 is delivered twice: once by the view/gap refill page and
         # once on the live stream. Two distinct completions, one price each.
@@ -1050,6 +1068,25 @@ def result_for(method, msg):
                      "params": gap_message("turn-1", "D", "cur-4")}],
                     "nextCursor": "cur-4"}
             return {"events": [], "nextCursor": None}
+        if SCENARIO == "gap_ephemeral_next":
+            if page.get("cursor") == "cur-1":
+                return {"events": [
+                    {"method": "item/completed",
+                     "params": gap_message("turn-1", "B", "cur-2")},
+                    {"method": "turn/completed",
+                     "params": {"sessionId": MSP_SID, "turnId": "turn-1",
+                                "terminal": "completed", "viewCursor": "cur-5"}}],
+                    "nextCursor": None}
+            return {"events": [], "nextCursor": None}
+        if SCENARIO == "gap_cursor_cycle":
+            # A misbehaving host: cur-1 -> cur-2 -> cur-1 -> ...
+            if page.get("cursor") == "cur-1":
+                return {"events": [{"method": "item/completed",
+                                    "params": gap_message("turn-1", "B", "cur-2")}],
+                        "nextCursor": "cur-2"}
+            return {"events": [{"method": "item/completed",
+                                "params": gap_message("turn-1", "X", "cur-3")}],
+                    "nextCursor": "cur-1"}
         if SCENARIO == "usage_gap" and page.get("direction") != "backward":
             # Refill overlaps the live stream: cur-3 is in this page too.
             return {"events": [

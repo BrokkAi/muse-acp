@@ -715,6 +715,59 @@ fn gap_refill_pages_from_the_hole_after_next_was_delivered() {
 }
 
 #[test]
+fn gap_refill_past_an_ephemeral_next_refuses_the_live_twins() {
+    // An item/delta `next` is never paged, so the walk runs to the end of the
+    // durable view and also delivers the turn's terminal. The live copy of
+    // that terminal must not settle the turn a second time.
+    let mut c = Client::spawn("gap_ephemeral_next", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "hi");
+    c.wait_for("\"stopReason\":\"end_turn\"", Duration::from_secs(15));
+    c.wait_stderr("view/gap refilled 2 events", Duration::from_secs(15));
+    // The live twin of cur-5 is queued behind the gap; let it be processed.
+    std::thread::sleep(Duration::from_millis(300));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert_eq!(
+        frames.matches("\"stopReason\":\"end_turn\"").count(),
+        1,
+        "the turn settles once: {frames}"
+    );
+    assert_eq!(
+        frames.matches("gap event B").count(),
+        1,
+        "the dropped event is refilled once: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn gap_refill_stops_on_a_next_cursor_cycle() {
+    let mut c = Client::spawn("gap_cursor_cycle", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "turn settles: {done}");
+    c.wait_stderr("view/gap refill stalled", Duration::from_secs(15));
+    // The adapter must stay responsive after the stalled walk.
+    let list_id = c.req("session/list", "{}");
+    c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap_or_default();
+    let pages = input
+        .lines()
+        .filter(|line| line.contains("\"direction\": \"forward\""))
+        .count();
+    assert_eq!(
+        pages, 2,
+        "the walk stops at the first repeated cursor: {input}"
+    );
+    c.finish();
+}
+
+#[test]
 fn a_successful_catalog_refresh_drops_stale_rates() {
     // The model list is replaced by each successful snapshot, so pricing must
     // be too: a model that comes back without a usable `cost` goes unpriced
