@@ -195,6 +195,9 @@ pub struct AcpSession {
     /// the turn settles; bounded so turns that never settle cannot grow it
     /// without limit.
     pub turn_usage: Vec<TurnUsage>,
+    /// Selectors from the host's latest `skill/list` for this session.
+    /// `None` until a catalog read succeeds.
+    pub skill_selectors: Option<std::collections::HashSet<String>>,
 }
 
 pub type Sessions = Arc<Mutex<HashMap<String, AcpSession>>>;

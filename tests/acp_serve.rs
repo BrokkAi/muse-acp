@@ -2798,6 +2798,32 @@ fn unknown_native_skill_preserves_typed_host_error() {
 }
 
 #[test]
+fn leading_slash_text_that_names_no_skill_is_sent_as_text() {
+    // An absolute path or an unknown word at the start of a question is not
+    // a command: it must reach the model as text, not fail as skillNotFound.
+    for (ver, text) in [
+        (1u64, "/tmp/build.log shows a linker error"),
+        (2, "/usr/local/bin/tool crashes on start"),
+        (2, "/nosuchskill please explain"),
+    ] {
+        let mut c = Client::spawn("quiet", &[]);
+        let sid = c.new_session(ver, "");
+        c.wait_for("available_commands_update", Duration::from_secs(15));
+        let _pid = c.prompt(&sid, text);
+        c.wait_input(
+            &format!("\"type\": \"text\", \"text\": \"{text}\""),
+            Duration::from_secs(15),
+        );
+        let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+        assert!(
+            !input.contains("\"type\": \"skill\""),
+            "v{ver} {text:?} must not become a skill invocation: {input}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn leading_space_escapes_a_slash_command() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");

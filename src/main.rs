@@ -1151,6 +1151,27 @@ fn skill_catalog(
     Some(skills)
 }
 
+/// Remember which selectors the session's skill catalog resolves, so prompt
+/// text is submitted as a native skill only when it names one of them.
+fn adopt_skill_catalog(
+    sessions: &Sessions,
+    acp_sid: &str,
+    skills: &[(String, String, Option<String>)],
+) {
+    if let Some(s) = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(acp_sid)
+    {
+        s.skill_selectors = Some(
+            skills
+                .iter()
+                .map(|(selector, _, _)| selector.clone())
+                .collect(),
+        );
+    }
+}
+
 fn send_host_error(stdout: &StdoutShared, id: &Option<J>, error: &J, fallback: i64, message: &str) {
     let code = msp::acp_error_code(error, fallback);
     if let Some(data) = msp::skill_error_data(error) {
@@ -2499,6 +2520,7 @@ fn handle_acp(
                             title_facts: initial_title_facts.clone(),
                             child_folds: HashMap::new(),
                             turn_usage: Vec::new(),
+                            skill_selectors: None,
                         },
                     );
                     // _meta exposes the host session id: pass it back to
@@ -2539,7 +2561,11 @@ fn handle_acp(
                             acp::session_modes(acp::mode_from_msp(&cur_mode))
                         )
                     };
-                    let skills = skill_catalog(host, &msp_sid).unwrap_or_default();
+                    let skills = skill_catalog(host, &msp_sid);
+                    if let Some(skills) = &skills {
+                        adopt_skill_catalog(sessions, &sid, skills);
+                    }
+                    let skills = skills.unwrap_or_default();
                     acp::send_result(stdout, &id, &result);
                     let (status, attention) = sessions
                         .lock()
@@ -2764,6 +2790,7 @@ fn handle_acp(
                             title_facts: HostTitleFacts::default(),
                             child_folds: HashMap::new(),
                             turn_usage: Vec::new(),
+                            skill_selectors: None,
                         });
                         entry.msp_sid = real_msp.clone();
                         entry.ver = ver;
@@ -2946,7 +2973,11 @@ fn handle_acp(
                             acp::session_modes(&mode_v)
                         )
                     };
-                    let skills = skill_catalog(host, &msp_out).unwrap_or_default();
+                    let skills = skill_catalog(host, &msp_out);
+                    if let Some(skills) = &skills {
+                        adopt_skill_catalog(sessions, &sid, skills);
+                    }
+                    let skills = skills.unwrap_or_default();
                     acp::send_result(stdout, &id, &result);
                     acp::send_available_commands(stdout, &sid, ver, &skills);
                 }
@@ -3135,6 +3166,7 @@ fn handle_acp(
                             title_facts: HostTitleFacts::default(),
                             child_folds: HashMap::new(),
                             turn_usage: Vec::new(),
+                            skill_selectors: None,
                         });
                         entry.msp_sid = new_msp.clone();
                         entry.ver = ver;
@@ -3233,11 +3265,12 @@ fn handle_acp(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let (msp_sid, roots, reasoning_effort, pending_approval) =
+            let (msp_sid, roots, skills, reasoning_effort, pending_approval) =
                 match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
                     Some(s) => (
                         s.msp_sid.clone(),
                         s.roots.clone(),
+                        s.skill_selectors.clone(),
                         reasoning_effort_override(s),
                         s.pending_perm
                             .as_ref()
@@ -3274,17 +3307,18 @@ fn handle_acp(
                 );
                 return;
             }
-            let (parts, acp_content) = match extract_prompt_parts(params.as_ref(), &roots) {
-                Ok((p, c)) if !p.is_empty() => (p, c),
-                Ok(_) => {
-                    acp::send_error(stdout, &id, -32602, "session/prompt requires content");
-                    return;
-                }
-                Err(e) => {
-                    acp::send_error(stdout, &id, -32602, &e);
-                    return;
-                }
-            };
+            let (parts, acp_content) =
+                match extract_prompt_parts(params.as_ref(), &roots, skills.as_ref()) {
+                    Ok((p, c)) if !p.is_empty() => (p, c),
+                    Ok(_) => {
+                        acp::send_error(stdout, &id, -32602, "session/prompt requires content");
+                        return;
+                    }
+                    Err(e) => {
+                        acp::send_error(stdout, &id, -32602, &e);
+                        return;
+                    }
+                };
             // `/compact` is a protocol command, not a prompt: run
             // session/compact and settle immediately. The compaction item
             // (when the host emits one) arrives as its own visible update.
@@ -3570,11 +3604,12 @@ fn handle_acp(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let (msp_sid, roots, reasoning_effort, active_turn, pending_approval) =
+            let (msp_sid, roots, skills, reasoning_effort, active_turn, pending_approval) =
                 match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
                     Some(s) => (
                         s.msp_sid.clone(),
                         s.roots.clone(),
+                        s.skill_selectors.clone(),
                         reasoning_effort_override(s),
                         s.active_turn.clone(),
                         s.pending_perm.is_some() || !s.perm_queue.is_empty(),
@@ -3599,17 +3634,18 @@ fn handle_acp(
                 );
                 return;
             }
-            let (parts, acp_content) = match extract_prompt_parts(params.as_ref(), &roots) {
-                Ok((parts, content)) if !parts.is_empty() => (parts, content),
-                Ok(_) => {
-                    acp::send_error(stdout, &id, -32602, "steering requires content");
-                    return;
-                }
-                Err(message) => {
-                    acp::send_error(stdout, &id, -32602, &message);
-                    return;
-                }
-            };
+            let (parts, acp_content) =
+                match extract_prompt_parts(params.as_ref(), &roots, skills.as_ref()) {
+                    Ok((parts, content)) if !parts.is_empty() => (parts, content),
+                    Ok(_) => {
+                        acp::send_error(stdout, &id, -32602, "steering requires content");
+                        return;
+                    }
+                    Err(message) => {
+                        acp::send_error(stdout, &id, -32602, &message);
+                        return;
+                    }
+                };
             if active_turn.is_none() && prompt_required {
                 acp::send_result(
                     stdout,
@@ -4501,6 +4537,7 @@ fn image_part(data_b64: &str, mime: &str) -> String {
 fn extract_prompt_parts(
     params: Option<&J>,
     roots: &[String],
+    skills: Option<&std::collections::HashSet<String>>,
 ) -> Result<(Vec<String>, String), String> {
     let p = params.ok_or("session/prompt requires params")?;
     let prompt = p.get("prompt").unwrap_or(p);
@@ -4522,7 +4559,7 @@ fn extract_prompt_parts(
             return;
         }
         let text = texts.join("\n");
-        if let Some(skill) = native_skill_part(&text) {
+        if let Some(skill) = native_skill_part(&text, skills) {
             parts.push(skill);
         } else {
             parts.push(format!("{{\"type\":\"text\",\"text\":{}}}", esc(&text)));
@@ -4623,10 +4660,17 @@ fn extract_prompt_parts(
     Ok((parts, format!("[{}]", content.join(","))))
 }
 
-/// Convert an editor slash command into the native MSP skill part. The host
-/// resolves the selector against its current catalog, so a stale or unknown
-/// name reaches MSP and produces its typed `skillNotFound` error.
-fn native_skill_part(text: &str) -> Option<String> {
+/// Convert an editor slash command into the native MSP skill part. Once the
+/// session's skill catalog is known, only a selector it lists becomes a skill:
+/// other leading-slash text, such as an absolute path at the start of a
+/// question, stays ordinary prompt text instead of failing as `skillNotFound`.
+/// The host still resolves the selector, so a skill removed after the last
+/// catalog read produces its typed error. Without a catalog (the read failed)
+/// every slash command is submitted and the host decides.
+fn native_skill_part(
+    text: &str,
+    skills: Option<&std::collections::HashSet<String>>,
+) -> Option<String> {
     // A leading space intentionally escapes command handling in ACP clients.
     if !text.starts_with('/') {
         return None;
@@ -4652,6 +4696,10 @@ fn native_skill_part(text: &str) -> Option<String> {
                 .trim_start()
                 .to_string();
         }
+    }
+
+    if skills.is_some_and(|known| !known.contains(&selector)) {
+        return None;
     }
 
     let mut part = format!("{{\"type\":\"skill\",\"selector\":{}", esc(&selector));
@@ -5148,6 +5196,7 @@ fn handle_msp(
                 .map(|s| s.ver)
                 .unwrap_or(1);
             if let Some(skills) = skill_catalog(host, msp_sid) {
+                adopt_skill_catalog(sessions, &acp_sid, &skills);
                 log(&format!(
                     "skill catalog refreshed for session {msp_sid}: {} row(s)",
                     skills.len()
