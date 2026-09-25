@@ -1511,6 +1511,10 @@ def main():
                 if SCENARIO == "session_list_stream" and method == "session/list" \
                         and os.environ.get("FAKE_STREAM_METADATA") != "1":
                     log_method("session/closed-sent")
+                    # Optional delay between the marker and the notification,
+                    # so tests cannot synchronize on the marker by luck.
+                    if os.environ.get("FAKE_CLOSE_DELAY_MS"):
+                        time.sleep(int(os.environ["FAKE_CLOSE_DELAY_MS"]) / 1000.0)
                     send({"jsonrpc": "2.0", "method": "session/closed",
                           "params": {"sessionId": MSP_SID}})
                 if method == "session/setReasoningEffort":

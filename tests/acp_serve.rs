@@ -6814,7 +6814,9 @@ fn resumed_active_prompt_cannot_be_unqueued() {
 
 #[test]
 fn session_list_stream_updates_titles_filters_rows_and_unloads_sessions() {
-    let mut c = Client::spawn("session_list_stream", &[]);
+    // The delay separates the fake's "sent" marker from the notification, so
+    // the test must wait for the adapter to apply the close.
+    let mut c = Client::spawn("session_list_stream", &[("FAKE_CLOSE_DELAY_MS", "300")]);
     let sid = c.new_session(1, "");
     c.wait_frame_contains("sessionListStream", Duration::from_secs(15));
 
@@ -6832,7 +6834,12 @@ fn session_list_stream_updates_titles_filters_rows_and_unloads_sessions() {
         !filtered.contains(&sid),
         "unrelated streamed row leaked: {filtered}"
     );
-    c.wait_log("session/closed-sent", Duration::from_secs(15));
+    // The fake's "sent" marker precedes delivery; wait until the adapter has
+    // applied the close, or the next listing races the notification.
+    c.wait_stderr(
+        "session list row closed: session=msp-sess-1",
+        Duration::from_secs(15),
+    );
 
     let listed_id = c.req("session/list", "{}");
     let listed = c.wait_for(&format!("\"id\":{listed_id}"), Duration::from_secs(15));
@@ -6848,7 +6855,12 @@ fn session_list_stream_notifications_are_ignored_without_a_grant() {
     let mut c = Client::spawn("session_list_stream_denied", &[]);
     let sid = c.new_session(1, "");
     c.wait_frame_contains("sessionListStream", Duration::from_secs(15));
-    c.wait_log("session/listChanged-sent", Duration::from_secs(15));
+    // Wait for the adapter to see and ignore the ungranted row, not just for
+    // the fake to send it, or the listing below proves nothing.
+    c.wait_stderr(
+        "session/listChanged ignored: sessionListStream was not granted",
+        Duration::from_secs(15),
+    );
 
     let list_id = c.req("session/list", "{}");
     let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
