@@ -599,7 +599,23 @@ impl MspHost {
                 Err(std::sync::TryLockError::WouldBlock) => return,
             };
             terminate_child(&mut child);
-            let _ = child.try_wait();
+            // The deadline exits the whole adapter without running Drop.
+            // Reap within our existing budget, then clean up the settings
+            // view even if the main loop is blocked writing to the editor.
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < until => std::thread::sleep(SHUTDOWN_POLL),
+                    Ok(None) | Err(_) => return,
+                }
+            }
+            drop(child);
+            let config = match self.host_config.try_lock() {
+                Ok(mut config) => config.take(),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            drop(config);
             return;
         }
     }

@@ -4213,6 +4213,52 @@ fn auto_review_settings_are_scoped_to_the_host_and_human_approvals_still_work() 
 
 #[cfg(unix)]
 #[test]
+fn auto_review_settings_are_cleaned_up_on_forced_shutdown() {
+    let (source, original) = auto_review_config();
+    let mut child = Command::new(adapter_bin())
+        .env("MUSE_CLI", fixture())
+        .env("XDG_CONFIG_HOME", &source)
+        .env("FAKE_CHECK_HOST_CONFIG", "1")
+        .env("FAKE_LOG", source.join("fake"))
+        .env("FAKE_FRAMES", source.join("fake.frames"))
+        .env("FAKE_SCENARIO", "quiet")
+        .env("MUSE_SHUTDOWN_TIMEOUT_MS", "1500")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut input = child.stdin.take().unwrap();
+    // Keep stdout unread so the main loop cannot run normal host cleanup.
+    for id in 1..100 {
+        writeln!(input, "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1}}}}").unwrap();
+    }
+    drop(input);
+    let status = child
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .expect("forced shutdown must stay bounded");
+    assert!(!status.success(), "the shutdown deadline should expire");
+    let config: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(source.join("fake.config"))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+    let root = std::path::PathBuf::from(config["root"].as_str().unwrap());
+    assert!(
+        !root.exists(),
+        "forced shutdown left temporary settings at {root:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(source.join("muse/settings.json")).unwrap(),
+        original
+    );
+    std::fs::remove_dir_all(source).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
 fn auto_review_override_is_recreated_on_restart_and_used_by_support() {
     let (source, original) = auto_review_config();
     let marker = source.join("restart.marker");
