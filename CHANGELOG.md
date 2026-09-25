@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.6.0
+
+- Stop overriding Muse's reasoning default: sessions start at "Muse
+  default" and send no per-turn tier until the user picks one, and the
+  option is offered only while no standing default is in force.
+- Gate leading-slash prompts on the skill catalog: fork sessions read
+  skill/list, a failed re-read forgets a stale catalog, `/skill <name>`
+  and `compact` always submit, and slash text naming no skill is sent as
+  ordinary text.
+- Settle orphaned in-flight prompts across durable host restarts,
+  including legacy sessions and sessions the restarted host cannot
+  re-attach.
+- Withdraw stale client requests with `$/cancel_request` for resolved
+  child-stream approvals and questions settled elsewhere.
+- Harden the transcript gap walk: refill from the hole, stop on cursor
+  cycles, and discard live twins of delivered pages.
+
 ## 0.5.0
 
 - Add Muse Code 1.3.0 compatibility, native skills, session reasoning defaults,
