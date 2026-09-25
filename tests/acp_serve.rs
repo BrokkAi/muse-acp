@@ -4958,9 +4958,18 @@ fn adapter_truncation_is_visible_and_configurable() {
         "original length missing: {card}"
     );
     assert!(
-        card.contains("\"retainedChars\":300"),
+        card.contains("\"retainedChars\":288"),
         "retained length missing: {card}"
     );
+    assert!(
+        card.contains("START") && card.contains("FAILURE AT END"),
+        "{card}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&card).unwrap();
+    let text = parsed["params"]["update"]["content"][0]["content"]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(text.chars().count(), 300);
     c.finish();
 }
 
@@ -5084,7 +5093,18 @@ fn output_unavailable_is_forwarded_as_typed_error() {
         response.contains("\"outputRef\":\"out-1\""),
         "output ref missing: {response}"
     );
+    let frames = c.frames.clone();
     c.finish();
+    assert_eq!(
+        frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| f.contains(&format!("\"id\":{read_id}")))
+            .count(),
+        1,
+        "structured errors must not be settled twice during shutdown"
+    );
 }
 
 #[test]
@@ -6902,5 +6922,372 @@ fn streamed_rows_preserve_metadata_priority_and_clear_omitted_fields() {
             && !cleared.contains("Initial title"),
         "{cleared}"
     );
+    c.finish();
+}
+
+#[test]
+fn fork_history_replays_only_the_forked_view_and_preserves_provenance() {
+    for scenario in [
+        "fork_history_inline",
+        "fork_history_paged",
+        "fork_history_snapshot",
+    ] {
+        for (ver, cut, second) in [
+            (1, serde_json::json!({"messageId":"msg-fork"}), false),
+            (
+                2,
+                serde_json::json!({"messageFingerprint":"sha256:e2bab1be910abb02f77bcbfaf13466c19100b8f0db25b9a2b4f9c80164556eab", "messageOccurrence":2}),
+                true,
+            ),
+            (2, serde_json::Value::Null, true),
+        ] {
+            let mut c = Client::spawn(scenario, &[]);
+            let sid = c.new_session(ver, "");
+            let mut params = serde_json::json!({"sessionId":sid, "replayFrom":{"type":"start"}});
+            if !cut.is_null() {
+                params["_meta"] = serde_json::json!({"jetbrains":{"air":{"forkPoint":cut}}});
+            }
+            let id = c.req("session/fork", &params.to_string());
+            let result = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            assert!(
+                result.contains("forkedFrom") && result.contains("opaque-cut"),
+                "{result}"
+            );
+            // A following request drains the queued live duplicate as well.
+            let barrier = c.req("session/list", "{}");
+            c.wait_for(&format!("\"id\":{barrier}"), Duration::from_secs(15));
+            let frames = c.frames.lock().unwrap().clone();
+            let messages: Vec<_> = frames
+                .iter()
+                .filter(|f| f.contains("msp-sess-forked") && f.contains("agent_message"))
+                .collect();
+            assert_eq!(
+                messages.iter().filter(|f| f.contains("fork here")).count(),
+                1,
+                "{scenario}: {messages:?}"
+            );
+            assert_eq!(
+                messages
+                    .iter()
+                    .filter(|f| f.contains("second turn"))
+                    .count(),
+                usize::from(second),
+                "{messages:?}"
+            );
+            assert!(
+                !messages
+                    .iter()
+                    .any(|f| f.contains("must not replay") || f.contains("partial")),
+                "{messages:?}"
+            );
+            c.finish();
+        }
+    }
+}
+
+#[test]
+fn fork_history_failure_does_not_register_a_partial_session() {
+    let mut c = Client::spawn("fork_history_failure", &[]);
+    let sid = c.new_session(1, "");
+    let id = c.req(
+        "session/fork",
+        &serde_json::json!({"sessionId":sid}).to_string(),
+    );
+    let result = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(result.contains("fork history failed"), "{result}");
+    let pid = c.prompt("msp-sess-forked", "should fail");
+    let prompt = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(prompt.contains("error"), "{prompt}");
+    c.finish();
+}
+
+#[test]
+fn user_shell_requires_editor_opt_in_task_controls_and_host_grant() {
+    for (caps, scenario, allowed) in [
+        (serde_json::json!({}), "user_shell", false),
+        (
+            serde_json::json!({"_meta":{"muse":{"capabilities":["userShell"]}}}),
+            "user_shell",
+            false,
+        ),
+        (
+            serde_json::json!({"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["asyncTasks"]}}}}),
+            "user_shell",
+            false,
+        ),
+        (
+            serde_json::json!({"_meta":{"muse":{"capabilities":["userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["asyncTasks"]}}}}),
+            "quiet",
+            false,
+        ),
+        (
+            serde_json::json!({"_meta":{"muse":{"capabilities":["userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["asyncTasks"]}}}}),
+            "user_shell",
+            true,
+        ),
+    ] {
+        for ver in [1, 2] {
+            let mut c = Client::spawn(scenario, &[]);
+            let key = if ver == 1 {
+                "clientCapabilities"
+            } else {
+                "capabilities"
+            };
+            let sid = c.new_session(ver, &format!(",\"{key}\":{caps}"));
+            let command_id = "0198a5d2-7b11-7000-8000-000000000009";
+            let request =
+                serde_json::json!({"sessionId":sid,"commandId":command_id,"commandText":"sleep 1"});
+            let id = c.req("_session/userShell", &request.to_string());
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            assert_eq!(frame.contains("\"result\""), allowed, "{frame}");
+            if allowed {
+                let done = c.wait_for("shell stopped", Duration::from_secs(15));
+                assert!(done.contains("\"exitSignal\":15"), "{done}");
+                c.wait_for("async_task_state_update", Duration::from_secs(15));
+                c.wait_input(command_id, Duration::from_secs(15));
+            }
+            let path = format!("{}.frames", c.fake_log);
+            c.finish();
+            let frames = std::fs::read_to_string(path).unwrap();
+            let init: serde_json::Value = frames
+                .lines()
+                .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+                .find(|f| f["method"] == "initialize")
+                .unwrap();
+            let requested = init["params"]["capabilities"]["requestedCapabilities"]
+                .as_array()
+                .unwrap();
+            assert_eq!(
+                requested.contains(&serde_json::json!("userShell")),
+                allowed || scenario == "quiet"
+            );
+            if !allowed {
+                assert!(
+                    !frames.contains("\"method\":\"session/userShell\""),
+                    "{frames}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn reasoning_recommendations_require_negotiation_and_host_default_facts() {
+    for (scenario, source, default) in [
+        ("quiet", "policy", false),
+        ("reasoning_resume", "user", false),
+        ("reasoning_resume", "future", false),
+        ("reasoning_resume", "policy", true),
+        ("reasoning_resume", "default", true),
+    ] {
+        for negotiated in [false, true] {
+            let mut c = Client::spawn(scenario, &[("FAKE_REASONING_SOURCE", source)]);
+            let caps = if negotiated {
+                ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"recommendedValue\"]}}}}"
+            } else {
+                ""
+            };
+            let sid = c.new_session(2, caps);
+            let id = c.req(
+                "session/resume",
+                &serde_json::json!({"sessionId":sid}).to_string(),
+            );
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            let result: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            let option = result["result"]["configOptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["configId"] == "reasoning_effort")
+                .unwrap();
+            assert_eq!(
+                option["_meta"]["jetbrains"]["air"]["recommendedValue"].as_str(),
+                (negotiated && default).then_some("high"),
+                "{frame}"
+            );
+            // A user selection must stay selected even while an earlier host
+            // recommendation is displayed next to it.
+            let id = c.req(
+                "session/set_config_option",
+                &serde_json::json!({"sessionId":sid,"configId":"reasoning_effort","value":"low"})
+                    .to_string(),
+            );
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            let result: serde_json::Value = serde_json::from_str(&frame).unwrap();
+            let option = result["result"]["configOptions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|o| o["configId"] == "reasoning_effort")
+                .unwrap();
+            assert_eq!(option["currentValue"], "low", "{frame}");
+            assert_eq!(
+                option["_meta"]["jetbrains"]["air"]["recommendedValue"].as_str(),
+                (negotiated && default).then_some("high"),
+                "{frame}"
+            );
+            c.finish();
+        }
+    }
+}
+
+#[test]
+fn shutdown_deadline_settles_a_command_blocking_the_main_loop() {
+    let mut c = Client::spawn(
+        "shutdown_pending_command",
+        &[("MUSE_SHUTDOWN_TIMEOUT_MS", "1500")],
+    );
+    c.new_session(1, "");
+    let id = c.req("session/list", "{}");
+    c.wait_log("command-stalled", Duration::from_secs(5));
+    drop(c.stdin);
+    let status = c
+        .child
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .expect("shutdown bounded");
+    assert!(!status.success(), "deadline expiry is an explicit failure");
+    let frames = c.frames.lock().unwrap().clone();
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.contains(&format!("\"id\":{id}"))
+                && frame.contains("shutdown deadline expired")),
+        "{frames:?}"
+    );
+    assert!(
+        std::fs::read_to_string(&c.stderr_log)
+            .unwrap()
+            .contains("shutdown deadline expired")
+    );
+}
+
+#[test]
+fn shutdown_deadline_bounds_unread_editor_stdout() {
+    let mut cmd = Command::new(adapter_bin());
+    cmd.env("MUSE_CLI", fixture())
+        .env("FAKE_SCENARIO", "quiet")
+        .env("MUSE_SHUTDOWN_TIMEOUT_MS", "1500")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn().unwrap();
+    let mut input = child.stdin.take().unwrap();
+    // Keep the output pipe open but unread. Responses eventually fill it and
+    // block the adapter's main thread, while its reader still observes EOF.
+    for id in 1..100 {
+        writeln!(input, "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1}}}}").unwrap();
+    }
+    drop(input);
+    let status = child
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .expect("unread stdout cannot strand shutdown");
+    assert!(!status.success());
+}
+
+#[test]
+fn shutdown_kills_a_host_that_ignores_stdin_eof() {
+    let mut c = Client::spawn("shutdown_stubborn", &[]);
+    c.new_session(1, "");
+    let started = Instant::now();
+    c.finish();
+    assert!(started.elapsed() < Duration::from_secs(9));
+}
+
+#[test]
+fn malformed_host_frames_do_not_kill_a_healthy_connection() {
+    let mut c = Client::spawn("malformed_msp", &[]);
+    let sid = c.new_session(1, "");
+    c.wait_stderr("serve parse error", Duration::from_secs(5));
+    let id = c.prompt(&sid, "still healthy");
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"stopReason\":\"end_turn\""), "{frame}");
+    c.finish();
+}
+
+#[test]
+fn user_shell_restart_restores_terminal_without_relaunching_the_command() {
+    let marker = std::env::temp_dir().join(format!(
+        "muse-acp-shell-restart-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let mut c = Client::spawn(
+        "user_shell_restart",
+        &[("FAKE_RESTART_MARKER", marker.to_str().unwrap())],
+    );
+    let sid = c.new_session(2, ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"userShell\"]},\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}");
+    let id = c.req("_session/userShell", &serde_json::json!({"sessionId":sid,"commandId":"0198a5d2-7b11-7000-8000-000000000009","commandText":"sleep 1"}).to_string());
+    c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    c.wait_stderr("host-restarted attempt=1", Duration::from_secs(15));
+    let terminal = c.wait_for("recovered shell terminal", Duration::from_secs(15));
+    assert!(terminal.contains("\"exitCode\":7"), "{terminal}");
+    let done = c.wait_for("async_task_state_update", Duration::from_secs(15));
+    assert!(done.contains("\"state\":\"completed\""), "{done}");
+    let path = c.fake_log.clone();
+    let frames = c.frames.clone();
+    c.finish();
+    assert_eq!(
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| *l == "session/userShell")
+            .count(),
+        1
+    );
+    let frames = frames.lock().unwrap();
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|f| f.contains("async_task_spawned"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|f| f.contains("async_task_state_update"))
+            .count(),
+        1
+    );
+    let _ = std::fs::remove_file(marker);
+}
+
+#[test]
+fn disconnect_retires_shell_tasks_without_fabricating_an_exit_code() {
+    let mut c = Client::spawn("async_resume", &[]);
+    c.initialize(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}");
+    let id = c.req("session/resume", "{\"sessionId\":\"existing-session\"}");
+    c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    let frames = c.frames.clone();
+    c.finish();
+    let frames = frames.lock().unwrap();
+    let shell = frames
+        .iter()
+        .find(|f| f.contains("shell-shell-resumed") && f.contains("terminalUnknown"))
+        .expect("running shell retired");
+    assert!(
+        !shell.contains("exitCode") && !shell.contains("exitSignal"),
+        "{shell}"
+    );
+}
+
+#[test]
+fn invalid_utf8_editor_frame_is_rejected_without_disconnect() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(1, "");
+    c.stdin
+        .write_all(b"{\"method\":\"session/prompt\",\"params\":\"\xff\"}\n")
+        .unwrap();
+    c.stdin.flush().unwrap();
+    let error = c.wait_for("invalid UTF-8 frame", Duration::from_secs(5));
+    assert!(error.contains("-32700"), "{error}");
+    let id = c.prompt(&sid, "healthy next frame");
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"stopReason\":\"end_turn\""), "{frame}");
     c.finish();
 }

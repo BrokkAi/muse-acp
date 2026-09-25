@@ -1,0 +1,22 @@
+[package]
+name = "muse-acp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+
+[[bin]]
+name = "json"
+path = "fuzz_targets/json.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

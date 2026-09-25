@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"item/delta","params":{"text":"hello 🦀","nested":[true,null,1.25e-2]}}

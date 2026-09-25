@@ -30,19 +30,22 @@ fn max_content() -> usize {
 /// fields for `_meta.muse.truncated` when the adapter cut the text.
 fn trunc(s: &str) -> (String, Option<String>) {
     let limit = max_content();
-    if s.len() <= limit {
+    let original = s.chars().count();
+    if original <= limit {
         return (s.to_string(), None);
     }
-    let mut cut = limit;
-    while !s.is_char_boundary(cut) {
-        cut -= 1;
-    }
+    // The marker is part of the display budget; retainedChars counts only
+    // original text. Split scalar values, never bytes, to preserve UTF-8.
+    const MARKER: &str = "…[truncated]";
+    let retained = limit - MARKER.chars().count();
+    let head_chars = retained.div_ceil(2);
+    let tail_chars = retained / 2;
+    let head = s.char_indices().nth(head_chars).unwrap().0;
+    let tail = s.char_indices().rev().nth(tail_chars - 1).unwrap().0;
     let meta = format!(
-        "\"source\":\"adapter\",\"originalChars\":{},\"retainedChars\":{}",
-        s.chars().count(),
-        s[..cut].chars().count()
+        "\"source\":\"adapter\",\"originalChars\":{original},\"retainedChars\":{retained},\"headChars\":{head_chars},\"tailChars\":{tail_chars}"
     );
-    (format!("{}…[truncated]", &s[..cut]), Some(meta))
+    (format!("{}{MARKER}{}", &s[..head], &s[tail..]), Some(meta))
 }
 
 fn tool_kind(tool: &str) -> &'static str {
@@ -336,7 +339,7 @@ impl SessionFold {
                 "\"content\":[{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]",
                 esc(&text)
             ));
-            if let Some(cut) = adapter_cut {
+            if let Some(cut) = adapter_cut.filter(|_| !host_truncated) {
                 if !fields.is_empty() {
                     fields.push(',');
                 }
@@ -680,6 +683,24 @@ impl SessionFold {
         self.async_task_states
             .insert(task_id.to_string(), state.to_string());
         out.push(Self::async_task_state_line(acp_sid, task_id, state));
+    }
+
+    /// A permanent transport loss cannot establish a host terminal outcome.
+    /// Retire the editor's running indicator with explicit unknown-outcome
+    /// metadata; durable restart reconciliation happens before this fallback.
+    pub fn disconnect_tasks(&mut self, acp_sid: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for task in self.announced_tasks.clone() {
+            if self.async_task_states.contains_key(&task) {
+                continue;
+            }
+            self.async_task_states
+                .insert(task.clone(), "failed".to_string());
+            out.push(Self::update_line(acp_sid, &format!(
+                "{{\"sessionUpdate\":\"async_task_state_update\",\"asyncTaskId\":{},\"state\":\"failed\",\"_meta\":{{\"muse\":{{\"terminalUnknown\":true,\"reason\":\"connection closed\"}}}}}}", esc(&task)
+            )));
+        }
+        out
     }
 
     fn async_task_state_line(acp_sid: &str, task_id: &str, state: &str) -> String {
@@ -1552,7 +1573,7 @@ pub fn stop_reason(terminal: &str) -> &'static str {
 
 #[cfg(test)]
 mod corpus_tests {
-    use super::SessionFold;
+    use super::{SessionFold, max_content, trunc};
     use crate::json::{J, parse_json};
     use std::path::{Path, PathBuf};
 
@@ -1902,5 +1923,57 @@ mod corpus_tests {
         let mut out = Vec::new();
         fold.on_item_completed("sid", 1, &completed, &mut out);
         assert!(out.is_empty(), "nothing to settle: {out:?}");
+    }
+    #[test]
+    fn truncation_keeps_unicode_head_and_tail_with_exact_metadata() {
+        let limit = max_content();
+        let short = "🦀".repeat(limit);
+        assert_eq!(trunc(&short), (short, None));
+        let original = format!("開始{}最後の失敗", "🦀".repeat(limit));
+        let (text, meta) = trunc(&original);
+        assert!(text.starts_with("開始") && text.ends_with("最後の失敗"));
+        assert_eq!(text.chars().count(), limit);
+        let meta = parse_json(&format!("{{{}}}", meta.unwrap())).unwrap();
+        assert_eq!(
+            meta.get("originalChars").unwrap().as_u64(),
+            Some(original.chars().count() as u64)
+        );
+        assert_eq!(
+            meta.get("retainedChars").unwrap().as_u64(),
+            Some((limit - 12) as u64)
+        );
+    }
+
+    #[test]
+    fn truncated_nested_json_remains_valid_editor_content() {
+        let nested = format!(
+            r#"{{"outer":{{"quoted":"\\\"{}","error":"final failure"}}}}"#,
+            "界".repeat(max_content())
+        );
+        let line = SessionFold::card_line(
+            "sid",
+            2,
+            true,
+            "id",
+            "title",
+            "read",
+            "failed",
+            Some(&nested),
+            None,
+            false,
+        );
+        let parsed = parse_json(&line).unwrap();
+        assert!(line.contains("final failure"));
+        assert_eq!(
+            parsed
+                .get("params")
+                .unwrap()
+                .get("update")
+                .unwrap()
+                .get("status")
+                .unwrap()
+                .as_str(),
+            Some("failed")
+        );
     }
 }

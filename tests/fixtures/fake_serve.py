@@ -112,6 +112,7 @@ CATALOG_READS = [0]
 USER_INPUT_DIALOGS = [True]
 USAGE_READS = [0]
 SKILL_READS = [0]
+FORK_ITEMS = []
 
 # Compatibility-diagnostics knobs: the fixture defaults to the validated
 # host shape, but tests can present an unknown fingerprint or a future
@@ -305,7 +306,7 @@ def usage_snapshot_history(context=True, cumulative=(100, 20)):
 def reasoning_snapshot_history():
     history = usage_snapshot_history()
     history["snapshot"]["state"]["reasoningEffort"] = {
-        "reasoningEffort": "high", "source": "policy"}
+        "reasoningEffort": "high", "source": os.environ.get("FAKE_REASONING_SOURCE", "policy")}
     return history
 
 
@@ -344,7 +345,7 @@ def question_params(user_input_id="ui-1"):
 def on_turn_start(params):
     tid = turn_id()
     base = {"sessionId": ACTIVE_SESSION[0], "turnId": tid}
-    if SCENARIO == "happy":
+    if SCENARIO in ("happy", "malformed_msp"):
         notify("item/completed", {**base, "item": {
             "itemId": "it-1", "kind": "agentMessage",
             "status": "completed", "text": "hello from fake host"}})
@@ -496,7 +497,7 @@ def on_turn_start(params):
         notify("item/completed", {**base, "item": {
             "itemId": "it-big", "kind": "toolCall", "callId": "call-big",
             "status": "completed", "tool": "read",
-            "args": {"path": "/tmp/big"}, "result": "x" * 20000}})
+            "args": {"path": "/tmp/big"}, "result": "START" + "x" * 19980 + "FAILURE AT END!"}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "tool_host_truncated":
         notify("item/completed", {**base, "item": {
@@ -950,6 +951,8 @@ def result_for(method, msg):
         granted = (["sessionListStream"]
                    if SCENARIO == "session_list_stream"
                    and "sessionListStream" in requested else [])
+        if SCENARIO.startswith("user_shell") and "userShell" in requested:
+            granted.append("userShell")
         USER_INPUT_DIALOGS[0] = msg.get("params", {}).get("capabilities", {}).get(
             "userInputDialogs", True) is not False
         return {
@@ -1048,6 +1051,11 @@ def result_for(method, msg):
         elif SCENARIO == "rename_snapshot":
             history = usage_snapshot_history()
             history["snapshot"]["state"]["name"] = "Snapshot name"
+        elif SCENARIO == "user_shell_recovered":
+            history = {"mode": "inline", "snapshot": None, "items": [{
+                "itemId": "shell-explicit", "kind": "userShell", "turnId": None,
+                "commandText": "sleep 1", "status": "completed", "revision": 2,
+                "exitCode": 7, "visibleOutput": "recovered shell terminal"}]}
         elif SCENARIO == "async_resume":
             history = {"mode": "inline", "snapshot": None, "items": [
                 {"itemId": "bg-resumed", "kind": "toolCall",
@@ -1090,6 +1098,22 @@ def result_for(method, msg):
         params = msg.get("params", {})
         log_input(params)
         return {"viewCursor": "cur-9"}
+    if method == "view/page" and SCENARIO.startswith("fork_history"):
+        params = msg.get("params", {})
+        if SCENARIO == "fork_history_failure":
+            return {"events": [], "nextCursor": "stuck"}
+        def event(cursor, item):
+            return {"method": "item/completed", "params": {
+                "sessionId": ACTIVE_SESSION[0], "viewCursor": cursor, "item": item}}
+        if not params.get("cursor"):
+            return {"events": [event("fork-start", dict(FORK_ITEMS[0], text="partial"))],
+                    "nextCursor": "fork-start"}
+        events = [event("fork-start", dict(FORK_ITEMS[0], text="partial"))]
+        events.extend(event("fork-head" if i == len(FORK_ITEMS) - 1 else "fork-middle", item)
+                      for i, item in enumerate(FORK_ITEMS))
+        events.append(event("after-fork-head", {"itemId": "too-late", "kind": "agentMessage",
+                                               "text": "must not replay", "status": "completed"}))
+        return {"events": events, "nextCursor": None}
     if method == "view/page":
         if SCENARIO == "file_changes_gap":
             return {"items": [{"itemId": "gap-write", "kind": "toolCall",
@@ -1274,9 +1298,44 @@ def result_for(method, msg):
             "cutCursor": "opaque-cut",
             "cutExplicit": "cutPoint" in params,
         }
+        if SCENARIO.startswith("fork_history"):
+            FORK_ITEMS[:] = [
+                {"itemId": "msg-fork", "kind": "agentMessage", "text": "fork here",
+                 "turnId": "turn-1", "status": "completed"},
+            ]
+            if params.get("cutPoint", {}).get("lastTurnId") != "turn-1":
+                FORK_ITEMS.append({"itemId": "msg-fork-dup", "kind": "agentMessage",
+                                   "text": "second turn", "turnId": "turn-2", "status": "completed"})
+            if SCENARIO == "fork_history_inline":
+                history = {"mode": "inline", "items": FORK_ITEMS, "snapshot": None}
+            elif SCENARIO == "fork_history_snapshot":
+                history = {"mode": "snapshot", "items": None, "snapshot": {
+                    "schemaVersion": 1, "viewCursor": "fork-start",
+                    "state": {"items": [dict(FORK_ITEMS[0], text="partial")]}}}
+            else:
+                history = {"mode": "none", "items": None, "snapshot": None}
+            # A repeated live completion at the replay boundary must not double render.
+            notify("item/completed", {"sessionId": ACTIVE_SESSION[0],
+                                      "viewCursor": "fork-head", "item": FORK_ITEMS[-1]})
+            return {"session": forked, "history": history,
+                    "viewCursor": "fork-head", "pendingRequests": []}
         return {"session": forked,
                 "history": {"mode": "inline", "items": [], "snapshot": None},
                 "viewCursor": "cur-f1", "pendingRequests": []}
+    if method == "session/userShell":
+        params = msg.get("params", {})
+        log_input(params)
+        item = {"itemId": "shell-explicit", "kind": "userShell", "turnId": None,
+                "commandId": params["commandId"], "commandText": params["commandText"],
+                "status": "inProgress", "revision": 1}
+        notify("item/started", {"sessionId": params["sessionId"], "item": item})
+        if SCENARIO == "user_shell_restart":
+            CRASH_AFTER_ACK[0] = True
+            return {"commandId": params["commandId"], "status": "accepted"}
+        notify("item/completed", {"sessionId": params["sessionId"], "item": {
+            **item, "status": "completed", "revision": 2, "exitSignal": 15,
+            "visibleOutput": "shell stopped"}})
+        return {"commandId": params["commandId"], "status": "accepted"}
     if method == "session/compact":
         log_input(msg.get("params", {}))
         if SCENARIO == "compact_noop":
@@ -1365,8 +1424,10 @@ def scenario_after_restart():
     """host_exit is a one-shot: the first process creates the marker and
     crashes; the replacement process sees the marker and behaves sanely."""
     marker = os.environ.get("FAKE_RESTART_MARKER", "")
-    if SCENARIO in ("host_exit", "host_exit_quiet", "host_exit_relaunch_unavailable", "close_stdin", "stdout_close_stays_alive") and marker:
+    if SCENARIO in ("host_exit", "host_exit_quiet", "host_exit_relaunch_unavailable", "close_stdin", "stdout_close_stays_alive", "user_shell_restart") and marker:
         if os.path.exists(marker):
+            if SCENARIO == "user_shell_restart":
+                return "user_shell_recovered"
             if SCENARIO == "host_exit_relaunch_unavailable":
                 return "support_exit"
             return "happy"
@@ -1417,7 +1478,17 @@ def main():
             # The adapter's reply to the fixture's unknown server request.
             log_method("unknown-request-reply:" + json.dumps(msg))
             continue
+        if SCENARIO == "shutdown_pending_command" and method == "session/list":
+            log_method("command-stalled")
+            time.sleep(60)
+            continue
         if method == "initialized":
+            if SCENARIO == "malformed_msp":
+                sys.stdout.buffer.write(b'{"method":"item/delta","params":{"text":"\xff"}}\n')
+                sys.stdout.buffer.flush()
+                for invalid in ('{"method":"item/delta","params":', '{"id":99,"method":"approval/request",}', r'{"method":"item/delta","params":{"text":"\u+D4A"}}'):
+                    sys.stdout.write(invalid + "\n")
+                sys.stdout.flush()
             if SCENARIO == "close_stdin":
                 os.close(0)
             if SCENARIO == "unknown_request":
@@ -1544,7 +1615,7 @@ def main():
                     if message:
                         sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))
                         sys.stderr.flush()
-                    default_code = "1" if SCENARIO in ("host_exit", "host_exit_quiet") else "0"
+                    default_code = "1" if SCENARIO in ("host_exit", "host_exit_quiet", "user_shell_restart") else "0"
                     os._exit(int(os.environ.get("FAKE_HOST_EXIT_CODE", default_code)))
                 if SCENARIO == "skills_changed" and method == "session/start":
                     notify("skill/changed", {"sessionId": MSP_SID})
@@ -1571,6 +1642,9 @@ def main():
                     notify("session/contextUsage", usage)
                     notify("session/contextUsage", usage)
 
+    if SCENARIO == "shutdown_stubborn":
+        log_method("shutdown-stubborn")
+        time.sleep(60)
     if SCENARIO == "shutdown_flush":
         time.sleep(0.6)
         log_method("shutdown-flushed")

@@ -1,0 +1,25 @@
+name: json-fuzz
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: nightly-2026-09-25
+      - run: cargo install cargo-fuzz --locked --version 0.13.2
+      - run: mkdir -p fuzz/corpus/json
+      - run: cargo fuzz run json fuzz/corpus/json fuzz/seeds/json -- -max_total_time=120 -timeout=5 -max_len=65536
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: json-fuzz-failures
+          path: fuzz/artifacts/
+          if-no-files-found: ignore

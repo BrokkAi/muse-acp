@@ -142,6 +142,8 @@ pub struct AcpSession {
     /// Source of the host's standing reasoning default. `None` means the
     /// host has not set one, so the selector remains a per-turn fallback.
     pub reasoning_effort_source: Option<String>,
+    /// Last explicit host default/policy tier, independent of user selection.
+    pub reasoning_recommendation: Option<String>,
     /// The foreground MSP turn, excluding queued turns.
     pub active_turn: Option<String>,
     pub view_cursor: String,
@@ -375,8 +377,9 @@ pub fn take_turn_usage(s: &mut AcpSession, turn_id: &str) -> Option<TurnUsage> {
 
 pub fn send_raw(stdout: &StdoutShared, line: &str) {
     let mut out = stdout.lock().unwrap_or_else(|p| p.into_inner());
-    let _ = writeln!(out, "{line}");
-    let _ = out.flush();
+    if writeln!(out, "{line}").and_then(|_| out.flush()).is_err() {
+        crate::shutdown::disconnect();
+    }
 }
 
 pub fn id_json(id: &Option<J>) -> String {
@@ -386,12 +389,25 @@ pub fn id_json(id: &Option<J>) -> String {
     }
 }
 
+fn send_response(stdout: &StdoutShared, id: &Option<J>, line: &str) {
+    let mut out = stdout.lock().unwrap_or_else(|p| p.into_inner());
+    if crate::shutdown::expiring() {
+        return;
+    }
+    if writeln!(out, "{line}").and_then(|_| out.flush()).is_ok() {
+        crate::shutdown::completed(id);
+    } else {
+        crate::shutdown::disconnect();
+    }
+}
+
 pub fn send_result(stdout: &StdoutShared, id: &Option<J>, result_json: &str) {
     if id.is_none() {
         return;
     }
-    send_raw(
+    send_response(
         stdout,
+        id,
         &format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}",
             id_json(id),
@@ -401,8 +417,9 @@ pub fn send_result(stdout: &StdoutShared, id: &Option<J>, result_json: &str) {
 }
 
 pub fn send_error(stdout: &StdoutShared, id: &Option<J>, code: i64, message: &str) {
-    send_raw(
+    send_response(
         stdout,
+        id,
         &format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":{code},\"message\":{}}}}}",
             id_json(id),
@@ -434,8 +451,9 @@ pub fn send_error_with_data(
     message: &str,
     data_json: &str,
 ) {
-    send_raw(
+    send_response(
         stdout,
+        id,
         &format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":{code},\"message\":{},\"data\":{data_json}}}}}",
             id_json(id),
@@ -525,11 +543,15 @@ pub fn send_config_option_update(
     acp_sid: &str,
     config_id: &str,
     value: &str,
+    recommended: Option<&str>,
 ) {
+    let meta = recommended.filter(|value| is_reasoning_effort(value))
+        .map(|value| format!(",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}", esc(value)))
+        .unwrap_or_default();
     send_raw(
         stdout,
         &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"config_option_update\",\"configId\":{},\"currentValue\":{}}}}}}}",
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"config_option_update\",\"configId\":{},\"currentValue\":{}{meta}}}}}}}",
             esc(acp_sid),
             esc(config_id),
             esc(value),
@@ -699,7 +721,7 @@ pub fn config_options(
     reasoning_effort: &str,
     offer_muse_default: bool,
     models_json: &[(String, String, bool)],
-    recommended_model: Option<&str>,
+    recommendations: (Option<&str>, Option<&str>),
 ) -> String {
     let mut model_opts = Vec::new();
     for (id, label, _) in models_json {
@@ -708,6 +730,10 @@ pub fn config_options(
     let id_key = if ver == 1 { "id" } else { "configId" };
     // AIR recommendedValue is additive metadata: emit it only when the client
     // negotiated it and the value is present among this selector's options.
+    let (recommended_model, recommended_reasoning) = recommendations;
+    let reasoning_meta = recommended_reasoning.filter(|value| is_reasoning_effort(value))
+        .map(|value| format!(",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}", esc(value)))
+        .unwrap_or_default();
     let recommended_meta = match recommended_model {
         Some(model) if models_json.iter().any(|(id, _, _)| id == model) => format!(
             ",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}",
@@ -723,7 +749,7 @@ pub fn config_options(
         ""
     };
     format!(
-        "[{{\"{id_key}\":\"mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]}}]",
+        "[{{\"{id_key}\":\"mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]{reasoning_meta}}}]",
         esc(current_mode),
         mode_options_json("value"),
         esc(current_model),
@@ -945,7 +971,7 @@ mod tests {
                 "medium",
                 true,
                 &models,
-                None,
+                (None, None),
             );
             let parsed = crate::json::parse_json(&options).expect("config options JSON");
             let J::Arr(items) = parsed else {
@@ -985,7 +1011,7 @@ mod tests {
             "max",
             false,
             &models,
-            None,
+            (None, None),
         );
         crate::json::parse_json(&options).expect("config options JSON");
         assert!(
