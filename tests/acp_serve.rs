@@ -63,6 +63,9 @@ impl Client {
         let err_file = std::fs::File::create(&stderr_log).expect("stderr log");
         let fake_log = dir.join("fake.log").to_str().unwrap().to_string();
         let mut cmd = Command::new(adapter_bin());
+        // Each fake-host test starts without the developer's Muse settings.
+        // Profile tests provide their own XDG_CONFIG_HOME below.
+        cmd.env("XDG_CONFIG_HOME", dir.join("config"));
         cmd.env("MUSE_CLI", fixture());
         cmd.env("FAKE_SCENARIO", scenario);
         cmd.env("FAKE_LOG", &fake_log);
@@ -4142,6 +4145,135 @@ fn host_121_fingerprint_is_tested() {
         Duration::from_secs(10),
     );
     c.finish();
+}
+
+#[cfg(unix)]
+fn auto_review_config() -> (std::path::PathBuf, &'static str) {
+    let source = std::env::temp_dir().join(format!(
+        "muse-acp-profile-test-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(source.join("muse")).unwrap();
+    let original = r#"{"schema_version":1,"model":"chosen","reasoning_effort":"xhigh","permissions":{"schema_version":1,"default_profile":":auto-review"}}"#;
+    std::fs::write(source.join("muse/settings.json"), original).unwrap();
+    (source, original)
+}
+
+#[cfg(unix)]
+#[test]
+fn auto_review_settings_are_scoped_to_the_host_and_human_approvals_still_work() {
+    let (source, original) = auto_review_config();
+    let mut c = Client::spawn(
+        "approval",
+        &[
+            ("XDG_CONFIG_HOME", source.to_str().unwrap()),
+            ("FAKE_CHECK_HOST_CONFIG", "1"),
+            ("MUSE_SERVE_ARGS", "--trust-workspace --disable-write"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let observed: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(format!("{}.config", c.fake_log))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+    let root = std::path::PathBuf::from(observed["root"].as_str().unwrap());
+    assert_ne!(root, source);
+    assert!(root.is_dir(), "config must live as long as the host");
+    assert_eq!(
+        observed["settings"],
+        serde_json::from_str::<serde_json::Value>(&original.replace(":auto-review", ":ask-me"))
+            .unwrap()
+    );
+    assert_eq!(
+        observed["args"],
+        serde_json::json!(["serve", "--trust-workspace", "--disable-write"])
+    );
+    let prompt = c.prompt(&sid, "request approval");
+    let permission = c.wait_for("request_permission", Duration::from_secs(15));
+    let permission_id = extract_str(&permission, "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{permission_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":\"c-deny\"}}}}}}"
+    ));
+    c.wait_log("approval/decide", Duration::from_secs(15));
+    c.wait_for(&format!("\"id\":{prompt}"), Duration::from_secs(15));
+    c.finish();
+    assert!(!root.exists(), "temporary host settings must be cleaned up");
+    assert_eq!(
+        std::fs::read_to_string(source.join("muse/settings.json")).unwrap(),
+        original
+    );
+    std::fs::remove_dir_all(source).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn auto_review_override_is_recreated_on_restart_and_used_by_support() {
+    let (source, original) = auto_review_config();
+    let marker = source.join("restart.marker");
+    let mut c = Client::spawn(
+        "host_exit",
+        &[
+            ("XDG_CONFIG_HOME", source.to_str().unwrap()),
+            ("FAKE_CHECK_HOST_CONFIG", "1"),
+            ("FAKE_RESTART_MARKER", marker.to_str().unwrap()),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    c.prompt(&sid, "restart");
+    c.wait_stderr(
+        "host-restarted attempt=1 sessions=1 failures=0",
+        Duration::from_secs(15),
+    );
+    let config_log = format!("{}.config", c.fake_log);
+    c.finish();
+    let configs: Vec<serde_json::Value> = std::fs::read_to_string(&config_log)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(configs.len(), 2);
+    assert_ne!(configs[0]["root"], configs[1]["root"]);
+    for config in configs {
+        assert_eq!(
+            config["settings"]["permissions"]["default_profile"],
+            ":ask-me"
+        );
+        assert!(!std::path::Path::new(config["root"].as_str().unwrap()).exists());
+    }
+
+    let support_log = source.join("support");
+    let output = Command::new(adapter_bin())
+        .arg("--support")
+        .env("MUSE_CLI", fixture())
+        .env("XDG_CONFIG_HOME", &source)
+        .env("FAKE_CHECK_HOST_CONFIG", "1")
+        .env("FAKE_LOG", &support_log)
+        .env("FAKE_SCENARIO", "support_exit")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let config: serde_json::Value = serde_json::from_str(
+        std::fs::read_to_string(support_log.with_extension("config"))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+    assert_eq!(
+        config["settings"]["permissions"]["default_profile"],
+        ":ask-me"
+    );
+    assert!(!std::path::Path::new(config["root"].as_str().unwrap()).exists());
+    assert_eq!(
+        std::fs::read_to_string(source.join("muse/settings.json")).unwrap(),
+        original
+    );
+    std::fs::remove_dir_all(source).unwrap();
 }
 
 #[test]

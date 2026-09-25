@@ -350,6 +350,18 @@ A disconnected or unread output pipe may prevent delivery of those final errors.
 to the host default; set `MUSE_APPROVAL_MODE=promptUnmatched` to force every
 unmatched tool call through `session/request_permission`.
 
+When Muse's saved `permissions.default_profile` is `:auto-review`, muse-acp
+uses `:ask-me` for its `muse serve` child so approvals go to the editor.
+Muse 1.4.0 rejects the auto-review profile in serve mode because its automated
+reviewer is unavailable; `MUSE_DISABLE_APPROVAL_JUDGE=1` does not override that
+profile. The adapter supplies a private temporary settings view via the child's
+`XDG_CONFIG_HOME`, preserving other settings and linking the remaining config
+entries. It leaves your saved Muse settings and editor launcher unchanged,
+keeps session data in its usual location, and removes the temporary view when
+the host exits. Restarts and `--support` probes use the same behavior. Other
+permission profiles are left as configured. Creating this view requires
+symbolic-link support (on Windows, Developer Mode or equivalent permission).
+
 Tool cards preserve host saturation facts in `_meta.muse`: `source: "host"`
 means the host bounded the streamed surface, while `source: "adapter"` carries
 the adapter's local character counts. Shortened output retains both its head
