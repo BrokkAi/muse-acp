@@ -6193,6 +6193,7 @@ fn handle_msp(
         }
         "session/listChanged" => {
             if !host.handshake().session_list_stream {
+                log("session/listChanged ignored: sessionListStream was not granted");
                 return;
             }
             let Some(row) = params.get("session") else {
@@ -6229,6 +6230,7 @@ fn handle_msp(
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 cache_session_closed(lists, msp_sid);
+                log(&format!("session list row closed: session={msp_sid}"));
             }
         }
         _ => {
