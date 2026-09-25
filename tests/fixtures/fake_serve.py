@@ -1440,6 +1440,14 @@ SCENARIO = scenario_after_restart()
 
 
 def main():
+    if os.environ.get("FAKE_CHECK_HOST_CONFIG") == "1" and sys.argv[1:2] == ["serve"]:
+        root = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+        with open(os.path.join(root, "muse", "settings.json")) as source:
+            settings = json.load(source)
+        with open(LOG + ".config", "a") as log:
+            log.write(json.dumps({"root": root, "settings": settings, "args": sys.argv[1:]}) + "\n")
+        if settings.get("permissions", {}).get("default_profile") == ":auto-review":
+            os.environ["FAKE_START_ERROR"] = "profile"
     if SCENARIO == "support_exit":
         message = os.environ.get("FAKE_HOST_STDERR", "serve diagnostic")
         sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))

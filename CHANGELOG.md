@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Start Muse hosts with human approvals when the saved profile is
+  `:auto-review`, avoiding the unavailable-reviewer session failure without
+  changing the user's Muse settings or editor launcher.
+
 ## 0.6.0
 
 - Stop overriding Muse's reasoning default: sessions start at "Muse

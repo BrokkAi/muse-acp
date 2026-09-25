@@ -7,6 +7,7 @@
 mod acp;
 mod compat;
 mod fold;
+mod host_config;
 mod json;
 mod msp;
 mod sha256;

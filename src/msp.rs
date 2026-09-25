@@ -210,8 +210,9 @@ pub fn command_timeout(env_override: Option<&str>, method: &str) -> std::time::D
 /// Guidance for a host that refuses to open a session over its permission
 /// profile (seen live on 1.2.1: `compose session permission profile:
 /// ... ':auto-review' ... reviewer is unavailable`). Profiles compose
-/// host-side from the user's Muse settings — nothing on the MSP wire
-/// selects one — so the fix is the settings key, never a retry. Returns
+/// host-side from Muse settings — nothing on the MSP wire selects one.
+/// The launch configuration handles the built-in auto-review profile;
+/// other profile refusals still need an actionable diagnostic. Returns
 /// None for unrelated errors; the caller keeps the host text either way.
 pub fn session_profile_hint(host_message: &str) -> Option<String> {
     if !host_message.contains("permission profile") {
@@ -225,7 +226,7 @@ pub fn session_profile_hint(host_message: &str) -> Option<String> {
         .map(|name| format!(" ({name})"))
         .unwrap_or_default();
     Some(format!(
-        " Hint: the host refused its own permission profile{profile}. That profile is composed from Muse settings (`permissions.default_profile`) and nothing on the wire overrides it — remove or change that setting; a profile whose reviewer is unavailable to `muse serve` refuses every session."
+        " Hint: muse serve refused its permission profile{profile}. Check Muse settings (`permissions.default_profile`) and managed policy. muse-acp substitutes :ask-me for the saved built-in :auto-review profile at host launch; other profiles must be usable by muse serve."
     ))
 }
 
@@ -580,6 +581,7 @@ pub struct MspHost {
     stderr_done: Arc<(Mutex<bool>, std::sync::Condvar)>,
     exit: Mutex<Option<ExitClassification>>,
     _child: Mutex<Child>,
+    host_config: Mutex<Option<crate::host_config::HostConfig>>,
 }
 
 impl MspHost {
@@ -597,7 +599,23 @@ impl MspHost {
                 Err(std::sync::TryLockError::WouldBlock) => return,
             };
             terminate_child(&mut child);
-            let _ = child.try_wait();
+            // The deadline exits the whole adapter without running Drop.
+            // Reap within our existing budget, then clean up the settings
+            // view even if the main loop is blocked writing to the editor.
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < until => std::thread::sleep(SHUTDOWN_POLL),
+                    Ok(None) | Err(_) => return,
+                }
+            }
+            drop(child);
+            let config = match self.host_config.try_lock() {
+                Ok(mut config) => config.take(),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
+                Err(std::sync::TryLockError::WouldBlock) => None,
+            };
+            drop(config);
             return;
         }
     }
@@ -638,6 +656,10 @@ impl MspHost {
             }
         };
         let status = status?;
+        self.host_config
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         self.wait_for_stderr();
         let exit = classify_status(&status, self.stderr.snapshot());
         *self.exit.lock().unwrap_or_else(|p| p.into_inner()) = Some(exit.clone());
@@ -710,7 +732,13 @@ impl MspHost {
                 }
             };
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(_)) => {
+                    self.host_config
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .take();
+                    break;
+                }
                 Ok(None) if !killed && Instant::now() >= kill_at => {
                     terminate_child(&mut child);
                     killed = true;
@@ -747,15 +775,7 @@ impl MspHost {
         user_shell: bool,
     ) -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
         let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
-        let mut cmd = Command::new(&bin);
-        cmd.arg("serve");
-        // Host-lifetime posture from env (see `muse serve --help`).
-        for a in std::env::var("MUSE_SERVE_ARGS")
-            .unwrap_or_default()
-            .split_whitespace()
-        {
-            cmd.arg(a);
-        }
+        let (mut cmd, host_config) = serve_command(&bin).map_err(LaunchError::Startup)?;
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -812,6 +832,7 @@ impl MspHost {
             stderr_done,
             exit: Mutex::new(None),
             _child: Mutex::new(child),
+            host_config: Mutex::new(host_config),
         });
         crate::shutdown::register_host(&host);
         let (tx, rx) = mpsc::channel();
@@ -1063,12 +1084,10 @@ impl MspHost {
     }
 }
 
-/// Run a bounded, stdin-EOF-only serve probe for `--support`. The probe does
-/// not send protocol frames or inspect stderr; it only records the observed
-/// process status and bounded stderr evidence for a human diagnostic.
-pub fn probe_serve_exit(timeout: Duration) -> Result<Option<ExitClassification>, String> {
-    let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
-    let mut cmd = Command::new(&bin);
+/// All host launches, including restarts and support probes, use the same
+/// process-local settings and host-lifetime flags.
+fn serve_command(bin: &str) -> Result<(Command, Option<crate::host_config::HostConfig>), String> {
+    let mut cmd = Command::new(bin);
     cmd.arg("serve");
     for arg in std::env::var("MUSE_SERVE_ARGS")
         .unwrap_or_default()
@@ -1076,6 +1095,16 @@ pub fn probe_serve_exit(timeout: Duration) -> Result<Option<ExitClassification>,
     {
         cmd.arg(arg);
     }
+    let config = crate::host_config::configure(&mut cmd)?;
+    Ok((cmd, config))
+}
+
+/// Run a bounded, stdin-EOF-only serve probe for `--support`. The probe does
+/// not send protocol frames; it records the observed process status and
+/// bounded stderr evidence for a human diagnostic.
+pub fn probe_serve_exit(timeout: Duration) -> Result<Option<ExitClassification>, String> {
+    let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
+    let (mut cmd, _host_config) = serve_command(&bin)?;
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
