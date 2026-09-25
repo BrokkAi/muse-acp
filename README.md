@@ -208,6 +208,33 @@ reattaches each session and reconciles task items from the returned fold; a
 terminal item settles a task that was already announced. MSP 1.3.0 task
 controls support targeted stops and session-wide background cancellation.
 
+Editors with an explicit user shell command feature can opt into
+`_meta.muse.capabilities: ["userShell"]` **and** AIR `asyncTasks` during ACP
+initialize. Only this combined opt-in requests MSP's `userShell` capability.
+After the host grants it, `_session/userShell` accepts `sessionId`, `commandText`,
+and an editor-generated UUIDv7 `commandId` (reuse it when retrying the same
+command). It returns host admission; output and completion arrive as shell task
+items. This runs a user-requested command outside a model turn, in the existing
+host workspace and permission profile. It does not change roots or approval
+modes. Without both editor capabilities and a host grant, the method is rejected.
+Normal ACP connections never request shell execution. Restart reconciles durable
+task facts without launching the command again; permanent disconnect marks
+unsettled tasks with `_meta.muse.terminalUnknown` and invents no exit code.
+
+ACP `session/fork` restores the **new fork's** history through its returned view
+head, including paged history, with replay deduplicated against live events.
+ACP v1 receives replay immediately; v2 requests it with
+`replayFrom: {"type":"start"}`. An omitted fork point copies all completed turns;
+AIR message ids or fingerprints select a completed turn inclusively. The response
+preserves host provenance in `_meta.muse.forkedFrom`. History failures return an
+error before registering the new ACP session.
+
+After AIR `recommendedValue` negotiation, model recommendations come from the
+catalog's default row. Reasoning recommendations require a host-published tier
+whose source is `default` or `policy`; a user setting or absent host default never
+creates one. Recommendations are separate from the current selection. Session
+list titles use only host-provided `name`, `title`, or `firstUserPrompt` facts.
+
 Per-turn file reports are available when the client advertises AIR v1
 `agentFileChangeReport` and places a valid `agentFileChangeReportRequest` on
 the prompt. The adapter reports workspace paths from successful native Muse
@@ -307,10 +334,17 @@ MUSE_CLI=muse                      # host binary (default: muse)
 MUSE_SERVE_ARGS="--trust-workspace" # host-lifetime flags (see `muse serve --help`)
 MUSE_APPROVAL_MODE=promptUnmatched  # allowAll|promptUnmatched|onRequest|denyUnmatched
 MUSE_COMMAND_TIMEOUT_MS=60000       # override host admission-ack timeout (milliseconds)
+MUSE_SHUTDOWN_TIMEOUT_MS=8000       # shutdown deadline, 100..60000ms; +250ms final drain
 MUSE_TOOL_OUTPUT_LIMIT=8000         # editor-facing tool output bound (characters)
 MUSE_LOG=debug                     # per-method protocol tracing (no payloads)
 # MUSE_ALLOW_UNSCOPED_READS=1       # DANGEROUS: allow local reads outside session cwd
 ```
+
+Editor EOF/shutdown starts a deadline on the input reader, so blocked command
+admission, stdout writes, child reaping, or stderr draining cannot hang exit.
+Outstanding requests receive shutdown errors while editor stdout is usable;
+if the deadline expires, the adapter records a diagnostic and exits nonzero.
+A disconnected or unread output pipe may prevent delivery of those final errors.
 
 `session/new {cwd}` starts a host session in `cwd`. Approval posture defaults
 to the host default; set `MUSE_APPROVAL_MODE=promptUnmatched` to force every
@@ -318,7 +352,10 @@ unmatched tool call through `session/request_permission`.
 
 Tool cards preserve host saturation facts in `_meta.muse`: `source: "host"`
 means the host bounded the streamed surface, while `source: "adapter"` carries
-the adapter's local character counts. Host `itemId`, `outputRef`, `patchRef`,
+the adapter's local character counts. Shortened output retains both its head
+and tail on Unicode scalar boundaries. The marker counts toward
+`MUSE_TOOL_OUTPUT_LIMIT`; `retainedChars` counts original text only, with
+`headChars`/`tailChars` recording the split. Host `itemId`, `outputRef`, `patchRef`,
 and edit-tool `patchSummary` fields are kept beside the bounded card. A client
 may negotiate `_meta.muse.capabilities: ["readOutput"]` during `initialize`
 and then use the adapter extension `_session/readOutput` with `sessionId`,

@@ -35,6 +35,7 @@ pub struct HandshakeInfo {
     /// Whether this connection was granted the opt-in live session listing
     /// stream. An absent grant deliberately means the legacy poll fallback.
     pub session_list_stream: bool,
+    pub user_shell: bool,
 }
 
 impl HandshakeInfo {
@@ -582,6 +583,25 @@ pub struct MspHost {
 }
 
 impl MspHost {
+    /// Last-resort kill without waiting for a lock or child progress.
+    pub fn force_stop(&self) {
+        let until = Instant::now() + Duration::from_millis(200);
+        loop {
+            let mut child = match self._child.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < until => {
+                    std::thread::sleep(SHUTDOWN_POLL);
+                    continue;
+                }
+                Err(std::sync::TryLockError::WouldBlock) => return,
+            };
+            terminate_child(&mut child);
+            let _ = child.try_wait();
+            return;
+        }
+    }
+
     /// Handshake facts captured at launch, for diagnostics and support output.
     pub fn handshake(&self) -> HandshakeInfo {
         self.handshake
@@ -595,6 +615,7 @@ impl MspHost {
     /// this, so reaping also gives the stderr reader a short bounded drain
     /// window before the evidence is exposed.
     pub fn reap(&self) -> Option<ExitClassification> {
+        let _deadline = crate::shutdown::deadline("child reap and stderr drain");
         if let Some(exit) = self.exit.lock().unwrap_or_else(|p| p.into_inner()).clone() {
             return Some(exit);
         }
@@ -653,6 +674,8 @@ impl MspHost {
     /// and reap it. Lock acquisition and child progress are both bounded so a
     /// broken host cannot strand adapter shutdown.
     pub fn shutdown(&self) {
+        let _deadline_guard = crate::shutdown::deadline("host shutdown");
+        self.fail_pending("serve shutting down");
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
         let writer = loop {
             match self.writer.try_lock() {
@@ -672,45 +695,43 @@ impl MspHost {
         drop(writer);
 
         let kill_at = Instant::now() + SHUTDOWN_GRACE;
-        let mut child = loop {
-            match self._child.try_lock() {
-                Ok(guard) => break Some(guard),
-                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
-                    break Some(poisoned.into_inner());
-                }
-                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
-                    std::thread::sleep(SHUTDOWN_POLL);
-                }
-                Err(std::sync::TryLockError::WouldBlock) => break None,
-            }
-        };
-        let Some(mut child) = child.take() else {
-            log("serve shutdown timed out waiting for child lock");
-            return;
-        };
-
         let mut killed = false;
         loop {
+            let mut child = match self._child.try_lock() {
+                Ok(guard) => guard,
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                    std::thread::sleep(SHUTDOWN_POLL);
+                    continue;
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    log("serve shutdown timed out waiting for child lock");
+                    return;
+                }
+            };
             match child.try_wait() {
                 Ok(Some(_)) => break,
                 Ok(None) if !killed && Instant::now() >= kill_at => {
                     terminate_child(&mut child);
                     killed = true;
                 }
-                Ok(None) if Instant::now() < deadline => {
-                    std::thread::sleep(SHUTDOWN_POLL);
-                }
-                Ok(None) => {
+                Ok(None) if Instant::now() >= deadline => {
                     log("serve shutdown timed out waiting for child exit");
                     break;
                 }
+                Ok(None) => {}
                 Err(e) => {
                     log(&format!("serve shutdown wait failed: {e}"));
                     break;
                 }
             }
+            // The deadline worker must be able to kill even while this path
+            // gives the child its graceful-exit window.
+            drop(child);
+            std::thread::sleep(SHUTDOWN_POLL);
         }
 
+        self.wait_for_stderr();
         let stderr_bytes = self.stderr.snapshot().len();
         if stderr_bytes > 0 {
             // Keep host diagnostics captured without echoing arbitrary host
@@ -723,6 +744,7 @@ impl MspHost {
 impl MspHost {
     pub fn launch(
         user_input_dialogs: bool,
+        user_shell: bool,
     ) -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
         let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
         let mut cmd = Command::new(&bin);
@@ -791,12 +813,14 @@ impl MspHost {
             exit: Mutex::new(None),
             _child: Mutex::new(child),
         });
+        crate::shutdown::register_host(&host);
         let (tx, rx) = mpsc::channel();
         let reader_host = host.clone();
         std::thread::spawn(move || reader_loop(reader_host, stdout, tx));
         // Handshake.
+        let shell_capability = if user_shell { ",\"userShell\"" } else { "" };
         let init_params = format!(
-            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream"]}}}}"#,
+            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream"{shell_capability}]}}}}"#,
             ver = crate::json::esc(env!("CARGO_PKG_VERSION")),
             user_input_dialogs = user_input_dialogs
         );
@@ -848,6 +872,8 @@ impl MspHost {
             detail: verdict.detail,
             durability,
             session_list_stream,
+            user_shell: user_shell
+                && matches!(res.get("grantedCapabilities"), Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("userShell"))),
         };
         if verdict.is_fatal() {
             host.shutdown();
@@ -1176,10 +1202,10 @@ pub fn output_unavailable_data(error: &J) -> J {
 
 fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender<MspEvent>) {
     let mut reader = BufReader::new(stdout);
-    let mut line = String::new();
+    let mut frame = Vec::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
+        frame.clear();
+        match reader.read_until(b'\n', &mut frame) {
             Ok(0) => {
                 host_closed(&host, &tx, "serve host stdout closed");
                 break;
@@ -1190,6 +1216,13 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
                 break;
             }
         }
+        let line = match std::str::from_utf8(&frame) {
+            Ok(line) => line,
+            Err(_) => {
+                log("serve parse error: invalid UTF-8 frame");
+                continue;
+            }
+        };
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -1266,6 +1299,7 @@ fn reader_loop(host: Arc<MspHost>, stdout: std::process::ChildStdout, tx: Sender
 /// receiver asleep until the full command timeout, delaying exit
 /// classification and durable-host recovery decisions.
 fn host_closed(host: &MspHost, tx: &Sender<MspEvent>, reason: &str) {
+    let _deadline = crate::shutdown::deadline("host reader disconnect");
     host.writer.lock().unwrap_or_else(|p| p.into_inner()).take();
     let _pending = host
         .pending
@@ -1456,6 +1490,7 @@ mod durability_tests {
             detail: "",
             durability: durability.map(str::to_string),
             session_list_stream: false,
+            user_shell: false,
         }
     }
 

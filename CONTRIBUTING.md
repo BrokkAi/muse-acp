@@ -37,3 +37,7 @@ section 5 of [LICENSE](LICENSE).
 
 See [RELEASING.md](RELEASING.md) for preparation, exact-commit checks, publication
 and recovery. Preflight branch pushes and manual dispatches do not publish.
+
+Coverage-guided JSON fuzzing uses a separate development package and optional
+manual CI workflow; see [fuzz/README.md](fuzz/README.md). `cargo test --locked`
+also runs its checked-in seed corpus without requiring nightly or libFuzzer.

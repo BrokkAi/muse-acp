@@ -144,6 +144,9 @@ impl<'a> Parser<'a> {
         }
         let s = std::str::from_utf8(&self.b[self.pos..self.pos + 4])
             .map_err(|_| "\\u not utf8".to_string())?;
+        if !s.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err("bad \\u hex".to_string());
+        }
         let v = u32::from_str_radix(s, 16).map_err(|_| "bad \\u hex".to_string())?;
         self.pos += 4;
         Ok(v)

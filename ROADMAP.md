@@ -4,7 +4,7 @@ This is a living roadmap for `muse-acp`. It records the direction that keeps the
 adapter close to Muse Session Protocol (MSP), safe around approvals and file
 access, and useful in real editor workflows.
 
-- **Last revised:** 2026-09-11
+- **Last revised:** 2026-09-25
 - **Baseline:** `v0.2.5`
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
@@ -463,12 +463,13 @@ and configurable.
 Status: **implemented.** The output bound is configurable through
 `MUSE_TOOL_OUTPUT_LIMIT` (clamped to a 200-character floor), adapter cuts emit
 both the human `…[truncated]` marker and machine-readable
-`_meta.muse.truncated` with `source`, `originalChars`, and `retainedChars`,
+`_meta.muse.truncated` with `source`, `originalChars`, `retainedChars`,
+`headChars`, and `tailChars`,
 and a host-saturated surface reports `source: "host"` without claiming an
 adapter cut. Negotiated clients can fetch stored bytes through the
 `_session/readOutput` adapter extension, which forwards `item/readOutput` byte
-ranges and preserves typed `outputUnavailable` data. Remaining work:
-head+tail retention.
+ranges and preserves typed `outputUnavailable` data. Head and tail are retained
+on Unicode scalar boundaries, with the marker included in the display budget.
 
 **Work items**
 
@@ -683,8 +684,12 @@ negotiation, backgrounded tool calls mark their command card
 own shell tasks with exit facts settled from code/signal. Durable resume folds
 restore active tasks without replaying old terminal work. `_session/async_task/stop`
 maps one AIR task to MSP `task/stop`, and `session/cancel` maps background work
-to `task/stopAll`; item terminal events remain authoritative. Remaining work:
-the `userShell` host capability request.
+to `task/stopAll`; item terminal events remain authoritative. The explicit editor
+`_session/userShell` feature requires both `_meta.muse.capabilities: ["userShell"]`
+and AIR `asyncTasks`; only that posture requests the host capability, and calls
+still require a host grant. The editor supplies a stable commandId for retries.
+Durable restart restores task outcomes without relaunching shell commands;
+permanent disconnect retires active indicators with terminal-unknown metadata.
 
 **Work items**
 
@@ -789,9 +794,11 @@ protocol versions advertise the fork capability; an omitted cut point maps to
 (`sha256:<64 hex>` of agent-authored message text, dependency-free SHA-256)
 resolves with 1-based `messageOccurrence` among duplicate texts. Unresolvable
 or malformed points fail closed with explicit invalid-params errors instead
-of silently copying extra history, and the new session is registered
-immediately so the fork result envelope's view notifications are never
-orphaned. Remaining work: history replay on request.
+of silently copying extra history. The new session's own inline/snapshot/paged
+history is folded before registration, through the returned view head only;
+queued live duplicates are suppressed. ACP v1 replays immediately, and v2
+replays when `replayFrom` is present (matching resume). `forkedFrom` is preserved
+in result metadata. A failed history read never registers a partial ACP session.
 
 **Work items**
 
@@ -814,13 +821,18 @@ orphaned. Remaining work: history replay on request.
 
 Small editor-facing parity items from the `codex-acp` comparison.
 
-Status: **model recommendation implemented.** After AIR
+Status: **host-sourced recommendations and session titles implemented.** After AIR
 `recommendedValue` negotiation, the model selector carries the catalog's
 `isDefault` row as `_meta.jetbrains.air.recommendedValue`, only when that
 value appears among the advertised options; recommendation metadata never
 overrides the current selection and is omitted without negotiation.
-Reasoning-effort recommendations stay unimplemented (the host publishes no
-default; none is fabricated).
+Reasoning recommendations require an explicit valid `reasoningEffort` fact with
+source `default` or `policy`, from a snapshot or live host event, under the same
+negotiation gate. User-authored defaults and unknown sources do not create a
+recommendation; later user selection does not overwrite a known recommendation.
+Current hosts may publish no default/policy facts, in which case it stays absent.
+Session titles use host `name`, `title`, then `firstUserPrompt` facts; transcript
+text is never mined to invent a title.
 
 **Work items**
 
@@ -852,7 +864,11 @@ classified by Python's `json` module with the adapter's verdicts required to
 match. The differential corpus immediately caught and fixed a real bug:
 trailing commas were accepted. Python-only extensions (`NaN`, `Infinity`) and
 lone surrogates stay intentionally stricter and are pinned by dedicated tests.
-Remaining work: coverage-guided fuzzing if a fuzzer is ever allowed in CI.
+Coverage-guided parser/serializer fuzzing now lives in `fuzz/`, with an independent
+strict-parser oracle, checked-in seeds replayed by ordinary CI, and an optional
+manual nightly/libFuzzer workflow. The first campaign caught signed Unicode
+escapes being accepted; the strict hex check and regression seed preserve the fix.
+See [fuzz/README.md](fuzz/README.md) for bounded runs and failure minimization.
 
 **Work items**
 
@@ -882,8 +898,12 @@ recovers from poisoning (`unwrap_or_else(|p| p.into_inner())`) across the
 session store, host writer, handshake, child handle, and stdout: the locks
 guard plain data, so a panic in one thread must not cascade into a wedged
 adapter. A client-disconnect test pins that stdin EOF exits promptly even
-with a turn in flight. Remaining work: a bounded shutdown timer around child
-reaping.
+with a turn in flight. A connection-wide shutdown deadline starts on the stdin
+reader before EOF/shutdown enters the main queue; local guards bound child reap,
+stderr drain, and pending-request settlement. Even a blocked editor pipe or host
+command cannot strand exit. Outstanding requests receive explicit errors when
+the output channel is usable; expiry records a diagnostic and exits nonzero.
+`MUSE_SHUTDOWN_TIMEOUT_MS` defaults to 8000 (plus a 250ms final drain window).
 
 **Work items**
 - Audit mutex poisoning and convert it into bounded, explicit adapter errors.
