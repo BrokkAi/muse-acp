@@ -5474,6 +5474,9 @@ fn child_approval_fails_closed_through_the_owner_session() {
     let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
     let _pid = c.prompt(&sid, "child needs permission");
     c.wait_log("subagent/stop", Duration::from_secs(15));
+    // The method log is written before result_for records its parameters.
+    // Wait for the record this assertion reads, not just request admission.
+    c.wait_input("\"subagentId\"", Duration::from_secs(15));
     let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("input log");
     assert!(
         input.contains("\"sessionId\": \"msp-sess-1\""),
