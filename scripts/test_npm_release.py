@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 import tempfile
+import shutil
+import tarfile
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -54,6 +56,37 @@ class NpmPackaging(unittest.TestCase):
         with self.assertRaises(FileNotFoundError):
             npm_release.stage(self.assets, output)
 
+    def test_staging_excludes_stray_files_in_the_launcher_directory(self):
+        self.build_archives()
+        sources = self.root / 'sources'
+        shutil.copytree(npm_release.ROOT / 'npm', sources / 'npm')
+        (sources / 'npm/bin/local-debug.cjs').write_text('must not be published')
+        output = self.root / 'package'
+        with patch.object(npm_release, 'ROOT', sources):
+            npm_release.stage(self.assets, output)
+        self.assertEqual([p.name for p in (output / 'bin').iterdir()], ['muse-acp.cjs'])
+
+    @unittest.skipUnless(shutil.which('npm'), 'npm is required to inspect real npm tarballs')
+    def test_real_npm_tarball_contents_permissions_and_reproducibility(self):
+        self.build_archives()
+        with patch.object(release, 'metadata'), patch.dict(npm_release.os.environ, {
+                'npm_config_cache': str(self.root / 'cache'), 'npm_config_offline': 'true'}):
+            first, manifest, integrity = npm_release.pack(self.assets, self.root / 'first')
+            second, _, second_integrity = npm_release.pack(self.assets, self.root / 'second')
+        self.assertEqual(first.read_bytes(), second.read_bytes())
+        self.assertEqual(integrity, second_integrity)
+        expected = {'package/' + name for name in ['package.json', 'README.md', 'LICENSE', 'NOTICE', 'bin/muse-acp.cjs']}
+        with tarfile.open(first) as archive:
+            for target in release.TARGETS:
+                binary = 'muse-acp.exe' if 'windows' in target else 'muse-acp'
+                prefix = f'package/native/{target}/'
+                expected.update({prefix + binary, prefix + 'release.json'})
+                self.assertEqual(archive.getmember(prefix + binary).mode, 0o755)
+                self.assertEqual(archive.extractfile(prefix + binary).read(), b'test native binary')
+            self.assertEqual(set(archive.getnames()), expected)
+            self.assertEqual(archive.getmember('package/bin/muse-acp.cjs').mode, 0o755)
+            self.assertEqual(json.load(archive.extractfile('package/package.json')), manifest)
+
     def test_publish_retries_only_skip_an_identical_tarball(self):
         manifest = {'name': '@brokkai/muse-acp', 'version': '0.5.0'}
         with patch.object(npm_release, 'registry_version', return_value={'dist': {'integrity': 'same'}}), \
@@ -82,6 +115,27 @@ class NpmPackaging(unittest.TestCase):
             npm_release.publish(Path('package.tgz'), manifest, 'same')
         self.assertIn('--tag=next', run.call_args.args[0])
         sleep.assert_called_once_with(5)
+
+    def test_publish_allows_several_minutes_for_replication_without_republishing(self):
+        manifest = {'name': '@brokkai/muse-acp', 'version': '0.6.0'}
+        with patch.object(npm_release, 'registry_version', side_effect=[None] * 49 + [{'dist': {'integrity': 'same'}}]), \
+             patch.object(npm_release.subprocess, 'run') as run, \
+             patch.object(npm_release.time, 'sleep') as sleep:
+            npm_release.publish(Path('package.tgz'), manifest, 'same')
+        self.assertEqual(sleep.call_count, 48)
+        run.assert_called_once()
+
+    def test_publish_readback_times_out_and_rejects_mismatched_integrity(self):
+        manifest = {'name': '@brokkai/muse-acp', 'version': '0.6.0'}
+        for responses in [[None] * (npm_release.VERIFY_ATTEMPTS + 1),
+                          [None, {'dist': {'integrity': 'different'}}]]:
+            with self.subTest(responses=len(responses)), \
+                 patch.object(npm_release, 'registry_version', side_effect=responses), \
+                 patch.object(npm_release.subprocess, 'run') as run, \
+                 patch.object(npm_release.time, 'sleep'):
+                with self.assertRaisesRegex(RuntimeError, 'integrity could not be verified'):
+                    npm_release.publish(Path('package.tgz'), manifest, 'same')
+                run.assert_called_once()
 
     def test_automated_publication_requires_a_tag_push(self):
         with patch.dict(npm_release.os.environ, {'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': 'workflow_dispatch'}), \

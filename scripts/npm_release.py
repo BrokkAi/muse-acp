@@ -19,6 +19,8 @@ import release
 
 ROOT = Path(__file__).resolve().parent.parent
 REGISTRY = 'https://registry.npmjs.org/'
+VERIFY_ATTEMPTS = 61
+VERIFY_INTERVAL = 5
 
 
 def npm(*args, **kwargs):
@@ -34,8 +36,11 @@ def stage(assets, directory):
     manifest['version'] = release.VERSION
     directory.mkdir(parents=True, exist_ok=True)
     (directory / 'package.json').write_text(json.dumps(manifest, indent=2) + '\n')
-    shutil.copytree(ROOT / 'npm/bin', directory / 'bin')
-    (directory / 'bin/muse-acp.cjs').chmod(0o755)
+    # Only ship the launcher, even when local ignored/untracked files are present.
+    (directory / 'bin').mkdir()
+    launcher = directory / 'bin/muse-acp.cjs'
+    launcher.write_bytes((ROOT / 'npm/bin/muse-acp.cjs').read_bytes())
+    launcher.chmod(0o755)
     for name in ['README.md', 'LICENSE', 'NOTICE']:
         (directory / name).write_bytes(release.source_bytes(name))
     for target, files in entries.items():
@@ -86,14 +91,16 @@ def publish(archive, manifest, integrity):
     subprocess.run([shutil.which('npm') or 'npm', 'publish', str(archive.resolve()),
                     '--access=public', '--ignore-scripts', '--registry=' + REGISTRY,
                     '--tag=' + dist_tag], check=True)
-    # A new package/version can take a few seconds to reach registry read replicas.
+    # New package metadata can take several minutes to reach registry read replicas.
     published = None
-    for attempt in range(6):
+    for attempt in range(VERIFY_ATTEMPTS):
         published = registry_version(manifest['name'], manifest['version'])
         if published is not None:
             break
-        if attempt < 5:
-            time.sleep(5)
+        if attempt == 0:
+            print('npm accepted the publish; waiting up to five minutes for registry metadata.', flush=True)
+        if attempt < VERIFY_ATTEMPTS - 1:
+            time.sleep(VERIFY_INTERVAL)
     release.require(published is not None and published['dist']['integrity'] == integrity,
                     'Published npm tarball integrity could not be verified')
 

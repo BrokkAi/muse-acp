@@ -11,7 +11,8 @@ JetBrains IDEs.**
 `muse-acp` is a small, dependency-free Rust bridge between the
 [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) used by editors
 and Muse Code's native [Muse Session Protocol](https://github.com/meta-models/muse-code-sdk)
-(MSP). It ships as one native binary—no Node.js, npm, or Python runtime needed.
+(MSP). Standalone installs use one native binary and need no Node.js, npm, or
+Python runtime. npm installs use a small Node.js launcher.
 
 This project started from a simple itch: I wanted to use the Muse Code
 subscription I already pay for inside the editors I already use, while keeping
@@ -146,6 +147,7 @@ muse-acp install-intellij   # IntelliJ IDEA and other JetBrains IDEs
 - Muse Code installed, authenticated, and available as `muse` on `PATH`.
 - Zed, or a JetBrains IDE with AI Assistant and custom ACP agent support.
 - Rust 1.88+ and Python 3 only when building or testing from source.
+- Node.js 22+ for npm installs and npm packaging tests.
 
 ## How it works
 
