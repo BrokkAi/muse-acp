@@ -74,6 +74,23 @@ class NpmPackaging(unittest.TestCase):
                 side_effect=urllib.error.HTTPError('url', 404, 'missing', {}, None)):
             self.assertIsNone(npm_release.registry_version('@brokkai/muse-acp', '0.5.0'))
 
+    def test_publish_waits_for_registry_replication_and_uses_next_for_prereleases(self):
+        manifest = {'name': '@brokkai/muse-acp', 'version': '0.6.0-rc.1'}
+        with patch.object(npm_release, 'registry_version', side_effect=[None, None, {'dist': {'integrity': 'same'}}]), \
+             patch.object(npm_release.subprocess, 'run') as run, \
+             patch.object(npm_release.time, 'sleep') as sleep:
+            npm_release.publish(Path('package.tgz'), manifest, 'same')
+        self.assertIn('--tag=next', run.call_args.args[0])
+        sleep.assert_called_once_with(5)
+
+    def test_automated_publication_requires_a_tag_push(self):
+        with patch.dict(npm_release.os.environ, {'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': 'workflow_dispatch'}), \
+             patch.object(npm_release.sys, 'argv', ['npm_release.py', 'publish']), \
+             patch.object(npm_release, 'pack') as pack:
+            with self.assertRaisesRegex(RuntimeError, 'matching tag push'):
+                npm_release.main()
+            pack.assert_not_called()
+
 
 if __name__ == '__main__':
     unittest.main()

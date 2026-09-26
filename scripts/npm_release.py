@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -85,7 +86,14 @@ def publish(archive, manifest, integrity):
     subprocess.run([shutil.which('npm') or 'npm', 'publish', str(archive.resolve()),
                     '--access=public', '--ignore-scripts', '--registry=' + REGISTRY,
                     '--tag=' + dist_tag], check=True)
-    published = registry_version(manifest['name'], manifest['version'])
+    # A new package/version can take a few seconds to reach registry read replicas.
+    published = None
+    for attempt in range(6):
+        published = registry_version(manifest['name'], manifest['version'])
+        if published is not None:
+            break
+        if attempt < 5:
+            time.sleep(5)
     release.require(published is not None and published['dist']['integrity'] == integrity,
                     'Published npm tarball integrity could not be verified')
 
