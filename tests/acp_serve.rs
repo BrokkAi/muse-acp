@@ -4147,7 +4147,6 @@ fn host_121_fingerprint_is_tested() {
     c.finish();
 }
 
-#[cfg(unix)]
 fn auto_review_config() -> (std::path::PathBuf, &'static str) {
     let source = std::env::temp_dir().join(format!(
         "muse-acp-profile-test-{}-{}",
@@ -4163,7 +4162,6 @@ fn auto_review_config() -> (std::path::PathBuf, &'static str) {
     (source, original)
 }
 
-#[cfg(unix)]
 #[test]
 fn auto_review_settings_are_scoped_to_the_host_and_human_approvals_still_work() {
     let (source, original) = auto_review_config();
@@ -4211,7 +4209,6 @@ fn auto_review_settings_are_scoped_to_the_host_and_human_approvals_still_work() 
     std::fs::remove_dir_all(source).unwrap();
 }
 
-#[cfg(unix)]
 #[test]
 fn auto_review_settings_are_cleaned_up_on_forced_shutdown() {
     let (source, original) = auto_review_config();
@@ -4229,10 +4226,7 @@ fn auto_review_settings_are_cleaned_up_on_forced_shutdown() {
         .spawn()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
-    // Keep stdout unread so the main loop cannot run normal host cleanup.
-    for id in 1..100 {
-        writeln!(input, "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1}}}}").unwrap();
-    }
+    initialize_with_unread_stdout(&mut input);
     drop(input);
     let status = child
         .wait_timeout(Duration::from_secs(5))
@@ -4257,7 +4251,6 @@ fn auto_review_settings_are_cleaned_up_on_forced_shutdown() {
     std::fs::remove_dir_all(source).unwrap();
 }
 
-#[cfg(unix)]
 #[test]
 fn auto_review_override_is_recreated_on_restart_and_used_by_support() {
     let (source, original) = auto_review_config();
@@ -7351,17 +7344,22 @@ fn shutdown_deadline_bounds_unread_editor_stdout() {
         .stderr(Stdio::null());
     let mut child = cmd.spawn().unwrap();
     let mut input = child.stdin.take().unwrap();
-    // Keep the output pipe open but unread. Responses eventually fill it and
-    // block the adapter's main thread, while its reader still observes EOF.
-    for id in 1..100 {
-        writeln!(input, "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1}}}}").unwrap();
-    }
+    initialize_with_unread_stdout(&mut input);
     drop(input);
     let status = child
         .wait_timeout(Duration::from_secs(5))
         .unwrap()
         .expect("unread stdout cannot strand shutdown");
     assert!(!status.success());
+}
+
+fn initialize_with_unread_stdout(input: &mut std::process::ChildStdin) {
+    // These responses fill the unread pipe on every supported OS; 99 replies
+    // fit entirely in macOS and Windows pipes and never test forced shutdown.
+    // The independent stdin reader can still receive EOF and arm the deadline.
+    for id in 1..=16_384 {
+        writeln!(input, "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1}}}}").unwrap();
+    }
 }
 
 #[test]
