@@ -1,4 +1,8 @@
 /target
+/dist/
+/npm-dist/
+/npm-smoke/
+/node_modules/
 /.worktrees/
 .env
 .env.*
