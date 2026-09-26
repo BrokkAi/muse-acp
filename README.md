@@ -62,6 +62,24 @@ Confirm `muse --version` works before continuing.
 
 ### 2. Install muse-acp
 
+With Node.js 22 or later, install from npm:
+
+```sh
+npm install -g @brokkai/muse-acp
+muse-acp --selftest
+```
+
+Or run without a global install:
+
+```sh
+npx --yes @brokkai/muse-acp --selftest
+```
+
+The npm package includes native binaries for all supported platforms and needs
+no install scripts or separate binary downloads. npm manages the `muse-acp`
+command on your PATH. Release and trusted publishing instructions are in
+[docs/npm-publishing.md](docs/npm-publishing.md).
+
 On Linux or macOS, install the latest release with:
 
 ```sh

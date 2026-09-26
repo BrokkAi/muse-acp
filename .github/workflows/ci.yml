@@ -17,6 +17,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: rustfmt, clippy
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - run: node --test npm/test/launcher.test.cjs
       - run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - run: sh -n install.sh
       - name: Validate Windows installer syntax
@@ -30,6 +35,7 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: ./target/debug/muse-acp --selftest
+      - run: node scripts/smoke_npm.cjs target/debug/muse-acp
 
   msrv:
     runs-on: ubuntu-latest
@@ -42,3 +48,20 @@ jobs:
         with:
           toolchain: 1.88.0
       - run: cargo test --locked
+
+  npm-launcher:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, macos-15, windows-2025]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - run: node --test npm/test/launcher.test.cjs

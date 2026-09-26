@@ -1,0 +1,26 @@
+{
+  "name": "@brokkai/muse-acp",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Use Muse Code in Zed and JetBrains IDEs through ACP",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/BrokkAi/muse-acp.git"
+  },
+  "homepage": "https://github.com/BrokkAi/muse-acp#readme",
+  "bugs": "https://github.com/BrokkAi/muse-acp/issues",
+  "bin": {
+    "muse-acp": "bin/muse-acp.cjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "os": ["darwin", "linux", "win32"],
+  "cpu": ["x64", "arm64"],
+  "files": ["bin/", "native/", "LICENSE", "NOTICE", "README.md"],
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}
