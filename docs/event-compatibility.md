@@ -24,7 +24,7 @@ client-to-server entry; all other rows below are emitted by the MSP host.
 | MSP notification | Disposition | ACP behavior |
 | --- | --- | --- |
 | `approval/requested` | Mapped to ACP | Opens `session/request_permission`; duplicate approval IDs are suppressed and unusable requests fail closed. |
-| `approval/resolved` | Mapped to ACP | Reasserts ACP v2 `running` state when the resolved approval unblocks active work. The permission response itself drives `approval/decide`. |
+| `approval/resolved` | Mapped to ACP | Withdraws an outstanding permission or feedback form with `$/cancel_request`, including child-stream approvals resolved elsewhere, and reasserts ACP v2 `running` when work remains. The permission response itself drives `approval/decide`. |
 | `approval/updated` | Mapped to ACP | Reasserts ACP v2 `running` state for an updated, still-active approval flow. |
 | `initialized` | Consumed | Sent by the adapter after the MSP `initialize` handshake. An unexpected inbound copy is harmlessly ignored. |
 | `item/completed` | Mapped to ACP | Folds the authoritative final item into message, tool-call, async-task, subagent, or other negotiated ACP updates. |
@@ -50,12 +50,24 @@ client-to-server entry; all other rows below are emitted by the MSP host.
 
 ## Host-emitted extensions
 
-These notifications have been observed from a host but are absent from the
-published `notifications` index.
+These notifications are handled by the adapter but are absent from the older
+vendored schema's `notifications` index. The [Muse 1.3.0 disposition
+matrix](../ROADMAP.md#9-richer-event-compatibility-matrix) also records host methods,
+errors, and deliberate omissions; the vendored schema is not the complete
+surface of newer hosts.
 
 | MSP notification | Disposition | ACP behavior |
 | --- | --- | --- |
-| `session/started` | Intentionally ignored | The preceding `session/start` result already establishes the session and subscription, so the extra lifecycle notice carries no additional ACP state. |
+| `session/started` | Internally tracked | Caches a new session-list row when Muse grants `sessionListStream`. Clients still request `session/list` to discover membership changes. |
+| `session/listChanged` | Mapped to ACP | Replaces a cached list row when `sessionListStream` is granted; pushes a changed active-session title through `session_info_update`. |
+| `session/closed` | Internally tracked | Removes the list row and records a tombstone when `sessionListStream` is granted. |
+| `session/nameChanged` | Mapped to ACP | Updates host title facts and publishes a changed title through `session_info_update`. |
+| `session/reasoningEffortChanged` | Mapped to ACP | Updates the standing reasoning default and emits `config_option_update`; negotiated recommendations require a host `default` or `policy` source. |
+| `session/statusChanged` | Mapped to ACP | Publishes host status and attention metadata and ACP v2 state; directs pending-request reconciliation without inventing unknown status values. |
+| `session/viewHealthChanged` | Consumed | Logs the view health and reason with guidance to reattach through resume. |
+| `skill/changed` | Mapped to ACP | Refreshes `skill/list` and the ACP available-command catalog. |
+| `usage/changed` | Mapped to ACP | Broadcasts the host's subscription observation to attached sessions as `_meta.museSubscriptionUsage`, separately from cost estimates. |
+| `session/modelRouteUnserved` | Intentionally ignored | No ACP mapping; the unhandled-notification path logs a diagnostic. |
 
 ## Server-initiated requests
 
@@ -71,6 +83,6 @@ to them as well as bridge their payloads. Any other server-initiated request is
 
 ## Client commands related to events
 
-`turn/cancel`, `approval/decide`, `userInput/answer`, `userInput/cancel`, and
+`turn/interrupt`, `turn/unqueue`, `approval/decide`, `userInput/answer`, `userInput/cancel`, and
 `userInput/clarify` are adapter-to-host commands. They are not event rows and
 are covered by request-schema conformance tests.

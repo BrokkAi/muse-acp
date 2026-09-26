@@ -1,7 +1,7 @@
 # muse-acp
 
-**Use your existing Muse Code subscription in Zed, IntelliJ IDEA, and other
-JetBrains IDEs.**
+**Use your existing Muse Code subscription in Zed, JetBrains IDEs, and other
+ACP clients.**
 
 [![CI](https://github.com/BrokkAi/muse-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/BrokkAi/muse-acp/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/BrokkAi/muse-acp)](https://github.com/BrokkAi/muse-acp/releases/latest)
@@ -95,8 +95,10 @@ destination or pin a version by setting an environment variable on `sh`:
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/BrokkAi/muse-acp/releases/latest/download/install.sh \
-  | MUSE_ACP_INSTALL_DIR="$HOME/bin" MUSE_ACP_VERSION=v0.2.2 sh
+  | MUSE_ACP_INSTALL_DIR="$HOME/bin" MUSE_ACP_VERSION=vX.Y.Z sh
 ```
+
+Replace `vX.Y.Z` with the release tag you want to install.
 
 On supported Windows x86_64 systems, run the PowerShell installer for the MSVC
 release:
@@ -142,11 +144,17 @@ muse-acp install            # Zed
 muse-acp install-intellij   # IntelliJ IDEA and other JetBrains IDEs
 ```
 
+Other stdio ACP clients can launch `muse-acp` directly. For example,
+[micro-acp](https://github.com/BrokkAi/micro-acp) includes a built-in adapter
+entry: `micro-acp --agent muse-acp`. It resolves and launches the npm package,
+so that route requires Node.js 22+ and npm as well as an authenticated Muse CLI.
+
 ## Requirements
 
 - Muse Code installed, authenticated, and available as `muse` on `PATH`.
-- Zed, or a JetBrains IDE with AI Assistant and custom ACP agent support.
-- Rust 1.88+ and Python 3 only when building or testing from source.
+- A stdio ACP client, such as Zed, a JetBrains IDE with AI Assistant and custom
+  ACP agent support, or micro-acp.
+- Rust 1.88+ to build from source; Python 3 for the integration tests.
 - Node.js 22+ for npm installs and npm packaging tests.
 
 ## How it works
@@ -305,10 +313,10 @@ at; a rate change never re-prices history.
 
 ### Client-provided MCP policy
 
-JetBrains may attach its integrated stdio MCP server to `session/new` even when
-the agent advertises no optional MCP transports (stdio, HTTP, and SSE are all
-reported unsupported). This adapter deliberately does not forward client MCP
-configuration:
+JetBrains may attach its integrated stdio MCP server to `session/new`. The
+adapter advertises HTTP and SSE MCP support as false; ACP v1 has no separate
+stdio capability flag. This adapter deliberately does not forward any
+client-provided MCP configuration, including stdio:
 
 - MSP 1.3.0 does expose a native session-scoped surface,
   `SessionConfig.mcpServers`, with typed `SessionMcpServerConfig` entries and
@@ -328,9 +336,8 @@ configuration:
   the absence of those tools is diagnosable rather than silent.
 
 Their presence never blocks the session or its selectors. To use MCP tools,
-configure them in Muse itself; if MSP later gains a native foreign-tool
-surface, this policy will be revisited only after the adapter negotiates the
-capability, uses an exact typed mapping, and has host-backed approval,
+configure them in Muse itself. Forwarding will be revisited only after the
+adapter negotiates the capability, uses an exact typed mapping, and has host-backed approval,
 workspace-confinement, lifecycle, failure, and regression-test guarantees.
 
 ## Run
@@ -359,6 +366,18 @@ MUSE_TOOL_OUTPUT_LIMIT=8000         # editor-facing tool output bound (character
 MUSE_LOG=debug                     # per-method protocol tracing (no payloads)
 # MUSE_ALLOW_UNSCOPED_READS=1       # DANGEROUS: allow local reads outside session cwd
 ```
+
+These are shell assignment examples; export them or put them in the client's
+agent environment so the adapter receives them. `MUSE_SERVE_ARGS` is split on
+whitespace, without shell expansion or shell-style quoting. Without
+`MUSE_COMMAND_TIMEOUT_MS`, admission deadlines are 30 seconds for the handshake,
+queries, and approval/input decisions; 180 seconds for session start/resume/read
+and view paging; and 60 seconds for other methods. These are command-response
+deadlines, not limits on a model turn's duration.
+
+A bare `/compact` prompt invokes Muse's native `session/compact`; compaction
+progress appears as a tool card. Other advertised slash commands come from
+Muse's skill catalog.
 
 Editor EOF/shutdown starts a deadline on the input reader, so blocked command
 admission, stdout writes, child reaping, or stderr draining cannot hang exit.
@@ -593,8 +612,9 @@ muse-acp uninstall
   starting a turn when the session is idle; otherwise the adapter uses MSP's
   atomic `ifBusy: "steer"` fallback.
 - Concurrent prompts queue host-side; every turn completes its own response.
-- Images in, audio out: the host input type is closed (`text|image`), so audio
-  blocks are rejected with the reason. The experimental MSP account surface is
+- Images are supported; audio input is not: the host input type is closed
+  (`text|image`), so audio blocks are rejected with the reason. The experimental
+  MSP account surface is
   intentionally deferred (`authMethods: []`); Muse credentials live outside
   ACP until the adapter makes an explicit `experimentalApi` adoption decision.
 - `session/list` reports durable Muse sessions, including sessions created

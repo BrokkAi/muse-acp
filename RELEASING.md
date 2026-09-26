@@ -1,9 +1,11 @@
 # Releasing muse-acp
 
-The only destination is `BrokkAi/muse-acp` GitHub Releases. Cargo explicitly
-sets `publish = false`; there are no registry packages, containers, update feeds,
-documentation deployments, signing or notarization services. There is one Rust
-binary with no runtime dependencies and no monorepo package publication order.
+Releases publish to `BrokkAi/muse-acp` GitHub Releases and to npm as
+`@brokkai/muse-acp`. Cargo sets `publish = false`, so there is no crates.io
+package. The native binary has no runtime dependencies; the npm package bundles
+all five native binaries and a Node.js launcher. The same tag workflow publishes
+GitHub assets first, then npm. See [npm publishing](docs/npm-publishing.md) for
+trusted publisher setup, package verification, and recovery rules.
 
 Each `v<version>` release has twelve assets: `install.sh` and `install.ps1`, plus an archive and
 `.sha256` sidecar for each of:
@@ -46,12 +48,14 @@ paths; Unix archives retain the installer's versioned parent directory.
    The authorization check requires this dispatch evidence. Run:
 
    ```sh
-   RELEASE_COMMIT=$(git rev-parse HEAD) RELEASE_TAG=v0.4.5 python3 scripts/release.py build
-   RELEASE_COMMIT=$(git rev-parse HEAD) RELEASE_TAG=v0.4.5 python3 scripts/release.py authorization
-   RELEASE_COMMIT=$(git rev-parse HEAD) RELEASE_TAG=v0.4.5 python3 scripts/release.py version
+   export RELEASE_COMMIT=$(git rev-parse HEAD)
+   export RELEASE_TAG=vX.Y.Z
+   python3 scripts/release.py build
+   python3 scripts/release.py authorization
+   python3 scripts/release.py version
    ```
 
-   Set the tag to the proposed version. These commands are non-publishing:
+   Replace `vX.Y.Z` with the proposed version's tag. These commands are non-publishing:
    they require successful exact-SHA CI and all release jobs, inspect publisher
    steps and unexpired Actions artifacts, and validate all packaged metadata.
    Version additionally checks the tag/release namespace and any existing
@@ -94,6 +98,13 @@ and compares payloads with the preflight build. Both `ci.yml` and `release.yml`
 must also succeed in the tag push context; branch evidence cannot replace tag
 workflow verification. The installer consumes GitHub's latest release URL;
 there is no independently published update feed.
+
+The tag run must also complete **Publish npm package with trusted publishing**.
+That step uses `id-token: write` for npm OIDC, publishes stable versions to
+`latest` and prereleases to `next`, and verifies registry integrity. If npm
+publication fails after GitHub succeeds, follow the npm guide and rerun the
+same tag workflow; do not replace the completed GitHub assets or reuse the
+version for different package contents.
 
 ## Preserved partial 0.4.4 release
 

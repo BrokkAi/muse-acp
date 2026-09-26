@@ -1,5 +1,11 @@
 # MSP golden transcripts
 
+> **Vendored upstream documentation.** The paths and `tbh-conformance`
+> commands below belong to the upstream Muse SDK repository. In this checkout,
+> run `cargo test --locked` from the muse-acp root; see
+> [local provenance and usage](../PROVENANCE.md). The remainder preserves the
+> upstream corpus documentation at the pinned revision.
+
 Hand-authored, schema-validated wire sessions for the Muse Session Protocol
 (MSP) v1 — the canned corpus a client team develops against before a live
 host exists. Owning spec: `specs/210-msp-conformance-testkit/` (#210); the

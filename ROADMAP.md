@@ -4,8 +4,9 @@ This is a living roadmap for `muse-acp`. It records the direction that keeps the
 adapter close to Muse Session Protocol (MSP), safe around approvals and file
 access, and useful in real editor workflows.
 
-- **Last revised:** 2026-09-25
-- **Baseline:** `v0.2.5`
+- **Last revised:** 2026-09-26
+- **Original planning baseline:** `v0.2.5`; current release history is in
+  [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
 - **Reference snapshots used for this revision:** Muse SDK `fbce769`
@@ -33,7 +34,7 @@ access, and useful in real editor workflows.
 
 ## Current strengths
 
-`v0.2.5` already has a solid stateful foundation:
+The adapter has a stateful foundation:
 
 - one long-lived `muse serve` host for all ACP sessions;
 - ACP v1 and v2 support;
@@ -49,8 +50,15 @@ access, and useful in real editor workflows.
 - restored context/cumulative usage and replay-safe completion pricing;
 - checksummed release installation and comment-preserving editor setup.
 
-The roadmap below protects those strengths while closing the main gaps in
-protocol safety, editor onboarding, feature breadth, and long-term maintenance.
+The shipped adapter also includes native subagents and async tasks, forks,
+compaction, file-change reports, bounded shutdown, host restart recovery, and
+npm distribution. It adapts a saved `:auto-review` profile to `:ask-me` for its
+serve child without changing the user's settings. See the README and changelog
+for current behavior.
+
+The status paragraphs below distinguish implemented work from open decisions.
+Work-item and acceptance lists retain the original design requirements; they
+are not all outstanding tasks.
 
 ## P0: protocol safety and compatibility
 
@@ -311,6 +319,12 @@ host-backed and tested.
 Clarify and test the adapter's multi-root behavior and continue tightening
 local-read confinement.
 
+Status: **implemented.** The adapter checks canonical paths against `cwd` plus
+the explicit additional-directory list on each attach, validates local file
+URIs and UTF-8 text, and bounds text expansion to 256 KiB. Tests cover symlinks,
+repeated/nested roots, path traversal, hard links, and Windows paths. Extra
+read roots do not expand Muse's own single tool workspace.
+
 **Work items**
 
 - Document how ACP `cwd`, additional workspace directories, and MSP session
@@ -375,7 +389,7 @@ events require an explicit documentation decision before CI passes.
 
 `approval/request` and `userInput/request` are server-initiated *requests*, not
 notifications; list them in a separate section with their response policy.
-`turn/cancel` is a client command, not an event.
+`turn/interrupt` and `turn/unqueue` are client commands, not events.
 
 Each row should state whether the event is consumed, mapped to ACP, internally
 tracked, intentionally ignored, or unsupported pending a protocol decision.
@@ -1022,7 +1036,11 @@ Track these alongside each release:
 - count of manually duplicated adapter version strings;
 - startup diagnostics that identify the next user action.
 
-## Suggested release checkpoints
+## Original release checkpoints
+
+The 0.3–0.5 groupings below are historical planning milestones, not upcoming
+releases or an exact account of which version shipped each feature. Use the
+changelog for that history. The 1.0 criteria remain a future stability target.
 
 ### `v0.3.0` — Compatibility-safe MSP adapter
 
