@@ -1,10 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.6.1
 
 - Start Muse hosts with human approvals when the saved profile is
   `:auto-review`, avoiding the unavailable-reviewer session failure without
   changing the user's Muse settings or editor launcher.
+- Exercise permission-profile startup, approvals, restart, and cleanup on
+  Windows as well as Unix, and fix the stdout saturation tests that blocked
+  macOS and Windows release builds.
+- Distribute the native adapter through `@brokkai/muse-acp` on npm, including
+  all five supported platform binaries.
 
 ## 0.6.0
 
