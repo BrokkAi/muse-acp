@@ -40,6 +40,7 @@ try {
       FAKE_SCENARIO: 'quiet',
       FAKE_CHECK_HOST_CONFIG: '1',
       FAKE_LOG: log,
+      FAKE_FRAMES: log + '.frames',
     },
     input: [
       { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 } },
