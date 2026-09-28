@@ -25,7 +25,7 @@ To see it working, run the integration tests named in Validation and Acceptance.
 - [x] (2026-09-28) Step 2 merged in PR #142, which closed #41.
 - [x] (2026-09-28) Step 3a: `SessionFold::observe_workflow` keeps the latest `(revision, children)` per `workflowRunId`, fed from snapshots, completions, and resume replay; `SessionFold::workflow_children` reads it.
 - [x] (2026-09-28) Step 3b: workflow cards render `label [childId]: status (phase)`, and usage errors list the children with status and attempt.
-- [x] (2026-09-28) Step 3c: `/workflow-child skip|retry <childId>` maps onto `workflow/childControl` (branch `brb/workflow-child-control`).
+- [x] (2026-09-28) Step 3c: `/workflow-child skip|retry <childId>` maps onto `workflow/childControl`. Steps 3a–3d merged in PR #143, which closed #46.
 - [x] (2026-09-28) Step 3d: removed the `childControlUnavailableReason` meta.
 - [x] (2026-09-28) Step 4: the `task/background` rationale is recorded on reopened issue #38.
 
@@ -65,7 +65,9 @@ Decision: ship steps 2 and 3 as separate pull requests rather than one. Rational
 ## Outcomes & Retrospective
 
 
-Step 0 merged in PR #139, step 1 in PR #141, and step 2 in PR #142. Step 3 is implemented with integration tests for the mapping, attempt tracking across a retry, usage listings, unknown children, and a surfaced `stale_attempt`. A fold unit test covers revision ordering and terminal cleanup. Step 4 is recorded on #38, which stays open because `task/background` is deliberately unbuilt. When step 3 merges, every Muse 1.3.0 host command except `task/background` has an editor path.
+This plan is complete. Step 0 merged in PR #139, step 1 in PR #141, step 2 in PR #142, and step 3 in PR #143. Step 3 has integration tests for the mapping, attempt tracking across a retry, usage listings, unknown children, and a surfaced `stale_attempt`. A fold unit test covers revision ordering and terminal cleanup. Step 4 is recorded on #38, which stays open because `task/background` is deliberately unbuilt. Every Muse 1.3.0 host command except `task/background` now has an editor path.
+
+Lessons: check that a conformance test actually covers what it claims. The request-frame test silently skipped every method missing from its hand-kept map. Also, a schema re-pin can make prose false as well as tests, so grep the docs for statements about the old pin.
 
 
 ## Context and Orientation
@@ -155,3 +157,5 @@ The workflow parser returns `(action, childId)`. Fold state gains a map from `wo
 
 
 Revision note (2026-09-28): converted from the scratch `plans.md` into ExecPlan form. Recorded step 0 as done in PR #139. Added the closed-issue, new-schema, and `children[]` findings, and dropped the nonexistent `session/delete` row.
+
+Revision note (2026-09-28): marked the plan complete after PR #143 merged, and added the retrospective lessons.
