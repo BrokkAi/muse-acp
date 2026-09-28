@@ -1,65 +1,53 @@
 # muse-acp
 
-**Use your existing Muse Code subscription in Zed, JetBrains IDEs, and other
-ACP clients.**
+**Use your existing Muse Code subscription in Zed, JetBrains IDEs, and any other
+ACP client.**
 
 [![CI](https://github.com/BrokkAi/muse-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/BrokkAi/muse-acp/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/BrokkAi/muse-acp)](https://github.com/BrokkAi/muse-acp/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-1.88%2B-orange.svg)](https://www.rust-lang.org/)
 
-`muse-acp` is a small, dependency-free Rust bridge between the
-[Agent Client Protocol](https://agentclientprotocol.com/) (ACP) used by editors
-and Muse Code's native [Muse Session Protocol](https://github.com/meta-models/muse-code-sdk)
-(MSP). Standalone installs use one native binary and need no Node.js, npm, or
-Python runtime. npm installs use a small Node.js launcher.
+`muse-acp` is a bridge between editors that speak the
+[Agent Client Protocol](https://agentclientprotocol.com/) (ACP) and
+[Muse Code](https://dev.meta.ai/docs/muse-code). It talks to Muse over its
+native [Muse Session Protocol](https://github.com/meta-models/muse-code-sdk)
+(MSP), so your subscription keeps Muse's own session engine, tools,
+authentication, and approval flow.
 
-This project started from a simple itch: I wanted to use the Muse Code
-subscription I already pay for inside the editors I already use, while keeping
-Muse's session engine, tools, authentication, and approval flow.
+The adapter is one small Rust binary with no runtime dependencies. It supports
+ACP v1 and v2, and installs on macOS, Linux, and Windows.
 
 > `muse-acp` is an independent community project. Muse Code and Muse Spark are
-> products of Meta and are not affiliated with or supported by this project.
+> products of Meta Platforms, Inc. This project is not affiliated with,
+> endorsed by, or supported by Meta.
 
-See [ROADMAP.md](ROADMAP.md) for protocol-compatibility, reliability, feature,
-and release priorities.
-The [MSP event compatibility matrix](docs/event-compatibility.md) records the
-ACP mapping or intentional disposition of every notification in the pinned
-schema, plus observed host extensions and server-initiated requests.
+## Requirements
 
-## Why MSP instead of `muse exec`?
-
-`muse-acp` starts one long-lived `muse serve` process and translates between
-ACP and MSP for the lifetime of the editor. Sessions, streamed updates,
-cancellation, configuration, approvals, and resume behavior travel over Muse's
-native protocol without starting a new Muse CLI process for every prompt.
-
-Other thoughtful integrations make a different, pragmatic choice:
-[bex-co/muse-code-acp](https://github.com/bex-co/muse-code-acp) and the
-[`muse-codes` Rust SDK](https://github.com/meawoppl/rust-code-agent-sdks/tree/main/muse-codes)
-wrap the headless `muse exec --json` event stream. That approach is useful for
-one-shot automation and broad compatibility. This project is optimized for a
-stateful IDE session, so MSP is the more direct fit.
+- **Muse Code** installed, authenticated, and available as `muse` on `PATH`.
+- A **stdio ACP client**: Zed, a JetBrains IDE with AI Assistant, or another
+  ACP client such as [micro-acp](https://github.com/BrokkAi/micro-acp).
+- **Node.js 22+** if you install from npm.
+- **Rust 1.88+** if you build from source.
 
 ## Quick start
 
 ### 1. Install Muse Code
 
-You need [Muse Code](https://dev.meta.ai/docs/muse-code) and an authenticated
-Muse account or subscription before installing this adapter:
+Install Muse and log in before installing the adapter:
 
 ```sh
 curl -fsSL https://dev.meta.ai/install.sh | sh
 muse login
 ```
 
-On macOS, Muse Code is also available through Homebrew:
+On macOS you can also use Homebrew:
 
 ```sh
 brew install --cask muse-code
 ```
 
-Confirm `muse --version` works before continuing.
+Confirm `muse --version` works, then continue.
 
 ### 2. Install muse-acp
 
@@ -70,27 +58,25 @@ npm install -g @brokkai/muse-acp
 muse-acp --selftest
 ```
 
-Or run without a global install:
+Or run it without a global install:
 
 ```sh
 npx --yes @brokkai/muse-acp --selftest
 ```
 
-The npm package includes native binaries for all supported platforms and needs
-no install scripts or separate binary downloads. npm manages the `muse-acp`
-command on your PATH. Release and trusted publishing instructions are in
-[docs/npm-publishing.md](docs/npm-publishing.md).
+The npm package bundles the native binaries for every supported platform, so it
+needs no install scripts or separate downloads.
 
-On Linux or macOS, install the latest release with:
+On Linux and macOS you can install the latest release instead:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/BrokkAi/muse-acp/releases/latest/download/install.sh | sh
 ```
 
-The installer detects the platform, verifies the release archive's SHA-256
-checksum, and installs `muse-acp` to `~/.local/bin`. Choose another absolute
-destination or pin a version by setting an environment variable on `sh`:
+The installer detects your platform, verifies the archive's SHA-256 checksum,
+and installs `muse-acp` to `~/.local/bin`. Pin a version or choose another
+absolute destination with environment variables on `sh`:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf \
@@ -98,44 +84,22 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   | MUSE_ACP_INSTALL_DIR="$HOME/bin" MUSE_ACP_VERSION=vX.Y.Z sh
 ```
 
-Replace `vX.Y.Z` with the release tag you want to install.
-
-On supported Windows x86_64 systems, run the PowerShell installer for the MSVC
-release:
+On Windows x86_64, run the PowerShell installer for the MSVC release:
 
 ```powershell
 irm https://github.com/BrokkAi/muse-acp/releases/latest/download/install.ps1 | iex
 ```
 
 It verifies the ZIP's SHA-256 checksum and installs `muse-acp.exe` to
-`$env:LOCALAPPDATA\Programs\muse-acp`. Set `MUSE_ACP_VERSION` or
-`MUSE_ACP_INSTALL_DIR` before running the command to pin a version or choose
-another absolute directory. The installer leaves `PATH` unchanged; add the
-reported directory to the user PATH and restart PowerShell. For a manual
-install, download the Windows archive and adjacent `.sha256` file from
-[GitHub Releases](https://github.com/BrokkAi/muse-acp/releases).
+`$env:LOCALAPPDATA\Programs\muse-acp`, leaving `PATH` untouched. Set
+`MUSE_ACP_VERSION` or `MUSE_ACP_INSTALL_DIR` to pin a version or choose another
+absolute directory, then add the reported directory to your user `PATH`.
 
-Linux release binaries require glibc. To build and install from a checkout,
-run `cargo install --path .`.
+From a checkout, build and install with Cargo:
 
-### Supported release targets
-
-The release and installer support matrix is explicit about the adapter binary,
-the host runtime, and the install path:
-
-| OS | Architecture | Runtime / host requirement | Release installer | Status |
-| --- | --- | --- | --- | --- |
-| macOS | x86_64 | macOS host and Muse Code for macOS | `install.sh` | Supported |
-| macOS | arm64 | macOS host and Muse Code for macOS | `install.sh` | Supported |
-| Linux | x86_64 | glibc; Muse Code for Linux | `install.sh` | Supported |
-| Linux | arm64 | glibc; Muse 1.0.2 may need sandbox support or `--disable-sandbox` | `install.sh` | Adapter supported; see the sandbox advisory below |
-| Windows | x86_64 | MSVC release target and Muse Code for Windows | `install.ps1` | Supported |
-
-Windows arm64, Linux musl, 32-bit systems, and other operating systems have no
-published release target. The editor registration commands use `HOME` on Unix
-and `USERPROFILE` on Windows for their default settings paths; IntelliJ still
-requires the installed executable's absolute path when `--command` is
-supplied.
+```sh
+cargo install --path .
+```
 
 ### 3. Connect your editor
 
@@ -144,430 +108,17 @@ muse-acp install            # Zed
 muse-acp install-intellij   # IntelliJ IDEA and other JetBrains IDEs
 ```
 
-Other stdio ACP clients can launch `muse-acp` directly. For example,
-[micro-acp](https://github.com/BrokkAi/micro-acp) includes a built-in adapter
-entry: `micro-acp --agent muse-acp`. It resolves and launches the npm package,
-so that route requires Node.js 22+ and npm as well as an authenticated Muse CLI.
+Both commands are safe to re-run: they preserve existing agent entries, write a
+`.bak` backup, and replace the settings file atomically. Use `--dry-run` to
+preview an edit.
 
-## Requirements
-
-- Muse Code installed, authenticated, and available as `muse` on `PATH`.
-- A stdio ACP client, such as Zed, a JetBrains IDE with AI Assistant and custom
-  ACP agent support, or micro-acp.
-- Rust 1.88+ to build from source; Python 3 for the integration tests.
-- Node.js 22+ for npm installs and npm packaging tests.
-
-## How it works
-
-One `muse serve` child serves all ACP sessions. `session/start`
-auto-subscribes us to the session view, so turns stream in as `item/*` and
-`turn/*` notifications, folded into ACP `session/update`s:
-
-| MSP | ACP |
-| --- | --- |
-| `item/delta` (message text) | `agent_message_chunk` (v2 carries `messageId`) |
-| toolCall `item/started\|updated\|completed` | `tool_call` (v1 create) / `tool_call_update` upsert with kind/title/status/content/rawInput |
-| host `item.truncated` + `outputRef`/`patchRef`/`patchSummary` | `_meta.muse` saturation and stored-output metadata; negotiated `_session/readOutput` forwards byte-ranged `item/readOutput` |
-| `turn/completed` | v1 `session/prompt` response `{stopReason}` plus the turn's `usage` when the host reported any; v2 `state_update` idle + `stopReason` |
-| `turn/interrupt` with `retract` | `session/cancel` (priority stop; waits for the terminal event; `already_terminal` = success) |
-| successful native file `toolCall` items | negotiated AIR `agentFileChangeReport` after the owning turn completes; paths come only from explicit host tool arguments and are deduplicated across replay |
-| `approval/requested` + `approval/request` | `session/request_permission` → `approval/decide` (deny-safe fallback) |
-| `session/resume` + history | `session/resume` (+ `replayFrom: {type:start}` replays messages); a retained view cursor is explicitly re-attached with `view/subscribe` so `(after, head]` events are replayed once across detachment or host restart; live-only resume still re-attaches from the returned head; usage is restored on attach: from `history.snapshot.state` when a snapshot is served, else by asking for the snapshot rung explicitly, else from one backward `view/page` read for the running totals; `session/viewHealthChanged` records an actionable stderr diagnostic |
-| `session/statusChanged` + `Session.status` / `.attention` | tracked per session; `session_info_update._meta.muse` exposes status and known attention flags, v2 receives running/idle or requires-action state; attention targets pending reconciliation |
-| `sessionDurability` (default durable) | continuity across turns; Muse's durable session ID is used directly by ACP |
-| `turn/start` `ifBusy` (queue default) | concurrent prompts per session; each completes its own response; `session/cancel` stops all of them |
-| `TurnInputPart` image | image blocks (inline base64 or local `file://` path); advertised in caps |
-| `userInput/requested` | `elicitation/create` form bridge (needs client `elicitation.form` caps); MSP `userInputDialogs` is declared from that capability and older/granting hosts still use auto-cancel as a backstop |
-| `session/setApprovalMode` | `configOptions` mode selector using the MSP names verbatim (`allowAll`/`promptUnmatched`/`onRequest`/`denyUnmatched`) + `session/set_config_option`; legacy v1 `modes` / `session/set_mode` |
-| `model/list` + `session/setModel` | `configOptions` model selector + `session/set_config_option`; legacy v1 `session/set_model` |
-| `session/goalChanged` | provider-neutral goal metadata in `session_info_update`; goal mutation remains host/TUI-driven because ACP has no negotiated goal-control capability |
-| `session/setReasoningEffort` + `session/reasoningEffortChanged` + `SnapshotState.reasoningEffort` | `configOptions` reasoning selector as the standing session default; it starts at `Muse default` (no override), and a tier chosen on a host without the setter becomes a per-turn override (`none` through `ultra`) |
-| `turn/steer` | v2 `_session/steering` extension with exact-turn targeting and race-safe idle behavior |
-| backgrounded `toolCall` + `userShell` items | negotiated AIR async tasks: `async_task_spawned`/`async_task_state_update` plus the backgrounded marker on the owning command card; `_session/async_task/stop` maps to MSP `task/stop`, while `session/cancel` maps to `task/stopAll`; terminal item events settle the task state |
-| `workflow` items | negotiated AIR async tasks keyed by `workflowRunId`; `_session/async_task/stop` admits MSP `workflow/cancel`, while the later workflow item and turn views settle the task and launching turn; ACP has no workflow child skip/retry surface |
-| `subagent` items | negotiated: `subagent_spawned` + `subagent_state_update` on the parent and the child transcript replayed from `session/read` onto the child session id; otherwise a synthetic tool card with `_meta.muse` provenance |
-| Muse skills | ACP `available_commands_update` is refreshed from MSP `skill/list` (and `skill/changed`); slash invocations such as `/plan` use native `skill` turn parts when the selector is in that catalog (also read for forks), with host `skillNotFound` errors preserved; other leading-slash text (an absolute path or a mistyped command) is sent as ordinary text, while `/skill <name>` is always submitted |
-| `session/contextUsage` + `session/tokenUsage` | `usage_update` (`used`/`size` from context occupancy, also restored on attach; `_meta.museCumulative` session totals, `_meta.musePressure`); each completion is counted once, so a `view/gap` refill that replays one already seen does not re-price it; `cost` is a client-local list-price estimate from `model/list` catalog rates, summed per completion — partial in both directions (historic and unpriceable completions are excluded, cached tokens are charged at the catalog cached rate), never a billing figure. The cost object is labeled `source: adapter-estimate`, `basis: catalog-list-price`, and `billing: false` so clients cannot mistake it for Muse billing |
-
-Muse 1.3.0 subscription usage is surfaced under `_meta.museSubscriptionUsage`.
-The adapter reads the host's last observation with `usage/read` and refreshes it
-for every attached session when `usage/changed` arrives. The payload keeps the
-host's `observedAtMs`, `tier`, `window`, and `weekly` values intact and is marked
-`source: msp-host-observation` and `billing: false`; it is an observation as of
-the host arrival stamp, never a cost or billing value. When a context window is
-available it rides the next `usage_update`; otherwise it uses
-`session_info_update` so the adapter does not invent ACP `used`/`size` values.
-An omitted `usage` member remains absent rather than being filled with zeros.
-
-Zed currently initializes custom agents with ACP v1 even though it supports
-config selectors, so the adapter returns `configOptions` in both protocol
-versions: v1 uses the selector field `id` (plus a legacy `modes` fallback), while
-v2 uses `configId`.
-
-Form questions also work in both versions when the client advertises
-`elicitation.form: {}` under `clientCapabilities` (v1) or `capabilities` (v2).
-The adapter waits for this ACP handshake before starting MSP, then declares
-`userInputDialogs: true` or `false` for the connection. A form-less client is
-therefore withheld from MSP user-input requests before a question is created;
-the auto-cancel path remains for hosts that predate or ignore that member.
-Repeated deliveries of a pending question reuse its existing form, including
-requests reissued during session resume.
-For an older or noncompliant host that still sends a question after receiving
-`userInputDialogs: false`, the adapter cancels it so the turn can continue; it
-does not emit an unsupported ACP request.
-
-Option-bearing questions first offer `Answer questions` or `Explain instead`;
-the latter sends a question-scoped `userInput/clarify` with up to 500
-characters.
-
-Goal control stays with the Muse host/TUI. The adapter does not invent an ACP
-editor request for `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, or
-`goal/clear` because ACP has no standard negotiated goal-control capability.
-When the host issues one of those stable MSP commands, the resulting
-`session/goalChanged` is folded and published to the editor. MSP's wake gates
-therefore remain authoritative: set/edit/resume may wake an idle unfinished
-goal, while pause/clear never wake.
-
-A resumed client receives the running AIR task set from the latest durable
-item fold even when it did not request transcript replay; completed historical
-shell commands are not re-announced. Closing the ACP connection ends the
-adapter and its host child. If a durable host restarts in place, the adapter
-reattaches each session and reconciles task items from the returned fold; a
-terminal item settles a task that was already announced. MSP 1.3.0 task
-controls support targeted stops and session-wide background cancellation.
-
-Editors with an explicit user shell command feature can opt into
-`_meta.muse.capabilities: ["userShell"]` **and** AIR `asyncTasks` during ACP
-initialize. Only this combined opt-in requests MSP's `userShell` capability.
-After the host grants it, `_session/userShell` accepts `sessionId`, `commandText`,
-and an editor-generated UUIDv7 `commandId` (reuse it when retrying the same
-command). It returns host admission; output and completion arrive as shell task
-items. This runs a user-requested command outside a model turn, in the existing
-host workspace and permission profile. It does not change roots or approval
-modes. Without both editor capabilities and a host grant, the method is rejected.
-Normal ACP connections never request shell execution. Restart reconciles durable
-task facts without launching the command again; permanent disconnect marks
-unsettled tasks with `_meta.muse.terminalUnknown` and invents no exit code.
-
-ACP `session/fork` restores the **new fork's** history through its returned view
-head, including paged history, with replay deduplicated against live events.
-ACP v1 receives replay immediately; v2 requests it with
-`replayFrom: {"type":"start"}`. An omitted fork point copies all completed turns;
-AIR message ids or fingerprints select a completed turn inclusively. The response
-preserves host provenance in `_meta.muse.forkedFrom`. History failures return an
-error before registering the new ACP session.
-
-After AIR `recommendedValue` negotiation, model recommendations come from the
-catalog's default row. Reasoning recommendations require a host-published tier
-whose source is `default` or `policy`; a user setting or absent host default never
-creates one. Recommendations are separate from the current selection. Session
-list titles use only host-provided `name`, `title`, or `firstUserPrompt` facts.
-
-Per-turn file reports are available when the client advertises AIR v1
-`agentFileChangeReport` and places a valid `agentFileChangeReportRequest` on
-the prompt. The adapter reports workspace paths from successful native Muse
-file-tool completions only. It includes both endpoints of a rename and sends
-paths without reading contents, so deleted and binary files are safe. Rejected
-writes are excluded. Shell commands, generators, and unknown tools never cause
-a guessed path; their presence marks `declaredComplete: false` instead.
-
-Session status is seeded from the `Session` object on start, resume, and fork,
-then updated from `session/statusChanged` without polling. Known
-`approvalPending` and `inputPending` flags select which pending-request class
-is reconciled; an explicit clear suppresses stale reconciliation. Unknown open
-status values are rendered as `unknown`, while unknown attention flags are
-ignored. A nullable status-event `viewCursor` preserves the last usable cursor
-when the host reports the unload fold-failure arm.
-
-Model choices are refreshed from Muse when creating, loading, or resuming a
-session and after a config option changes. The adapter does not permanently
-cache the first nonempty catalog. If a refresh fails, it retains the last
-successful catalog; stderr records failures and each snapshot's source and
-model count. An open selector does not itself trigger a refresh.
-
-The reasoning selector sets Muse's session-wide default on hosts that support
-`session/setReasoningEffort`. The adapter folds
-`session/reasoningEffortChanged` and restores `SnapshotState.reasoningEffort`
-on resume. A session with no standing default shows `Muse default`, and the
-adapter sends no `reasoningEffort`: a per-turn value outranks the tier
-configured in Muse, so the adapter never picks one on the user's behalf. On
-older hosts that do not implement the setter, a tier the user selects remains
-a per-turn `reasoningEffort` override for compatibility, and selecting `Muse
-default` drops it again. MSP cannot clear a standing session default, so once
-the host reports one the selector stops offering `Muse default` and refuses it.
-
-Restoring usage on attach takes up to two extra reads, and only when the
-resume itself carried none. `session/contextUsage` is not durable-sourced, so
-it never appears in a `view/page`; the context occupancy is only ever served in
-a snapshot, and the default `auto` history rung usually resolves to `inline`.
-The adapter therefore asks for the snapshot rung explicitly, and falls back to
-a backward page for the running totals alone. When neither carries usage, the
-session reports none until the next live `session/contextUsage`.
-
-Catalog pricing follows the same snapshot: a successful refresh replaces the
-per-model rates outright, so a model that comes back without a usable `cost`,
-or that leaves the catalog, stops being priced rather than keeping the rates it
-used to have. Only a failed refresh retains the previous rates. Completions
-already added to a session's running estimate keep the price they were charged
-at; a rate change never re-prices history.
-
-### Client-provided MCP policy
-
-JetBrains may attach its integrated stdio MCP server to `session/new`. The
-adapter advertises HTTP and SSE MCP support as false; ACP v1 has no separate
-stdio capability flag. This adapter deliberately does not forward any
-client-provided MCP configuration, including stdio:
-
-- MSP 1.3.0 does expose a native session-scoped surface,
-  `SessionConfig.mcpServers`, with typed `SessionMcpServerConfig` entries and
-  the grantable `sessionMcp` capability. That is a protocol improvement, but
-  it is not by itself an authorization or lifecycle contract for forwarding an
-  ACP client's server definition. Muse still owns the tool runtime, approval
-  flow, and sandbox. Wire typing and validation prove the shape of a request,
-  not that the supplied server is allowed by those approval, sandbox, and
-  workspace policies.
-- This adapter does not negotiate `sessionMcp` or translate client-owned MCP
-  configuration into a Muse session. Forwarding would need to define required
-  versus optional startup failures, disconnects, and behavior across resume,
-  fork, and close while proving that every server and tool remains inside the
-  session workspace and Muse approval flow.
-- Ignoring the configuration cannot widen permissions or introduce a new MCP
-  process/connection. It is logged (`ignoring client-provided MCP servers`) so
-  the absence of those tools is diagnosable rather than silent.
-
-Their presence never blocks the session or its selectors. To use MCP tools,
-configure them in Muse itself. Forwarding will be revisited only after the
-adapter negotiates the capability, uses an exact typed mapping, and has host-backed approval,
-workspace-confinement, lifecycle, failure, and regression-test guarantees.
-
-## Run
-
-```sh
-cargo build
-./target/debug/muse-acp --selftest   # static + schema-compat + CLI probe
-./target/debug/muse-acp --support    # redacted support bundle (no secrets)
-```
-
-`--selftest` validates the adapter's static payloads, prints the MSP schema
-compatibility table, and probes the configured Muse CLI
-(`cli-ready`/`cli-unready` with the binary and reported version). It is a
-diagnostic and always exits successfully, so support output can be collected
-before Muse is installed.
-
-Env:
-
-```sh
-MUSE_CLI=muse                      # host binary (default: muse)
-MUSE_SERVE_ARGS="--trust-workspace" # host-lifetime flags (see `muse serve --help`)
-MUSE_APPROVAL_MODE=promptUnmatched  # allowAll|promptUnmatched|onRequest|denyUnmatched
-MUSE_COMMAND_TIMEOUT_MS=60000       # override host admission-ack timeout (milliseconds)
-MUSE_SHUTDOWN_TIMEOUT_MS=8000       # shutdown deadline, 100..60000ms; +250ms final drain
-MUSE_TOOL_OUTPUT_LIMIT=8000         # editor-facing tool output bound (characters)
-MUSE_LOG=debug                     # per-method protocol tracing (no payloads)
-# MUSE_ALLOW_UNSCOPED_READS=1       # DANGEROUS: allow local reads outside session cwd
-```
-
-These are shell assignment examples; export them or put them in the client's
-agent environment so the adapter receives them. `MUSE_SERVE_ARGS` is split on
-whitespace, without shell expansion or shell-style quoting. Without
-`MUSE_COMMAND_TIMEOUT_MS`, admission deadlines are 30 seconds for the handshake,
-queries, and approval/input decisions; 180 seconds for session start/resume/read
-and view paging; and 60 seconds for other methods. These are command-response
-deadlines, not limits on a model turn's duration.
-
-A bare `/compact` prompt invokes Muse's native `session/compact`; compaction
-progress appears as a tool card. Other advertised slash commands come from
-Muse's skill catalog.
-
-Editor EOF/shutdown starts a deadline on the input reader, so blocked command
-admission, stdout writes, child reaping, or stderr draining cannot hang exit.
-Outstanding requests receive shutdown errors while editor stdout is usable;
-if the deadline expires, the adapter records a diagnostic and exits nonzero.
-A disconnected or unread output pipe may prevent delivery of those final errors.
-
-`session/new {cwd}` starts a host session in `cwd`. Approval posture defaults
-to the host default; set `MUSE_APPROVAL_MODE=promptUnmatched` to force every
-unmatched tool call through `session/request_permission`.
-
-When Muse's saved `permissions.default_profile` is `:auto-review`, muse-acp
-uses `:ask-me` for its `muse serve` child so approvals go to the editor.
-Muse 1.4.0 rejects the auto-review profile in serve mode because its automated
-reviewer is unavailable; `MUSE_DISABLE_APPROVAL_JUDGE=1` does not override that
-profile. The adapter supplies a private temporary settings view via the child's
-`XDG_CONFIG_HOME`, preserving other settings and linking the remaining config
-entries. It leaves your saved Muse settings and editor launcher unchanged,
-keeps session data in its usual location, and removes the temporary view when
-the host exits. Restarts and `--support` probes use the same behavior. Other
-permission profiles are left as configured. Creating this view requires
-symbolic-link support (on Windows, Developer Mode or equivalent permission).
-
-Tool cards preserve host saturation facts in `_meta.muse`: `source: "host"`
-means the host bounded the streamed surface, while `source: "adapter"` carries
-the adapter's local character counts. Shortened output retains both its head
-and tail on Unicode scalar boundaries. The marker counts toward
-`MUSE_TOOL_OUTPUT_LIMIT`; `retainedChars` counts original text only, with
-`headChars`/`tailChars` recording the split. Host `itemId`, `outputRef`, `patchRef`,
-and edit-tool `patchSummary` fields are kept beside the bounded card. A client
-may negotiate `_meta.muse.capabilities: ["readOutput"]` during `initialize`
-and then use the adapter extension `_session/readOutput` with `sessionId`,
-`itemId`, `outputRef`, and optional byte offsets and lengths to retrieve the
-stored bytes. The adapter forwards the host's `outputUnavailable` data as the
-typed `-32041` error.
-
-### Workspace roots and local resources
-
-ACP `cwd` is the primary workspace root and the base for relative resource
-paths. The adapter passes it to Muse as MSP's single `workspaceRoot`. When a
-client supplies `additionalDirectories`, each entry must be an absolute path;
-the adapter treats `[cwd, ...additionalDirectories]` as the ordered set of
-roots approved for local image and textual `resource_link` expansion. MSP v1
-has no additional-root field, so these extra roots do not change Muse's own
-tool workspace or sandbox policy.
-
-The adapter accepts nested, unrelated, and symlinked roots and removes exact
-duplicates while preserving first occurrence order. It resolves the requested
-path and every root through the filesystem before checking containment. This
-means `..`, percent-encoded separators, path spelling differences on a
-case-normalizing filesystem, and symlinks cannot escape the union of approved
-roots. A symlink supplied as a root authorizes its resolved target. Hard links
-are path entries rather than redirects: a hard-link name inside a root is in
-scope, while another name for the same inode outside every root is not.
-
-Only valid UTF-8 text without binary control bytes is expanded as text, with a
-256 KiB limit. Malformed `file://` percent escapes are rejected, remote file
-hosts are rejected, and non-file resource links remain mentions. Embedded
-non-image blobs remain unsupported.
-
-On `session/load`, `session/resume`, and `session/fork`, the request's complete
-additional-directory list becomes active. Omitting it or sending an empty list
-activates no extra roots, so old filesystem scope is never restored implicitly.
-Live `session/list` entries report that active list; Muse sessions discovered
-after an adapter restart have only their persisted MSP `workspaceRoot`.
-
-Local reads are confined to this root set by default.
-`MUSE_ALLOW_UNSCOPED_READS` disables that boundary only when its value is
-explicitly `1`, `true`, `yes`, or `on` (case-insensitive). Do not enable it for
-untrusted sessions or workspaces.
-
-### Authentication and remote environments
-
-`cli-ready` only means the CLI can be invoked; it does not verify a login.
-When Muse explicitly reports that it is not authenticated or that a session or
-credential has expired, the adapter supplies login guidance and the configured
-executable and handshake version (when available). Session creation, resume,
-and prompt rejections use ACP's `-32000` authentication-required error instead
-of a generic internal error. Mid-turn failures use that error in ACP v1 and an
-explanatory transcript message in v2, whose prompt has already been accepted.
-Raw recognized authentication error text is omitted because it may contain
-credentials. MSP 1.3.0's `TurnErrorKind.authRequired` is treated as an
-authoritative Muse login failure. Older hosts without that kind still require
-explicit login/expiry wording; generic HTTP 401/403, permission errors, and
-unknown host errors are not enough to identify a Muse login failure, so an
-unexplained host error still needs investigation.
-
-Run `muse login` with the executable selected by `MUSE_CLI`, then restart the
-editor agent and retry. For SSH, containers, remote IDE backends, or another OS
-account, run login **where the adapter runs, as the same OS user**. A login on
-your local desktop does not establish credentials for a remote host. GUI
-editors may also have a different `PATH`; set `MUSE_CLI` to an absolute path
-when the editor cannot find the CLI that works in your terminal.
-
-The adapter never opens a browser, prompts for credentials over ACP stdio, or
-copies credentials between machines. In a browserless environment, inspect
-`muse login --help` on that host and use only the remote/browserless flow
-supported by that installed Muse version. If it requires a browser or callback
-that the environment cannot provide, complete the supported login setup before
-starting the adapter; there is no adapter-provided headless login bypass.
-
-Muse 1.3.0 now publishes an experimental account surface: `account/loginStart`,
-`account/loginCancel`, `account/logout`, and `account/read`, plus the
-`account/changed` and `account/loginCompleted` notifications. It is gated by
-the MSP `experimentalApi` client capability and is absent from the stable
-schema bundle pinned by this adapter. This adapter does not opt into that
-experimental surface or perform adapter-side credential handling, so it
-deliberately keeps `authMethods` empty and ACP authentication requests return
-an unsupported-method error with external-login guidance.
-
-If the adapter adopts the surface later, the device-code branch is the only
-candidate: it returns a verification URL and user code without putting a
-secret on the ACP stdio path. The `apiKey` branch remains out of scope because
-it carries a credential; it must not be accepted unless the adapter also
-defines the required `ACCOUNT_LOGIN_API_KEY_REDACTED` logging and support-bundle
-contract. Until an explicit `experimentalApi` adoption decision is made,
-credentials stay outside ACP and users must complete login in the Muse
-environment. Error-code semantics follow the
-[ACP schema](https://agentclientprotocol.com/protocol/v1/schema#errorcode).
-
-### Linux arm64 sandbox advisory
-
-Muse 1.0.2 may fail to start its sandbox on Linux arm64 because a required
-sandbox binary is missing. Prefer upgrading Muse or installing the required
-sandbox support. If neither is possible, and you explicitly accept running host
-tools without the sandbox's isolation, use:
-
-```sh
-MUSE_SERVE_ARGS="--trust-workspace --disable-sandbox"
-```
-
-`--disable-sandbox` materially reduces isolation. Approval prompts and this
-adapter's workspace read confinement are not substitutes for the host sandbox.
-Sandbox posture is fixed for the `muse serve` lifetime; re-enable it as soon as
-the host supports the platform, and re-check `muse serve --help` on newer builds.
+Any other ACP client can launch `muse-acp` directly over stdio.
 
 ## Editor setup
 
-The editor registration commands preserve existing agent entries, are safe to
-re-run, and write a `.bak` file before changing an existing configuration.
-Settings are replaced
-atomically (same-directory temp file plus rename) with rollback to the
-pre-edit content if the write fails. Use `--dry-run` to preview an edit.
-The Unix installer targets macOS and Linux, and the PowerShell installer
-targets Windows x86_64. Both binary installers verify release checksums. The
-Windows installer stores the executable under
-`$env:LOCALAPPDATA\Programs\muse-acp` by default and does not edit `PATH`.
-
-### IntelliJ IDEA and other JetBrains IDEs
-
-JetBrains AI Assistant supports custom ACP agents through
-[`~/.jetbrains/acp.json`](https://www.jetbrains.com/help/ai-assistant/activate-agents.html#add-acp-agents).
-Register the installed binary with:
-
-```sh
-muse-acp install-intellij
-```
-
-The command records the running `muse-acp` binary's full path, as required by
-JetBrains, while preserving other configured agents:
-
-```json
-{
-  "agent_servers": {
-    "muse-acp": {
-      "command": "/Users/you/.local/bin/muse-acp",
-      "args": [],
-      "env": {}
-    }
-  }
-}
-```
-
-Open AI Chat and select `muse-acp` as the agent. Useful variants:
-
-```sh
-muse-acp install-intellij --command /absolute/path/to/muse-acp
-muse-acp install-intellij --env MUSE_CLI=/absolute/path/to/muse
-muse-acp install-intellij --settings /path/to/acp.json --dry-run
-muse-acp uninstall-intellij
-```
-
 ### Zed
 
-```sh
-muse-acp install
-```
-
-After the binary is on `PATH`, `muse-acp install` registers it in
-`~/.config/zed/settings.json` as a custom agent server:
+`muse-acp install` registers the adapter in `~/.config/zed/settings.json`:
 
 ```json
 {
@@ -582,74 +133,284 @@ After the binary is on `PATH`, `muse-acp install` registers it in
 }
 ```
 
-```sh
-muse-acp install --command /path/to/muse-acp
-muse-acp install --env MUSE_CLI=muse --env MUSE_SERVE_ARGS=--trust-workspace
-muse-acp install --settings /path/to/settings.json --dry-run
-muse-acp uninstall
+### JetBrains IDEs
+
+`muse-acp install-intellij` writes `~/.jetbrains/acp.json`, recording the full
+path to the running binary as JetBrains requires:
+
+```json
+{
+  "agent_servers": {
+    "muse-acp": {
+      "command": "/Users/you/.local/bin/muse-acp",
+      "args": [],
+      "env": {}
+    }
+  }
+}
 ```
 
-## Protocol notes
+Then open AI Chat and select `muse-acp`.
 
-- v2 `session/prompt` replies `{}` on accept; completion is the terminal
-  `state_update`. v1 replies `{stopReason}`, plus a `usage` object when the
-  host reported token usage for that turn. `usage` sums the turn's
-  `session/tokenUsage` legs (each counted once, replays excluded) into the
-  ACP v1 shape: `totalTokens`, `inputTokens`, `outputTokens`, and the
-  optional `thoughtTokens`, `cachedReadTokens`, `cachedWriteTokens`.
-  `inputTokens` is MSP's counted-once `promptTokens`, so cached input is
-  already inside it and reasoning tokens are already inside `outputTokens`;
-  a counter the host never reported is omitted rather than sent as zero, and
-  a turn with no reported usage carries no `usage` at all.
-  `usage._meta` adds `"mjolnir.dev/usage-scope": "turn"` and a `muse` block
-  with `modelCalls`, `apiDurationMs` (summed `durationMs`), and `modelUsage`,
-  the same counters per model id. A leg with no `modelId` counts in the
-  totals and is left out of `modelUsage`. v2 sessions are unchanged: they
-  settle through `state_update`, which carries no usage member.
-- v2 initialization advertises steering at `_meta.steering.supported`. The
-  `_session/steering` request accepts the same `sessionId` and `prompt` fields
-  as `session/prompt`. `_meta.steering.idleBehavior: "promptRequired"` avoids
-  starting a turn when the session is idle; otherwise the adapter uses MSP's
-  atomic `ifBusy: "steer"` fallback.
-- Concurrent prompts queue host-side; every turn completes its own response.
-- Images are supported; audio input is not: the host input type is closed
-  (`text|image`), so audio blocks are rejected with the reason. The experimental
-  MSP account surface is
-  intentionally deferred (`authMethods: []`); Muse credentials live outside
-  ACP until the adapter makes an explicit `experimentalApi` adoption decision.
-- `session/list` reports durable Muse sessions, including sessions created
-  outside the current adapter process, so Zed can import and restore them.
-- When Muse grants `sessionListStream`, `session/started`,
-  `session/listChanged`, and `session/closed` keep the adapter's list rows
-  current. A changed title for an active ACP session is pushed through
-  `session_info_update`; ACP has no list-membership push, so clients still
-  re-ask `session/list` for births and unloads. Hosts that do not grant the
-  capability retain the polling behavior.
-- Authority for MSP shapes is the schema the host ships
-  (`muse schema generate-json-schema`); the docs site may describe a newer
-  host — a fingerprint mismatch is logged, not fatal.
+### Installer options
 
-## Verify
+`install` and `install-intellij` accept:
+
+```sh
+muse-acp install --command /absolute/path/to/muse-acp
+muse-acp install --env MUSE_CLI=/absolute/path/to/muse
+muse-acp install --settings /path/to/settings.json --dry-run
+muse-acp uninstall
+muse-acp uninstall-intellij
+```
+
+Run `muse-acp help` for the full option list.
+
+## Configuration
+
+The adapter reads its settings from the environment. Export them in your shell,
+or set them in the client's agent entry so the editor passes them to the
+adapter.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `MUSE_CLI` | `muse` | Muse host binary to launch. Use an absolute path when the editor's `PATH` differs from your shell's. |
+| `MUSE_SERVE_ARGS` | none | Extra host-lifetime flags for `muse serve` (see `muse serve --help`). Split on whitespace; no shell quoting or expansion. |
+| `MUSE_APPROVAL_MODE` | host default | Force an approval posture: `allowAll`, `promptUnmatched`, `onRequest`, or `denyUnmatched`. `promptUnmatched` sends every unmatched tool call through `session/request_permission`. |
+| `MUSE_COMMAND_TIMEOUT_MS` | method-specific | Override the host admission-ack deadline, in milliseconds. |
+| `MUSE_SHUTDOWN_TIMEOUT_MS` | `8000` | Shutdown deadline, 100–60000 ms. |
+| `MUSE_TOOL_OUTPUT_LIMIT` | `8000` | Editor-facing tool output bound, in characters (minimum 200). |
+| `MUSE_LOG` | `normal` | Set to `debug` for per-method protocol tracing (no payloads). |
+| `MUSE_ALLOW_UNSCOPED_READS` | off | **Dangerous.** Set to `1`, `true`, `yes`, or `on` to allow local reads outside the approved workspace roots. |
+
+Without `MUSE_COMMAND_TIMEOUT_MS`, admission deadlines are 30 seconds for the
+handshake, queries, and approval or input decisions; 180 seconds for session
+start, resume, and read and for view paging; and 60 seconds for other methods.
+These bound how long the adapter waits for a command response, not how long a
+model turn may run.
+
+### Approval-profile compatibility
+
+If Muse is saved with the `:auto-review` permission profile, `muse serve`
+cannot start its automated reviewer. The adapter gives its own `muse serve`
+child a private, temporary settings view that uses `:ask-me`, so approvals come
+to your editor. Your saved Muse settings, editor launcher, and session data are
+left untouched, and the temporary view is removed when the host exits. This
+requires symbolic-link support (on Windows, Developer Mode or equivalent).
+Other permission profiles are passed through unchanged.
+
+## What's supported
+
+- **Sessions** — new, load, resume, list, close, and fork, with durable Muse
+  session IDs that survive adapter and host restarts.
+- **Turns** — streamed text and tool updates, queued concurrent prompts,
+  cancellation with a terminal event, and exact-turn steering over the ACP v2
+  `_session/steering` extension.
+- **Approvals** — Muse approval requests surfaced as
+  `session/request_permission`, with a deny-safe fallback.
+- **Questions** — Muse `userInput/requested` bridged to ACP
+  `elicitation/create` forms when the client advertises form support; otherwise
+  the host falls back to auto-cancel.
+- **Configuration** — model, approval mode, and reasoning effort exposed as ACP
+  `configOptions` selectors, refreshed from Muse on create, load, resume, and
+  config change. The reasoning selector starts at `Muse default` and sends no
+  override until you pick a tier.
+- **Skills** — Muse's skill catalog drives ACP `available_commands_update`.
+  Slash prompts such as `/plan` use native skill turn parts; `/compact` invokes
+  Muse's native compaction.
+- **Content** — text, inline and local-file images, `resource_link` text
+  expansion, and embedded context. Audio is rejected, because Muse's input type
+  is closed to `text` and `image`.
+- **Usage** — context occupancy as `usage_update`, cumulative session totals,
+  subscription observations under `_meta.museSubscriptionUsage`, and a
+  client-local list-price cost estimate explicitly labeled as not a billing
+  figure.
+- **Tasks and subagents** — backgrounded shell commands, workflows, and native
+  subagents surfaced through negotiated ACP extensions where the client
+  advertises support, with synthesized tool cards otherwise.
+- **File changes** — per-turn workspace file-change reports from the host's
+  native file tools when the client negotiates the AIR extension.
+- **Stored output** — bounded tool output with head and tail retained, plus
+  opt-in `_session/readOutput` access to the host's stored bytes.
+
+The [MSP event compatibility matrix](docs/event-compatibility.md) records the
+ACP mapping or intentional disposition of every notification in the pinned
+schema. [ROADMAP.md](ROADMAP.md) tracks compatibility, reliability, and release
+priorities.
+
+### Client-provided MCP servers
+
+The adapter does not forward MCP servers that an ACP client attaches to a
+session, including the stdio server JetBrains may pass. It advertises HTTP and
+SSE MCP support as `false` and logs the omission (`ignoring client-provided MCP
+servers`) so the missing tools are diagnosable. Configure MCP servers in Muse
+itself instead. ACP client-owned MCP configuration remains a limitation of this
+adapter, not of Muse's session-scoped MCP support.
+
+## How it compares
+
+Several independent projects bridge Muse Code to ACP. They broadly split into
+two designs: adapters that speak Muse's native session protocol over a
+long-lived `muse serve`, and bridges that wrap the one-shot `muse exec --json`
+event stream. The table below reflects each project's public documentation and
+package metadata as of September 2026; check the projects themselves for
+current behavior.
+
+| Adapter | Language / runtime | Muse transport | Install | Editor targets | License |
+| --- | --- | --- | --- | --- | --- |
+| **muse-acp** (this project) | Rust; single native binary, no runtime | MSP over one long-lived `muse serve` | npm `@brokkai/muse-acp`, release installers, `cargo install` | Zed, JetBrains, any stdio ACP client | Apache-2.0 |
+| [bex-co/muse-code-acp](https://github.com/bex-co/muse-code-acp) | TypeScript; Node.js 22+ | Muse SDK over `muse serve` | npm `@bex-co/muse-code-acp` | Zed, VS Code, other ACP clients | Apache-2.0 |
+| [sanjay3290/muse-acp](https://github.com/sanjay3290/muse-acp) | TypeScript; Node.js 20+ | MSP over `muse serve` | npm `muse-acp` | ACP clients (Zed example) | Apache-2.0 |
+| [julianubico/muse-code-acp-bridge](https://github.com/julianubico/muse-code-acp-bridge) | JavaScript; Node.js 22.13+ | `muse exec --json` JSONL | from source (documented npm name not currently published) | acpx custom agents | MIT |
+| [einklover/muse-acp-server](https://github.com/einklover/muse-acp-server) | TypeScript; Node.js 22+ | `muse exec --json`, with model traffic proxied through OpenCode credentials | from source | Paseo | MIT |
+| [jannotix/muse-acp-agent](https://github.com/jannotix/muse-acp-agent) | TypeScript | Uses Muse Code models as the reasoning core | from source | ACP clients | Apache-2.0 |
+
+The headless `muse exec --json` design is a good fit for one-shot automation and
+scripted workflows. This adapter chooses MSP so a single editor session keeps
+native streaming, approvals, cancellation, configuration, resume, and usage,
+instead of starting a new Muse CLI process for each prompt.
+
+Adjacent projects worth knowing about, though not ACP adapters themselves:
+[BrokkAi/mjolnir](https://github.com/BrokkAi/mjolnir) is a Rust control plane
+for several ACP coding agents including Muse, and
+[agentic-control-plane/muse-code-acp-plugin](https://github.com/agentic-control-plane/muse-code-acp-plugin)
+is a Muse plugin that policy-checks tool calls.
+
+## How it works
+
+One `muse serve` child serves all ACP sessions for the adapter's lifetime.
+`session/new` starts a host session in the requested `cwd`; `session/start`
+auto-subscribes the adapter to the session view so turns stream in as `item/*`
+and `turn/*` notifications. The adapter folds those into ACP `session/update`
+messages:
+
+| Muse (MSP) | Editor (ACP) |
+| --- | --- |
+| `session/start`, turns, and history | `session/new`, `session/prompt`, `session/load`, `session/resume`, `session/fork` |
+| `item/delta` message text | `agent_message_chunk` |
+| `toolCall` items | `tool_call` and `tool_call_update` |
+| `turn/completed` | v1 prompt response with stop reason and usage; v2 `state_update` |
+| `approval/requested` | `session/request_permission`, answered with `approval/decide` |
+| `userInput/requested` | `elicitation/create` form |
+| `model/list`, `session/setModel`, `session/setApprovalMode`, `session/setReasoningEffort` | `configOptions` selectors and `session/set_config_option` |
+| `skill/list`, `skill/changed` | `available_commands_update` |
+| `session/contextUsage`, `session/tokenUsage` | `usage_update` |
+| `turn/steer` | `_session/steering` (ACP v2) |
+| Forks, subagents, async tasks, user shell, stored output | negotiated ACP extensions |
+
+Muse's stable schema is the authority for MSP shapes (`muse schema
+generate-json-schema`). A schema fingerprint mismatch with the vendored bundle
+is logged, not fatal.
+
+## Workspace and file access
+
+ACP's `cwd` is the primary workspace root and the base for relative resource
+paths; the adapter passes it to Muse as MSP's single `workspaceRoot`. If a
+client sends `additionalDirectories`, each must be absolute, and the adapter
+treats `[cwd, ...additionalDirectories]` as the ordered set of roots approved
+for local image and textual `resource_link` expansion. MSP v1 has no
+additional-root field, so extra roots do not widen Muse's own tool workspace or
+sandbox policy.
+
+Local reads are confined to that root set. The adapter resolves each path and
+root through the filesystem before checking containment, so `..`,
+percent-encoded separators, case differences, and symlinks cannot escape the
+approved roots. Only valid UTF-8 text without binary control bytes is expanded,
+up to 256 KiB per resource; malformed `file://` escapes and remote hosts are
+rejected. Setting `MUSE_ALLOW_UNSCOPED_READS` disables this boundary and should
+not be used with untrusted sessions.
+
+## Authentication and remote environments
+
+When Muse reports that it is not authenticated, or that a session or credential
+has expired, the adapter returns ACP's `-32000` authentication-required error
+with login guidance. Run `muse login` with the executable selected by
+`MUSE_CLI`, then restart the editor agent.
+
+Run the login **where the adapter runs, as the same OS user**. For SSH,
+containers, remote IDE backends, or a different OS account, a login on your
+desktop does not help; log in on the remote host. The adapter never opens a
+browser, never prompts for credentials over ACP stdio, and never copies
+credentials between machines. It advertises no ACP auth methods, so credentials
+stay in the Muse environment.
+
+## Sandbox advisory for Linux arm64
+
+Muse 1.0.2 may fail to start its sandbox on Linux arm64 when a required sandbox
+binary is missing. Prefer upgrading Muse or installing the sandbox support.
+Only if neither is possible, and only if you accept running host tools without
+the sandbox's isolation:
+
+```sh
+MUSE_SERVE_ARGS="--trust-workspace --disable-sandbox"
+```
+
+`--disable-sandbox` materially reduces isolation, and neither approval prompts
+nor this adapter's read confinement replace it. Sandbox posture is fixed for
+the life of `muse serve`; re-enable it as soon as the host supports your
+platform.
+
+## Diagnostics
+
+```sh
+muse-acp --selftest   # static payload + schema compatibility + CLI probe
+muse-acp --support    # redacted support bundle, safe to paste into a report
+```
+
+`--selftest` validates the adapter's built-in payloads, prints the MSP schema
+compatibility table, and reports whether the configured Muse CLI can be invoked
+(`cli-ready` or `cli-unready`). It exits `0` even when Muse is not installed, so
+you can collect output on a machine that is still being set up.
+
+Set `MUSE_LOG=debug` for per-method protocol tracing. Tracing records method
+names and outcomes, not payloads.
+
+When the editor closes the ACP connection, the adapter starts a shutdown
+deadline, fails outstanding requests, and exits. If the deadline expires first,
+it records a diagnostic and exits nonzero.
+
+## Supported platforms
+
+| OS | Architecture | Notes |
+| --- | --- | --- |
+| macOS | x86_64, arm64 | Supported |
+| Linux | x86_64, arm64 | glibc; see the Linux arm64 sandbox advisory above |
+| Windows | x86_64 | MSVC release |
+
+Windows arm64, Linux musl, 32-bit systems, and other operating systems have no
+published release target.
+
+## Development
+
+Build and run from a checkout:
+
+```sh
+cargo build
+./target/debug/muse-acp --selftest
+```
+
+Before submitting a change:
 
 ```sh
 cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo run --locked -- --selftest
+node --test npm/test/launcher.test.cjs
+python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 The integration tests use the checked-in fake MSP host at
-`tests/fixtures/fake_serve.py`; they do not require a live Muse session.
+`tests/fixtures/fake_serve.py`, so they do not require a live Muse session.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the full development workflow and
+[RELEASING.md](RELEASING.md) for the release process.
 
-## Contributing and security
+## Security
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow. Please
-report vulnerabilities privately as described in [SECURITY.md](SECURITY.md),
-not in a public issue.
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md),
+never in a public issue.
 
 ## License
 
-Copyright 2026 Brokk.ai.
-
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) and
-[NOTICE](NOTICE).
+Copyright 2026 Brokk.ai. Licensed under the Apache License, Version 2.0. See
+[LICENSE](LICENSE) and [NOTICE](NOTICE).
