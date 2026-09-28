@@ -236,10 +236,13 @@ pub fn session_profile_hint(host_message: &str) -> Option<String> {
 pub fn describe_spawn_error(bin: &str, e: &std::io::Error) -> String {
     match e.kind() {
         std::io::ErrorKind::NotFound => format!(
-            "Muse CLI not found: '{bin}'. Install Muse Code              (https://dev.meta.ai/docs/muse-code), ensure it is on PATH, or set              MUSE_CLI=/absolute/path/to/muse"
+            "Muse CLI not found: '{bin}'. Install Muse Code \
+             (https://dev.meta.ai/docs/muse-code), ensure it is on PATH, or set \
+             MUSE_CLI=/absolute/path/to/muse"
         ),
         std::io::ErrorKind::PermissionDenied => format!(
-            "Muse CLI is not executable: '{bin}'. Fix permissions or set              MUSE_CLI=/absolute/path/to/muse"
+            "Muse CLI is not executable: '{bin}'. Fix permissions or set \
+             MUSE_CLI=/absolute/path/to/muse"
         ),
         _ => format!("failed to spawn '{bin} serve': {e}"),
     }
@@ -1545,10 +1548,12 @@ mod readiness_tests {
         assert!(msg.contains("Muse CLI not found"), "{msg}");
         assert!(msg.contains("'/opt/muse'"), "{msg}");
         assert!(msg.contains("MUSE_CLI="), "{msg}");
+        assert!(!msg.contains("  "), "stray source indentation: {msg}");
 
         let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let msg = describe_spawn_error("/opt/muse", &denied);
         assert!(msg.contains("not executable"), "{msg}");
+        assert!(!msg.contains("  "), "stray source indentation: {msg}");
     }
 }
 
