@@ -17,9 +17,9 @@ To see it working, run the integration tests named in Validation and Acceptance.
 ## Progress
 
 
-- [x] (2026-09-28) Step 0, SDK re-pin: vendored `muse-code-sdk` revision `a7c10c5` into `tests/protocol/`. Opened as PR #139 on branch `brb/sdk-repin-a7c10c5`; not yet merged.
+- [x] (2026-09-28) Step 0, SDK re-pin: vendored `muse-code-sdk` revision `a7c10c5` into `tests/protocol/`. Merged in PR #139, which also corrected the ROADMAP section 9 intro that the re-pin made stale.
 - [x] (2026-09-28) Adopted the ExecPlan convention (`AGENTS.md`, `.agents/PLANS.md`, this file) on branch `brb/adopt-execplans`.
-- [ ] Step 1, roadmap reconcile (its own PR, after #139 merges).
+- [ ] Step 1, roadmap reconcile (its own PR).
 - [ ] Step 2, `/rename` mapped to `session/rename` (feature PR).
 - [ ] Step 3a, retain workflow children per run in fold state.
 - [ ] Step 3b, make child ids discoverable from the editor.
@@ -57,7 +57,7 @@ Decision: rows that stay "Unsupported pending protocol decision" must link an op
 ## Outcomes & Retrospective
 
 
-Step 0 is complete in PR #139. The corpus diff was purely additive, and all CONTRIBUTING gates passed locally. Nothing else has landed yet.
+Step 0 is complete and merged in PR #139. The corpus diff was purely additive, and all CONTRIBUTING gates passed locally. Nothing else has landed yet.
 
 
 ## Context and Orientation
@@ -75,7 +75,7 @@ The `/goal` slash command is the pattern to copy for new commands. It has four p
 ## Plan of Work
 
 
-Step 1 is a documentation-only reconcile of the ROADMAP section 9 table, done after PR #139 merges. The prose above the table ("The pinned schema bundle predates the Muse 1.3.0 additions…") is stale once the bundle is re-pinned, so rewrite it. Rewrite the disposition and behavior cells for surfaces that have landed: `goal/*`, `skill/list`, `skill/changed`, `task/stop`, `task/stopAll`, `usage/read`, `usage/changed`, `view/subscribe`, `workflow/cancel`, `session/setReasoningEffort`, `session/reasoningEffortChanged`, `session/statusChanged`, `session/nameChanged`, `session/viewHealthChanged`, `item/readOutput`, `skillNotFound`, and `outputUnavailable`. For each, read the code path (search `src/` for the method name) and describe the behavior; `docs/event-compatibility.md` already has accurate wording for the notifications. Keep `task/background` and `session/modelRouteUnserved` (intentionally ignored) as they are. Leave the `session/rename` and `workflow/childControl` rows for steps 2 and 3. Relink every row that stays unsupported to an open issue, per the Decision Log.
+Step 1 is a documentation-only reconcile of the ROADMAP section 9 table. Its intro was already corrected in PR #139. Rewrite the disposition and behavior cells for surfaces that have landed: `goal/*`, `skill/list`, `skill/changed`, `task/stop`, `task/stopAll`, `usage/read`, `usage/changed`, `view/subscribe`, `workflow/cancel`, `session/setReasoningEffort`, `session/reasoningEffortChanged`, `session/statusChanged`, `session/nameChanged`, `session/viewHealthChanged`, `item/readOutput`, `skillNotFound`, and `outputUnavailable`. For each, read the code path (search `src/` for the method name) and describe the behavior; `docs/event-compatibility.md` already has accurate wording for the notifications. Keep `task/background` and `session/modelRouteUnserved` (intentionally ignored) as they are. Leave the `session/rename` and `workflow/childControl` rows for steps 2 and 3. Relink every row that stays unsupported to an open issue, per the Decision Log.
 
 Step 2 adds `/rename <name>`, which maps to `session/rename` with params `commandId`, `name`, and `sessionId`, all required strings. The result carries `commandId`, `status`, and an optional normalized `name`. Add `parse_rename_command` beside `parse_goal_command`. A bare `/rename` or whitespace-only name is a usage error. Intercept it in the prompt handler the same way `/goal` is intercepted, and settle the prompt the same way. Advertise `rename` in `available_commands_json` with the hint `<name>`, and filter any host skill named `rename`. Make `fake_serve.py` acknowledge `session/rename`, and emit `session/nameChanged` so the test can observe the title update the adapter already publishes through `session_info_update`. Add `rename_slash_command_maps_to_host_method` to `tests/acp_serve.rs`. It covers the mapping, the settle, the bare-name usage error, and the leading-space escape. Then update the README command list, the ROADMAP row for `session/rename`, and `docs/event-compatibility.md` if it lists commands.
 
