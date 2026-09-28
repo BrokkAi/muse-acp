@@ -27,6 +27,7 @@ An unauthenticated prompt already returns ACP error `-32000` ("auth required") w
 - [x] (2026-09-28) Milestone 3: degraded "host unavailable" mode so `initialize` succeeds without Muse. A registry-validator-shaped handshake with `MUSE_CLI=/nonexistent-muse` returns the auth methods, `session/new` gets the install guidance, and `shutdown` exits 0.
 - [x] (2026-09-28) Milestone 4: tests, README/ROADMAP/CHANGELOG. `cargo fmt --check`, clippy, `cargo test --locked` (227 integration tests), selftest, `sh -n install.sh`, and the npm smoke test pass.
 - [ ] Not verified: a live, interactive `muse login` through an editor's terminal-auth UI (needs a human and a browser); whether an already-running `muse serve` picks up new credentials without a restart.
+- [ ] (2026-09-28) **Blocking: Windows + Zed fails before login.** Ryan built this branch, merged with `brb/zed-windows-settings` (PR #151), on Windows. Zed shows "Failed to Launch / Server exited with status exit code: 1", so the login UI is never reachable. Not yet diagnosed; the Windows developer continues from here. See "Windows exit-1 triage" under Surprises & Discoveries.
 
 ## Surprises & Discoveries
 
@@ -36,6 +37,13 @@ An unauthenticated prompt already returns ACP error `-32000` ("auth required") w
 - Observation: the registry validator infers a method's type from `type`, or else from `_meta` keys `terminal-auth`/`agent-auth`, and otherwise defaults to `agent`. It requires `id` and `name`.
 - Observation: three existing tests (`unsupported_envelope_schema_version_fails_closed`, `command_timeout_reports_method_id_and_configured_duration`, `authentication_initialize_failure_has_external_login_guidance`) asserted that the adapter exits on a failed launch. They now assert the degraded contract through the helper `assert_host_unavailable`. The schema case still fails closed, because no request reaches a host. The MSP-initialize auth failure now yields `-32000` on `session/new`, which is exactly the point where terminal-auth clients offer login.
 - Observation (pre-existing, fixed here): `describe_spawn_error` in `src/msp.rs` had runs of spaces inside its message ("Install Muse Code              (https://..."), because a string continuation lacked a trailing backslash. The unit test `spawn_errors_name_the_next_user_action` now rejects double spaces.
+
+- Observation: **Windows exit-1 triage (open).** With this branch built on Windows, Zed reports the agent exited with code 1 before any login is possible. This branch's degraded mode only covers `MspHost::launch` *failing*. If launch succeeds, the adapter can still exit 1 in the main loop of `src/main.rs`, on `LoopMsg::Msp(MspEvent::Eof(..))` (the host went away). That happens (a) when the reaped exit is not retryable, (b) when the restart budget is exhausted or a restart fails, or (c) when the host's durability profile isn't restartable. `shutdown::exit` also forces 1 when the shutdown deadline is expiring. So the leading hypothesis is that `muse serve` starts on Windows, then exits, and the adapter exits with it. That path still kills the agent, so terminal auth can't recover it. It needs confirming. On Windows, from the repo:
+      .\target\debug\muse-acp.exe --selftest
+      '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}' | .\target\debug\muse-acp.exe
+      .\target\debug\muse-acp.exe --support
+  Read the `[muse-acp]` stderr lines: `host unavailable: ...` means a launch failure (should not exit), and `serve host gone (...)` / `serve-exit ...` mean the post-launch exit path. Also confirm that Zed's settings entry (`%APPDATA%\Zed\settings.json`, `agent_servers.muse-acp.command`) points at the freshly built exe, not an older `muse-acp` on `PATH`. Related Windows issues: #150, where an `:auto-review` profile needs symlink privilege (os error 1314, a launch failure); and #151, where the Zed installer used the wrong settings path on Windows.
+- Observation (review of PR #149, considered and deferred): in host-unavailable mode, `authenticate {"methodId":"muse-login"}` returns the launch error rather than `{}`, and nothing relaunches the host without an agent restart. It was deferred because live Muse 1.4.0 does not fail its launch for a logged-out user (it fails at the first prompt, which works). Also, ACP terminal-auth clients restart the agent after login, and returning success without a working relaunch would loop the user through login. Revisit it together with the Windows triage above, since a host that exits after launch needs a recovery story of its own.
 
 ## Decision Log
 
@@ -58,6 +66,10 @@ An unauthenticated prompt already returns ACP error `-32000` ("auth required") w
 ## Outcomes & Retrospective
 
 The adapter now meets the ACP Registry auth requirement. `initialize` (v1 and v2) advertises one `terminal` method, `muse-login`, and the handshake succeeds even without Muse installed. The login itself is `muse-acp login`, which delegates to `muse login`, so the adapter still never touches credentials. What remains is a manual editor check (Zed or JetBrains) of the terminal-auth UI with a real Muse account, plus submitting the registry entry (an `agent.json` using the npm distribution `@brokkai/muse-acp@<version>`). The lesson: the registry's CI exercises the no-Muse path, so handshake robustness mattered as much as the auth method itself.
+
+Status as of 2026-09-28: Linux behavior and the full contribution gate are green. Manual testing on Windows + Zed fails with exit code 1 before login (see the Windows exit-1 triage entry). That must be diagnosed on Windows before this PR merges.
+
+Revision note (2026-09-28): added the Windows test result, the triage steps and hypotheses for it, and the deferred review finding, so the work can continue from a Windows machine with only this file.
 
 ## Context and Orientation
 
