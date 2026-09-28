@@ -247,11 +247,15 @@ pub fn muse_cli() -> String {
 }
 
 /// First `<stem>.exe`, `.cmd`, or `.bat` in PATH order, as a full path.
+/// Empty and relative entries (a trailing `;`, `.`) are skipped: they resolve
+/// against the working directory, often an untrusted project checkout, which
+/// Rust's own Windows search also refuses to consult.
 fn find_windows_launcher(
     dirs: impl Iterator<Item = std::path::PathBuf>,
     stem: &str,
 ) -> Option<String> {
-    dirs.flat_map(|dir| ["exe", "cmd", "bat"].map(|ext| dir.join(format!("{stem}.{ext}"))))
+    dirs.filter(|dir| dir.is_absolute())
+        .flat_map(|dir| ["exe", "cmd", "bat"].map(|ext| dir.join(format!("{stem}.{ext}"))))
         .find(|candidate| candidate.is_file())
         .and_then(|candidate| candidate.into_os_string().into_string().ok())
 }
@@ -1641,13 +1645,31 @@ mod authentication_tests {
         std::fs::create_dir_all(&second).unwrap();
         std::fs::write(second.join("muse.exe"), "").unwrap();
         std::fs::write(first.join("muse.cmd"), "").unwrap();
-        let dirs = || vec![root.join("missing"), first.clone(), second.clone()].into_iter();
+        // A relative entry resolves against the working directory (the crate
+        // root under cargo test) and must be skipped even when it matches.
+        let relative = std::path::PathBuf::from(format!(
+            "target/muse-acp-launcher-rel-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&relative).unwrap();
+        std::fs::write(relative.join("muse.exe"), "").unwrap();
+        let dirs = || {
+            vec![
+                std::path::PathBuf::new(),
+                relative.clone(),
+                root.join("missing"),
+                first.clone(),
+                second.clone(),
+            ]
+            .into_iter()
+        };
         assert_eq!(
             find_windows_launcher(dirs(), "muse").as_deref(),
             first.join("muse.cmd").to_str()
         );
         assert_eq!(find_windows_launcher(dirs(), "absent"), None);
         let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&relative);
     }
 
     #[test]
