@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.7.0
+
+- Add adapter slash commands for Muse host controls: `/goal` sets, edits,
+  pauses, resumes, or clears the session goal; `/rename <name>` renames the
+  session; and `/workflow-child skip|retry <childId>` controls one child of a
+  running workflow using its current attempt. Workflow cards now show child
+  ids, and a bare `/workflow-child` lists the children you can control.
+- Stop relaunching a Muse host that crashes right after every restart: at
+  most five automatic restarts are allowed in any ten minutes, with growing
+  backoff, before the adapter stops with an explicit message.
+- Re-pin the vendored Muse SDK conformance corpus to `a7c10c5`. Its manifest
+  matches the live-validated 1.3.0-R3401.1 host surface, so it now classifies
+  as tested. Every emitted host request is validated against the schema's
+  method index.
+- Document the negotiated protocol extensions in the README and reconcile the
+  roadmap's Muse 1.3.0 disposition table with landed support.
+
 ## 0.6.2
 
 - Rewrite the README for new users, covering quick start, editor setup,
