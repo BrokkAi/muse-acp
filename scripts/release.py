@@ -145,13 +145,32 @@ def validate(directory):
     return {t: inspect_archive(directory, t) for t in TARGETS}
 
 
-def tag_check():
+def tag_commit():
+    """The commit the version's tag points at, or None when it has no tag."""
     ref = optional('git/ref/tags/' + TAG)
-    if ref:
-        obj = ref['object']
-        while obj['type'] == 'tag':
-            obj = api('git/tags/' + obj['sha'])['object']
-        require(obj['type'] == 'commit' and obj['sha'] == SHA, 'Existing tag points at another commit')
+    if not ref:
+        return None
+    obj = ref['object']
+    while obj['type'] == 'tag':
+        obj = api('git/tags/' + obj['sha'])['object']
+    require(obj['type'] == 'commit', 'Tag does not point at a commit')
+    return obj['sha']
+
+
+def tag_check():
+    commit = tag_commit()
+    require(commit in (None, SHA), 'Existing tag points at another commit')
+
+
+def preflight_superseded():
+    # After a release, master keeps the released version until the next bump.
+    # Its pushes have nothing to publish, so the publisher preflight passes as
+    # a no-op instead of failing on the existing tag. Release topic branches,
+    # dispatches, and tag pushes keep the strict check.
+    if os.environ.get('GITHUB_EVENT_NAME') != 'push' or os.environ.get('GITHUB_REF') != 'refs/heads/master':
+        return False
+    commit = tag_commit()
+    return commit is not None and commit != SHA
 
 
 def find_release(tag):
@@ -251,9 +270,10 @@ def evidence(kind):
     runs = json.loads(gh('run', 'list', '--repo', 'github.com/' + REPO, '--commit', SHA, '--limit', '100',
                         '--json', 'databaseId,workflowName,headSha,headBranch,event,status,conclusion'))
     for workflow in ['ci', 'release']:
-        event = 'workflow_dispatch' if kind == 'authorization' and workflow == 'release' else 'push'
-        candidates = [r for r in runs if r['workflowName'] == workflow and r['headSha'] == SHA and r['event'] == event and not r['headBranch'].startswith('v')]
-        require(candidates, 'Missing exact-commit ' + workflow + ' ' + event + ' run')
+        # The automatic branch push runs are the preflight; no manual dispatch
+        # is needed, so pushing the tag is the only release action.
+        candidates = [r for r in runs if r['workflowName'] == workflow and r['headSha'] == SHA and r['event'] == 'push' and not r['headBranch'].startswith('v')]
+        require(candidates, 'Missing exact-commit ' + workflow + ' push run')
         run = max(candidates, key=lambda r: r['databaseId'])
         require(run['status'] == 'completed' and run['conclusion'] == 'success', 'Latest ' + workflow + ' run did not succeed')
         detail = json.loads(gh('run', 'view', str(run['databaseId']), '--repo', 'github.com/' + REPO, '--json', 'headSha,jobs,conclusion'))
@@ -320,6 +340,9 @@ if __name__ == '__main__':
             package(sys.argv[2], Path('dist'))
         elif mode == 'authorize':
             metadata()
+            if preflight_superseded():
+                print(f'{TAG} is already released at another commit; no publisher preflight until the version is bumped.')
+                sys.exit(0)
             release = release_state()
             if release and not release['draft']:
                 validate(Path('dist'))
@@ -329,6 +352,9 @@ if __name__ == '__main__':
         elif mode == 'staged':
             metadata()
             validate(Path('dist'))
+            if preflight_superseded():
+                print(f'{TAG} is already released at another commit; staged assets validated, release state not compared.')
+                sys.exit(0)
             if os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch' or (
                 os.environ.get('GITHUB_EVENT_NAME') == 'push'
                 and os.environ.get('GITHUB_REF', '').startswith('refs/tags/')

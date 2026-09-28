@@ -20,6 +20,9 @@
   `PATH`. Previously Muse was never found there unless `MUSE_CLI` was set.
 - On Windows, `muse-acp install` records the full path to `muse-acp.exe` in
   Zed's settings, because the PowerShell installer does not change `PATH`.
+- Fix `muse-acp install` and `uninstall` on Windows: they now edit
+  `%APPDATA%\Zed\settings.json`, where Zed reads its settings, instead of
+  `~/.config/zed/settings.json`.
 
 ## 0.7.0
 

@@ -102,6 +102,42 @@ class ArchiveValidation(unittest.TestCase):
                 release.authorization()
 
 
+class TagOnlyRelease(unittest.TestCase):
+    def test_master_push_with_released_version_is_a_no_op(self):
+        env = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/master'}
+        with patch.dict(release.os.environ, env), patch.object(release, 'tag_commit', return_value='0' * 40):
+            self.assertTrue(release.preflight_superseded())
+
+    def test_unreleased_version_on_master_is_still_checked(self):
+        env = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': 'refs/heads/master'}
+        with patch.dict(release.os.environ, env), patch.object(release, 'tag_commit', return_value=None):
+            self.assertFalse(release.preflight_superseded())
+
+    def test_release_branches_and_tags_keep_the_strict_check(self):
+        for ref in ['refs/heads/brb/release-9.9.9', 'refs/tags/' + release.TAG]:
+            env = {'GITHUB_EVENT_NAME': 'push', 'GITHUB_REF': ref}
+            with patch.dict(release.os.environ, env), patch.object(release, 'tag_commit', return_value='0' * 40):
+                self.assertFalse(release.preflight_superseded(), ref)
+        with patch.object(release, 'tag_commit', return_value='0' * 40):
+            with self.assertRaisesRegex(RuntimeError, 'another commit'):
+                release.tag_check()
+
+    def test_authorization_evidence_needs_only_push_runs(self):
+        push_runs = [{'databaseId': n, 'workflowName': w, 'headSha': release.SHA,
+                      'headBranch': 'master', 'event': 'push', 'status': 'completed',
+                      'conclusion': 'success'} for n, w in [(1, 'ci'), (2, 'release')]]
+        ci_detail = {'headSha': release.SHA, 'conclusion': 'success',
+                     'jobs': [{'name': 'check', 'conclusion': 'success'}]}
+        with patch.object(release, 'metadata'), patch.object(
+            release, 'gh', side_effect=[json.dumps(push_runs).encode(),
+                                        json.dumps(ci_detail).encode(), RuntimeError('release run read')]
+        ):
+            # Reaching the release push run's detail proves no manual
+            # workflow_dispatch run was demanded.
+            with self.assertRaisesRegex(RuntimeError, 'release run read'):
+                release.evidence('authorization')
+
+
 class DraftRecovery(unittest.TestCase):
     def test_hidden_draft_found_on_later_page_and_read_by_id(self):
         draft = {'id': 42, 'tag_name': release.TAG, 'draft': True}
