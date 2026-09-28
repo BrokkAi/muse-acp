@@ -237,6 +237,25 @@ Other permission profiles are passed through unchanged.
 - **Stored output** — bounded tool output with head and tail retained, plus
   opt-in `_session/readOutput` access to the host's stored bytes.
 
+### Protocol extensions
+
+Beyond core ACP, the adapter negotiates these extensions. Each activates
+only when the client opts in too, with the documented fallback otherwise:
+
+- `_session/steering` (ACP v2 only) — exact-turn steering; rejected with
+  `-32601` on v1. Follows the ecosystem `_session/steering` convention
+  (`steering.supported`); the standards-track `session/inject` proposal is
+  still unmerged — adopting it is future work.
+- `_session/readOutput` — opt-in reads of host-stored tool output.
+- `_session/userShell` — shell commands outside any turn; needs editor
+  opt-in, AIR `asyncTasks`, and a host grant all together.
+- `_session/async_task/stop` — stop one background task; `session/cancel`
+  maps background work to `task/stopAll`.
+- JetBrains AIR v1 (`agentFileChangeReport`, `nativeSubagentSessions`,
+  `asyncTasks`, `recommendedValue`) — per-turn file-change reports, native
+  subagent sessions, async-task observation and stops, model and reasoning
+  recommendations.
+
 The [MSP event compatibility matrix](docs/event-compatibility.md) records the
 ACP mapping or intentional disposition of every notification in the pinned
 schema. [ROADMAP.md](ROADMAP.md) tracks compatibility, reliability, and release
