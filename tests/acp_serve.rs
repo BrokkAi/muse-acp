@@ -4182,7 +4182,25 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 }
 
 #[test]
-fn sdk_manifest_fingerprint_is_degraded_not_tested() {
+fn sdk_manifest_fingerprint_is_tested() {
+    // The vendored SDK manifest (a7c10c5) equals the live-validated
+    // 1.3.0-R3401.1 host surface.
+    let mut c = Client::spawn(
+        "quiet",
+        &[(
+            "FAKE_FINGERPRINT",
+            "sha256:7469c9e352e67def4a59df7e439984d7194fa351e1c8b7abb34060fd977ced81",
+        )],
+    );
+    c.initialize(1, "");
+    c.wait_stderr("status=tested", Duration::from_secs(10));
+    c.finish();
+}
+
+#[test]
+fn retired_sdk_manifest_fingerprint_is_unknown() {
+    // The fbce769 manifest fingerprint was never a live host; once the pin
+    // moved it must not keep a compatibility entry.
     let mut c = Client::spawn(
         "quiet",
         &[(
@@ -4191,7 +4209,7 @@ fn sdk_manifest_fingerprint_is_degraded_not_tested() {
         )],
     );
     c.initialize(1, "");
-    c.wait_stderr("status=degraded", Duration::from_secs(10));
+    c.wait_stderr("status=unknown", Duration::from_secs(10));
     c.finish();
 }
 
