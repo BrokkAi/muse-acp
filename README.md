@@ -218,6 +218,10 @@ Other permission profiles are passed through unchanged.
 - **Skills** — Muse's skill catalog drives ACP `available_commands_update`.
   Slash prompts such as `/plan` use native skill turn parts; `/compact` invokes
   Muse's native compaction.
+- **Goals** — `/goal <objective>` sets the session goal, `/goal edit
+  <objective>` replaces it, and `/goal pause`, `/goal resume`, `/goal clear`
+  manage it, mapping onto the host `goal/*` methods. Goal state still streams
+  back through `session/goalChanged` display metadata.
 - **Content** — text, inline and local-file images, `resource_link` text
   expansion, and embedded context. Audio is rejected, because Muse's input type
   is closed to `text` and `image`.

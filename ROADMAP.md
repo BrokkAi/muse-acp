@@ -645,7 +645,7 @@ supplies no summary.
 
 Surface session-level state without corrupting prompt settlement.
 
-Status: **implemented (display plus settlement); goal control is host-driven.**
+Status: **implemented (display plus `/goal` control).**
 `session/goalChanged` (including explicit `null` clears) publishes the
 provider-neutral `_meta.goal` presentation on `session_info_update`;
 `session/branchChanged` publishes a namespaced branch observation; both are
@@ -656,13 +656,16 @@ non-settling per schema (it never resolves a turn-wait) and records attempt
 facts in diagnostics. Race tests pin retract-then-completed and
 retry-then-completed settle-exactly-once.
 
-The stable MSP `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and
-`goal/clear` methods remain host/TUI controls. ACP has no standard negotiated
-goal-mutation capability, so the adapter does not invent an editor request
-surface or advertise one. Host-issued changes are still folded and published
-with MSP's wake gates intact: set/edit/resume may wake an idle unfinished goal,
-while pause/clear never wake. Revisit this decision if ACP gains a negotiated
-goal-control surface.
+The `/goal` slash command maps onto the stable MSP `goal/set`, `goal/edit`,
+`goal/pause`, `goal/resume`, and `goal/clear` methods with the host TUI
+syntax, settling the ACP prompt immediately while goal display and any woken
+turn stream separately. Bare `/goal` and malformed invocations fail closed
+with usage guidance and never reach the host. Direct ACP `goal/*` methods
+stay outside the negotiated surface and are still rejected (`-32601`),
+pinned by `goal_control_remains_host_driven_without_acp_negotiation`.
+Host-issued changes are still folded and published with MSP's wake gates
+intact: set/edit/resume may wake an idle unfinished goal, while pause/clear
+never wake.
 
 **Work items**
 - Represent branch changes (`BranchState { branch, vcs, workspaceRoot }` from

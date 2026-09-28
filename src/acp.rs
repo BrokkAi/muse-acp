@@ -768,8 +768,12 @@ pub fn session_modes(current_mode: &str) -> String {
 }
 
 /// Build the editor command palette from the host's current skill catalog.
-/// `/compact` is local to the adapter and therefore remains available even
-/// though it is not a host skill.
+/// `/compact` and `/goal` are local to the adapter and therefore remain
+/// available even though they are not host skills: `/compact` invokes the
+/// host's native compaction and `/goal
+/// [<objective>|edit <objective>|clear|pause|resume]` maps onto the host
+/// `goal/*` methods. Any catalog row named `goal` is deduplicated below so
+/// the local command is advertised exactly once.
 fn available_commands_json(ver: u8, skills: &[(String, String, Option<String>)]) -> String {
     let input = |hint: &str| {
         if ver == 1 {
@@ -778,19 +782,27 @@ fn available_commands_json(ver: u8, skills: &[(String, String, Option<String>)])
             format!("{{\"type\":\"text\",\"hint\":{}}}", esc(hint))
         }
     };
-    let mut items =
-        vec!["{\"name\":\"compact\",\"description\":\"Compact the session context\"}".to_string()];
-    items.extend(skills.iter().map(|(name, description, hint)| {
-        let input = hint
-            .as_deref()
-            .map(|hint| format!(",\"input\":{}", input(hint)))
-            .unwrap_or_default();
+    let goal_hint = "[<objective>|edit <objective>|clear|pause|resume]";
+    let mut items = vec![
+        "{\"name\":\"compact\",\"description\":\"Compact the session context\"}".to_string(),
         format!(
-            "{{\"name\":{},\"description\":{}{input}}}",
-            esc(name),
-            esc(description),
-        )
-    }));
+            "{{\"name\":\"goal\",\"description\":\"Start or manage continuous work toward a goal\",\"input\":{}}}",
+            input(goal_hint)
+        ),
+    ];
+    items.extend(skills.iter().filter(|(name, _, _)| name != "goal").map(
+        |(name, description, hint)| {
+            let input = hint
+                .as_deref()
+                .map(|hint| format!(",\"input\":{}", input(hint)))
+                .unwrap_or_default();
+            format!(
+                "{{\"name\":{},\"description\":{}{input}}}",
+                esc(name),
+                esc(description),
+            )
+        },
+    ));
     format!("[{}]", items.join(","))
 }
 
@@ -989,8 +1001,10 @@ mod tests {
             let J::Arr(items) = parsed else {
                 panic!("available commands must be an array");
             };
-            assert_eq!(items.len(), 2);
+            assert_eq!(items.len(), 3);
             assert!(commands.contains("\"name\":\"plan\""));
+            assert!(commands.contains("\"name\":\"goal\""));
+            assert!(commands.contains("\"name\":\"compact\""));
         }
         assert!(crate::json::parse_json(&session_modes("promptUnmatched")).is_ok());
     }
