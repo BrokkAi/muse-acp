@@ -409,9 +409,11 @@ usable cursor for the unload fold-failure arm.
 
 **Muse Code 1.3.0 stable-surface additions**
 
-The pinned schema bundle predates the Muse 1.3.0 additions, so this inventory is
-kept beside the notification rows until the bundle is re-pinned. A disposition
-of **Unsupported pending protocol decision** means the adapter does not send or
+The pinned schema bundle (`a7c10c5`) now includes the Muse 1.3.0 additions, and
+its notifications are classified in
+[`docs/event-compatibility.md`](docs/event-compatibility.md). This inventory also
+covers the added methods, error kinds, and requests, which that matrix does not
+track. A disposition of **Unsupported pending protocol decision** means the adapter does not send or
 surface the entry yet; the linked issue is the planned follow-up. Incoming
 notifications with that disposition remain safe because the notification
 fold's unknown-method path logs and continues.
