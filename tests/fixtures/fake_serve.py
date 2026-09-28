@@ -192,6 +192,7 @@ def turn_id():
 ACTIVE_SESSION = [MSP_SID]
 CRASH_AFTER_ACK = [False]
 WORKFLOW_TURN = [""]
+WORKFLOW_CHILD_ATTEMPT = [1]
 
 
 ACTIVE_WORKSPACE = ["/tmp/fake-ws"]
@@ -1402,6 +1403,27 @@ def result_for(method, msg):
         params = msg.get("params", {})
         log_input(params)
         return {"commandId": params.get("commandId", ""), "status": "accepted"}
+    if method == "workflow/childControl":
+        params = msg.get("params", {})
+        log_input(params)
+        # A retry starts the next attempt; with FAKE_WORKFLOW_SILENT_RETRY the
+        # new attempt is not announced, so the adapter's next control is stale
+        # (rejected in the dispatch loop).
+        if params.get("action") == "retry":
+            WORKFLOW_CHILD_ATTEMPT[0] += 1
+            if not os.environ.get("FAKE_WORKFLOW_SILENT_RETRY"):
+                notify("item/updated", {
+                    "sessionId": MSP_SID, "turnId": WORKFLOW_TURN[0], "item": {
+                        "itemId": "it-wf-control", "kind": "workflow",
+                        "status": "inProgress", "revision": 2 + WORKFLOW_CHILD_ATTEMPT[0],
+                        "workflowRunId": "wfr-control", "entryId": "triage-batch",
+                        "scriptId": "triage@sha256:aa10",
+                        "triggerSource": "modelProposal",
+                        "children": [{"childId": "c1",
+                                      "attempt": WORKFLOW_CHILD_ATTEMPT[0],
+                                      "status": "started", "phase": "triage",
+                                      "label": "triage issue #1"}]}})
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
     if method == "workflow/cancel":
         params = msg.get("params", {})
         log_input(params)
@@ -1569,6 +1591,18 @@ def main():
                           "error": {"code": -32601,
                                     "message": "method not found: session/setReasoningEffort",
                                     "data": {"kind": "methodNotFound"}}})
+                    continue
+                if (method == "workflow/childControl"
+                        and msg.get("params", {}).get("attempt")
+                        != WORKFLOW_CHILD_ATTEMPT[0]):
+                    # The host keys child control by (childId, attempt): a
+                    # stale attempt is rejected, never re-keyed.
+                    log_input(msg.get("params", {}))
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32030,
+                                    "message": "stale_attempt: re-read the workflow item",
+                                    "data": {"kind": "commandRejected",
+                                             "reason": "stale_attempt"}}})
                     continue
                 if (SCENARIO == "skill_not_found"
                         and method in ("turn/start", "turn/steer")):

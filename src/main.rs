@@ -3586,16 +3586,26 @@ fn handle_acp(
                 }
                 return;
             }
-            // `/goal ...` and `/rename ...` are protocol commands, not
-            // prompts: run the matching host method and settle immediately.
-            // Their effects (`session/goalChanged`, `session/nameChanged`,
-            // any woken goal turn) arrive as their own updates.
+            // `/goal ...`, `/rename ...`, and `/workflow-child ...` are
+            // protocol commands, not prompts: run the matching host method
+            // and settle immediately on its admission ack. Their effects
+            // (`session/goalChanged`, `session/nameChanged`, workflow item
+            // updates, any woken goal turn) arrive as their own updates.
             let command_attempt = parse_json(&acp_content).ok().and_then(|c| match c {
                 J::Arr(blocks) if blocks.len() == 1 => {
                     let only = &blocks[0];
                     let text = only.get("text").and_then(|v| v.as_str()).unwrap_or("");
                     if only.get("type").and_then(|v| v.as_str()) == Some("text") {
-                        parse_protocol_command(text).map(|parsed| (text.to_string(), parsed))
+                        let workflow_children = || {
+                            sessions
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .get(&sid)
+                                .map(|s| s.fold.workflow_children())
+                                .unwrap_or_default()
+                        };
+                        parse_protocol_command(text, &workflow_children)
+                            .map(|parsed| (text.to_string(), parsed))
                     } else {
                         None
                     }
@@ -3617,7 +3627,7 @@ fn handle_acp(
                     esc(&msp_sid)
                 );
                 for (key, value) in &fields {
-                    params.push_str(&format!(",{}:{}", esc(key), esc(value)));
+                    params.push_str(&format!(",{}:{}", esc(key), j_to_string(value)));
                 }
                 params.push('}');
                 match host.command(&method, &params) {
@@ -5138,20 +5148,85 @@ fn parse_rename_command(text: &str) -> Option<Result<String, String>> {
     }
 }
 
-/// A host method plus its string params besides `commandId` and `sessionId`.
-type ProtocolCommand = (String, Vec<(&'static str, String)>);
+/// Parse `/workflow-child skip|retry <childId>` against the session's running
+/// workflow children (read lazily, only for this command). The attempt comes
+/// from the latest folded workflow item, never from the user: a stale one is
+/// the host's `stale_attempt` rejection to report, not a value to guess. Usage
+/// errors list the controllable children so an editor user can find ids.
+fn parse_workflow_child_command(
+    text: &str,
+    children: &dyn Fn() -> Vec<fold::WorkflowChild>,
+) -> Option<Result<ProtocolCommand, String>> {
+    let body = text.strip_prefix('/')?;
+    let mut words = body.split_whitespace();
+    if words.next()? != "workflow-child" {
+        return None;
+    }
+    let children = children();
+    if children.is_empty() {
+        return Some(Err("no running workflow children to control".to_string()));
+    }
+    let listing = children
+        .iter()
+        .map(|c| {
+            format!(
+                "{} ({}, {}, attempt {})",
+                c.child_id, c.label, c.status, c.attempt
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let (Some(action @ ("skip" | "retry")), Some(child_id), None) =
+        (words.next(), words.next(), words.next())
+    else {
+        return Some(Err(format!(
+            "usage: /workflow-child skip|retry <childId>; running children: {listing}"
+        )));
+    };
+    let matches: Vec<_> = children.iter().filter(|c| c.child_id == child_id).collect();
+    Some(match matches.as_slice() {
+        [child] => Ok((
+            "workflow/childControl".to_string(),
+            vec![
+                ("action", J::Str(action.to_string())),
+                ("attempt", J::Num(child.attempt.to_string())),
+                ("childId", J::Str(child.child_id.clone())),
+                ("workflowRunId", J::Str(child.workflow_run_id.clone())),
+            ],
+        )),
+        [] => Err(format!(
+            "unknown workflow child {child_id}; running children: {listing}"
+        )),
+        _ => Err(format!(
+            "workflow child {child_id} is in more than one running workflow"
+        )),
+    })
+}
+
+/// A host method plus its params besides `commandId` and `sessionId`.
+type ProtocolCommand = (String, Vec<(&'static str, J)>);
 
 /// Parse an adapter-local slash command that maps onto one host method.
 /// Returns `None` when the text is not such a command.
-fn parse_protocol_command(text: &str) -> Option<Result<ProtocolCommand, String>> {
+fn parse_protocol_command(
+    text: &str,
+    workflow_children: &dyn Fn() -> Vec<fold::WorkflowChild>,
+) -> Option<Result<ProtocolCommand, String>> {
     if let Some(parsed) = parse_goal_command(text) {
         return Some(parsed.map(|(method, objective)| {
-            let fields = objective.map(|o| ("objective", o)).into_iter().collect();
+            let fields = objective
+                .map(|o| ("objective", J::Str(o)))
+                .into_iter()
+                .collect();
             (method, fields)
         }));
     }
-    parse_rename_command(text)
-        .map(|parsed| parsed.map(|name| ("session/rename".to_string(), vec![("name", name)])))
+    if let Some(parsed) = parse_rename_command(text) {
+        return Some(
+            parsed.map(|name| ("session/rename".to_string(), vec![("name", J::Str(name))])),
+        );
+    }
+    parse_workflow_child_command(text, workflow_children)
 }
 
 /// Convert an editor slash command into the native MSP skill part. Once the
@@ -5162,9 +5237,9 @@ fn parse_protocol_command(text: &str) -> Option<Result<ProtocolCommand, String>>
 /// the adapter's own `compact` command are always submitted. The host still
 /// resolves the selector, so a skill removed after the last catalog read
 /// produces its typed error. Without a catalog (the last read failed) every
-/// slash command is submitted and the host decides. (`/goal` and `/rename`
-/// never reach this function as skills: they are intercepted as protocol
-/// commands first.)
+/// slash command is submitted and the host decides. (`/goal`, `/rename`, and
+/// `/workflow-child` never reach this function as skills: they are
+/// intercepted as protocol commands first.)
 fn native_skill_part(
     text: &str,
     skills: Option<&std::collections::HashSet<String>>,

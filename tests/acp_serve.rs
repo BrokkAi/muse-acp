@@ -4980,17 +4980,121 @@ fn workflow_items_render_children_state() {
         "title missing: {card}"
     );
     assert!(
-        card.contains("triage issue #1: started (triage)"),
-        "child state missing: {card}"
+        card.contains("triage issue #1 [c1]: started (triage)"),
+        "child state and id missing: {card}"
     );
     assert!(
-        card.contains("ACP exposes no workflow child skip/retry surface"),
-        "unsupported child control reason missing: {card}"
+        !card.contains("childControlUnavailableReason"),
+        "child control is supported now: {card}"
     );
-    let done = c.wait_for("triage issue #1: completed", Duration::from_secs(15));
+    let done = c.wait_for("triage issue #1 [c1]: completed", Duration::from_secs(15));
     assert!(
         done.contains("\"workflowRunId\":\"wfr-1\""),
         "run id meta missing: {done}"
+    );
+    c.finish();
+}
+
+#[test]
+fn workflow_child_control_keys_the_current_attempt() {
+    // `/workflow-child skip|retry <childId>` maps onto
+    // `workflow/childControl`, taking the attempt from the latest folded
+    // workflow item, never from the user.
+    let mut c = Client::spawn("workflow_control", &[]);
+    let sid = c.new_session(2, "");
+    let commands = c.wait_for("available_commands_update", Duration::from_secs(15));
+    assert!(
+        commands.contains("\"name\":\"workflow-child\""),
+        "workflow-child must be advertised: {commands}"
+    );
+    // Without a running workflow there is nothing to control.
+    let pid = c.prompt(&sid, "/workflow-child retry c1");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32602") && frame.contains("no running workflow children"),
+        "control without a workflow must fail closed: {frame}"
+    );
+
+    let _run = c.prompt(&sid, "run workflow");
+    c.wait_for("triage issue #1 [c1]: started", Duration::from_secs(15));
+
+    // A bare command lists the controllable children.
+    let pid = c.prompt(&sid, "/workflow-child");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32602")
+            && frame.contains("c1 (triage issue #1, started, attempt 1)"),
+        "bare /workflow-child must list children: {frame}"
+    );
+    // An unknown child is a usage error, never a host call.
+    let pid = c.prompt(&sid, "/workflow-child skip nope");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32602") && frame.contains("nope"),
+        "unknown child must fail closed: {frame}"
+    );
+
+    let pid = c.prompt(&sid, "/workflow-child retry c1");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"result\""),
+        "retry must settle on the admission ack: {frame}"
+    );
+    c.wait_input("\"action\": \"retry\"", Duration::from_secs(10));
+    c.wait_for("triage issue #1 [c1]: started", Duration::from_secs(15));
+
+    // The retry's announced attempt 2 keys the next control.
+    let pid = c.prompt(&sid, "/workflow-child skip c1");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"result\""),
+        "skip must settle on the admission ack: {frame}"
+    );
+    c.wait_input("\"action\": \"skip\"", Duration::from_secs(10));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    let controls: Vec<&str> = input
+        .lines()
+        .filter(|line| line.contains("\"action\""))
+        .collect();
+    assert_eq!(controls.len(), 2, "two controls reach the host: {input}");
+    for (line, attempt, action) in [(controls[0], 1, "retry"), (controls[1], 2, "skip")] {
+        for field in [
+            format!("\"attempt\": {attempt}"),
+            format!("\"action\": \"{action}\""),
+            "\"childId\": \"c1\"".to_string(),
+            "\"workflowRunId\": \"wfr-control\"".to_string(),
+        ] {
+            assert!(line.contains(&field), "{action} is missing {field}: {line}");
+        }
+    }
+    c.finish();
+}
+
+#[test]
+fn workflow_child_control_surfaces_stale_attempt() {
+    // The host advanced the child without announcing it, so the adapter's
+    // attempt is stale: the rejection is shown, not silently re-keyed.
+    let mut c = Client::spawn("workflow_control", &[("FAKE_WORKFLOW_SILENT_RETRY", "1")]);
+    let sid = c.new_session(2, "");
+    let _run = c.prompt(&sid, "run workflow");
+    c.wait_for("triage issue #1 [c1]: started", Duration::from_secs(15));
+    let pid = c.prompt(&sid, "/workflow-child retry c1");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"result\""),
+        "first retry is admitted: {frame}"
+    );
+    let pid = c.prompt(&sid, "/workflow-child retry c1");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"error\"") && frame.contains("stale_attempt"),
+        "stale attempt must surface: {frame}"
+    );
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    assert_eq!(
+        input.lines().filter(|l| l.contains("\"action\"")).count(),
+        2,
+        "the stale control is sent once, never retried: {input}"
     );
     c.finish();
 }

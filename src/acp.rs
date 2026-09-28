@@ -768,11 +768,13 @@ pub fn session_modes(current_mode: &str) -> String {
 }
 
 /// Build the editor command palette from the host's current skill catalog.
-/// `/compact`, `/goal`, and `/rename` are local to the adapter and therefore
-/// remain available even though they are not host skills: `/compact` invokes
-/// the host's native compaction, `/goal
+/// `/compact`, `/goal`, `/rename`, and `/workflow-child` are local to the
+/// adapter and therefore remain available even though they are not host
+/// skills: `/compact` invokes the host's native compaction, `/goal
 /// [<objective>|edit <objective>|clear|pause|resume]` maps onto the host
-/// `goal/*` methods, and `/rename <name>` maps onto `session/rename`. Catalog
+/// `goal/*` methods, `/rename <name>` maps onto `session/rename`, and
+/// `/workflow-child skip|retry <childId>` maps onto `workflow/childControl`.
+/// Catalog
 /// rows with a local command's name are deduplicated below so each local
 /// command is advertised exactly once.
 fn available_commands_json(ver: u8, skills: &[(String, String, Option<String>)]) -> String {
@@ -794,11 +796,15 @@ fn available_commands_json(ver: u8, skills: &[(String, String, Option<String>)])
             "{{\"name\":\"rename\",\"description\":\"Rename this session\",\"input\":{}}}",
             input("<name>")
         ),
+        format!(
+            "{{\"name\":\"workflow-child\",\"description\":\"Skip or retry a running workflow child\",\"input\":{}}}",
+            input("skip|retry <childId>")
+        ),
     ];
     items.extend(
         skills
             .iter()
-            .filter(|(name, _, _)| name != "goal" && name != "rename")
+            .filter(|(name, _, _)| !matches!(name.as_str(), "goal" | "rename" | "workflow-child"))
             .map(|(name, description, hint)| {
                 let input = hint
                     .as_deref()
@@ -1013,11 +1019,12 @@ mod tests {
                 panic!("available commands must be an array");
             };
             // The host's `rename` row is shadowed by the local command.
-            assert_eq!(items.len(), 4);
+            assert_eq!(items.len(), 5);
             assert!(commands.contains("\"name\":\"plan\""));
             assert!(commands.contains("\"name\":\"goal\""));
             assert!(commands.contains("\"name\":\"compact\""));
             assert!(commands.contains("\"name\":\"rename\""));
+            assert!(commands.contains("\"name\":\"workflow-child\""));
             assert!(!commands.contains("Host rename skill"));
         }
         assert!(crate::json::parse_json(&session_modes("promptUnmatched")).is_ok());

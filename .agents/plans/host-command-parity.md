@@ -22,11 +22,12 @@ To see it working, run the integration tests named in Validation and Acceptance.
 - [x] (2026-09-28) Reopened #38, #41, and #46 with comments explaining the remaining work, so unsupported rows link open issues.
 - [x] (2026-09-28) Step 1, roadmap reconcile: rewrote 22 stale rows of the ROADMAP section 9 table from the code paths (branch `brb/roadmap-130-reconcile`).
 - [x] (2026-09-28) Step 2, `/rename` mapped to `session/rename` (branch `brb/rename-slash-command`). The `/goal` intercept is now a generic protocol-command dispatch (`parse_protocol_command`), which step 3 extends.
-- [ ] Step 3a, retain workflow children per run in fold state.
-- [ ] Step 3b, make child ids discoverable from the editor.
-- [ ] Step 3c, the workflow child-control slash command.
-- [ ] Step 3d, remove the hardcoded `childControlUnavailableReason`.
-- [ ] Step 4, record the `task/background` rationale on a tracking issue.
+- [x] (2026-09-28) Step 2 merged in PR #142, which closed #41.
+- [x] (2026-09-28) Step 3a: `SessionFold::observe_workflow` keeps the latest `(revision, children)` per `workflowRunId`, fed from snapshots, completions, and resume replay; `SessionFold::workflow_children` reads it.
+- [x] (2026-09-28) Step 3b: workflow cards render `label [childId]: status (phase)`, and usage errors list the children with status and attempt.
+- [x] (2026-09-28) Step 3c: `/workflow-child skip|retry <childId>` maps onto `workflow/childControl` (branch `brb/workflow-child-control`).
+- [x] (2026-09-28) Step 3d: removed the `childControlUnavailableReason` meta.
+- [x] (2026-09-28) Step 4: the `task/background` rationale is recorded on reopened issue #38.
 
 
 ## Surprises & Discoveries
@@ -52,6 +53,8 @@ Decision: once the SDK manifest fingerprint equals the live-validated 1.3.0-R340
 
 Decision: the workflow child-control command never takes `attempt` from the user. It reads `attempt` from the adapter's latest copy of the workflow item. Rationale: the schema says a stale attempt is rejected with `stale_attempt` and must never be guessed. Surface that rejection verbatim rather than retrying. Date: 2026-09-28.
 
+Decision: name the child-control command `/workflow-child skip|retry <childId>`. Rationale: a bare `/workflow` could shadow a host skill of that name, while the hyphenated name is unambiguous. Protocol-command params became JSON values instead of strings, because `attempt` is an integer. If a child id appears in more than one running workflow, the command is rejected rather than guessing a run. Date: 2026-09-28.
+
 Decision: do not build `task/background`. Rationale: see the step 4 section of Plan of Work. Date: 2026-09-28.
 
 Decision: rows that stay "Unsupported pending protocol decision" must link an open issue. Reopen #38, #41, and #46, or file replacements; either needs the maintainer's approval because it is visible on GitHub. Date: 2026-09-28.
@@ -62,7 +65,7 @@ Decision: ship steps 2 and 3 as separate pull requests rather than one. Rational
 ## Outcomes & Retrospective
 
 
-Step 0 is complete and merged in PR #139. The corpus diff was purely additive, and all CONTRIBUTING gates passed locally. Nothing else has landed yet.
+Step 0 merged in PR #139, step 1 in PR #141, and step 2 in PR #142. Step 3 is implemented with integration tests for the mapping, attempt tracking across a retry, usage listings, unknown children, and a surfaced `stale_attempt`. A fold unit test covers revision ordering and terminal cleanup. Step 4 is recorded on #38, which stays open because `task/background` is deliberately unbuilt. When step 3 merges, every Muse 1.3.0 host command except `task/background` has an editor path.
 
 
 ## Context and Orientation
