@@ -6844,9 +6844,10 @@ fn timed_out_pipe_write_cannot_be_delivered_later() {
     let list = c.req("session/list", "{}");
     c.wait_for(&format!("\"id\":{list}"), Duration::from_secs(5));
     c.wait_log("pipe-stall-start", Duration::from_secs(5));
-    let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"text","text":"x".repeat(128 * 1024)}]});
+    // Larger than any platform's pipe buffer, so the write must block.
+    let params = serde_json::json!({"sessionId":sid,"prompt":[{"type":"text","text":"x".repeat(1024 * 1024)}]});
     let id = c.req("session/prompt", &params.to_string());
-    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(12));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(30));
     assert!(
         frame.contains("error") && frame.contains("host terminated"),
         "{frame}"

@@ -11,7 +11,9 @@ const { targetFor } = require('../bin/muse-acp.cjs');
 
 function fixture(t, withBinary = true) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'muse-acp-npm-'));
-  t.after(() => fs.rmSync(root, { recursive: true, force: true }));
+  // Windows can briefly keep an exited child's files locked (EPERM/EBUSY);
+  // rmSync retries those errors.
+  t.after(() => fs.rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }));
   fs.mkdirSync(path.join(root, 'bin'));
   const launcher = path.join(root, 'bin/muse-acp.cjs');
   fs.copyFileSync(path.join(__dirname, '../bin/muse-acp.cjs'), launcher);
