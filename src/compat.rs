@@ -14,12 +14,6 @@ pub const SUPPORTED_SCHEMA_VERSION: u64 = 1;
 pub const TESTED_FINGERPRINT: &str =
     "sha256:03312c213efd14277a0e0a102f70adeae497a469ca4edf7242f479953ed758b7";
 
-/// Fingerprint published by the Muse SDK manifest at revision `fbce769`
-/// (schema version 1). Recorded because it is the shape source we track, but
-/// it has not been verified against a live `muse serve` build yet.
-pub const SDK_MANIFEST_FINGERPRINT: &str =
-    "sha256:cfd31ee77d78fdada9febc4edccd29b0434ff8f6bf157c7c03fd0ecfcbc29f5a";
-
 /// Stable-surface fingerprint of the Muse 1.2.1 host (schema version 1).
 /// The `initialize` reply carries this fingerprint (it is the stable-surface
 /// digest, not a build hash), and it matches the binary's own `muse schema`
@@ -40,6 +34,12 @@ pub const HOST_130_FINGERPRINT: &str =
 /// and full turn (`end_turn`, `terminal=completed`).
 pub const HOST_130_R3401_1_FINGERPRINT: &str =
     "sha256:7469c9e352e67def4a59df7e439984d7194fa351e1c8b7abb34060fd977ced81";
+
+/// Fingerprint published by the vendored Muse SDK manifest at revision
+/// `a7c10c5` (schema version 1). It is the same stable surface the 1.3.0-R3401.1
+/// host reports, so it classifies through that live-validated entry rather
+/// than a separate table arm.
+pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_130_R3401_1_FINGERPRINT;
 
 /// Fingerprint embedded in the SDK conformance-transcript fixtures. It is
 /// deliberately distinct from every host fingerprint and must never be
@@ -104,10 +104,6 @@ impl Compatibility {
 fn table_entry(fingerprint: &str) -> Option<(Status, &'static str)> {
     Some(match fingerprint {
         TESTED_FINGERPRINT => (Status::Tested, "validated against live host 1.0.2"),
-        SDK_MANIFEST_FINGERPRINT => (
-            Status::Degraded,
-            "SDK manifest fbce769 schema v1; no live-host verification recorded",
-        ),
         HOST_121_FINGERPRINT => (Status::Tested, "validated against live host 1.2.1"),
         HOST_130_FINGERPRINT => (Status::Tested, "validated against live host 1.3.0"),
         HOST_130_R3401_1_FINGERPRINT => {
@@ -196,9 +192,13 @@ mod tests {
     }
 
     #[test]
-    fn sdk_manifest_is_degraded_not_tested() {
+    fn sdk_manifest_matches_live_validated_r3401_1() {
+        // The vendored SDK manifest (a7c10c5) publishes the exact surface the
+        // live 1.3.0-R3401.1 host was validated against, so it is tested, not
+        // merely a known shape.
+        assert_eq!(SDK_MANIFEST_FINGERPRINT, HOST_130_R3401_1_FINGERPRINT);
         let c = classify(Some(1), SDK_MANIFEST_FINGERPRINT);
-        assert_eq!(c.status, Status::Degraded);
+        assert_eq!(c.status, Status::Tested);
         assert!(!c.is_fatal());
     }
 

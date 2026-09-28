@@ -9,9 +9,10 @@ access, and useful in real editor workflows.
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
-- **Reference snapshots used for this revision:** Muse SDK `fbce769`
-  (2026-09-02; stable schema version 1, manifest fingerprint
-  `sha256:cfd31ee77d78fdada9febc4edccd29b0434ff8f6bf157c7c03fd0ecfcbc29f5a`)
+- **Reference snapshots used for this revision:** Muse SDK `a7c10c5`
+  (2026-09-21; stable schema version 1, manifest fingerprint
+  `sha256:7469c9e352e67def4a59df7e439984d7194fa351e1c8b7abb34060fd977ced81`,
+  identical to the live-validated 1.3.0-R3401.1 host surface)
   and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
@@ -80,9 +81,10 @@ the verdict into richer support bundles.
 
 - Seed the table with the inputs already known to differ: the adapter pins
   `sha256:03312c213efd14277a0e0a102f70adeae497a469ca4edf7242f479953ed758b7`
-  (host 1.0.2), while the SDK manifest at `fbce769` publishes
+  (host 1.0.2). The SDK manifest at the earlier `fbce769` pin published
   `sha256:cfd31ee77d78fdada9febc4edccd29b0434ff8f6bf157c7c03fd0ecfcbc29f5a`
-  (schema version 1). Host 1.2.1 reports
+  (schema version 1, never live-validated; now unknown); the current `a7c10c5`
+  pin publishes the 1.3.0-R3401.1 fingerprint below. Host 1.2.1 reports
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
   bundle via the binary's own `muse schema` export, plus a live 1.2.1
@@ -123,7 +125,7 @@ The SDK publishes generated MSP types, a schema bundle, and recorded transcripts
 The Rust adapter should consume those artifacts as conformance inputs.
 
 Status: **emissions validated and permission paths replayed.**
-`tests/protocol/` pins SDK revision `fbce769` (stable manifest, JSON schema
+`tests/protocol/` pins SDK revision `a7c10c5` (stable manifest, JSON schema
 bundle, 50 golden transcripts) with provenance and license. CI now replays
 every server-side item event through the notification fold (unknown kinds must
 tolerate), validates every emitted ACP frame with the adapter's own parser,
@@ -138,7 +140,7 @@ explicit message by default).
 
 **Work items**
 
-- Pin the SDK revision (currently `fbce769`, 2026-09-02) and vendor
+- Pin the SDK revision (currently `a7c10c5`, 2026-09-21) and vendor
   `schema/msp/stable/manifest.json`, `schema/msp/stable/msp.schema.json`, and
   the `schema/msp/transcripts/` corpus under `tests/protocol/`, or fetch that
   locked revision in CI. The corpus already covers approvals, cancellation,
@@ -407,9 +409,11 @@ usable cursor for the unload fold-failure arm.
 
 **Muse Code 1.3.0 stable-surface additions**
 
-The pinned schema bundle predates the Muse 1.3.0 additions, so this inventory is
-kept beside the notification rows until the bundle is re-pinned. A disposition
-of **Unsupported pending protocol decision** means the adapter does not send or
+The pinned schema bundle (`a7c10c5`) now includes the Muse 1.3.0 additions, and
+its notifications are classified in
+[`docs/event-compatibility.md`](docs/event-compatibility.md). This inventory also
+covers the added methods, error kinds, and requests, which that matrix does not
+track. A disposition of **Unsupported pending protocol decision** means the adapter does not send or
 surface the entry yet; the linked issue is the planned follow-up. Incoming
 notifications with that disposition remain safe because the notification
 fold's unknown-method path logs and continues.

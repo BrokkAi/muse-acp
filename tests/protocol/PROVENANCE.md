@@ -1,8 +1,10 @@
 # Vendored Muse MSP conformance corpus
 
 - **Source:** <https://github.com/meta-models/muse-code-sdk>
-- **Upstream revision:** `fbce769ccb75ab971d00e01a00fe076de4c773fc`
-  ("Re-mirror SDK source closure at the docs cohort head", 2026-09-02)
+- **Upstream revision:** `a7c10c5dd3f66be412077d29f9d11111af70317b`
+  ("Merge pull request #25 from meta-models/python-tree-audience-gate",
+  2026-09-21). Only `schema/msp/` was copied; the revision's `python/`,
+  `clients/`, and `scripts/` trees are not vendored.
 - **License:** MIT — see `LICENSE.muse-code-sdk`
 - **Contents:**
   - `stable/manifest.json` — schema version + stable-surface fingerprint
