@@ -20,6 +20,18 @@
   `PATH`. Previously Muse was never found there unless `MUSE_CLI` was set.
 - On Windows, `muse-acp install` records the full path to `muse-acp.exe` in
   Zed's settings, because the PowerShell installer does not change `PATH`.
+- Make goal turns stoppable. A `/goal` command that starts a goal turn now
+  keeps the editor prompt open until that turn ends, so the editor shows it
+  running and Stop interrupts it (the host then pauses the goal). Stop and
+  closing a session also reach a turn the host started on its own, such as a
+  goal continuation.
+- `/goal stop`, `/goal cancel`, and other one-word control words now fail with
+  guidance instead of becoming a goal whose objective is that word.
+- `/goal`, `/rename`, and `/workflow-child` accept @-mentions, which join the
+  command as `[@name](uri)` links; images still fail the command. Previously
+  a mention turned the command into an ordinary prompt.
+- `/goal`, `/rename`, and `/workflow-child` now work while a tool permission
+  prompt is open, so a goal can be paused or cleared while its turn waits.
 - Fix `muse-acp install` and `uninstall` on Windows: they now edit
   `%APPDATA%\Zed\settings.json`, where Zed reads its settings, instead of
   `~/.config/zed/settings.json`.

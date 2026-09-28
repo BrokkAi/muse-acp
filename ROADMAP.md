@@ -427,11 +427,11 @@ fold's unknown-method path logs and continues.
 <!-- msp-1.3.0-matrix:start -->
 | MSP addition | Disposition | Adapter behavior or tracking |
 | --- | --- | --- |
-| `goal/clear` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack; goal state streams back through `session/goalChanged`. |
-| `goal/edit` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack; goal state streams back through `session/goalChanged`. |
-| `goal/pause` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack; goal state streams back through `session/goalChanged`. |
-| `goal/resume` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack; goal state streams back through `session/goalChanged`. |
-| `goal/set` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack; goal state streams back through `session/goalChanged`. |
+| `goal/clear` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack, or on the terminal of a goal turn the command woke, which Stop interrupts; goal state streams back through `session/goalChanged`. |
+| `goal/edit` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack, or on the terminal of a goal turn the command woke, which Stop interrupts; goal state streams back through `session/goalChanged`. |
+| `goal/pause` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack, or on the terminal of a goal turn the command woke, which Stop interrupts; goal state streams back through `session/goalChanged`. |
+| `goal/resume` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack, or on the terminal of a goal turn the command woke, which Stop interrupts; goal state streams back through `session/goalChanged`. |
+| `goal/set` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack, or on the terminal of a goal turn the command woke, which Stop interrupts; goal state streams back through `session/goalChanged`. |
 | `item/readOutput` | Mapped to ACP | Backs the opt-in `_session/readOutput` extension with bounded `offsetBytes`/`lengthBytes` reads of host-stored tool output. |
 | `session/rename` | Mapped to ACP | The adapter-local `/rename <name>` slash command sends `session/rename` and settles the prompt on the host ack; the new title arrives through `session/nameChanged`. |
 | `session/setReasoningEffort` | Mapped to ACP | Sent when the ACP reasoning `configOptions` selector picks a tier; the selector starts at "Muse default" and cannot clear a standing host default. |
@@ -668,9 +668,14 @@ retry-then-completed settle-exactly-once.
 
 The `/goal` slash command maps onto the stable MSP `goal/set`, `goal/edit`,
 `goal/pause`, `goal/resume`, and `goal/clear` methods with the host TUI
-syntax, settling the ACP prompt immediately while goal display and any woken
-turn stream separately. Bare `/goal` and malformed invocations fail closed
-with usage guidance and never reach the host. Direct ACP `goal/*` methods
+syntax. A command whose ack names a fresh goal turn (an idle wake) keeps the
+ACP prompt open as that turn's own, so the editor shows it running and
+`session/cancel` interrupts it (the host then pauses the goal); other commands
+settle on the ack. `session/cancel` also interrupts a running turn no prompt
+owns, such as a host goal continuation. Bare `/goal`, lone control words
+(`/goal stop`), and malformed invocations fail closed with usage guidance and
+never reach the host. @-mentions join the objective as `[@name](uri)` links,
+and goal commands bypass the pending-approval hold. Direct ACP `goal/*` methods
 stay outside the negotiated surface and are still rejected (`-32601`),
 pinned by `goal_control_remains_host_driven_without_acp_negotiation`.
 Host-issued changes are still folded and published with MSP's wake gates
