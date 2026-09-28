@@ -102,6 +102,11 @@ jobs:
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: python scripts/release.py publish
+      - name: Verify the published release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: python scripts/release.py published
       - name: Publish npm package with trusted publishing
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:

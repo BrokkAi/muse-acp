@@ -30,8 +30,12 @@ paths; Unix archives retain the installer's versioned parent directory.
    'test_*.py'`. Push the topic branch and open a PR to master. `ci.yml` runs on
    pushes and PRs. `release.yml` runs on master and release-topic pushes; these
    runs build/test all five platforms and validate the publisher without
-   publishing. A manual dispatch also only validates, and additionally compares its rebuilt
-   payloads with a prior successful push preflight at the same commit.
+   publishing. After a release, master keeps the released version until the
+   next bump; its `release` runs still build and test every platform, but the
+   publisher preflight passes as a no-op instead of failing on the existing
+   tag, so a red `release` run on master is always a real failure. A manual
+   dispatch is optional; it only validates, and additionally compares its
+   rebuilt payloads with a prior successful push preflight at the same commit.
 3. The `publisher` job uses the repository-scoped ephemeral `github.token`, with
    `contents: write` and `actions: read`, and no environment or external secret. It creates,
    updates, and deletes a disposable private draft (no assets or tag), proving
@@ -39,35 +43,34 @@ paths; Unix archives retain the installer's versioned parent directory.
    deletion. Ref lookups assert no probe tag was created. Organizations must
    permit Actions, these runners/actions, and the job's write token. A denied
    token or approval is a blocking error; local gh credentials are not proof.
-4. Merge the PR normally, respecting approvals and checks. Fetch master and
-   detach this workspace at the actual merged commit. Wait for both `ci` and
-   `release` push runs at that exact SHA to succeed. Dispatch `release.yml` against a
-   branch still pointing at that exact commit and require its successful
-   conclusion and matching head SHA. This non-publishing rebuild checks payload
-   reproducibility and exercises Actions artifact reads in the publisher job.
-   The authorization check requires this dispatch evidence. Run:
+4. Merge the PR normally, respecting approvals and checks. The `ci` and
+   `release` push runs at the merged commit are the release preflight; wait
+   for both to succeed. No manual workflow dispatch is required.
+
+   Optionally, verify the same evidence locally from a checkout detached at
+   the merged commit (these commands never publish):
 
    ```sh
    export RELEASE_COMMIT=$(git rev-parse HEAD)
    export RELEASE_TAG=vX.Y.Z
    python3 scripts/release.py build
-   python3 scripts/release.py authorization
    python3 scripts/release.py version
    ```
 
-   Replace `vX.Y.Z` with the proposed version's tag. These commands are non-publishing:
-   they require successful exact-SHA CI and all release jobs, inspect publisher
-   steps and unexpired Actions artifacts, and validate all packaged metadata.
-   Version additionally checks the tag/release namespace and any existing
-   assets. Authentication, network errors, missing/expired evidence, skipped
-   jobs, and conflicting versions fail closed. Artifact retention is 30 days;
-   rerun the unchanged commit's non-publishing workflow if evidence expires.
+   Replace `vX.Y.Z` with the proposed version's tag. They require successful
+   exact-SHA `ci` and `release` push runs, inspect the publisher steps and
+   unexpired Actions artifacts, validate all packaged metadata, and check the
+   tag/release namespace and any existing assets. Authentication, network
+   errors, missing/expired evidence, skipped jobs, and conflicting versions
+   fail closed. Artifact retention is 30 days; rerun the unchanged commit's
+   non-publishing workflow if evidence expires.
 
 ## Publication (separate authorization/phase)
 
-Only an explicit push of a matching `v*` tag publishes. Push the annotated tag
-from an authorized CLI identity; do not assume tags pushed with GITHUB_TOKEN
-will trigger Actions. Never create/push tags during preflight. The publication
+Pushing the matching annotated `v*` tag at the merged commit is the only
+release action; everything else runs in the tag workflow. Push it from an
+authorized CLI identity; do not assume tags pushed with GITHUB_TOKEN will
+trigger Actions. Never create/push tags during preflight. The publication
 workflow builds all platforms before its publisher starts. Release builds pin
 Rust 1.98.1. Windows uses the MSVC `/Brepro` linker option to avoid changing
 PE timestamps and identifiers (see [LLVM's reproducible-linking notes](https://blog.llvm.org/2019/11/deterministic-builds-with-clang-and-lld.html)).
@@ -91,10 +94,11 @@ for those bytes; never replace the archive just because compression differs.
 Already-public releases are verified read-only by the publication command.
 Never move tags or replace assets of a completed release.
 
-After publication, run `python3 scripts/release.py published` with
-`RELEASE_COMMIT` and `RELEASE_TAG` set. It requires a public release, the exact
+After publishing, the tag run's **Verify the published release** step runs
+`python3 scripts/release.py published`. It requires a public release, the exact
 tag commit and all twelve assets, validates every checksum and archive member,
-and compares payloads with the preflight build. Both `ci.yml` and `release.yml`
+and compares payloads with the preflight build. The same command can be rerun
+locally with `RELEASE_COMMIT` and `RELEASE_TAG` set. Both `ci.yml` and `release.yml`
 must also succeed in the tag push context; branch evidence cannot replace tag
 workflow verification. The installer consumes GitHub's latest release URL;
 there is no independently published update feed.
