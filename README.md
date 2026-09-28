@@ -133,6 +133,9 @@ Any other ACP client can launch `muse-acp` directly over stdio.
 }
 ```
 
+On Windows it records the full path to the running `muse-acp.exe` instead,
+because the PowerShell installer leaves `PATH` untouched.
+
 ### JetBrains IDEs
 
 `muse-acp install-intellij` writes `~/.jetbrains/acp.json`, recording the full
@@ -174,7 +177,7 @@ adapter.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MUSE_CLI` | `muse` | Muse host binary to launch. Use an absolute path when the editor's `PATH` differs from your shell's. |
+| `MUSE_CLI` | `muse` | Muse host binary to launch. Use an absolute path when the editor's `PATH` differs from your shell's. On Windows the default also finds the `muse.cmd` launcher that the Muse installer puts on `PATH`. |
 | `MUSE_SERVE_ARGS` | none | Extra host-lifetime flags for `muse serve` (see `muse serve --help`). Split on whitespace; no shell quoting or expansion. |
 | `MUSE_APPROVAL_MODE` | host default | Force an approval posture: `allowAll`, `promptUnmatched`, `onRequest`, or `denyUnmatched`. `promptUnmatched` sends every unmatched tool call through `session/request_permission`. |
 | `MUSE_COMMAND_TIMEOUT_MS` | method-specific | Override the host admission-ack deadline, in milliseconds. |
@@ -352,9 +355,14 @@ not be used with untrusted sessions.
 
 ## Authentication and remote environments
 
-When Muse reports that it is not authenticated, or that a session or credential
-has expired, the adapter returns ACP's `-32000` authentication-required error
-with login guidance. Editors that support ACP terminal auth then offer the
+When Muse has no credential, `session/new` and `session/load` fail with ACP's
+`-32000` authentication-required error, so editors such as Zed open their login
+screen before the first prompt. The adapter learns this from Muse's
+`account/read`, which reports only which kind of credential is in effect. That
+method is experimental, so the adapter opts into Muse's experimental API. If
+the check is unavailable, the first prompt reports the same error instead. A
+credential that expires later also yields `-32000` with login guidance.
+Editors that support ACP terminal auth then offer the
 adapter's `muse-login` method. It runs `muse-acp login` in a terminal, which
 runs `muse login` with the executable selected by `MUSE_CLI`, so you can
 approve the device code in your browser. You can also run either command
@@ -376,7 +384,8 @@ containers, remote IDE backends, or a different OS account, a login on your
 desktop does not help; log in on the remote host. The adapter never opens a
 browser, never prompts for credentials over ACP stdio, and never copies
 credentials between machines. Its only ACP auth method runs Muse's own login
-in a terminal, so credentials stay in the Muse environment.
+in a terminal, and `account/read` never returns key material, so credentials
+stay in the Muse environment.
 
 ## Sandbox advisory for Linux arm64
 

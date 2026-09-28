@@ -713,10 +713,27 @@ fn default_settings_path(client: Client) -> Result<std::path::PathBuf, String> {
     Ok(home_dir()?.join(relative))
 }
 
+fn running_exe() -> Result<std::path::PathBuf, String> {
+    std::env::current_exe()
+        .map_err(|e| format!("cannot determine the muse-acp executable path: {e}"))
+}
+
+/// Zed resolves a bare command through PATH at spawn time. The Windows
+/// installer leaves PATH untouched, so there a default install records this
+/// binary's full path instead; an explicit `--command` is kept as given.
+fn zed_command(command: &str) -> Result<String, String> {
+    if !(cfg!(windows) && command == DEFAULT_COMMAND) {
+        return Ok(command.to_string());
+    }
+    running_exe()?
+        .into_os_string()
+        .into_string()
+        .map_err(|_| "muse-acp executable path is not valid UTF-8".to_string())
+}
+
 fn intellij_command(command: &str) -> Result<String, String> {
     let path = if command == DEFAULT_COMMAND {
-        std::env::current_exe()
-            .map_err(|e| format!("cannot determine the muse-acp executable path: {e}"))?
+        running_exe()?
     } else {
         let path = std::path::PathBuf::from(command);
         if !path.is_absolute() {
@@ -800,16 +817,16 @@ fn cmd_install(client: Client, o: &InstallerOpts) -> i32 {
         },
     };
     let command = match client {
-        // Zed resolves the registered command through PATH at spawn time.
-        Client::Zed => o.command.clone(),
+        Client::Zed => zed_command(&o.command),
         // JetBrains requires a full path in ~/.jetbrains/acp.json.
-        Client::IntelliJ => match intellij_command(&o.command) {
-            Ok(command) => command,
-            Err(e) => {
-                eprintln!("muse-acp: {e}");
-                return 1;
-            }
-        },
+        Client::IntelliJ => intellij_command(&o.command),
+    };
+    let command = match command {
+        Ok(command) => command,
+        Err(e) => {
+            eprintln!("muse-acp: {e}");
+            return 1;
+        }
     };
     let original = match std::fs::read_to_string(&settings_path) {
         Ok(s) => s,
@@ -1023,6 +1040,21 @@ mod tests {
         assert!(path.is_absolute());
         assert!(path.is_file());
         assert!(intellij_command("relative/muse-acp").is_err());
+    }
+
+    #[test]
+    fn zed_default_command_is_absolute_only_on_windows() {
+        let command = zed_command(DEFAULT_COMMAND).unwrap();
+        if cfg!(windows) {
+            let path = std::path::Path::new(&command);
+            assert!(path.is_absolute() && path.is_file(), "{command}");
+        } else {
+            assert_eq!(command, DEFAULT_COMMAND);
+        }
+        assert_eq!(
+            zed_command("/opt/bin/muse-acp").unwrap(),
+            "/opt/bin/muse-acp"
+        );
     }
 
     fn temp_settings_path(name: &str) -> std::path::PathBuf {

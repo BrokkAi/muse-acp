@@ -1250,6 +1250,26 @@ fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
     }
 }
 
+/// Fail session creation with ACP's auth-required error while Muse has no
+/// credential. Clients such as Zed show their login screen for this error on
+/// session/new or session/load, but only an error banner when it arrives
+/// with the first prompt.
+fn reject_if_logged_out(host: &MspHost, stdout: &StdoutShared, id: &Option<J>) -> bool {
+    if !host.logged_out() {
+        return false;
+    }
+    // Shown above the client's login buttons, so lead with the button; the
+    // manual route covers clients without terminal auth.
+    acp::send_error(
+        stdout,
+        id,
+        -32000,
+        "Muse is not logged in. Choose **Log in with Muse** to approve a code in your browser, \
+         or run `muse login` where muse-acp runs and restart the agent.",
+    );
+    true
+}
+
 /// The single ACP auth method: terminal auth that re-runs this adapter as
 /// `muse-acp login`. Clients replace the agent's (empty) default arguments
 /// with `args`, so the login needs no separate executable.
@@ -1496,7 +1516,7 @@ fn selftest() -> i32 {
 /// diagnostic only: it must never gate selftest's exit status, because a
 /// support bundle may legitimately come from a machine without Muse.
 fn cli_readiness_lines() -> Vec<String> {
-    let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
+    let bin = msp::muse_cli();
     let output = std::process::Command::new(&bin)
         .arg("--version")
         .stdin(std::process::Stdio::null())
@@ -1530,7 +1550,7 @@ fn cli_readiness_lines() -> Vec<String> {
 /// its terminal to the configured `muse login` and reports that exit status.
 /// Nothing is read from or written to the credential store here.
 fn login() -> i32 {
-    let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
+    let bin = msp::muse_cli();
     eprintln!("[muse-acp] running `{bin} login`");
     match std::process::Command::new(&bin).arg("login").status() {
         Ok(status) if status.success() => {
@@ -2632,6 +2652,9 @@ fn handle_acp(
                     }
                 }
             };
+            if reject_if_logged_out(host, stdout, &id) {
+                return;
+            }
             let cmd = host.mint_cmd("cmd-");
             let res = host.command(
                 "session/start",
@@ -2889,6 +2912,9 @@ fn handle_acp(
                     -32602,
                     "session resume requires params.sessionId",
                 );
+                return;
+            }
+            if reject_if_logged_out(host, stdout, &id) {
                 return;
             }
             // Known ACP session: re-attach. New versions expose the durable
@@ -4870,8 +4896,8 @@ fn handle_acp(
             }
         }
         "auth/login" | "auth/logout" | "logout" => {
-            // The experimental account/* surface is not opted into; Muse
-            // credentials live outside ACP.
+            // Only `account/read` is used; login and logout stay with the
+            // Muse CLI, so credentials never cross ACP.
             acp::send_error(
                 stdout,
                 &id,

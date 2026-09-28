@@ -27,7 +27,10 @@ An unauthenticated prompt already returns ACP error `-32000` ("auth required") w
 - [x] (2026-09-28) Milestone 3: degraded "host unavailable" mode so `initialize` succeeds without Muse. A registry-validator-shaped handshake with `MUSE_CLI=/nonexistent-muse` returns the auth methods, `session/new` gets the install guidance, and `shutdown` exits 0.
 - [x] (2026-09-28) Milestone 4: tests, README/ROADMAP/CHANGELOG. `cargo fmt --check`, clippy, `cargo test --locked` (227 integration tests), selftest, `sh -n install.sh`, and the npm smoke test pass.
 - [ ] Not verified: a live, interactive `muse login` through an editor's terminal-auth UI (needs a human and a browser); whether an already-running `muse serve` picks up new credentials without a restart.
-- [ ] (2026-09-28) **Blocking: Windows + Zed fails before login.** Ryan built this branch, merged with `brb/zed-windows-settings` (PR #151), on Windows. Zed shows "Failed to Launch / Server exited with status exit code: 1", so the login UI is never reachable. Not yet diagnosed; the Windows developer continues from here. See "Windows exit-1 triage" under Surprises & Discoveries.
+- [x] (2026-09-28) Windows + Zed "exit code 1" diagnosed: the Zed settings entry was hand-written as `target\debug\muse_acp` (no such file; cargo builds `muse-acp.exe`). With the path fixed and `MUSE_CLI` set to `muse.cmd`, Zed connects, "Reauthenticate" lists `muse-login`, and the device code appears.
+- [x] (2026-09-28) Milestone 5: `session/new` and `session/load` return `-32000` when `account/read` reports `loggedOut` (experimental MSP opt-in), so Zed opens its login screen instead of a prompt-time error banner.
+- [x] (2026-09-28) Milestone 6: Windows fixes. `msp::muse_cli()` finds `muse.exe`/`muse.cmd`/`muse.bat` on PATH, and `muse-acp install` records the absolute exe path for Zed on Windows.
+- [ ] Not verified: Zed's login screen appearing on `session/new` with a real logged-out Muse (needs a rebuilt agent in Zed).
 
 ## Surprises & Discoveries
 
@@ -43,6 +46,10 @@ An unauthenticated prompt already returns ACP error `-32000` ("auth required") w
       '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":1}}' | .\target\debug\muse-acp.exe
       .\target\debug\muse-acp.exe --support
   Read the `[muse-acp]` stderr lines: `host unavailable: ...` means a launch failure (should not exit), and `serve host gone (...)` / `serve-exit ...` mean the post-launch exit path. Also confirm that Zed's settings entry (`%APPDATA%\Zed\settings.json`, `agent_servers.muse-acp.command`) points at the freshly built exe, not an older `muse-acp` on `PATH`. Related Windows issues: #150, where an `:auto-review` profile needs symlink privilege (os error 1314, a launch failure); and #151, where the Zed installer used the wrong settings path on Windows.
+- Observation (resolved): the exit 1 was Zed failing to spawn a nonexistent `target\debug\muse_acp`, not the adapter. Two real Windows defects surfaced on the way. (1) The Muse installer ships `muse.cmd`, and `Command::new("muse")` only tries `muse.exe`, so `--selftest` printed `cli-unready ... error=program not found` and no default setup could reach Muse. (2) `install.ps1` leaves PATH untouched, while `muse-acp install` wrote a bare `"command": "muse-acp"` for Zed.
+- Observation: Zed never sends ACP `authenticate` for a terminal method. It runs the agent command with `args` appended (`agent_server_store.rs`, `command.args.extend(extra_args)`; the installer writes `"args": []`), treats exit 0 as success for non-Claude/Gemini method ids, then calls `reset()`, which restarts the agent. It opens the full login screen only when `session/new`/`session/load` fails with `-32000` (`conversation_view.rs`, `downcast::<AuthRequired>`). A prompt-time `-32000` becomes `ThreadError::AuthenticationRequired`, a banner the user must click through ("Reauthenticate").
+- Observation: Muse 1.4.0 has no stable login-status surface. `muse login --help` shows only the device flow; `muse auth` only has `set`. MSP's `account/read` returns `{"state":"loggedOut","credentialRequired":true}` for a logged-out user, but only with `capabilities.experimentalApi: true` in `initialize`. In the 1.4.0 schema (`muse schema generate-json-schema --experimental`), the only experimental items are `account/read`, `account/loginStart`, `account/loginCancel`, `account/logout`, and the `account/changed`/`account/loginCompleted` notifications. Unknown notifications are only logged (`src/main.rs`, "unhandled MSP notification").
+- Observation: PowerShell 5.1 prepends a BOM when piping into a native exe, so the adapter answers `-32700 unexpected char 'ï'`. Pipe from bash for manual tests.
 - Observation (review of PR #149, considered and deferred): in host-unavailable mode, `authenticate {"methodId":"muse-login"}` returns the launch error rather than `{}`, and nothing relaunches the host without an agent restart. It was deferred because live Muse 1.4.0 does not fail its launch for a logged-out user (it fails at the first prompt, which works). Also, ACP terminal-auth clients restart the agent after login, and returning success without a working relaunch would loop the user through login. Revisit it together with the Windows triage above, since a host that exits after launch needs a recovery story of its own.
 
 ## Decision Log
@@ -63,11 +70,18 @@ An unauthenticated prompt already returns ACP error `-32000` ("auth required") w
   Rationale: the registry handshake must pass on machines without Muse, and editors show a request error better than a dead agent. Relaunching is left to the editor restarting the agent, which terminal-auth clients already do.
   Date/Author: 2026-09-28 / Claude.
 
+- Decision: opt into MSP's experimental API and call `account/read` before `session/start` and `session/resume`, returning `-32000` when it reports `loggedOut` with `credentialRequired` not `false`. Any other answer or error proceeds as before. This supersedes "not opting into MSP's experimental API" from the first decision; login itself still runs through `muse login`.
+  Rationale: Zed only shows its login screen for a session-creation auth error, and Muse offers no stable way to detect a logged-out user. On 1.4.0 the opt-in gates only `account/*`, and the fallback keeps the prompt-time error if the experimental method changes. Ask the Muse team to stabilize `account/read` so the opt-in can go.
+  Date/Author: 2026-09-28 / Claude with Ryan Svihla.
+- Decision: on Windows, resolve the default Muse binary by searching PATH for `muse.exe`, `muse.cmd`, then `muse.bat`, and make a default `muse-acp install` for Zed record `current_exe()`. Other platforms keep the bare names.
+  Rationale: registry and installer users cannot be expected to set `MUSE_CLI`. On macOS/Linux a bare name keeps symlinked installs (Homebrew, cargo) working across upgrades.
+  Date/Author: 2026-09-28 / Claude with Ryan Svihla.
+
 ## Outcomes & Retrospective
 
 The adapter now meets the ACP Registry auth requirement. `initialize` (v1 and v2) advertises one `terminal` method, `muse-login`, and the handshake succeeds even without Muse installed. The login itself is `muse-acp login`, which delegates to `muse login`, so the adapter still never touches credentials. What remains is a manual editor check (Zed or JetBrains) of the terminal-auth UI with a real Muse account, plus submitting the registry entry (an `agent.json` using the npm distribution `@brokkai/muse-acp@<version>`). The lesson: the registry's CI exercises the no-Muse path, so handshake robustness mattered as much as the auth method itself.
 
-Status as of 2026-09-28: Linux behavior and the full contribution gate are green. Manual testing on Windows + Zed fails with exit code 1 before login (see the Windows exit-1 triage entry). That must be diagnosed on Windows before this PR merges.
+Status as of 2026-09-28 (later): the Windows exit 1 was a bad hand-written Zed path. With it fixed, login works end to end in Zed through "Reauthenticate". Milestones 5 and 6 make a logged-out user land on Zed's login screen and remove the Windows need for `MUSE_CLI` and PATH edits.
 
 Revision note (2026-09-28): added the Windows test result, the triage steps and hypotheses for it, and the deferred review finding, so the work can continue from a Windows machine with only this file.
 

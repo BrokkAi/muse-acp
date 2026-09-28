@@ -7277,7 +7277,12 @@ fn terminal_auth_method_runs_muse_acp_login() {
         );
         if version == 1 {
             let legacy = &method["_meta"]["terminal-auth"];
-            assert_eq!(legacy["command"], adapter_bin(), "{frame}");
+            // Compare as paths: Cargo may spell the target dir with `/` on Windows.
+            assert_eq!(
+                std::path::Path::new(legacy["command"].as_str().unwrap_or_default()),
+                std::path::Path::new(&adapter_bin()),
+                "{frame}"
+            );
             assert_eq!(legacy["args"], serde_json::json!(["login"]), "{frame}");
         }
 
@@ -7296,6 +7301,39 @@ fn terminal_auth_method_runs_muse_acp_login() {
             frame.contains("\"code\":-32601") && frame.contains("muse login"),
             "v{version}: {frame}"
         );
+        c.finish();
+    }
+}
+
+#[test]
+fn logged_out_account_fails_session_creation_with_auth_required() {
+    // The fixture answers account/read only behind experimentalApi, so this
+    // also proves the adapter opts in during the MSP handshake.
+    let mut c = Client::spawn("account_logged_out", &[]);
+    c.initialize(1, "");
+    for (method, params) in [
+        ("session/new", format!("{{\"cwd\":{}}}", temp_cwd_json())),
+        (
+            "session/load",
+            format!("{{\"sessionId\":\"existing\",\"cwd\":{}}}", temp_cwd_json()),
+        ),
+    ] {
+        let id = c.req(method, &params);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"code\":-32000"), "{method}: {frame}");
+        assert!(
+            frame.contains("Muse is not logged in")
+                && frame.contains("Log in with Muse")
+                && frame.contains("muse login"),
+            "{method}: {frame}"
+        );
+    }
+    c.finish();
+
+    for scenario in ["account_logged_in", "account_keyless"] {
+        let mut c = Client::spawn(scenario, &[]);
+        let sid = c.new_session(1, "");
+        assert!(!sid.is_empty(), "{scenario}");
         c.finish();
     }
 }

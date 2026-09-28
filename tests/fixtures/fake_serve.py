@@ -111,6 +111,7 @@ CATALOG_READS = [0]
 # create a user-input request. An explicit override exercises the backstop for
 # hosts that predate userInputDialogs or ignore it.
 USER_INPUT_DIALOGS = [True]
+EXPERIMENTAL_API = [False]
 USAGE_READS = [0]
 SKILL_READS = [0]
 FORK_ITEMS = []
@@ -962,6 +963,8 @@ def result_for(method, msg):
             granted.append("userShell")
         USER_INPUT_DIALOGS[0] = msg.get("params", {}).get("capabilities", {}).get(
             "userInputDialogs", True) is not False
+        EXPERIMENTAL_API[0] = msg.get("params", {}).get("capabilities", {}).get(
+            "experimentalApi") is True
         return {
             "schema": SCHEMA,
             "grantedCapabilities": granted,
@@ -1593,6 +1596,24 @@ def main():
                         sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))
                         sys.stderr.flush()
                     os._exit(int(os.environ.get("FAKE_HOST_EXIT_CODE", "5")))
+                if method == "account/read" and SCENARIO.startswith("account_"):
+                    # Live 1.4.0: account/* exists only behind experimentalApi.
+                    if not EXPERIMENTAL_API[0]:
+                        send({"jsonrpc": "2.0", "id": ident,
+                              "error": {"code": -32601,
+                                        "message": "method not found: account/read",
+                                        "data": {"kind": "methodNotFound"}}})
+                        continue
+                    state = {
+                        "account_logged_out": {"state": "loggedOut",
+                                               "credentialRequired": True},
+                        "account_keyless": {"state": "loggedOut",
+                                            "credentialRequired": False},
+                        "account_logged_in": {"state": "accountLogin",
+                                              "credentialRequired": True},
+                    }[SCENARIO]
+                    send({"jsonrpc": "2.0", "id": ident, "result": state})
+                    continue
                 if (method == "session/setReasoningEffort"
                         and SCENARIO == "reasoning_legacy"):
                     send({"jsonrpc": "2.0", "id": ident,

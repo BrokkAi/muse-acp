@@ -187,7 +187,7 @@ fn method_timeout_ms(method: &str) -> u64 {
         "session/start" | "session/resume" | "session/read" | "view/page" => 180_000,
         // Cheap queries.
         "model/list" | "session/list" | "usage/read" | "view/subscribe" | "view/unsubscribe"
-        | "item/readOutput" => 30_000,
+        | "item/readOutput" | "account/read" => 30_000,
         // Control-plane decisions should be fast but not flaky.
         "approval/decide" | "userInput/answer" | "userInput/cancel" | "userInput/clarify"
         | "task/background" | "task/stop" | "task/stopAll" => 30_000,
@@ -230,9 +230,35 @@ pub fn session_profile_hint(host_message: &str) -> Option<String> {
     ))
 }
 
-/// Turn a host spawn failure into the next user action. MSP exposes no
-/// auth/health probe, so the readiness diagnosis starts at "can we even run
-/// the CLI"; session errors carry host text from there.
+/// The Muse executable: `MUSE_CLI`, else `muse` from PATH. On Windows the
+/// Muse installer ships `muse.cmd`, which `Command::new("muse")` never finds
+/// (it only appends `.exe`), so search PATH for the launcher scripts too.
+pub fn muse_cli() -> String {
+    if let Ok(bin) = std::env::var("MUSE_CLI") {
+        return bin;
+    }
+    if cfg!(windows)
+        && let Some(path) = std::env::var_os("PATH")
+            .and_then(|path| find_windows_launcher(std::env::split_paths(&path), "muse"))
+    {
+        return path;
+    }
+    "muse".to_string()
+}
+
+/// First `<stem>.exe`, `.cmd`, or `.bat` in PATH order, as a full path.
+fn find_windows_launcher(
+    dirs: impl Iterator<Item = std::path::PathBuf>,
+    stem: &str,
+) -> Option<String> {
+    dirs.flat_map(|dir| ["exe", "cmd", "bat"].map(|ext| dir.join(format!("{stem}.{ext}"))))
+        .find(|candidate| candidate.is_file())
+        .and_then(|candidate| candidate.into_os_string().into_string().ok())
+}
+
+/// Turn a host spawn failure into the next user action. The readiness
+/// diagnosis starts at "can we even run the CLI"; session errors carry host
+/// text from there.
 pub fn describe_spawn_error(bin: &str, e: &std::io::Error) -> String {
     match e.kind() {
         std::io::ErrorKind::NotFound => format!(
@@ -248,7 +274,6 @@ pub fn describe_spawn_error(bin: &str, e: &std::io::Error) -> String {
     }
 }
 
-/// The account surface is experimental and this adapter does not opt into it.
 /// Match explicit login diagnostics in free-text host errors; a bare 401/403
 /// or permission denial may belong to a tool. Never echo raw authentication
 /// errors: they can contain credentials.
@@ -286,9 +311,16 @@ pub fn auth_failure(message: &str) -> Option<&'static str> {
     }
 }
 
+/// Read an `account/read` result (MSP `AccountState`). `credentialRequired`
+/// is `false` on keyless deployments, which never need a login.
+pub fn account_logged_out(state: &J) -> bool {
+    state.get("state").and_then(J::as_str) == Some("loggedOut")
+        && !matches!(state.get("credentialRequired"), Some(J::Bool(false)))
+}
+
 pub fn auth_diagnostic(message: &str, host: &HandshakeInfo) -> Option<String> {
     let failure = auth_failure(message)?;
-    let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".into());
+    let bin = muse_cli();
     let host_label = if host.server_version.is_empty() {
         "unreported (initialize did not complete)".to_string()
     } else {
@@ -777,7 +809,7 @@ impl MspHost {
         user_input_dialogs: bool,
         user_shell: bool,
     ) -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
-        let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
+        let bin = muse_cli();
         let (mut cmd, host_config) = serve_command(&bin).map_err(LaunchError::Startup)?;
         let mut child = cmd
             .stdin(Stdio::piped())
@@ -843,8 +875,11 @@ impl MspHost {
         std::thread::spawn(move || reader_loop(reader_host, stdout, tx));
         // Handshake.
         let shell_capability = if user_shell { ",\"userShell\"" } else { "" };
+        // `experimentalApi` is the only way to reach `account/read`, which
+        // lets session/new report a logged-out host before the first turn
+        // (see `MspHost::logged_out`). On Muse 1.4.0 it gates nothing else.
         let init_params = format!(
-            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream"{shell_capability}]}}}}"#,
+            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"experimentalApi":true,"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream"{shell_capability}]}}}}"#,
             ver = crate::json::esc(env!("CARGO_PKG_VERSION")),
             user_input_dialogs = user_input_dialogs
         );
@@ -953,6 +988,24 @@ impl MspHost {
             c,
             d
         )
+    }
+
+    /// True only when the experimental `account/read` positively reports no
+    /// credential on a deployment that needs one. Any error or unexpected
+    /// shape (an older host, a changed experimental surface) reads as "not
+    /// known to be logged out", so the first turn's auth error still applies.
+    /// The result names a credential lane, never key material.
+    pub fn logged_out(&self) -> bool {
+        match self.command("account/read", "{}") {
+            Ok(state) => account_logged_out(&state),
+            Err(error) => {
+                log(&format!(
+                    "account/read unavailable: {}",
+                    err_message(&error)
+                ));
+                false
+            }
+        }
     }
 
     /// Send a command; Ok(result) / Err(error object).
@@ -1106,7 +1159,7 @@ fn serve_command(bin: &str) -> Result<(Command, Option<crate::host_config::HostC
 /// not send protocol frames; it records the observed process status and
 /// bounded stderr evidence for a human diagnostic.
 pub fn probe_serve_exit(timeout: Duration) -> Result<Option<ExitClassification>, String> {
-    let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
+    let bin = muse_cli();
     let (mut cmd, _host_config) = serve_command(&bin)?;
     let mut child = cmd
         .stdin(Stdio::null())
@@ -1560,6 +1613,42 @@ mod readiness_tests {
 #[cfg(test)]
 mod authentication_tests {
     use super::*;
+
+    #[test]
+    fn only_a_positive_logged_out_account_state_blocks_sessions() {
+        let state = |raw: &str| parse_json(raw).unwrap();
+        assert!(account_logged_out(&state(
+            r#"{"state":"loggedOut","credentialRequired":true}"#
+        )));
+        assert!(account_logged_out(&state(r#"{"state":"loggedOut"}"#)));
+        for raw in [
+            r#"{"state":"loggedOut","credentialRequired":false}"#,
+            r#"{"state":"accountLogin","credentialRequired":true}"#,
+            r#"{"state":"envKey"}"#,
+            r#"{"state":"apiKey"}"#,
+            r#"{"state":"somethingNew"}"#,
+            r#"{}"#,
+        ] {
+            assert!(!account_logged_out(&state(raw)), "{raw}");
+        }
+    }
+
+    #[test]
+    fn windows_launcher_search_takes_the_first_path_hit() {
+        let root = std::env::temp_dir().join(format!("muse-acp-launcher-{}", std::process::id()));
+        let (first, second) = (root.join("a"), root.join("b"));
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(second.join("muse.exe"), "").unwrap();
+        std::fs::write(first.join("muse.cmd"), "").unwrap();
+        let dirs = || vec![root.join("missing"), first.clone(), second.clone()].into_iter();
+        assert_eq!(
+            find_windows_launcher(dirs(), "muse").as_deref(),
+            first.join("muse.cmd").to_str()
+        );
+        assert_eq!(find_windows_launcher(dirs(), "absent"), None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     #[test]
     fn unrelated_failures_do_not_request_muse_login() {
