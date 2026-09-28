@@ -21,7 +21,7 @@ To see it working, run the integration tests named in Validation and Acceptance.
 - [x] (2026-09-28) Adopted the ExecPlan convention (`AGENTS.md`, `.agents/PLANS.md`, this file) on branch `brb/adopt-execplans`.
 - [x] (2026-09-28) Reopened #38, #41, and #46 with comments explaining the remaining work, so unsupported rows link open issues.
 - [x] (2026-09-28) Step 1, roadmap reconcile: rewrote 22 stale rows of the ROADMAP section 9 table from the code paths (branch `brb/roadmap-130-reconcile`).
-- [ ] Step 2, `/rename` mapped to `session/rename` (feature PR).
+- [x] (2026-09-28) Step 2, `/rename` mapped to `session/rename` (branch `brb/rename-slash-command`). The `/goal` intercept is now a generic protocol-command dispatch (`parse_protocol_command`), which step 3 extends.
 - [ ] Step 3a, retain workflow children per run in fold state.
 - [ ] Step 3b, make child ids discoverable from the editor.
 - [ ] Step 3c, the workflow child-control slash command.
@@ -37,6 +37,8 @@ Every tracking issue the ROADMAP links for the still-unbuilt surfaces is closed:
 The re-pinned schema (`tests/protocol/stable/msp.schema.json` after PR #139) defines both `SessionRenameParams` and `WorkflowChildControlParams`. The integration tests validate every adapter-to-host request frame against the bundle's required fields and property types, so the new commands must match the schema exactly. They are not skipped the way `goal/*` was under the old pin.
 
 The workflow item itself carries `children[]`. Each child has required fields `childId`, `attempt` (an integer, at least 1), and `status`, and optional `label`, `phase`, `durationMs`, `resultRef`, `terminal`, and `usage`. The fold in `src/fold.rs` already renders `label: status (phase)` lines from this array but throws away `childId` and `attempt`. Step 3 therefore needs to retain data the adapter already receives, not invent new event handling.
+
+The request-frame conformance test `emitted_frames_conform_to_the_vendored_schema` in `tests/acp_serve.rs` used a hand-kept method-to-definition map that lacked every method added since the old pin, including `goal/*`. Those frames were never schema-checked. It now resolves each method's params through the schema's `methods` index. A mutation check (renaming `/rename`'s `name` field) confirmed the test fails with `session/rename is missing required field name`.
 
 An earlier scratch plan listed `session/delete` as an undecided row to keep. No such row exists in the ROADMAP matrix, and `tests/msp_130_matrix.rs` does not list it. Ignore it.
 

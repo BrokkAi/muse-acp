@@ -1336,6 +1336,16 @@ def result_for(method, msg):
             **item, "status": "completed", "revision": 2, "exitSignal": 15,
             "visibleOutput": "shell stopped"}})
         return {"commandId": params["commandId"], "status": "accepted"}
+    if method == "session/rename":
+        params = msg.get("params", {})
+        log_input(params)
+        name = params.get("name", "")
+        notify("session/nameChanged", {
+            "sessionId": params.get("sessionId", MSP_SID), "name": name,
+            "viewCursor": "cur-rename-1", "sourceRange": {"start": 1, "end": 1},
+        })
+        return {"commandId": params.get("commandId", ""), "status": "accepted",
+                "name": name}
     if method in ("goal/set", "goal/edit", "goal/pause", "goal/resume",
                     "goal/clear"):
         params = msg.get("params", {})
