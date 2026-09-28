@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+- Advertise an ACP terminal auth method, `muse-login`, so editors can offer
+  login when Muse is not authenticated. It runs the new `muse-acp login`
+  command, which hands the terminal to `muse login` (a browser device-code
+  approval) and exits with its status. The adapter still never handles
+  credentials.
+- Complete the ACP handshake even when `muse serve` cannot start (for example,
+  when Muse is not installed). Later requests return the startup diagnostic
+  instead of the agent exiting, so the editor can show what to fix.
+- Fail `session/new` and `session/load` with ACP's auth-required error when
+  Muse has no credential, so editors such as Zed open their login screen
+  before the first prompt. This reads Muse's experimental `account/read`,
+  which reports only which kind of credential is in effect; the adapter now
+  opts into the experimental MSP API for it. If the check is unavailable, the
+  first prompt reports the error as before.
+- On Windows, find the `muse.cmd` launcher that the Muse installer puts on
+  `PATH`. Previously Muse was never found there unless `MUSE_CLI` was set.
+- On Windows, `muse-acp install` records the full path to `muse-acp.exe` in
+  Zed's settings, because the PowerShell installer does not change `PATH`.
 - Fix `muse-acp install` and `uninstall` on Windows: they now edit
   `%APPDATA%\Zed\settings.json`, where Zed reads its settings, instead of
   `~/.config/zed/settings.json`.

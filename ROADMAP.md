@@ -263,10 +263,15 @@ Status: **host-readiness and auth diagnostics implemented.** Spawn failures
 distinguish a missing CLI (install/PATH/`MUSE_CLI` guidance) from a
 non-executable one, `--selftest` reports `cli-ready`/`cli-unready` with the
 binary and version without gating the exit status, and explicit host login or
-expiry failures map to actionable ACP diagnostics. Muse 1.3.0 now exposes an
-experimental `account/*` surface, but the adapter deliberately keeps it
+expiry failures map to actionable ACP diagnostics. The adapter advertises one
+ACP terminal auth method, `muse-login`, which runs `muse-acp login` and hands
+the terminal to `muse login`. The ACP Registry requires an `agent` or
+`terminal` method. The handshake also succeeds when `muse serve` cannot
+start, so registry validation and editors without Muse get the auth method
+and a per-request diagnostic instead of a dead agent. Muse 1.3.0 also exposes
+an experimental `account/*` surface, but the adapter deliberately keeps it
 deferred: `experimentalApi` is opt-in, the pinned stable bundle does not
-contain those methods, and the adapter has no credential-handling path.
+contain those methods, and terminal auth needs no credential-handling path.
 Browserless-login guidance remains documented below.
 
 **Work items**
@@ -275,7 +280,8 @@ Browserless-login guidance remains documented below.
   unsupported host version, and host startup failure.
 - Include the executable path and host version where available.
 - Provide the next user action for each failure.
-- Revisit ACP authentication only with an explicit `experimentalApi` posture
+- Terminal auth (`muse-login` -> `muse-acp login`) is implemented. Revisit
+  in-protocol `agent` auth only with an explicit `experimentalApi` posture
   decision. If adopted, expose the device-code branch of `account/loginStart`
   only; keep the secret-bearing `apiKey` branch out of scope and use
   `account/read`/`account/changed` to improve readiness diagnostics.
