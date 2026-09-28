@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.6.2
+
+- Rewrite the README for new users, covering quick start, editor setup,
+  configuration, and diagnostics, and align the contributing, releasing, roadmap,
+  security, and protocol guides with current adapter behavior. The
+  refreshed README ships in the release archives and the npm package.
+
 ## 0.6.1
 
 - Start Muse hosts with human approvals when the saved profile is
