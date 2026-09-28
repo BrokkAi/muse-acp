@@ -354,15 +354,29 @@ not be used with untrusted sessions.
 
 When Muse reports that it is not authenticated, or that a session or credential
 has expired, the adapter returns ACP's `-32000` authentication-required error
-with login guidance. Run `muse login` with the executable selected by
-`MUSE_CLI`, then restart the editor agent.
+with login guidance. Editors that support ACP terminal auth then offer the
+adapter's `muse-login` method. It runs `muse-acp login` in a terminal, which
+runs `muse login` with the executable selected by `MUSE_CLI`, so you can
+approve the device code in your browser. You can also run either command
+yourself, then restart the editor agent.
+
+```sh
+muse-acp login                   # or: npx --yes @brokkai/muse-acp login
+```
+
+`META_API_KEY`, when set in the agent's environment, takes priority over the
+account login.
+
+If `muse serve` cannot start at all (for example, Muse is not installed), the
+adapter still completes the ACP handshake. Every later request then returns
+the startup diagnostic, so the editor shows what to fix.
 
 Run the login **where the adapter runs, as the same OS user**. For SSH,
 containers, remote IDE backends, or a different OS account, a login on your
 desktop does not help; log in on the remote host. The adapter never opens a
 browser, never prompts for credentials over ACP stdio, and never copies
-credentials between machines. It advertises no ACP auth methods, so credentials
-stay in the Muse environment.
+credentials between machines. Its only ACP auth method runs Muse's own login
+in a terminal, so credentials stay in the Muse environment.
 
 ## Sandbox advisory for Linux arm64
 

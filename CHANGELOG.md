@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Advertise an ACP terminal auth method, `muse-login`, so editors can offer
+  login when Muse is not authenticated. It runs the new `muse-acp login`
+  command, which hands the terminal to `muse login` (a browser device-code
+  approval) and exits with its status. The adapter still never handles
+  credentials.
+- Complete the ACP handshake even when `muse serve` cannot start (for example,
+  when Muse is not installed). Later requests return the startup diagnostic
+  instead of the agent exiting, so the editor can show what to fix.
+
 ## 0.7.0
 
 - Add adapter slash commands for Muse host controls: `/goal` sets, edits,

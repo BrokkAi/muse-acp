@@ -4491,21 +4491,39 @@ fn transcript_fixture_fingerprint_is_never_reported_as_host_compatible() {
     c.finish();
 }
 
+/// A failed host launch still completes the ACP handshake (clients need the
+/// auth methods), then refuses every later request with the launch diagnostic.
+/// Returns that refusal frame.
+fn assert_host_unavailable(c: &mut Client, diagnostic: &str) -> String {
+    let id = c.req("initialize", "{\"protocolVersion\":1}");
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
+    assert!(
+        frame.contains("\"result\"") && frame.contains("\"muse-login\""),
+        "{frame}"
+    );
+    let log = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
+    assert!(
+        log.contains("host unavailable") && log.contains(diagnostic),
+        "missing launch diagnostic: {log}"
+    );
+    let id = c.req(
+        "session/new",
+        &format!(r#"{{"cwd":{},"mcpServers":[]}}"#, temp_cwd_json()),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
+    assert!(
+        frame.contains("\"error\"") && frame.contains(diagnostic),
+        "{frame}"
+    );
+    frame
+}
+
 #[test]
 fn unsupported_envelope_schema_version_fails_closed() {
     let mut c = Client::spawn("quiet", &[("FAKE_SCHEMA_VERSION", "2")]);
-    let _ = c.req("initialize", "{\"protocolVersion\":1}");
-    let status = c
-        .child
-        .wait_timeout(Duration::from_secs(10))
-        .expect("wait")
-        .expect("adapter exited");
-    assert!(!status.success(), "adapter must fail closed: {status}");
-    let log = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
-    assert!(
-        log.contains("incompatible host schema"),
-        "missing fatal diagnostic: {log}"
-    );
+    let frame = assert_host_unavailable(&mut c, "incompatible host schema");
+    assert!(frame.contains("\"code\":-32603"), "{frame}");
+    c.finish();
 }
 
 #[test]
@@ -4551,18 +4569,11 @@ fn command_timeout_reports_method_id_and_configured_duration() {
             ("MUSE_COMMAND_TIMEOUT_MS", "200"),
         ],
     );
-    let _ = c.req("initialize", "{\"protocolVersion\":1}");
-    let status = c
-        .child
-        .wait_timeout(Duration::from_secs(10))
-        .expect("wait")
-        .expect("adapter exited");
-    assert!(!status.success(), "adapter must fail on timeout: {status}");
-    let log = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
-    assert!(
-        log.contains("serve command timed out after 200ms method=initialize id=1"),
-        "missing timeout diagnostics: {log}"
+    assert_host_unavailable(
+        &mut c,
+        "serve command timed out after 200ms method=initialize id=1",
     );
+    c.finish();
 }
 
 #[test]
@@ -6126,24 +6137,80 @@ fn recommended_value_is_omitted_without_negotiation() {
 }
 
 #[test]
-fn missing_cli_failure_names_the_next_action() {
+fn missing_cli_still_completes_the_handshake_and_names_the_next_action() {
+    // Registry validators run the agent where Muse is not installed; the
+    // handshake (with its auth methods) must still succeed.
     let mut c = Client::spawn("happy", &[("MUSE_CLI", "/nonexistent-muse")]);
-    let _ = c.req("initialize", "{\"protocolVersion\":1}");
+    let id = c.req("initialize", "{\"protocolVersion\":1}");
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
+    assert!(
+        frame.contains("\"result\"") && frame.contains("\"muse-login\""),
+        "{frame}"
+    );
+    let id = c.req(
+        "session/new",
+        &format!(r#"{{"cwd":{},"mcpServers":[]}}"#, temp_cwd_json()),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
+    assert!(
+        frame.contains("\"code\":-32603")
+            && frame.contains("Muse CLI not found: '/nonexistent-muse'")
+            && frame.contains("MUSE_CLI="),
+        "unactionable spawn error: {frame}"
+    );
+    let log = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
+    assert!(log.contains("host unavailable"), "{log}");
+    let id = c.req("shutdown", "{}");
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
+    assert!(frame.contains("\"result\":null"), "{frame}");
     let status = c
         .child
         .wait_timeout(Duration::from_secs(10))
         .expect("wait")
         .expect("adapter exited");
-    assert!(!status.success(), "missing CLI must fail: {status}");
-    let log = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
-    assert!(
-        log.contains("Muse CLI not found: '/nonexistent-muse'"),
-        "unactionable spawn error: {log}"
-    );
-    assert!(
-        log.contains("action") || log.contains("MUSE_CLI="),
-        "missing guidance: {log}"
-    );
+    assert!(status.success(), "shutdown must stay clean: {status}");
+}
+
+#[cfg(unix)]
+#[test]
+fn login_subcommand_hands_the_terminal_to_muse_login() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("acp-login-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let args_file = dir.join("args");
+    let script = dir.join("muse");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nprintf '%s' \"$*\" > '{}'\nexit 3\n",
+            args_file.display()
+        ),
+    )
+    .expect("fake muse");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let out = Command::new(adapter_bin())
+        .arg("login")
+        .env("MUSE_CLI", &script)
+        .output()
+        .expect("login");
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert_eq!(std::fs::read_to_string(&args_file).expect("args"), "login");
+
+    let out = Command::new(adapter_bin())
+        .arg("login")
+        .env("MUSE_CLI", "/nonexistent-muse")
+        .output()
+        .expect("login");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(stderr.contains("Muse CLI not found"), "{stderr}");
+
+    let out = Command::new(adapter_bin())
+        .args(["login", "extra"])
+        .output()
+        .expect("login");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
 }
 
 #[test]
@@ -7166,14 +7233,13 @@ fn authentication_initialize_failure_has_external_login_guidance() {
             ("FAKE_ERROR_MESSAGE", "Not logged in: secret-sentinel"),
         ],
     );
-    let _ = c.req("initialize", "{\"protocolVersion\":1}");
-    let status = c
-        .child
-        .wait_timeout(Duration::from_secs(10))
-        .expect("wait")
-        .expect("adapter exited");
-    assert!(!status.success());
-    let stderr = std::fs::read_to_string(&c.stderr_log).expect("adapter stderr");
+    // Auth-required, so a terminal-auth client offers `muse-login` here.
+    let frame = assert_host_unavailable(&mut c, "Muse is not authenticated");
+    assert!(frame.contains("\"code\":-32000"), "{frame}");
+    assert!(!frame.contains("secret-sentinel"), "{frame}");
+    let stderr_log = c.stderr_log.clone();
+    c.finish();
+    let stderr = std::fs::read_to_string(&stderr_log).expect("adapter stderr");
     assert!(
         stderr.contains("Muse is not authenticated") && stderr.contains("muse login"),
         "{stderr}"
@@ -7186,7 +7252,7 @@ fn authentication_initialize_failure_has_external_login_guidance() {
 }
 
 #[test]
-fn authentication_remains_external_until_experimental_account_surface_is_adopted() {
+fn terminal_auth_method_runs_muse_acp_login() {
     for version in [1, 2] {
         let mut c = Client::spawn("quiet", &[]);
         let id = c.req(
@@ -7194,8 +7260,37 @@ fn authentication_remains_external_until_experimental_account_surface_is_adopted
             &format!(r#"{{"protocolVersion":{version},"clientCapabilities":{{}}}}"#),
         );
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
-        assert!(frame.contains("\"authMethods\":[]"), "v{version}: {frame}");
+        let reply: serde_json::Value = serde_json::from_str(&frame).expect("initialize json");
+        let methods = reply["result"]["authMethods"]
+            .as_array()
+            .unwrap_or_else(|| panic!("v{version}: {frame}"));
+        assert_eq!(methods.len(), 1, "v{version}: {frame}");
+        let method = &methods[0];
+        let id_key = if version == 1 { "id" } else { "methodId" };
+        assert_eq!(method[id_key], "muse-login", "v{version}: {frame}");
+        assert!(method["name"].is_string(), "v{version}: {frame}");
+        assert_eq!(method["type"], "terminal", "v{version}: {frame}");
+        assert_eq!(
+            method["args"],
+            serde_json::json!(["login"]),
+            "v{version}: {frame}"
+        );
+        if version == 1 {
+            let legacy = &method["_meta"]["terminal-auth"];
+            assert_eq!(legacy["command"], adapter_bin(), "{frame}");
+            assert_eq!(legacy["args"], serde_json::json!(["login"]), "{frame}");
+        }
+
+        let id = c.req("authenticate", r#"{"methodId":"muse-login"}"#);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\":{}"), "v{version}: {frame}");
         let id = c.req("authenticate", r#"{"methodId":"login"}"#);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"code\":-32602") && frame.contains("muse-login"),
+            "v{version}: {frame}"
+        );
+        let id = c.req("auth/logout", "{}");
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
         assert!(
             frame.contains("\"code\":-32601") && frame.contains("muse login"),

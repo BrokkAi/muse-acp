@@ -1196,13 +1196,96 @@ enum LoopMsg {
 }
 
 fn v2_init() -> String {
-    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":[],"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
+    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
+        .replace("__AUTH_METHODS__", &auth_methods_v2())
 }
 
 fn v1_init() -> String {
-    r#"{"protocolVersion":1,"authMethods":[],"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}},"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__}}"#
+    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}},"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
+        .replace("__AUTH_METHODS__", &auth_methods_v1())
+}
+
+fn send_initialize(stdout: &StdoutShared, id: &Option<J>) {
+    if negotiated_ver() == 2 {
+        acp::send_result(stdout, id, &v2_init());
+    } else {
+        acp::send_result(stdout, id, &v1_init());
+    }
+}
+
+/// Answer ACP after `muse serve` failed to launch. Only the handshake and
+/// shutdown succeed; every other request reports why the host is missing,
+/// using the auth-required code when that is the cause.
+fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
+    let id = msg.get("id").cloned();
+    match msg.get("method").and_then(J::as_str) {
+        Some("initialize") => {
+            negotiate_acp(msg);
+            send_initialize(stdout, &id);
+        }
+        Some(method @ ("shutdown" | "exit")) => {
+            if method == "shutdown" {
+                acp::send_result(stdout, &id, "null");
+            }
+            shutdown::settle(stdout, "adapter shutting down");
+            shutdown::exit(0);
+        }
+        Some(_) if id.is_some() => {
+            let code = if msp::auth_failure(reason).is_some() {
+                -32000
+            } else {
+                -32603
+            };
+            acp::send_error(
+                stdout,
+                &id,
+                code,
+                &format!("Muse host unavailable: {reason}"),
+            );
+        }
+        // Notifications and client responses have nothing to answer.
+        _ => {}
+    }
+}
+
+/// The single ACP auth method: terminal auth that re-runs this adapter as
+/// `muse-acp login`. Clients replace the agent's (empty) default arguments
+/// with `args`, so the login needs no separate executable.
+const AUTH_METHOD_ID: &str = "muse-login";
+const AUTH_METHOD_NAME: &str = "Log in with Muse";
+const AUTH_METHOD_DESCRIPTION: &str =
+    "Run `muse login` in a terminal and approve the code in your browser";
+
+fn auth_methods_v1() -> String {
+    // Clients predating the typed method read the `_meta` terminal-auth
+    // convention, which needs an explicit executable.
+    let legacy = std::env::current_exe()
+        .ok()
+        .and_then(|path| path.to_str().map(str::to_string))
+        .map(|exe| {
+            format!(
+                r#","_meta":{{"terminal-auth":{{"label":"Muse login","command":{},"args":["login"]}}}}"#,
+                esc(&exe)
+            )
+        })
+        .unwrap_or_default();
+    format!(
+        r#"[{{"id":{},"name":{},"description":{},"type":"terminal","args":["login"]{legacy}}}]"#,
+        esc(AUTH_METHOD_ID),
+        esc(AUTH_METHOD_NAME),
+        esc(AUTH_METHOD_DESCRIPTION)
+    )
+}
+
+fn auth_methods_v2() -> String {
+    format!(
+        r#"[{{"methodId":{},"name":{},"description":{},"type":"terminal","args":["login"]}}]"#,
+        esc(AUTH_METHOD_ID),
+        esc(AUTH_METHOD_NAME),
+        esc(AUTH_METHOD_DESCRIPTION)
+    )
 }
 
 fn has_nonempty_array(params: Option<&J>, key: &str) -> bool {
@@ -1440,6 +1523,26 @@ fn cli_readiness_lines() -> Vec<String> {
         Err(e) => format!("cli-unready binary={bin} action=install-muse-or-set-MUSE_CLI error={e}"),
     };
     vec![line]
+}
+
+/// `muse-acp login`: the ACP terminal-auth target. Clients run it in a real
+/// terminal; the device-code flow belongs to Muse, so the adapter only hands
+/// its terminal to the configured `muse login` and reports that exit status.
+/// Nothing is read from or written to the credential store here.
+fn login() -> i32 {
+    let bin = std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string());
+    eprintln!("[muse-acp] running `{bin} login`");
+    match std::process::Command::new(&bin).arg("login").status() {
+        Ok(status) if status.success() => {
+            eprintln!("[muse-acp] Muse login complete; return to your editor.");
+            0
+        }
+        Ok(status) => status.code().filter(|code| *code != 0).unwrap_or(1),
+        Err(e) => {
+            eprintln!("[muse-acp] {}", msp::describe_spawn_error(&bin, &e));
+            1
+        }
+    }
 }
 
 /// A redacted support bundle: static diagnostics only. It deliberately
@@ -1856,6 +1959,9 @@ fn main() {
     if args.as_slice() == ["--support"] {
         shutdown::exit(support_bundle());
     }
+    if args.as_slice() == ["login"] {
+        shutdown::exit(login());
+    }
     if let Some(exit_code) = zed::dispatch(&args) {
         shutdown::exit(exit_code);
     }
@@ -1916,6 +2022,9 @@ fn main() {
     // launching earlier would force a fallback posture before we know whether
     // form elicitation is available.
     let mut host: Option<Arc<MspHost>> = None;
+    // Set when the first launch fails; the adapter then answers without a host
+    // until the client restarts it.
+    let mut host_unavailable: Option<String> = None;
     let mut restart_budget = RestartBudget::new();
 
     for msg in rx {
@@ -1937,6 +2046,10 @@ fn main() {
                 }
                 match parse_json(trimmed) {
                     Ok(v) => {
+                        if let Some(reason) = host_unavailable.as_deref() {
+                            serve_without_host(&stdout, &v, reason);
+                            continue;
+                        }
                         if host.is_none() {
                             let is_initialize =
                                 v.get("method").and_then(|m| m.as_str()) == Some("initialize");
@@ -1957,21 +2070,21 @@ fn main() {
                             ) {
                                 Ok(h) => h,
                                 Err(e) => {
-                                    let _deadline = shutdown::deadline("host launch failure");
-                                    acp::send_error(
-                                        &stdout,
-                                        &v.get("id").cloned(),
-                                        -32603,
-                                        &e.to_string(),
-                                    );
-                                    shutdown::settle(&stdout, &e.to_string());
+                                    // Still complete the handshake: clients (and
+                                    // the ACP registry check) need the advertised
+                                    // auth methods even where Muse cannot start,
+                                    // and a request error explains more than a
+                                    // dead agent.
                                     if let LaunchError::HostExit(exit) = &e {
                                         for line in exit.support_lines("serve-exit") {
                                             log(&line);
                                         }
                                     }
-                                    eprintln!("[muse-acp] fatal: {e}");
-                                    shutdown::exit(1);
+                                    eprintln!("[muse-acp] host unavailable: {e}");
+                                    let reason = e.to_string();
+                                    serve_without_host(&stdout, &v, &reason);
+                                    host_unavailable = Some(reason);
+                                    continue;
                                 }
                             };
                             let hi = new_host.handshake();
@@ -2485,14 +2598,7 @@ fn handle_acp(
     }
 
     match method.as_str() {
-        "initialize" => {
-            let v = negotiated_ver();
-            if v == 2 {
-                acp::send_result(stdout, &id, &v2_init());
-            } else {
-                acp::send_result(stdout, &id, &v1_init());
-            }
-        }
+        "initialize" => send_initialize(stdout, &id),
         "session/new" => {
             let ver = negotiated_ver();
             if !validate_session_roots(stdout, &id, params.as_ref()) {
@@ -4743,9 +4849,29 @@ fn handle_acp(
                 ),
             }
         }
-        "authenticate" | "auth/login" | "auth/logout" | "logout" => {
-            // The experimental account/* surface is not opted into
-            // (authMethods is []); Muse credentials live outside ACP.
+        "authenticate" => {
+            // The terminal-auth login already ran outside ACP. Muse checks
+            // its credentials on the next turn, and a still-unauthenticated
+            // prompt fails with -32000 again, so success cannot mask it.
+            let method_id = params
+                .as_ref()
+                .and_then(|p| p.get("methodId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if method_id == AUTH_METHOD_ID {
+                acp::send_result(stdout, &id, "{}");
+            } else {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    &format!("unknown auth method; muse-acp supports {AUTH_METHOD_ID:?}"),
+                );
+            }
+        }
+        "auth/login" | "auth/logout" | "logout" => {
+            // The experimental account/* surface is not opted into; Muse
+            // credentials live outside ACP.
             acp::send_error(
                 stdout,
                 &id,

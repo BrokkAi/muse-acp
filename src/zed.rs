@@ -39,6 +39,7 @@ fn usage() -> &'static str {
     "usage: muse-acp [command] [options]\n\
      \n\
      \x20 (no command)         run the ACP agent over stdio (what clients spawn)\n\
+     \x20 login                run `muse login` (the ACP terminal-auth method)\n\
      \x20 install              register muse-acp as a Zed agent server\n\
      \x20 uninstall            remove the Zed settings entry again\n\
      \x20 install-intellij     register muse-acp in JetBrains IDEs\n\
@@ -137,6 +138,11 @@ fn parse_args(args: &[String]) -> Result<Cli, String> {
     }
     match args[0].as_str() {
         "-h" | "--help" | "help" => Ok(Cli::Help),
+        // A bare `login` is dispatched in main before reaching here.
+        "login" => Err(format!(
+            "unexpected argument: {}",
+            args.get(1).map(String::as_str).unwrap_or("login")
+        )),
         "-V" | "--version" => {
             if args.len() > 1 {
                 return Err(format!("unexpected argument: {}", args[1]));
