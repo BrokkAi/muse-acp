@@ -421,31 +421,31 @@ fold's unknown-method path logs and continues.
 <!-- msp-1.3.0-matrix:start -->
 | MSP addition | Disposition | Adapter behavior or tracking |
 | --- | --- | --- |
-| `goal/clear` | Unsupported pending protocol decision | Goal control needs an ACP affordance and wake semantics; tracked by [#45](https://github.com/BrokkAi/muse-acp/issues/45). |
-| `goal/edit` | Unsupported pending protocol decision | Goal control needs an ACP affordance and wake semantics; tracked by [#45](https://github.com/BrokkAi/muse-acp/issues/45). |
-| `goal/pause` | Unsupported pending protocol decision | Goal control needs an ACP affordance and wake semantics; tracked by [#45](https://github.com/BrokkAi/muse-acp/issues/45). |
-| `goal/resume` | Unsupported pending protocol decision | Goal control needs an ACP affordance and wake semantics; tracked by [#45](https://github.com/BrokkAi/muse-acp/issues/45). |
-| `goal/set` | Unsupported pending protocol decision | Goal control needs an ACP affordance and wake semantics; tracked by [#45](https://github.com/BrokkAi/muse-acp/issues/45). |
-| `item/readOutput` | Unsupported pending protocol decision | The adapter has no ACP fetch-through surface for host-stored output; tracked by [#39](https://github.com/BrokkAi/muse-acp/issues/39). |
+| `goal/clear` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack; goal state streams back through `session/goalChanged`. |
+| `goal/edit` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack; goal state streams back through `session/goalChanged`. |
+| `goal/pause` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack; goal state streams back through `session/goalChanged`. |
+| `goal/resume` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack; goal state streams back through `session/goalChanged`. |
+| `goal/set` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack; goal state streams back through `session/goalChanged`. |
+| `item/readOutput` | Mapped to ACP | Backs the opt-in `_session/readOutput` extension with bounded `offsetBytes`/`lengthBytes` reads of host-stored tool output. |
 | `session/rename` | Unsupported pending protocol decision | Rename needs an ACP surface and host-authored title handling; tracked by [#41](https://github.com/BrokkAi/muse-acp/issues/41). |
-| `session/setReasoningEffort` | Unsupported pending protocol decision | Session defaults need to be reconciled with per-turn overrides; tracked by [#42](https://github.com/BrokkAi/muse-acp/issues/42). |
-| `skill/list` | Unsupported pending protocol decision | Native skill discovery and turn parts are deferred; tracked by [#40](https://github.com/BrokkAi/muse-acp/issues/40). |
+| `session/setReasoningEffort` | Mapped to ACP | Sent when the ACP reasoning `configOptions` selector picks a tier; the selector starts at "Muse default" and cannot clear a standing host default. |
+| `skill/list` | Mapped to ACP | Read per session to build the ACP `available_commands_update` catalog; slash prompts naming a listed skill become native skill turn parts. |
 | `task/background` | Unsupported pending protocol decision | The adapter observes backgrounded items but does not issue the host control command; tracked by [#38](https://github.com/BrokkAi/muse-acp/issues/38). |
-| `task/stop` | Unsupported pending protocol decision | Async-task stop must be mapped to host admission and terminal item events; tracked by [#38](https://github.com/BrokkAi/muse-acp/issues/38). |
-| `task/stopAll` | Unsupported pending protocol decision | Async-task stop must be mapped to host admission and terminal item events; tracked by [#38](https://github.com/BrokkAi/muse-acp/issues/38). |
-| `usage/read` | Unsupported pending protocol decision | Subscription usage needs a labeled ACP presentation distinct from cost estimates; tracked by [#43](https://github.com/BrokkAi/muse-acp/issues/43). |
-| `view/subscribe` | Unsupported pending protocol decision | Explicit cursor re-attach needs gap and duplicate-replay coverage; tracked by [#44](https://github.com/BrokkAi/muse-acp/issues/44). |
-| `workflow/cancel` | Unsupported pending protocol decision | Workflow control must settle from subsequent view events; tracked by [#46](https://github.com/BrokkAi/muse-acp/issues/46). |
+| `task/stop` | Mapped to ACP | Sent for `_session/async_task/stop` on a backgrounded tool task when AIR async tasks are negotiated; the terminal item event settles the task. |
+| `task/stopAll` | Mapped to ACP | Sent on `session/cancel` when AIR async tasks are negotiated, so cancellation also stops the session's background work. |
+| `usage/read` | Mapped to ACP | Reads the host-global subscription snapshot and publishes it as `_meta.museSubscriptionUsage`, separately from cost estimates; an unavailable host keeps existing state. |
+| `view/subscribe` | Mapped to ACP | Re-attaches at the last delivered cursor after resume or host restart so a durable suffix appended while detached is replayed; a failed subscribe keeps the resume attachment and logs a diagnostic. |
+| `workflow/cancel` | Mapped to ACP | Sent for `_session/async_task/stop` on a workflow async task (keyed by `workflowRunId`); the ack is admission-only and the workflow settles from subsequent view events. |
 | `workflow/childControl` | Unsupported pending protocol decision | Child skip/retry needs an ACP affordance and admission-only handling; tracked by [#46](https://github.com/BrokkAi/muse-acp/issues/46). |
 | `session/modelRouteUnserved` | Intentionally ignored | No ACP mapping or adapter state exists for a host routing observation; the unknown-notification path retains a diagnostic. |
-| `session/nameChanged` | Unsupported pending protocol decision | Host-authored names must flow into session information; tracked by [#41](https://github.com/BrokkAi/muse-acp/issues/41) and [#67](https://github.com/BrokkAi/muse-acp/issues/67). |
-| `session/reasoningEffortChanged` | Unsupported pending protocol decision | The session default must be folded and restored without overriding per-turn choices; tracked by [#42](https://github.com/BrokkAi/muse-acp/issues/42). |
-| `session/statusChanged` | Unsupported pending protocol decision | Status and attention flags need per-session tracking and an ACP presentation; tracked by [#68](https://github.com/BrokkAi/muse-acp/issues/68). |
-| `session/viewHealthChanged` | Unsupported pending protocol decision | View availability needs a diagnosable reconnect disposition; tracked by [#44](https://github.com/BrokkAi/muse-acp/issues/44). |
-| `skill/changed` | Unsupported pending protocol decision | A change should refresh the native skill catalog; tracked by [#40](https://github.com/BrokkAi/muse-acp/issues/40). |
-| `usage/changed` | Unsupported pending protocol decision | A change should refresh host-observed subscription usage; tracked by [#43](https://github.com/BrokkAi/muse-acp/issues/43). |
-| `skillNotFound` | Unsupported pending protocol decision | Native selector errors will be surfaced with their typed data when skill support lands; tracked by [#40](https://github.com/BrokkAi/muse-acp/issues/40). |
-| `outputUnavailable` | Unsupported pending protocol decision | Stored-output availability details will be surfaced by fetch-through; tracked by [#39](https://github.com/BrokkAi/muse-acp/issues/39). |
+| `session/nameChanged` | Mapped to ACP | Updates host title facts and publishes a changed title through `session_info_update`. |
+| `session/reasoningEffortChanged` | Mapped to ACP | Updates the standing reasoning default and emits `config_option_update`; negotiated recommendations require a host `default` or `policy` source. |
+| `session/statusChanged` | Mapped to ACP | Publishes host status and attention metadata and ACP v2 state; directs pending-request reconciliation without inventing unknown status values. |
+| `session/viewHealthChanged` | Consumed | Logs the view health and reason with guidance to reattach through resume. |
+| `skill/changed` | Mapped to ACP | Refreshes `skill/list` and the ACP available-command catalog. |
+| `usage/changed` | Mapped to ACP | Broadcasts the host's subscription observation to attached sessions as `_meta.museSubscriptionUsage`, separately from cost estimates. |
+| `skillNotFound` | Mapped to ACP | Forwarded as ACP error `-32032` with the host's typed data, keeping the rejected selector visible; slash text naming no listed skill is sent as ordinary text instead. |
+| `outputUnavailable` | Mapped to ACP | Forwarded from `_session/readOutput` with the host's typed availability facts (`availability`, `itemId`, `outputRef`) intact. |
 
 Muse 1.3.0 also publishes a top-level `requests` index. Both entries are
 deliberate server-initiated request paths and return the empty `RequestReceipt`

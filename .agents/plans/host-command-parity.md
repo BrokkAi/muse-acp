@@ -19,7 +19,8 @@ To see it working, run the integration tests named in Validation and Acceptance.
 
 - [x] (2026-09-28) Step 0, SDK re-pin: vendored `muse-code-sdk` revision `a7c10c5` into `tests/protocol/`. Merged in PR #139, which also corrected the ROADMAP section 9 intro that the re-pin made stale.
 - [x] (2026-09-28) Adopted the ExecPlan convention (`AGENTS.md`, `.agents/PLANS.md`, this file) on branch `brb/adopt-execplans`.
-- [ ] Step 1, roadmap reconcile (its own PR).
+- [x] (2026-09-28) Reopened #38, #41, and #46 with comments explaining the remaining work, so unsupported rows link open issues.
+- [x] (2026-09-28) Step 1, roadmap reconcile: rewrote 22 stale rows of the ROADMAP section 9 table from the code paths (branch `brb/roadmap-130-reconcile`).
 - [ ] Step 2, `/rename` mapped to `session/rename` (feature PR).
 - [ ] Step 3a, retain workflow children per run in fold state.
 - [ ] Step 3b, make child ids discoverable from the editor.
@@ -52,6 +53,8 @@ Decision: the workflow child-control command never takes `attempt` from the user
 Decision: do not build `task/background`. Rationale: see the step 4 section of Plan of Work. Date: 2026-09-28.
 
 Decision: rows that stay "Unsupported pending protocol decision" must link an open issue. Reopen #38, #41, and #46, or file replacements; either needs the maintainer's approval because it is visible on GitHub. Date: 2026-09-28.
+
+Decision: ship steps 2 and 3 as separate pull requests rather than one. Rationale: `/rename` is small and independent, and step 3 carries new fold state that deserves its own review. The feature PRs close #41 and #46. Date: 2026-09-28.
 
 
 ## Outcomes & Retrospective
