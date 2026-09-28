@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `muse-acp install` now writes Zed's settings where Zed reads them:
+  `%APPDATA%\Zed\settings.json` on Windows (previously
+  `%USERPROFILE%\.config\zed`, which Zed ignores there), and
+  `$XDG_CONFIG_HOME/zed` on Linux when that variable is set.
+
 ## 0.7.0
 
 - Add adapter slash commands for Muse host controls: `/goal` sets, edits,

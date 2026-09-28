@@ -2,7 +2,6 @@
 
 use crate::json::{J, esc, parse_json};
 
-const ZED_SETTINGS_REL: &str = ".config/zed/settings.json";
 const INTELLIJ_SETTINGS_REL: &str = ".jetbrains/acp.json";
 const DEFAULT_AGENT_NAME: &str = "muse-acp";
 const DEFAULT_COMMAND: &str = "muse-acp";
@@ -699,12 +698,55 @@ fn home_dir() -> Result<std::path::PathBuf, String> {
         })
 }
 
-fn default_settings_path(client: Client) -> Result<std::path::PathBuf, String> {
-    let relative = match client {
-        Client::Zed => ZED_SETTINGS_REL,
-        Client::IntelliJ => INTELLIJ_SETTINGS_REL,
+#[derive(Clone, Copy)]
+enum Platform {
+    Windows,
+    MacOs,
+    OtherUnix,
+}
+
+const CURRENT_PLATFORM: Platform = if cfg!(windows) {
+    Platform::Windows
+} else if cfg!(target_os = "macos") {
+    Platform::MacOs
+} else {
+    Platform::OtherUnix
+};
+
+/// Zed's own config location: `%APPDATA%\Zed` on Windows, `~/.config/zed` on
+/// macOS, and `$XDG_CONFIG_HOME/zed` (default `~/.config/zed`) elsewhere.
+/// Empty or relative environment values are ignored, as XDG requires.
+fn zed_settings_path(
+    platform: Platform,
+    home: impl FnOnce() -> Result<std::path::PathBuf, String>,
+    var: impl Fn(&str) -> Option<String>,
+) -> Result<std::path::PathBuf, String> {
+    let absolute = |name: &str| {
+        var(name)
+            .map(std::path::PathBuf::from)
+            .filter(|path| path.is_absolute())
     };
-    Ok(home_dir()?.join(relative))
+    let config = match platform {
+        Platform::Windows => match absolute("APPDATA") {
+            Some(app_data) => app_data.join("Zed"),
+            None => home()?.join("AppData").join("Roaming").join("Zed"),
+        },
+        Platform::MacOs => home()?.join(".config").join("zed"),
+        Platform::OtherUnix => match absolute("XDG_CONFIG_HOME") {
+            Some(config) => config.join("zed"),
+            None => home()?.join(".config").join("zed"),
+        },
+    };
+    Ok(config.join("settings.json"))
+}
+
+fn default_settings_path(client: Client) -> Result<std::path::PathBuf, String> {
+    match client {
+        Client::Zed => {
+            zed_settings_path(CURRENT_PLATFORM, home_dir, |name| std::env::var(name).ok())
+        }
+        Client::IntelliJ => Ok(home_dir()?.join(INTELLIJ_SETTINGS_REL)),
+    }
 }
 
 fn intellij_command(command: &str) -> Result<String, String> {
@@ -1017,6 +1059,57 @@ mod tests {
         assert!(path.is_absolute());
         assert!(path.is_file());
         assert!(intellij_command("relative/muse-acp").is_err());
+    }
+
+    #[test]
+    fn zed_settings_follow_zeds_per_os_config_dir() {
+        let base = std::env::temp_dir();
+        let home = base.join("home");
+        let app_data = base.join("appdata");
+        let xdg = base.join("xdg");
+        let env = |pairs: Vec<(&'static str, String)>| {
+            move |name: &str| {
+                pairs
+                    .iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| value.clone())
+            }
+        };
+        let path =
+            |platform, pairs| zed_settings_path(platform, || Ok(home.clone()), env(pairs)).unwrap();
+        let settings = |dir: std::path::PathBuf| dir.join("settings.json");
+        let text = |p: &std::path::Path| p.to_str().unwrap().to_string();
+
+        assert_eq!(
+            path(Platform::Windows, vec![("APPDATA", text(&app_data))]),
+            settings(app_data.join("Zed"))
+        );
+        assert_eq!(
+            path(Platform::Windows, vec![]),
+            settings(home.join("AppData").join("Roaming").join("Zed"))
+        );
+        // macOS Zed does not read XDG_CONFIG_HOME.
+        assert_eq!(
+            path(Platform::MacOs, vec![("XDG_CONFIG_HOME", text(&xdg))]),
+            settings(home.join(".config").join("zed"))
+        );
+        assert_eq!(
+            path(Platform::OtherUnix, vec![("XDG_CONFIG_HOME", text(&xdg))]),
+            settings(xdg.join("zed"))
+        );
+        for ignored in ["", "relative/config"] {
+            assert_eq!(
+                path(
+                    Platform::OtherUnix,
+                    vec![("XDG_CONFIG_HOME", ignored.to_string())]
+                ),
+                settings(home.join(".config").join("zed"))
+            );
+            assert_eq!(
+                path(Platform::Windows, vec![("APPDATA", ignored.to_string())]),
+                settings(home.join("AppData").join("Roaming").join("Zed"))
+            );
+        }
     }
 
     fn temp_settings_path(name: &str) -> std::path::PathBuf {
