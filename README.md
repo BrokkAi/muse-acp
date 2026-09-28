@@ -222,6 +222,9 @@ Other permission profiles are passed through unchanged.
   <objective>` replaces it, and `/goal pause`, `/goal resume`, `/goal clear`
   manage it, mapping onto the host `goal/*` methods. Goal state still streams
   back through `session/goalChanged` display metadata.
+- **Session names** — `/rename <name>` renames the session through the host's
+  `session/rename`; the new title arrives through `session/nameChanged` as an
+  ACP `session_info_update`.
 - **Content** — text, inline and local-file images, `resource_link` text
   expansion, and embedded context. Audio is rejected, because Muse's input type
   is closed to `text` and `image`.

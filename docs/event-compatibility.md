@@ -88,4 +88,5 @@ to them as well as bridge their payloads. Any other server-initiated request is
 are covered by request-schema conformance tests. The same holds for the
 `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear`
 commands, which editors reach through the adapter's `/goal` slash command
-rather than as raw ACP methods.
+rather than as raw ACP methods, and for `session/rename`, which editors reach
+through `/rename <name>`.

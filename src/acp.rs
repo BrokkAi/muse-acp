@@ -768,12 +768,13 @@ pub fn session_modes(current_mode: &str) -> String {
 }
 
 /// Build the editor command palette from the host's current skill catalog.
-/// `/compact` and `/goal` are local to the adapter and therefore remain
-/// available even though they are not host skills: `/compact` invokes the
-/// host's native compaction and `/goal
+/// `/compact`, `/goal`, and `/rename` are local to the adapter and therefore
+/// remain available even though they are not host skills: `/compact` invokes
+/// the host's native compaction, `/goal
 /// [<objective>|edit <objective>|clear|pause|resume]` maps onto the host
-/// `goal/*` methods. Any catalog row named `goal` is deduplicated below so
-/// the local command is advertised exactly once.
+/// `goal/*` methods, and `/rename <name>` maps onto `session/rename`. Catalog
+/// rows with a local command's name are deduplicated below so each local
+/// command is advertised exactly once.
 fn available_commands_json(ver: u8, skills: &[(String, String, Option<String>)]) -> String {
     let input = |hint: &str| {
         if ver == 1 {
@@ -789,20 +790,27 @@ fn available_commands_json(ver: u8, skills: &[(String, String, Option<String>)])
             "{{\"name\":\"goal\",\"description\":\"Start or manage continuous work toward a goal\",\"input\":{}}}",
             input(goal_hint)
         ),
+        format!(
+            "{{\"name\":\"rename\",\"description\":\"Rename this session\",\"input\":{}}}",
+            input("<name>")
+        ),
     ];
-    items.extend(skills.iter().filter(|(name, _, _)| name != "goal").map(
-        |(name, description, hint)| {
-            let input = hint
-                .as_deref()
-                .map(|hint| format!(",\"input\":{}", input(hint)))
-                .unwrap_or_default();
-            format!(
-                "{{\"name\":{},\"description\":{}{input}}}",
-                esc(name),
-                esc(description),
-            )
-        },
-    ));
+    items.extend(
+        skills
+            .iter()
+            .filter(|(name, _, _)| name != "goal" && name != "rename")
+            .map(|(name, description, hint)| {
+                let input = hint
+                    .as_deref()
+                    .map(|hint| format!(",\"input\":{}", input(hint)))
+                    .unwrap_or_default();
+                format!(
+                    "{{\"name\":{},\"description\":{}{input}}}",
+                    esc(name),
+                    esc(description),
+                )
+            }),
+    );
     format!("[{}]", items.join(","))
 }
 
@@ -991,20 +999,26 @@ mod tests {
             };
             assert_eq!(items.len(), 3);
 
-            let skills = vec![(
-                "plan".to_string(),
-                "Create a plan".to_string(),
-                Some("what to plan".to_string()),
-            )];
+            let skills = vec![
+                (
+                    "plan".to_string(),
+                    "Create a plan".to_string(),
+                    Some("what to plan".to_string()),
+                ),
+                ("rename".to_string(), "Host rename skill".to_string(), None),
+            ];
             let commands = available_commands_json(ver, &skills);
             let parsed = crate::json::parse_json(&commands).expect("available commands JSON");
             let J::Arr(items) = parsed else {
                 panic!("available commands must be an array");
             };
-            assert_eq!(items.len(), 3);
+            // The host's `rename` row is shadowed by the local command.
+            assert_eq!(items.len(), 4);
             assert!(commands.contains("\"name\":\"plan\""));
             assert!(commands.contains("\"name\":\"goal\""));
             assert!(commands.contains("\"name\":\"compact\""));
+            assert!(commands.contains("\"name\":\"rename\""));
+            assert!(!commands.contains("Host rename skill"));
         }
         assert!(crate::json::parse_json(&session_modes("promptUnmatched")).is_ok());
     }

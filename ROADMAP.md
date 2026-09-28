@@ -427,7 +427,7 @@ fold's unknown-method path logs and continues.
 | `goal/resume` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack; goal state streams back through `session/goalChanged`. |
 | `goal/set` | Mapped to ACP | The adapter-local `/goal` slash command maps onto `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear` and settles the prompt on the host ack; goal state streams back through `session/goalChanged`. |
 | `item/readOutput` | Mapped to ACP | Backs the opt-in `_session/readOutput` extension with bounded `offsetBytes`/`lengthBytes` reads of host-stored tool output. |
-| `session/rename` | Unsupported pending protocol decision | Rename needs an ACP surface and host-authored title handling; tracked by [#41](https://github.com/BrokkAi/muse-acp/issues/41). |
+| `session/rename` | Mapped to ACP | The adapter-local `/rename <name>` slash command sends `session/rename` and settles the prompt on the host ack; the new title arrives through `session/nameChanged`. |
 | `session/setReasoningEffort` | Mapped to ACP | Sent when the ACP reasoning `configOptions` selector picks a tier; the selector starts at "Muse default" and cannot clear a standing host default. |
 | `skill/list` | Mapped to ACP | Read per session to build the ACP `available_commands_update` catalog; slash prompts naming a listed skill become native skill turn parts. |
 | `task/background` | Unsupported pending protocol decision | The adapter observes backgrounded items but does not issue the host control command; tracked by [#38](https://github.com/BrokkAi/muse-acp/issues/38). |

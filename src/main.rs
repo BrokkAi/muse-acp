@@ -3586,24 +3586,24 @@ fn handle_acp(
                 }
                 return;
             }
-            // `/goal ...` is a protocol command, not a prompt: run the
-            // matching `goal/*` method and settle immediately. Goal display
-            // (`session/goalChanged`) and any woken goal turn arrive as their
-            // own updates.
-            let goal_attempt = parse_json(&acp_content).ok().and_then(|c| match c {
+            // `/goal ...` and `/rename ...` are protocol commands, not
+            // prompts: run the matching host method and settle immediately.
+            // Their effects (`session/goalChanged`, `session/nameChanged`,
+            // any woken goal turn) arrive as their own updates.
+            let command_attempt = parse_json(&acp_content).ok().and_then(|c| match c {
                 J::Arr(blocks) if blocks.len() == 1 => {
                     let only = &blocks[0];
                     let text = only.get("text").and_then(|v| v.as_str()).unwrap_or("");
                     if only.get("type").and_then(|v| v.as_str()) == Some("text") {
-                        parse_goal_command(text).map(|parsed| (text.to_string(), parsed))
+                        parse_protocol_command(text).map(|parsed| (text.to_string(), parsed))
                     } else {
                         None
                     }
                 }
                 _ => None,
             });
-            if let Some((raw_text, parsed)) = goal_attempt {
-                let (method, objective) = match parsed {
+            if let Some((raw_text, parsed)) = command_attempt {
+                let (method, fields) = match parsed {
                     Ok(command) => command,
                     Err(message) => {
                         acp::send_error(stdout, &id, -32602, &message);
@@ -3611,19 +3611,15 @@ fn handle_acp(
                     }
                 };
                 let cmd = host.mint_cmd("cmd-");
-                let params = match objective {
-                    Some(objective) => format!(
-                        "{{\"commandId\":{},\"sessionId\":{},\"objective\":{}}}",
-                        esc(&cmd),
-                        esc(&msp_sid),
-                        esc(&objective)
-                    ),
-                    None => format!(
-                        "{{\"commandId\":{},\"sessionId\":{}}}",
-                        esc(&cmd),
-                        esc(&msp_sid)
-                    ),
-                };
+                let mut params = format!(
+                    "{{\"commandId\":{},\"sessionId\":{}",
+                    esc(&cmd),
+                    esc(&msp_sid)
+                );
+                for (key, value) in &fields {
+                    params.push_str(&format!(",{}:{}", esc(key), esc(value)));
+                }
+                params.push('}');
                 match host.command(&method, &params) {
                     Ok(accepted) => {
                         if let Some(turn) = accepted.get("turnId").and_then(|v| v.as_str()) {
@@ -5124,6 +5120,40 @@ fn parse_goal_command(text: &str) -> Option<Result<(String, Option<String>), Str
     }
 }
 
+/// Parse a `/rename <name>` protocol command into the requested session name.
+/// Returns `None` when the text is not a `/rename` command (a leading space
+/// escapes it). The name is trimmed; the host applies its own normalization
+/// and validation, so an empty-after-trim name is the only local error.
+fn parse_rename_command(text: &str) -> Option<Result<String, String>> {
+    let body = text.strip_prefix('/')?;
+    let mut words = body.splitn(2, char::is_whitespace);
+    if words.next().unwrap_or_default() != "rename" {
+        return None;
+    }
+    let name = words.next().unwrap_or_default().trim();
+    if name.is_empty() {
+        Some(Err("usage: /rename <name>".to_string()))
+    } else {
+        Some(Ok(name.to_string()))
+    }
+}
+
+/// A host method plus its string params besides `commandId` and `sessionId`.
+type ProtocolCommand = (String, Vec<(&'static str, String)>);
+
+/// Parse an adapter-local slash command that maps onto one host method.
+/// Returns `None` when the text is not such a command.
+fn parse_protocol_command(text: &str) -> Option<Result<ProtocolCommand, String>> {
+    if let Some(parsed) = parse_goal_command(text) {
+        return Some(parsed.map(|(method, objective)| {
+            let fields = objective.map(|o| ("objective", o)).into_iter().collect();
+            (method, fields)
+        }));
+    }
+    parse_rename_command(text)
+        .map(|parsed| parsed.map(|name| ("session/rename".to_string(), vec![("name", name)])))
+}
+
 /// Convert an editor slash command into the native MSP skill part. Once the
 /// session's skill catalog is known, only a selector it lists becomes a skill:
 /// other leading-slash text, such as an absolute path at the start of a
@@ -5132,8 +5162,9 @@ fn parse_goal_command(text: &str) -> Option<Result<(String, Option<String>), Str
 /// the adapter's own `compact` command are always submitted. The host still
 /// resolves the selector, so a skill removed after the last catalog read
 /// produces its typed error. Without a catalog (the last read failed) every
-/// slash command is submitted and the host decides. (`/goal` never reaches
-/// this function as a skill: it is intercepted as a protocol command first.)
+/// slash command is submitted and the host decides. (`/goal` and `/rename`
+/// never reach this function as skills: they are intercepted as protocol
+/// commands first.)
 fn native_skill_part(
     text: &str,
     skills: Option<&std::collections::HashSet<String>>,

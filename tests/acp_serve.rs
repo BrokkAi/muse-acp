@@ -3142,6 +3142,59 @@ fn goal_slash_commands_map_to_host_goal_methods() {
 }
 
 #[test]
+fn rename_slash_command_maps_to_host_method() {
+    // `/rename <name>` is a protocol command: it sends `session/rename`,
+    // settles without a turn, and the host's `session/nameChanged` retitles
+    // the ACP session.
+    for ver in [1, 2] {
+        let mut c = Client::spawn("quiet", &[]);
+        let sid = c.new_session(ver, "");
+        let commands = c.wait_for("available_commands_update", Duration::from_secs(15));
+        assert!(
+            commands.contains("\"name\":\"rename\""),
+            "rename must be advertised: {commands}"
+        );
+        let pid = c.prompt(&sid, "/rename  Release prep ");
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"result\""),
+            "v{ver} /rename must settle honestly: {frame}"
+        );
+        c.wait_log("session/rename", Duration::from_secs(10));
+        c.wait_input("\"name\": \"Release prep\"", Duration::from_secs(10));
+        let renamed = c.wait_for("\"title\":\"Release prep\"", Duration::from_secs(15));
+        assert!(
+            renamed.contains("\"sessionUpdate\":\"session_info_update\""),
+            "v{ver} rename must retitle the ACP session: {renamed}"
+        );
+
+        // A bare or blank `/rename` is a usage error, never a host call.
+        for text in ["/rename", "/rename   "] {
+            let pid = c.prompt(&sid, text);
+            let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+            assert!(
+                frame.contains("\"code\":-32602"),
+                "{text:?} must fail closed: {frame}"
+            );
+        }
+        // A leading space escapes command handling like any other slash text.
+        let _pid = c.prompt(&sid, " /rename Other");
+        c.wait_input("\"text\": \" /rename Other\"", Duration::from_secs(15));
+        c.wait_log("turn/start", Duration::from_secs(15));
+        let methods = std::fs::read_to_string(&c.fake_log).expect("fake log");
+        assert_eq!(
+            methods
+                .lines()
+                .filter(|line| *line == "session/rename")
+                .count(),
+            1,
+            "only the first /rename reaches the host: {methods}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn a_forked_session_reads_its_skill_catalog() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
@@ -6321,39 +6374,12 @@ fn emitted_frames_conform_to_the_vendored_schema() {
     let schema: serde_json::Value = serde_json::from_str(&schema_text).expect("schema JSON");
     let defs = schema["$defs"].as_object().expect("$defs");
 
+    // Resolve each method's params through the schema's own `methods`
+    // index, so every published method is validated without a hand-kept map.
+    let method_index = schema["methods"].as_object().expect("methods index");
     let def_for = |method: &str| -> Option<&serde_json::Value> {
-        let name = match method {
-            "initialize" => "InitializeParams",
-            "session/start" => "SessionStartParams",
-            "session/resume" => "SessionResumeParams",
-            "session/list" => "SessionListParams",
-            "session/read" => "SessionReadParams",
-            "session/fork" => "SessionForkParams",
-            "session/compact" => "SessionCompactParams",
-            "session/setModel" => "SessionSetModelParams",
-            "session/setApprovalMode" => "SessionSetApprovalModeParams",
-            "session/userShell" => "SessionUserShellParams",
-            "model/list" => "ModelListParams",
-            "turn/start" => "TurnStartParams",
-            "turn/steer" => "TurnSteerParams",
-            "turn/cancel" => "TurnCancelParams",
-            "turn/interrupt" => "TurnInterruptParams",
-            "turn/unqueue" => "TurnUnqueueParams",
-            "approval/decide" => "ApprovalDecideParams",
-            "approval/listPending" => "ApprovalListPendingParams",
-            "userInput/answer" => "UserInputAnswerParams",
-            "userInput/cancel" => "UserInputCancelParams",
-            "userInput/clarify" => "UserInputClarifyParams",
-            "view/page" => "ViewPageParams",
-            "view/unsubscribe" => "ViewUnsubscribeParams",
-            "subagent/sendMessage" | "subagent/followupTask" => "SubagentInputParams",
-            "subagent/interrupt" | "subagent/stop" | "subagent/close" => {
-                "SubagentOwnerReasonParams"
-            }
-            "subagent/resume" | "subagent/reopen" | "subagent/readResult" => "SubagentTargetParams",
-            _ => return None,
-        };
-        defs.get(name)
+        let reference = method_index.get(method)?["params"]["$ref"].as_str()?;
+        defs.get(reference.strip_prefix("#/$defs/")?)
     };
 
     let type_matches = |value: &serde_json::Value, schema_type: &str| -> bool {
@@ -6397,6 +6423,14 @@ fn emitted_frames_conform_to_the_vendored_schema() {
     c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
     let cid = c.prompt(&sid, "/compact");
     c.wait_for(&format!("\"id\":{cid}"), Duration::from_secs(15));
+    for text in [
+        "/goal Green the suite",
+        "/goal pause",
+        "/rename Conformance",
+    ] {
+        let pid = c.prompt(&sid, text);
+        c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    }
     let oid = c.req(
         "session/set_config_option",
         &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"model\",\"value\":\"fake-model\"}}"),
@@ -6455,6 +6489,9 @@ fn emitted_frames_conform_to_the_vendored_schema() {
         "turn/start",
         "approval/decide",
         "approval/listPending",
+        "goal/set",
+        "goal/pause",
+        "session/rename",
     ] {
         assert!(
             methods.contains(expected),
