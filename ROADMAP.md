@@ -942,7 +942,11 @@ the output channel is usable; expiry records a diagnostic and exits nonzero.
   sessions recover terminals on resume; unrecognized or ephemeral profiles
   mark in-progress items terminal-unknown and refuse `commandId` replay.
 - Bound the restart loop (for example, N attempts with backoff) and surface
-  the classification in diagnostics.
+  the classification in diagnostics. Each restart retries its launch up to
+  three times, and a cross-generation budget admits at most five automatic
+  restarts in any ten minutes with growing backoff, so a host that crashes
+  right after every relaunch stops the adapter with an explicit message
+  ([#133](https://github.com/BrokkAi/muse-acp/issues/133)).
 
 **Acceptance criteria**
 - Host or client disconnect settles all open ACP requests.

@@ -34,6 +34,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   host_exit_classified exit after a turn/start ack with FAKE_HOST_EXIT_CODE
   host_exit_before_ack exit before a turn/start admission response
   host_exit_relaunch_unavailable first exit is retryable, replacement exits 5
+  host_crash_loop every generation crashes (exit 1) right after it is usable
   support_exit stdin-free serve probe writes stderr and exits with a code
   workflow_control live workflow; workflow/cancel emits the later item/turn views
   skills_changed skill/list changes after a skill/changed notification
@@ -530,6 +531,11 @@ def on_turn_start(params):
         # Exit after the admission ack so the adapter can classify the
         # successful spawn separately from a launch/spawn failure.
         CRASH_AFTER_ACK[0] = True
+    elif SCENARIO == "host_crash_loop":
+        # First generation: crash after a turn ack. Every replacement crashes
+        # right after its session/resume ack (see result_for), so the host
+        # never stays up and the adapter must stop relaunching it.
+        CRASH_AFTER_ACK[0] = True
     elif SCENARIO == "host_exit":
         # Complete the turn, then die like a crashed host once the ack is on
         # the wire: the adapter must restart, re-attach, and keep serving.
@@ -1025,6 +1031,8 @@ def result_for(method, msg):
                 "encoding": "utf8", "eof": True,
                 "mediaType": "text/plain", "offsetBytes": offset}
     if method == "session/resume":
+        if SCENARIO == "host_crash_loop":
+            CRASH_AFTER_ACK[0] = True
         params = msg.get("params", {})
         log_input(params)
         # Only the explicitly requested snapshot rung can carry occupancy;
@@ -1672,7 +1680,7 @@ def main():
                     if message:
                         sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))
                         sys.stderr.flush()
-                    default_code = "1" if SCENARIO in ("host_exit", "host_exit_quiet", "user_shell_restart") else "0"
+                    default_code = "1" if SCENARIO in ("host_exit", "host_exit_quiet", "user_shell_restart", "host_crash_loop") else "0"
                     os._exit(int(os.environ.get("FAKE_HOST_EXIT_CODE", default_code)))
                 if SCENARIO == "skills_changed" and method == "session/start":
                     notify("skill/changed", {"sessionId": MSP_SID})
