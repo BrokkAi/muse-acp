@@ -3076,6 +3076,72 @@ fn explicit_skill_and_compact_spellings_are_still_submitted() {
 }
 
 #[test]
+fn goal_slash_commands_map_to_host_goal_methods() {
+    // `/goal` is a protocol command, not a prompt: each subcommand maps to
+    // its `goal/*` host method with the documented params shape, and the
+    // prompt settles immediately while goal display streams separately.
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let commands = c.wait_for("available_commands_update", Duration::from_secs(15));
+    assert!(
+        commands.contains("\"name\":\"goal\""),
+        "goal must be advertised: {commands}"
+    );
+    for (text, method) in [
+        ("/goal Green the suite", "goal/set"),
+        ("/goal edit Green it harder", "goal/edit"),
+        ("/goal pause", "goal/pause"),
+        ("/goal resume", "goal/resume"),
+        ("/goal clear", "goal/clear"),
+    ] {
+        let pid = c.prompt(&sid, text);
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"result\""),
+            "{text} must settle honestly: {frame}"
+        );
+        c.wait_log(method, Duration::from_secs(10));
+    }
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    assert!(
+        input.contains("\"objective\": \"Green the suite\""),
+        "set carries the objective: {input}"
+    );
+    assert!(
+        input.contains("\"objective\": \"Green it harder\""),
+        "edit carries the replacement objective: {input}"
+    );
+    // A bare `/goal` is a usage error, never a turn and never a host call.
+    let pid = c.prompt(&sid, "/goal");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32602"),
+        "bare /goal must fail closed: {frame}"
+    );
+    // A leading space escapes command handling like any other slash text.
+    // (Count first: the earlier positive case already logged one goal/pause.)
+    let pauses_before = std::fs::read_to_string(&c.fake_log)
+        .expect("fake log")
+        .lines()
+        .filter(|line| *line == "goal/pause")
+        .count();
+    let _pid = c.prompt(&sid, " /goal pause");
+    c.wait_input("\"text\": \" /goal pause\"", Duration::from_secs(15));
+    c.wait_log("turn/start", Duration::from_secs(15));
+    let methods = std::fs::read_to_string(&c.fake_log).expect("fake log");
+    assert!(
+        methods.lines().any(|line| line == "turn/start"),
+        "escaped goal text must start a turn: {methods}"
+    );
+    assert_eq!(
+        methods.lines().filter(|line| *line == "goal/pause").count(),
+        pauses_before,
+        "escaped goal text must not pause the goal: {methods}"
+    );
+    c.finish();
+}
+
+#[test]
 fn a_forked_session_reads_its_skill_catalog() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");

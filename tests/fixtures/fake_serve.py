@@ -1336,6 +1336,11 @@ def result_for(method, msg):
             **item, "status": "completed", "revision": 2, "exitSignal": 15,
             "visibleOutput": "shell stopped"}})
         return {"commandId": params["commandId"], "status": "accepted"}
+    if method in ("goal/set", "goal/edit", "goal/pause", "goal/resume",
+                    "goal/clear"):
+        params = msg.get("params", {})
+        log_input(params)
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
     if method == "session/compact":
         log_input(msg.get("params", {}))
         if SCENARIO == "compact_noop":

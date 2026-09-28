@@ -3586,6 +3586,76 @@ fn handle_acp(
                 }
                 return;
             }
+            // `/goal ...` is a protocol command, not a prompt: run the
+            // matching `goal/*` method and settle immediately. Goal display
+            // (`session/goalChanged`) and any woken goal turn arrive as their
+            // own updates.
+            let goal_attempt = parse_json(&acp_content).ok().and_then(|c| match c {
+                J::Arr(blocks) if blocks.len() == 1 => {
+                    let only = &blocks[0];
+                    let text = only.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    if only.get("type").and_then(|v| v.as_str()) == Some("text") {
+                        parse_goal_command(text).map(|parsed| (text.to_string(), parsed))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            });
+            if let Some((raw_text, parsed)) = goal_attempt {
+                let (method, objective) = match parsed {
+                    Ok(command) => command,
+                    Err(message) => {
+                        acp::send_error(stdout, &id, -32602, &message);
+                        return;
+                    }
+                };
+                let cmd = host.mint_cmd("cmd-");
+                let params = match objective {
+                    Some(objective) => format!(
+                        "{{\"commandId\":{},\"sessionId\":{},\"objective\":{}}}",
+                        esc(&cmd),
+                        esc(&msp_sid),
+                        esc(&objective)
+                    ),
+                    None => format!(
+                        "{{\"commandId\":{},\"sessionId\":{}}}",
+                        esc(&cmd),
+                        esc(&msp_sid)
+                    ),
+                };
+                match host.command(&method, &params) {
+                    Ok(accepted) => {
+                        if let Some(turn) = accepted.get("turnId").and_then(|v| v.as_str()) {
+                            log(&format!("{method} accepted, goal turn {turn}"));
+                        }
+                        if ver == 2 {
+                            acp::send_result(stdout, &id, "{}");
+                            send_v2_user_message(stdout, &sid, &acp_content);
+                            acp::send_state(stdout, &sid, "idle", Some("end_turn"));
+                        } else {
+                            let msg_id = mint_id("msg-", &ID_COUNTER);
+                            acp::send_raw(
+                                stdout,
+                                &format!(
+                                    "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
+                                    esc(&sid),
+                                    esc(&msg_id),
+                                    esc(&raw_text)
+                                ),
+                            );
+                            acp::send_result(stdout, &id, "{\"stopReason\":\"end_turn\"}");
+                        }
+                    }
+                    Err(e) => acp::send_error(
+                        stdout,
+                        &id,
+                        msp::acp_error_code(&e, -32603),
+                        &format!("{method} failed: {}", err_message(&e)),
+                    ),
+                }
+                return;
+            }
             // The host queues concurrent turns itself (ifBusy defaults to
             // queue); track every in-flight turn so each completes its own
             // prompt response.
@@ -5013,6 +5083,47 @@ fn extract_prompt_parts(
     Ok((parts, format!("[{}]", content.join(","))))
 }
 
+/// Parse a `/goal` protocol command into its `goal/*` host method and
+/// optional objective, mirroring the host TUI syntax `/goal [<objective>|edit
+/// <objective>|clear|pause|resume]`. Returns `None` when the text is not a
+/// `/goal` command (a leading space escapes it, like any slash command).
+/// Objectives follow the host trim rule: empty-after-trim is a usage error,
+/// and the bare verbs take no arguments because the host rejects an
+/// `objective` field on them.
+fn parse_goal_command(text: &str) -> Option<Result<(String, Option<String>), String>> {
+    const USAGE: &str = "usage: /goal <objective> | /goal edit <objective> | /goal pause | /goal resume | /goal clear";
+    if !text.starts_with('/') {
+        return None;
+    }
+    let body = &text[1..];
+    let mut words = body.splitn(2, char::is_whitespace);
+    if words.next().unwrap_or_default() != "goal" {
+        return None;
+    }
+    let rest = words.next().unwrap_or_default().trim_start().to_string();
+    let mut sub = rest.splitn(2, char::is_whitespace);
+    let first = sub.next().unwrap_or_default();
+    let args = sub.next().unwrap_or_default().trim_start();
+    match first {
+        "" => Some(Err(USAGE.to_string())),
+        "edit" => {
+            if args.trim().is_empty() {
+                Some(Err("/goal edit requires an objective".to_string()))
+            } else {
+                Some(Ok(("goal/edit".to_string(), Some(args.trim().to_string()))))
+            }
+        }
+        "pause" | "resume" | "clear" => {
+            if args.trim().is_empty() {
+                Some(Ok((format!("goal/{first}"), None)))
+            } else {
+                Some(Err(format!("/goal {first} takes no arguments")))
+            }
+        }
+        _ => Some(Ok(("goal/set".to_string(), Some(rest.trim().to_string())))),
+    }
+}
+
 /// Convert an editor slash command into the native MSP skill part. Once the
 /// session's skill catalog is known, only a selector it lists becomes a skill:
 /// other leading-slash text, such as an absolute path at the start of a
@@ -5021,7 +5132,8 @@ fn extract_prompt_parts(
 /// the adapter's own `compact` command are always submitted. The host still
 /// resolves the selector, so a skill removed after the last catalog read
 /// produces its typed error. Without a catalog (the last read failed) every
-/// slash command is submitted and the host decides.
+/// slash command is submitted and the host decides. (`/goal` never reaches
+/// this function as a skill: it is intercepted as a protocol command first.)
 fn native_skill_part(
     text: &str,
     skills: Option<&std::collections::HashSet<String>>,
