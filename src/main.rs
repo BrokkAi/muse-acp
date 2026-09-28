@@ -2312,6 +2312,25 @@ fn send_v2_user_message(stdout: &StdoutShared, sid: &str, content: &str) {
     );
 }
 
+/// Echo accepted prompt content (`content` is its ACP JSON array) as v1 user
+/// message chunks sharing one message id.
+fn send_v1_user_message(stdout: &StdoutShared, sid: &str, content: &str) {
+    let msg_id = mint_id("msg-", &ID_COUNTER);
+    if let Ok(J::Arr(blocks)) = parse_json(content) {
+        for b in blocks {
+            acp::send_raw(
+                stdout,
+                &format!(
+                    "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":{},\"content\":{}}}}}}}",
+                    esc(sid),
+                    esc(&msg_id),
+                    j_to_string(&b)
+                ),
+            );
+        }
+    }
+}
+
 fn steering_prompt_required(params: Option<&J>) -> Result<bool, String> {
     let Some(meta) = params.and_then(|p| p.get("_meta")) else {
         return Ok(false);
@@ -3691,6 +3710,130 @@ fn handle_acp(
                         return;
                     }
                 };
+            let (parts, acp_content) =
+                match extract_prompt_parts(params.as_ref(), &roots, skills.as_ref()) {
+                    Ok((p, c)) if !p.is_empty() => (p, c),
+                    Ok(_) => {
+                        acp::send_error(stdout, &id, -32602, "session/prompt requires content");
+                        return;
+                    }
+                    Err(e) => {
+                        acp::send_error(stdout, &id, -32602, &e);
+                        return;
+                    }
+                };
+            // `/goal ...`, `/rename ...`, and `/workflow-child ...` are
+            // protocol commands, not prompts: run the matching host method.
+            // They are control commands rather than human turn input, so they
+            // run even while an approval awaits its verdict (pausing a goal
+            // whose turn is blocked on an approval is exactly when a user
+            // needs it). Their effects (`session/goalChanged`,
+            // `session/nameChanged`, workflow item updates) arrive as their
+            // own updates.
+            let command_line = match parse_json(&acp_content) {
+                Ok(J::Arr(blocks)) => protocol_command_text(&blocks),
+                _ => None,
+            };
+            if let Some(line) = command_line {
+                let workflow_children = || {
+                    sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&sid)
+                        .map(|s| s.fold.workflow_children())
+                        .unwrap_or_default()
+                };
+                let parsed = line.and_then(|line| {
+                    parse_protocol_command(&line, &workflow_children)
+                        .unwrap_or_else(|| Err(format!("unrecognized command: {line}")))
+                });
+                let (method, fields) = match parsed {
+                    Ok(command) => command,
+                    Err(message) => {
+                        acp::send_error(stdout, &id, -32602, &message);
+                        return;
+                    }
+                };
+                let cmd = host.mint_cmd("cmd-");
+                let mut params = format!(
+                    "{{\"commandId\":{},\"sessionId\":{}",
+                    esc(&cmd),
+                    esc(&msp_sid)
+                );
+                for (key, value) in &fields {
+                    params.push_str(&format!(",{}:{}", esc(key), j_to_string(value)));
+                }
+                params.push('}');
+                match host.command(&method, &params) {
+                    Ok(accepted) => {
+                        // A goal verb that woke an idle session names the
+                        // fresh goal turn it launched; on a busy session the
+                        // ack names the turn already running (a routing
+                        // fact). Only a fresh turn becomes this prompt's own,
+                        // so the editor shows it running, Stop reaches it
+                        // (the host then pauses the goal), and the prompt
+                        // settles with its terminal. Host notifications wait
+                        // until this handler returns, so the session state
+                        // read here predates the command.
+                        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                        let woken = accepted
+                            .get("turnId")
+                            .and_then(|v| v.as_str())
+                            .filter(|_| method.starts_with("goal/"))
+                            .zip(map.get_mut(&sid))
+                            .filter(|(turn, s)| {
+                                s.active_turn.as_deref() != Some(*turn)
+                                    && !s.in_flight.iter().any(|f| f.msp_turn == *turn)
+                            });
+                        if let Some((turn, s)) = woken {
+                            log(&format!("{method} woke goal turn {turn}"));
+                            s.in_flight.push(InFlight {
+                                msp_turn: turn.to_string(),
+                                req_id: id.clone().unwrap_or(J::Null),
+                                queued: false,
+                                file_report: report_request.map(new_file_report),
+                            });
+                            s.active_turn = Some(turn.to_string());
+                            drop(map);
+                            if ver == 2 {
+                                acp::send_result(stdout, &id, "{}");
+                                send_v2_user_message(stdout, &sid, &acp_content);
+                                acp::send_state(stdout, &sid, "running", None);
+                            } else {
+                                // v1: the prompt response arrives with the
+                                // goal turn's terminal.
+                                send_v1_user_message(stdout, &sid, &acp_content);
+                            }
+                            return;
+                        }
+                        let busy = map
+                            .get(&sid)
+                            .is_some_and(|s| s.active_turn.is_some() || !s.in_flight.is_empty());
+                        drop(map);
+                        if ver == 2 {
+                            acp::send_result(stdout, &id, "{}");
+                            send_v2_user_message(stdout, &sid, &acp_content);
+                            // The command is done, not the session: a turn
+                            // that is still running keeps it running.
+                            if busy {
+                                acp::send_state(stdout, &sid, "running", None);
+                            } else {
+                                acp::send_state(stdout, &sid, "idle", Some("end_turn"));
+                            }
+                        } else {
+                            send_v1_user_message(stdout, &sid, &acp_content);
+                            acp::send_result(stdout, &id, "{\"stopReason\":\"end_turn\"}");
+                        }
+                    }
+                    Err(e) => acp::send_error(
+                        stdout,
+                        &id,
+                        msp::acp_error_code(&e, -32603),
+                        &format!("{method} failed: {}", err_message(&e)),
+                    ),
+                }
+                return;
+            }
             // A new turn while an approval needs its recorded verdict would
             // submit fresh human input against an unresolved decision stage:
             // the host rejects that as an unrecorded human resolution. Hold
@@ -3710,18 +3853,6 @@ fn handle_acp(
                 );
                 return;
             }
-            let (parts, acp_content) =
-                match extract_prompt_parts(params.as_ref(), &roots, skills.as_ref()) {
-                    Ok((p, c)) if !p.is_empty() => (p, c),
-                    Ok(_) => {
-                        acp::send_error(stdout, &id, -32602, "session/prompt requires content");
-                        return;
-                    }
-                    Err(e) => {
-                        acp::send_error(stdout, &id, -32602, &e);
-                        return;
-                    }
-                };
             // `/compact` is a protocol command, not a prompt: run
             // session/compact and settle immediately. The compaction item
             // (when the host emits one) arrives as its own visible update.
@@ -3781,82 +3912,6 @@ fn handle_acp(
                 }
                 return;
             }
-            // `/goal ...`, `/rename ...`, and `/workflow-child ...` are
-            // protocol commands, not prompts: run the matching host method
-            // and settle immediately on its admission ack. Their effects
-            // (`session/goalChanged`, `session/nameChanged`, workflow item
-            // updates, any woken goal turn) arrive as their own updates.
-            let command_attempt = parse_json(&acp_content).ok().and_then(|c| match c {
-                J::Arr(blocks) if blocks.len() == 1 => {
-                    let only = &blocks[0];
-                    let text = only.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                    if only.get("type").and_then(|v| v.as_str()) == Some("text") {
-                        let workflow_children = || {
-                            sessions
-                                .lock()
-                                .unwrap_or_else(|p| p.into_inner())
-                                .get(&sid)
-                                .map(|s| s.fold.workflow_children())
-                                .unwrap_or_default()
-                        };
-                        parse_protocol_command(text, &workflow_children)
-                            .map(|parsed| (text.to_string(), parsed))
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            });
-            if let Some((raw_text, parsed)) = command_attempt {
-                let (method, fields) = match parsed {
-                    Ok(command) => command,
-                    Err(message) => {
-                        acp::send_error(stdout, &id, -32602, &message);
-                        return;
-                    }
-                };
-                let cmd = host.mint_cmd("cmd-");
-                let mut params = format!(
-                    "{{\"commandId\":{},\"sessionId\":{}",
-                    esc(&cmd),
-                    esc(&msp_sid)
-                );
-                for (key, value) in &fields {
-                    params.push_str(&format!(",{}:{}", esc(key), j_to_string(value)));
-                }
-                params.push('}');
-                match host.command(&method, &params) {
-                    Ok(accepted) => {
-                        if let Some(turn) = accepted.get("turnId").and_then(|v| v.as_str()) {
-                            log(&format!("{method} accepted, goal turn {turn}"));
-                        }
-                        if ver == 2 {
-                            acp::send_result(stdout, &id, "{}");
-                            send_v2_user_message(stdout, &sid, &acp_content);
-                            acp::send_state(stdout, &sid, "idle", Some("end_turn"));
-                        } else {
-                            let msg_id = mint_id("msg-", &ID_COUNTER);
-                            acp::send_raw(
-                                stdout,
-                                &format!(
-                                    "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
-                                    esc(&sid),
-                                    esc(&msg_id),
-                                    esc(&raw_text)
-                                ),
-                            );
-                            acp::send_result(stdout, &id, "{\"stopReason\":\"end_turn\"}");
-                        }
-                    }
-                    Err(e) => acp::send_error(
-                        stdout,
-                        &id,
-                        msp::acp_error_code(&e, -32603),
-                        &format!("{method} failed: {}", err_message(&e)),
-                    ),
-                }
-                return;
-            }
             // The host queues concurrent turns itself (ifBusy defaults to
             // queue); track every in-flight turn so each completes its own
             // prompt response.
@@ -3909,20 +3964,7 @@ fn handle_acp(
                         acp::send_state(stdout, &sid, "running", None);
                     } else {
                         // v1 prompt flow echoes user content as chunks.
-                        let msg_id = mint_id("msg-", &ID_COUNTER);
-                        if let Ok(J::Arr(blocks)) = parse_json(&acp_content) {
-                            for b in blocks {
-                                acp::send_raw(
-                                    stdout,
-                                    &format!(
-                                        "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":{},\"content\":{}}}}}}}",
-                                        esc(&sid),
-                                        esc(&msg_id),
-                                        j_to_string(&b)
-                                    ),
-                                );
-                            }
-                        }
+                        send_v1_user_message(stdout, &sid, &acp_content);
                     }
                     // v1: the prompt response arrives with the terminal.
                 }
@@ -4254,31 +4296,7 @@ fn handle_acp(
                 );
                 return;
             }
-            let turns = sessions
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .get(&sid)
-                .map(|s| {
-                    let msp = s.msp_sid.clone();
-                    s.in_flight
-                        .iter()
-                        .map(|f| (msp.clone(), f.msp_turn.clone(), f.req_id.clone()))
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            for (msp_sid, turn_id, req_id) in &turns {
-                let cmd = host.mint_cmd("cmd-");
-                let _ = host.command(
-                    "turn/cancel",
-                    &format!(
-                        "{{\"commandId\":{},\"sessionId\":{},\"turnId\":{}}}",
-                        esc(&cmd),
-                        esc(msp_sid),
-                        esc(turn_id)
-                    ),
-                );
-                let _ = req_id;
-            }
+            cancel_session_turns(host, sessions, &sid);
             let removed = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -4325,23 +4343,21 @@ fn handle_acp(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .get(&sid)
-                .map(|s| {
-                    let msp = s.msp_sid.clone();
-                    s.in_flight
-                        .iter()
-                        .map(|f| (msp.clone(), f.msp_turn.clone()))
-                        .collect::<Vec<_>>()
-                })
+                .map(session_stop_targets)
                 .unwrap_or_default();
             // session/cancel is the editor's stop gesture: interrupt every
-            // in-flight turn on the priority lane and ask the host to retract
-            // a submission when it has produced no assistant output yet.
-            for (msp_sid, turn_id) in turns {
+            // foreground turn on the priority lane, including one no prompt
+            // owns (a goal continuation the host submitted itself). A
+            // prompt's own submission also asks the host to retract it when
+            // it has produced no assistant output yet; an unowned turn has
+            // no prompt text to restore.
+            for (msp_sid, turn_id, owned) in turns {
                 let cmd = host.mint_cmd("cmd-");
+                let retract = if owned { ",\"retract\":true" } else { "" };
                 match host.command(
                     "turn/interrupt",
                     &format!(
-                        "{{\"commandId\":{},\"sessionId\":{},\"turnId\":{},\"retract\":true}}",
+                        "{{\"commandId\":{},\"sessionId\":{},\"turnId\":{}{retract}}}",
                         esc(&cmd),
                         esc(&msp_sid),
                         esc(&turn_id)
@@ -5310,9 +5326,15 @@ fn extract_prompt_parts(
 /// `/goal` command (a leading space escapes it, like any slash command).
 /// Objectives follow the host trim rule: empty-after-trim is a usage error,
 /// and the bare verbs take no arguments because the host rejects an
-/// `objective` field on them.
+/// `objective` field on them. A lone control word (`/goal stop`, `/goal
+/// Pause`) is a usage error too: the host would store it as a new goal and
+/// start working on it, which is never what the user meant.
 fn parse_goal_command(text: &str) -> Option<Result<(String, Option<String>), String>> {
     const USAGE: &str = "usage: /goal <objective> | /goal edit <objective> | /goal pause | /goal resume | /goal clear";
+    const CONTROL_WORDS: [&str; 15] = [
+        "stop", "cancel", "abort", "end", "quit", "exit", "off", "done", "status", "show", "help",
+        "pause", "resume", "clear", "edit",
+    ];
     if !text.starts_with('/') {
         return None;
     }
@@ -5340,6 +5362,17 @@ fn parse_goal_command(text: &str) -> Option<Result<(String, Option<String>), Str
             } else {
                 Some(Err(format!("/goal {first} takes no arguments")))
             }
+        }
+        _ if args.trim().is_empty()
+            && CONTROL_WORDS.iter().any(|word| {
+                first
+                    .trim_end_matches(|c: char| c.is_ascii_punctuation())
+                    .eq_ignore_ascii_case(word)
+            }) =>
+        {
+            Some(Err(format!(
+                "/goal {first} is not a goal: press Stop to interrupt the running goal turn (the host then pauses the goal), use /goal pause to stop further goal turns, or /goal clear to remove the goal; {USAGE}"
+            )))
         }
         _ => Some(Ok(("goal/set".to_string(), Some(rest.trim().to_string())))),
     }
@@ -5420,6 +5453,58 @@ fn parse_workflow_child_command(
 
 /// A host method plus its params besides `commandId` and `sessionId`.
 type ProtocolCommand = (String, Vec<(&'static str, J)>);
+
+/// Adapter-local slash commands that map onto one host method.
+const PROTOCOL_COMMANDS: [&str; 3] = ["goal", "rename", "workflow-child"];
+
+/// The command line of a protocol-command prompt, or `None` when the prompt
+/// is not one. The first block decides: it must be text naming a protocol
+/// command (a leading space escapes it). Editors send each @-mention as its
+/// own block, so later text and mention blocks join the line, a mention as
+/// its `[@name](uri)` link text (a reference only, never embedded contents);
+/// any other block cannot be part of a command and is a usage error.
+fn protocol_command_text(blocks: &[J]) -> Option<Result<String, String>> {
+    let first = blocks.first()?;
+    if first.get("type").and_then(J::as_str) != Some("text") {
+        return None;
+    }
+    let name = first
+        .get("text")
+        .and_then(J::as_str)?
+        .strip_prefix('/')?
+        .split(char::is_whitespace)
+        .next()?;
+    if !PROTOCOL_COMMANDS.contains(&name) {
+        return None;
+    }
+    let mention = |label: &str, uri: &str| format!("[@{label}]({uri})");
+    let mut line = String::new();
+    for block in blocks {
+        let text = block.get("text").and_then(J::as_str);
+        let uri = block.get("uri").and_then(J::as_str);
+        let embedded = block
+            .get("resource")
+            .and_then(|r| r.get("uri"))
+            .and_then(J::as_str);
+        match (block.get("type").and_then(J::as_str), text, uri, embedded) {
+            (Some("text"), Some(text), _, _) => line.push_str(text),
+            (Some("resource_link"), _, Some(uri), _) if !uri.is_empty() => {
+                let label = block.get("name").and_then(J::as_str).unwrap_or(uri);
+                line.push_str(&mention(label, uri));
+            }
+            (Some("resource"), _, _, Some(uri)) if !uri.is_empty() => {
+                let label = uri.rsplit('/').next().filter(|l| !l.is_empty());
+                line.push_str(&mention(label.unwrap_or(uri), uri));
+            }
+            _ => {
+                return Some(Err(format!(
+                    "/{name} accepts text and @-mentions only; remove images and other attachments"
+                )));
+            }
+        }
+    }
+    Some(Ok(line))
+}
 
 /// Parse an adapter-local slash command that maps onto one host method.
 /// Returns `None` when the text is not such a command.
@@ -7839,21 +7924,33 @@ fn stop_all_background_tasks(host: &Arc<MspHost>, sessions: &Sessions, acp_sid: 
     }
 }
 
-/// Cancel every in-flight turn of one ACP session (fail-closed helper).
+/// Every foreground turn a stop gesture must reach, as `(MSP session id, turn
+/// id, owned by a prompt)`: the prompts' in-flight turns, plus the running
+/// turn when no prompt owns it (a goal continuation the host submitted
+/// itself). A stale `active_turn` only costs an `already_terminal` rejection.
+fn session_stop_targets(s: &AcpSession) -> Vec<(String, String, bool)> {
+    let mut targets: Vec<_> = s
+        .in_flight
+        .iter()
+        .map(|f| (s.msp_sid.clone(), f.msp_turn.clone(), true))
+        .collect();
+    if let Some(turn) = &s.active_turn
+        && !s.in_flight.iter().any(|f| &f.msp_turn == turn)
+    {
+        targets.push((s.msp_sid.clone(), turn.clone(), false));
+    }
+    targets
+}
+
+/// Cancel every foreground turn of one ACP session (fail-closed helper).
 fn cancel_session_turns(host: &Arc<MspHost>, sessions: &Sessions, acp_sid: &str) {
     let turns = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(acp_sid)
-        .map(|s| {
-            let msp = s.msp_sid.clone();
-            s.in_flight
-                .iter()
-                .map(|f| (msp.clone(), f.msp_turn.clone()))
-                .collect::<Vec<_>>()
-        })
+        .map(session_stop_targets)
         .unwrap_or_default();
-    for (msp_sid, turn_id) in turns {
+    for (msp_sid, turn_id, _) in turns {
         let cmd = host.mint_cmd("cmd-");
         let _ = host.command(
             "turn/cancel",
@@ -8476,6 +8573,94 @@ fn complete_elicitation(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn goal_command_parses_verbs_objectives_and_control_words() {
+        use super::parse_goal_command as parse;
+        let ok = |method: &str, objective: Option<&str>| {
+            Some(Ok((method.to_string(), objective.map(str::to_string))))
+        };
+        assert_eq!(
+            parse("/goal Green the suite"),
+            ok("goal/set", Some("Green the suite"))
+        );
+        assert_eq!(
+            parse("/goal\n  Green it \n"),
+            ok("goal/set", Some("Green it"))
+        );
+        assert_eq!(
+            parse("/goal edit  Harder "),
+            ok("goal/edit", Some("Harder"))
+        );
+        assert_eq!(parse("/goal pause"), ok("goal/pause", None));
+        assert_eq!(parse("/goal resume \n"), ok("goal/resume", None));
+        assert_eq!(parse("/goal clear"), ok("goal/clear", None));
+        assert_eq!(
+            parse("/goal stop the flaky test"),
+            ok("goal/set", Some("stop the flaky test"))
+        );
+        for text in ["/goal", "/goal   ", "/goal edit", "/goal pause now"] {
+            assert!(
+                matches!(parse(text), Some(Err(_))),
+                "{text} is a usage error"
+            );
+        }
+        for text in [
+            "/goal stop",
+            "/goal STOP",
+            "/goal cancel!",
+            "/goal Pause",
+            "/goal help",
+        ] {
+            let Some(Err(message)) = parse(text) else {
+                panic!("{text} must not become a goal");
+            };
+            assert!(message.contains("/goal pause"), "{text}: {message}");
+        }
+        for text in [" /goal stop", "/goals x", "goal x", "/rename x"] {
+            assert_eq!(parse(text), None, "{text} is not a /goal command");
+        }
+    }
+
+    #[test]
+    fn protocol_command_text_joins_text_and_mentions() {
+        use super::protocol_command_text as line;
+        let blocks = |raw: &str| match crate::json::parse_json(raw) {
+            Ok(crate::json::J::Arr(blocks)) => blocks,
+            other => panic!("test blocks must be an array: {other:?}"),
+        };
+        assert_eq!(
+            line(&blocks(r#"[{"type":"text","text":"/goal x"}]"#)),
+            Some(Ok("/goal x".to_string()))
+        );
+        assert_eq!(
+            line(&blocks(
+                r#"[{"type":"text","text":"/goal port "},{"type":"resource_link","uri":"file:///a/b.rs","name":"b.rs"},{"type":"text","text":" to go"}]"#
+            )),
+            Some(Ok("/goal port [@b.rs](file:///a/b.rs) to go".to_string()))
+        );
+        assert_eq!(
+            line(&blocks(
+                r#"[{"type":"text","text":"/rename "},{"type":"resource","resource":{"uri":"file:///a/c.md","text":"body"}}]"#
+            )),
+            Some(Ok("/rename [@c.md](file:///a/c.md)".to_string()))
+        );
+        assert!(matches!(
+            line(&blocks(
+                r#"[{"type":"text","text":"/goal x"},{"type":"image","data":"AA==","mimeType":"image/png"}]"#
+            )),
+            Some(Err(_))
+        ));
+        for raw in [
+            r#"[{"type":"text","text":" /goal x"}]"#,
+            r#"[{"type":"text","text":"/compact"}]"#,
+            r#"[{"type":"text","text":"/plan x"},{"type":"resource_link","uri":"file:///a"}]"#,
+            r#"[{"type":"resource_link","uri":"file:///a"},{"type":"text","text":"/goal x"}]"#,
+            r#"[]"#,
+        ] {
+            assert_eq!(line(&blocks(raw)), None, "{raw} is not a protocol command");
+        }
+    }
 
     #[test]
     fn restart_budget_caps_a_crash_loop_and_recovers_after_the_window() {

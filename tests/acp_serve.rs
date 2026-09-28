@@ -3141,6 +3141,224 @@ fn goal_slash_commands_map_to_host_goal_methods() {
     c.finish();
 }
 
+/// Index of the first captured frame containing `want`.
+fn frame_index(c: &Client, want: &str) -> usize {
+    c.frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .position(|f| f.contains(want))
+        .unwrap_or_else(|| panic!("no frame contains {want:?}"))
+}
+
+#[test]
+fn goal_wake_keeps_the_prompt_open_until_the_goal_turn_ends() {
+    // An idle `/goal` wakes a goal turn. The prompt is that turn's, so the
+    // editor shows it running (with a Stop button) until its terminal.
+    let mut c = Client::spawn("goal_wake", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "/goal Green the suite");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"end_turn\""),
+        "the goal turn's terminal settles the prompt: {done}"
+    );
+    assert!(
+        frame_index(&c, "working on the goal") < frame_index(&c, &format!("\"id\":{pid}")),
+        "the prompt must stay open while the goal turn runs"
+    );
+    c.finish();
+}
+
+#[test]
+fn goal_wake_reports_running_in_v2() {
+    let mut c = Client::spawn("goal_wake", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "/goal Green the suite");
+    let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(accepted.contains("\"result\":{}"), "v2 accepts: {accepted}");
+    c.wait_for("\"stopReason\":\"end_turn\"", Duration::from_secs(15));
+    let running = frame_index(&c, "\"state\":\"running\"");
+    let answer = frame_index(&c, "working on the goal");
+    let idle = frame_index(&c, "\"stopReason\":\"end_turn\"");
+    assert!(
+        running < answer && answer < idle,
+        "running, then the goal turn's output, then idle"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_cancel_interrupts_a_goal_turn() {
+    let mut c = Client::spawn("goal_wake_hang", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "/goal Green the suite");
+    c.wait_for("working on the goal", Duration::from_secs(15));
+    // On a busy session the ack names the running turn: that is routing,
+    // not a new turn, so the edit settles at once and the goal turn stays
+    // with the first prompt.
+    let eid = c.prompt(&sid, "/goal edit Green it harder");
+    let edit = c.wait_for(&format!("\"id\":{eid}"), Duration::from_secs(15));
+    assert!(
+        edit.contains("\"stopReason\":\"end_turn\""),
+        "busy edit settles on its ack: {edit}"
+    );
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_log("turn/interrupt", Duration::from_secs(15));
+    c.wait_input("\"turnId\": \"turn-1\"", Duration::from_secs(15));
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"cancelled\""),
+        "Stop ends the goal prompt: {done}"
+    );
+    // The host pauses an interrupted goal; the adapter shows that state.
+    c.wait_for("\"status\":\"paused\"", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn v2_busy_goal_command_keeps_the_session_running() {
+    // A goal command that settles on its ack while the goal turn still runs
+    // must not report the session idle.
+    let mut c = Client::spawn("goal_wake_hang", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "/goal Green the suite");
+    c.wait_for("working on the goal", Duration::from_secs(15));
+    let eid = c.prompt(&sid, "/goal edit Green it harder");
+    c.wait_for(&format!("\"id\":{eid}"), Duration::from_secs(15));
+    c.wait_input("Green it harder", Duration::from_secs(15));
+    // The edit's own echo precedes its state update; wait for both.
+    c.wait_for("Green it harder\"}", Duration::from_secs(15));
+    std::thread::sleep(Duration::from_millis(300));
+    assert!(
+        !c.frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|f| f.contains("\"state\":\"idle\"")),
+        "the goal turn is still running"
+    );
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_for("\"state\":\"idle\"", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn session_cancel_interrupts_an_unowned_host_turn() {
+    // After the woken goal turn ends, the host continues the goal with a turn
+    // of its own that no prompt owns. Stop must still reach it, as a plain
+    // interrupt: there is no prompt text to retract.
+    let mut c = Client::spawn("goal_continuation", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "/goal Green the suite");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("\"stopReason\":\"end_turn\""), "{done}");
+    c.wait_stderr("turn/started turn=turn-2", Duration::from_secs(15));
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_log("turn/interrupt", Duration::from_secs(15));
+    c.wait_input("\"turnId\": \"turn-2\"", Duration::from_secs(15));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    let interrupt = input
+        .lines()
+        .find(|line| line.contains("\"turnId\": \"turn-2\""))
+        .expect("interrupt params");
+    assert!(
+        !interrupt.contains("retract"),
+        "an unowned turn has no prompt to retract: {interrupt}"
+    );
+    c.finish();
+}
+
+#[test]
+fn goal_control_words_fail_closed() {
+    // `/goal stop` once became a goal named "stop" that the host then worked
+    // on. A lone control word is a usage error that names the real controls.
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    for text in ["/goal stop", "/goal Pause", "/goal cancel."] {
+        let pid = c.prompt(&sid, text);
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"code\":-32602") && frame.contains("/goal pause"),
+            "{text} must fail closed with guidance: {frame}"
+        );
+    }
+    // A longer objective that starts with a control word is still a goal.
+    let pid = c.prompt(&sid, "/goal stop the flaky test from failing");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "{frame}");
+    c.wait_input(
+        "\"objective\": \"stop the flaky test from failing\"",
+        Duration::from_secs(15),
+    );
+    let methods = std::fs::read_to_string(&c.fake_log).expect("fake log");
+    assert_eq!(
+        methods.lines().filter(|line| *line == "goal/set").count(),
+        1,
+        "only the real objective reaches the host: {methods}"
+    );
+    c.finish();
+}
+
+#[test]
+fn goal_objective_keeps_mentions() {
+    // Editors send each @-mention as its own block. The mention joins the
+    // objective as a link instead of turning `/goal` into an ordinary prompt.
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"/goal port \"}},{{\"type\":\"resource_link\",\"uri\":\"file:///tmp/lib.rs\",\"name\":\"lib.rs\"}},{{\"type\":\"text\",\"text\":\" to go\"}}]}}"
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "{frame}");
+    c.wait_input(
+        "\"objective\": \"port [@lib.rs](file:///tmp/lib.rs) to go\"",
+        Duration::from_secs(15),
+    );
+    // An image cannot be part of a goal: fail closed, never a turn.
+    let pid = c.req(
+        "session/prompt",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"/goal port this\"}},{{\"type\":\"image\",\"data\":\"iVBORw0KGgo=\",\"mimeType\":\"image/png\"}}]}}"
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32602") && frame.contains("@-mentions only"),
+        "{frame}"
+    );
+    let methods = std::fs::read_to_string(&c.fake_log).expect("fake log");
+    assert!(
+        !methods.lines().any(|line| line == "turn/start"),
+        "a goal command never starts a prompt turn: {methods}"
+    );
+    c.finish();
+}
+
+#[test]
+fn goal_commands_pass_the_pending_approval_hold() {
+    // Pausing a goal whose turn waits on an approval is exactly when a user
+    // needs it; ordinary prompts stay held.
+    let mut c = Client::spawn("approval_hang", &[]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "do it");
+    c.wait_for("request_permission", Duration::from_secs(15));
+    let gid = c.prompt(&sid, "/goal pause");
+    let frame = c.wait_for(&format!("\"id\":{gid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"stopReason\":\"end_turn\""),
+        "/goal pause is not held: {frame}"
+    );
+    c.wait_log("goal/pause", Duration::from_secs(15));
+    let held = c.prompt(&sid, "try again");
+    let err = c.wait_for(&format!("\"id\":{held}"), Duration::from_secs(15));
+    assert!(err.contains("still pending"), "prompts stay held: {err}");
+    c.finish();
+}
+
 #[test]
 fn rename_slash_command_maps_to_host_method() {
     // `/rename <name>` is a protocol command: it sends `session/rename`,

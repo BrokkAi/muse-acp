@@ -224,8 +224,11 @@ Other permission profiles are passed through unchanged.
   Muse's native compaction.
 - **Goals** — `/goal <objective>` sets the session goal, `/goal edit
   <objective>` replaces it, and `/goal pause`, `/goal resume`, `/goal clear`
-  manage it, mapping onto the host `goal/*` methods. Goal state still streams
-  back through `session/goalChanged` display metadata.
+  manage it, mapping onto the host `goal/*` methods. When a command starts a
+  goal turn, the prompt stays open until that turn ends, and Stop interrupts
+  it (Muse then pauses the goal). Stop also reaches goal turns Muse starts on
+  its own. Objectives may include @-mentions. Goal state still streams back
+  through `session/goalChanged` display metadata.
 - **Session names** — `/rename <name>` renames the session through the host's
   `session/rename`; the new title arrives through `session/nameChanged` as an
   ACP `session_info_update`.

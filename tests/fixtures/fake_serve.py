@@ -90,6 +90,12 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   close_stdin  closes the host's stdin after initialization, then exits
   stdout_close_stays_alive closes stdout but keeps the child alive briefly
   stderr_flood writes enough stderr to require a concurrent drain
+  goal_wake    an idle goal/set|edit|resume wakes a goal turn that answers
+               and completes (the ack names the fresh turn)
+  goal_wake_hang the woken goal turn runs until turn/interrupt, which pauses
+               the goal; a later wake verb names it as the busy turn
+  goal_continuation the woken goal turn completes, then the host starts its
+               own follow-up turn that runs until turn/interrupt
 """
 import json
 import os
@@ -195,6 +201,52 @@ ACTIVE_SESSION = [MSP_SID]
 CRASH_AFTER_ACK = [False]
 WORKFLOW_TURN = [""]
 WORKFLOW_CHILD_ATTEMPT = [1]
+# The goal turn currently running in the goal_* scenarios ("" when idle).
+GOAL_TURN = [""]
+GOAL_OBJECTIVE = [""]
+
+
+def goal_changed(status):
+    notify("session/goalChanged", {
+        "sessionId": MSP_SID, "viewCursor": f"cur-goal-{TURNS[0]}-{status}",
+        "sourceRange": {"start": 1, "end": 1},
+        "goal": {"objective": GOAL_OBJECTIVE[0], "status": status,
+                 "percentComplete": 0}})
+
+
+def on_goal_command(method, params):
+    """goal/* ack. In the goal_* scenarios a wake verb on an idle session
+    launches a goal turn and names it; on a busy session it names the turn
+    already running, like the real host's routing fact."""
+    result = {"commandId": params.get("commandId", ""), "status": "accepted"}
+    if params.get("objective"):
+        GOAL_OBJECTIVE[0] = params["objective"]
+    if (SCENARIO not in ("goal_wake", "goal_wake_hang", "goal_continuation")
+            or method not in ("goal/set", "goal/edit", "goal/resume")):
+        return result
+    if GOAL_TURN[0]:
+        result["turnId"] = GOAL_TURN[0]
+        goal_changed("active")
+        return result
+    tid = turn_id()
+    base = {"sessionId": MSP_SID, "turnId": tid}
+    result["turnId"] = tid
+    goal_changed("active")
+    notify("turn/started", {**base, "commandId": params.get("commandId", "")})
+    notify("item/completed", {**base, "item": {
+        "itemId": f"it-goal-{tid}", "kind": "agentMessage", "turnId": tid,
+        "status": "completed", "text": "working on the goal"}})
+    if SCENARIO == "goal_wake_hang":
+        GOAL_TURN[0] = tid
+        return result
+    notify("turn/completed", {**base, "terminal": "completed"})
+    if SCENARIO == "goal_continuation":
+        # The host's own follow-up: no client command, no prompt owns it.
+        follow = turn_id()
+        GOAL_TURN[0] = follow
+        notify("turn/started", {"sessionId": MSP_SID, "turnId": follow,
+                                "commandId": "runtime-goal-" + follow})
+    return result
 
 
 ACTIVE_WORKSPACE = ["/tmp/fake-ws"]
@@ -1362,7 +1414,7 @@ def result_for(method, msg):
                     "goal/clear"):
         params = msg.get("params", {})
         log_input(params)
-        return {"commandId": params.get("commandId", ""), "status": "accepted"}
+        return on_goal_command(method, params)
     if method == "session/compact":
         log_input(msg.get("params", {}))
         if SCENARIO == "compact_noop":
@@ -1461,6 +1513,10 @@ def result_for(method, msg):
         # the exact turn and interrupt posture.
         params = msg.get("params", {})
         log_input(params)
+        if GOAL_TURN[0] and params.get("turnId") == GOAL_TURN[0]:
+            # Interrupting a goal turn pauses the goal (host safety rule).
+            GOAL_TURN[0] = ""
+            goal_changed("paused")
         notify("turn/completed", {"sessionId": MSP_SID,
                                   "turnId": params.get("turnId", ""),
                                   "terminal": "cancelled"})
