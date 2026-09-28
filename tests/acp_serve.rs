@@ -5352,6 +5352,39 @@ fn durable_host_crash_restarts_and_reattaches() {
 }
 
 #[test]
+fn a_host_that_crashes_after_every_restart_is_not_relaunched_forever() {
+    // Each replacement host becomes usable and then crashes again. The
+    // per-restart attempt budget resets on every successful relaunch, so the
+    // adapter needs a cross-generation cap (#133): it must stop, settle the
+    // editor, and exit instead of spawning hosts indefinitely.
+    let mut c = Client::spawn("host_crash_loop", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "start the loop");
+    c.wait_stderr("host restart budget exhausted", Duration::from_secs(60));
+    c.wait_stderr(
+        "keeps exiting right after it restarts",
+        Duration::from_secs(5),
+    );
+    // The prompt settles (the first restart reconciles it) rather than hang.
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let status = c
+        .child
+        .wait_timeout(Duration::from_secs(15))
+        .expect("wait")
+        .expect("adapter exited");
+    assert!(!status.success(), "a crash loop is a failure: {status}");
+    let spawned = std::fs::read_to_string(format!("{}.pid", c.fake_log))
+        .expect("pid log")
+        .lines()
+        .count();
+    // The first host plus at most the budgeted restarts.
+    assert!(
+        (2..=6).contains(&spawned),
+        "host generations must be bounded: {spawned}"
+    );
+}
+
+#[test]
 fn adapter_truncation_is_visible_and_configurable() {
     let mut c = Client::spawn("tool_huge_output", &[("MUSE_TOOL_OUTPUT_LIMIT", "300")]);
     let sid = c.new_session(1, "");

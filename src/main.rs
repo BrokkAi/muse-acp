@@ -1635,6 +1635,50 @@ fn reattach_view(
     }
 }
 
+/// Cross-generation limit on automatic host restarts (#133). The attempt
+/// budget inside `restart_durable_host` covers one relaunch and resets once a
+/// replacement comes up, so a host that crashes right after every restart
+/// would otherwise be relaunched forever. At most `MAX` restarts are admitted
+/// in any sliding `WINDOW`, and each one waits longer than the last, so a
+/// crash loop slows down before it stops. An occasional crash well apart from
+/// others always gets an immediate restart.
+struct RestartBudget {
+    recent: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl RestartBudget {
+    const MAX: usize = 5;
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+    fn new() -> Self {
+        Self {
+            recent: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Admit a restart at `now`, returning the delay to wait before
+    /// relaunching, or `None` once the window's budget is spent.
+    fn admit(&mut self, now: std::time::Instant) -> Option<std::time::Duration> {
+        while self
+            .recent
+            .front()
+            .is_some_and(|at| now.duration_since(*at) >= Self::WINDOW)
+        {
+            self.recent.pop_front();
+        }
+        if self.recent.len() >= Self::MAX {
+            return None;
+        }
+        // 0, 250ms, 500ms, 1s, 2s for the 1st..5th restart in the window.
+        let delay = match self.recent.len() {
+            0 => std::time::Duration::ZERO,
+            n => std::time::Duration::from_millis(250u64 << (n - 1)),
+        };
+        self.recent.push_back(now);
+        Some(delay)
+    }
+}
+
 fn restart_durable_host(
     old: &Arc<MspHost>,
     tx: &mpsc::Sender<LoopMsg>,
@@ -1872,6 +1916,7 @@ fn main() {
     // launching earlier would force a fallback posture before we know whether
     // form elicitation is available.
     let mut host: Option<Arc<MspHost>> = None;
+    let mut restart_budget = RestartBudget::new();
 
     for msg in rx {
         if shutdown::expiring() {
@@ -2020,6 +2065,24 @@ fn main() {
                 // profiles get no such guarantee, so they fail closed.
                 drop(cleanup_deadline);
                 if old_host.handshake().restartable() {
+                    let Some(delay) = restart_budget.admit(std::time::Instant::now()) else {
+                        let message = format!(
+                            "Muse serve keeps exiting right after it restarts ({} automatic restarts in {} minutes); automatic recovery has stopped. Check the Muse logs, then restart muse-acp.",
+                            RestartBudget::MAX,
+                            RestartBudget::WINDOW.as_secs() / 60
+                        );
+                        log(&format!("host restart budget exhausted: {message}"));
+                        fail_all_with_message(&stdout, &sessions, &message);
+                        shutdown::settle(&stdout, &message);
+                        shutdown::exit(1);
+                    };
+                    if !delay.is_zero() {
+                        log(&format!(
+                            "host restart backoff {}ms after repeated exits",
+                            delay.as_millis()
+                        ));
+                        std::thread::sleep(delay);
+                    }
                     match restart_durable_host(&old_host, &tx, &stdout, &sessions) {
                         Ok(new_host) => {
                             host = Some(new_host);
@@ -8261,6 +8324,35 @@ fn complete_elicitation(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn restart_budget_caps_a_crash_loop_and_recovers_after_the_window() {
+        use std::time::Duration;
+        let start = std::time::Instant::now();
+        let mut budget = super::RestartBudget::new();
+        let delays: Vec<_> = (0..5)
+            .map(|i| budget.admit(start + Duration::from_secs(i)))
+            .collect();
+        assert_eq!(
+            delays,
+            [0, 250, 500, 1000, 2000].map(|ms| Some(Duration::from_millis(ms)))
+        );
+        assert_eq!(budget.admit(start + Duration::from_secs(5)), None);
+        // Once the oldest restart leaves the window, one more is admitted.
+        assert!(
+            budget
+                .admit(start + super::RestartBudget::WINDOW + Duration::from_secs(1))
+                .is_some()
+        );
+        // Isolated crashes far apart always restart immediately.
+        let mut sparse = super::RestartBudget::new();
+        for hour in 0..10 {
+            assert_eq!(
+                sparse.admit(start + Duration::from_secs(3600 * hour)),
+                Some(Duration::ZERO)
+            );
+        }
+    }
     use super::{
         CostRate, env_flag_enabled, friendly_terminal_error, friendly_turn_error, is_network_error,
         parse_rates, v1_init, v2_init,
