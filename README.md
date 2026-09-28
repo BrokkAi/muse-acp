@@ -118,7 +118,8 @@ Any other ACP client can launch `muse-acp` directly over stdio.
 
 ### Zed
 
-`muse-acp install` registers the adapter in `~/.config/zed/settings.json`:
+`muse-acp install` registers the adapter in Zed's settings file,
+`~/.config/zed/settings.json` (`%APPDATA%\Zed\settings.json` on Windows):
 
 ```json
 {

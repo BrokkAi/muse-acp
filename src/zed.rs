@@ -699,8 +699,26 @@ fn home_dir() -> Result<std::path::PathBuf, String> {
         })
 }
 
+/// Zed on Windows keeps its config under `%APPDATA%\Zed`, not `~/.config/zed`.
+fn zed_windows_settings_path(appdata: Option<String>) -> Result<std::path::PathBuf, String> {
+    appdata
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            std::path::PathBuf::from(value)
+                .join("Zed")
+                .join("settings.json")
+        })
+        .ok_or_else(|| {
+            "cannot determine the Zed config directory (APPDATA unset); pass --settings <path>"
+                .to_string()
+        })
+}
+
 fn default_settings_path(client: Client) -> Result<std::path::PathBuf, String> {
     let relative = match client {
+        Client::Zed if cfg!(windows) => {
+            return zed_windows_settings_path(std::env::var("APPDATA").ok());
+        }
         Client::Zed => ZED_SETTINGS_REL,
         Client::IntelliJ => INTELLIJ_SETTINGS_REL,
     };
@@ -1017,6 +1035,27 @@ mod tests {
         assert!(path.is_absolute());
         assert!(path.is_file());
         assert!(intellij_command("relative/muse-acp").is_err());
+    }
+
+    #[test]
+    fn zed_windows_settings_live_under_appdata() {
+        let appdata = r"C:\Users\you\AppData\Roaming";
+        assert_eq!(
+            zed_windows_settings_path(Some(appdata.into())).unwrap(),
+            std::path::Path::new(appdata)
+                .join("Zed")
+                .join("settings.json")
+        );
+        assert!(zed_windows_settings_path(None).is_err());
+        assert!(zed_windows_settings_path(Some(String::new())).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn zed_default_settings_path_uses_appdata_on_windows() {
+        let path = default_settings_path(Client::Zed).unwrap();
+        assert!(path.starts_with(std::env::var("APPDATA").unwrap()));
+        assert!(path.ends_with(std::path::Path::new("Zed").join("settings.json")));
     }
 
     fn temp_settings_path(name: &str) -> std::path::PathBuf {

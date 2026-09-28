@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fix `muse-acp install` and `uninstall` on Windows: they now edit
+  `%APPDATA%\Zed\settings.json`, where Zed reads its settings, instead of
+  `~/.config/zed/settings.json`.
+
 ## 0.7.0
 
 - Add adapter slash commands for Muse host controls: `/goal` sets, edits,
