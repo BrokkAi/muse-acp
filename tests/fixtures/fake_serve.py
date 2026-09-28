@@ -1670,7 +1670,10 @@ def main():
                     })
                 if method == "session/list" and SCENARIO == "pipe_stall":
                     log_method("pipe-stall-start")
-                    time.sleep(8)
+                    # Stay stalled well past the adapter's 5s write timeout,
+                    # however late a slow runner starts that write; the
+                    # adapter kills this process when the timeout fires.
+                    time.sleep(60)
                 if method == "model/list" and SCENARIO == "stdout_close_stays_alive":
                     os.close(1)
                     time.sleep(1.0)

@@ -215,12 +215,24 @@ impl<'a> Parser<'a> {
                     if c < 0x20 {
                         return Err(format!("unescaped control in string at {}", self.pos));
                     }
-                    let rest = &self.b[self.pos..];
-                    let s = std::str::from_utf8(rest)
-                        .map_err(|_| "invalid utf8 in string".to_string())?;
-                    let ch = s.chars().next().ok_or("empty string tail")?;
-                    out.push(ch);
-                    self.pos += ch.len_utf8();
+                    // Copy the whole run of plain bytes at once. The input is
+                    // a `&str` and the run ends only at ASCII bytes, which
+                    // never occur inside a multibyte character, so the run is
+                    // valid UTF-8 on its own. Decoding one character at a
+                    // time by re-validating the rest of the buffer made large
+                    // strings (a pasted file in a prompt) quadratic.
+                    let start = self.pos;
+                    while self
+                        .b
+                        .get(self.pos)
+                        .is_some_and(|&b| b != b'"' && b != b'\\' && b >= 0x20)
+                    {
+                        self.pos += 1;
+                    }
+                    out.push_str(
+                        std::str::from_utf8(&self.b[start..self.pos])
+                            .map_err(|_| "invalid utf8 in string".to_string())?,
+                    );
                 }
             }
         }
@@ -382,6 +394,27 @@ pub fn mint_id(prefix: &str, counter: &std::sync::atomic::AtomicU64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn large_strings_parse_in_linear_time() {
+        // A multi-megabyte prompt (mixed ASCII, multibyte text, and escapes)
+        // must parse promptly; the old per-character re-validation was
+        // quadratic and stalled the ACP stdin pump on large pastes.
+        let chunk = "plain ascii é 漢字 🎉 \\\"q\\n ";
+        let body = chunk.repeat(4 * 1024 * 1024 / chunk.len());
+        let text = format!("{{\"text\":\"{body}\"}}");
+        let started = std::time::Instant::now();
+        let parsed = super::parse_json(&text).expect("large string");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "parsing took {:?}",
+            started.elapsed()
+        );
+        let value = parsed.get("text").and_then(|v| v.as_str()).expect("text");
+        // `\"` and `\n` in the JSON text decode to a quote and a newline.
+        assert!(value.starts_with("plain ascii é 漢字 🎉 \"q\n "));
+        assert_eq!(value.matches('🎉').count(), body.matches('🎉').count());
+    }
+
     use super::{J, parse_json};
 
     /// Strict RFC 8259 numbers: leading zeros, bare fractions, and
