@@ -225,6 +225,10 @@ Other permission profiles are passed through unchanged.
 - **Session names** — `/rename <name>` renames the session through the host's
   `session/rename`; the new title arrives through `session/nameChanged` as an
   ACP `session_info_update`.
+- **Workflow children** — workflow cards list each child with its id, and
+  `/workflow-child skip <childId>` or `/workflow-child retry <childId>` controls
+  one child of a running workflow through the host's `workflow/childControl`.
+  A bare `/workflow-child` lists the children you can control.
 - **Content** — text, inline and local-file images, `resource_link` text
   expansion, and embedded context. Audio is rejected, because Muse's input type
   is closed to `text` and `image`.

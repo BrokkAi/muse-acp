@@ -161,12 +161,25 @@ pub struct SessionFold {
     pub announced_tasks: std::collections::HashSet<String>,
     /// Workflow async task ids, keyed by the AIR task id (workflowRunId).
     workflow_tasks: HashMap<String, String>,
+    /// Latest `(revision, children)` of each running workflow, keyed by
+    /// `workflowRunId`. Child control reads the current attempt from here.
+    workflow_children: HashMap<String, (u64, Vec<WorkflowChild>)>,
     /// Last terminal state sent for each async task.
     /// AIR task id -> MSP item id, used when task control targets the host.
     async_task_msp_ids: HashMap<String, String>,
     /// Last terminal state emitted for each AIR task, suppressing duplicate
     /// item/updated + item/completed deliveries.
     async_task_states: HashMap<String, String>,
+}
+
+/// One child of a running workflow, as the latest workflow item reported it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowChild {
+    pub workflow_run_id: String,
+    pub child_id: String,
+    pub attempt: u64,
+    pub status: String,
+    pub label: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -188,6 +201,7 @@ impl SessionFold {
             air_async_tasks: false,
             announced_tasks: std::collections::HashSet::new(),
             workflow_tasks: HashMap::new(),
+            workflow_children: HashMap::new(),
             async_task_msp_ids: HashMap::new(),
             async_task_states: HashMap::new(),
         }
@@ -223,6 +237,73 @@ impl SessionFold {
                     .to_string(),
             },
         );
+    }
+
+    /// Track the children of a running workflow from its item snapshots. A
+    /// terminal item (or a completed delivery) drops the run, and an older
+    /// revision never replaces a newer one. Children without an id or a valid
+    /// attempt (integer >= 1) are not controllable and are skipped.
+    fn observe_workflow(&mut self, item: &J, completed: bool) {
+        if item.get("kind").and_then(|v| v.as_str()) != Some("workflow") {
+            return;
+        }
+        let Some(run_id) = item
+            .get("workflowRunId")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        if completed || matches!(status, "completed" | "failed" | "cancelled") {
+            self.workflow_children.remove(run_id);
+            return;
+        }
+        let revision = item.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
+        if self
+            .workflow_children
+            .get(run_id)
+            .is_some_and(|(seen, _)| *seen > revision)
+        {
+            return;
+        }
+        let children = match item.get("children") {
+            Some(J::Arr(children)) => children
+                .iter()
+                .filter_map(|child| {
+                    let child_id = child.get("childId")?.as_str()?;
+                    let attempt = child.get("attempt")?.as_u64()?;
+                    (!child_id.is_empty() && attempt >= 1).then(|| WorkflowChild {
+                        workflow_run_id: run_id.to_string(),
+                        child_id: child_id.to_string(),
+                        attempt,
+                        status: child
+                            .get("status")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string(),
+                        label: child
+                            .get("label")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("child")
+                            .to_string(),
+                    })
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+        self.workflow_children
+            .insert(run_id.to_string(), (revision, children));
+    }
+
+    /// Children of every running workflow, ordered by run id and then by
+    /// the host's child order.
+    pub fn workflow_children(&self) -> Vec<WorkflowChild> {
+        let mut runs: Vec<_> = self.workflow_children.iter().collect();
+        runs.sort_by(|a, b| a.0.cmp(b.0));
+        runs.into_iter()
+            .flat_map(|(_, (_, children))| children.iter().cloned())
+            .collect()
     }
 
     /// Return the latest owner-side observation for a durable child.
@@ -522,6 +603,11 @@ impl SessionFold {
                             .map(|c| {
                                 let label =
                                     c.get("label").and_then(|v| v.as_str()).unwrap_or("child");
+                                // The id is what `/workflow-child` takes.
+                                let label = match c.get("childId").and_then(|v| v.as_str()) {
+                                    Some(id) if !id.is_empty() => format!("{label} [{id}]"),
+                                    _ => label.to_string(),
+                                };
                                 let status = c
                                     .get("status")
                                     .and_then(|v| v.as_str())
@@ -549,10 +635,6 @@ impl SessionFold {
                         (
                             "triggerSource",
                             item.get("triggerSource").unwrap_or(&J::Null),
-                        ),
-                        (
-                            "childControlUnavailableReason",
-                            &J::Str("ACP exposes no workflow child skip/retry surface".to_string()),
                         ),
                     ],
                 );
@@ -980,6 +1062,7 @@ impl SessionFold {
             Some(s) => s.to_string(),
             None => return,
         };
+        self.observe_workflow(item, !Self::replay_is_in_flight(item));
         if self.known(&item_id) {
             return;
         }
@@ -1030,6 +1113,7 @@ impl SessionFold {
             None => return,
         };
         self.observe_subagent(item);
+        self.observe_workflow(item, false);
         if self.known(&item_id) {
             return; // gap-refill replay of a settled item
         }
@@ -1305,6 +1389,7 @@ impl SessionFold {
             None => return,
         };
         self.observe_subagent(item);
+        self.observe_workflow(item, true);
         if self.known(&item_id) {
             return; // gap-refill replay of a settled item
         }
@@ -1574,7 +1659,7 @@ pub fn stop_reason(terminal: &str) -> &'static str {
 #[cfg(test)]
 mod corpus_tests {
     use super::{SessionFold, max_content, trunc};
-    use crate::json::{J, parse_json};
+    use crate::json::{J, j_to_string, parse_json};
     use std::path::{Path, PathBuf};
 
     fn transcript_paths() -> Vec<PathBuf> {
@@ -1664,6 +1749,77 @@ mod corpus_tests {
             "too few item events replayed: {item_events}"
         );
         assert!(emitted >= 30, "fold emitted too little: {emitted}");
+    }
+
+    fn workflow_item(revision: u64, status: &str, children: &str) -> J {
+        parse_json(&format!(
+            r#"{{"itemId":"it-wf","kind":"workflow","status":"{status}","revision":{revision},"workflowRunId":"wfr-1","children":[{children}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn workflow_children_track_the_latest_attempt() {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_snapshot(
+            "sid",
+            2,
+            &workflow_item(
+                2,
+                "inProgress",
+                r#"{"childId":"c1","attempt":1,"status":"started","label":"one"},{"childId":"","attempt":1,"status":"started"},{"childId":"c3","attempt":0,"status":"started"}"#,
+            ),
+            &mut out,
+        );
+        let children = fold.workflow_children();
+        assert_eq!(
+            children.len(),
+            1,
+            "unkeyed children are skipped: {children:?}"
+        );
+        assert_eq!(children[0].child_id, "c1");
+        assert_eq!(children[0].attempt, 1);
+        assert_eq!(children[0].workflow_run_id, "wfr-1");
+
+        // A retry's snapshot advances the attempt.
+        fold.on_item_snapshot(
+            "sid",
+            2,
+            &workflow_item(
+                4,
+                "inProgress",
+                r#"{"childId":"c1","attempt":2,"status":"started"}"#,
+            ),
+            &mut out,
+        );
+        assert_eq!(fold.workflow_children()[0].attempt, 2);
+
+        // An older revision delivered late never rolls it back.
+        fold.on_item_snapshot(
+            "sid",
+            2,
+            &workflow_item(
+                3,
+                "inProgress",
+                r#"{"childId":"c1","attempt":1,"status":"started"}"#,
+            ),
+            &mut out,
+        );
+        assert_eq!(fold.workflow_children()[0].attempt, 2);
+
+        // A terminal workflow has nothing left to control.
+        let completed = parse_json(&format!(
+            r#"{{"sessionId":"s","item":{}}}"#,
+            j_to_string(&workflow_item(
+                5,
+                "completed",
+                r#"{"childId":"c1","attempt":2,"status":"completed"}"#
+            ))
+        ))
+        .unwrap();
+        fold.on_item_completed("sid", 2, &completed, &mut out);
+        assert!(fold.workflow_children().is_empty());
     }
 
     #[test]

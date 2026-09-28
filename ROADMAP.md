@@ -436,7 +436,7 @@ fold's unknown-method path logs and continues.
 | `usage/read` | Mapped to ACP | Reads the host-global subscription snapshot and publishes it as `_meta.museSubscriptionUsage`, separately from cost estimates; an unavailable host keeps existing state. |
 | `view/subscribe` | Mapped to ACP | Re-attaches at the last delivered cursor after resume or host restart so a durable suffix appended while detached is replayed; a failed subscribe keeps the resume attachment and logs a diagnostic. |
 | `workflow/cancel` | Mapped to ACP | Sent for `_session/async_task/stop` on a workflow async task (keyed by `workflowRunId`); the ack is admission-only and the workflow settles from subsequent view events. |
-| `workflow/childControl` | Unsupported pending protocol decision | Child skip/retry needs an ACP affordance and admission-only handling; tracked by [#46](https://github.com/BrokkAi/muse-acp/issues/46). |
+| `workflow/childControl` | Mapped to ACP | The adapter-local `/workflow-child skip\|retry <childId>` slash command sends the child's current attempt from the latest folded workflow item and settles on the admission-only ack; a `stale_attempt` rejection is surfaced, never re-keyed. Workflow cards show each child's id. |
 | `session/modelRouteUnserved` | Intentionally ignored | No ACP mapping or adapter state exists for a host routing observation; the unknown-notification path retains a diagnostic. |
 | `session/nameChanged` | Mapped to ACP | Updates host title facts and publishes a changed title through `session_info_update`. |
 | `session/reasoningEffortChanged` | Mapped to ACP | Updates the standing reasoning default and emits `config_option_update`; negotiated recommendations require a host `default` or `policy` source. |
