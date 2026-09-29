@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.9.0
 
 - When Muse is not installed, report it as ACP's auth-required error with a
   clear "Muse Code is not installed" message, and name the terminal auth
