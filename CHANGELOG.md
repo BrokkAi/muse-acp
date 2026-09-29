@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Forward the MCP servers an editor attaches to a session, such as Zed's
+  context servers or the JetBrains IDE server, to Muse 1.3.0 and newer through
+  typed session MCP configuration. Stdio and HTTP servers are supported, and
+  ACP HTTP MCP support is advertised when the host grants `sessionMcp`. Tool
+  calls go through Muse approvals. Servers are loaded as optional, so one that
+  cannot start does not break the session. Loading a session re-sends the
+  servers, and so does a host restart. SSE servers, malformed entries, and
+  hosts without the grant are logged by server name only. Previously every
+  client MCP server was dropped.
 - Advertise an ACP terminal auth method, `muse-login`, so editors can offer
   login when Muse is not authenticated. It runs the new `muse-acp login`
   command, which hands the terminal to `muse login` (a browser device-code

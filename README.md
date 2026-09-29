@@ -212,6 +212,9 @@ Other permission profiles are passed through unchanged.
   `_session/steering` extension.
 - **Approvals** — Muse approval requests surfaced as
   `session/request_permission`, with a deny-safe fallback.
+- **MCP servers** — stdio and HTTP MCP servers attached by the editor load
+  into the Muse session on Muse 1.3.0 and newer; see
+  [Client-provided MCP servers](#client-provided-mcp-servers).
 - **Questions** — Muse `userInput/requested` bridged to ACP
   `elicitation/create` forms when the client advertises form support; otherwise
   the host falls back to auto-cancel.
@@ -277,12 +280,42 @@ priorities.
 
 ### Client-provided MCP servers
 
-The adapter does not forward MCP servers that an ACP client attaches to a
-session, including the stdio server JetBrains may pass. It advertises HTTP and
-SSE MCP support as `false` and logs the omission (`ignoring client-provided MCP
-servers`) so the missing tools are diagnosable. Configure MCP servers in Muse
-itself instead. ACP client-owned MCP configuration remains a limitation of this
-adapter, not of Muse's session-scoped MCP support.
+MCP servers that your editor attaches to a session become tools in that Muse
+session. This includes Zed's context servers and the IDE server JetBrains
+passes. It needs Muse 1.3.0 or newer: the adapter requests the host's
+`sessionMcp` capability and loads the servers through `session/start` and
+`session/resume` configuration.
+
+- **Transports** — stdio servers and HTTP (streamable HTTP) servers. The
+  adapter advertises HTTP support (`mcpCapabilities.http` in ACP v1,
+  `session.mcp` in ACP v2) only when the host granted `sessionMcp`. SSE
+  servers are not supported by Muse and are dropped with a log line.
+- **Failures** — every server is loaded as optional. A server that cannot
+  start is skipped, and the session keeps working without its tools. An
+  invalid entry (for example, one with no command) is dropped with a log line
+  and does not fail the session.
+- **Approvals** — the model sees each tool as `mcp__<server>__<tool>`, and
+  every call goes through Muse's normal approval flow. Muse's "Always allow
+  this MCP tool" choice saves a persistent rule for that server and tool name.
+  It applies to any later server with the same name, including one configured
+  in Muse itself.
+- **Reloading** — Muse fixes a session's MCP servers when it loads the
+  session, and it does not save them. Loading a session again re-sends the
+  editor's current servers. If the adapter's Muse host already has the session
+  loaded with a different set, for example after you close a thread, change
+  context servers, and reopen it, the session keeps its current servers until
+  muse-acp restarts. A restarted Muse host gets the servers again
+  automatically.
+- **Forks** — a forked session starts without the editor's MCP servers,
+  because Muse's fork takes no configuration. It gets them the next time Muse
+  loads it.
+- **Older Muse hosts** — without the `sessionMcp` grant, the servers are
+  dropped and the adapter logs `ignoring client-provided MCP servers: this
+  Muse host did not grant sessionMcp`. Configure MCP servers in Muse itself
+  instead.
+
+The adapter log names forwarded and dropped servers but never prints their
+commands, arguments, URLs, environment values, or headers.
 
 ## How it compares
 

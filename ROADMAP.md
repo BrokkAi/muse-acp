@@ -293,34 +293,44 @@ Browserless-login guidance remains documented below.
   `muse-acp`, or report a protocol incompatibility.
 - Authentication errors do not appear as generic JSON-RPC internal errors.
 
-### 7. Explicit client MCP policy
+### 7. Client MCP forwarding
 
-Client MCP configuration is tolerated but not forwarded under the explicit
-policy below.
+Client MCP servers are forwarded to Muse through MSP 1.3.0 typed session
+configuration (`SessionConfig.mcpServers`, gated by `sessionMcp`).
 
-Status: **policy decided and documented.** Client MCP servers are tolerated
-but never forwarded. MSP 1.3.0 now exposes typed native session configuration
-(`SessionConfig.mcpServers`, gated by `sessionMcp`), but that wire surface does
-not by itself prove an ACP-to-Muse authorization, workspace-confinement, or
-lifecycle mapping. Every drop is logged, the README states the revised
-reasoning, and forwarding stays a non-goal until those guarantees are
-host-backed and tested.
+Status: **implemented.** The adapter requests `sessionMcp` and translates ACP
+stdio and HTTP servers into `config.mcpServers` on `session/start` and
+`session/resume`, each with `mode: optional`. A live Muse 1.4.1 host backed the
+guarantees this item used to wait for. Tool calls arrive as
+`mcp__<server>__<tool>` through the normal `approval/request` flow. Stdio
+servers start in the session's workspace root. The host fixes a loaded
+session's MCP set and does not persist it. A required server that cannot start
+fails every turn, which is why client servers are sent as optional. Hosts
+without the grant keep the old drop-and-log behavior. The design, probes, and
+decisions are in `.agents/plans/session-mcp-forwarding.md`.
 
 **Work items**
 
-- Document why client-provided MCP is ignored.
-- Emit a diagnostic or capability signal rather than silently dropping it.
-- If forwarding is added:
-    - support stdio command and HTTP client servers where possible;
-    - route tool calls through Muse approvals;
-    - preserve session-root confinement;
-    - define lifecycle and failure behavior for client-owned servers;
-    - avoid extending host permissions merely because a client supplied a tool.
+- Done: document the forwarding behavior and its limits in the README.
+- Done: advertise HTTP MCP only with the host grant (v1
+  `mcpCapabilities.http`, v2 `session.mcp`); log every dropped server by name,
+  never by command, URL, environment, or header value.
+- Done: stdio and streamable-HTTP servers; SSE and malformed entries are
+  dropped without failing the session.
+- Done: tool calls go through Muse approvals; the adapter grants no permission
+  of its own because a client supplied a tool.
+- Done: lifecycle. Loads re-send the servers, a conflicting reload attaches to
+  the running set, and a restarted host gets the servers again. Forks start
+  without them until Muse loads the fork again.
+- Open: MSP has no way to add servers to a loaded session or a fork. Revisit
+  if the host adds session unload or fork configuration.
 
 **Acceptance criteria**
 
-- Users can discover from logs/docs why MCP tools are unavailable.
-- Any future forwarding path cannot bypass approval or workspace policy.
+- Editor-supplied MCP tools are callable in Muse sessions and every call
+  requires the session's Muse approval policy.
+- Users can tell from logs and docs which servers were forwarded, which were
+  dropped, and why.
 
 ### 8. Workspace roots and resource-link hardening
 
