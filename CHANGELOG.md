@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.1
 
 - Classify Muse 1.4.1 as a tested host. Its stable schema adds to the 1.3.0
   surface without removing or requiring anything, and the live-host smoke
