@@ -4,7 +4,7 @@
 
 - When Muse is not installed, report it as ACP's auth-required error with a
   clear "Muse Code is not installed" message, and name the terminal auth
-  method **Install Muse Code and log in**. `muse-acp login` then offers to
+  method **Set up Muse Code**. `muse-acp login` then offers to
   run Muse's official installer, asking first, before `muse login`.
   Previously requests failed with a generic `-32603` startup error.
 - When `muse` is not on `PATH`, look for it where Muse's installer puts it

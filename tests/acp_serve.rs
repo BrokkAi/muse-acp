@@ -6619,7 +6619,7 @@ fn missing_cli_still_completes_the_handshake_and_names_the_next_action() {
     assert!(
         frame.contains("\"result\"")
             && frame.contains("\"muse-login\"")
-            && frame.contains("\"Install Muse Code and log in\""),
+            && frame.contains("\"Set up Muse Code\""),
         "{frame}"
     );
     let id = c.req(
@@ -6631,7 +6631,7 @@ fn missing_cli_still_completes_the_handshake_and_names_the_next_action() {
     assert!(
         frame.contains("\"code\":-32000")
             && frame.contains("Muse Code is not installed")
-            && frame.contains("Install Muse Code and log in")
+            && frame.contains("Set up Muse Code")
             && frame.contains("Muse CLI not found: '/nonexistent-muse'")
             && frame.contains("MUSE_CLI="),
         "unactionable spawn error: {frame}"

@@ -1255,7 +1255,7 @@ fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
                 -32000,
                 &format!(
                     "Muse Code is not installed. Choose **{AUTH_METHOD_NAME_INSTALL}** to install \
-                     it with the official installer, or install it yourself \
+                     it and log in, or install it yourself \
                      (https://dev.meta.ai/docs/muse-code) and restart the agent. ({reason})"
                 ),
             );
@@ -1307,9 +1307,9 @@ const AUTH_METHOD_ID: &str = "muse-login";
 const AUTH_METHOD_NAME: &str = "Log in with Muse";
 const AUTH_METHOD_DESCRIPTION: &str =
     "Run `muse login` in a terminal and approve the code in your browser";
-const AUTH_METHOD_NAME_INSTALL: &str = "Install Muse Code and log in";
+const AUTH_METHOD_NAME_INSTALL: &str = "Set up Muse Code";
 const AUTH_METHOD_DESCRIPTION_INSTALL: &str =
-    "Install Muse Code with its official installer, then run `muse login` in a terminal";
+    "Install Muse Code with its official installer, then log in with `muse login`";
 
 fn auth_method_label() -> (&'static str, &'static str) {
     if MUSE_NOT_INSTALLED.load(Ordering::SeqCst) {

@@ -4,9 +4,9 @@ This ExecPlan is a living document. Keep `Progress`, `Surprises & Discoveries`, 
 
 ## Purpose / Big Picture
 
-`muse-acp` is an adapter between the Agent Client Protocol (ACP, the JSON-RPC protocol editors such as Zed and JetBrains IDEs use to talk to coding agents) and Muse Code's `muse serve` host. Before this change, someone who installed the adapter from an editor's agent catalog (the ACP Registry) without first installing Muse got a generic `-32603` "Muse host unavailable: Muse CLI not found" error when opening a thread, and nothing in the editor could fix it. After this change the editor gets ACP's auth-required error (`-32000`) with the message "Muse Code is not installed", so it shows its login screen. There the adapter's single auth method is named "Install Muse Code and log in". Choosing it runs `muse-acp login` in a terminal. That command prints the official Muse installer command, asks before running it, installs Muse, then continues with `muse login`. The adapter also finds Muse in the installer's default directory when the editor's `PATH` lacks it, which is the usual case right after an install.
+`muse-acp` is an adapter between the Agent Client Protocol (ACP, the JSON-RPC protocol editors such as Zed and JetBrains IDEs use to talk to coding agents) and Muse Code's `muse serve` host. Before this change, someone who installed the adapter from an editor's agent catalog (the ACP Registry) without first installing Muse got a generic `-32603` "Muse host unavailable: Muse CLI not found" error when opening a thread, and nothing in the editor could fix it. After this change the editor gets ACP's auth-required error (`-32000`) with the message "Muse Code is not installed", so it shows its login screen. There the adapter's single auth method is named "Set up Muse Code". Choosing it runs `muse-acp login` in a terminal. That command prints the official Muse installer command, asks before running it, installs Muse, then continues with `muse login`. The adapter also finds Muse in the installer's default directory when the editor's `PATH` lacks it, which is the usual case right after an install.
 
-To see it working, run the adapter with no Muse reachable (an empty `PATH`, `HOME` and `LOCALAPPDATA` pointing at an empty directory, `MUSE_CLI` unset). `initialize` lists the method named "Install Muse Code and log in", `session/new` returns `-32000` starting with "Muse Code is not installed", and `muse-acp login` with `n` on stdin prints the installer command and exits 1 without installing.
+To see it working, run the adapter with no Muse reachable (an empty `PATH`, `HOME` and `LOCALAPPDATA` pointing at an empty directory, `MUSE_CLI` unset). `initialize` lists the method named "Set up Muse Code", `session/new` returns `-32000` starting with "Muse Code is not installed", and `muse-acp login` with `n` on stdin prints the installer command and exits 1 without installing.
 
 ## Progress
 
@@ -41,6 +41,9 @@ To see it working, run the adapter with no Muse reachable (an empty `PATH`, `HOM
 - Decision: no automatic relaunch of `muse serve` from host-unavailable mode after an install.
   Rationale: this matches the earlier plan, where terminal-auth clients restart the agent after login. The login message tells users to restart the agent if Muse still shows as missing.
   Date/Author: 2026-09-29 / Claude.
+- Decision: name the method "Set up Muse Code" when Muse is missing, replacing the first draft's "Install Muse Code and log in".
+  Rationale: the editor shows this on its sign-in screen, and to a person a login button that installs software reads oddly. "Set up" covers install plus sign-in.
+  Date/Author: 2026-09-29 / Claude with Ryan Svihla.
 
 ## Outcomes & Retrospective
 
@@ -75,7 +78,7 @@ The code changes are additive. Running the Muse installer twice is safe; it repl
 
 A no-Muse `session/new` error on Windows:
 
-    {"code":-32000,"message":"Muse Code is not installed. Choose **Install Muse Code and log in** to install it with the official installer, or install it yourself (https://dev.meta.ai/docs/muse-code) and restart the agent. (Muse CLI not found: 'muse'. ...)"}
+    {"code":-32000,"message":"Muse Code is not installed. Choose **Set up Muse Code** to install it and log in, or install it yourself (https://dev.meta.ai/docs/muse-code) and restart the agent. (Muse CLI not found: 'muse'. ...)"}
 
 ## Interfaces and Dependencies
 

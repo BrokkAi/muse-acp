@@ -417,7 +417,7 @@ handshake. Every later request then returns the startup diagnostic, so the
 editor shows what to fix.
 
 If Muse is not installed, requests fail with the same `-32000` error, and the
-auth method is named **Install Muse Code and log in**. `muse-acp login` then
+auth method is named **Set up Muse Code**. `muse-acp login` then
 shows the official Muse installer command (`curl -fsSL
 https://dev.meta.ai/install.sh | bash`, or `irm https://dev.meta.ai/install.ps1
 | iex` on Windows) and asks before running it. It installs only on Enter or
