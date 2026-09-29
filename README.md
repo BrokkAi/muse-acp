@@ -178,7 +178,7 @@ adapter.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `MUSE_CLI` | `muse` | Muse host binary to launch. Use an absolute path when the editor's `PATH` differs from your shell's. On Windows the default also finds the `muse.cmd` launcher that the Muse installer puts on `PATH`. |
+| `MUSE_CLI` | `muse` | Muse host binary to launch. Use an absolute path when the editor's `PATH` differs from your shell's. On Windows the default also finds the `muse.cmd` launcher that the Muse installer puts on `PATH`. When `PATH` has no `muse`, the default falls back to the Muse installer's location (`MUSE_INSTALL_DIR`, else `~/.local/bin`, or `%LOCALAPPDATA%\Programs\muse` on Windows). |
 | `MUSE_SERVE_ARGS` | none | Extra host-lifetime flags for `muse serve` (see `muse serve --help`). Split on whitespace; no shell quoting or expansion. |
 | `MUSE_APPROVAL_MODE` | host default | Force an approval posture: `allowAll`, `promptUnmatched`, `onRequest`, or `denyUnmatched`. `promptUnmatched` sends every unmatched tool call through `session/request_permission`. |
 | `MUSE_COMMAND_TIMEOUT_MS` | method-specific | Override the host admission-ack deadline, in milliseconds. |
@@ -412,9 +412,20 @@ muse-acp login                   # or: npx --yes @brokkai/muse-acp login
 `META_API_KEY`, when set in the agent's environment, takes priority over the
 account login.
 
-If `muse serve` cannot start at all (for example, Muse is not installed), the
-adapter still completes the ACP handshake. Every later request then returns
-the startup diagnostic, so the editor shows what to fix.
+If `muse serve` cannot start at all, the adapter still completes the ACP
+handshake. Every later request then returns the startup diagnostic, so the
+editor shows what to fix.
+
+If Muse is not installed, requests fail with the same `-32000` error, and the
+auth method is named **Install Muse Code and log in**. `muse-acp login` then
+shows the official Muse installer command (`curl -fsSL
+https://dev.meta.ai/install.sh | bash`, or `irm https://dev.meta.ai/install.ps1
+| iex` on Windows) and asks before running it. It installs only on Enter or
+`y`, then continues with `muse login`. It never installs when `MUSE_CLI` is
+set. Restart the editor agent afterwards if it still reports Muse as missing.
+Muse's installer puts `muse` in `~/.local/bin` (`%LOCALAPPDATA%\Programs\muse`
+on Windows, or `MUSE_INSTALL_DIR`), and the adapter looks there when `muse` is
+not on the editor's `PATH`.
 
 Run the login **where the adapter runs, as the same OS user**. For SSH,
 containers, remote IDE backends, or a different OS account, a login on your

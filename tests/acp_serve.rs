@@ -6615,8 +6615,11 @@ fn missing_cli_still_completes_the_handshake_and_names_the_next_action() {
     let mut c = Client::spawn("happy", &[("MUSE_CLI", "/nonexistent-muse")]);
     let id = c.req("initialize", "{\"protocolVersion\":1}");
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
+    // The login method is named for the install it now starts with.
     assert!(
-        frame.contains("\"result\"") && frame.contains("\"muse-login\""),
+        frame.contains("\"result\"")
+            && frame.contains("\"muse-login\"")
+            && frame.contains("\"Install Muse Code and log in\""),
         "{frame}"
     );
     let id = c.req(
@@ -6624,8 +6627,11 @@ fn missing_cli_still_completes_the_handshake_and_names_the_next_action() {
         &format!(r#"{{"cwd":{},"mcpServers":[]}}"#, temp_cwd_json()),
     );
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
+    // Auth-required, so clients show the install-and-login button.
     assert!(
-        frame.contains("\"code\":-32603")
+        frame.contains("\"code\":-32000")
+            && frame.contains("Muse Code is not installed")
+            && frame.contains("Install Muse Code and log in")
             && frame.contains("Muse CLI not found: '/nonexistent-muse'")
             && frame.contains("MUSE_CLI="),
         "unactionable spawn error: {frame}"
@@ -6683,6 +6689,33 @@ fn login_subcommand_hands_the_terminal_to_muse_login() {
         .output()
         .expect("login");
     assert_eq!(out.status.code(), Some(2), "{out:?}");
+}
+
+#[test]
+fn login_offers_to_install_missing_muse_and_declines_without_an_answer() {
+    // No Muse on PATH or in the installer's default location.
+    let dir = std::env::temp_dir().join(format!("acp-login-install-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let out = Command::new(adapter_bin())
+        .arg("login")
+        .env_remove("MUSE_CLI")
+        .env_remove("MUSE_INSTALL_DIR")
+        .env("PATH", &dir)
+        .env("HOME", &dir)
+        .env("LOCALAPPDATA", &dir)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("login");
+    let _ = std::fs::remove_dir_all(&dir);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(
+        stderr.contains("Muse Code is not installed")
+            && stderr.contains("https://dev.meta.ai/install.")
+            && stderr.contains("Install Muse Code now?")
+            && stderr.contains("Muse Code was not installed"),
+        "{stderr}"
+    );
 }
 
 #[test]

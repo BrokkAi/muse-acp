@@ -234,20 +234,62 @@ pub fn session_profile_hint(host_message: &str) -> Option<String> {
     ))
 }
 
-/// The Muse executable: `MUSE_CLI`, else `muse` from PATH. On Windows the
-/// Muse installer ships `muse.cmd`, which `Command::new("muse")` never finds
-/// (it only appends `.exe`), so search PATH for the launcher scripts too.
+/// The Muse executable: `MUSE_CLI`, else `muse` from PATH, else the Muse
+/// installer's default location. On Windows the installer ships `muse.cmd`,
+/// which `Command::new("muse")` never finds (it only appends `.exe`), so
+/// search for the launcher scripts too. Editors often start agents without
+/// the installer's directory on PATH, which the last fallback covers,
+/// including right after `muse-acp login` installed Muse.
 pub fn muse_cli() -> String {
     if let Ok(bin) = std::env::var("MUSE_CLI") {
         return bin;
     }
-    if cfg!(windows)
-        && let Some(path) = std::env::var_os("PATH")
-            .and_then(|path| find_windows_launcher(std::env::split_paths(&path), "muse"))
+    let path_dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    let install_dir = default_install_dir(
+        std::env::var_os("MUSE_INSTALL_DIR"),
+        std::env::var_os(if cfg!(windows) {
+            "LOCALAPPDATA"
+        } else {
+            "HOME"
+        }),
+    );
+    if cfg!(windows) {
+        return find_windows_launcher(path_dirs.into_iter().chain(install_dir), "muse")
+            .unwrap_or_else(|| "muse".to_string());
+    }
+    // A bare name keeps symlinked installs (Homebrew, cargo) working across
+    // upgrades, so the installer path is only used when PATH has no `muse`.
+    let on_path = path_dirs
+        .iter()
+        .any(|dir| dir.is_absolute() && dir.join("muse").is_file());
+    if !on_path
+        && let Some(bin) = install_dir
+            .map(|dir| dir.join("muse"))
+            .filter(|bin| bin.is_file())
+            .and_then(|bin| bin.into_os_string().into_string().ok())
     {
-        return path;
+        return bin;
     }
     "muse".to_string()
+}
+
+/// Where Muse's official installer puts `muse`: `MUSE_INSTALL_DIR` when set,
+/// else `<HOME>/.local/bin`, or `<LOCALAPPDATA>\Programs\muse` on Windows.
+fn default_install_dir(
+    install_dir: Option<std::ffi::OsString>,
+    base: Option<std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    if let Some(dir) = install_dir.filter(|dir| !dir.is_empty()) {
+        return Some(dir.into());
+    }
+    let base = std::path::PathBuf::from(base.filter(|base| !base.is_empty())?);
+    Some(if cfg!(windows) {
+        base.join("Programs").join("muse")
+    } else {
+        base.join(".local").join("bin")
+    })
 }
 
 /// First `<stem>.exe`, `.cmd`, or `.bat` in PATH order, as a full path.
@@ -509,6 +551,8 @@ impl fmt::Display for ExitClassification {
 
 #[derive(Debug)]
 pub enum LaunchError {
+    /// No Muse executable exists at the resolved path.
+    NotInstalled(String),
     Spawn(String),
     Startup(String),
     HostExit(ExitClassification),
@@ -517,7 +561,7 @@ pub enum LaunchError {
 impl LaunchError {
     pub fn retryable(&self) -> bool {
         match self {
-            LaunchError::Spawn(_) => false,
+            LaunchError::NotInstalled(_) | LaunchError::Spawn(_) => false,
             LaunchError::Startup(_) => true,
             LaunchError::HostExit(exit) => exit.retryable(),
         }
@@ -527,7 +571,9 @@ impl LaunchError {
 impl fmt::Display for LaunchError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LaunchError::Spawn(message) | LaunchError::Startup(message) => f.write_str(message),
+            LaunchError::NotInstalled(message)
+            | LaunchError::Spawn(message)
+            | LaunchError::Startup(message) => f.write_str(message),
             LaunchError::HostExit(exit) => f.write_str(&exit.editor_message()),
         }
     }
@@ -824,7 +870,14 @@ impl MspHost {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| LaunchError::Spawn(describe_spawn_error(&bin, &e)))?;
+            .map_err(|e| {
+                let message = describe_spawn_error(&bin, &e);
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    LaunchError::NotInstalled(message)
+                } else {
+                    LaunchError::Spawn(message)
+                }
+            })?;
         let stdout = match child.stdout.take() {
             Some(stdout) => stdout,
             None => {
@@ -1689,6 +1742,25 @@ mod authentication_tests {
         assert_eq!(find_windows_launcher(dirs(), "absent"), None);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&relative);
+    }
+
+    #[test]
+    fn default_install_dir_follows_the_muse_installer() {
+        let os = |s: &str| Some(std::ffi::OsString::from(s));
+        assert_eq!(
+            default_install_dir(os("/opt/muse-bin"), os("/home/u")),
+            Some(std::path::PathBuf::from("/opt/muse-bin"))
+        );
+        let expected = if cfg!(windows) {
+            std::path::Path::new("/home/u")
+                .join("Programs")
+                .join("muse")
+        } else {
+            std::path::Path::new("/home/u").join(".local").join("bin")
+        };
+        assert_eq!(default_install_dir(os(""), os("/home/u")), Some(expected));
+        assert_eq!(default_install_dir(None, os("")), None);
+        assert_eq!(default_install_dir(None, None), None);
     }
 
     #[test]
