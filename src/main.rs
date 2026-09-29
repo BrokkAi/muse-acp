@@ -20,7 +20,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
 
@@ -42,6 +42,7 @@ static AIR_RECOMMENDED: AtomicU64 = AtomicU64::new(0); // 1 when the client want
 static USER_SHELL: AtomicU64 = AtomicU64::new(0); // explicit editor shell feature
 static READ_OUTPUT: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates stored-output reads
 static AIR_FILE_REPORT: AtomicU64 = AtomicU64::new(0); // 1 when per-turn file reports are negotiated
+static MUSE_NOT_INSTALLED: AtomicBool = AtomicBool::new(false); // host launch found no Muse executable
 
 const FILE_REPORT_MAX_PATHS: usize = 1024;
 const FILE_REPORT_MAX_PATH_LENGTH: usize = 4096;
@@ -1246,6 +1247,19 @@ fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
             shutdown::settle(stdout, "adapter shutting down");
             shutdown::exit(0);
         }
+        // Auth-required, so clients show the button that installs Muse.
+        Some(_) if id.is_some() && MUSE_NOT_INSTALLED.load(Ordering::SeqCst) => {
+            acp::send_error(
+                stdout,
+                &id,
+                -32000,
+                &format!(
+                    "Muse Code is not installed. Choose **{AUTH_METHOD_NAME_INSTALL}** to install \
+                     it and log in, or install it yourself \
+                     (https://dev.meta.ai/docs/muse-code) and restart the agent. ({reason})"
+                ),
+            );
+        }
         Some(_) if id.is_some() => {
             let code = if msp::auth_failure(reason).is_some() {
                 -32000
@@ -1286,13 +1300,27 @@ fn reject_if_logged_out(host: &MspHost, stdout: &StdoutShared, id: &Option<J>) -
 
 /// The single ACP auth method: terminal auth that re-runs this adapter as
 /// `muse-acp login`. Clients replace the agent's (empty) default arguments
-/// with `args`, so the login needs no separate executable.
+/// with `args`, so the login needs no separate executable. Where Muse is
+/// missing the same login first offers to install it, and the method is
+/// named for that.
 const AUTH_METHOD_ID: &str = "muse-login";
 const AUTH_METHOD_NAME: &str = "Log in with Muse";
 const AUTH_METHOD_DESCRIPTION: &str =
     "Run `muse login` in a terminal and approve the code in your browser";
+const AUTH_METHOD_NAME_INSTALL: &str = "Set up Muse Code";
+const AUTH_METHOD_DESCRIPTION_INSTALL: &str =
+    "Install Muse Code with its official installer, then log in with `muse login`";
+
+fn auth_method_label() -> (&'static str, &'static str) {
+    if MUSE_NOT_INSTALLED.load(Ordering::SeqCst) {
+        (AUTH_METHOD_NAME_INSTALL, AUTH_METHOD_DESCRIPTION_INSTALL)
+    } else {
+        (AUTH_METHOD_NAME, AUTH_METHOD_DESCRIPTION)
+    }
+}
 
 fn auth_methods_v1() -> String {
+    let (name, description) = auth_method_label();
     // Clients predating the typed method read the `_meta` terminal-auth
     // convention, which needs an explicit executable.
     let legacy = std::env::current_exe()
@@ -1300,7 +1328,8 @@ fn auth_methods_v1() -> String {
         .and_then(|path| path.to_str().map(str::to_string))
         .map(|exe| {
             format!(
-                r#","_meta":{{"terminal-auth":{{"label":"Muse login","command":{},"args":["login"]}}}}"#,
+                r#","_meta":{{"terminal-auth":{{"label":{},"command":{},"args":["login"]}}}}"#,
+                esc(name),
                 esc(&exe)
             )
         })
@@ -1308,17 +1337,18 @@ fn auth_methods_v1() -> String {
     format!(
         r#"[{{"id":{},"name":{},"description":{},"type":"terminal","args":["login"]{legacy}}}]"#,
         esc(AUTH_METHOD_ID),
-        esc(AUTH_METHOD_NAME),
-        esc(AUTH_METHOD_DESCRIPTION)
+        esc(name),
+        esc(description)
     )
 }
 
 fn auth_methods_v2() -> String {
+    let (name, description) = auth_method_label();
     format!(
         r#"[{{"methodId":{},"name":{},"description":{},"type":"terminal","args":["login"]}}]"#,
         esc(AUTH_METHOD_ID),
-        esc(AUTH_METHOD_NAME),
-        esc(AUTH_METHOD_DESCRIPTION)
+        esc(name),
+        esc(description)
     )
 }
 
@@ -1607,19 +1637,108 @@ fn cli_readiness_lines() -> Vec<String> {
 /// `muse-acp login`: the ACP terminal-auth target. Clients run it in a real
 /// terminal; the device-code flow belongs to Muse, so the adapter only hands
 /// its terminal to the configured `muse login` and reports that exit status.
-/// Nothing is read from or written to the credential store here.
+/// Nothing is read from or written to the credential store here. When Muse
+/// is missing (and `MUSE_CLI` does not pin a path), it offers Muse's
+/// official installer first.
 fn login() -> i32 {
-    let bin = msp::muse_cli();
-    eprintln!("[muse-acp] running `{bin} login`");
-    match std::process::Command::new(&bin).arg("login").status() {
+    let run = |bin: &str| {
+        eprintln!("[muse-acp] running `{bin} login`");
+        std::process::Command::new(bin).arg("login").status()
+    };
+    let mut bin = msp::muse_cli();
+    let mut result = run(&bin);
+    let mut installed = false;
+    if matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+        && std::env::var_os("MUSE_CLI").is_none()
+    {
+        if let Err(code) = install_muse() {
+            return code;
+        }
+        installed = true;
+        bin = msp::muse_cli();
+        result = run(&bin);
+    }
+    match result {
         Ok(status) if status.success() => {
-            eprintln!("[muse-acp] Muse login complete; return to your editor.");
+            eprintln!(
+                "[muse-acp] Muse login complete; return to your editor{}.",
+                if installed {
+                    " and restart the agent if it still reports Muse missing"
+                } else {
+                    ""
+                }
+            );
             0
         }
         Ok(status) => status.code().filter(|code| *code != 0).unwrap_or(1),
         Err(e) => {
             eprintln!("[muse-acp] {}", msp::describe_spawn_error(&bin, &e));
             1
+        }
+    }
+}
+
+/// Muse's official installer as a command line: its download URL piped to a
+/// shell, exactly as the Muse docs publish it.
+fn muse_installer() -> (&'static str, &'static [&'static str]) {
+    if cfg!(windows) {
+        (
+            "powershell",
+            &[
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "irm https://dev.meta.ai/install.ps1 | iex",
+            ],
+        )
+    } else {
+        // The installer script needs bash; pipefail keeps a failed download
+        // from looking like a successful install.
+        (
+            "bash",
+            &[
+                "-c",
+                "set -o pipefail; curl -fsSL https://dev.meta.ai/install.sh | bash",
+            ],
+        )
+    }
+}
+
+/// Offer to install Muse, running the installer only on a typed answer:
+/// Enter or "y" accepts, and anything else, including a closed stdin,
+/// declines.
+fn install_muse() -> Result<(), i32> {
+    let (program, args) = muse_installer();
+    eprintln!(
+        "[muse-acp] Muse Code is not installed. muse-acp can install it with the official installer:"
+    );
+    eprintln!("    {}", args.last().copied().unwrap_or_default());
+    eprint!("Install Muse Code now? [Y/n] ");
+    let mut answer = String::new();
+    let accepted = match std::io::stdin().read_line(&mut answer) {
+        Ok(0) | Err(_) => false,
+        Ok(_) => matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "" | "y" | "yes"
+        ),
+    };
+    if !accepted {
+        eprintln!(
+            "\n[muse-acp] Muse Code was not installed. Install it \
+             (https://dev.meta.ai/docs/muse-code), then log in again."
+        );
+        return Err(1);
+    }
+    match std::process::Command::new(program).args(args).status() {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => {
+            eprintln!("[muse-acp] the Muse installer failed ({status})");
+            Err(status.code().filter(|code| *code != 0).unwrap_or(1))
+        }
+        Err(e) => {
+            eprintln!("[muse-acp] could not run the Muse installer with `{program}`: {e}");
+            Err(1)
         }
     }
 }
@@ -2172,6 +2291,9 @@ fn main() {
                                         }
                                     }
                                     eprintln!("[muse-acp] host unavailable: {e}");
+                                    if matches!(e, LaunchError::NotInstalled(_)) {
+                                        MUSE_NOT_INSTALLED.store(true, Ordering::SeqCst);
+                                    }
                                     let reason = e.to_string();
                                     serve_without_host(&stdout, &v, &reason);
                                     host_unavailable = Some(reason);

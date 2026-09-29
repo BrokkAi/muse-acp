@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- When Muse is not installed, report it as ACP's auth-required error with a
+  clear "Muse Code is not installed" message, and name the terminal auth
+  method **Set up Muse Code**. `muse-acp login` then offers to
+  run Muse's official installer, asking first, before `muse login`.
+  Previously requests failed with a generic `-32603` startup error.
+- When `muse` is not on `PATH`, look for it where Muse's installer puts it
+  (`MUSE_INSTALL_DIR`, `~/.local/bin`, or `%LOCALAPPDATA%\Programs\muse` on
+  Windows). Editors often launch agents without that directory on `PATH`.
+
 ## 0.8.1
 
 - Classify Muse 1.4.1 as a tested host. Its stable schema adds to the 1.3.0
