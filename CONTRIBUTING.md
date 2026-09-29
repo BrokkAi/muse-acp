@@ -21,7 +21,8 @@ node scripts/smoke_npm.cjs target/debug/muse-acp
 ```
 
 CI also parses `install.ps1` with PowerShell, tests the minimum Rust version,
-and runs the npm launcher tests on Linux, macOS, and Windows.
+runs clippy, the Rust tests, and the selftest on macOS and Windows, and runs the
+npm launcher tests on Linux, macOS, and Windows.
 
 Keep protocol changes compatible with the ACP versions advertised by the
 adapter. Add regression coverage for behavior changes, especially permission,
