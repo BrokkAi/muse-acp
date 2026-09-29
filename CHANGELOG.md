@@ -11,6 +11,13 @@
   (`MUSE_INSTALL_DIR`, `~/.local/bin`, or `%LOCALAPPDATA%\Programs\muse` on
   Windows). Editors often launch agents without that directory on `PATH`.
 
+## 0.8.1
+
+- Classify Muse 1.4.1 as a tested host. Its stable schema adds to the 1.3.0
+  surface without removing or requiring anything, and the live-host smoke
+  test passes, so startup logs now report `status=tested` instead of
+  `status=unknown`.
+
 ## 0.8.0
 
 - Forward the MCP servers an editor attaches to a session, such as Zed's

@@ -116,7 +116,7 @@ To see it working, run `cargo test --locked --test acp_serve mcp` and observe th
 ## Outcomes & Retrospective
 
 
-Editor MCP servers now reach Muse sessions on hosts that grant `sessionMcp`, and the live end-to-end run proved the purpose: an ACP client attached a stdio server, the editor received a permission prompt for `mcp__probe__secret_word`, and the tool's output reached the thread. Hosts without the grant keep the previous behavior. The remaining gap is the host's: a loaded session or a fork cannot change its MCP set until the host process restarts, so the adapter logs this case and documents it rather than failing. The live Muse 1.4.1 schema fingerprint (`sha256:e0e163db...`) is not yet recorded in `src/compat.rs`, so the adapter reports it as `status=unknown`. That is separate work.
+Editor MCP servers now reach Muse sessions on hosts that grant `sessionMcp`, and the live end-to-end run proved the purpose: an ACP client attached a stdio server, the editor received a permission prompt for `mcp__probe__secret_word`, and the tool's output reached the thread. Hosts without the grant keep the previous behavior. The remaining gap is the host's: a loaded session or a fork cannot change its MCP set until the host process restarts, so the adapter logs this case and documents it rather than failing. The live Muse 1.4.1 schema fingerprint (`sha256:e0e163db...`) is not yet recorded in `src/compat.rs`, so the adapter reported it as `status=unknown`; a follow-up change recorded it in the compatibility table as tested.
 
 
 ## Context and Orientation

@@ -4,7 +4,7 @@ This is a living roadmap for `muse-acp`. It records the direction that keeps the
 adapter close to Muse Session Protocol (MSP), safe around approvals and file
 access, and useful in real editor workflows.
 
-- **Last revised:** 2026-09-26
+- **Last revised:** 2026-09-29
 - **Original planning baseline:** `v0.2.5`; current release history is in
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
@@ -96,7 +96,15 @@ the verdict into richer support bundles.
   release label: Muse 1.3.0-R3401.1 reports
   `sha256:7469c9e352e67def4a59df7e439984d7194fa351e1c8b7abb34060fd977ced81`
   (schema version 1; live handshake, session lifecycle, and full turn
-  verified). Transcript fixtures
+  verified). Host 1.4.1 reports
+  `sha256:e0e163db6ccf00dbe68402ce55d6319b3edc33c421f31e9583b587b2de8a118f`
+  (schema version 1; the binary's `muse schema` export is additive over the
+  vendored bundle, and the live-host smoke test passed). No published SDK
+  carries the 1.4 surface yet. The SDK repository's Python tree and PyPI
+  `muse-code-sdk` 1.3.1 publish an intermediate
+  `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
+  surface, while its top-level schema and npm `@muse-code/sdk` 1.3.0 stay on
+  the vendored 1.3.0-R3401.1 fingerprint. Transcript fixtures
   intentionally carry their own
   fingerprint (`sha256:c8d1a2a1866814e220fd396d382a9a75861412feee884b5021b2ee359bd3dc59`)
   and must not be conflated with either surface.
@@ -147,6 +155,14 @@ explicit message by default).
   compaction, cursor/gap recovery, goals, handshakes, models, pending-command
   reconciliation, resume, subagents, user input, user shell, workflows, and
   unknown-kind/state/stream tolerance.
+- Re-pin once the SDK publishes the Muse 1.4 stable surface (see §1), then
+  adopt its additive methods and fields. `workspaceRoots` on `session/start`
+  and `turn/start` lets the host apply its workspace rules to ACP
+  `additionalDirectories` instead of the adapter alone (§8). `session/delete`
+  and `session/deleteCompleted` back ACP v2 `session/delete`. The catalog's
+  per-model `variants`, `defaultReasoningEffort`, and
+  `reasoningEffortVariants` let the reasoning selector offer only the tiers a
+  model supports.
 - Validate JSON payloads emitted by the adapter against the schema bundle.
 - Replay recorded MSP transcripts through the notification fold and permission
   paths.
