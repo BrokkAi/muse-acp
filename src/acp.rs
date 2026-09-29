@@ -206,6 +206,10 @@ pub struct AcpSession {
     /// Selectors from the host's latest `skill/list` for this session.
     /// `None` until a catalog read succeeds.
     pub skill_selectors: Option<std::collections::HashSet<String>>,
+    /// MSP `config.mcpServers` JSON for the client's latest MCP servers. The
+    /// host does not persist them, so a restarted host is sent them again
+    /// when it loads the session.
+    pub mcp_servers: Option<String>,
 }
 
 pub type Sessions = Arc<Mutex<HashMap<String, AcpSession>>>;

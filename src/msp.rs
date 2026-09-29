@@ -36,6 +36,10 @@ pub struct HandshakeInfo {
     /// stream. An absent grant deliberately means the legacy poll fallback.
     pub session_list_stream: bool,
     pub user_shell: bool,
+    /// Whether `session/start` and `session/resume` may carry
+    /// `config.mcpServers`. Without the grant a non-empty map is rejected
+    /// with `capabilityRequired`, so client MCP servers are dropped instead.
+    pub session_mcp: bool,
 }
 
 impl HandshakeInfo {
@@ -883,7 +887,7 @@ impl MspHost {
         // lets session/new report a logged-out host before the first turn
         // (see `MspHost::logged_out`). On Muse 1.4.0 it gates nothing else.
         let init_params = format!(
-            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"experimentalApi":true,"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream"{shell_capability}]}}}}"#,
+            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"experimentalApi":true,"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream","sessionMcp"{shell_capability}]}}}}"#,
             ver = crate::json::esc(env!("CARGO_PKG_VERSION")),
             user_input_dialogs = user_input_dialogs
         );
@@ -937,6 +941,10 @@ impl MspHost {
             session_list_stream,
             user_shell: user_shell
                 && matches!(res.get("grantedCapabilities"), Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("userShell"))),
+            session_mcp: matches!(
+                res.get("grantedCapabilities"),
+                Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("sessionMcp"))
+            ),
         };
         if verdict.is_fatal() {
             host.shutdown();
@@ -1242,6 +1250,16 @@ pub fn err_message(e: &J) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("unknown error")
         .to_string()
+}
+
+/// A `session/resume` whose `config.mcpServers` differs from the MCP set of
+/// the session already loaded on this host. MSP fixes that set when the
+/// session runtime is built and has no unload command.
+pub fn is_session_configuration_conflict(e: &J) -> bool {
+    let data = e.get("data");
+    data.and_then(|d| d.get("kind")).and_then(|k| k.as_str()) == Some("commandRejected")
+        && data.and_then(|d| d.get("reason")).and_then(|r| r.as_str())
+            == Some("session_configuration_conflict")
 }
 
 /// Older Muse hosts do not know the 1.3.0 session-default method. Keep the
@@ -1580,6 +1598,7 @@ mod durability_tests {
             durability: durability.map(str::to_string),
             session_list_stream: false,
             user_shell: false,
+            session_mcp: false,
         }
     }
 

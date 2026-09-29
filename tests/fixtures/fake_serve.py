@@ -96,6 +96,12 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
                the goal; a later wake verb names it as the busy turn
   goal_continuation the woken goal turn completes, then the host starts its
                own follow-up turn that runs until turn/interrupt
+
+Session MCP (every scenario): `sessionMcp` is granted when requested unless
+FAKE_NO_SESSION_MCP=1. As on the live host, a non-empty config.mcpServers
+without the grant fails with capabilityRequired. FAKE_MCP_CONFLICT=1 rejects
+the first session/resume that carries a non-empty config.mcpServers with the
+live `session_configuration_conflict` error.
 """
 import json
 import os
@@ -118,6 +124,8 @@ CATALOG_READS = [0]
 # hosts that predate userInputDialogs or ignore it.
 USER_INPUT_DIALOGS = [True]
 EXPERIMENTAL_API = [False]
+SESSION_MCP = [False]
+MCP_CONFLICTED = [False]
 USAGE_READS = [0]
 SKILL_READS = [0]
 FORK_ITEMS = []
@@ -1013,6 +1021,10 @@ def result_for(method, msg):
                    and "sessionListStream" in requested else [])
         if SCENARIO.startswith("user_shell") and "userShell" in requested:
             granted.append("userShell")
+        SESSION_MCP[0] = ("sessionMcp" in requested
+                          and os.environ.get("FAKE_NO_SESSION_MCP") != "1")
+        if SESSION_MCP[0]:
+            granted.append("sessionMcp")
         USER_INPUT_DIALOGS[0] = msg.get("params", {}).get("capabilities", {}).get(
             "userInputDialogs", True) is not False
         EXPERIMENTAL_API[0] = msg.get("params", {}).get("capabilities", {}).get(
@@ -1637,6 +1649,29 @@ def main():
                                              "itemId": "it-stored",
                                              "outputRef": "out-1"}}})
                     continue
+                mcp_servers = ((msg.get("params") or {}).get("config") or {}).get("mcpServers")
+                if method in ("session/start", "session/resume") and mcp_servers:
+                    if not SESSION_MCP[0]:
+                        # Live 1.4.1 refusal without the grant.
+                        send({"jsonrpc": "2.0", "id": ident,
+                              "error": {"code": -32010,
+                                        "message": "session MCP configuration requires the sessionMcp capability",
+                                        "data": {"kind": "capabilityRequired",
+                                                 "capability": "sessionMcp",
+                                                 "retryable": False}}})
+                        continue
+                    if (method == "session/resume" and not MCP_CONFLICTED[0]
+                            and os.environ.get("FAKE_MCP_CONFLICT") == "1"):
+                        MCP_CONFLICTED[0] = True
+                        command = msg["params"].get("commandId", "")
+                        send({"jsonrpc": "2.0", "id": ident,
+                              "error": {"code": -32030,
+                                        "message": "command " + command + " rejected: session MCP configuration conflicts with the loaded session runtime",
+                                        "data": {"kind": "commandRejected",
+                                                 "commandId": command,
+                                                 "reason": "session_configuration_conflict",
+                                                 "retryable": False}}})
+                        continue
                 if (method == "session/start"
                         and os.environ.get("FAKE_START_ERROR", "") == "profile"):
                     # Mirrors the live 1.2.1 refusal when the user's default

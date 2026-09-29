@@ -2811,54 +2811,308 @@ fn legacy_set_mode_adopts_the_folded_host_mode() {
     c.finish();
 }
 
-#[test]
-fn v1_jetbrains_mcp_attachment_is_logged_and_not_forwarded() {
-    let mut c = Client::spawn("quiet", &[]);
-    let init = c.req("initialize", "{\"protocolVersion\":1}");
-    let initialized = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+/// Params of every MSP request the adapter sent for `method`, oldest first.
+fn host_requests(c: &Client, method: &str) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(format!("{}.frames", c.fake_log))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|frame| frame["method"] == method)
+        .map(|frame| frame["params"].clone())
+        .collect()
+}
+
+/// Initialize ACP `ver` and open a session whose `mcpServers` is the given
+/// JSON. Returns the initialize and session/new result frames.
+fn open_with_mcp(c: &mut Client, ver: u64, servers: &str) -> (String, String) {
+    let init = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+    let init_frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     assert!(
-        initialized.contains("\"result\""),
-        "init failed: {initialized}"
+        init_frame.contains("\"result\""),
+        "init failed: {init_frame}"
     );
     c.notify("initialized", "{}");
-
-    let dir = std::path::Path::new(&c.fake_log)
-        .parent()
-        .expect("fake log parent")
-        .join("workspace");
-    std::fs::create_dir_all(&dir).expect("tmpdir");
-    let cwd = dir.to_str().unwrap().replace('\\', "\\\\");
     let id = c.req(
         "session/new",
-        &format!(
-            "{{\"cwd\":\"{cwd}\",\"mcpServers\":[{{\"name\":\"intellij\",\"command\":\"idea\",\"args\":[\"stdioMcpServer\"]}}]}}"
-        ),
+        &format!("{{\"cwd\":{},\"mcpServers\":{servers}}}", temp_cwd_json()),
     );
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "session/new failed: {frame}");
+    (init_frame, frame)
+}
+
+/// Check an emitted `config.mcpServers` against the vendored schema's
+/// closed `SessionMcpServerConfig` union: each value matches exactly one arm
+/// by its `transport` const, carries the arm's required members, and names
+/// no member the arm does not declare.
+fn assert_mcp_servers_match_schema(servers: &serde_json::Value) {
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(format!(
+            "{}/tests/protocol/stable/msp.schema.json",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .expect("vendored schema bundle"),
+    )
+    .expect("schema JSON");
+    let arms = schema["$defs"]["SessionMcpServerConfig"]["oneOf"]
+        .as_array()
+        .expect("SessionMcpServerConfig arms");
+    let servers = servers.as_object().expect("mcpServers object");
+    assert!(!servers.is_empty());
+    for (name, server) in servers {
+        assert!(!name.is_empty(), "server names must be non-empty");
+        let arm = arms
+            .iter()
+            .find(|arm| arm["properties"]["transport"]["const"] == server["transport"])
+            .unwrap_or_else(|| panic!("no schema arm for {name}: {server}"));
+        for required in arm["required"].as_array().expect("required") {
+            let key = required.as_str().unwrap();
+            assert!(server.get(key).is_some(), "{name} lacks {key}: {server}");
+        }
+        for key in server.as_object().expect("server object").keys() {
+            assert!(
+                arm["properties"].get(key).is_some(),
+                "{name} has undeclared member {key}: {server}"
+            );
+        }
+        assert_eq!(server["mode"], "optional", "{name}: {server}");
+    }
+}
+
+#[test]
+fn v1_jetbrains_stdio_mcp_server_is_forwarded_to_the_session() {
+    let mut c = Client::spawn("quiet", &[]);
+    let (init, frame) = open_with_mcp(
+        &mut c,
+        1,
+        r#"[{"name":"intellij","command":"idea","args":["stdioMcpServer"],"env":[{"name":"IJ_MCP_SERVER_PORT","value":"SECRET-64342"}]}]"#,
+    );
     assert!(
-        frame.contains("\"result\"")
-            && frame.contains("\"configOptions\"")
+        init.contains("\"mcpCapabilities\":{\"http\":true,\"sse\":false}"),
+        "a granted host must advertise HTTP MCP: {init}"
+    );
+    assert!(
+        frame.contains("\"configOptions\"")
             && frame.contains("\"id\":\"mode\"")
             && frame.contains("\"id\":\"model\"")
             && frame.contains("\"id\":\"reasoning_effort\""),
         "JetBrains-style session must return v1 selectors: {frame}"
     );
-    c.wait_log("session/start", Duration::from_secs(15));
+    let initialize = host_requests(&c, "initialize");
+    assert!(
+        initialize[0]["capabilities"]["requestedCapabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("sessionMcp")),
+        "the adapter must request sessionMcp: {initialize:?}"
+    );
+    let start = &host_requests(&c, "session/start")[0];
+    assert_eq!(
+        start["config"],
+        serde_json::json!({"mcpServers": {"intellij": {
+            "transport": "stdio",
+            "command": "idea",
+            "args": ["stdioMcpServer"],
+            "env": {"IJ_MCP_SERVER_PORT": "SECRET-64342"},
+            "mode": "optional"
+        }}})
+    );
+    assert_mcp_servers_match_schema(&start["config"]["mcpServers"]);
     c.wait_stderr(
-        "ignoring client-provided MCP servers",
+        "forwarding 1 client MCP server(s) to Muse: \"intellij\"",
         Duration::from_secs(15),
     );
-    let host_frames =
-        std::fs::read_to_string(format!("{}.frames", c.fake_log)).expect("host frames");
-    let start = host_frames
-        .lines()
-        .find(|line| line.contains("\"method\": \"session/start\""))
-        .expect("session/start frame");
-    assert!(
-        !start.contains("\"mcpServers\"") && !start.contains("\"config\""),
-        "client MCP configuration must not cross the MSP boundary: {start}"
-    );
+    let stderr_log = c.stderr_log.clone();
     c.finish();
+    let stderr = std::fs::read_to_string(stderr_log).unwrap();
+    assert!(
+        stderr.contains("client MCP servers: forwarded to Muse (sessionMcp granted)"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("SECRET"),
+        "env values must not be logged: {stderr}"
+    );
+}
+
+#[test]
+fn v2_http_mcp_server_is_forwarded_and_unsupported_entries_are_dropped() {
+    let mut c = Client::spawn("quiet", &[]);
+    let (init, _) = open_with_mcp(
+        &mut c,
+        2,
+        concat!(
+            r#"[{"type":"http","name":"docs","url":"https://SECRET.example/mcp","headers":[{"name":"Authorization","value":"Bearer SECRET-TOKEN"}]},"#,
+            r#"{"type":"sse","name":"legacy","url":"https://SECRET.example/sse"},"#,
+            r#"{"type":"stdio","name":"broken"},"#,
+            r#"{"type":"stdio","name":"files","command":"/usr/bin/files-mcp"}]"#,
+        ),
+    );
+    assert!(
+        init.contains("\"mcp\":{\"stdio\":{},\"http\":{}}"),
+        "a granted host must advertise stdio and HTTP MCP in v2: {init}"
+    );
+    let start = &host_requests(&c, "session/start")[0];
+    assert_eq!(
+        start["config"]["mcpServers"],
+        serde_json::json!({
+            "docs": {
+                "transport": "streamableHttp",
+                "url": "https://SECRET.example/mcp",
+                "headers": {"Authorization": "Bearer SECRET-TOKEN"},
+                "mode": "optional"
+            },
+            "files": {
+                "transport": "stdio",
+                "command": "/usr/bin/files-mcp",
+                "mode": "optional"
+            }
+        })
+    );
+    assert_mcp_servers_match_schema(&start["config"]["mcpServers"]);
+    c.wait_stderr(
+        "MCP server \"legacy\" dropped: the SSE transport is not supported by Muse",
+        Duration::from_secs(15),
+    );
+    c.wait_stderr(
+        "MCP server \"broken\" dropped: missing command",
+        Duration::from_secs(15),
+    );
+    c.wait_stderr(
+        "forwarding 2 client MCP server(s) to Muse: \"docs\", \"files\"",
+        Duration::from_secs(15),
+    );
+    let stderr_log = c.stderr_log.clone();
+    c.finish();
+    let stderr = std::fs::read_to_string(stderr_log).unwrap();
+    assert!(
+        !stderr.contains("SECRET") && !stderr.contains("files-mcp"),
+        "URLs, headers and commands must not be logged: {stderr}"
+    );
+}
+
+#[test]
+fn a_host_without_the_session_mcp_grant_receives_no_client_mcp_servers() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("quiet", &[("FAKE_NO_SESSION_MCP", "1")]);
+        let (init, _) = open_with_mcp(&mut c, ver, r#"[{"name":"intellij","command":"idea"}]"#);
+        if ver == 1 {
+            assert!(
+                init.contains("\"mcpCapabilities\":{\"http\":false,\"sse\":false}"),
+                "{init}"
+            );
+        } else {
+            assert!(!init.contains("\"mcp\":"), "{init}");
+        }
+        c.wait_stderr(
+            "ignoring client-provided MCP servers: this Muse host did not grant sessionMcp",
+            Duration::from_secs(15),
+        );
+        let start = &host_requests(&c, "session/start")[0];
+        assert!(start.get("config").is_none(), "v{ver}: {start}");
+        c.finish();
+    }
+}
+
+#[test]
+fn load_resends_client_mcp_servers_and_survives_a_configuration_conflict() {
+    let mut c = Client::spawn("load", &[("FAKE_MCP_CONFLICT", "1")]);
+    c.initialize(1, "");
+    let load = |c: &mut Client| {
+        let id = c.req(
+            "session/load",
+            r#"{"sessionId":"msp-sess-old","mcpServers":[{"name":"intellij","command":"idea"}]}"#,
+        );
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\""), "load failed: {frame}");
+    };
+    let config = serde_json::json!({"mcpServers": {"intellij": {
+        "transport": "stdio", "command": "idea", "mode": "optional"
+    }}});
+    // The attach resumes; a load also reads a history snapshot from the
+    // already-loaded session, which needs no configuration.
+    let attaches = |c: &Client| {
+        host_requests(c, "session/resume")
+            .into_iter()
+            .filter(|params| params["history"] == "inline")
+            .collect::<Vec<_>>()
+    };
+
+    // The host already runs this session with another MCP set: the adapter
+    // attaches to it instead of failing the editor's load.
+    load(&mut c);
+    c.wait_stderr(
+        "session msp-sess-old is already loaded with a different MCP server set",
+        Duration::from_secs(15),
+    );
+    let resumes = attaches(&c);
+    assert_eq!(resumes.len(), 2, "{resumes:?}");
+    assert_eq!(resumes[0]["config"], config);
+    assert!(resumes[1].get("config").is_none(), "{:?}", resumes[1]);
+    assert_ne!(resumes[0]["commandId"], resumes[1]["commandId"]);
+
+    // Without a conflict the configuration is sent once and accepted.
+    load(&mut c);
+    let resumes = attaches(&c);
+    assert_eq!(resumes.len(), 3, "{resumes:?}");
+    assert_eq!(resumes[2]["config"], config);
+    c.finish();
+}
+
+#[test]
+fn fork_keeps_client_mcp_servers_for_the_next_load_only() {
+    let mut c = Client::spawn("quiet", &[]);
+    let servers = r#"[{"name":"intellij","command":"idea"}]"#;
+    let (_, frame) = open_with_mcp(&mut c, 1, servers);
+    let sid = extract_str(&frame, "sessionId").expect("sessionId");
+    let id = c.req(
+        "session/fork",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"cwd\":{},\"mcpServers\":{servers}}}",
+            temp_cwd_json()
+        ),
+    );
+    let forked = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(forked.contains("\"result\""), "fork failed: {forked}");
+    c.wait_stderr(
+        "not applying 1 client MCP server(s) to the forked session until Muse loads it again",
+        Duration::from_secs(15),
+    );
+    let fork = &host_requests(&c, "session/fork")[0];
+    assert!(fork.get("config").is_none(), "{fork}");
+    c.finish();
+}
+
+#[test]
+fn a_restarted_host_reloads_the_client_mcp_servers() {
+    let marker = std::env::temp_dir().join(format!(
+        "muse-acp-mcp-restart-{}-{}.marker",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let marker_str = marker.to_str().unwrap().to_string();
+    let mut c = Client::spawn("host_exit", &[("FAKE_RESTART_MARKER", marker_str.as_str())]);
+    let (_, frame) = open_with_mcp(&mut c, 1, r#"[{"name":"intellij","command":"idea"}]"#);
+    let sid = extract_str(&frame, "sessionId").expect("sessionId");
+    let p1 = c.prompt(&sid, "before crash");
+    c.wait_for(&format!("\"id\":{p1}"), Duration::from_secs(15));
+    c.wait_stderr(
+        "host-restarted attempt=1 sessions=1 failures=0",
+        Duration::from_secs(10),
+    );
+    let started = &host_requests(&c, "session/start")[0];
+    let resumes = host_requests(&c, "session/resume");
+    assert_eq!(resumes.len(), 1, "{resumes:?}");
+    assert_eq!(
+        resumes[0]["config"], started["config"],
+        "the replacement host must load the same client MCP servers"
+    );
+    assert!(resumes[0]["config"]["mcpServers"]["intellij"].is_object());
+    c.finish();
+    let _ = std::fs::remove_file(&marker);
 }
 
 #[test]

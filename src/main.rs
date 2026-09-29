@@ -9,6 +9,7 @@ mod compat;
 mod fold;
 mod host_config;
 mod json;
+mod mcp;
 mod msp;
 mod sha256;
 mod shutdown;
@@ -1195,23 +1196,36 @@ enum LoopMsg {
     Msp(MspEvent),
 }
 
-fn v2_init() -> String {
-    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
+/// ACP initialize payloads. `session_mcp` is the host's `sessionMcp` grant:
+/// with it, client stdio and HTTP MCP servers are forwarded to Muse. Without
+/// it no MCP transport is advertised beyond the stdio support ACP v1 always
+/// implies, and client servers are dropped.
+fn v2_init(session_mcp: bool) -> String {
+    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v2())
+        .replace(
+            "__MCP__",
+            if session_mcp {
+                r#""mcp":{"stdio":{},"http":{}},"#
+            } else {
+                ""
+            },
+        )
 }
 
-fn v1_init() -> String {
-    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":false,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}},"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__}}"#
+fn v1_init(session_mcp: bool) -> String {
+    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}},"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v1())
+        .replace("__MCP_HTTP__", if session_mcp { "true" } else { "false" })
 }
 
-fn send_initialize(stdout: &StdoutShared, id: &Option<J>) {
+fn send_initialize(stdout: &StdoutShared, id: &Option<J>, session_mcp: bool) {
     if negotiated_ver() == 2 {
-        acp::send_result(stdout, id, &v2_init());
+        acp::send_result(stdout, id, &v2_init(session_mcp));
     } else {
-        acp::send_result(stdout, id, &v1_init());
+        acp::send_result(stdout, id, &v1_init(session_mcp));
     }
 }
 
@@ -1223,7 +1237,7 @@ fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
     match msg.get("method").and_then(J::as_str) {
         Some("initialize") => {
             negotiate_acp(msg);
-            send_initialize(stdout, &id);
+            send_initialize(stdout, &id, false);
         }
         Some(method @ ("shutdown" | "exit")) => {
             if method == "shutdown" {
@@ -1308,13 +1322,6 @@ fn auth_methods_v2() -> String {
     )
 }
 
-fn has_nonempty_array(params: Option<&J>, key: &str) -> bool {
-    matches!(
-        params.and_then(|p| p.get(key)),
-        Some(J::Arr(values)) if !values.is_empty()
-    )
-}
-
 /// Validate and assemble ACP's ordered effective workspace root set. `cwd`
 /// remains first and is the base for relative paths. Exact duplicate strings
 /// are removed without canonicalizing here; access checks canonicalize both
@@ -1366,9 +1373,70 @@ fn same_workspace_roots(left: &[String], right: &[String]) -> bool {
             .all(|(a, b)| same_workspace_root(a, b))
 }
 
-fn ignore_client_mcp_servers(params: Option<&J>) {
-    if has_nonempty_array(params, "mcpServers") {
-        log("ignoring client-provided MCP servers (not supported by the Muse host)");
+/// The client's MCP servers as MSP `config.mcpServers` JSON, or None when
+/// there is nothing to send. Dropped entries are logged. A host without the
+/// `sessionMcp` grant (Muse before 1.3.0) would reject a non-empty map, so
+/// the whole list is dropped there. `applied` is false for a fork, whose
+/// servers only take effect when Muse next loads the session.
+fn client_mcp_servers(host: &Arc<MspHost>, params: Option<&J>, applied: bool) -> Option<String> {
+    let translation = mcp::translate(params);
+    if !translation.supplied() {
+        return None;
+    }
+    if !host.handshake().session_mcp {
+        log("ignoring client-provided MCP servers: this Muse host did not grant sessionMcp");
+        return None;
+    }
+    for line in &translation.dropped {
+        log(line);
+    }
+    if translation.servers.is_some() {
+        let count = translation.forwarded.len();
+        let names = translation.names();
+        log(&if applied {
+            format!("forwarding {count} client MCP server(s) to Muse: {names}")
+        } else {
+            format!(
+                "not applying {count} client MCP server(s) to the forked session until Muse loads it again (MSP session/fork takes no configuration): {names}"
+            )
+        });
+    }
+    translation.servers
+}
+
+/// `,"config":{"mcpServers":...}` for `session/start` and `session/resume`.
+fn mcp_config_field(servers: Option<&str>) -> String {
+    servers
+        .map(|servers| format!(",\"config\":{{\"mcpServers\":{servers}}}"))
+        .unwrap_or_default()
+}
+
+/// MSP `session/resume` with inline history and the client's MCP servers.
+/// A session this host has already loaded keeps the MCP set it was loaded
+/// with (MSP has no unload), so a different set is rejected as
+/// `session_configuration_conflict`. Retry once without configuration: the
+/// session attaches with the servers it has instead of becoming unusable.
+fn resume_session(host: &Arc<MspHost>, msp_sid: &str, mcp_servers: Option<&str>) -> Result<J, J> {
+    let send = |servers: Option<&str>| {
+        let cmd = host.mint_cmd("cmd-");
+        host.command(
+            "session/resume",
+            &format!(
+                "{{\"commandId\":{},\"sessionId\":{},\"history\":\"inline\"{}}}",
+                esc(&cmd),
+                esc(msp_sid),
+                mcp_config_field(servers)
+            ),
+        )
+    };
+    match send(mcp_servers) {
+        Err(e) if mcp_servers.is_some() && msp::is_session_configuration_conflict(&e) => {
+            log(&format!(
+                "session {msp_sid} is already loaded with a different MCP server set; it keeps that set until muse-acp restarts"
+            ));
+            send(None)
+        }
+        result => result,
     }
 }
 
@@ -1381,15 +1449,6 @@ fn validate_session_roots(stdout: &StdoutShared, id: &Option<J>, params: Option<
         acp::send_error(stdout, id, -32602, "params.cwd must be an absolute path");
         return false;
     }
-    // ACP v1 requires clients to send `mcpServers` with session/new, and
-    // JetBrains may attach its integrated stdio MCP server even though our
-    // initialize response advertises no optional HTTP/SSE MCP transports.
-    // MSP 1.3.0 has a native SessionConfig.mcpServers surface and a
-    // sessionMcp capability, but this adapter does not negotiate or translate
-    // ACP client-owned servers into it. Muse owns its tool runtime, so
-    // tolerate and ignore them instead of aborting the whole session before
-    // its config options can be returned.
-    ignore_client_mcp_servers(params);
     if let Err(message) = session_roots(params, cwd) {
         acp::send_error(stdout, id, -32602, &message);
         return false;
@@ -1495,7 +1554,7 @@ fn resolve_fork_cut_point(
 fn selftest() -> i32 {
     // Validate every static emitted literal with our own parser, so a
     // misplaced brace fails here instead of at a live client.
-    for lit in [v2_init(), v1_init()] {
+    for lit in [v2_init(true), v2_init(false), v1_init(true), v1_init(false)] {
         if let Err(e) = parse_json(&lit) {
             eprintln!("[muse-acp] selftest FAIL: {e} in {lit}");
             return 1;
@@ -1811,11 +1870,18 @@ fn restart_durable_host(
     // Snapshot the attach list first; host calls must happen unlocked. Keep
     // the ACP key: a session resumed under a legacy `sess-*` id is stored
     // under that id, not under its MSP id.
-    let attach: Vec<(String, String, String)> = sessions
+    let attach: Vec<(String, String, String, Option<String>)> = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .iter()
-        .map(|(acp_sid, s)| (acp_sid.clone(), s.msp_sid.clone(), s.view_cursor.clone()))
+        .map(|(acp_sid, s)| {
+            (
+                acp_sid.clone(),
+                s.msp_sid.clone(),
+                s.view_cursor.clone(),
+                s.mcp_servers.clone(),
+            )
+        })
         .collect();
     let max_attempts = 3u32;
     let mut last_err = String::new();
@@ -1839,16 +1905,21 @@ fn restart_durable_host(
                     }
                 });
                 let mut failures = Vec::new();
-                for (acp_sid, msp_sid, after) in &attach {
-                    let cmd = host.mint_cmd("cmd-");
-                    match host.command(
-                        "session/resume",
-                        &format!(
-                            "{{\"commandId\":{},\"sessionId\":{},\"history\":\"inline\"}}",
-                            esc(&cmd),
-                            esc(msp_sid)
-                        ),
-                    ) {
+                let session_mcp = host.handshake().session_mcp;
+                for (acp_sid, msp_sid, after, mcp_servers) in &attach {
+                    // Session MCP configuration is not durable: without it
+                    // the replacement host loads the session with no client
+                    // MCP servers.
+                    let mcp_servers = match mcp_servers.as_deref() {
+                        Some(_) if !session_mcp => {
+                            log(&format!(
+                                "session {msp_sid} lost its client MCP servers: the restarted Muse host did not grant sessionMcp"
+                            ));
+                            None
+                        }
+                        servers => servers,
+                    };
+                    match resume_session(&host, msp_sid, mcp_servers) {
                         Ok(r) => {
                             let resume_head = r
                                 .get("viewCursor")
@@ -2118,6 +2189,11 @@ fn main() {
                                 hi.status,
                                 hi.detail
                             ));
+                            log(if hi.session_mcp {
+                                "client MCP servers: forwarded to Muse (sessionMcp granted)"
+                            } else {
+                                "client MCP servers: dropped (this Muse host did not grant sessionMcp)"
+                            });
                             forward_msp_events(&tx, msp_rx);
                             host = Some(new_host);
                         }
@@ -2637,7 +2713,7 @@ fn handle_acp(
     }
 
     match method.as_str() {
-        "initialize" => send_initialize(stdout, &id),
+        "initialize" => send_initialize(stdout, &id, host.handshake().session_mcp),
         "session/new" => {
             let ver = negotiated_ver();
             if !validate_session_roots(stdout, &id, params.as_ref()) {
@@ -2674,14 +2750,19 @@ fn handle_acp(
             if reject_if_logged_out(host, stdout, &id) {
                 return;
             }
+            // Editors attach their MCP servers (Zed context servers, the
+            // JetBrains IDE server) to session setup; MSP 1.3.0 loads them
+            // into this session's runtime.
+            let mcp_servers = client_mcp_servers(host, params.as_ref(), true);
             let cmd = host.mint_cmd("cmd-");
             let res = host.command(
                 "session/start",
                 &format!(
-                    "{{\"commandId\":{},\"workspaceRoot\":{}{}}}",
+                    "{{\"commandId\":{},\"workspaceRoot\":{}{}{}}}",
                     esc(&cmd),
                     esc(&cwd),
-                    start_mode
+                    start_mode,
+                    mcp_config_field(mcp_servers.as_deref())
                 ),
             );
             match res {
@@ -2817,6 +2898,7 @@ fn handle_acp(
                             child_folds: HashMap::new(),
                             turn_usage: Vec::new(),
                             skill_selectors: None,
+                            mcp_servers,
                         },
                     );
                     // _meta exposes the host session id: pass it back to
@@ -2907,7 +2989,6 @@ fn handle_acp(
                     return;
                 }
             }
-            ignore_client_mcp_servers(params.as_ref());
             if let Err(message) = additional_directories(params.as_ref()) {
                 acp::send_error(stdout, &id, -32602, &message);
                 return;
@@ -2963,17 +3044,12 @@ fn handle_acp(
                 .get(&sid)
                 .map(|s| s.view_cursor.clone())
                 .filter(|cursor| !cursor.is_empty());
-            let cmd = host.mint_cmd("cmd-");
+            // The host does not persist session MCP configuration, so a load
+            // must carry the client's servers again to restore the tools.
+            let mcp_servers = client_mcp_servers(host, params.as_ref(), true);
             // Ask for inline history explicitly; the host may still downgrade
             // (history.mode reports what was served).
-            match host.command(
-                "session/resume",
-                &format!(
-                    "{{\"commandId\":{},\"sessionId\":{},\"history\":\"inline\"}}",
-                    esc(&cmd),
-                    esc(&msp_sid)
-                ),
-            ) {
+            match resume_session(host, &msp_sid, mcp_servers.as_deref()) {
                 Ok(r) => {
                     // Pending questions/approvals survive reconnects; the host
                     // re-issues their requests, which the normal bridge picks
@@ -3092,9 +3168,13 @@ fn handle_acp(
                             child_folds: HashMap::new(),
                             turn_usage: Vec::new(),
                             skill_selectors: None,
+                            mcp_servers: None,
                         });
                         entry.msp_sid = real_msp.clone();
                         entry.ver = ver;
+                        // The client's latest set, even when a conflict kept
+                        // the loaded one: a restarted host loads this.
+                        entry.mcp_servers = mcp_servers;
                         if let Some(session) = r.get("session") {
                             adopt_session_projection(entry, session);
                         }
@@ -3386,11 +3466,14 @@ fn handle_acp(
                 acp::send_error(stdout, &id, -32602, "params.cwd must be an absolute path");
                 return;
             }
-            ignore_client_mcp_servers(params.as_ref());
             if let Err(message) = additional_directories(params.as_ref()) {
                 acp::send_error(stdout, &id, -32602, &message);
                 return;
             }
+            // MSP session/fork takes no configuration, and the fork is loaded
+            // without MCP servers. Keep the client's set on the record so a
+            // restarted host loads the fork with it.
+            let mcp_servers = client_mcp_servers(host, params.as_ref(), false);
             // Resolve the source MSP session: known ACP session first, then
             // preserved metadata (same rule as resume).
             let meta_msp_sid = params
@@ -3558,9 +3641,11 @@ fn handle_acp(
                             child_folds: HashMap::new(),
                             turn_usage: Vec::new(),
                             skill_selectors: None,
+                            mcp_servers: None,
                         });
                         entry.msp_sid = new_msp.clone();
                         entry.ver = ver;
+                        entry.mcp_servers = mcp_servers;
                         adopt_session_projection(entry, &new_session);
                         entry.cwd = restored_cwd;
                         entry.roots = roots;
@@ -9043,7 +9128,7 @@ mod tests {
 
     #[test]
     fn initialization_payloads_report_the_cargo_version() {
-        for payload in [v2_init(), v1_init()] {
+        for payload in [v2_init(true), v2_init(false), v1_init(true), v1_init(false)] {
             let parsed = parse_json(&payload).expect("initialization payload JSON");
             let version = ["info", "agentInfo"]
                 .iter()
