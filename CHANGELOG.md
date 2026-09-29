@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
 
 - Forward the MCP servers an editor attaches to a session, such as Zed's
   context servers or the JetBrains IDE server, to Muse 1.3.0 and newer through
