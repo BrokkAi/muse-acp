@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- When Muse declines `/compact`, for example on a session too short to
+  compact, the prompt now ends normally with a note naming Muse's reason.
+  Previously a `compaction_unavailable` or `missing_run` answer surfaced as an
+  internal `-32603` error, and a no-op compaction ended without a word. On
+  ACP v2 the session stays running if another turn still is.
 - Classify Muse 1.4.2 as a tested host. Its stable schema only adds to
   1.4.1's, and the live-host suite passes against it, so startup logs now
   report `status=tested` instead of `status=unknown`.
