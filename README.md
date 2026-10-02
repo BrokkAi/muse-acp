@@ -213,8 +213,8 @@ a new one, the adapter moves the new file to your configuration when the host
 exits, unless your configuration also changed in the meantime. If the editor
 stops the agent before it can, the next launch finishes the job. With hard
 links, a login you complete in a terminal while the agent runs reaches
-`muse serve` when the editor next authenticates, as it does after **Log in
-with Muse**, or when the agent restarts. If the view cannot
+`muse serve` with your next prompt or new session, or when the editor
+authenticates after **Log in with Muse**. If the view cannot
 be built, for example because the temporary folder is on a different drive
 from your configuration, `muse serve` starts with your saved settings, and the
 error the editor shows if Muse then refuses the profile says why.

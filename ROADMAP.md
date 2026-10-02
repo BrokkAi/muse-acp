@@ -99,7 +99,11 @@ the verdict into richer support bundles.
   verified). Host 1.4.1 reports
   `sha256:e0e163db6ccf00dbe68402ce55d6319b3edc33c421f31e9583b587b2de8a118f`
   (schema version 1; the binary's `muse schema` export is additive over the
-  vendored bundle, and the live-host smoke test passed). No published SDK
+  vendored bundle, and the live-host smoke test passed). Host 1.4.2 reports
+  `sha256:61afea3112e0906e9dc3a536144278a74cb4b36fc6e20901a91d4432ba3568e2`
+  (schema version 1; additive over 1.4.1 with `feedback/submit`,
+  `session/list` filters, and cumulative cost fields, and the loopback
+  live-host suite passed). No published SDK
   carries the 1.4 surface yet. The SDK repository's Python tree and PyPI
   `muse-code-sdk` 1.3.1 publish an intermediate
   `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
