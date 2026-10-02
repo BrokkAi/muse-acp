@@ -3,8 +3,9 @@
 
 A throwaway Muse config points `endpoint_transport.base_url` at this server,
 so the host's model traffic never leaves the machine and needs no
-credentials. It serves the model catalog (`GET .../muse-code/models`) and
-scripted Responses API streams (`POST .../responses`).
+credentials. It serves scripted Responses API streams (`POST .../responses`)
+and the model catalog (`GET .../muse-code/models`), which some Muse builds
+fetch and others replace with their bundled catalog.
 
 Usage: loopback_provider.py <log file> <script file>
 
@@ -17,13 +18,15 @@ else gets the text "ok". A reply is {"text": "..."} or
 hold the stream open before it completes.
 
 The first line on stdout is the port. The log gets one JSON line per model
-call: {"call", "reply", "request"}. Standard library only.
+call: {"call", "reply", "last"}, where "last" is the type and role of the
+request's last input item. Standard library only.
 """
 import json
 import re
 import sys
 import threading
 import time
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MODEL = "fake-model"
@@ -110,54 +113,81 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(CATALOG)
 
     def do_POST(self):
+        try:
+            self.respond()
+        except OSError:
+            # The host hung up, for example after a cancel.
+            pass
+        except Exception:
+            # Fail visibly instead of dropping the connection, which Muse
+            # would retry until the test times out.
+            traceback.print_exc()
+            if not self.started:
+                self.empty(500)
+
+    def respond(self):
+        self.started = False
         body = self.rfile.read(int(self.headers.get("content-length", "0")))
         if not self.path.endswith("/responses"):
             self.empty(404)
             return
         request = json.loads(body)
+        reply = reply_for(request)
+        if "tool" not in reply and "text" not in reply:
+            raise ValueError(f"script reply needs text or tool: {reply}")
+        last = (request.get("input") or [{}])[-1]
         with LOCK:
             index = CALLS[0]
             CALLS[0] += 1
-            reply = reply_for(request)
             with open(LOG, "a") as log:
-                log.write(json.dumps({"call": index, "reply": reply,
-                                      "request": request}) + "\n")
+                log.write(json.dumps({
+                    "call": index, "reply": reply,
+                    "last": {"type": last.get("type"), "role": last.get("role")},
+                }) + "\n")
         rid = f"resp_{index}"
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("connection", "close")
         self.end_headers()
         self.close_connection = True
-        try:
-            self.wfile.write(sse({"type": "response.created", "sequence_number": 1,
-                                  "response": response(rid, "in_progress")}))
-            if "tool" in reply:
-                tool = reply["tool"]
-                self.wfile.write(sse({
-                    "type": "response.function_call_arguments.done",
-                    "sequence_number": 2, "output_index": 0,
-                    "item_id": f"fc_{index}", "name": tool["name"],
-                    "call_id": f"call_{index}",
-                    "arguments": json.dumps(tool["arguments"]),
-                }))
-            else:
-                self.wfile.write(sse({
-                    "type": "response.output_text.delta", "sequence_number": 2,
-                    "output_index": 0, "item_id": f"msg_{index}",
-                    "content_index": 0, "delta": reply["text"],
-                }))
+        self.started = True
+        events = iter(range(1, 100))
+
+        def send(event):
+            event["sequence_number"] = next(events)
+            self.wfile.write(sse(event))
             self.wfile.flush()
+
+        send({"type": "response.created", "response": response(rid, "in_progress")})
+        if "tool" in reply:
+            tool = reply["tool"]
+            send({"type": "response.function_call_arguments.done",
+                  "output_index": 0, "item_id": f"fc_{index}", "name": tool["name"],
+                  "call_id": f"call_{index}", "arguments": json.dumps(tool["arguments"])})
             if reply.get("hold_ms"):
                 time.sleep(reply["hold_ms"] / 1000)
-            self.wfile.write(sse({
-                "type": "response.completed", "sequence_number": 3,
-                "response": response(rid, "completed", usage={
-                    "input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
-            }))
-            self.wfile.flush()
-        except OSError:
-            # The host hung up, for example after a cancel.
-            pass
+        else:
+            # The full message sequence, so Muse streams the text as it
+            # arrives rather than when the response completes.
+            item = {"type": "message", "id": f"msg_{index}", "role": "assistant",
+                    "status": "in_progress", "content": []}
+            part = {"type": "output_text", "text": "", "annotations": []}
+            send({"type": "response.output_item.added", "output_index": 0, "item": item})
+            send({"type": "response.content_part.added", "output_index": 0,
+                  "item_id": item["id"], "content_index": 0, "part": part})
+            send({"type": "response.output_text.delta", "output_index": 0,
+                  "item_id": item["id"], "content_index": 0, "delta": reply["text"]})
+            if reply.get("hold_ms"):
+                time.sleep(reply["hold_ms"] / 1000)
+            done_part = dict(part, text=reply["text"])
+            send({"type": "response.output_text.done", "output_index": 0,
+                  "item_id": item["id"], "content_index": 0, "text": reply["text"]})
+            send({"type": "response.content_part.done", "output_index": 0,
+                  "item_id": item["id"], "content_index": 0, "part": done_part})
+            send({"type": "response.output_item.done", "output_index": 0,
+                  "item": dict(item, status="completed", content=[done_part])})
+        send({"type": "response.completed", "response": response(rid, "completed", usage={
+            "input_tokens": 1, "output_tokens": 1, "total_tokens": 2})})
 
 
 server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)

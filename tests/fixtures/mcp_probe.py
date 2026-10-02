@@ -28,10 +28,12 @@ for line in sys.stdin:
         continue
     if method == "initialize":
         reply(ident, {
-            "protocolVersion": message.get("params", {}).get("protocolVersion", "2025-06-18"),
+            "protocolVersion": (message.get("params") or {}).get("protocolVersion", "2025-06-18"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": "probe", "version": "1"},
         })
+    elif method == "ping":
+        reply(ident, {})
     elif method == "tools/list":
         reply(ident, {"tools": [TOOL]})
     elif method == "tools/call":

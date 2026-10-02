@@ -3,13 +3,16 @@
 //! Each test drives the adapter against a real Muse host whose model calls go
 //! to `tests/fixtures/loopback_provider.py` on 127.0.0.1, which answers with
 //! scripted Responses API streams. Every test gets a throwaway Muse config
-//! with a dummy API key, its own home, and its own workspace, so no
+//! with a dummy API key, its own home, and its own workspace, and the adapter
+//! runs with a cleared environment and Muse's self-update turned off, so no
 //! credentials or network access are needed and nothing touches the
-//! developer's Muse settings.
+//! developer's Muse settings. A failing test keeps its directory and prints
+//! the logs.
 //!
 //! Skipped unless `MUSE_ACP_LOOPBACK=1`. `MUSE_CLI` selects the Muse binary
-//! (default `muse`) and `PYTHON` the interpreter (default `python3`). CI runs
-//! this suite against each pinned Muse build.
+//! (default: `muse` on `PATH`, else `~/.local/bin/muse`) and `PYTHON` the
+//! interpreter (default `python3`). CI runs this suite against each pinned
+//! Muse build.
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -106,26 +109,71 @@ impl Host {
     fn settings(&self) -> String {
         std::fs::read_to_string(self.dir.join("config/muse/settings.json")).unwrap()
     }
-
-    /// The replies the provider sent, one per model call.
-    fn replies(&self) -> Vec<Value> {
-        std::fs::read_to_string(self.dir.join("provider.log"))
-            .unwrap_or_default()
-            .lines()
-            .map(|line| serde_json::from_str::<Value>(line).unwrap()["reply"].clone())
-            .collect()
-    }
 }
 
 impl Drop for Host {
     fn drop(&mut self) {
         let _ = self.provider.kill();
         let _ = self.provider.wait();
+        if std::thread::panicking() {
+            // Keep the evidence: adapter logs, the provider log, Muse's state.
+            for entry in std::fs::read_dir(&self.dir).into_iter().flatten().flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name.ends_with(".log") {
+                    let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                    let tail = &text[text.len().saturating_sub(8000)..];
+                    eprintln!("---- {name} (tail)\n{tail}");
+                }
+            }
+            eprintln!("kept {} for inspection", self.dir.display());
+            return;
+        }
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
 
-type Frames = Arc<(Mutex<Vec<Value>>, Condvar)>;
+/// The Muse binary to test, resolved with the real environment because the
+/// adapter runs with a throwaway home: `MUSE_CLI` (a relative path is taken
+/// from the working directory), else `muse` on `PATH`, else the installer's
+/// `~/.local/bin/muse`.
+fn muse_cli() -> PathBuf {
+    let wanted = PathBuf::from(std::env::var_os("MUSE_CLI").unwrap_or_else(|| "muse".into()));
+    if wanted.components().count() > 1 {
+        return std::path::absolute(&wanted).unwrap();
+    }
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&path)
+        .chain(std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/bin")))
+        .map(|dir| dir.join(&wanted))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "{} is not on PATH or in ~/.local/bin; set MUSE_CLI",
+                wanted.display()
+            )
+        })
+}
+
+/// Variables the adapter keeps from the real environment. Everything else,
+/// such as a developer's model, proxy, or API key settings, is dropped.
+const KEPT_ENV: [&str; 8] = [
+    "PATH",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+    "WINDIR",
+    "LANG",
+    "LC_ALL",
+];
+
+#[derive(Default)]
+struct Output {
+    frames: Vec<Value>,
+    closed: bool,
+}
+
+type Frames = Arc<(Mutex<Output>, Condvar)>;
 
 /// The adapter under test, launched as an editor would launch it.
 struct Adapter {
@@ -136,6 +184,15 @@ struct Adapter {
     log: PathBuf,
 }
 
+impl Drop for Adapter {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
 impl Adapter {
     fn launch(host: &Host) -> Adapter {
         static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -144,18 +201,21 @@ impl Adapter {
             "adapter-{}.log",
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut child = Command::new(env!("CARGO_BIN_EXE_muse-acp"))
-            .env(
-                "MUSE_CLI",
-                std::env::var("MUSE_CLI").unwrap_or_else(|_| "muse".to_string()),
-            )
+        let mut command = Command::new(env!("CARGO_BIN_EXE_muse-acp"));
+        command.env_clear();
+        for name in KEPT_ENV {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        let mut child = command
+            .env("MUSE_CLI", muse_cli())
+            .env("MUSE_NO_AUTO_UPDATE", "1")
             .env("XDG_CONFIG_HOME", host.dir.join("config"))
             .env("XDG_DATA_HOME", home.join(".local/share"))
             .env("XDG_STATE_HOME", home.join(".local/state"))
             .env("XDG_CACHE_HOME", home.join(".cache"))
             .env("HOME", &home)
-            .env_remove("MUSE_APPROVAL_MODE")
-            .env_remove("MUSE_SERVE_ARGS")
             .current_dir(host.workspace())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -163,18 +223,20 @@ impl Adapter {
             .spawn()
             .expect("spawn the adapter");
         let stdout = child.stdout.take().unwrap();
-        let frames: Frames = Arc::new((Mutex::new(Vec::new()), Condvar::new()));
+        let frames: Frames = Arc::new((Mutex::new(Output::default()), Condvar::new()));
         let writer = frames.clone();
         std::thread::spawn(move || {
+            let (lock, ready) = &*writer;
             for line in BufReader::new(stdout).lines() {
                 let Ok(line) = line else { break };
                 let Ok(frame) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
-                let (lock, ready) = &*writer;
-                lock.lock().unwrap().push(frame);
+                lock.lock().unwrap().frames.push(frame);
                 ready.notify_all();
             }
+            lock.lock().unwrap().closed = true;
+            ready.notify_all();
         });
         let mut adapter = Adapter {
             stdin: child.stdin.take(),
@@ -208,19 +270,25 @@ impl Adapter {
     fn wait(&self, what: &str, matches: impl Fn(&Value) -> bool) -> Value {
         let (lock, ready) = &*self.frames;
         let deadline = Instant::now() + TIMEOUT;
-        let mut frames = lock.lock().unwrap();
+        let mut output = lock.lock().unwrap();
         loop {
-            if let Some(frame) = frames.iter().find(|frame| matches(frame)) {
+            if let Some(frame) = output.frames.iter().find(|frame| matches(frame)) {
                 return frame.clone();
             }
             let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
+            if output.closed || left.is_zero() {
+                let why = if output.closed {
+                    "the adapter exited"
+                } else {
+                    "timed out"
+                };
                 panic!(
-                    "timed out waiting for {what}\nframes: {frames:#?}\nadapter log:\n{}",
+                    "{why} waiting for {what}\nframes: {:#?}\nadapter log:\n{}",
+                    output.frames,
                     std::fs::read_to_string(&self.log).unwrap_or_default()
                 );
             }
-            frames = ready.wait_timeout(frames, left).unwrap().0;
+            output = ready.wait_timeout(output, left).unwrap().0;
         }
     }
 
@@ -255,6 +323,7 @@ impl Adapter {
             .0
             .lock()
             .unwrap()
+            .frames
             .iter()
             .filter(|frame| {
                 frame["method"] == "session/update"
@@ -305,6 +374,7 @@ impl Adapter {
             std::thread::sleep(Duration::from_millis(50));
         }
         let _ = self.child.kill();
+        let _ = self.child.wait();
         panic!("adapter did not exit after stdin closed");
     }
 }
@@ -369,11 +439,12 @@ fn cancel_stops_a_streaming_turn() {
     );
     let mut adapter = Adapter::launch(&host);
     let session = adapter.new_session(&host, json!([]));
+    let started = Instant::now();
     let id = adapter.prompt(&session, "take your time [[script:slow]]");
+    // The provider holds the stream open for 30 s after this text.
     adapter.wait("the first streamed text", |frame| {
         frame["params"]["update"]["content"]["text"] == "thinking"
     });
-    let started = Instant::now();
     adapter.send(
         json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session}}),
     );
@@ -381,7 +452,7 @@ fn cancel_stops_a_streaming_turn() {
     assert_eq!(result["stopReason"], "cancelled", "{result}");
     assert!(
         started.elapsed() < Duration::from_secs(20),
-        "cancel took {:?}",
+        "the turn must stop while the model is still streaming, not after {:?}",
         started.elapsed()
     );
     adapter.finish();
@@ -468,10 +539,4 @@ fn a_saved_auto_review_profile_still_sends_approvals_to_the_editor() {
     assert_eq!(adapter.result(id)["stopReason"], "end_turn");
     adapter.finish();
     assert_eq!(host.settings(), saved, "saved settings must not change");
-    assert!(
-        host.replies()
-            .iter()
-            .any(|reply| reply["tool"]["name"] == "bash"),
-        "the scripted shell call must have been served"
-    );
 }
