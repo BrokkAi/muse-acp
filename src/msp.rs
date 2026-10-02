@@ -1329,10 +1329,16 @@ pub fn err_message(e: &J) -> String {
 /// the session already loaded on this host. MSP fixes that set when the
 /// session runtime is built and has no unload command.
 pub fn is_session_configuration_conflict(e: &J) -> bool {
-    let data = e.get("data");
-    data.and_then(|d| d.get("kind")).and_then(|k| k.as_str()) == Some("commandRejected")
-        && data.and_then(|d| d.get("reason")).and_then(|r| r.as_str())
-            == Some("session_configuration_conflict")
+    rejection_reason(e) == Some("session_configuration_conflict")
+}
+
+/// The `reason` of a `commandRejected` error, if the error is one.
+pub fn rejection_reason(e: &J) -> Option<&str> {
+    let data = e.get("data")?;
+    if data.get("kind")?.as_str()? != "commandRejected" {
+        return None;
+    }
+    data.get("reason")?.as_str()
 }
 
 /// Older Muse hosts do not know the 1.3.0 session-default method. Keep the
@@ -1493,9 +1499,11 @@ fn host_closed(host: &MspHost, tx: &Sender<MspEvent>, reason: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExitKind, StderrTail, classify_exit_parts, command_timeout, known_server_request,
+        ExitKind, StderrTail, classify_exit_parts, command_timeout,
+        is_session_configuration_conflict, known_server_request, rejection_reason,
         session_profile_hint, session_suffix,
     };
+    use crate::json::parse_json;
     use std::time::Duration;
 
     #[test]
@@ -1549,6 +1557,35 @@ mod tests {
         let lines = exit.support_lines("support");
         assert!(lines[0].contains("exit-code=5"));
         assert!(lines.iter().any(|line| line.contains("serve gate is off")));
+    }
+
+    #[test]
+    fn rejection_reason_reads_only_command_rejections() {
+        let error =
+            |data: &str| parse_json(&format!(r#"{{"code":-32030,"data":{data}}}"#)).unwrap();
+        assert_eq!(
+            rejection_reason(&error(
+                r#"{"kind":"commandRejected","reason":"compaction_unavailable"}"#
+            )),
+            Some("compaction_unavailable")
+        );
+        assert_eq!(
+            rejection_reason(&error(
+                r#"{"kind":"internal","reason":"compaction_unavailable"}"#
+            )),
+            None
+        );
+        assert_eq!(
+            rejection_reason(&error(r#"{"kind":"commandRejected"}"#)),
+            None
+        );
+        assert_eq!(
+            rejection_reason(&parse_json(r#"{"code":-32603}"#).unwrap()),
+            None
+        );
+        assert!(is_session_configuration_conflict(&error(
+            r#"{"kind":"commandRejected","reason":"session_configuration_conflict"}"#
+        )));
     }
 
     #[test]
