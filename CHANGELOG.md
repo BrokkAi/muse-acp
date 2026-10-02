@@ -10,7 +10,7 @@
   in your Muse configuration instead of the temporary settings view, where
   they were lost when it was removed. A login completed in a terminal while
   the agent runs now reaches it: right away, or on Windows without symbolic
-  links when the editor next authenticates.
+  links at the next prompt, new session, or editor authentication.
 - Fix startup on Windows for a saved `:auto-review` permission profile
   without Developer Mode or administrator rights. The private settings view
   now links folders with directory junctions and, when symbolic links are not
