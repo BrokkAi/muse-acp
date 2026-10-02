@@ -8,6 +8,7 @@ mod acp;
 mod compat;
 mod fold;
 mod host_config;
+mod hosts;
 mod json;
 mod mcp;
 mod msp;
@@ -28,10 +29,9 @@ use acp::{
     AcpSession, FileChangeReport, HostTitleFacts, InFlight, PendingPerm, Sessions, StdoutShared,
 };
 use fold::SessionFold;
+use hosts::{HostKind, HostTag, Hosts};
 use json::{J, esc, j_to_string, mint_id, parse_json};
-use msp::{
-    ExitClassification, ExitKind, LaunchError, MspEvent, MspHost, err_code, err_message, log,
-};
+use msp::{ExitClassification, ExitKind, LaunchError, MspEvent, err_code, err_message, log};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static VER: AtomicU64 = AtomicU64::new(0); // negotiated ACP version for the connection
@@ -767,7 +767,7 @@ fn valid_subscription_usage(v: &J) -> bool {
 /// Read the host-global subscription snapshot. `Some(None)` is a successful
 /// truthful absence; `None` means the host does not implement the optional
 /// 1.3.0 surface or returned a malformed response, so existing state stays.
-fn read_subscription_usage(host: &Arc<MspHost>) -> Option<Option<String>> {
+fn read_subscription_usage(host: &Arc<Hosts>) -> Option<Option<String>> {
     let r = match host.command("usage/read", "{}") {
         Ok(r) => r,
         Err(e) => {
@@ -806,7 +806,7 @@ fn adopt_subscription_usage(stdout: &StdoutShared, s: &mut AcpSession, next: Opt
 
 /// Refresh one ACP session from the host-global `usage/read` surface.
 fn refresh_subscription_usage(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     acp_sid: &str,
@@ -823,7 +823,7 @@ fn refresh_subscription_usage(
 /// Refresh all attached sessions after a host restart. Subscription usage is
 /// host-global, so one read is enough and every session receives the same
 /// observation.
-fn refresh_all_subscription_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions) {
+fn refresh_all_subscription_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions) {
     let Some(next) = read_subscription_usage(host) else {
         return;
     };
@@ -848,7 +848,7 @@ fn refresh_all_subscription_usage(host: &Arc<MspHost>, stdout: &StdoutShared, se
 /// Deduplication is by approval/user-input id, so pull-versus-reissue races
 /// resolve to exactly one ACP presentation.
 fn reconcile_pending(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     lists: &SessionLists,
@@ -933,7 +933,7 @@ fn reconcile_pending(
 }
 
 /// Restores facts, not cost: historic completions stay unpriced.
-fn backfill_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
+fn backfill_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
     let (msp_sid, want_context, want_totals, want_reasoning) = match sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -1050,7 +1050,7 @@ fn backfill_usage(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Session
     }
 }
 
-fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
+fn catalog(host: &Arc<Hosts>) -> Vec<(String, String, bool)> {
     let cell = CATALOG.get_or_init(|| Mutex::new(Vec::new()));
     // MSP exposes a point-in-time snapshot, with no catalog subscription.
     // Refresh whenever we return config options: a nonempty startup catalog
@@ -1115,7 +1115,7 @@ fn catalog(host: &Arc<MspHost>) -> Vec<(String, String, bool)> {
 /// shortcut spelling that it can resolve, so this is also the source of truth
 /// for the ACP command catalog.
 fn skill_catalog(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     msp_sid: &str,
 ) -> Option<Vec<(String, String, Option<String>)>> {
     let params = format!("{{\"sessionId\":{}}}", esc(msp_sid));
@@ -1194,7 +1194,7 @@ enum LoopMsg {
     AcpLine(String),
     AcpInvalidUtf8,
     AcpEof,
-    Msp(MspEvent),
+    Msp(HostTag, MspEvent),
 }
 
 /// ACP initialize payloads. `session_mcp` is the host's `sessionMcp` grant:
@@ -1282,7 +1282,7 @@ fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
 /// credential. Clients such as Zed show their login screen for this error on
 /// session/new or session/load, but only an error banner when it arrives
 /// with the first prompt.
-fn reject_if_logged_out(host: &MspHost, stdout: &StdoutShared, id: &Option<J>) -> bool {
+fn reject_if_logged_out(host: &Hosts, stdout: &StdoutShared, id: &Option<J>) -> bool {
     // A login made in a terminal since launch must reach the host first.
     host.refresh_config();
     if !host.logged_out() {
@@ -1410,7 +1410,7 @@ fn same_workspace_roots(left: &[String], right: &[String]) -> bool {
 /// `sessionMcp` grant (Muse before 1.3.0) would reject a non-empty map, so
 /// the whole list is dropped there. `applied` is false for a fork, whose
 /// servers only take effect when Muse next loads the session.
-fn client_mcp_servers(host: &Arc<MspHost>, params: Option<&J>, applied: bool) -> Option<String> {
+fn client_mcp_servers(host: &Arc<Hosts>, params: Option<&J>, applied: bool) -> Option<String> {
     let translation = mcp::translate(params);
     if !translation.supplied() {
         return None;
@@ -1448,7 +1448,7 @@ fn mcp_config_field(servers: Option<&str>) -> String {
 /// with (MSP has no unload), so a different set is rejected as
 /// `session_configuration_conflict`. Retry once without configuration: the
 /// session attaches with the servers it has instead of becoming unusable.
-fn resume_session(host: &Arc<MspHost>, msp_sid: &str, mcp_servers: Option<&str>) -> Result<J, J> {
+fn resume_session(host: &Arc<Hosts>, msp_sid: &str, mcp_servers: Option<&str>) -> Result<J, J> {
     let send = |servers: Option<&str>| {
         let cmd = host.mint_cmd("cmd-");
         host.command(
@@ -1494,7 +1494,7 @@ fn validate_session_roots(stdout: &StdoutShared, id: &Option<J>, params: Option<
 /// Message ids and SHA-256 fingerprints (with a 1-based occurrence) resolve
 /// against host history. An unresolved point must fail closed.
 fn resolve_fork_cut_point(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     msp_sid: &str,
     params: Option<&J>,
 ) -> Result<Option<String>, String> {
@@ -1882,7 +1882,7 @@ fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
 /// subscribe keeps the resume attachment and leaves a diagnostic rather than
 /// turning a successful session attach into an error.
 fn reattach_view(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     sessions: &Sessions,
     acp_sid: &str,
     msp_sid: &str,
@@ -1982,12 +1982,91 @@ impl RestartBudget {
     }
 }
 
-fn restart_durable_host(
-    old: &Arc<MspHost>,
-    tx: &mpsc::Sender<LoopMsg>,
+/// Learns which host holds the sessions an event names, so commands for a
+/// subagent child session reach the host running it.
+fn learn_event_owner(hosts: &Hosts, tag: HostTag, params: &J) {
+    if let Some(sid) = params.get("sessionId").and_then(|v| v.as_str()) {
+        hosts.learn_owner(sid, tag.kind);
+    }
+    if let Some(child) = params
+        .get("item")
+        .and_then(|item| item.get("childSessionId"))
+        .and_then(|v| v.as_str())
+    {
+        hosts.learn_owner(child, tag.kind);
+    }
+}
+
+/// The read-only host exited. Relaunch it for the sessions it held; with
+/// none left, the next read-only session starts a new one. Its failures never
+/// stop the adapter: default sessions on the main host keep working.
+fn recover_read_only_host(
+    hosts: &Arc<Hosts>,
+    budget: &mut RestartBudget,
     stdout: &StdoutShared,
     sessions: &Sessions,
-) -> Result<Arc<MspHost>, String> {
+    lists: &SessionLists,
+    why: &str,
+) {
+    log(&format!("read-only serve host gone ({why})"));
+    if let Some(old) = hosts.host(HostKind::ReadOnly) {
+        if let Some(exit) = old.reap() {
+            for line in exit.support_lines("read-only-serve-exit") {
+                log(&line);
+            }
+        }
+        old.shutdown();
+    }
+    let owned: Vec<String> = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|(_, s)| hosts.owner(&s.msp_sid) == HostKind::ReadOnly)
+        .map(|(acp_sid, _)| acp_sid.clone())
+        .collect();
+    if owned.is_empty() {
+        hosts.clear_read_only();
+        return;
+    }
+    let restarted = match budget.admit(std::time::Instant::now()) {
+        Some(delay) => {
+            std::thread::sleep(delay);
+            restart_durable_host(hosts, HostKind::ReadOnly, None, stdout, sessions)
+        }
+        None => Err("it keeps exiting right after it restarts".to_string()),
+    };
+    match restarted {
+        Ok(()) => {
+            for sid in owned {
+                reconcile_pending(hosts, stdout, sessions, lists, &sid);
+            }
+        }
+        Err(e) => {
+            hosts.clear_read_only();
+            let message = format!(
+                "The read-only Muse host stopped and could not restart ({e}). Switch this session's mode to retry."
+            );
+            log(&message);
+            let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+            for sid in owned {
+                if let Some(s) = map.get_mut(&sid) {
+                    fail_in_flight(stdout, s, &message);
+                }
+            }
+        }
+    }
+}
+
+/// Relaunches the `kind` host and re-attaches the sessions it owned, except
+/// `exclude`, a session moving to the other host.
+fn restart_durable_host(
+    hosts: &Arc<Hosts>,
+    kind: HostKind,
+    exclude: Option<&str>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+) -> Result<(), String> {
+    let old = hosts.host(kind);
     // Snapshot the attach list first; host calls must happen unlocked. Keep
     // the ACP key: a session resumed under a legacy `sess-*` id is stored
     // under that id, not under its MSP id.
@@ -1995,6 +2074,7 @@ fn restart_durable_host(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .iter()
+        .filter(|(acp_sid, s)| hosts.owner(&s.msp_sid) == kind && Some(acp_sid.as_str()) != exclude)
         .map(|(acp_sid, s)| {
             (
                 acp_sid.clone(),
@@ -2012,19 +2092,9 @@ fn restart_durable_host(
         if attempt > 1 {
             std::thread::sleep(std::time::Duration::from_millis(250u64 << (attempt - 2)));
         }
-        match MspHost::launch(
-            ELICIT_FORM.load(Ordering::SeqCst) == 1,
-            USER_SHELL.load(Ordering::SeqCst) == 1,
-        ) {
-            Ok((host, msp_rx)) => {
-                let fwd_tx = tx.clone();
-                std::thread::spawn(move || {
-                    for ev in msp_rx {
-                        if fwd_tx.send(LoopMsg::Msp(ev)).is_err() {
-                            break;
-                        }
-                    }
-                });
+        match hosts.launch_kind(kind) {
+            Ok((host, generation)) => {
+                hosts.replace(kind, host.clone(), generation);
                 let mut failures = Vec::new();
                 let session_mcp = host.handshake().session_mcp;
                 for (acp_sid, msp_sid, after, mcp_servers) in &attach {
@@ -2040,7 +2110,7 @@ fn restart_durable_host(
                         }
                         servers => servers,
                     };
-                    match resume_session(&host, msp_sid, mcp_servers) {
+                    match resume_session(hosts, msp_sid, mcp_servers) {
                         Ok(r) => {
                             let resume_head = r
                                 .get("viewCursor")
@@ -2087,7 +2157,7 @@ fn restart_durable_host(
                                     drop(map);
                                 }
                                 reattach_view(
-                                    &host,
+                                    hosts,
                                     sessions,
                                     acp_sid,
                                     msp_sid,
@@ -2119,18 +2189,21 @@ fn restart_durable_host(
                     }
                 }
                 if !attach.is_empty() {
-                    refresh_all_subscription_usage(&host, stdout, sessions);
+                    refresh_all_subscription_usage(hosts, stdout, sessions);
                 }
                 log(&format!(
-                    "host-restarted attempt={attempt} sessions={} failures={}",
+                    "host-restarted attempt={attempt} sessions={} failures={} host={}",
                     attach.len(),
-                    failures.len()
+                    failures.len(),
+                    kind.name()
                 ));
                 for f in &failures {
                     log(&format!("restart re-attach failed: {f}"));
                 }
-                old.reap();
-                return Ok(host);
+                if let Some(old) = &old {
+                    old.reap();
+                }
+                return Ok(());
             }
             Err(e) => {
                 let retryable = e.retryable();
@@ -2150,17 +2223,6 @@ fn restart_durable_host(
         }
     }
     Err(last_err)
-}
-
-fn forward_msp_events(tx: &mpsc::Sender<LoopMsg>, msp_rx: mpsc::Receiver<MspEvent>) {
-    let fwd_tx = tx.clone();
-    std::thread::spawn(move || {
-        for ev in msp_rx {
-            if fwd_tx.send(LoopMsg::Msp(ev)).is_err() {
-                break;
-            }
-        }
-    });
 }
 
 fn main() {
@@ -2233,11 +2295,12 @@ fn main() {
     // capabilities. `userInputDialogs` is fixed for the MSP connection, so
     // launching earlier would force a fallback posture before we know whether
     // form elicitation is available.
-    let mut host: Option<Arc<MspHost>> = None;
+    let mut host: Option<Arc<Hosts>> = None;
     // Set when the first launch fails; the adapter then answers without a host
     // until the client restarts it.
     let mut host_unavailable: Option<String> = None;
     let mut restart_budget = RestartBudget::new();
+    let mut read_only_budget = RestartBudget::new();
 
     for msg in rx {
         if shutdown::expiring() {
@@ -2276,9 +2339,21 @@ fn main() {
                                 continue;
                             }
                             let user_input_dialogs = negotiate_acp(&v);
-                            let (new_host, msp_rx) = match MspHost::launch(
+                            let forward_tx = tx.clone();
+                            let forward: hosts::Forward = Box::new(move |tag, events| {
+                                let tx = forward_tx.clone();
+                                std::thread::spawn(move || {
+                                    for ev in events {
+                                        if tx.send(LoopMsg::Msp(tag, ev)).is_err() {
+                                            break;
+                                        }
+                                    }
+                                });
+                            });
+                            let new_host = match Hosts::launch(
                                 user_input_dialogs,
                                 USER_SHELL.load(Ordering::SeqCst) == 1,
+                                forward,
                             ) {
                                 Ok(h) => h,
                                 Err(e) => {
@@ -2318,7 +2393,6 @@ fn main() {
                             } else {
                                 "client MCP servers: dropped (this Muse host did not grant sessionMcp)"
                             });
-                            forward_msp_events(&tx, msp_rx);
                             host = Some(new_host);
                         }
                         handle_acp(
@@ -2332,15 +2406,21 @@ fn main() {
                     Err(e) => acp::send_error(&stdout, &None, -32700, &format!("parse error: {e}")),
                 }
             }
-            LoopMsg::Msp(MspEvent::Notification { method, params }) => {
-                if let Some(active_host) = host.as_ref() {
+            LoopMsg::Msp(tag, MspEvent::Notification { method, params }) => {
+                if let Some(active_host) = host.as_ref()
+                    && active_host.is_current(tag)
+                {
+                    learn_event_owner(active_host, tag, &params);
                     handle_msp(active_host, &stdout, &sessions, &lists, &method, &params);
                 }
             }
-            LoopMsg::Msp(MspEvent::Request { method, params }) => {
+            LoopMsg::Msp(tag, MspEvent::Request { method, params }) => {
                 // Reissued server requests (multi-stage approvals, resumed
                 // questions) carry their own payloads: bridge them too.
-                if let Some(active_host) = host.as_ref() {
+                if let Some(active_host) = host.as_ref()
+                    && active_host.is_current(tag)
+                {
+                    learn_event_owner(active_host, tag, &params);
                     match method.as_str() {
                         "approval/request" => {
                             open_approval(active_host, &stdout, &sessions, &params)
@@ -2369,12 +2449,30 @@ fn main() {
                 }
                 shutdown::exit(0);
             }
-            LoopMsg::Msp(MspEvent::Eof(why)) => {
-                let cleanup_deadline = shutdown::deadline("host disconnect");
-                log(&format!("serve host gone ({why})"));
-                let Some(old_host) = host.as_ref().cloned() else {
+            LoopMsg::Msp(tag, MspEvent::Eof(why)) => {
+                let Some(hosts) = host.as_ref().cloned() else {
                     continue;
                 };
+                // A host replaced on purpose, to release a session for the
+                // other host, ends without being a crash.
+                if !hosts.is_current(tag) {
+                    log(&format!("replaced {} host exited ({why})", tag.kind.name()));
+                    continue;
+                }
+                if tag.kind == HostKind::ReadOnly {
+                    recover_read_only_host(
+                        &hosts,
+                        &mut read_only_budget,
+                        &stdout,
+                        &sessions,
+                        &lists,
+                        &why,
+                    );
+                    continue;
+                }
+                let cleanup_deadline = shutdown::deadline("host disconnect");
+                log(&format!("serve host gone ({why})"));
+                let old_host = hosts.main_host();
                 let observed_exit = old_host.reap();
                 old_host.shutdown();
                 if let Some(exit) = observed_exit.as_ref() {
@@ -2416,9 +2514,8 @@ fn main() {
                         ));
                         std::thread::sleep(delay);
                     }
-                    match restart_durable_host(&old_host, &tx, &stdout, &sessions) {
-                        Ok(new_host) => {
-                            host = Some(new_host);
+                    match restart_durable_host(&hosts, HostKind::Main, None, &stdout, &sessions) {
+                        Ok(()) => {
                             // Reissued requests arrive on the new view; pull
                             // reconciliation as the belt-and-braces pass.
                             let ids: Vec<String> = sessions
@@ -2646,7 +2743,7 @@ fn subagent_control_allowed(method: &str, target: &SubagentControlTarget) -> boo
 }
 
 fn subagent_control(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     id: &Option<J>,
@@ -2826,7 +2923,7 @@ fn negotiate_acp(msg: &J) -> bool {
 }
 
 fn handle_acp(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     lists: &SessionLists,
@@ -5217,7 +5314,7 @@ fn replay_items(resume_res: &J) -> Option<Vec<J>> {
 /// Read the fork's own view, never the source's evolving live stream. Build
 /// everything before registration so a failed page cannot expose a partial fork.
 fn collect_history(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     sid: &str,
     result: &J,
 ) -> Result<(Vec<J>, std::collections::HashSet<String>), String> {
@@ -6181,7 +6278,7 @@ fn owner_for_msp_session(
 /// drill-down is a point-in-time `session/read`, exactly what tdd SS4.5.7
 /// prescribes ("child transcript drill-down without a second protocol").
 fn drill_down_subagent_child(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     acp_sid: &str,
@@ -6266,7 +6363,7 @@ fn drill_down_subagent_child(
 }
 
 fn handle_msp(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     lists: &SessionLists,
@@ -7358,7 +7455,7 @@ fn invalidate_pending_approval(
 /// approval id so multi-stage/resumed flows bridge exactly once. Never leaves
 /// an approval silently unresolved: without displayable choices there is
 /// nothing the client could answer, so fail closed by cancelling the turn.
-fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, params: &J) {
+fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, params: &J) {
     let msp_sid = params
         .get("sessionId")
         .and_then(|v| v.as_str())
@@ -7642,7 +7739,7 @@ struct PermissionDecision {
 
 /// Send the one MSP decision associated with a completed permission flow.
 fn send_permission_decision(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     acp_sid: &str,
@@ -7711,7 +7808,7 @@ fn send_permission_decision(
 /// Fail closed: without an explicit approving choice from the client, never
 /// send an approving decide — cancel the underlying turn instead.
 fn complete_permission(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     id: &Option<J>,
@@ -7874,7 +7971,7 @@ fn complete_permission(
 /// after this request is matched, so a late response cannot target a newer
 /// requirement or another approval.
 fn complete_permission_feedback(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     id: &Option<J>,
@@ -7948,7 +8045,7 @@ fn complete_permission_feedback(
 
 /// Display the next queued approval for a session, if any.
 fn pop_queued_approval(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     acp_sid: &str,
@@ -7974,7 +8071,7 @@ fn pop_queued_approval(
 /// only stop that child; falling back to root turn cancellation would widen
 /// the effect to unrelated work in the owner session.
 fn fail_closed_owner_work(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     sessions: &Sessions,
     acp_sid: &str,
     owner_msp_sid: &str,
@@ -8017,7 +8114,7 @@ fn fail_closed_owner_work(
 
 /// Stop one AIR async task through MSP's admission-only task command.
 fn stop_async_task(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     id: &Option<J>,
@@ -8136,7 +8233,7 @@ fn stop_async_task(
 
 /// Stop all background work admitted by the host for one negotiated session.
 /// MSP's acknowledgement is not a task outcome; item events settle each card.
-fn stop_all_background_tasks(host: &Arc<MspHost>, sessions: &Sessions, acp_sid: &str) {
+fn stop_all_background_tasks(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) {
     let target = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -8198,7 +8295,7 @@ fn session_stop_targets(s: &AcpSession) -> Vec<(String, String, bool)> {
 }
 
 /// Cancel every foreground turn of one ACP session (fail-closed helper).
-fn cancel_session_turns(host: &Arc<MspHost>, sessions: &Sessions, acp_sid: &str) {
+fn cancel_session_turns(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) {
     let turns = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -8341,7 +8438,7 @@ fn remove_pending_ui(sessions: &Sessions, acp_sid: &str, req_id: &J) -> Option<a
 /// Bridge an MSP `userInput/requested` to ACP `elicitation/create` (form mode).
 /// Returns false when there is nothing bridgeable (caller falls back).
 fn bridge_user_input(
-    _host: &Arc<MspHost>,
+    _host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     acp_sid: &str,
@@ -8590,7 +8687,7 @@ fn clarification_schema() -> &'static str {
 
 /// Client reply to our `elicitation/create` (matched by id).
 fn complete_elicitation(
-    host: &Arc<MspHost>,
+    host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     id: &Option<J>,
