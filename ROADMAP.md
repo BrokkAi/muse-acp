@@ -149,8 +149,9 @@ approval payload through the permission mapping, requiring ordered choices
 plus a deny fallback, and an env-gated `MUSE_ACP_LIVE_HOST=1` smoke test
 drives a real host handshake, session lifecycle, and close (skipped with an
 explicit message by default). The `live-host` CI job also runs
-`tests/live_loopback.rs` on every push against each pinned Muse build
-(downloaded and checksum-verified), with no credentials: a real `muse serve`
+`tests/live_loopback.rs` on every push against each pinned Muse build on
+Linux x86-64, and the newest on macOS arm64 (downloaded and
+checksum-verified), with no credentials: a real `muse serve`
 whose model calls go to a scripted loopback provider. It covers prompt to
 `end_turn`, shell approval allow and deny, a piped command whose approval
 carries both stages, cancel during a streaming model step, reload after an
@@ -158,8 +159,8 @@ adapter restart, a crashed host's durable restart that re-attaches the
 session, fork with its source history, `/compact` (declined on a short
 session), `/goal`, `write_todos` as an editor plan, the AIR file-change
 report, editor MCP forwarding, and a saved `:auto-review` profile. Still to
-come (#157): the `userInput` form and subagent spawn, since Muse offers
-neither tool to a model it does not know, plus a macOS arm64 run.
+come (#176): the `userInput` form and subagent spawn, since Muse offers
+neither tool to a model it does not know.
 
 **Work items**
 
