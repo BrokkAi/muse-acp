@@ -148,7 +148,15 @@ dev-dependency; the binary stays dependency-free), and replays every corpus
 approval payload through the permission mapping, requiring ordered choices
 plus a deny fallback, and an env-gated `MUSE_ACP_LIVE_HOST=1` smoke test
 drives a real host handshake, session lifecycle, and close (skipped with an
-explicit message by default).
+explicit message by default). The `live-host` CI job also runs
+`tests/live_loopback.rs` on every push against each pinned Muse build
+(downloaded and checksum-verified), with no credentials: a real `muse serve`
+whose model calls go to a scripted loopback provider. It covers prompt to
+`end_turn`, shell approval allow and deny, cancel, reload after an adapter
+restart, editor MCP forwarding, and a saved `:auto-review` profile. Fork,
+`/compact`, `/goal`, the `userInput` form, subagents, the file-change report,
+host-crash recovery, and multi-stage shell approvals are still to come
+(#157).
 
 **Work items**
 

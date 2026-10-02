@@ -203,15 +203,18 @@ left untouched, and the temporary view is removed when the host exits. Other
 permission profiles are passed through unchanged.
 
 The view links the rest of your configuration instead of copying it, so
-credentials are never copied. On Windows it needs neither Developer Mode nor
+credentials are never copied. Files Muse creates while it runs, such as the
+credential from your first login or your first workspace trust, are written
+to your real configuration too. On Windows it needs neither Developer Mode nor
 administrator rights: folders are linked with directory junctions, and files
 with symbolic links when Windows allows them, otherwise with hard links. When
-Muse replaces a hard-linked file, such as a refreshed `auth.json`, the adapter
-moves the new file back over the original when the host exits, unless the
-original also changed in the meantime. If the editor stops the agent before
-it can, the next launch finishes the job. With hard links, a file you replace
-outside the agent while it runs, for example by running `muse login` in a
-terminal, reaches `muse serve` after the agent restarts. If the view cannot
+Muse replaces a hard-linked file, such as a refreshed `auth.json`, or creates
+a new one, the adapter moves the new file to your configuration when the host
+exits, unless your configuration also changed in the meantime. If the editor
+stops the agent before it can, the next launch finishes the job. With hard
+links, a login you complete in a terminal while the agent runs reaches
+`muse serve` when the editor next authenticates, as it does after **Log in
+with Muse**, or when the agent restarts. If the view cannot
 be built, for example because the temporary folder is on a different drive
 from your configuration, `muse serve` starts with your saved settings, and the
 error the editor shows if Muse then refuses the profile says why.

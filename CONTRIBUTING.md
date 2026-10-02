@@ -7,6 +7,18 @@ Thank you for helping improve `muse-acp`.
 Install Rust 1.88 or newer, Python 3, and Node.js 22 or newer. The integration suite uses the
 checked-in fake MSP host, so it does not require a live Muse session.
 
+The live-host suite runs the adapter against a real `muse serve` whose model
+calls go to a scripted loopback provider (`tests/fixtures/loopback_provider.py`).
+It needs Muse installed but no Muse account, and it never reads your Muse
+settings:
+
+```sh
+MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loopback
+```
+
+Set `MUSE_CLI` to test a specific Muse build. CI runs this suite against each
+pinned build listed in `.github/workflows/ci.yml`.
+
 Before submitting a pull request, run:
 
 ```sh
