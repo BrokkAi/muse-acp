@@ -219,8 +219,9 @@ flags; their calls still go through approvals.
 Muse lets only one host hold a session, and releases it only when that host
 exits. Changing the mode of an open session therefore restarts the host that
 holds it, and every other session on that host reconnects by itself. The
-change is refused while a turn runs on that host, in this thread or another;
-try again when it finishes.
+change is refused while anything runs on that host, in this thread or
+another: a turn, a background tool, a subagent, or a workflow. Try again when
+it finishes.
 
 The adapter remembers each session's mode in
 `$XDG_STATE_HOME/muse-acp/session-modes.json` (Windows:

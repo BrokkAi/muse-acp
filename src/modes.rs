@@ -81,7 +81,11 @@ pub fn save(msp_sid: &str, mode: &str) {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let staging = path.with_extension("json.tmp");
+        // Each process stages its own file, so two adapters saving at once
+        // never rename a half-written store into place. The later save
+        // wins; a mode saved at the same moment by another adapter can be
+        // lost, which only means that session reopens in the default mode.
+        let staging = path.with_extension(format!("json.{}.tmp", std::process::id()));
         std::fs::write(&staging, format!("{{{body}}}\n"))?;
         std::fs::rename(&staging, &path)
     };

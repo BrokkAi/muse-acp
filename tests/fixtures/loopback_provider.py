@@ -81,13 +81,19 @@ def reply_for(request):
     if "submit_reminder_decision" in offered(request):
         return {"tool": {"name": "submit_reminder_decision",
                          "arguments": OBSERVER_DECISION}}
-    last = (request.get("input") or [{}])[-1]
-    if last.get("type") == "function_call_output":
+    items = request.get("input") or [{}]
+    if items[-1].get("type") == "function_call_output":
         return {"text": "done"}
-    if last.get("role") == "user":
-        marker = re.search(r"\[\[script:([\w-]+)\]\]", text_of(last))
-        if marker and marker.group(1) in SCRIPT:
-            return SCRIPT[marker.group(1)]
+    # The prompt can arrive as several user messages, for example with the
+    # adapter's plan-mode instruction after the user's text.
+    prompt = []
+    for item in reversed(items):
+        if item.get("role") != "user":
+            break
+        prompt.append(text_of(item))
+    marker = re.search(r"\[\[script:([\w-]+)\]\]", "".join(prompt))
+    if marker and marker.group(1) in SCRIPT:
+        return SCRIPT[marker.group(1)]
     return {"text": "ok"}
 
 

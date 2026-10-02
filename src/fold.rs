@@ -338,6 +338,21 @@ impl SessionFold {
         self.items.contains_key(item_id)
     }
 
+    /// Whether work this session started may still run on its host after the
+    /// turn: a tool call, subagent, or workflow not yet reported finished.
+    pub fn has_running_work(&self) -> bool {
+        self.items
+            .values()
+            .any(|role| matches!(role, ItemRole::Tool { .. }))
+            || self.subagents.values().any(|s| {
+                !matches!(
+                    s.item_status.as_str(),
+                    "completed" | "failed" | "rejected" | "cancelled" | "timedOut"
+                )
+            })
+            || !self.workflow_children.is_empty()
+    }
+
     fn known(&self, item_id: &str) -> bool {
         self.done.contains(item_id)
     }
@@ -1018,6 +1033,18 @@ impl SessionFold {
         (title, tool.to_string())
     }
 
+    /// A replayed message's text. A user message shows the prompt as the
+    /// user wrote it (`displayText`), without text the adapter added, such
+    /// as the plan-mode instruction.
+    fn message_text(item: &J) -> &str {
+        let display = (item.get("kind").and_then(|v| v.as_str()) == Some("userMessage"))
+            .then(|| item.get("displayText").and_then(|v| v.as_str()))
+            .flatten();
+        display
+            .or_else(|| item.get("text").and_then(|v| v.as_str()))
+            .unwrap_or("")
+    }
+
     fn replay_message_line(acp_sid: &str, ver: u8, kind: &str, msg_id: &str, text: &str) -> String {
         let content = format!("[{{\"type\":\"text\",\"text\":{}}}]", esc(text));
         let update = match (kind, ver) {
@@ -1072,7 +1099,7 @@ impl SessionFold {
                 "toolCall" | "subagent" => self.on_item_snapshot(acp_sid, ver, item, out),
                 "agentMessage" | "userMessage" => {
                     self.on_item_snapshot(acp_sid, ver, item, out);
-                    let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    let text = Self::message_text(item);
                     if text.is_empty() {
                         return;
                     }
@@ -1096,7 +1123,7 @@ impl SessionFold {
             }
             "agentMessage" | "userMessage" => {
                 self.done.insert(item_id);
-                let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                let text = Self::message_text(item);
                 if !text.is_empty() {
                     let msg_id = mint_id("msg-", &self.idc);
                     out.push(Self::replay_message_line(acp_sid, ver, kind, &msg_id, text));

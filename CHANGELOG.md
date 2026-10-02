@@ -8,8 +8,11 @@
   Muse itself refuses file writes and shell commands. Plan also tells Muse to
   plan rather than implement, and a bare `/plan` switches to it without
   starting a turn. Changing an open session's mode moves it between the two
-  hosts and is refused while a turn runs on the host it leaves. The mode is
-  remembered, so a reloaded session comes back in it.
+  hosts and is refused while a turn or background work runs on the host it
+  leaves. The mode is remembered, so a reloaded session comes back in it.
+- When the Muse host restarts, a session that had not run a turn yet starts
+  again under its own id. Muse saves a session only with its first turn, so
+  such a session previously failed to reconnect.
 - The approval policy moves to its own **Approval Mode** selector
   (`approval_mode`). Approval mode ids sent to `mode` or `session/set_mode`
   still set it.

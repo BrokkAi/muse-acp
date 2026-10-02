@@ -18,7 +18,7 @@ use crate::{
 
 static OUTPUT: OnceLock<StdoutShared> = OnceLock::new();
 static REQUESTS: OnceLock<Mutex<HashMap<String, J>>> = OnceLock::new();
-static HOST: OnceLock<Mutex<Weak<MspHost>>> = OnceLock::new();
+static HOSTS: OnceLock<Mutex<Vec<Weak<MspHost>>>> = OnceLock::new();
 static DISCONNECTED: AtomicBool = AtomicBool::new(false);
 static EXPIRING: AtomicBool = AtomicBool::new(false);
 
@@ -26,11 +26,16 @@ pub fn initialize(stdout: &StdoutShared) {
     let _ = OUTPUT.set(stdout.clone());
 }
 
+/// Records a running host, so an expired deadline stops it. The adapter can
+/// run a main and a read-only host at once.
 pub fn register_host(host: &Arc<MspHost>) {
-    *HOST
+    let mut hosts = HOSTS
         .get_or_init(Default::default)
         .lock()
-        .unwrap_or_else(|p| p.into_inner()) = Arc::downgrade(host);
+        .unwrap_or_else(|p| p.into_inner());
+    hosts.retain(|host| host.strong_count() > 0);
+    hosts.push(Arc::downgrade(host));
+    drop(hosts);
     if expiring() {
         host.force_stop();
     }
@@ -151,11 +156,12 @@ fn expire(context: &'static str) -> ! {
         );
     });
     std::thread::spawn(|| {
-        if let Some(host) = HOST
+        let hosts: Vec<Arc<MspHost>> = HOSTS
             .get()
-            .and_then(|host| host.try_lock().ok())
-            .and_then(|host| host.upgrade())
-        {
+            .and_then(|hosts| hosts.try_lock().ok())
+            .map(|hosts| hosts.iter().filter_map(Weak::upgrade).collect())
+            .unwrap_or_default();
+        for host in hosts {
             host.force_stop();
         }
     });

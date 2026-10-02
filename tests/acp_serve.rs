@@ -8511,6 +8511,22 @@ fn bare_plan_switches_to_plan_without_a_turn() {
     c.wait_log("ro:turn/start", Duration::from_secs(15));
     c.wait_input("Plan mode: investigate", Duration::from_secs(15));
     c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    // The instruction follows the user's text, and the transcript keeps
+    // only what the user wrote.
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    let turn: serde_json::Value = inputs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|params| params.to_string().contains("Plan mode: investigate"))
+        .unwrap();
+    assert_eq!(turn["displayText"], "what should change", "{turn}");
+    assert_eq!(turn["input"][0]["text"], "what should change", "{turn}");
+    assert!(
+        turn["input"][1]["text"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("Plan mode: investigate")),
+        "{turn}"
+    );
     c.finish();
 }
 

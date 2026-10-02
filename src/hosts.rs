@@ -15,7 +15,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use crate::json::{J, parse_json};
-use crate::msp::{HandshakeInfo, LaunchError, MspEvent, MspHost};
+use crate::msp::{HandshakeInfo, LaunchError, MspEvent, MspHost, mk_err};
 
 /// Flags that make Muse refuse workspace writes and shell commands.
 pub const READ_ONLY_ARGS: [&str; 2] = ["--disable-write", "--disable-shell"];
@@ -62,6 +62,8 @@ pub struct Hosts {
     main: Mutex<Current>,
     read_only: Mutex<Option<Current>>,
     owners: Mutex<HashMap<String, HostKind>>,
+    /// Held while the read-only host launches, so two callers never start two.
+    launching: Mutex<()>,
     user_input_dialogs: bool,
     user_shell: bool,
     forward: Forward,
@@ -82,6 +84,7 @@ impl Hosts {
             main: Mutex::new(Current { host, generation }),
             read_only: Mutex::new(None),
             owners: Mutex::new(HashMap::new()),
+            launching: Mutex::new(()),
             user_input_dialogs,
             user_shell,
             forward,
@@ -131,6 +134,10 @@ impl Hosts {
         if let Some(host) = self.host(HostKind::ReadOnly) {
             return Ok(host);
         }
+        let _launching = lock(&self.launching);
+        if let Some(host) = self.host(HostKind::ReadOnly) {
+            return Ok(host);
+        }
         let (host, generation) = self
             .launch_kind(HostKind::ReadOnly)
             .map_err(|e| format!("could not start the read-only Muse host: {e}"))?;
@@ -149,15 +156,15 @@ impl Hosts {
         }
     }
 
-    /// Records the host that loaded a session. An explicit start, resume,
-    /// fork, or move decides; events only teach sessions not yet known, such
-    /// as subagent children.
+    /// Records the host that holds a session: the one that started, resumed,
+    /// forked, or moved it, or the one running a subagent child session.
     pub fn note_owner(&self, msp_sid: &str, kind: HostKind) {
         if !msp_sid.is_empty() {
             lock(&self.owners).insert(msp_sid.to_string(), kind);
         }
     }
 
+    /// Records an owner only for a session not known yet.
     pub fn learn_owner(&self, msp_sid: &str, kind: HostKind) {
         if !msp_sid.is_empty() {
             lock(&self.owners)
@@ -178,8 +185,17 @@ impl Hosts {
             .unwrap_or(HostKind::Main)
     }
 
-    /// The process that owns the params' `sessionId`, else the main host.
-    fn route(&self, params_json: &str) -> Arc<MspHost> {
+    /// The process that owns the params' `sessionId`, else the main host. A
+    /// read-only session never falls back to the main host: its host is
+    /// started again if it is not running.
+    fn route(&self, params_json: &str) -> Result<Arc<MspHost>, J> {
+        // Most adapters never run a read-only session; skip parsing then.
+        let any_read_only = lock(&self.owners)
+            .values()
+            .any(|kind| *kind == HostKind::ReadOnly);
+        if !any_read_only {
+            return Ok(self.main_host());
+        }
         let owner = parse_json(params_json)
             .ok()
             .and_then(|params| {
@@ -190,11 +206,16 @@ impl Hosts {
             })
             .map(|sid| self.owner(&sid))
             .unwrap_or(HostKind::Main);
-        self.host(owner).unwrap_or_else(|| self.main_host())
+        match owner {
+            HostKind::Main => Ok(self.main_host()),
+            HostKind::ReadOnly => self
+                .read_only_host()
+                .map_err(|message| mk_err(-32603, &message)),
+        }
     }
 
     pub fn command(&self, method: &str, params_json: &str) -> Result<J, J> {
-        self.route(params_json).command(method, params_json)
+        self.route(params_json)?.command(method, params_json)
     }
 
     pub fn mint_cmd(&self, prefix: &str) -> String {

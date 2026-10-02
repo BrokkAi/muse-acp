@@ -21,6 +21,7 @@ To see it working, run `MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loop
 - [x] (2026-10-02 15:40Z) Milestone 2: session modes in `src/acp.rs`; `mode` and legacy `modes` carry them; `approval_mode` carries the approval policy, with old ids on `mode` still accepted; `src/modes.rs` persists non-default modes.
 - [x] (2026-10-02 16:10Z) Milestone 3: `switch_session_mode` moves sessions between hosts; load, resume, and fork open on the right host; plan turns carry the instruction; bare `/plan` switches.
 - [x] (2026-10-02 16:40Z) Milestone 4: five fake-host tests in `tests/acp_serve.rs`, two live tests in `tests/live_loopback.rs` (15/15 pass on 1.3.0, 1.4.1, and 1.4.2), README, CHANGELOG.
+- [x] (2026-10-02 18:30Z) Review fixes on PR #179: a read-only session never routes to the main host (its host relaunches on demand); re-attach retries a held session and starts an unsaved one again for every restart, not only for the moved session; a failed move puts the session back; moves need a durable host and an idle one, background work included; the plan instruction follows the user's parts and the transcript keeps the user's text (`displayText`); the shutdown deadline stops every host; the mode store stages per process. A third live test covers a second unsaved session across a move (16/16 on 1.3.0, 1.4.1, and 1.4.2).
 
 
 ## Surprises & Discoveries
@@ -38,6 +39,12 @@ To see it working, run `MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loop
 
 - Observation: Muse writes a session to disk with its first turn. Moving a session that never ran a turn found nothing to resume on the new host (`-32020 sessionNotFound`) once the old host exited.
   Evidence: live test `read_only_mode_blocks_writes_until_switched_back` failed with "session ... was not found" before the fallback; `session/start` with the same `sessionId` on the new host fixed it.
+
+- Observation: a mode change also restarts the host the moving session leaves, so every other session there that had not run a turn was lost the same way, and so was the moved session after an adapter restart: a bare `/plan` on an empty session left nothing for the next adapter to load.
+  Evidence: CI `plan_mode_survives_an_adapter_restart` on 1.4.1 and macOS 1.4.2 failed with "resume failed: session ... was not found". The test now runs a turn before restarting, and `a_mode_change_keeps_other_new_sessions_usable` logs "had not run a turn, so Muse had not saved it; started it again" for both sessions on 1.4.1 and 1.4.2.
+
+- Observation: just after a host exits, the next host's `session/resume` can briefly answer `runtime_busy` or `sessionInUse` for a session the old host held.
+  Evidence: CI run on PR #179 before the retry; resumes now retry for up to ten seconds.
 
 - Observation: fake-host tests shared the developer's `~/.local/state`, and every fake host uses the session id `msp-sess-1`, so a test that switched to plan made a later test load on the read-only host.
   Evidence: `host_restart_settles_orphaned_turns_of_a_legacy_session_id` failed with "read-only Muse host started" in its log; each test spawn now sets its own `XDG_STATE_HOME`.
@@ -70,6 +77,22 @@ To see it working, run `MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loop
   Rationale: a session with no turns has no history to lose, and `session/start` accepts an explicit id that the old host no longer holds.
   Date/Author: 2026-10-02, Claude.
 
+- Decision: every re-attach (crash restart, a host restarted to release a moving session, and the move itself) goes through one helper that retries a held session and starts an unsaved one again with its workspace, approval mode, model, reasoning default, and MCP servers, refusing a start that comes back under another id.
+  Rationale: a restart caused by a mode change is routine, unlike a crash, so losing sessions that never ran would be visible; one path keeps the three cases consistent.
+  Date/Author: 2026-10-02, Claude.
+
+- Decision: a read-only session never falls back to the main host. If the read-only host is gone, routing a command for its session starts it again, and a failed start fails the command.
+  Rationale: a fallback would run a read-only or plan session where Muse allows writes.
+  Date/Author: 2026-10-02, Claude.
+
+- Decision: the plan instruction is the last input part, and plan turns send the user's text as `displayText`; replay prefers `displayText` for user messages. Steering input and host-started goal turns do not get the instruction.
+  Rationale: a skill invocation must stay first, and the transcript should show what the user wrote. The read-only host is the guarantee; steering joins a turn that already carries the instruction, and the adapter does not compose goal continuations.
+  Date/Author: 2026-10-02, Claude.
+
+- Decision: a move is refused on a host whose durability profile is not restartable, and while anything runs on the host being left: a turn, a pending approval or question, a tool call still running, a subagent, or a workflow.
+  Rationale: the restart would lose sessions on an ephemeral host and would kill background work.
+  Date/Author: 2026-10-02, Claude.
+
 - Decision: persist each session's mode in `$XDG_STATE_HOME/muse-acp/session-modes.json` (Windows: `%LOCALAPPDATA%\muse-acp\session-modes.json`), keyed by Muse session id, and open loaded and resumed sessions on the matching host. A fork keeps its source's mode.
   Rationale: the issue requires the mode to survive load and resume or the README to say it does not; a read-only guarantee that silently lapses on reload would be worse than none. A fork is created on the host that holds its source, so it starts in that mode.
   Date/Author: 2026-10-02, Claude.
@@ -82,7 +105,7 @@ To see it working, run `MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loop
 ## Outcomes & Retrospective
 
 
-Read-only and Plan work as designed on every pinned Muse build: a write in either mode is refused by Muse and nothing reaches the workspace, switching back allows it, and the mode survives an adapter restart. The router kept the change to `main.rs` small: most of its command call sites did not change. The cost of the two-host design is visible only on a mode change: the host being left restarts, and the change waits for its turns to finish. Not covered: MCP tools in read-only sessions (still approval-gated), and modes are not shared with other Muse clients.
+Read-only and Plan work as designed on every pinned Muse build: a write in either mode is refused by Muse and nothing reaches the workspace, switching back allows it, and the mode survives an adapter restart once the session has run a turn (Muse does not save a session before that). The review of PR #179 found that restarts lost sessions that never ran and that a read-only session could fall back to the main host; both are fixed and covered. The router kept the change to `main.rs` small: most of its command call sites did not change. The cost of the two-host design is visible only on a mode change: the host being left restarts, and the change waits for its turns to finish. Not covered: MCP tools in read-only sessions (still approval-gated), and modes are not shared with other Muse clients.
 
 
 ## Context and Orientation

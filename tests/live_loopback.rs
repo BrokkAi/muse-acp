@@ -883,6 +883,26 @@ fn read_only_mode_blocks_writes_until_switched_back() {
 }
 
 #[test]
+fn a_mode_change_keeps_other_new_sessions_usable() {
+    if !enabled("a_mode_change_keeps_other_new_sessions_usable") {
+        return;
+    }
+    let host = Host::start(json!({"write": write_step()}), None);
+    let mut adapter = Adapter::launch(&host);
+    // Neither session has run a turn, so Muse has not saved either. Moving
+    // one restarts the main host, which must start the other again.
+    let waiting = adapter.new_session(&host, json!([]));
+    let planning = adapter.new_session(&host, json!([]));
+    set_mode(&mut adapter, &planning, "plan");
+    adapter.turn(&waiting, "write it [[script:write]]");
+    assert_eq!(
+        std::fs::read_to_string(host.workspace().join("notes.txt")).unwrap(),
+        "written\n"
+    );
+    adapter.finish();
+}
+
+#[test]
 fn plan_mode_survives_an_adapter_restart() {
     if !enabled("plan_mode_survives_an_adapter_restart") {
         return;
@@ -891,6 +911,9 @@ fn plan_mode_survives_an_adapter_restart() {
     let mut first = Adapter::launch(&host);
     let session = first.new_session(&host, json!([]));
     first.turn(&session, "/plan");
+    // Muse saves a session with its first turn; one that never ran cannot be
+    // loaded again.
+    first.turn(&session, "look around");
     first.finish();
 
     let mut second = Adapter::launch(&host);
@@ -904,6 +927,11 @@ fn plan_mode_survives_an_adapter_restart() {
     assert!(
         !host.workspace().join("notes.txt").exists(),
         "a reloaded plan session must still not write"
+    );
+    assert!(
+        tool_output(&second).contains("denied"),
+        "Muse reports the refusal: {}",
+        tool_output(&second)
     );
     second.finish();
 }
