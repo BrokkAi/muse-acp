@@ -1283,6 +1283,8 @@ fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
 /// session/new or session/load, but only an error banner when it arrives
 /// with the first prompt.
 fn reject_if_logged_out(host: &MspHost, stdout: &StdoutShared, id: &Option<J>) -> bool {
+    // A login made in a terminal since launch must reach the host first.
+    host.refresh_config();
     if !host.logged_out() {
         return false;
     }
@@ -3886,6 +3888,9 @@ fn handle_acp(
             }
         }
         "session/prompt" => {
+            // A manual `muse login` sends no `authenticate`, so a login made
+            // since the last request reaches the host here.
+            host.refresh_config();
             let ver = negotiated_ver();
             let report_request = file_report_request(params.as_ref());
             let sid = params

@@ -195,9 +195,11 @@ fn prepare(source: &Path) -> io::Result<Option<HostConfig>> {
     }
     for name in MUSE_FILES {
         let file = source.join("muse").join(name);
-        if fs::symlink_metadata(&file).is_err()
-            && let Err(error) = link_missing(&mut config, &file, &muse.join(name))
-        {
+        let missing = matches!(
+            fs::symlink_metadata(&file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        );
+        if missing && let Err(error) = link_missing(&mut config, &file, &muse.join(name)) {
             crate::msp::log(&format!(
                 "a new {name} would stay in the Muse settings view: {error}"
             ));
@@ -539,6 +541,13 @@ mod tests {
             fs::read_to_string(view.join("auth.json")).unwrap(),
             "second credential"
         );
+        // Muse removes the view's entry; the next refresh links it again.
+        fs::remove_file(view.join("auth.json")).unwrap();
+        overlay.refresh();
+        assert_eq!(
+            fs::read_to_string(view.join("auth.json")).unwrap(),
+            "second credential"
+        );
         drop(overlay);
         assert_eq!(
             fs::read_to_string(muse.join("trust.json")).unwrap(),
@@ -548,6 +557,24 @@ mod tests {
             fs::read_to_string(muse.join("auth.json")).unwrap(),
             "second credential"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_logout_is_not_undone_by_a_later_launch() {
+        let (source, mut overlay) = bare_windows_overlay();
+        let muse = source.root.join("muse");
+        let root = overlay.root.clone();
+        fs::write(muse.join("auth.json"), "credential").unwrap();
+        overlay.refresh();
+        assert!(root.join("muse/auth.json").exists());
+        // `muse logout` in a terminal, then the editor terminates the agent.
+        fs::remove_file(muse.join("auth.json")).unwrap();
+        overlay.links.abandon();
+        std::mem::forget(overlay);
+        windows::sweep();
+        assert!(!root.exists());
+        assert!(!muse.join("auth.json").exists(), "the logout must stand");
     }
 
     #[cfg(windows)]

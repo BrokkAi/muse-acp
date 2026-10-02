@@ -294,13 +294,35 @@ impl HardLink {
     }
 
     /// The original was replaced outside the view, for example by `muse
-    /// login` in a terminal, while the view still links the old file.
+    /// login` in a terminal, while the view still links the old file, or the
+    /// view's entry is gone while the original exists.
     fn stale(&self) -> bool {
-        let view_unchanged =
-            FileState::read(&self.target).is_ok_and(|current| current.same_file(&self.state));
-        let original_replaced =
-            FileState::read(&self.source).is_ok_and(|current| !current.same_file(&self.state));
-        view_unchanged && original_replaced
+        let Ok(original) = FileState::read(&self.source) else {
+            return false;
+        };
+        match FileState::read(&self.target) {
+            Ok(view) => view.same_file(&self.state) && !original.same_file(&self.state),
+            Err(error) => error.kind() == io::ErrorKind::NotFound,
+        }
+    }
+
+    /// Links the view to the current original, replacing the old link in one
+    /// rename so Muse never finds the entry missing.
+    fn relink(&self) -> io::Result<Self> {
+        let mut staging = self.target.as_os_str().to_owned();
+        staging.push(".muse-acp-relink");
+        let staging = PathBuf::from(staging);
+        let _ = fs::remove_file(&staging);
+        fs::hard_link(&self.source, &staging)?;
+        if let Err(error) = fs::rename(&staging, &self.target) {
+            let _ = fs::remove_file(&staging);
+            return Err(error);
+        }
+        Ok(HardLink {
+            source: self.source.clone(),
+            target: self.target.clone(),
+            state: FileState::read(&self.target)?,
+        })
     }
 
     fn to_json(&self) -> String {
@@ -385,8 +407,12 @@ fn move_new(from: &Path, to: &Path) -> io::Result<()> {
         .write(true)
         .create_new(true)
         .open(to)?;
-    io::copy(&mut reader, &mut writer)?;
-    writer.sync_all()?;
+    if let Err(error) = io::copy(&mut reader, &mut writer).and_then(|_| writer.sync_all()) {
+        // Never leave a partial file where Muse would read it.
+        drop(writer);
+        let _ = fs::remove_file(to);
+        return Err(error);
+    }
     drop(writer);
     fs::remove_file(from)
 }
@@ -452,7 +478,8 @@ impl Links {
                 Err(error) if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
                     FILE_SYMLINKS_DENIED.store(true, Ordering::Relaxed);
                 }
-                Err(error) => return Err(error),
+                // Any other refusal: a pending entry needs no link at all.
+                Err(_) => {}
             }
         }
         let pending = Pending {
@@ -504,9 +531,7 @@ impl Links {
                 kept.push(link);
                 continue;
             }
-            match fs::remove_file(&link.target)
-                .and_then(|()| HardLink::create(&link.source, &link.target))
-            {
+            match link.relink() {
                 Ok(relinked) => fresh.push(relinked),
                 Err(error) => {
                     log(&format!(
@@ -550,6 +575,38 @@ impl Links {
     }
 }
 
+enum Entry {
+    Pending(Pending),
+    Hard(HardLink),
+}
+
+impl Entry {
+    fn target(&self) -> &Path {
+        match self {
+            Entry::Pending(pending) => &pending.target,
+            Entry::Hard(link) => &link.target,
+        }
+    }
+}
+
+/// The manifest's entries, keeping only the last one for each view path: a
+/// refresh records a pending file it linked, or a link it replaced, again.
+fn latest_entries(manifest: &str) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = Vec::new();
+    for line in manifest.lines() {
+        let entry = match Pending::from_json(line) {
+            Some(pending) => Entry::Pending(pending),
+            None => match HardLink::from_json(line) {
+                Some(link) => Entry::Hard(link),
+                None => continue,
+            },
+        };
+        entries.retain(|earlier| earlier.target() != entry.target());
+        entries.push(entry);
+    }
+    entries
+}
+
 /// Finishes the views earlier adapters left behind. A view whose owner file
 /// can be deleted has no live owner: restore its hard-linked files, then
 /// remove it. Views without a manifest are left alone; an older adapter may
@@ -573,11 +630,10 @@ pub fn sweep() {
             Err(_) => continue,
         }
         let manifest = fs::read_to_string(root.join(MANIFEST)).unwrap_or_default();
-        for line in manifest.lines() {
-            if let Some(pending) = Pending::from_json(line) {
-                pending.keep();
-            } else if let Some(link) = HardLink::from_json(line) {
-                link.restore();
+        for entry in latest_entries(&manifest) {
+            match entry {
+                Entry::Pending(pending) => pending.keep(),
+                Entry::Hard(link) => link.restore(),
             }
         }
         if let Err(error) = fs::remove_dir_all(&root) {
