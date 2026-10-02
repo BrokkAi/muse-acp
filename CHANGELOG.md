@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add session-scoped **Auto-review**. A new default-off `auto_review`
+  selector lets the adapter approve eligible workspace-local file access for
+  one action at a time. Shell, network, deletes, moves, hidden paths,
+  protected, host-escalated, subagent, staged, and out-of-workspace requests
+  keep prompting, and so do requests missing either host flag. The selector
+  is adapter policy, not a Muse approval mode: it never changes the host's
+  mode, never selects a session or permanent grant, and writes one audit line
+  per automatic decision. See the README Auto-review section and
+  [docs/auto-review.md](docs/auto-review.md).
 - Add **Read-only** and **Plan** session modes. The editor's Mode selector
   now offers Default, Read-only, and Plan. Read-only and Plan sessions run on
   a second `muse serve` started with `--disable-write --disable-shell`, so
