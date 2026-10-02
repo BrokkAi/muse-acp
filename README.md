@@ -199,9 +199,19 @@ If Muse is saved with the `:auto-review` permission profile, `muse serve`
 cannot start its automated reviewer. The adapter gives its own `muse serve`
 child a private, temporary settings view that uses `:ask-me`, so approvals come
 to your editor. Your saved Muse settings, editor launcher, and session data are
-left untouched, and the temporary view is removed when the host exits. This
-requires symbolic-link support (on Windows, Developer Mode or equivalent).
-Other permission profiles are passed through unchanged.
+left untouched, and the temporary view is removed when the host exits. Other
+permission profiles are passed through unchanged.
+
+The view links the rest of your configuration instead of copying it, so
+credentials are never copied. On Windows it needs neither Developer Mode nor
+administrator rights: folders are linked with directory junctions, and files
+with symbolic links when Windows allows them, otherwise with hard links. When
+Muse replaces a hard-linked file, such as a refreshed `auth.json`, the adapter
+moves the new file back over the original when the host exits, unless the
+original also changed in the meantime. If the view cannot be built, for
+example because the temporary folder is on a different drive from your
+configuration, the adapter logs why and starts `muse serve` with your saved
+settings.
 
 ## What's supported
 

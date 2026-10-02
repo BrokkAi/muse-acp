@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Fix startup on Windows for a saved `:auto-review` permission profile
+  without Developer Mode or administrator rights. The private settings view
+  now links folders with directory junctions and, when symbolic links are not
+  allowed, files with hard links. A file Muse replaces through a hard link is
+  moved back over the original when the host exits. Previously every request
+  failed with `A required privilege is not held by the client (os error
+  1314)`.
+- If the settings view cannot be built, log why and start `muse serve` with
+  the saved settings instead of failing every request.
+
 ## 0.9.0
 
 - When Muse is not installed, report it as ACP's auth-required error with a
