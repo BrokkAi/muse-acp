@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Classify Muse 1.4.2 as a tested host. Its stable schema only adds to
+  1.4.1's, and the live-host suite passes against it, so startup logs now
+  report `status=tested` instead of `status=unknown`.
 - Fix startup on Windows for a saved `:auto-review` permission profile
   without Developer Mode or administrator rights. The private settings view
   now links folders with directory junctions and, when symbolic links are not
