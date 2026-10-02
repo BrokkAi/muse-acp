@@ -214,6 +214,12 @@ impl Adapter {
                 command.env(name, value);
             }
         }
+        // On macOS Muse reads credentials from the Keychain, which waits for
+        // an approval no headless run can give. Its file backend reads the
+        // throwaway auth.json instead.
+        if cfg!(target_os = "macos") {
+            command.env("TBH_CREDENTIAL_BACKEND", "file");
+        }
         let mut child = command
             .env("MUSE_CLI", muse_cli())
             .env("MUSE_NO_AUTO_UPDATE", "1")
