@@ -2458,19 +2458,15 @@ fn config_options_result(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) 
         "{{\"configOptions\":{}}}",
         acp::config_options(
             s.ver,
-            acp::ConfigOptions {
-                session_mode: &s.session_mode,
-                approval_mode: &s.mode_value,
-                model: &s.model_value,
-                reasoning_effort: &s.reasoning_effort,
-                offer_muse_default: s.reasoning_effort_source.is_none(),
-                auto_review: s.auto_review,
-                recommendations: (
-                    recommended_model(&models).as_deref(),
-                    recommended_reasoning(s).as_deref(),
-                ),
-            },
+            (&s.session_mode, &s.mode_value),
+            &s.model_value,
+            &s.reasoning_effort,
+            s.reasoning_effort_source.is_none(),
             &models,
+            (
+                recommended_model(&models).as_deref(),
+                recommended_reasoning(s).as_deref()
+            ),
         )
     ))
 }
@@ -3493,7 +3489,6 @@ fn handle_acp(
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
                             mode_value: acp::mode_from_msp(&cur_mode).to_string(),
-                            auto_review: false,
                             session_mode: acp::DEFAULT_MODE.to_string(),
                             model_value: cur_model.clone(),
                             reasoning_effort: acp::REASONING_DEFAULT.to_string(),
@@ -3546,16 +3541,12 @@ fn handle_acp(
                             esc(&msp_sid),
                             acp::config_options(
                                 ver,
-                                acp::ConfigOptions {
-                                    session_mode: acp::DEFAULT_MODE,
-                                    approval_mode: acp::mode_from_msp(&cur_mode),
-                                    model: &cur_model,
-                                    reasoning_effort: acp::REASONING_DEFAULT,
-                                    offer_muse_default: true,
-                                    auto_review: false,
-                                    recommendations: (recommended_model(&models).as_deref(), None),
-                                },
+                                (acp::DEFAULT_MODE, acp::mode_from_msp(&cur_mode)),
+                                &cur_model,
+                                acp::REASONING_DEFAULT,
+                                true,
                                 &models,
+                                (recommended_model(&models).as_deref(), None),
                             )
                         )
                     } else {
@@ -3565,16 +3556,12 @@ fn handle_acp(
                             esc(&msp_sid),
                             acp::config_options(
                                 ver,
-                                acp::ConfigOptions {
-                                    session_mode: acp::DEFAULT_MODE,
-                                    approval_mode: acp::mode_from_msp(&cur_mode),
-                                    model: &cur_model,
-                                    reasoning_effort: acp::REASONING_DEFAULT,
-                                    offer_muse_default: true,
-                                    auto_review: false,
-                                    recommendations: (recommended_model(&models).as_deref(), None),
-                                },
+                                (acp::DEFAULT_MODE, acp::mode_from_msp(&cur_mode)),
+                                &cur_model,
+                                acp::REASONING_DEFAULT,
+                                true,
                                 &models,
+                                (recommended_model(&models).as_deref(), None),
                             ),
                             acp::session_modes(acp::DEFAULT_MODE)
                         )
@@ -3794,7 +3781,6 @@ fn handle_acp(
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
                             mode_value: "promptUnmatched".to_string(),
-                            auto_review: false,
                             session_mode: session_mode.clone(),
                             model_value: String::new(),
                             reasoning_effort: acp::REASONING_DEFAULT.to_string(),
@@ -3969,7 +3955,6 @@ fn handle_acp(
                         reasoning_v,
                         offer_default_v,
                         recommended_v,
-                        auto_review_v,
                     ) = sessions
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -3982,7 +3967,6 @@ fn handle_acp(
                                 s.reasoning_effort.clone(),
                                 s.reasoning_effort_source.is_none(),
                                 recommended_reasoning(s),
-                                s.auto_review,
                             )
                         })
                         .unwrap_or_default();
@@ -3996,19 +3980,15 @@ fn handle_acp(
                             esc(&msp_out),
                             acp::config_options(
                                 ver,
-                                acp::ConfigOptions {
-                                    session_mode: &session_mode_v,
-                                    approval_mode: &mode_v,
-                                    model: &model_v,
-                                    reasoning_effort: &reasoning_v,
-                                    offer_muse_default: offer_default_v,
-                                    auto_review: auto_review_v,
-                                    recommendations: (
-                                        recommended_model(&models).as_deref(),
-                                        recommended_v.as_deref(),
-                                    ),
-                                },
+                                (&session_mode_v, &mode_v),
+                                &model_v,
+                                &reasoning_v,
+                                offer_default_v,
                                 &models,
+                                (
+                                    recommended_model(&models).as_deref(),
+                                    recommended_v.as_deref()
+                                ),
                             )
                         )
                     } else {
@@ -4019,19 +3999,15 @@ fn handle_acp(
                             esc(&msp_out),
                             acp::config_options(
                                 ver,
-                                acp::ConfigOptions {
-                                    session_mode: &session_mode_v,
-                                    approval_mode: &mode_v,
-                                    model: &model_v,
-                                    reasoning_effort: &reasoning_v,
-                                    offer_muse_default: offer_default_v,
-                                    auto_review: auto_review_v,
-                                    recommendations: (
-                                        recommended_model(&models).as_deref(),
-                                        recommended_v.as_deref(),
-                                    ),
-                                },
+                                (&session_mode_v, &mode_v),
+                                &model_v,
+                                &reasoning_v,
+                                offer_default_v,
                                 &models,
+                                (
+                                    recommended_model(&models).as_deref(),
+                                    recommended_v.as_deref()
+                                ),
                             ),
                             acp::session_modes(&session_mode_v)
                         )
@@ -4297,7 +4273,6 @@ fn handle_acp(
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
                             mode_value: mode_value.clone(),
-                            auto_review: false,
                             session_mode: fork_mode.clone(),
                             model_value: new_model.clone(),
                             reasoning_effort: parent_reasoning
@@ -4366,7 +4341,6 @@ fn handle_acp(
                         reasoning_out,
                         offer_default_out,
                         recommended_out,
-                        auto_review_out,
                     ) = sessions
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -4379,7 +4353,6 @@ fn handle_acp(
                                 s.reasoning_effort.clone(),
                                 s.reasoning_effort_source.is_none(),
                                 recommended_reasoning(s),
-                                s.auto_review,
                             )
                         })
                         .unwrap_or_default();
@@ -4391,19 +4364,15 @@ fn handle_acp(
                             esc(&new_msp),
                             acp::config_options(
                                 ver,
-                                acp::ConfigOptions {
-                                    session_mode: &session_mode_out,
-                                    approval_mode: &mode_out,
-                                    model: &model_out,
-                                    reasoning_effort: &reasoning_out,
-                                    offer_muse_default: offer_default_out,
-                                    auto_review: auto_review_out,
-                                    recommendations: (
-                                        recommended_model(&models).as_deref(),
-                                        recommended_out.as_deref(),
-                                    ),
-                                },
+                                (&session_mode_out, &mode_out),
+                                &model_out,
+                                &reasoning_out,
+                                offer_default_out,
                                 &models,
+                                (
+                                    recommended_model(&models).as_deref(),
+                                    recommended_out.as_deref()
+                                ),
                             )
                         )
                     } else {
@@ -4413,19 +4382,15 @@ fn handle_acp(
                             esc(&new_msp),
                             acp::config_options(
                                 ver,
-                                acp::ConfigOptions {
-                                    session_mode: &session_mode_out,
-                                    approval_mode: &mode_out,
-                                    model: &model_out,
-                                    reasoning_effort: &reasoning_out,
-                                    offer_muse_default: offer_default_out,
-                                    auto_review: auto_review_out,
-                                    recommendations: (
-                                        recommended_model(&models).as_deref(),
-                                        recommended_out.as_deref(),
-                                    ),
-                                },
+                                (&session_mode_out, &mode_out),
+                                &model_out,
+                                &reasoning_out,
+                                offer_default_out,
                                 &models,
+                                (
+                                    recommended_model(&models).as_deref(),
+                                    recommended_out.as_deref()
+                                ),
                             ),
                             acp::session_modes(&session_mode_out)
                         )
@@ -5543,20 +5508,6 @@ fn handle_acp(
                         return;
                     }
                 },
-                // Adapter policy: no host command and no MSP vocabulary. The
-                // refreshed selector is returned by the common Ok arm below.
-                "auto_review" => match acp::resolve_auto_review(&value) {
-                    Some(_) => Ok(J::Null),
-                    None => {
-                        acp::send_error(
-                            stdout,
-                            &id,
-                            -32602,
-                            &format!("auto_review must be {}", acp::AUTO_REVIEW_HELP),
-                        );
-                        return;
-                    }
-                },
                 "model" => host.command(
                     "session/setModel",
                     &format!(
@@ -5611,7 +5562,7 @@ fn handle_acp(
                         stdout,
                         &id,
                         -32602,
-                        "unknown configId (want mode|approval_mode|auto_review|model|reasoning_effort)",
+                        "unknown configId (want mode|approval_mode|model|reasoning_effort)",
                     );
                     return;
                 }
@@ -5645,9 +5596,6 @@ fn handle_acp(
                                     .or_else(|| acp::resolve_mode(&value))
                                     .unwrap_or("promptUnmatched");
                                 s.mode_value = acp::mode_from_msp(m).to_string();
-                            }
-                            "auto_review" => {
-                                s.auto_review = value == acp::AUTO_REVIEW_WORKSPACE;
                             }
                             "model" => s.model_value = value.clone(),
                             "reasoning_effort" => {
@@ -6594,102 +6542,6 @@ fn confined_path(path: &str, roots: &[String]) -> Result<std::path::PathBuf, Str
     Err(format!(
         "{path} is outside all approved workspace roots (set MUSE_ALLOW_UNSCOPED_READS=1 to allow)"
     ))
-}
-
-/// Strict workspace check for auto-review. Unlike `confined_path`, this
-/// deliberately ignores `MUSE_ALLOW_UNSCOPED_READS`: that flag widens read
-/// access for resource links, and must never approve a write outside the
-/// roots. A path that does not exist yet is allowed only when its canonical
-/// parent is inside a root, because a create has no final entry to
-/// canonicalize. An entry that exists but cannot be resolved (a dangling
-/// symlink, a permission failure) is refused rather than guessed at.
-fn auto_review_path_allowed(path: &str, roots: &[String]) -> bool {
-    if path.is_empty() {
-        return false;
-    }
-    let candidate = Path::new(path);
-    if !candidate.is_absolute() {
-        return false;
-    }
-    let resolved = match std::fs::canonicalize(candidate) {
-        Ok(resolved) => resolved,
-        Err(_) => {
-            if std::fs::symlink_metadata(candidate).is_ok() {
-                return false;
-            }
-            let (Some(parent), Some(name)) = (candidate.parent(), candidate.file_name()) else {
-                return false;
-            };
-            match std::fs::canonicalize(parent) {
-                Ok(parent) => parent.join(name),
-                Err(_) => return false,
-            }
-        }
-    };
-    roots.iter().any(|root| {
-        std::fs::canonicalize(root).is_ok_and(|root| {
-            resolved.strip_prefix(&root).is_ok_and(|rest| {
-                !rest.as_os_str().is_empty()
-                    && rest.components().all(|component| match component {
-                        std::path::Component::Normal(name) => {
-                            !name.to_string_lossy().starts_with('.')
-                        }
-                        _ => false,
-                    })
-            })
-        })
-    })
-}
-
-/// File-access kinds auto-review may approve. Destructive access (delete,
-/// move) and access kinds this list does not know still prompt.
-const AUTO_REVIEW_ACCESS: [&str; 9] = [
-    "read", "list", "stat", "search", "write", "create", "append", "edit", "modify",
-];
-
-/// The choice id auto-review may send for this approval, or None to open the
-/// ordinary editor prompt. None covers every uncertain case: unknown subjects,
-/// relative, hidden, or unresolvable paths, shell/network/process actions,
-/// staged requests, host-judged or protected writes, child approvals, and
-/// approvals whose only allowing choices would create a standing grant.
-fn auto_review_choice(params: &J, roots: &[String]) -> Option<String> {
-    // The schema requires both flags on every approval request. A host that
-    // omits one is not describing the request well enough to auto-approve it.
-    if !matches!(params.get("judgeEscalated"), Some(J::Bool(false)))
-        || !matches!(params.get("protectedWrite"), Some(J::Bool(false)))
-    {
-        return None;
-    }
-    if params.get("subagentOrigin").is_some() {
-        return None;
-    }
-    let subject = params.get("subject")?;
-    if subject.get("kind").and_then(|v| v.as_str()) != Some("fileAccess") {
-        return None;
-    }
-    if let Some(stages) = subject.get("stages")
-        && !matches!(stages, J::Arr(items) if items.is_empty())
-    {
-        return None;
-    }
-    let access = subject
-        .get("access")
-        .and_then(|v| v.as_str())?
-        .to_ascii_lowercase();
-    if !AUTO_REVIEW_ACCESS.contains(&access.as_str()) {
-        return None;
-    }
-    let path = subject.get("path").and_then(|v| v.as_str())?;
-    if !auto_review_path_allowed(path, roots) {
-        return None;
-    }
-    if let Some(target) = subject.get("target").and_then(|v| v.as_str())
-        && !auto_review_path_allowed(target, roots)
-    {
-        return None;
-    }
-    let (_, choices) = acp::perm_options(params);
-    acp::approve_once_choice(&choices)
 }
 
 /// Explicit opt-in parser for security-sensitive environment flags. Merely
@@ -8148,11 +8000,6 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
         .unwrap_or(J::Null);
     let requirement_json = j_to_string(&requirement);
     let approval_key = format!("{}:{requirement_json}", approval_id);
-    // Adapter policy answers eligible approvals before the editor sees them.
-    // Ineligible or ambiguous requests fall through to the ordinary prompt.
-    if try_auto_review(host, stdout, sessions, &acp_sid, &owner_msp_sid, params) {
-        return;
-    }
     let mut stale_request = None;
     let mut duplicate = false;
     let mut queued = false;
@@ -8470,88 +8317,6 @@ fn send_permission_decision(
     // Whether or not the decide was admitted, the displayed permission is
     // settled from the client's perspective; show the next queued approval.
     pop_queued_approval(host, stdout, sessions, acp_sid);
-}
-
-/// Answer an eligible approval with a once-scoped allow, or return false so
-/// the ordinary editor prompt runs. Deduplicates against `approval_seen`
-/// exactly like the display path, so a reissued notification cannot decide
-/// the same requirement twice. Returns true when the approval is settled,
-/// including a requirement auto-review already answered.
-fn try_auto_review(
-    host: &Arc<Hosts>,
-    stdout: &StdoutShared,
-    sessions: &Sessions,
-    acp_sid: &str,
-    owner_msp_sid: &str,
-    params: &J,
-) -> bool {
-    let Some(approval_id) = params.get("approvalId").and_then(|v| v.as_str()) else {
-        return false;
-    };
-    if approval_id.is_empty() {
-        return false;
-    }
-    let (enabled, roots, ver) = {
-        let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(s) = map.get(acp_sid) else {
-            return false;
-        };
-        (s.auto_review, s.roots.clone(), s.ver)
-    };
-    if !enabled {
-        return false;
-    }
-    let Some(choice) = auto_review_choice(params, &roots) else {
-        return false;
-    };
-    let requirement_json = j_to_string(
-        &params
-            .get("currentRequirementId")
-            .cloned()
-            .unwrap_or(J::Null),
-    );
-    let approval_key = format!("{approval_id}:{requirement_json}");
-    {
-        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(s) = map.get_mut(acp_sid) else {
-            return false;
-        };
-        if s.approval_seen.contains(&approval_key) {
-            return true;
-        }
-        s.approval_seen.insert(approval_key);
-    }
-    let requirement = params
-        .get("currentRequirementId")
-        .cloned()
-        .unwrap_or(J::Null);
-    let tool_name = params
-        .get("toolName")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Muse action");
-    let subject_kind = params
-        .get("subject")
-        .and_then(|s| s.get("kind"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    log(&format!(
-        "auto-review approved {approval_id} ({tool_name}, {subject_kind}) with {choice}"
-    ));
-    send_permission_decision(
-        host,
-        stdout,
-        sessions,
-        acp_sid,
-        PermissionDecision {
-            msp_sid: owner_msp_sid.to_string(),
-            ver,
-            approval_id: approval_id.to_string(),
-            requirement,
-            choice,
-            feedback: None,
-        },
-    );
-    true
 }
 
 /// Client reply to our `session/request_permission` (matched by id).
@@ -10104,262 +9869,6 @@ mod tests {
             );
         }
         assert!(!env_flag_enabled(None));
-    }
-
-    #[test]
-    fn auto_review_eligibility_is_workspace_strict() {
-        use super::{auto_review_choice, esc, parse_json};
-
-        let root = std::env::temp_dir().join(format!(
-            "muse-acp-auto-review-{}-eligibility",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(root.join("src").join(".hidden")).unwrap();
-        std::fs::create_dir_all(root.join(".github").join("workflows")).unwrap();
-        let root = std::fs::canonicalize(&root).unwrap();
-        let roots = vec![root.to_string_lossy().to_string()];
-        let inside = root.join("inside.txt");
-        std::fs::write(&inside, "x").unwrap();
-        let nested = root.join("src").join("main.rs");
-        std::fs::write(&nested, "x").unwrap();
-        let hidden_file = root.join(".env");
-        std::fs::write(&hidden_file, "x").unwrap();
-        let hidden_dir_file = root.join(".github").join("workflows").join("ci.yml");
-        std::fs::write(&hidden_dir_file, "x").unwrap();
-        let nested_hidden = root.join("src").join(".hidden").join("file.rs");
-        std::fs::write(&nested_hidden, "x").unwrap();
-        let outside = std::env::temp_dir().join(format!(
-            "muse-acp-auto-review-{}-outside.txt",
-            std::process::id()
-        ));
-
-        const ONCE: &str = r#"[{"choiceId":"c-allow","decision":"approved","scope":"once"},{"choiceId":"c-always","decision":"approved","scope":"session"},{"choiceId":"c-deny","decision":"denied","scope":"once"}]"#;
-        const DURABLE_ONLY: &str = r#"[{"choiceId":"c-always","decision":"approved","scope":"session"},{"choiceId":"c-deny","decision":"denied","scope":"once"}]"#;
-        const FLAGS_OK: &str = "\"judgeEscalated\":false,\"protectedWrite\":false,";
-
-        let build_full = |flags: &str,
-                          subject_extra: &str,
-                          kind: &str,
-                          access: &str,
-                          path: &str,
-                          choices: &str| {
-            parse_json(&format!(
-                "{{{flags}\"subject\":{{\"kind\":{kind},\"access\":{access},\"path\":{path}{subject_extra}}},\"availableChoices\":{choices}}}"
-            ))
-            .unwrap()
-        };
-        // The common case: an ordinary write with both host flags explicitly
-        // false, as the MSP schema requires.
-        let build = |subject_extra: &str, kind: &str, path: &str, choices: &str| {
-            build_full(FLAGS_OK, subject_extra, kind, "\"write\"", path, choices)
-        };
-        let json_path = |path: &std::path::Path| esc(&path.to_string_lossy());
-        let choice = |params: &J| auto_review_choice(params, &roots);
-
-        assert_eq!(
-            choice(&build("", "\"fileAccess\"", &json_path(&inside), ONCE)),
-            Some("c-allow".to_string()),
-            "an existing file inside the root is eligible"
-        );
-        assert_eq!(
-            choice(&build(
-                "",
-                "\"fileAccess\"",
-                &json_path(&root.join("created.txt")),
-                ONCE
-            )),
-            Some("c-allow".to_string()),
-            "a create whose canonical parent is inside the root is eligible"
-        );
-        assert_eq!(
-            choice(&build(
-                "",
-                "\"fileAccess\"",
-                &esc(&format!("relative{}file.txt", std::path::MAIN_SEPARATOR)),
-                ONCE
-            )),
-            None,
-            "relative paths are never auto-approved"
-        );
-        assert_eq!(
-            choice(&build(
-                "",
-                "\"fileAccess\"",
-                &json_path(&root.join("missing-dir").join("created.txt")),
-                ONCE
-            )),
-            None,
-            "a create whose parent does not resolve is never auto-approved"
-        );
-        assert_eq!(
-            choice(&build("", "\"fileAccess\"", &json_path(&outside), ONCE)),
-            None,
-            "a path outside every root is never auto-approved"
-        );
-        assert_eq!(
-            choice(&build(
-                &format!(",\"target\":{}", json_path(&outside)),
-                "\"fileAccess\"",
-                &json_path(&inside),
-                ONCE
-            )),
-            None,
-            "an out-of-root move target is never auto-approved"
-        );
-        assert_eq!(
-            choice(&build("", "\"shell\"", &json_path(&inside), ONCE)),
-            None,
-            "shell subjects are never auto-approved"
-        );
-        assert_eq!(
-            choice(&build("", "\"unixSocket\"", &json_path(&inside), ONCE)),
-            None,
-            "socket subjects are never auto-approved"
-        );
-        assert_eq!(
-            choice(&build("", "\"futureKind\"", &json_path(&inside), ONCE)),
-            None,
-            "unknown subjects are never auto-approved"
-        );
-        assert_eq!(
-            choice(&build_full(
-                "\"judgeEscalated\":true,\"protectedWrite\":false,",
-                "",
-                "\"fileAccess\"",
-                "\"write\"",
-                &json_path(&inside),
-                ONCE
-            )),
-            None,
-            "a host-judged escalation is never overridden"
-        );
-        assert_eq!(
-            choice(&build_full(
-                "\"judgeEscalated\":false,\"protectedWrite\":true,",
-                "",
-                "\"fileAccess\"",
-                "\"write\"",
-                &json_path(&inside),
-                ONCE
-            )),
-            None,
-            "a protected write is never auto-approved"
-        );
-        assert_eq!(
-            choice(&build_full(
-                "\"judgeEscalated\":false,\"protectedWrite\":false,\"subagentOrigin\":{\"subagentId\":\"child-1\"},",
-                "",
-                "\"fileAccess\"",
-                "\"write\"",
-                &json_path(&inside),
-                ONCE
-            )),
-            None,
-            "child approvals prompt in the first cut"
-        );
-        assert_eq!(
-            choice(&build(
-                "",
-                "\"fileAccess\"",
-                &json_path(&inside),
-                DURABLE_ONLY
-            )),
-            None,
-            "session-scoped grants are never selected silently"
-        );
-        assert_eq!(
-            choice(&build_full(
-                FLAGS_OK,
-                "",
-                "\"fileAccess\"",
-                "\"read\"",
-                &json_path(&nested),
-                ONCE
-            )),
-            Some("c-allow".to_string()),
-            "a nested non-hidden file is eligible"
-        );
-        for hidden in [&hidden_file, &hidden_dir_file, &nested_hidden] {
-            assert_eq!(
-                choice(&build("", "\"fileAccess\"", &json_path(hidden), ONCE)),
-                None,
-                "a hidden path is never auto-approved: {}",
-                hidden.display()
-            );
-        }
-        assert_eq!(
-            choice(&build("", "\"fileAccess\"", &json_path(&root), ONCE)),
-            None,
-            "the workspace root itself is not an ordinary file"
-        );
-        for access in ["\"delete\"", "\"move\"", "\"chmod\""] {
-            assert_eq!(
-                choice(&build_full(
-                    FLAGS_OK,
-                    "",
-                    "\"fileAccess\"",
-                    access,
-                    &json_path(&inside),
-                    ONCE
-                )),
-                None,
-                "access {access} is never auto-approved"
-            );
-        }
-        assert_eq!(
-            choice(&build_full(
-                "",
-                "",
-                "\"fileAccess\"",
-                "\"write\"",
-                &json_path(&inside),
-                ONCE
-            )),
-            None,
-            "missing host flags fail closed"
-        );
-        assert_eq!(
-            choice(&build(
-                ",\"stages\":[{\"position\":0}]",
-                "\"fileAccess\"",
-                &json_path(&inside),
-                ONCE
-            )),
-            None,
-            "a staged subject is never auto-approved"
-        );
-        assert_eq!(
-            choice(&build(
-                ",\"stages\":[]",
-                "\"fileAccess\"",
-                &json_path(&inside),
-                ONCE
-            )),
-            Some("c-allow".to_string()),
-            "an empty stages list is not a stage"
-        );
-
-        #[cfg(unix)]
-        {
-            let outside_file = outside.with_extension("symlink-target");
-            std::fs::write(&outside_file, "outside").unwrap();
-            let escape = root.join("escape.txt");
-            let _ = std::fs::remove_file(&escape);
-            std::os::unix::fs::symlink(&outside_file, &escape).unwrap();
-            assert_eq!(
-                choice(&build("", "\"fileAccess\"", &json_path(&escape), ONCE)),
-                None,
-                "a symlink that resolves outside the root is never auto-approved"
-            );
-            let dangling = root.join("dangling.txt");
-            let _ = std::fs::remove_file(&dangling);
-            std::os::unix::fs::symlink(outside.with_extension("missing"), &dangling).unwrap();
-            assert_eq!(
-                choice(&build("", "\"fileAccess\"", &json_path(&dangling), ONCE)),
-                None,
-                "a dangling symlink is never auto-approved"
-            );
-        }
     }
 
     #[test]

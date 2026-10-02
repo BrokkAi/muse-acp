@@ -142,7 +142,6 @@ APPROVAL_PARAMS = {
     "sessionId": MSP_SID, "approvalId": "ap-1", "toolCallId": "call-1",
     "toolName": "workspace-shell",
     "subject": {"kind": "shell", "command": "cargo test"},
-    "protectedWrite": False, "judgeEscalated": False,
     "availableChoices": [
         {"choiceId": "c-allow", "label": "Allow",
          "decision": "approved", "scope": "once"},
@@ -264,29 +263,6 @@ def on_goal_command(method, params):
 
 
 ACTIVE_WORKSPACE = ["/tmp/fake-ws"]
-
-
-def approval_params(**overrides):
-    """Approval params with the file-write path resolved at emission time.
-
-    FAKE_APPROVAL_PATH=workspace points a fileAccess subject at the active
-    session workspace; any other non-empty value is used literally. The
-    default subject (shell) is returned unchanged.
-    """
-    params = dict(APPROVAL_PARAMS)
-    params.update(overrides)
-    subject = params.get("subject")
-    if isinstance(subject, dict) and subject.get("kind") == "fileAccess":
-        override = os.environ.get("FAKE_APPROVAL_PATH", "")
-        if override == "workspace":
-            subject = dict(subject)
-            subject["path"] = os.path.join(ACTIVE_WORKSPACE[0], "output.txt")
-            params["subject"] = subject
-        elif override:
-            subject = dict(subject)
-            subject["path"] = override
-            params["subject"] = subject
-    return params
 
 
 def session_obj(session_id=None, workspace_root=None):
@@ -531,17 +507,17 @@ def on_turn_start(params):
             "args": json.dumps({"command": "printf data > inferred.txt"})}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO in ("approval", "pending_reconcile_dup"):
-        notify("approval/requested", approval_params())
+        notify("approval/requested", dict(APPROVAL_PARAMS))
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO in ("approval_hang", "approval_queue"):
         # The turn stays open until the client answers or cancels.
-        notify("approval/requested", approval_params())
+        notify("approval/requested", dict(APPROVAL_PARAMS))
         if SCENARIO == "approval_queue":
-            notify("approval/requested", approval_params(approvalId="approval-second"))
+            notify("approval/requested", {**APPROVAL_PARAMS, "approvalId": "approval-second"})
     elif SCENARIO == "approval_resolved_elsewhere":
         # Another actor (policy, reviewer, or a second client) decides the
         # approval while the editor still shows the permission prompt.
-        notify("approval/requested", approval_params())
+        notify("approval/requested", dict(APPROVAL_PARAMS))
         notify("approval/resolved", {
             "sessionId": MSP_SID, "approvalId": "ap-1", "itemId": "it-ap",
             "turnId": tid, "decision": "approved", "resolvedBy": "policy",
