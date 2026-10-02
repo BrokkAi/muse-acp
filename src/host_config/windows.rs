@@ -39,6 +39,9 @@ const OWNER: &str = ".muse-acp-owner";
 /// One JSON line per hard link: what to restore if the owner never does.
 const MANIFEST: &str = ".muse-acp-links";
 const VIEW_PREFIX: &str = "muse-acp-config-";
+/// Opened without sharing while one adapter sweeps, so two never restore and
+/// remove the same view. Windows closes it if that adapter dies.
+const SWEEP_LOCK: &str = "muse-acp-sweep.lock";
 
 /// Set after the first refused symbolic link, so later files go straight to
 /// hard links. Tests set it to exercise the hard-link path on elevated CI.
@@ -607,11 +610,41 @@ fn latest_entries(manifest: &str) -> Vec<Entry> {
     entries
 }
 
+/// Waits for the machine-wide sweep lock.
+fn sweep_turn() -> Option<fs::File> {
+    let path = std::env::temp_dir().join(SWEEP_LOCK);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .share_mode(0)
+            .open(&path)
+        {
+            Ok(file) => return Some(file),
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(error) => {
+                log(&format!(
+                    "another adapter is still sweeping settings views; leaving them for the next launch: {error}"
+                ));
+                return None;
+            }
+        }
+    }
+}
+
 /// Finishes the views earlier adapters left behind. A view whose owner file
 /// can be deleted has no live owner: restore its hard-linked files, then
 /// remove it. Views without a manifest are left alone; an older adapter may
-/// still be using one.
+/// still be using one. One sweep runs at a time; a sweep that cannot get its
+/// turn within a few seconds is left to the next launch.
 pub fn sweep() {
+    let Some(_turn) = sweep_turn() else {
+        return;
+    };
     let Ok(entries) = fs::read_dir(std::env::temp_dir()) else {
         return;
     };
