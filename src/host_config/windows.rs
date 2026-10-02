@@ -293,6 +293,16 @@ impl HardLink {
         }
     }
 
+    /// The original was replaced outside the view, for example by `muse
+    /// login` in a terminal, while the view still links the old file.
+    fn stale(&self) -> bool {
+        let view_unchanged =
+            FileState::read(&self.target).is_ok_and(|current| current.same_file(&self.state));
+        let original_replaced =
+            FileState::read(&self.source).is_ok_and(|current| !current.same_file(&self.state));
+        view_unchanged && original_replaced
+    }
+
     fn to_json(&self) -> String {
         format!(
             "{{\"source\":{},\"target\":{},\"volume\":\"{}\",\"id\":\"{}\",\"written\":\"{}\",\"size\":\"{}\"}}",
@@ -321,12 +331,73 @@ impl HardLink {
     }
 }
 
-/// The view's ownership marker, manifest, and hard links.
+/// A Muse file that did not exist at launch, on an account without symbolic
+/// links. Muse would create it in the view, so it is moved to the real
+/// folder when the view goes away, unless the real folder has one by then.
+pub struct Pending {
+    source: PathBuf,
+    target: PathBuf,
+}
+
+impl Pending {
+    fn keep(&self) {
+        if fs::symlink_metadata(&self.target).is_err() || fs::symlink_metadata(&self.source).is_ok()
+        {
+            return;
+        }
+        if let Err(error) = move_new(&self.target, &self.source) {
+            log(&format!(
+                "could not keep the new {}: {error}",
+                self.source.display()
+            ));
+        }
+    }
+
+    fn to_json(&self) -> String {
+        format!(
+            "{{\"pending\":true,\"source\":{},\"target\":{}}}",
+            esc(&self.source.to_string_lossy()),
+            esc(&self.target.to_string_lossy()),
+        )
+    }
+
+    fn from_json(line: &str) -> Option<Self> {
+        let value = parse_json(line).ok()?;
+        let text = |key: &str| value.get(key).and_then(J::as_str);
+        matches!(value.get("pending"), Some(J::Bool(true))).then_some(())?;
+        Some(Pending {
+            source: PathBuf::from(text("source")?),
+            target: PathBuf::from(text("target")?),
+        })
+    }
+}
+
+/// Moves a file to a path that must not exist yet: the move never replaces
+/// a file. Across volumes it copies, then removes the original.
+fn move_new(from: &Path, to: &Path) -> io::Result<()> {
+    match fs::hard_link(from, to) {
+        Ok(()) => return fs::remove_file(from),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Err(error),
+        Err(_) => {}
+    }
+    let mut reader = fs::File::open(from)?;
+    let mut writer = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)?;
+    io::copy(&mut reader, &mut writer)?;
+    writer.sync_all()?;
+    drop(writer);
+    fs::remove_file(from)
+}
+
+/// The view's ownership marker, manifest, hard links, and pending files.
 #[derive(Default)]
 pub struct Links {
     owner: Option<fs::File>,
     manifest: Option<fs::File>,
     pub(super) hard: Vec<HardLink>,
+    pending: Vec<Pending>,
 }
 
 impl Links {
@@ -367,11 +438,92 @@ impl Links {
             ),
             None => error,
         })?;
-        if let Some(manifest) = &mut self.manifest {
-            writeln!(manifest, "{}", link.to_json())?;
-        }
+        self.record(&link.to_json())?;
         self.hard.push(link);
         Ok(())
+    }
+
+    /// Links a Muse file that does not exist yet: a dangling symbolic link
+    /// when Windows allows one, otherwise a pending entry.
+    pub fn link_missing(&mut self, source: &Path, target: &Path) -> io::Result<()> {
+        if !FILE_SYMLINKS_DENIED.load(Ordering::Relaxed) {
+            match std::os::windows::fs::symlink_file(source, target) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => {
+                    FILE_SYMLINKS_DENIED.store(true, Ordering::Relaxed);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let pending = Pending {
+            source: source.to_path_buf(),
+            target: target.to_path_buf(),
+        };
+        self.record(&pending.to_json())?;
+        self.pending.push(pending);
+        Ok(())
+    }
+
+    fn record(&mut self, line: &str) -> io::Result<()> {
+        match &mut self.manifest {
+            Some(manifest) => writeln!(manifest, "{line}"),
+            None => Ok(()),
+        }
+    }
+
+    /// Links pending files that appeared in the real folder, and relinks
+    /// hard links whose original was replaced, so the running host sees
+    /// changes made outside it, such as a login in a terminal.
+    pub fn refresh(&mut self) {
+        let mut fresh = Vec::new();
+        // Files that appeared in the real folder after launch.
+        self.pending.retain(|pending| {
+            if fs::symlink_metadata(&pending.target).is_ok()
+                || fs::symlink_metadata(&pending.source).is_err()
+            {
+                return true;
+            }
+            match HardLink::create(&pending.source, &pending.target) {
+                Ok(link) => {
+                    fresh.push(link);
+                    false
+                }
+                Err(error) => {
+                    log(&format!(
+                        "could not link the new {}: {error}",
+                        pending.source.display()
+                    ));
+                    true
+                }
+            }
+        });
+        // Originals replaced while the view still links the old file.
+        let mut kept = Vec::new();
+        for link in std::mem::take(&mut self.hard) {
+            if !link.stale() {
+                kept.push(link);
+                continue;
+            }
+            match fs::remove_file(&link.target)
+                .and_then(|()| HardLink::create(&link.source, &link.target))
+            {
+                Ok(relinked) => fresh.push(relinked),
+                Err(error) => {
+                    log(&format!(
+                        "could not relink {}: {error}",
+                        link.source.display()
+                    ));
+                    kept.push(link);
+                }
+            }
+        }
+        self.hard = kept;
+        for link in fresh {
+            if let Err(error) = self.record(&link.to_json()) {
+                log(&format!("could not record a refreshed link: {error}"));
+            }
+            self.hard.push(link);
+        }
     }
 
     /// Closes the owner and manifest without restoring, as when the process
@@ -381,13 +533,17 @@ impl Links {
         self.owner = None;
         self.manifest = None;
         self.hard.clear();
+        self.pending.clear();
     }
 
-    /// Restores every hard-linked file, then releases the owner file so the
-    /// view can be removed.
+    /// Restores every hard-linked file and keeps new files, then releases
+    /// the owner file so the view can be removed.
     pub fn restore(&mut self) {
         for link in &self.hard {
             link.restore();
+        }
+        for pending in &self.pending {
+            pending.keep();
         }
         self.manifest = None;
         self.owner = None;
@@ -417,8 +573,12 @@ pub fn sweep() {
             Err(_) => continue,
         }
         let manifest = fs::read_to_string(root.join(MANIFEST)).unwrap_or_default();
-        for link in manifest.lines().filter_map(HardLink::from_json) {
-            link.restore();
+        for line in manifest.lines() {
+            if let Some(pending) = Pending::from_json(line) {
+                pending.keep();
+            } else if let Some(link) = HardLink::from_json(line) {
+                link.restore();
+            }
         }
         if let Err(error) = fs::remove_dir_all(&root) {
             log(&format!(

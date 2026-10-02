@@ -5108,6 +5108,8 @@ fn handle_acp(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if method_id == AUTH_METHOD_ID {
+                // A settings view may still link the old credential.
+                host.refresh_config();
                 acp::send_result(stdout, &id, "{}");
             } else {
                 acp::send_error(
