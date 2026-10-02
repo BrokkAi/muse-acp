@@ -2127,7 +2127,20 @@ fn switch_session_mode(
         }
         hosts.note_owner(&msp_sid, destination);
         let mut fresh = false;
-        let r = match resume_session(hosts, &msp_sid, mcp_servers.as_deref()) {
+        // The old host may still be letting go of the session for a moment
+        // after it exits: Muse then answers runtime_busy or sessionInUse.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let resumed = loop {
+            let attempt = resume_session(hosts, &msp_sid, mcp_servers.as_deref());
+            let held = attempt.as_ref().err().is_some_and(|e| {
+                err_code(e) == -32021 || msp::rejection_reason(e) == Some("runtime_busy")
+            });
+            if !held || std::time::Instant::now() >= deadline {
+                break attempt;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        };
+        let r = match resumed {
             Ok(r) => Ok(r),
             // Muse saves a session with its first turn, so one that never
             // ran ended with its old host. Start it again under its id.
