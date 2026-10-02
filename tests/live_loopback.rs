@@ -619,6 +619,84 @@ fn replies(host: &Host) -> Vec<Value> {
         .collect()
 }
 
+/// The tool results Muse returned to the model, one per model call that
+/// followed a tool call.
+fn tool_results(host: &Host) -> Vec<String> {
+    std::fs::read_to_string(host.dir.join("provider.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|call| call["last"]["type"] == "function_call_output")
+        .map(|call| call["last"]["output"].to_string())
+        .collect()
+}
+
+/// The adapter's `elicitation/create` form whose schema asks for `field`.
+fn form(adapter: &Adapter, field: &str) -> Value {
+    adapter.wait(&format!("a form asking for {field}"), |frame| {
+        frame["method"] == "elicitation/create"
+            && frame["params"]["requestedSchema"]["properties"]
+                .get(field)
+                .is_some()
+    })
+}
+
+#[test]
+fn a_user_input_question_becomes_an_editor_form_and_the_answer_reaches_muse() {
+    if !enabled("a_user_input_question_becomes_an_editor_form_and_the_answer_reaches_muse") {
+        return;
+    }
+    // Muse offers request_user_input only to a client that can show forms.
+    let host = Host::start(
+        json!({"ask": {"tool": {"name": "request_user_input", "arguments": {"questions": [{
+            "id": "color",
+            "header": "Color",
+            "question": "Which color should the notes use?",
+            "options": [
+                {"label": "Blue (Recommended)", "description": "Calm."},
+                {"label": "Red", "description": "Loud."},
+            ],
+        }]}}}}),
+        None,
+    );
+    let mut adapter = Adapter::launch_with(&host, json!({"elicitation": {"form": {}}}));
+    let session = adapter.new_session(&host, json!([]));
+    let prompt = adapter.prompt(&session, "ask me [[script:ask]]");
+    let route = form(&adapter, "route");
+    adapter.send(json!({
+        "jsonrpc": "2.0",
+        "id": route["id"],
+        "result": {"action": "accept", "content": {"route": "Answer questions"}},
+    }));
+    let question = form(&adapter, "q0");
+    assert!(
+        question["params"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Which color should the notes use?")),
+        "{question}"
+    );
+    let red = question["params"]["requestedSchema"]["properties"]["q0"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|choice| choice.as_str().is_some_and(|label| label.contains("Red")))
+        .unwrap_or_else(|| panic!("no Red choice in {question}"))
+        .clone();
+    adapter.send(json!({
+        "jsonrpc": "2.0",
+        "id": question["id"],
+        "result": {"action": "accept", "content": {"q0": red}},
+    }));
+    let result = adapter.result(prompt);
+    assert_eq!(result["stopReason"], "end_turn", "{result}");
+    let results = tool_results(&host);
+    assert!(
+        results.iter().any(|output| output.contains("Red")),
+        "Muse returns the chosen answer to the model: {results:?}"
+    );
+    adapter.finish();
+}
+
 #[test]
 fn a_fork_starts_from_the_source_history_and_continues_on_its_own() {
     if !enabled("a_fork_starts_from_the_source_history_and_continues_on_its_own") {

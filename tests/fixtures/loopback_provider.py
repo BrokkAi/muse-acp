@@ -19,7 +19,8 @@ hold the stream open before it completes.
 
 The first line on stdout is the port. The log gets one JSON line per model
 call: {"call", "reply", "last"}, where "last" is the type and role of the
-request's last input item. Standard library only.
+request's last input item, plus its "output" when it is a tool result.
+Standard library only.
 """
 import json
 import re
@@ -148,7 +149,8 @@ class Handler(BaseHTTPRequestHandler):
             with open(LOG, "a") as log:
                 log.write(json.dumps({
                     "call": index, "reply": reply,
-                    "last": {"type": last.get("type"), "role": last.get("role")},
+                    "last": {"type": last.get("type"), "role": last.get("role"),
+                             "output": last.get("output")},
                 }) + "\n")
         rid = f"resp_{index}"
         self.send_response(200)
