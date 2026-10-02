@@ -619,6 +619,31 @@ fn replies(host: &Host) -> Vec<Value> {
         .collect()
 }
 
+/// Waits until the model has been called with a last input item whose text
+/// contains `needle`.
+fn wait_for_model_input(host: &Host, needle: &str) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        let seen = std::fs::read_to_string(host.dir.join("provider.log"))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .any(|call| {
+                call["last"]["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(needle))
+            });
+        if seen {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the model never received {needle:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 /// The tool results Muse returned to the model, one per model call that
 /// followed a tool call.
 fn tool_results(host: &Host) -> Vec<String> {
@@ -694,6 +719,48 @@ fn a_user_input_question_becomes_an_editor_form_and_the_answer_reaches_muse() {
         results.iter().any(|output| output.contains("Red")),
         "Muse returns the chosen answer to the model: {results:?}"
     );
+    adapter.finish();
+}
+
+#[test]
+fn a_workflow_child_runs_and_its_result_reaches_the_parent() {
+    if !enabled("a_workflow_child_runs_and_its_result_reaches_the_parent") {
+        return;
+    }
+    // `muse serve` starts child agents through the workflow tool; the native
+    // subagent tools stay hidden there. The child reports through
+    // submit_result, which the provider answers with "child finished".
+    let host = Host::start(
+        json!({"workflow": {"tool": {"name": "workflow", "arguments": {
+            "name": "Helper run",
+            "script": "export default async function workflow(host) { return await host.agent({ input: \"child task\", label: \"helper\" }); }",
+        }}}}),
+        None,
+    );
+    let mut adapter = Adapter::launch(&host);
+    let session = adapter.new_session(&host, json!([]));
+    adapter.turn(&session, "delegate it [[script:workflow]]");
+    // The workflow runs on after the turn. Its card names the child session
+    // and settles when the child does.
+    let done = adapter.wait("the workflow card to complete", |frame| {
+        let update = &frame["params"]["update"];
+        frame["method"] == "session/update"
+            && update["title"] == "Workflow Helper run"
+            && update["status"] == "completed"
+    });
+    let card: String = adapter
+        .updates("tool_call")
+        .iter()
+        .filter(|update| update["title"] == "Workflow Helper run")
+        .map(|update| update["content"].to_string())
+        .collect();
+    assert!(
+        card.contains("helper [") && card.contains("]: completed"),
+        "the card follows the child to completion: {card}"
+    );
+    assert_eq!(done["params"]["sessionId"], session.as_str(), "{done}");
+    // Muse wakes the parent with the child's result.
+    wait_for_model_input(&host, "child finished");
     adapter.finish();
 }
 

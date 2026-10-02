@@ -17,7 +17,8 @@ MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loopback
 ```
 
 Set `MUSE_CLI` to test a specific Muse build. CI runs this suite against each
-pinned build listed in `.github/workflows/ci.yml`.
+pinned build listed in `.github/workflows/ci.yml`, and a pull request to master
+needs the `live-host` check, which passes only when every build passes.
 
 Before submitting a pull request, run:
 

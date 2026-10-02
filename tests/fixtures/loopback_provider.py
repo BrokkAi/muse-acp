@@ -12,14 +12,16 @@ Usage: loopback_provider.py <log file> <script file>
 The script maps names to replies. A request whose last input item is a user
 message containing `[[script:NAME]]` gets the reply NAME. A request whose
 last item is a tool result gets the text "done". Muse's background reminder
-observers (offered only `submit_reminder_decision`) decide "none". Anything
+observers (offered only `submit_reminder_decision`) decide "none". A
+workflow child (offered `submit_result`) reports "child finished". Anything
 else gets the text "ok". A reply is {"text": "..."} or
 {"tool": {"name": "...", "arguments": {...}}}, optionally with "hold_ms" to
 hold the stream open before it completes.
 
 The first line on stdout is the port. The log gets one JSON line per model
 call: {"call", "reply", "last"}, where "last" is the type and role of the
-request's last input item, plus its "output" when it is a tool result.
+request's last input item, plus its "output" when it is a tool result and
+the start of its "text".
 Standard library only.
 """
 import json
@@ -35,6 +37,7 @@ LOG = sys.argv[1]
 SCRIPT = json.load(open(sys.argv[2]))
 LOCK = threading.Lock()
 CALLS = [0]
+CHILD_RESULT = "child finished"
 OBSERVER_DECISION = {
     "advisory_text": None, "confidence": None, "decision": "none",
     "priority": None, "reason": "not needed", "skill_id": None,
@@ -85,6 +88,10 @@ def reply_for(request):
     items = request.get("input") or [{}]
     if items[-1].get("type") == "function_call_output":
         return {"text": "done"}
+    # A workflow child finishes by reporting its result.
+    if "submit_result" in offered(request):
+        return {"tool": {"name": "submit_result",
+                         "arguments": {"text": CHILD_RESULT, "notes": None}}}
     # The prompt can arrive as several user messages, for example with the
     # adapter's plan-mode instruction after the user's text.
     prompt = []
@@ -150,7 +157,8 @@ class Handler(BaseHTTPRequestHandler):
                 log.write(json.dumps({
                     "call": index, "reply": reply,
                     "last": {"type": last.get("type"), "role": last.get("role"),
-                             "output": last.get("output")},
+                             "output": last.get("output"),
+                             "text": text_of(last)[:4000]},
                 }) + "\n")
         rid = f"resp_{index}"
         self.send_response(200)
