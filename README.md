@@ -67,6 +67,10 @@ npx --yes @brokkai/muse-acp --selftest
 The npm package bundles the native binaries for every supported platform, so it
 needs no install scripts or separate downloads.
 
+> The package is the scoped `@brokkai/muse-acp`. The unscoped `muse-acp`
+> package on npm is a different, unrelated project, so `npm install -g
+> muse-acp` installs someone else's adapter.
+
 On Linux and macOS you can install the latest release instead:
 
 ```sh
