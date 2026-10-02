@@ -113,6 +113,20 @@ jobs:
         env:
           MUSE_ACP_LOOPBACK: '1'
 
+  # One check over every live-host leg. Pull requests to master require it;
+  # its name stays the same when a pinned build changes.
+  live-host-result:
+    name: live-host
+    needs: live-host
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every live-host leg to pass
+        env:
+          RESULT: ${{ needs.live-host.result }}
+        run: test "$RESULT" = success
+
   msrv:
     runs-on: ubuntu-latest
     timeout-minutes: 15
