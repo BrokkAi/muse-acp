@@ -31,13 +31,6 @@ impl J {
             None
         }
     }
-    pub fn as_bool(&self) -> Option<bool> {
-        if let J::Bool(b) = self {
-            Some(*b)
-        } else {
-            None
-        }
-    }
 }
 
 const MAX_DEPTH: usize = 64;

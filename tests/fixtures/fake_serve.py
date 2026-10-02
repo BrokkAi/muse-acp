@@ -142,6 +142,7 @@ APPROVAL_PARAMS = {
     "sessionId": MSP_SID, "approvalId": "ap-1", "toolCallId": "call-1",
     "toolName": "workspace-shell",
     "subject": {"kind": "shell", "command": "cargo test"},
+    "protectedWrite": False, "judgeEscalated": False,
     "availableChoices": [
         {"choiceId": "c-allow", "label": "Allow",
          "decision": "approved", "scope": "once"},

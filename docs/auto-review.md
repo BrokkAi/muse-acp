@@ -45,9 +45,9 @@ request is eligible, the adapter sends `approval/decide` directly and the
 editor never sees a permission dialog for it. When a request is not eligible,
 nothing changes: the normal `session/request_permission` flow runs.
 
-Multi-stage approvals are evaluated stage by stage. A stage that is not
-eligible prompts for that stage; an eligible stage is answered with a
-once-scoped allow.
+Staged approval subjects are not auto-approved in this first cut. Any subject
+carrying a non-empty `stages` array reaches the editor, so a multi-stage
+approval always prompts.
 
 ## Eligibility
 
@@ -56,18 +56,23 @@ An approval is eligible only when every one of these conditions holds.
 | Condition | Why |
 | --- | --- |
 | The subject kind is `fileAccess`. | Shell, process, network, Unix-socket, tool, and unknown subjects can act outside a path-scoped workspace. Unknown kinds are never auto-approved. |
-| The subject has an absolute `path` that resolves inside one of the session's approved roots. | The workspace boundary is the whole safety argument. Relative paths, missing paths with missing parents, and paths outside every root are not eligible. |
+| The access kind is one of `read`, `list`, `stat`, `search`, `write`, `create`, `append`, `edit`, or `modify`. | Deletes, moves, and access kinds the adapter does not know are destructive or ambiguous, so they prompt. |
+| The subject has an absolute `path` that resolves inside one of the session's approved roots. | The workspace boundary is the whole safety argument. Relative paths, missing paths with missing parents, the root directory itself, and paths outside every root are not eligible. |
+| No path component below the matched root starts with `.`. | Hidden paths such as `.git`, `.github`, `.env`, and `.vscode` hold credentials, hooks, and code that runs. |
 | If the subject has a `target`, it also resolves inside a root. | Moves and renames can have two path-shaped ends; both must stay inside. |
-| `judgeEscalated` is absent or false. | Muse's own judge escalated this request; the adapter does not overrule it. |
-| `protectedWrite` is absent or false. | Muse marked this as a protected write. |
+| `judgeEscalated` is present and false. | A missing flag is a malformed request; a true flag is Muse's own escalation, which the adapter does not overrule. |
+| `protectedWrite` is present and false. | A missing flag is a malformed request; a true flag means Muse marked this as a protected write. |
 | `subagentOrigin` is absent. | First-cut policy: approvals from child agents still prompt on the owner session. |
+| `stages` is absent or an empty array. | Staged subjects carry per-stage argv that the adapter does not yet evaluate, so they prompt. |
 | At least one allowing choice is scoped to `once`. | Auto-review may approve this action, but it may not create a session or permanent "allow always" rule. |
 
 Path checks canonicalize both the candidate and every root. A symlink that
 resolves outside a root is refused. A file that does not exist yet is allowed
 only when its parent directory exists and resolves inside a root, which is the
 normal case for creating a new file. An entry that exists but cannot be
-resolved, such as a dangling symlink, is refused rather than guessed at.
+resolved, such as a dangling symlink, is refused rather than guessed at. The
+candidate must be a strict descendant of a root, and every component below
+that root must be a normal, non-hidden name.
 
 `MUSE_ALLOW_UNSCOPED_READS` does not affect auto-review. That variable widens
 read access for resource links; it never widens what auto-review may approve.
@@ -80,11 +85,17 @@ editor permission dialog:
 - Shell commands and process executions, including commands that only touch
   the workspace. The adapter cannot prove a shell command stays inside a
   path-scoped boundary.
+- Deletes, moves, and unknown file-access kinds.
 - Network requests and Unix-socket requests.
 - Reads or writes outside every approved workspace root.
+- Paths under hidden files or folders inside a root, such as `.git`,
+  `.github`, `.env`, or `.vscode`.
 - Writes Muse marked `protectedWrite`.
 - Requests Muse's judge escalated.
 - Approvals from subagents or child sessions.
+- Staged approval subjects.
+- Approvals missing either `protectedWrite` or `judgeEscalated`, even when the
+  rest of the request looks ordinary.
 - Approvals whose only allow choices are scoped to the session or to
   persistent rules.
 - Malformed, unknown, or ambiguous subjects.

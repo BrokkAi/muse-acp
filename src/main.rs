@@ -6626,21 +6626,38 @@ fn auto_review_path_allowed(path: &str, roots: &[String]) -> bool {
             }
         }
     };
-    roots
-        .iter()
-        .any(|root| std::fs::canonicalize(root).is_ok_and(|root| resolved.starts_with(root)))
+    roots.iter().any(|root| {
+        std::fs::canonicalize(root).is_ok_and(|root| {
+            resolved.strip_prefix(&root).is_ok_and(|rest| {
+                !rest.as_os_str().is_empty()
+                    && rest.components().all(|component| match component {
+                        std::path::Component::Normal(name) => {
+                            !name.to_string_lossy().starts_with('.')
+                        }
+                        _ => false,
+                    })
+            })
+        })
+    })
 }
+
+/// File-access kinds auto-review may approve. Destructive access (delete,
+/// move) and access kinds this list does not know still prompt.
+const AUTO_REVIEW_ACCESS: [&str; 9] = [
+    "read", "list", "stat", "search", "write", "create", "append", "edit", "modify",
+];
 
 /// The choice id auto-review may send for this approval, or None to open the
 /// ordinary editor prompt. None covers every uncertain case: unknown subjects,
-/// relative or unresolvable paths, shell/network/process actions, host-judged
-/// or protected writes, child approvals, and approvals whose only allowing
-/// choices would create a standing grant.
+/// relative, hidden, or unresolvable paths, shell/network/process actions,
+/// staged requests, host-judged or protected writes, child approvals, and
+/// approvals whose only allowing choices would create a standing grant.
 fn auto_review_choice(params: &J, roots: &[String]) -> Option<String> {
-    if params.get("judgeEscalated").and_then(J::as_bool) == Some(true) {
-        return None;
-    }
-    if params.get("protectedWrite").and_then(J::as_bool) == Some(true) {
+    // The schema requires both flags on every approval request. A host that
+    // omits one is not describing the request well enough to auto-approve it.
+    if !matches!(params.get("judgeEscalated"), Some(J::Bool(false)))
+        || !matches!(params.get("protectedWrite"), Some(J::Bool(false)))
+    {
         return None;
     }
     if params.get("subagentOrigin").is_some() {
@@ -6648,6 +6665,18 @@ fn auto_review_choice(params: &J, roots: &[String]) -> Option<String> {
     }
     let subject = params.get("subject")?;
     if subject.get("kind").and_then(|v| v.as_str()) != Some("fileAccess") {
+        return None;
+    }
+    if let Some(stages) = subject.get("stages")
+        && !matches!(stages, J::Arr(items) if items.is_empty())
+    {
+        return None;
+    }
+    let access = subject
+        .get("access")
+        .and_then(|v| v.as_str())?
+        .to_ascii_lowercase();
+    if !AUTO_REVIEW_ACCESS.contains(&access.as_str()) {
         return None;
     }
     let path = subject.get("path").and_then(|v| v.as_str())?;
@@ -10085,11 +10114,20 @@ mod tests {
             "muse-acp-auto-review-{}-eligibility",
             std::process::id()
         ));
-        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(root.join("src").join(".hidden")).unwrap();
+        std::fs::create_dir_all(root.join(".github").join("workflows")).unwrap();
         let root = std::fs::canonicalize(&root).unwrap();
         let roots = vec![root.to_string_lossy().to_string()];
         let inside = root.join("inside.txt");
         std::fs::write(&inside, "x").unwrap();
+        let nested = root.join("src").join("main.rs");
+        std::fs::write(&nested, "x").unwrap();
+        let hidden_file = root.join(".env");
+        std::fs::write(&hidden_file, "x").unwrap();
+        let hidden_dir_file = root.join(".github").join("workflows").join("ci.yml");
+        std::fs::write(&hidden_dir_file, "x").unwrap();
+        let nested_hidden = root.join("src").join(".hidden").join("file.rs");
+        std::fs::write(&nested_hidden, "x").unwrap();
         let outside = std::env::temp_dir().join(format!(
             "muse-acp-auto-review-{}-outside.txt",
             std::process::id()
@@ -10097,24 +10135,34 @@ mod tests {
 
         const ONCE: &str = r#"[{"choiceId":"c-allow","decision":"approved","scope":"once"},{"choiceId":"c-always","decision":"approved","scope":"session"},{"choiceId":"c-deny","decision":"denied","scope":"once"}]"#;
         const DURABLE_ONLY: &str = r#"[{"choiceId":"c-always","decision":"approved","scope":"session"},{"choiceId":"c-deny","decision":"denied","scope":"once"}]"#;
+        const FLAGS_OK: &str = "\"judgeEscalated\":false,\"protectedWrite\":false,";
 
-        let build = |outer: &str, subject_extra: &str, kind: &str, path: &str, choices: &str| {
+        let build_full = |flags: &str,
+                          subject_extra: &str,
+                          kind: &str,
+                          access: &str,
+                          path: &str,
+                          choices: &str| {
             parse_json(&format!(
-                "{{{outer}\"subject\":{{\"kind\":{kind},\"access\":\"write\",\"path\":{path}{subject_extra}}},\"availableChoices\":{choices}}}"
+                "{{{flags}\"subject\":{{\"kind\":{kind},\"access\":{access},\"path\":{path}{subject_extra}}},\"availableChoices\":{choices}}}"
             ))
             .unwrap()
+        };
+        // The common case: an ordinary write with both host flags explicitly
+        // false, as the MSP schema requires.
+        let build = |subject_extra: &str, kind: &str, path: &str, choices: &str| {
+            build_full(FLAGS_OK, subject_extra, kind, "\"write\"", path, choices)
         };
         let json_path = |path: &std::path::Path| esc(&path.to_string_lossy());
         let choice = |params: &J| auto_review_choice(params, &roots);
 
         assert_eq!(
-            choice(&build("", "", "\"fileAccess\"", &json_path(&inside), ONCE)),
+            choice(&build("", "\"fileAccess\"", &json_path(&inside), ONCE)),
             Some("c-allow".to_string()),
             "an existing file inside the root is eligible"
         );
         assert_eq!(
             choice(&build(
-                "",
                 "",
                 "\"fileAccess\"",
                 &json_path(&root.join("created.txt")),
@@ -10126,7 +10174,6 @@ mod tests {
         assert_eq!(
             choice(&build(
                 "",
-                "",
                 "\"fileAccess\"",
                 &esc(&format!("relative{}file.txt", std::path::MAIN_SEPARATOR)),
                 ONCE
@@ -10137,7 +10184,6 @@ mod tests {
         assert_eq!(
             choice(&build(
                 "",
-                "",
                 "\"fileAccess\"",
                 &json_path(&root.join("missing-dir").join("created.txt")),
                 ONCE
@@ -10146,13 +10192,12 @@ mod tests {
             "a create whose parent does not resolve is never auto-approved"
         );
         assert_eq!(
-            choice(&build("", "", "\"fileAccess\"", &json_path(&outside), ONCE)),
+            choice(&build("", "\"fileAccess\"", &json_path(&outside), ONCE)),
             None,
             "a path outside every root is never auto-approved"
         );
         assert_eq!(
             choice(&build(
-                "",
                 &format!(",\"target\":{}", json_path(&outside)),
                 "\"fileAccess\"",
                 &json_path(&inside),
@@ -10162,25 +10207,26 @@ mod tests {
             "an out-of-root move target is never auto-approved"
         );
         assert_eq!(
-            choice(&build("", "", "\"shell\"", &json_path(&inside), ONCE)),
+            choice(&build("", "\"shell\"", &json_path(&inside), ONCE)),
             None,
             "shell subjects are never auto-approved"
         );
         assert_eq!(
-            choice(&build("", "", "\"unixSocket\"", &json_path(&inside), ONCE)),
+            choice(&build("", "\"unixSocket\"", &json_path(&inside), ONCE)),
             None,
             "socket subjects are never auto-approved"
         );
         assert_eq!(
-            choice(&build("", "", "\"futureKind\"", &json_path(&inside), ONCE)),
+            choice(&build("", "\"futureKind\"", &json_path(&inside), ONCE)),
             None,
             "unknown subjects are never auto-approved"
         );
         assert_eq!(
-            choice(&build(
-                "\"judgeEscalated\":true,",
+            choice(&build_full(
+                "\"judgeEscalated\":true,\"protectedWrite\":false,",
                 "",
                 "\"fileAccess\"",
+                "\"write\"",
                 &json_path(&inside),
                 ONCE
             )),
@@ -10188,10 +10234,11 @@ mod tests {
             "a host-judged escalation is never overridden"
         );
         assert_eq!(
-            choice(&build(
-                "\"protectedWrite\":true,",
+            choice(&build_full(
+                "\"judgeEscalated\":false,\"protectedWrite\":true,",
                 "",
                 "\"fileAccess\"",
+                "\"write\"",
                 &json_path(&inside),
                 ONCE
             )),
@@ -10199,10 +10246,11 @@ mod tests {
             "a protected write is never auto-approved"
         );
         assert_eq!(
-            choice(&build(
-                "\"subagentOrigin\":{\"subagentId\":\"child-1\"},",
+            choice(&build_full(
+                "\"judgeEscalated\":false,\"protectedWrite\":false,\"subagentOrigin\":{\"subagentId\":\"child-1\"},",
                 "",
                 "\"fileAccess\"",
+                "\"write\"",
                 &json_path(&inside),
                 ONCE
             )),
@@ -10212,13 +10260,83 @@ mod tests {
         assert_eq!(
             choice(&build(
                 "",
-                "",
                 "\"fileAccess\"",
                 &json_path(&inside),
                 DURABLE_ONLY
             )),
             None,
             "session-scoped grants are never selected silently"
+        );
+        assert_eq!(
+            choice(&build_full(
+                FLAGS_OK,
+                "",
+                "\"fileAccess\"",
+                "\"read\"",
+                &json_path(&nested),
+                ONCE
+            )),
+            Some("c-allow".to_string()),
+            "a nested non-hidden file is eligible"
+        );
+        for hidden in [&hidden_file, &hidden_dir_file, &nested_hidden] {
+            assert_eq!(
+                choice(&build("", "\"fileAccess\"", &json_path(hidden), ONCE)),
+                None,
+                "a hidden path is never auto-approved: {}",
+                hidden.display()
+            );
+        }
+        assert_eq!(
+            choice(&build("", "\"fileAccess\"", &json_path(&root), ONCE)),
+            None,
+            "the workspace root itself is not an ordinary file"
+        );
+        for access in ["\"delete\"", "\"move\"", "\"chmod\""] {
+            assert_eq!(
+                choice(&build_full(
+                    FLAGS_OK,
+                    "",
+                    "\"fileAccess\"",
+                    access,
+                    &json_path(&inside),
+                    ONCE
+                )),
+                None,
+                "access {access} is never auto-approved"
+            );
+        }
+        assert_eq!(
+            choice(&build_full(
+                "",
+                "",
+                "\"fileAccess\"",
+                "\"write\"",
+                &json_path(&inside),
+                ONCE
+            )),
+            None,
+            "missing host flags fail closed"
+        );
+        assert_eq!(
+            choice(&build(
+                ",\"stages\":[{\"position\":0}]",
+                "\"fileAccess\"",
+                &json_path(&inside),
+                ONCE
+            )),
+            None,
+            "a staged subject is never auto-approved"
+        );
+        assert_eq!(
+            choice(&build(
+                ",\"stages\":[]",
+                "\"fileAccess\"",
+                &json_path(&inside),
+                ONCE
+            )),
+            Some("c-allow".to_string()),
+            "an empty stages list is not a stage"
         );
 
         #[cfg(unix)]

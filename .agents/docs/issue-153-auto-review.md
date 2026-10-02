@@ -48,22 +48,26 @@ flowchart TD
 
 Eligibility is deliberately narrow for the first cut:
 
-- `subject.kind == "fileAccess"`, `subject.path` is absolute and resolves
-  inside one of the session's approved roots. Canonicalization is mandatory:
-  an existing path must resolve inside a root, and a not-yet-created path must
-  have a canonical parent inside a root. `subject.target`, when present, must
-  also resolve inside a root.
-- `judgeEscalated` is false or absent.
-- `protectedWrite` is false or absent.
+- `subject.kind == "fileAccess"` with an ordinary access kind (`read`, `list`,
+  `stat`, `search`, `write`, `create`, `append`, `edit`, `modify`). Deletes,
+  moves, and unknown access kinds prompt.
+- `subject.path` is absolute, is a strict descendant of an approved root, and
+  resolves inside it. Canonicalization is mandatory: an existing path must
+  resolve inside a root, and a not-yet-created path must have a canonical
+  parent inside a root. `subject.target`, when present, must also resolve
+  inside a root. No path component below the root may start with `.`, so
+  `.git`, `.github`, `.env`, and similar hidden paths prompt.
+- `judgeEscalated` is present and false.
+- `protectedWrite` is present and false.
 - No `subagentOrigin`; child approvals still prompt in the first cut.
+- No non-empty `subject.stages`; staged subjects prompt in the first cut.
 - At least one approving choice with `scope == "once"` exists. Session and
   local-persistent grants are never selected silently.
 
-Everything else — shell/process, network, Unix sockets, tool or unknown
-subjects, relative or missing paths, unresolvable paths, symlinks that escape
-the roots, durable-only choices, malformed params — prompts exactly as today.
-Multi-stage approvals are re-evaluated at each requirement; a stage that is
-not eligible prompts for that stage.
+Everything else - shell/process, network, Unix sockets, tool or unknown
+subjects, deletes and moves, hidden paths, relative or missing paths,
+unresolvable paths, symlinks that escape the roots, staged subjects, missing
+host flags, durable-only choices, malformed params - prompts exactly as today.
 
 Each auto-decision writes one stderr audit line naming the approval id, the
 tool, the subject kind, and the chosen once-scoped choice.
@@ -117,8 +121,8 @@ This feature ships with documentation, not after it:
   `session/request_permission`; the host receives `approval/decide` with the
   once-scoped approving choice, and stderr carries the audit line.
 - Shell, network, out-of-workspace, protected-write, judge-escalated,
-  subagent-origin, and durable-only-choice cases still prompt, with
-  regression coverage.
+  subagent-origin, delete/move, hidden-path, staged, missing-flag, and
+  durable-only-choice cases still prompt, with regression coverage.
 - The approval-mode selector, MSP wire vocabulary, and `MUSE_APPROVAL_MODE`
   are unchanged.
 - README, `docs/auto-review.md`, and CHANGELOG are updated in the same change.
@@ -129,9 +133,10 @@ This feature ships with documentation, not after it:
    threaded through ACP v1/v2 `configOptions` and `session/set_config_option`
    with no host call.
 2. Add strict eligibility and once-scoped choice selection, with unit coverage
-   for inside/outside roots, creates, symlink escapes, non-`fileAccess`
-   subjects, protected and judge-escalated requests, child approvals, and
-   durable-only choices.
+   for inside/outside roots, creates, symlink escapes, hidden paths,
+   destructive or unknown access kinds, non-`fileAccess` subjects, missing or
+   true host flags, staged subjects, child approvals, and durable-only
+   choices.
 3. Answer eligible approvals in the single `open_approval` funnel, with the
    stderr audit line and the prompt fallback, plus fake-host regression tests
    for both protocol versions.

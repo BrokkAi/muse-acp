@@ -31,14 +31,15 @@ workspace-local edit or switching to `allowAll` and giving up review entirely.
 `muse-acp` gives you the middle path: a per-session **Auto-review** selector
 that works in every ACP client.
 
-Turn it on and ordinary file access inside your approved workspace roots is
-approved once, immediately, on your behalf. Shell commands, network access,
-protected files, requests Muse's own judge escalated, subagent approvals, and
-any path that resolves outside your workspace still stop and ask you, exactly
-as they do today. Auto-review never changes Muse's sandbox or approval mode,
-never creates a standing "allow always" rule, and never widens your workspace.
-Every automatic decision is written to the adapter's stderr log so you can
-audit it later.
+Turn it on and ordinary reads and edits inside your approved workspace roots
+are approved once, immediately, on your behalf. Shell commands, deletes and
+moves, network access, protected files, requests Muse's own judge escalated,
+subagent approvals, staged requests, and anything outside your workspace -
+including hidden paths such as `.git` and `.env` - still stop and ask you,
+exactly as they do today. Auto-review never changes Muse's sandbox or approval
+mode, never creates a standing "allow always" rule, and never widens your
+workspace. Every automatic decision is written to the adapter's stderr log so
+you can audit it later.
 
 ```mermaid
 flowchart TD

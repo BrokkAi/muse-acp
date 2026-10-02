@@ -110,6 +110,15 @@ headline capability.
   `FAKE_APPROVAL_PATH=workspace` now points a file-access subject at the
   active `session/start` workspace.
   Evidence: `tests/fixtures/fake_serve.py`, `fn approval_params`.
+- Observation: Self-review of the open PR found four fail-open gaps in the
+  first implementation: unknown, delete, and move access kinds were approved;
+  hidden paths under a root (`.git`, `.env`, `.github`) were approved; missing
+  `protectedWrite`/`judgeEscalated` flags were treated as false; and a
+  non-empty `subject.stages` array was ignored. All four now fail closed to
+  the editor prompt.
+  Evidence: unit cases in `tests::auto_review_eligibility_is_workspace_strict`
+  cover hidden files and directories, delete/move/chmod access, missing host
+  flags, and staged subjects.
 
 ## Decision Log
 
@@ -173,6 +182,17 @@ headline capability.
   issue. A feature users cannot discover or understand does not satisfy the
   intent.
   Date/Author: 2026-10-02, root agent.
+- Decision: A post-implementation review tightened eligibility to an access
+  allowlist (deletes, moves, and unknown kinds prompt), non-hidden components
+  below the matched root, `protectedWrite` and `judgeEscalated` explicitly
+  false, and no non-empty `stages` array.
+  Rationale: the first cut treated missing flags and unknown access kinds as
+  safe and allowed writes under `.git`, `.github`, and `.env`. All four are
+  fail-open directions that contradict the feature's fail-closed premise.
+  The superseded PR #169 had reached the same conclusions for hidden paths and
+  staged requests, so this also aligns the replacement with the earlier
+  safety analysis.
+  Date/Author: 2026-10-02, root agent, during PR review.
 
 ## Outcomes & Retrospective
 
@@ -182,10 +202,11 @@ documentation deliverables, and the working tree implements it:
 - A default-off `auto_review` config option with values `off` and `workspace`
   appears in ACP v1 and v2 `configOptions` and is settable through
   `session/set_config_option` without touching the host.
-- Eligible approvals (workspace-local `fileAccess`, no protected write, no
-  host-judge escalation, no subagent origin, with a once-scoped allow choice)
-  are answered directly with `approval/decide` and never open
-  `session/request_permission`. Everything else prompts as before.
+- Eligible approvals (workspace-local `fileAccess` with an ordinary access
+  kind, non-hidden path components, `protectedWrite` and `judgeEscalated`
+  explicitly false, no subagent origin, no non-empty `stages`, and a
+  once-scoped allow choice) are answered directly with `approval/decide` and
+  never open `session/request_permission`. Everything else prompts as before.
 - Path eligibility canonicalizes both sides, resolves creates through their
   canonical parent, refuses dangling symlinks and unresolvable entries, and
   ignores `MUSE_ALLOW_UNSCOPED_READS`.
