@@ -17,10 +17,10 @@ To see it working, run `MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loop
 
 
 - [x] (2026-10-02 14:00Z) Probed live Muse 1.4.2 (see Surprises & Discoveries) and settled the design.
-- [ ] Milestone 1: `src/hosts.rs` router over one or two `MspHost` processes; `main.rs` uses it everywhere it used `MspHost`; events carry their process; a crashed process restarts and re-attaches only its own sessions. No behavior change yet.
-- [ ] Milestone 2: session modes (`default`, `readOnly`, `plan`) in `src/acp.rs`; the `mode` selector and legacy `modes` carry them; the approval policy moves to `approval_mode` (old approval ids sent to `mode` still work); persisted per session.
-- [ ] Milestone 3: switching modes moves a session between hosts; new, loaded, resumed, and forked sessions open on the right host; plan prompts carry the planning instruction; bare `/plan`.
-- [ ] Milestone 4: fake-host integration tests, live loopback tests, README, CHANGELOG, ROADMAP.
+- [x] (2026-10-02 15:00Z) Milestone 1: `src/hosts.rs` router; `main.rs` uses it everywhere it used `MspHost`; events carry their host kind and generation; a crashed read-only host restarts alone. The full suite and the live suite passed unchanged.
+- [x] (2026-10-02 15:40Z) Milestone 2: session modes in `src/acp.rs`; `mode` and legacy `modes` carry them; `approval_mode` carries the approval policy, with old ids on `mode` still accepted; `src/modes.rs` persists non-default modes.
+- [x] (2026-10-02 16:10Z) Milestone 3: `switch_session_mode` moves sessions between hosts; load, resume, and fork open on the right host; plan turns carry the instruction; bare `/plan` switches.
+- [x] (2026-10-02 16:40Z) Milestone 4: five fake-host tests in `tests/acp_serve.rs`, two live tests in `tests/live_loopback.rs` (15/15 pass on 1.3.0, 1.4.1, and 1.4.2), README, CHANGELOG.
 
 
 ## Surprises & Discoveries
@@ -34,6 +34,13 @@ To see it working, run `MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loop
 
 - Observation: a session can be loaded by only one `muse serve` at a time, and Muse releases it only when that host shuts down. A second host's `session/resume` fails with `-32021 sessionInUse`, and neither waiting four minutes nor `view/unsubscribe` released it (no `session/closed` arrived).
   Evidence: `{"code":-32021,"data":{"kind":"sessionInUse",...},"message":"session ... is already in use"}` after 244 s, with and without `view/unsubscribe`.
+
+
+- Observation: Muse writes a session to disk with its first turn. Moving a session that never ran a turn found nothing to resume on the new host (`-32020 sessionNotFound`) once the old host exited.
+  Evidence: live test `read_only_mode_blocks_writes_until_switched_back` failed with "session ... was not found" before the fallback; `session/start` with the same `sessionId` on the new host fixed it.
+
+- Observation: fake-host tests shared the developer's `~/.local/state`, and every fake host uses the session id `msp-sess-1`, so a test that switched to plan made a later test load on the read-only host.
+  Evidence: `host_restart_settles_orphaned_turns_of_a_legacy_session_id` failed with "read-only Muse host started" in its log; each test spawn now sets its own `XDG_STATE_HOME`.
 
 
 ## Decision Log
@@ -55,8 +62,12 @@ To see it working, run `MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loop
   Rationale: issue #159 asks for the session modes on the ACP mode surface, as bex-co does. Accepting the old ids keeps editors that remember a previous approval selection working.
   Date/Author: 2026-10-02, Claude.
 
-- Decision: Plan is the read-only host plus a planning instruction prepended to each turn; only an explicit mode change leaves it. A bare `/plan` switches to Plan and ends without a turn; `/plan <text>` switches and then runs the turn as before.
-  Rationale: matches the issue and bex-co. The host flags are the guarantee; the instruction only shapes the answer.
+- Decision: Plan is the read-only host plus a planning instruction prepended to each turn; only an explicit mode change leaves it. A bare `/plan` switches to Plan and ends without a turn; `/plan <text>` keeps running Muse's plan skill in the current mode.
+  Rationale: the issue asks only for a bare `/plan` to switch. Making `/plan <text>` switch too, as bex-co does, would change an existing command and could fail whenever another thread on the main host is mid-turn.
+  Date/Author: 2026-10-02, Claude.
+
+- Decision: when the moved session cannot be resumed on the new host because Muse never saved it (`sessionNotFound`), start it there under the same `sessionId`, workspace, approval mode, and MCP servers, and follow its view from the new head.
+  Rationale: a session with no turns has no history to lose, and `session/start` accepts an explicit id that the old host no longer holds.
   Date/Author: 2026-10-02, Claude.
 
 - Decision: persist each session's mode in `$XDG_STATE_HOME/muse-acp/session-modes.json` (Windows: `%LOCALAPPDATA%\muse-acp\session-modes.json`), keyed by Muse session id, and open loaded and resumed sessions on the matching host. A fork keeps its source's mode.
@@ -71,7 +82,7 @@ To see it working, run `MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loop
 ## Outcomes & Retrospective
 
 
-(To be written at completion.)
+Read-only and Plan work as designed on every pinned Muse build: a write in either mode is refused by Muse and nothing reaches the workspace, switching back allows it, and the mode survives an adapter restart. The router kept the change to `main.rs` small: most of its command call sites did not change. The cost of the two-host design is visible only on a mode change: the host being left restarts, and the change waits for its turns to finish. Not covered: MCP tools in read-only sessions (still approval-gated), and modes are not shared with other Muse clients.
 
 
 ## Context and Orientation

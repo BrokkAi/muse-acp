@@ -197,6 +197,40 @@ start, resume, and read and for view paging; and 60 seconds for other methods.
 These bound how long the adapter waits for a command response, not how long a
 model turn may run.
 
+### Read-only and plan modes
+
+The editor's **Mode** selector chooses what Muse may change in a session:
+
+- **Default** — Muse edits files and runs commands as the approval mode
+  allows.
+- **Read-only** — Muse can read, search, and answer, but cannot write files
+  or run shell commands.
+- **Plan** — read-only, and each turn tells Muse to investigate and propose a
+  plan instead of implementing it. Only changing the mode leaves Plan. A bare
+  `/plan` switches to Plan without starting a turn; `/plan <text>` still runs
+  Muse's plan skill in the current mode.
+
+Read-only and Plan are enforced by Muse, not by the adapter: those sessions
+run on a second `muse serve` that `muse-acp` starts with `--disable-write
+--disable-shell` the first time it is needed, and Muse answers a write with
+"tool policy denied filesystem write". MCP tools are not covered by those
+flags; their calls still go through approvals.
+
+Muse lets only one host hold a session, and releases it only when that host
+exits. Changing the mode of an open session therefore restarts the host that
+holds it, and every other session on that host reconnects by itself. The
+change is refused while a turn runs on that host, in this thread or another;
+try again when it finishes.
+
+The adapter remembers each session's mode in
+`$XDG_STATE_HOME/muse-acp/session-modes.json` (Windows:
+`%LOCALAPPDATA%\muse-acp\session-modes.json`), so a session you load or
+resume later comes back in the same mode. A fork keeps its source's mode.
+
+The approval policy has its own **Approval Mode** selector (`approval_mode`).
+Clients that still send an approval mode such as `promptUnmatched` to the
+`mode` selector, or to `session/set_mode`, keep setting the approval mode.
+
 ### Approval-profile compatibility
 
 If Muse is saved with the `:auto-review` permission profile, `muse serve`
@@ -238,10 +272,12 @@ error the editor shows if Muse then refuses the profile says why.
 - **Questions** — Muse `userInput/requested` bridged to ACP
   `elicitation/create` forms when the client advertises form support; otherwise
   the host falls back to auto-cancel.
-- **Configuration** — model, approval mode, and reasoning effort exposed as ACP
-  `configOptions` selectors, refreshed from Muse on create, load, resume, and
-  config change. The reasoning selector starts at `Muse default` and sends no
-  override until you pick a tier.
+- **Modes** — Default, Read-only, and Plan, where Muse itself refuses file
+  writes and shell commands; see [Read-only and plan modes](#read-only-and-plan-modes).
+- **Configuration** — mode, approval mode, model, and reasoning effort exposed
+  as ACP `configOptions` selectors, refreshed from Muse on create, load,
+  resume, and config change. The reasoning selector starts at `Muse default`
+  and sends no override until you pick a tier.
 - **Skills** — Muse's skill catalog drives ACP `available_commands_update`.
   Slash prompts such as `/plan` use native skill turn parts; `/compact` invokes
   Muse's native compaction.

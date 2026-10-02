@@ -36,6 +36,18 @@ fn adapter_bin() -> String {
     env!("CARGO_BIN_EXE_muse-acp").to_string()
 }
 
+/// A private state folder for one adapter run, so remembered session modes
+/// never come from the developer's machine or another test: every fake host
+/// uses the same session ids.
+fn fresh_state_dir() -> std::path::PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    std::env::temp_dir().join(format!(
+        "muse-acp-test-state-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 struct Client {
     child: Child,
     stdin: std::process::ChildStdin,
@@ -66,6 +78,8 @@ impl Client {
         // Each fake-host test starts without the developer's Muse settings.
         // Profile tests provide their own XDG_CONFIG_HOME below.
         cmd.env("XDG_CONFIG_HOME", dir.join("config"));
+        // ...and without its remembered session modes.
+        cmd.env("XDG_STATE_HOME", dir.join("state"));
         cmd.env("MUSE_CLI", fixture());
         cmd.env("FAKE_SCENARIO", scenario);
         cmd.env("FAKE_LOG", &fake_log);
@@ -2724,7 +2738,8 @@ fn v1_advertises_config_options_and_slash_commands() {
         cfg.contains("\"id\":\"mode\"")
             && cfg.contains("\"id\":\"model\"")
             && cfg.contains("\"id\":\"reasoning_effort\"")
-            && cfg.contains("\"modes\":{\"currentModeId\":\"promptUnmatched\""),
+            && cfg.contains("\"id\":\"approval_mode\"")
+            && cfg.contains("\"modes\":{\"currentModeId\":\"default\""),
         "v1 selectors use the legacy id field and mode fallback: {cfg}"
     );
     assert!(
@@ -3808,7 +3823,7 @@ fn reasoning_effort_is_selected_and_sent_to_msp() {
         "updated reasoning value reflected: {set}"
     );
     assert!(
-        !set.contains("{\"value\":\"default\""),
+        !set.contains("{\"value\":\"default\",\"name\":\"Muse default\""),
         "a standing host default cannot be cleared, so it is not offered: {set}"
     );
 
@@ -3874,7 +3889,7 @@ fn reasoning_effort_default_is_restored_from_resume_snapshot() {
     let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
     assert!(
         resumed.contains("\"currentValue\":\"high\"")
-            && !resumed.contains("{\"value\":\"default\""),
+            && !resumed.contains("{\"value\":\"default\",\"name\":\"Muse default\""),
         "resume restores the host's standing reasoning effort: {resumed}"
     );
 
@@ -4822,6 +4837,7 @@ fn auto_review_settings_are_scoped_to_the_host_and_human_approvals_still_work() 
 fn auto_review_settings_are_cleaned_up_on_forced_shutdown() {
     let (source, original) = auto_review_config();
     let mut child = Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
         .env("MUSE_CLI", fixture())
         .env("XDG_CONFIG_HOME", &source)
         .env("FAKE_CHECK_HOST_CONFIG", "1")
@@ -4897,6 +4913,7 @@ fn auto_review_override_is_recreated_on_restart_and_used_by_support() {
 
     let support_log = source.join("support");
     let output = Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
         .arg("--support")
         .env("MUSE_CLI", fixture())
         .env("XDG_CONFIG_HOME", &source)
@@ -6717,6 +6734,7 @@ fn login_subcommand_hands_the_terminal_to_muse_login() {
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
 
     let out = Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
         .arg("login")
         .env("MUSE_CLI", &script)
         .output()
@@ -6725,6 +6743,7 @@ fn login_subcommand_hands_the_terminal_to_muse_login() {
     assert_eq!(std::fs::read_to_string(&args_file).expect("args"), "login");
 
     let out = Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
         .arg("login")
         .env("MUSE_CLI", "/nonexistent-muse")
         .output()
@@ -6734,6 +6753,7 @@ fn login_subcommand_hands_the_terminal_to_muse_login() {
     assert!(stderr.contains("Muse CLI not found"), "{stderr}");
 
     let out = Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
         .args(["login", "extra"])
         .output()
         .expect("login");
@@ -6746,6 +6766,7 @@ fn login_offers_to_install_missing_muse_and_declines_without_an_answer() {
     let dir = std::env::temp_dir().join(format!("acp-login-install-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("tmpdir");
     let out = Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
         .arg("login")
         .env_remove("MUSE_CLI")
         .env_remove("MUSE_INSTALL_DIR")
@@ -6770,6 +6791,7 @@ fn login_offers_to_install_missing_muse_and_declines_without_an_answer() {
 #[test]
 fn selftest_reports_cli_readiness_without_gating() {
     let ok = std::process::Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
         .arg("--selftest")
         .env("MUSE_CLI", adapter_bin())
         .output()
@@ -6785,6 +6807,7 @@ fn selftest_reports_cli_readiness_without_gating() {
     );
 
     let missing = std::process::Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
         .arg("--selftest")
         .env("MUSE_CLI", "/nonexistent-muse")
         .output()
@@ -7438,6 +7461,7 @@ fn closed_host_stdout_reaps_the_child_without_waiting_for_process_exit() {
 #[test]
 fn closed_editor_stdout_does_not_block_adapter_shutdown() {
     let mut cmd = Command::new(adapter_bin());
+    cmd.env("XDG_STATE_HOME", fresh_state_dir());
     cmd.env("MUSE_CLI", fixture())
         .env("FAKE_SCENARIO", "quiet")
         .stdin(Stdio::piped())
@@ -7511,6 +7535,7 @@ fn host_stderr_is_drained_while_the_host_is_running() {
 #[test]
 fn support_bundle_redacts_unknown_muse_env_values() {
     let out = std::process::Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
         .arg("--support")
         .env("MUSE_CLI", fixture())
         .env("FAKE_SCENARIO", "support_exit")
@@ -8285,6 +8310,7 @@ fn shutdown_deadline_settles_a_command_blocking_the_main_loop() {
 #[test]
 fn shutdown_deadline_bounds_unread_editor_stdout() {
     let mut cmd = Command::new(adapter_bin());
+    cmd.env("XDG_STATE_HOME", fresh_state_dir());
     cmd.env("MUSE_CLI", fixture())
         .env("FAKE_SCENARIO", "quiet")
         .env("MUSE_SHUTDOWN_TIMEOUT_MS", "1500")
@@ -8414,5 +8440,141 @@ fn invalid_utf8_editor_frame_is_rejected_without_disconnect() {
     let id = c.prompt(&sid, "healthy next frame");
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(frame.contains("\"stopReason\":\"end_turn\""), "{frame}");
+    c.finish();
+}
+
+fn set_session_mode(c: &mut Client, sid: &str, value: &str) -> String {
+    let id = c.req(
+        "session/set_config_option",
+        &serde_json::json!({"sessionId": sid, "configId": "mode", "value": value}).to_string(),
+    );
+    c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15))
+}
+
+fn fake_methods(c: &Client) -> Vec<String> {
+    std::fs::read_to_string(&c.fake_log)
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn read_only_mode_moves_the_session_to_a_read_only_host_and_back() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(1, "");
+    let frame = set_session_mode(&mut c, &sid, "readOnly");
+    assert!(
+        frame.contains("\"id\":\"mode\",\"name\":\"Mode\"")
+            && frame.contains("\"currentValue\":\"readOnly\""),
+        "{frame}"
+    );
+    c.wait_for("\"currentModeId\":\"readOnly\"", Duration::from_secs(15));
+    // The session left the main host and resumed on the read-only one.
+    c.wait_log("ro:session/resume", Duration::from_secs(15));
+    c.wait_stderr("moved to the read-only Muse host", Duration::from_secs(15));
+    let pid = c.prompt(&sid, "look around");
+    c.wait_log("ro:turn/start", Duration::from_secs(15));
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        !fake_methods(&c).iter().any(|m| m == "turn/start"),
+        "a read-only turn must not reach the main host"
+    );
+
+    let frame = set_session_mode(&mut c, &sid, "default");
+    assert!(frame.contains("\"currentValue\":\"default\""), "{frame}");
+    c.wait_stderr("moved to the main Muse host", Duration::from_secs(15));
+    let pid = c.prompt(&sid, "now change things");
+    c.wait_log("turn/start", Duration::from_secs(15));
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn bare_plan_switches_to_plan_without_a_turn() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "/plan");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(!frame.contains("\"error\""), "{frame}");
+    c.wait_for("Plan mode is on", Duration::from_secs(15));
+    c.wait_for(
+        "\"sessionUpdate\":\"config_option_update\",\"configId\":\"mode\",\"currentValue\":\"plan\"",
+        Duration::from_secs(15),
+    );
+    assert!(
+        !fake_methods(&c).iter().any(|m| m.ends_with("turn/start")),
+        "a bare /plan starts no turn"
+    );
+    // The next prompt runs on the read-only host, told to plan.
+    let pid = c.prompt(&sid, "what should change");
+    c.wait_log("ro:turn/start", Duration::from_secs(15));
+    c.wait_input("Plan mode: investigate", Duration::from_secs(15));
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn a_mode_change_waits_for_the_running_turn() {
+    let mut c = Client::spawn("approval_hang", &[]);
+    let sid = c.new_session(1, "");
+    c.prompt(&sid, "run it");
+    c.wait_for("request_permission", Duration::from_secs(15));
+    let frame = set_session_mode(&mut c, &sid, "readOnly");
+    assert!(
+        frame.contains("\"error\"") && frame.contains("wait for the current turn"),
+        "{frame}"
+    );
+    assert!(
+        !fake_methods(&c).iter().any(|m| m.starts_with("ro:")),
+        "no read-only host while the turn runs"
+    );
+    c.finish();
+}
+
+#[test]
+fn approval_ids_sent_to_mode_still_set_the_approval_mode() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(1, "");
+    let frame = set_session_mode(&mut c, &sid, "allowAll");
+    let options: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    let options = options["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    let value = |id: &str| {
+        options
+            .iter()
+            .find(|o| o["id"] == id)
+            .map(|o| o["currentValue"].clone())
+    };
+    assert_eq!(value("mode"), Some("default".into()), "{frame}");
+    assert_eq!(value("approval_mode"), Some("allowAll".into()), "{frame}");
+    c.wait_log("session/setApprovalMode", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn plan_mode_is_remembered_when_the_session_is_loaded_again() {
+    let state = fresh_state_dir();
+    let state = state.to_str().unwrap();
+    let mut c = Client::spawn("happy", &[("XDG_STATE_HOME", state)]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "/plan");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    c.finish();
+
+    let mut c = Client::spawn("happy", &[("XDG_STATE_HOME", state)]);
+    c.initialize(1, "");
+    let id = c.req(
+        "session/load",
+        &serde_json::json!({"sessionId": sid, "mcpServers": []}).to_string(),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"currentModeId\":\"plan\""),
+        "the reloaded session is still in plan mode: {frame}"
+    );
+    c.wait_log("ro:session/resume", Duration::from_secs(15));
     c.finish();
 }

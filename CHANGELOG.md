@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Add **Read-only** and **Plan** session modes. The editor's Mode selector
+  now offers Default, Read-only, and Plan. Read-only and Plan sessions run on
+  a second `muse serve` started with `--disable-write --disable-shell`, so
+  Muse itself refuses file writes and shell commands. Plan also tells Muse to
+  plan rather than implement, and a bare `/plan` switches to it without
+  starting a turn. Changing an open session's mode moves it between the two
+  hosts and is refused while a turn runs on the host it leaves. The mode is
+  remembered, so a reloaded session comes back in it.
+- The approval policy moves to its own **Approval Mode** selector
+  (`approval_mode`). Approval mode ids sent to `mode` or `session/set_mode`
+  still set it.
 - When Muse declines `/compact`, for example on a session too short to
   compact, the prompt now ends normally with a note naming Muse's reason.
   Previously a `compaction_unavailable` or `missing_run` answer surfaced as an

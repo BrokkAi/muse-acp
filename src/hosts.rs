@@ -166,6 +166,11 @@ impl Hosts {
         }
     }
 
+    /// The host recorded for a session, if any.
+    pub fn known_owner(&self, msp_sid: &str) -> Option<HostKind> {
+        lock(&self.owners).get(msp_sid).copied()
+    }
+
     pub fn owner(&self, msp_sid: &str) -> HostKind {
         lock(&self.owners)
             .get(msp_sid)
@@ -190,21 +195,6 @@ impl Hosts {
 
     pub fn command(&self, method: &str, params_json: &str) -> Result<J, J> {
         self.route(params_json).command(method, params_json)
-    }
-
-    pub fn command_on(&self, kind: HostKind, method: &str, params_json: &str) -> Result<J, J> {
-        match self.host(kind) {
-            Some(host) => host.command(method, params_json),
-            None => Err(parse_json(&format!(
-                "{{\"code\":-32603,\"message\":{}}}",
-                crate::json::esc(&format!("the {} Muse host is not running", kind.name()))
-            ))
-            .expect("static error JSON")),
-        }
-    }
-
-    pub fn notify(&self, method: &str, params_json: &str) -> Result<(), String> {
-        self.route(params_json).notify(method, params_json)
     }
 
     pub fn mint_cmd(&self, prefix: &str) -> String {
