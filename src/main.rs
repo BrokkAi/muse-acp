@@ -4082,7 +4082,7 @@ fn handle_acp(
             });
             if is_compact.is_some() {
                 let cmd = host.mint_cmd("cmd-");
-                match host.command(
+                let note = match host.command(
                     "session/compact",
                     &format!(
                         "{{\"commandId\":{},\"sessionId\":{}}}",
@@ -4098,29 +4098,54 @@ fn handle_acp(
                                 r.get("reason").and_then(|v| v.as_str()).unwrap_or("?")
                             ));
                         }
-                        if ver == 2 {
-                            acp::send_result(stdout, &id, "{}");
-                            send_v2_user_message(stdout, &sid, &acp_content);
-                            acp::send_state(stdout, &sid, "idle", Some("end_turn"));
-                        } else {
-                            let msg_id = mint_id("msg-", &ID_COUNTER);
-                            acp::send_raw(
-                                stdout,
-                                &format!(
-                                    "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":\"/compact\"}}}}}}}}",
-                                    esc(&sid),
-                                    esc(&msg_id)
-                                ),
-                            );
-                            acp::send_result(stdout, &id, "{\"stopReason\":\"end_turn\"}");
-                        }
+                        None
                     }
-                    Err(e) => acp::send_error(
+                    // Muse declines a session with too little history to
+                    // compact. That is an answer, not a failure.
+                    Err(e) if msp::rejection_reason(&e) == Some("compaction_unavailable") => {
+                        log("compact declined: compaction_unavailable");
+                        Some("Nothing to compact yet.")
+                    }
+                    Err(e) => {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            msp::acp_error_code(&e, -32603),
+                            &format!("session/compact failed: {}", err_message(&e)),
+                        );
+                        return;
+                    }
+                };
+                let agent_note = |stdout: &StdoutShared| {
+                    if let Some(note) = note {
+                        acp::send_raw(
+                            stdout,
+                            &format!(
+                                "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
+                                esc(&sid),
+                                esc(&mint_id("msg-", &ID_COUNTER)),
+                                esc(note)
+                            ),
+                        );
+                    }
+                };
+                if ver == 2 {
+                    acp::send_result(stdout, &id, "{}");
+                    send_v2_user_message(stdout, &sid, &acp_content);
+                    agent_note(stdout);
+                    acp::send_state(stdout, &sid, "idle", Some("end_turn"));
+                } else {
+                    let msg_id = mint_id("msg-", &ID_COUNTER);
+                    acp::send_raw(
                         stdout,
-                        &id,
-                        msp::acp_error_code(&e, -32603),
-                        &format!("session/compact failed: {}", err_message(&e)),
-                    ),
+                        &format!(
+                            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":\"/compact\"}}}}}}}}",
+                            esc(&sid),
+                            esc(&msg_id)
+                        ),
+                    );
+                    agent_note(stdout);
+                    acp::send_result(stdout, &id, "{\"stopReason\":\"end_turn\"}");
                 }
                 return;
             }

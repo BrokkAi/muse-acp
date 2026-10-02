@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `/compact` on a session too short to compact now ends normally with
+  "Nothing to compact yet." Previously Muse's `compaction_unavailable`
+  answer surfaced as an internal `-32603` error.
 - Classify Muse 1.4.2 as a tested host. Its stable schema only adds to
   1.4.1's, and the live-host suite passes against it, so startup logs now
   report `status=tested` instead of `status=unknown`.

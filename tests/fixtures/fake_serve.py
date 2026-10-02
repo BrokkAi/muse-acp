@@ -1672,6 +1672,17 @@ def main():
                                                  "reason": "session_configuration_conflict",
                                                  "retryable": False}}})
                         continue
+                if method == "session/compact" and SCENARIO == "compact_unavailable":
+                    # Mirrors live 1.3-1.4 hosts on a session too short to compact.
+                    command = msg["params"].get("commandId", "")
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32030,
+                                    "message": "session/compact command " + command + " rejected: compaction_unavailable",
+                                    "data": {"kind": "commandRejected",
+                                             "commandId": command,
+                                             "reason": "compaction_unavailable",
+                                             "retryable": False}}})
+                    continue
                 if (method == "session/start"
                         and os.environ.get("FAKE_START_ERROR", "") == "profile"):
                     # Mirrors the live 1.2.1 refusal when the user's default

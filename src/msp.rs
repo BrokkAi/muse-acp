@@ -1329,10 +1329,15 @@ pub fn err_message(e: &J) -> String {
 /// the session already loaded on this host. MSP fixes that set when the
 /// session runtime is built and has no unload command.
 pub fn is_session_configuration_conflict(e: &J) -> bool {
-    let data = e.get("data");
-    data.and_then(|d| d.get("kind")).and_then(|k| k.as_str()) == Some("commandRejected")
-        && data.and_then(|d| d.get("reason")).and_then(|r| r.as_str())
-            == Some("session_configuration_conflict")
+    rejection_reason(e) == Some("session_configuration_conflict")
+}
+
+/// The `reason` of a `commandRejected` error, if the error is one.
+pub fn rejection_reason(e: &J) -> Option<&str> {
+    let data = e.get("data")?;
+    (data.get("kind")?.as_str()? == "commandRejected")
+        .then(|| data.get("reason")?.as_str())
+        .flatten()
 }
 
 /// Older Muse hosts do not know the 1.3.0 session-default method. Keep the

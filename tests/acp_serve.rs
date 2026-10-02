@@ -5314,6 +5314,29 @@ fn compact_noop_settles_the_prompt_without_faking_work() {
 }
 
 #[test]
+fn compact_on_a_session_with_too_little_history_settles_with_a_note() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("compact_unavailable", &[]);
+        let sid = c.new_session(ver, "");
+        let pid = c.prompt(&sid, "/compact");
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(
+            !frame.contains("\"error\""),
+            "v{ver}: a declined compaction is not a failure: {frame}"
+        );
+        if ver == 1 {
+            assert!(frame.contains("\"stopReason\":\"end_turn\""), "{frame}");
+        }
+        c.wait_for("Nothing to compact yet.", Duration::from_secs(15));
+        c.wait_stderr(
+            "compact declined: compaction_unavailable",
+            Duration::from_secs(10),
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn compact_in_running_text_is_still_a_prompt() {
     // Only a bare /compact is a command; prefixed text stays a turn.
     let mut c = Client::spawn("happy", &[]);
