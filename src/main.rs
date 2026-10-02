@@ -13,13 +13,16 @@ mod json;
 mod mcp;
 mod modes;
 mod msp;
+mod reviewer;
 mod sha256;
 mod shutdown;
 mod zed;
 
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
+use std::sync::LazyLock;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
@@ -2254,6 +2257,8 @@ fn mode_on_host(mode: String, owner: HostKind) -> String {
         (wanted, held) if wanted == held => mode,
         (_, HostKind::ReadOnly) => acp::READ_ONLY_MODE.to_string(),
         (_, HostKind::Main) => acp::DEFAULT_MODE.to_string(),
+        // The reviewer host never serves a user session; its mode is moot.
+        (_, HostKind::Reviewer) => acp::DEFAULT_MODE.to_string(),
     }
 }
 
@@ -2458,15 +2463,19 @@ fn config_options_result(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) 
         "{{\"configOptions\":{}}}",
         acp::config_options(
             s.ver,
-            (&s.session_mode, &s.mode_value),
-            &s.model_value,
-            &s.reasoning_effort,
-            s.reasoning_effort_source.is_none(),
+            acp::ConfigOptions {
+                session_mode: &s.session_mode,
+                approval_mode: &s.mode_value,
+                model: &s.model_value,
+                reasoning_effort: &s.reasoning_effort,
+                offer_muse_default: s.reasoning_effort_source.is_none(),
+                auto_review: s.auto_review,
+                recommendations: (
+                    recommended_model(&models).as_deref(),
+                    recommended_reasoning(s).as_deref(),
+                ),
+            },
             &models,
-            (
-                recommended_model(&models).as_deref(),
-                recommended_reasoning(s).as_deref()
-            ),
         )
     ))
 }
@@ -2782,6 +2791,9 @@ fn main() {
                     && active_host.is_current(tag)
                 {
                     learn_event_owner(active_host, tag, &params);
+                    if handle_review_event(active_host, &stdout, &sessions, &method, &params) {
+                        continue;
+                    }
                     match method.as_str() {
                         "approval/request" => {
                             open_approval(active_host, &stdout, &sessions, &params)
@@ -2818,6 +2830,25 @@ fn main() {
                 // other host, ends without being a crash.
                 if !hosts.is_current(tag) {
                     log(&format!("replaced {} host exited ({why})", tag.kind.name()));
+                    continue;
+                }
+                if tag.kind == HostKind::Reviewer {
+                    hosts.clear_reviewer();
+                    let job = REVIEW_STATE
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .active
+                        .take();
+                    if let Some(job) = job {
+                        deny_review_job(
+                            &hosts,
+                            &stdout,
+                            &sessions,
+                            job,
+                            "the reviewer host exited before deciding",
+                        );
+                        start_next_review(&hosts, &stdout, &sessions);
+                    }
                     continue;
                 }
                 if tag.kind == HostKind::ReadOnly {
@@ -3489,6 +3520,9 @@ fn handle_acp(
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
                             mode_value: acp::mode_from_msp(&cur_mode).to_string(),
+                            auto_review: false,
+                            review_context: std::collections::VecDeque::new(),
+                            review_evidence: std::collections::VecDeque::new(),
                             session_mode: acp::DEFAULT_MODE.to_string(),
                             model_value: cur_model.clone(),
                             reasoning_effort: acp::REASONING_DEFAULT.to_string(),
@@ -3541,12 +3575,16 @@ fn handle_acp(
                             esc(&msp_sid),
                             acp::config_options(
                                 ver,
-                                (acp::DEFAULT_MODE, acp::mode_from_msp(&cur_mode)),
-                                &cur_model,
-                                acp::REASONING_DEFAULT,
-                                true,
+                                acp::ConfigOptions {
+                                    session_mode: acp::DEFAULT_MODE,
+                                    approval_mode: acp::mode_from_msp(&cur_mode),
+                                    model: &cur_model,
+                                    reasoning_effort: acp::REASONING_DEFAULT,
+                                    offer_muse_default: true,
+                                    auto_review: false,
+                                    recommendations: (recommended_model(&models).as_deref(), None),
+                                },
                                 &models,
-                                (recommended_model(&models).as_deref(), None),
                             )
                         )
                     } else {
@@ -3556,12 +3594,16 @@ fn handle_acp(
                             esc(&msp_sid),
                             acp::config_options(
                                 ver,
-                                (acp::DEFAULT_MODE, acp::mode_from_msp(&cur_mode)),
-                                &cur_model,
-                                acp::REASONING_DEFAULT,
-                                true,
+                                acp::ConfigOptions {
+                                    session_mode: acp::DEFAULT_MODE,
+                                    approval_mode: acp::mode_from_msp(&cur_mode),
+                                    model: &cur_model,
+                                    reasoning_effort: acp::REASONING_DEFAULT,
+                                    offer_muse_default: true,
+                                    auto_review: false,
+                                    recommendations: (recommended_model(&models).as_deref(), None),
+                                },
                                 &models,
-                                (recommended_model(&models).as_deref(), None),
                             ),
                             acp::session_modes(acp::DEFAULT_MODE)
                         )
@@ -3781,6 +3823,9 @@ fn handle_acp(
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
                             mode_value: "promptUnmatched".to_string(),
+                            auto_review: false,
+                            review_context: std::collections::VecDeque::new(),
+                            review_evidence: std::collections::VecDeque::new(),
                             session_mode: session_mode.clone(),
                             model_value: String::new(),
                             reasoning_effort: acp::REASONING_DEFAULT.to_string(),
@@ -3955,6 +4000,7 @@ fn handle_acp(
                         reasoning_v,
                         offer_default_v,
                         recommended_v,
+                        auto_review_v,
                     ) = sessions
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -3967,6 +4013,7 @@ fn handle_acp(
                                 s.reasoning_effort.clone(),
                                 s.reasoning_effort_source.is_none(),
                                 recommended_reasoning(s),
+                                s.auto_review,
                             )
                         })
                         .unwrap_or_default();
@@ -3980,15 +4027,19 @@ fn handle_acp(
                             esc(&msp_out),
                             acp::config_options(
                                 ver,
-                                (&session_mode_v, &mode_v),
-                                &model_v,
-                                &reasoning_v,
-                                offer_default_v,
+                                acp::ConfigOptions {
+                                    session_mode: &session_mode_v,
+                                    approval_mode: &mode_v,
+                                    model: &model_v,
+                                    reasoning_effort: &reasoning_v,
+                                    offer_muse_default: offer_default_v,
+                                    auto_review: auto_review_v,
+                                    recommendations: (
+                                        recommended_model(&models).as_deref(),
+                                        recommended_v.as_deref(),
+                                    ),
+                                },
                                 &models,
-                                (
-                                    recommended_model(&models).as_deref(),
-                                    recommended_v.as_deref()
-                                ),
                             )
                         )
                     } else {
@@ -3999,15 +4050,19 @@ fn handle_acp(
                             esc(&msp_out),
                             acp::config_options(
                                 ver,
-                                (&session_mode_v, &mode_v),
-                                &model_v,
-                                &reasoning_v,
-                                offer_default_v,
+                                acp::ConfigOptions {
+                                    session_mode: &session_mode_v,
+                                    approval_mode: &mode_v,
+                                    model: &model_v,
+                                    reasoning_effort: &reasoning_v,
+                                    offer_muse_default: offer_default_v,
+                                    auto_review: auto_review_v,
+                                    recommendations: (
+                                        recommended_model(&models).as_deref(),
+                                        recommended_v.as_deref(),
+                                    ),
+                                },
                                 &models,
-                                (
-                                    recommended_model(&models).as_deref(),
-                                    recommended_v.as_deref()
-                                ),
                             ),
                             acp::session_modes(&session_mode_v)
                         )
@@ -4273,6 +4328,9 @@ fn handle_acp(
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
                             mode_value: mode_value.clone(),
+                            auto_review: false,
+                            review_context: std::collections::VecDeque::new(),
+                            review_evidence: std::collections::VecDeque::new(),
                             session_mode: fork_mode.clone(),
                             model_value: new_model.clone(),
                             reasoning_effort: parent_reasoning
@@ -4341,6 +4399,7 @@ fn handle_acp(
                         reasoning_out,
                         offer_default_out,
                         recommended_out,
+                        auto_review_out,
                     ) = sessions
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -4353,6 +4412,7 @@ fn handle_acp(
                                 s.reasoning_effort.clone(),
                                 s.reasoning_effort_source.is_none(),
                                 recommended_reasoning(s),
+                                s.auto_review,
                             )
                         })
                         .unwrap_or_default();
@@ -4364,15 +4424,19 @@ fn handle_acp(
                             esc(&new_msp),
                             acp::config_options(
                                 ver,
-                                (&session_mode_out, &mode_out),
-                                &model_out,
-                                &reasoning_out,
-                                offer_default_out,
+                                acp::ConfigOptions {
+                                    session_mode: &session_mode_out,
+                                    approval_mode: &mode_out,
+                                    model: &model_out,
+                                    reasoning_effort: &reasoning_out,
+                                    offer_muse_default: offer_default_out,
+                                    auto_review: auto_review_out,
+                                    recommendations: (
+                                        recommended_model(&models).as_deref(),
+                                        recommended_out.as_deref(),
+                                    ),
+                                },
                                 &models,
-                                (
-                                    recommended_model(&models).as_deref(),
-                                    recommended_out.as_deref()
-                                ),
                             )
                         )
                     } else {
@@ -4382,15 +4446,19 @@ fn handle_acp(
                             esc(&new_msp),
                             acp::config_options(
                                 ver,
-                                (&session_mode_out, &mode_out),
-                                &model_out,
-                                &reasoning_out,
-                                offer_default_out,
+                                acp::ConfigOptions {
+                                    session_mode: &session_mode_out,
+                                    approval_mode: &mode_out,
+                                    model: &model_out,
+                                    reasoning_effort: &reasoning_out,
+                                    offer_muse_default: offer_default_out,
+                                    auto_review: auto_review_out,
+                                    recommendations: (
+                                        recommended_model(&models).as_deref(),
+                                        recommended_out.as_deref(),
+                                    ),
+                                },
                                 &models,
-                                (
-                                    recommended_model(&models).as_deref(),
-                                    recommended_out.as_deref()
-                                ),
                             ),
                             acp::session_modes(&session_mode_out)
                         )
@@ -4482,6 +4550,12 @@ fn handle_acp(
                         return;
                     }
                 };
+            {
+                let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(s) = map.get_mut(&sid) {
+                    remember_review_line(&mut s.review_context, format!("user: {acp_content}"));
+                }
+            }
             // `/goal ...`, `/rename ...`, and `/workflow-child ...` are
             // protocol commands, not prompts: run the matching host method.
             // They are control commands rather than human turn input, so they
@@ -5508,6 +5582,20 @@ fn handle_acp(
                         return;
                     }
                 },
+                // Adapter policy: no host command and no MSP vocabulary. The
+                // refreshed selector is returned by the common Ok arm below.
+                "auto_review" => match acp::resolve_auto_review(&value) {
+                    Some(_) => Ok(J::Null),
+                    None => {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32602,
+                            &format!("auto_review must be {}", acp::AUTO_REVIEW_HELP),
+                        );
+                        return;
+                    }
+                },
                 "model" => host.command(
                     "session/setModel",
                     &format!(
@@ -5562,7 +5650,7 @@ fn handle_acp(
                         stdout,
                         &id,
                         -32602,
-                        "unknown configId (want mode|approval_mode|model|reasoning_effort)",
+                        "unknown configId (want mode|approval_mode|auto_review|model|reasoning_effort)",
                     );
                     return;
                 }
@@ -5596,6 +5684,9 @@ fn handle_acp(
                                     .or_else(|| acp::resolve_mode(&value))
                                     .unwrap_or("promptUnmatched");
                                 s.mode_value = acp::mode_from_msp(m).to_string();
+                            }
+                            "auto_review" => {
+                                s.auto_review = value == acp::AUTO_REVIEW_ON;
                             }
                             "model" => s.model_value = value.clone(),
                             "reasoning_effort" => {
@@ -6544,6 +6635,461 @@ fn confined_path(path: &str, roots: &[String]) -> Result<std::path::PathBuf, Str
     ))
 }
 
+/// One approval waiting on the auto-review agent.
+struct ReviewJob {
+    acp_sid: String,
+    owner_msp_sid: String,
+    ver: u8,
+    approval_id: String,
+    requirement: J,
+    choices: Vec<acp::PermChoice>,
+    child_subagent_id: Option<String>,
+    prompt: String,
+}
+
+#[derive(Default)]
+struct ReviewState {
+    /// The memory-only reviewer session, once started.
+    session: Option<String>,
+    /// The job whose reviewer turn is running.
+    active: Option<ReviewJob>,
+    /// Jobs waiting for the reviewer to finish the current turn.
+    queue: VecDeque<ReviewJob>,
+    /// Accumulated answer text for the active turn.
+    text: String,
+    /// Reviewer turn id, so stale events cannot settle a later review.
+    turn: String,
+}
+
+static REVIEW_STATE: LazyLock<Mutex<ReviewState>> =
+    LazyLock::new(|| Mutex::new(ReviewState::default()));
+
+/// Keep the reviewer prompt bounded: recent lines, bounded total size.
+fn remember_review_line(buf: &mut VecDeque<String>, line: String) {
+    const MAX_LINES: usize = 40;
+    const MAX_CHARS: usize = 16_000;
+    buf.push_back(line);
+    while buf.len() > MAX_LINES {
+        buf.pop_front();
+    }
+    let mut total: usize = buf.iter().map(String::len).sum();
+    while total > MAX_CHARS {
+        if let Some(front) = buf.pop_front() {
+            total -= front.len();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Hand an approval to the reviewer instead of the editor. Returns false when
+/// auto-review is off or the approval cannot be described well enough to try.
+fn enqueue_review(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    owner_msp_sid: &str,
+    params: &J,
+) -> bool {
+    let Some(approval_id) = params.get("approvalId").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    let requirement_json = j_to_string(
+        &params
+            .get("currentRequirementId")
+            .cloned()
+            .unwrap_or(J::Null),
+    );
+    let requirement_json = requirement_json.as_str();
+    let (enabled, roots, mode, trusted, evidence, ver) = {
+        let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get(acp_sid) else {
+            return false;
+        };
+        if !s.auto_review {
+            return false;
+        }
+        (
+            true,
+            s.roots.clone(),
+            s.mode_value.clone(),
+            s.review_context
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n"),
+            s.review_evidence.iter().cloned().collect::<Vec<_>>(),
+            s.ver,
+        )
+    };
+    if !enabled {
+        return false;
+    }
+    let (_, choices) = acp::perm_options(params);
+    if choices.is_empty() {
+        return false;
+    }
+    let key = format!("{approval_id}:{requirement_json}");
+    {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get_mut(acp_sid) else {
+            return false;
+        };
+        if s.approval_seen.contains(&key) {
+            return true;
+        }
+        s.approval_seen.insert(key);
+    }
+    let requirement = params
+        .get("currentRequirementId")
+        .cloned()
+        .unwrap_or(J::Null);
+    let prompt = reviewer::build_prompt(&j_to_string(params), &trusted, &evidence, &roots, &mode);
+    let job = ReviewJob {
+        acp_sid: acp_sid.to_string(),
+        owner_msp_sid: owner_msp_sid.to_string(),
+        ver,
+        approval_id: approval_id.to_string(),
+        requirement,
+        choices,
+        child_subagent_id: child_of(params),
+        prompt,
+    };
+    {
+        let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        st.queue.push_back(job);
+    }
+    start_next_review(host, stdout, sessions);
+    true
+}
+
+fn child_of(params: &J) -> Option<String> {
+    params
+        .get("subagentOrigin")
+        .and_then(|o| o.get("subagentId"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+}
+
+/// Starts the next queued review on the memory-only reviewer host. Any
+/// failure to start or describe the review denies that approval: an
+/// unanswered prompt is worse than a visible refusal.
+fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions) {
+    let (job, session, cwd) = {
+        let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        if st.active.is_some() {
+            return;
+        }
+        let Some(job) = st.queue.pop_front() else {
+            return;
+        };
+        let cwd = sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&job.acp_sid)
+            .map(|s| s.cwd.clone())
+            .unwrap_or_default();
+        (job, st.session.clone(), cwd)
+    };
+    let reviewer = match host.reviewer_host() {
+        Ok(host) => host,
+        Err(error) => {
+            deny_review_job(host, stdout, sessions, job, &error);
+            start_next_review(host, stdout, sessions);
+            return;
+        }
+    };
+    let session = match session {
+        Some(session) => session,
+        None => {
+            let cmd = reviewer.mint_cmd("cmd-");
+            let params = format!(
+                "{{\"commandId\":{},\"workspaceRoot\":{},\"approvalMode\":\"denyUnmatched\"}}",
+                esc(&cmd),
+                esc(&cwd)
+            );
+            match reviewer.command("session/start", &params) {
+                Ok(result) => match result
+                    .get("session")
+                    .and_then(|s| s.get("sessionId"))
+                    .and_then(|v| v.as_str())
+                {
+                    Some(sid) => {
+                        host.note_owner(sid, HostKind::Reviewer);
+                        let sid = sid.to_string();
+                        REVIEW_STATE
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .session = Some(sid.clone());
+                        sid
+                    }
+                    None => {
+                        deny_review_job(
+                            host,
+                            stdout,
+                            sessions,
+                            job,
+                            "reviewer session started without an id",
+                        );
+                        start_next_review(host, stdout, sessions);
+                        return;
+                    }
+                },
+                Err(error) => {
+                    deny_review_job(
+                        host,
+                        stdout,
+                        sessions,
+                        job,
+                        &format!("reviewer session failed: {}", err_message(&error)),
+                    );
+                    start_next_review(host, stdout, sessions);
+                    return;
+                }
+            }
+        }
+    };
+    let cmd = reviewer.mint_cmd("cmd-");
+    let params = format!(
+        "{{\"commandId\":{},\"sessionId\":{},\"prompt\":[{{\"type\":\"text\",\"text\":{}}}]}}",
+        esc(&cmd),
+        esc(&session),
+        esc(&job.prompt)
+    );
+    match reviewer.command("turn/start", &params) {
+        Ok(result) => {
+            let turn = result
+                .get("turnId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            log(&format!(
+                "auto-review started for {} on the memory-only reviewer host",
+                job.approval_id
+            ));
+            let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+            st.active = Some(job);
+            st.text.clear();
+            st.turn = turn;
+        }
+        Err(error) => {
+            deny_review_job(
+                host,
+                stdout,
+                sessions,
+                job,
+                &format!("reviewer turn failed: {}", err_message(&error)),
+            );
+            reset_reviewer_host(host);
+            start_next_review(host, stdout, sessions);
+        }
+    }
+}
+
+fn reset_reviewer_host(host: &Arc<Hosts>) {
+    if let Some(reviewer) = host.host(HostKind::Reviewer) {
+        reviewer.shutdown();
+    }
+    host.clear_reviewer();
+    REVIEW_STATE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .session = None;
+}
+
+/// Deny one job with the host's own reject choice, carrying the reviewer's
+/// rationale as feedback when the host accepts it.
+fn deny_review_job(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    job: ReviewJob,
+    rationale: &str,
+) {
+    let Some(choice) = reviewer::deny_choice(&job.choices) else {
+        log(&format!(
+            "auto-review deny {}: no reject choice; failing closed",
+            job.approval_id
+        ));
+        fail_closed_owner_work(
+            host,
+            sessions,
+            &job.acp_sid,
+            &job.owner_msp_sid,
+            job.child_subagent_id.as_deref(),
+        );
+        return;
+    };
+    let feedback = job
+        .choices
+        .iter()
+        .find(|c| c.id == choice)
+        .filter(|c| c.accepts_feedback)
+        .map(|_| rationale.to_string());
+    log(&format!(
+        "auto-review deny {}: {rationale}",
+        job.approval_id
+    ));
+    send_permission_decision(
+        host,
+        stdout,
+        sessions,
+        &job.acp_sid,
+        PermissionDecision {
+            msp_sid: job.owner_msp_sid,
+            ver: job.ver,
+            approval_id: job.approval_id,
+            requirement: job.requirement,
+            choice,
+            feedback,
+        },
+    );
+}
+
+fn finish_review(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    job: ReviewJob,
+    text: &str,
+) {
+    match reviewer::parse_assessment(text) {
+        Some(assessment) => match reviewer::effective_outcome(&assessment) {
+            reviewer::Outcome::Allow => match reviewer::allow_choice(&job.choices) {
+                Some(choice) => {
+                    log(&format!(
+                        "auto-review allow {}: {}",
+                        job.approval_id, assessment.rationale
+                    ));
+                    send_permission_decision(
+                        host,
+                        stdout,
+                        sessions,
+                        &job.acp_sid,
+                        PermissionDecision {
+                            msp_sid: job.owner_msp_sid,
+                            ver: job.ver,
+                            approval_id: job.approval_id,
+                            requirement: job.requirement,
+                            choice,
+                            feedback: None,
+                        },
+                    );
+                }
+                None => deny_review_job(
+                    host,
+                    stdout,
+                    sessions,
+                    job,
+                    "auto-review allowed the action but the host offered no approving choice",
+                ),
+            },
+            reviewer::Outcome::Deny => {
+                deny_review_job(host, stdout, sessions, job, &assessment.rationale)
+            }
+        },
+        None => deny_review_job(
+            host,
+            stdout,
+            sessions,
+            job,
+            "auto-review returned no usable decision",
+        ),
+    }
+    start_next_review(host, stdout, sessions);
+}
+
+/// Route reviewer-session events. Returns true when the event belonged to the
+/// reviewer and must not reach the user-session handlers.
+fn handle_review_event(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    method: &str,
+    params: &J,
+) -> bool {
+    let Some(sid) = params.get("sessionId").and_then(|v| v.as_str()) else {
+        return false;
+    };
+    {
+        let st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        if st.session.as_deref() != Some(sid) {
+            return false;
+        }
+    }
+    match method {
+        "item/delta" => {
+            let field = params
+                .get("field")
+                .and_then(|v| v.as_str())
+                .unwrap_or("text");
+            if field == "text"
+                && let Some(delta) = params.get("delta").and_then(|v| v.as_str())
+            {
+                let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+                if st.active.is_some() {
+                    st.text.push_str(delta);
+                }
+            }
+        }
+        "item/completed" => {
+            let item = params.get("item").cloned().unwrap_or(J::Null);
+            if item.get("kind").and_then(|v| v.as_str()) == Some("agentMessage")
+                && let Some(text) = item.get("text").and_then(|v| v.as_str())
+            {
+                let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+                if st.active.is_some() {
+                    st.text = text.to_string();
+                }
+            }
+        }
+        "turn/completed" => {
+            let turn = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+            let (job, text) = {
+                let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+                if !st.turn.is_empty() && !turn.is_empty() && st.turn != turn {
+                    return true;
+                }
+                (st.active.take(), std::mem::take(&mut st.text))
+            };
+            if let Some(job) = job {
+                finish_review(host, stdout, sessions, job, &text);
+            }
+        }
+        "approval/requested" | "approval/request" | "approval/updated" => {
+            // The reviewer must not act; deny its own approval so the review
+            // can continue to a decision.
+            let (_, choices) = acp::perm_options(params);
+            if let Some(choice) = acp::fallback_deny(&choices) {
+                let requirement = params
+                    .get("currentRequirementId")
+                    .cloned()
+                    .unwrap_or(J::Null);
+                let cmd = host.mint_cmd("cmd-");
+                let _ = host.command(
+                    "approval/decide",
+                    &format!(
+                        "{{\"commandId\":{},\"sessionId\":{},\"approvalId\":{},\"requirementId\":{},\"choiceId\":{}}}",
+                        esc(&cmd),
+                        esc(sid),
+                        esc(
+                            params
+                                .get("approvalId")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                        ),
+                        j_to_string(&requirement),
+                        esc(&choice),
+                    ),
+                );
+            }
+        }
+        _ => {}
+    }
+    true
+}
+
 /// Explicit opt-in parser for security-sensitive environment flags. Merely
 /// defining a variable (for example, to `0`) must not weaken confinement.
 fn env_flag_enabled(value: Option<&str>) -> bool {
@@ -6885,6 +7431,9 @@ fn handle_msp(
     method: &str,
     params: &J,
 ) {
+    if handle_review_event(host, stdout, sessions, method, params) {
+        return;
+    }
     // Track the newest view cursor on every event that carries one. Durable
     // item and usage notifications also use the cursor as a replay key;
     // approval and user-input requests use their own ids because a host may
@@ -7151,6 +7700,20 @@ fn handle_msp(
                     .get_mut(&acp_sid)
                 {
                     s.fold.on_item_completed(&acp_sid, s.ver, params, &mut out);
+                    let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("item");
+                    let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+                    let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
+                    let text: String = item
+                        .get("text")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .chars()
+                        .take(800)
+                        .collect();
+                    remember_review_line(
+                        &mut s.review_evidence,
+                        format!("{kind} {tool} {status}: {text}"),
+                    );
                 }
                 for line in out {
                     acp::send_raw(stdout, &line);
@@ -8000,6 +8563,11 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
         .unwrap_or(J::Null);
     let requirement_json = j_to_string(&requirement);
     let approval_key = format!("{}:{requirement_json}", approval_id);
+    // Adapter policy answers eligible approvals before the editor sees them.
+    // Ineligible or ambiguous requests fall through to the ordinary prompt.
+    if enqueue_review(host, stdout, sessions, &acp_sid, &owner_msp_sid, params) {
+        return;
+    }
     let mut stale_request = None;
     let mut duplicate = false;
     let mut queued = false;
@@ -9869,6 +10437,182 @@ mod tests {
             );
         }
         assert!(!env_flag_enabled(None));
+    }
+
+    // Replaced by the reviewer-session tests; kept out of the build until the
+    // old deterministic eligibility test is removed.
+    #[cfg(any())]
+    #[test]
+    fn auto_review_eligibility_is_workspace_strict() {
+        use super::{auto_review_choice, esc, parse_json};
+
+        let root = std::env::temp_dir().join(format!(
+            "muse-acp-auto-review-{}-eligibility",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let roots = vec![root.to_string_lossy().to_string()];
+        let inside = root.join("inside.txt");
+        std::fs::write(&inside, "x").unwrap();
+        let outside = std::env::temp_dir().join(format!(
+            "muse-acp-auto-review-{}-outside.txt",
+            std::process::id()
+        ));
+
+        const ONCE: &str = r#"[{"choiceId":"c-allow","decision":"approved","scope":"once"},{"choiceId":"c-always","decision":"approved","scope":"session"},{"choiceId":"c-deny","decision":"denied","scope":"once"}]"#;
+        const DURABLE_ONLY: &str = r#"[{"choiceId":"c-always","decision":"approved","scope":"session"},{"choiceId":"c-deny","decision":"denied","scope":"once"}]"#;
+
+        let build = |outer: &str, subject_extra: &str, kind: &str, path: &str, choices: &str| {
+            parse_json(&format!(
+                "{{{outer}\"subject\":{{\"kind\":{kind},\"access\":\"write\",\"path\":{path}{subject_extra}}},\"availableChoices\":{choices}}}"
+            ))
+            .unwrap()
+        };
+        let json_path = |path: &std::path::Path| esc(&path.to_string_lossy());
+        let choice = |params: &J| auto_review_choice(params, &roots);
+
+        assert_eq!(
+            choice(&build("", "", "\"fileAccess\"", &json_path(&inside), ONCE)),
+            Some("c-allow".to_string()),
+            "an existing file inside the root is eligible"
+        );
+        assert_eq!(
+            choice(&build(
+                "",
+                "",
+                "\"fileAccess\"",
+                &json_path(&root.join("created.txt")),
+                ONCE
+            )),
+            Some("c-allow".to_string()),
+            "a create whose canonical parent is inside the root is eligible"
+        );
+        assert_eq!(
+            choice(&build(
+                "",
+                "",
+                "\"fileAccess\"",
+                &esc(&format!("relative{}file.txt", std::path::MAIN_SEPARATOR)),
+                ONCE
+            )),
+            None,
+            "relative paths are never auto-approved"
+        );
+        assert_eq!(
+            choice(&build(
+                "",
+                "",
+                "\"fileAccess\"",
+                &json_path(&root.join("missing-dir").join("created.txt")),
+                ONCE
+            )),
+            None,
+            "a create whose parent does not resolve is never auto-approved"
+        );
+        assert_eq!(
+            choice(&build("", "", "\"fileAccess\"", &json_path(&outside), ONCE)),
+            None,
+            "a path outside every root is never auto-approved"
+        );
+        assert_eq!(
+            choice(&build(
+                "",
+                &format!(",\"target\":{}", json_path(&outside)),
+                "\"fileAccess\"",
+                &json_path(&inside),
+                ONCE
+            )),
+            None,
+            "an out-of-root move target is never auto-approved"
+        );
+        assert_eq!(
+            choice(&build("", "", "\"shell\"", &json_path(&inside), ONCE)),
+            None,
+            "shell subjects are never auto-approved"
+        );
+        assert_eq!(
+            choice(&build("", "", "\"unixSocket\"", &json_path(&inside), ONCE)),
+            None,
+            "socket subjects are never auto-approved"
+        );
+        assert_eq!(
+            choice(&build("", "", "\"futureKind\"", &json_path(&inside), ONCE)),
+            None,
+            "unknown subjects are never auto-approved"
+        );
+        assert_eq!(
+            choice(&build(
+                "\"judgeEscalated\":true,",
+                "",
+                "\"fileAccess\"",
+                &json_path(&inside),
+                ONCE
+            )),
+            None,
+            "a host-judged escalation is never overridden"
+        );
+        assert_eq!(
+            choice(&build(
+                "\"protectedWrite\":true,",
+                "",
+                "\"fileAccess\"",
+                &json_path(&inside),
+                ONCE
+            )),
+            None,
+            "a protected write is never auto-approved"
+        );
+        assert_eq!(
+            choice(&build(
+                "\"subagentOrigin\":{\"subagentId\":\"child-1\"},",
+                "",
+                "\"fileAccess\"",
+                &json_path(&inside),
+                ONCE
+            )),
+            None,
+            "child approvals prompt in the first cut"
+        );
+        assert_eq!(
+            choice(&build(
+                "",
+                "",
+                "\"fileAccess\"",
+                &json_path(&inside),
+                DURABLE_ONLY
+            )),
+            None,
+            "session-scoped grants are never selected silently"
+        );
+
+        #[cfg(unix)]
+        {
+            let outside_file = outside.with_extension("symlink-target");
+            std::fs::write(&outside_file, "outside").unwrap();
+            let escape = root.join("escape.txt");
+            let _ = std::fs::remove_file(&escape);
+            std::os::unix::fs::symlink(&outside_file, &escape).unwrap();
+            assert_eq!(
+                choice(&build("", "", "\"fileAccess\"", &json_path(&escape), ONCE)),
+                None,
+                "a symlink that resolves outside the root is never auto-approved"
+            );
+            let dangling = root.join("dangling.txt");
+            let _ = std::fs::remove_file(&dangling);
+            std::os::unix::fs::symlink(outside.with_extension("missing"), &dangling).unwrap();
+            assert_eq!(
+                choice(&build(
+                    "",
+                    "",
+                    "\"fileAccess\"",
+                    &json_path(&dangling),
+                    ONCE
+                )),
+                None,
+                "a dangling symlink is never auto-approved"
+            );
+        }
     }
 
     #[test]

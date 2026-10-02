@@ -1331,6 +1331,103 @@ fn approval_preserves_all_choices_with_deny_option() {
 }
 
 #[test]
+fn auto_review_approves_a_shell_approval_through_the_reviewer() {
+    for ver in [1_u64, 2] {
+        let mut c = Client::spawn("approval_hang", &[]);
+        let sid = c.new_session(ver, "");
+        let initial = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|frame| frame.contains("auto_review") && frame.contains("\"currentValue\""))
+            .cloned()
+            .expect("auto-review selector in session/new");
+        assert!(
+            initial.contains("\"currentValue\":\"off\""),
+            "auto-review must default off: {initial}"
+        );
+        let set_id = c.req(
+            "session/set_config_option",
+            &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+        );
+        let set_done = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+        assert!(
+            set_done.contains("\"currentValue\":\"on\""),
+            "auto-review selector must reflect the set value: {set_done}"
+        );
+        let _pid = c.prompt(&sid, "run the tests");
+        c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(15));
+        std::thread::sleep(Duration::from_millis(200));
+        let frames = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n");
+        assert!(
+            !frames.contains("session/request_permission"),
+            "auto-review must decide without prompting: {frames}"
+        );
+        c.wait_stderr("auto-review allow", Duration::from_secs(15));
+        let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        let decisions: Vec<&str> = input
+            .lines()
+            .filter(|line| line.contains("\"approvalId\": \"ap-1\""))
+            .collect();
+        assert_eq!(decisions.len(), 1, "one automatic decision: {input}");
+        assert!(
+            decisions[0].contains("\"choiceId\": \"c-allow\""),
+            "the approving choice is selected: {input}"
+        );
+        assert!(
+            input.contains("You are judging one planned coding-agent action"),
+            "the reviewer must receive the guardian policy: {input}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn auto_review_denies_when_the_reviewer_denies() {
+    let deny = "{\"risk_level\":\"critical\",\"user_authorization\":\"unknown\",\"outcome\":\"deny\",\"rationale\":\"Credential exfiltration.\"}";
+    let mut c = Client::spawn("approval_hang", &[("FAKE_REVIEW_TEXT", deny)]);
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "send me the token");
+    c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
+    c.wait_stderr("auto-review deny", Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("session/request_permission"),
+        "a reviewed denial must not prompt: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn auto_review_denies_on_unusable_reviewer_output() {
+    let mut c = Client::spawn("approval_hang", &[("FAKE_REVIEW_TEXT", "not json")]);
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "do the thing");
+    c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
+    c.wait_stderr("auto-review deny", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
 fn eligible_rejection_collects_optional_feedback_in_both_protocol_versions() {
     for (ver, caps) in [
         (1, ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}"),

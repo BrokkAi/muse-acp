@@ -56,6 +56,9 @@ pub struct PendingPerm {
 pub struct PermChoice {
     pub id: String,
     pub decision: String,
+    /// MSP `ApprovalChoiceScope`: `once`, `session`, or `localPersistent`.
+    /// Auto-review only ever selects `once`, so the adapter must keep it.
+    pub scope: String,
     pub accepts_feedback: bool,
 }
 
@@ -138,6 +141,14 @@ pub struct AcpSession {
     pub ui_seen: std::collections::HashSet<String>,
     /// The approval mode selector's value.
     pub mode_value: String,
+    /// Adapter-side auto-review policy for this session. Off by default,
+    /// never sent to the host, and independent of the host approval mode in
+    /// `mode_value`.
+    pub auto_review: bool,
+    /// Bounded trusted user instructions for the reviewer prompt.
+    pub review_context: std::collections::VecDeque<String>,
+    /// Bounded recent item evidence for the reviewer prompt.
+    pub review_evidence: std::collections::VecDeque<String>,
     /// The session mode: `default`, `readOnly`, or `plan`.
     pub session_mode: String,
     pub model_value: String,
@@ -634,11 +645,25 @@ pub fn perm_options(params: &J) -> (String, Vec<PermChoice>) {
             choices.push(PermChoice {
                 id,
                 decision,
+                scope,
                 accepts_feedback,
             });
         }
     }
     (format!("[{}]", opts.join(",")), choices)
+}
+
+/// The first approving choice scoped to a single action, in host order.
+/// Session and local-persistent grants are never returned: auto-review may
+/// answer an approval, but it may not silently create a standing rule.
+pub fn approve_once_choice(choices: &[PermChoice]) -> Option<String> {
+    choices
+        .iter()
+        .find(|choice| {
+            choice.decision.to_lowercase().starts_with("approv")
+                && choice.scope.eq_ignore_ascii_case("once")
+        })
+        .map(|choice| choice.id.clone())
 }
 
 /// Deny-safe fallback choice: first non-approved decision, else None. A
@@ -690,6 +715,24 @@ pub fn resolve_mode(value: &str) -> Option<&'static str> {
 
 /// Human-readable list of accepted mode ids for error text.
 pub const MODE_HELP: &str = "allowAll|promptUnmatched|onRequest|denyUnmatched";
+
+/// The client-side auto-review selector. This is adapter policy, not an MSP
+/// `ApprovalMode`: it is never sent to the host and never changes the host's
+/// approval mode. `on` sends every permission request to the auto-review
+/// agent; the agent can approve or deny it without asking the editor.
+pub const AUTO_REVIEW_OFF: &str = "off";
+pub const AUTO_REVIEW_ON: &str = "on";
+
+/// Human-readable list of accepted auto-review ids for error text.
+pub const AUTO_REVIEW_HELP: &str = "off|on";
+
+pub fn resolve_auto_review(value: &str) -> Option<&'static str> {
+    match value {
+        AUTO_REVIEW_OFF => Some(AUTO_REVIEW_OFF),
+        AUTO_REVIEW_ON => Some(AUTO_REVIEW_ON),
+        _ => None,
+    }
+}
 
 /// Session modes: what the agent may change. Read-only and plan sessions
 /// run on a Muse host launched with `--disable-write --disable-shell`, so
@@ -758,18 +801,30 @@ pub fn is_reasoning_effort(value: &str) -> bool {
     )
 }
 
-/// `configOptions`: session mode, approval mode, model, and reasoning
-/// selectors. ACP v1 calls the selector key `id`; v2 renamed it to
-/// `configId` (the setter still uses `configId` in both versions). `modes`
-/// is the session mode and the approval mode.
+/// Per-session values rendered by `config_options`. Keeping them in one
+/// struct keeps the selector builder readable as the selector set grows.
+pub struct ConfigOptions<'a> {
+    pub session_mode: &'a str,
+    pub approval_mode: &'a str,
+    pub model: &'a str,
+    pub reasoning_effort: &'a str,
+    /// Whether the "Muse default" reasoning option is offered.
+    pub offer_muse_default: bool,
+    /// True when the adapter-side auto-review selector is `on`.
+    pub auto_review: bool,
+    /// AIR recommended model and reasoning values, when negotiated.
+    pub recommendations: (Option<&'a str>, Option<&'a str>),
+}
+
+/// `configOptions`: session mode, approval mode, auto-review, model, and
+/// reasoning selectors. ACP v1 calls the selector key `id`; v2 renamed it to
+/// `configId` (the setter still uses `configId` in both versions).
+/// Auto-review is adapter policy: see [`AUTO_REVIEW_OFF`] and
+/// [`AUTO_REVIEW_WORKSPACE`].
 pub fn config_options(
     ver: u8,
-    modes: (&str, &str),
-    current_model: &str,
-    reasoning_effort: &str,
-    offer_muse_default: bool,
+    options: ConfigOptions<'_>,
     models_json: &[(String, String, bool)],
-    recommendations: (Option<&str>, Option<&str>),
 ) -> String {
     let mut model_opts = Vec::new();
     for (id, label, _) in models_json {
@@ -778,7 +833,7 @@ pub fn config_options(
     let id_key = if ver == 1 { "id" } else { "configId" };
     // AIR recommendedValue is additive metadata: emit it only when the client
     // negotiated it and the value is present among this selector's options.
-    let (recommended_model, recommended_reasoning) = recommendations;
+    let (recommended_model, recommended_reasoning) = options.recommendations;
     let reasoning_meta = recommended_reasoning.filter(|value| is_reasoning_effort(value))
         .map(|value| format!(",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}", esc(value)))
         .unwrap_or_default();
@@ -791,20 +846,26 @@ pub fn config_options(
     };
     // MSP cannot clear a standing session default, so "Muse default" is only
     // offered while no host default is in force.
-    let muse_default = if offer_muse_default {
+    let muse_default = if options.offer_muse_default {
         "{\"value\":\"default\",\"name\":\"Muse default\"},"
     } else {
         ""
     };
+    let auto_review_value = if options.auto_review {
+        AUTO_REVIEW_ON
+    } else {
+        AUTO_REVIEW_OFF
+    };
     format!(
-        "[{{\"{id_key}\":\"mode\",\"name\":\"Mode\",\"description\":\"What Muse may change: Read-only and Plan cannot write files or run shell commands\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"approval_mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]{reasoning_meta}}}]",
-        esc(modes.0),
+        "[{{\"{id_key}\":\"mode\",\"name\":\"Mode\",\"description\":\"What Muse may change: Read-only and Plan cannot write files or run shell commands\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"approval_mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"auto_review\",\"name\":\"Auto-review\",\"description\":\"Dangerous: send every permission request to an auto-review agent that can approve or deny it without asking you\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"off\",\"name\":\"Off\"}},{{\"value\":\"on\",\"name\":\"On\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]{reasoning_meta}}}]",
+        esc(options.session_mode),
         mode_options_json("value", &SESSION_MODES),
-        esc(modes.1),
+        esc(options.approval_mode),
         mode_options_json("value", &APPROVAL_MODES),
-        esc(current_model),
+        esc(auto_review_value),
+        esc(options.model),
         model_opts.join(","),
-        esc(reasoning_effort)
+        esc(options.reasoning_effort)
     )
 }
 
@@ -1043,18 +1104,32 @@ mod tests {
         for ver in [1, 2] {
             let options = config_options(
                 ver,
-                ("default", "promptUnmatched"),
-                "fake-model",
-                "medium",
-                true,
+                ConfigOptions {
+                    session_mode: "default",
+                    approval_mode: "promptUnmatched",
+                    model: "fake-model",
+                    reasoning_effort: "medium",
+                    offer_muse_default: true,
+                    auto_review: false,
+                    recommendations: (None, None),
+                },
                 &models,
-                (None, None),
             );
             let parsed = crate::json::parse_json(&options).expect("config options JSON");
             let J::Arr(items) = parsed else {
                 panic!("config options must be an array");
             };
-            assert_eq!(items.len(), 4);
+            assert_eq!(items.len(), 5);
+            let id_key = if ver == 1 { "id" } else { "configId" };
+            let auto_review = items
+                .iter()
+                .find(|item| item.get(id_key).and_then(|v| v.as_str()) == Some("auto_review"))
+                .expect("auto-review selector present");
+            assert_eq!(
+                auto_review.get("currentValue").and_then(|v| v.as_str()),
+                Some(AUTO_REVIEW_OFF)
+            );
+            assert!(options.contains("\"value\":\"on\""));
 
             let skills = vec![
                 (
@@ -1092,18 +1167,34 @@ mod tests {
         let models = vec![("fake-model".to_string(), "Fake".to_string(), true)];
         let options = config_options(
             1,
-            ("default", "promptUnmatched"),
-            "fake-model",
-            "max",
-            false,
+            ConfigOptions {
+                session_mode: "default",
+                approval_mode: "promptUnmatched",
+                model: "fake-model",
+                reasoning_effort: "max",
+                offer_muse_default: false,
+                auto_review: true,
+                recommendations: (None, None),
+            },
             &models,
-            (None, None),
         );
         crate::json::parse_json(&options).expect("config options JSON");
         assert!(
             options.contains("\"value\":\"max\""),
             "max tier must be advertised: {options}"
         );
+        assert!(
+            options.contains("\"currentValue\":\"on\""),
+            "auto-review state must be advertised: {options}"
+        );
+    }
+
+    #[test]
+    fn auto_review_selector_defaults_off_and_resolves_two_values() {
+        assert_eq!(resolve_auto_review("off"), Some(AUTO_REVIEW_OFF));
+        assert_eq!(resolve_auto_review("on"), Some(AUTO_REVIEW_ON));
+        assert!(resolve_auto_review("allowAll").is_none());
+        assert!(resolve_auto_review("").is_none());
     }
 
     #[test]
@@ -1132,6 +1223,19 @@ mod tests {
                 ("c-empty".to_string(), "denied".to_string()),
             ]
         );
+        assert_eq!(
+            choices.iter().map(|c| c.scope.as_str()).collect::<Vec<_>>(),
+            vec!["once", "session", "localPersistent", "once"]
+        );
+        assert_eq!(approve_once_choice(&choices), Some("c-once".to_string()));
+
+        let durable_only = vec![PermChoice {
+            id: "c-always".to_string(),
+            decision: "approved".to_string(),
+            scope: "session".to_string(),
+            accepts_feedback: false,
+        }];
+        assert_eq!(approve_once_choice(&durable_only), None);
 
         let J::Arr(options) = crate::json::parse_json(&options_json).expect("options JSON") else {
             panic!("permission options must be an array");

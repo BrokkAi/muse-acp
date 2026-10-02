@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add session-scoped **Auto-review**. A new default-off `auto_review`
+  selector sends every permission request to a reviewer agent instead of the
+  editor. The reviewer runs on a memory-only, read-only Muse host, follows a
+  Codex-style safety policy, and answers with a risk level, user-authorization
+  score, allow/deny outcome, and rationale; failures deny. The selector never
+  changes the host's approval mode, and each decision is logged with its
+  rationale. See the README Auto-review section and
+  [docs/auto-review.md](docs/auto-review.md).
 - Add **Read-only** and **Plan** session modes. The editor's Mode selector
   now offers Default, Read-only, and Plan. Read-only and Plan sessions run on
   a second `muse serve` started with `--disable-write --disable-shell`, so

@@ -22,6 +22,41 @@ ACP v1 and v2, and installs on macOS, Linux, and Windows.
 > products of Meta Platforms, Inc. This project is not affiliated with,
 > endorsed by, or supported by Meta.
 
+## Auto-review: let an agent decide every prompt
+
+Muse Code's own `:auto-review` permission profile is a TUI feature. Under
+`muse serve`, a saved `:auto-review` session falls back to asking you for
+everything, so editor users choose between clicking through every prompt or
+switching to `allowAll` and giving up review entirely. `muse-acp` gives you
+the middle path: a per-session **Auto-review** selector that sends every
+permission request to a reviewer agent instead of to you.
+
+The reviewer is a second Muse model session on its own memory-only, read-only
+host (`--no-session-log`), so reviews are never saved and never touch your
+files. It gets the same kind of input Codex's guardian gets: a fixed safety
+policy, your trusted instructions, recent evidence, and the exact approval
+request. It answers with strict JSON - `risk_level`, `user_authorization`,
+`outcome`, and a rationale. Low and medium risk actions proceed; critical
+risk is denied; high risk proceeds only when your instructions authorize it.
+A reviewer failure or an unusable answer denies the action rather than
+letting it run. Every decision is logged to stderr with its rationale.
+
+```mermaid
+flowchart TD
+    A[Muse sends a permission request] --> B{Auto-review on?}
+    B -- No --> P[Editor permission prompt]
+    B -- Yes --> R[Reviewer agent: policy + instructions + action]
+    R --> D{allow or deny?}
+    D -- allow --> E[approval/decide with an allowing choice]
+    D -- deny --> F[approval/decide with a rejecting choice + rationale]
+```
+
+Auto-review is off by default. Select **On** in the **Auto-review**
+selector, next to Approval Mode in clients that render ACP `configOptions`,
+and it applies to that session only. See the
+[Auto-review guide](docs/auto-review.md) for the policy, the reviewer's
+inputs, the decision thresholds, and the failure behavior.
+
 ## Requirements
 
 - **Muse Code** installed, authenticated, and available as `muse` on `PATH`.
@@ -180,6 +215,9 @@ The adapter reads its settings from the environment. Export them in your shell,
 or set them in the client's agent entry so the editor passes them to the
 adapter.
 
+Auto-review is the exception: it is a per-session selector, not an environment
+variable. See [Auto-review](#auto-review-keep-the-boundary-lose-the-busywork).
+
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `MUSE_CLI` | `muse` | Muse host binary to launch. Use an absolute path when the editor's `PATH` differs from your shell's. On Windows the default also finds the `muse.cmd` launcher that the Muse installer puts on `PATH`. When `PATH` has no `muse`, the default falls back to the Muse installer's location (`MUSE_INSTALL_DIR`, else `~/.local/bin`, or `%LOCALAPPDATA%\Programs\muse` on Windows). |
@@ -266,7 +304,9 @@ error the editor shows if Muse then refuses the profile says why.
   cancellation with a terminal event, and exact-turn steering over the ACP v2
   `_session/steering` extension.
 - **Approvals** — Muse approval requests surfaced as
-  `session/request_permission`, with a deny-safe fallback.
+  `session/request_permission`, with a deny-safe fallback, plus optional
+  [Auto-review](#auto-review-keep-the-boundary-lose-the-busywork) for
+  workspace-local file access.
 - **MCP servers** — stdio and HTTP MCP servers attached by the editor load
   into the Muse session on Muse 1.3.0 and newer; see
   [Client-provided MCP servers](#client-provided-mcp-servers).
@@ -275,10 +315,10 @@ error the editor shows if Muse then refuses the profile says why.
   the host falls back to auto-cancel.
 - **Modes** — Default, Read-only, and Plan, where Muse itself refuses file
   writes and shell commands; see [Read-only and plan modes](#read-only-and-plan-modes).
-- **Configuration** — mode, approval mode, model, and reasoning effort exposed
-  as ACP `configOptions` selectors, refreshed from Muse on create, load,
-  resume, and config change. The reasoning selector starts at `Muse default`
-  and sends no override until you pick a tier.
+- **Configuration** — mode, approval mode, auto-review, model, and reasoning
+  effort exposed as ACP `configOptions` selectors, refreshed from Muse on
+  create, load, resume, and config change. The reasoning selector starts at
+  `Muse default` and sends no override until you pick a tier.
 - **Skills** — Muse's skill catalog drives ACP `available_commands_update`.
   Slash prompts such as `/plan` use native skill turn parts; `/compact` invokes
   Muse's native compaction.
@@ -417,7 +457,7 @@ messages:
 | `item/delta` message text | `agent_message_chunk` |
 | `toolCall` items | `tool_call` and `tool_call_update` |
 | `turn/completed` | v1 prompt response with stop reason and usage; v2 `state_update` |
-| `approval/requested` | `session/request_permission`, answered with `approval/decide` |
+| `approval/requested` | `session/request_permission`, answered with `approval/decide`; eligible requests can be answered directly by Auto-review |
 | `userInput/requested` | `elicitation/create` form |
 | `model/list`, `session/setModel`, `session/setApprovalMode`, `session/setReasoningEffort` | `configOptions` selectors and `session/set_config_option` |
 | `skill/list`, `skill/changed` | `available_commands_update` |

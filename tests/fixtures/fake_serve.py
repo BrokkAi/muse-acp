@@ -113,6 +113,10 @@ SCHEMA = {"fingerprint": FP, "version": 1}
 MSP_SID = "msp-sess-1"
 SCENARIO = os.environ.get("FAKE_SCENARIO", "happy")
 MODE = os.environ.get("FAKE_MODE", "promptUnmatched")
+# The adapter launches a third, memory-only host for auto-review. It serves
+# one reviewer session and answers each review turn with scripted JSON.
+REVIEW_HOST = "--no-session-log" in sys.argv
+REVIEW_SID = "msp-reviewer"
 # When set, session/setApprovalMode folds to this mode instead of echoing the
 # request, modelling a host that downgrades or pins the effective mode.
 FOLDED_MODE = os.environ.get("FAKE_FOLDED_MODE", "")
@@ -263,6 +267,29 @@ def on_goal_command(method, params):
 
 
 ACTIVE_WORKSPACE = ["/tmp/fake-ws"]
+
+
+def approval_params(**overrides):
+    """Approval params with the file-write path resolved at emission time.
+
+    FAKE_APPROVAL_PATH=workspace points a fileAccess subject at the active
+    session workspace; any other non-empty value is used literally. The
+    default subject (shell) is returned unchanged.
+    """
+    params = dict(APPROVAL_PARAMS)
+    params.update(overrides)
+    subject = params.get("subject")
+    if isinstance(subject, dict) and subject.get("kind") == "fileAccess":
+        override = os.environ.get("FAKE_APPROVAL_PATH", "")
+        if override == "workspace":
+            subject = dict(subject)
+            subject["path"] = os.path.join(ACTIVE_WORKSPACE[0], "output.txt")
+            params["subject"] = subject
+        elif override:
+            subject = dict(subject)
+            subject["path"] = override
+            params["subject"] = subject
+    return params
 
 
 def session_obj(session_id=None, workspace_root=None):
@@ -507,17 +534,17 @@ def on_turn_start(params):
             "args": json.dumps({"command": "printf data > inferred.txt"})}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO in ("approval", "pending_reconcile_dup"):
-        notify("approval/requested", dict(APPROVAL_PARAMS))
+        notify("approval/requested", approval_params())
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO in ("approval_hang", "approval_queue"):
         # The turn stays open until the client answers or cancels.
-        notify("approval/requested", dict(APPROVAL_PARAMS))
+        notify("approval/requested", approval_params())
         if SCENARIO == "approval_queue":
-            notify("approval/requested", {**APPROVAL_PARAMS, "approvalId": "approval-second"})
+            notify("approval/requested", approval_params(approvalId="approval-second"))
     elif SCENARIO == "approval_resolved_elsewhere":
         # Another actor (policy, reviewer, or a second client) decides the
         # approval while the editor still shows the permission prompt.
-        notify("approval/requested", dict(APPROVAL_PARAMS))
+        notify("approval/requested", approval_params())
         notify("approval/resolved", {
             "sessionId": MSP_SID, "approvalId": "ap-1", "itemId": "it-ap",
             "turnId": tid, "decision": "approved", "resolvedBy": "policy",
@@ -1018,6 +1045,13 @@ def on_turn_start(params):
 
 
 def result_for(method, msg):
+    if REVIEW_HOST:
+        if method == "session/start":
+            return {"session": session_obj(session_id=REVIEW_SID),
+                    "viewCursor": "cur-review"}
+        if method == "turn/start":
+            log_input(msg.get("params", {}))
+            return {"status": "accepted"}
     if method == "initialize":
         requested = (msg.get("params", {}).get("capabilities", {})
                      .get("requestedCapabilities", []))
@@ -1756,6 +1790,21 @@ def main():
                     continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
+                if REVIEW_HOST and method == "turn/start":
+                    text = os.environ.get(
+                        "FAKE_REVIEW_TEXT",
+                        '{"outcome":"allow","rationale":"routine action"}')
+                    notify("item/delta", {
+                        "sessionId": REVIEW_SID, "itemId": "review-msg",
+                        "field": "text", "delta": text})
+                    notify("item/completed", {
+                        "sessionId": REVIEW_SID,
+                        "item": {"itemId": "review-msg", "kind": "agentMessage",
+                                 "status": "completed", "text": text}})
+                    notify("turn/completed", {
+                        "sessionId": REVIEW_SID, "turnId": "review-turn-1",
+                        "terminal": "completed"})
+                    continue
                 if SCENARIO in ("session_list_stream", "session_list_stream_denied") \
                         and method == "session/start":
                     root = msg.get("params", {}).get("workspaceRoot", "/tmp/fake-ws")
