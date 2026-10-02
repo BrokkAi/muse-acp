@@ -298,10 +298,15 @@ impl Adapter {
         }
     }
 
-    fn result(&self, id: u64) -> Value {
-        let response = self.wait(&format!("the response to request {id}"), |frame| {
+    /// The response to request `id`, error or not.
+    fn response(&self, id: u64) -> Value {
+        self.wait(&format!("the response to request {id}"), |frame| {
             frame["id"] == id && frame.get("method").is_none()
-        });
+        })
+    }
+
+    fn result(&self, id: u64) -> Value {
+        let response = self.response(id);
         assert!(
             response.get("error").is_none(),
             "request {id} failed: {response}"
@@ -318,19 +323,23 @@ impl Adapter {
     }
 
     fn prompt(&mut self, session: &str, text: &str) -> u64 {
-        self.request(
-            "session/prompt",
-            json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]}),
-        )
+        self.prompt_with(session, text, Value::Null)
     }
 
-    /// Prompts and returns the stop reason once the turn ends.
-    fn turn(&mut self, session: &str, text: &str) -> String {
+    fn prompt_with(&mut self, session: &str, text: &str, meta: Value) -> u64 {
+        let mut params = json!({"sessionId": session, "prompt": [{"type": "text", "text": text}]});
+        if !meta.is_null() {
+            params["_meta"] = meta;
+        }
+        self.request("session/prompt", params)
+    }
+
+    /// Prompts and requires the turn to end normally.
+    fn turn(&mut self, session: &str, text: &str) -> Value {
         let id = self.prompt(session, text);
-        self.result(id)["stopReason"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string()
+        let result = self.result(id);
+        assert_eq!(result["stopReason"], "end_turn", "{text}: {result}");
+        result
     }
 
     /// Waits until the adapter's log contains `needle`.
@@ -353,20 +362,22 @@ impl Adapter {
     /// The process id of the adapter's `muse serve` child (Linux only).
     #[cfg(target_os = "linux")]
     fn host_pid(&self) -> u32 {
-        let tasks = format!("/proc/{}/task", self.child.id());
-        std::fs::read_dir(&tasks)
+        let adapter = self.child.id();
+        std::fs::read_dir("/proc")
             .unwrap()
             .flatten()
-            .map(|task| std::fs::read_to_string(task.path().join("children")).unwrap_or_default())
-            .collect::<Vec<_>>()
-            .join(" ")
-            .split_whitespace()
-            .filter_map(|pid| pid.parse::<u32>().ok())
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<u32>().ok())
             .find(|pid| {
-                std::fs::read(format!("/proc/{pid}/cmdline"))
-                    .is_ok_and(|cmdline| cmdline.split(|b| *b == 0).any(|arg| arg == b"serve"))
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+                // The parent pid follows the state, after the command name.
+                let parent = stat
+                    .rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok());
+                parent == Some(adapter)
+                    && std::fs::read(format!("/proc/{pid}/cmdline"))
+                        .is_ok_and(|cmdline| cmdline.split(|b| *b == 0).any(|arg| arg == b"serve"))
             })
-            .expect("a muse serve child")
+            .expect("a muse serve child of the adapter")
     }
 
     fn updates(&self, kind: &str) -> Vec<Value> {
@@ -592,56 +603,73 @@ fn a_saved_auto_review_profile_still_sends_approvals_to_the_editor() {
     assert_eq!(host.settings(), saved, "saved settings must not change");
 }
 
+/// The replies the provider sent, one per model call.
+fn replies(host: &Host) -> Vec<Value> {
+    std::fs::read_to_string(host.dir.join("provider.log"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .map(|call| call["reply"].clone())
+        .collect()
+}
+
 #[test]
-fn a_fork_continues_on_its_own() {
-    if !enabled("a_fork_continues_on_its_own") {
+fn a_fork_starts_from_the_source_history_and_continues_on_its_own() {
+    if !enabled("a_fork_starts_from_the_source_history_and_continues_on_its_own") {
         return;
     }
     let host = Host::start(json!({"hello": {"text": "loopback says hello"}}), None);
     let mut adapter = Adapter::launch(&host);
     let session = adapter.new_session(&host, json!([]));
-    assert_eq!(adapter.turn(&session, "first [[script:hello]]"), "end_turn");
-    let id = adapter.request("session/fork", json!({"sessionId": session}));
+    adapter.turn(&session, "first [[script:hello]]");
+    let id = adapter.request(
+        "session/fork",
+        json!({"sessionId": session, "cwd": host.workspace(), "mcpServers": []}),
+    );
     let fork = adapter.result(id)["sessionId"]
         .as_str()
         .unwrap()
         .to_string();
     assert_ne!(fork, session);
-    assert_eq!(
-        adapter.turn(&fork, "in the fork [[script:hello]]"),
-        "end_turn"
-    );
-    assert_eq!(
-        adapter.turn(&session, "in the source [[script:hello]]"),
-        "end_turn"
-    );
+    adapter.wait("the fork's copy of the first prompt", |frame| {
+        frame["params"]["sessionId"] == fork.as_str()
+            && frame["params"]["update"]["sessionUpdate"] == "user_message_chunk"
+            && frame["params"]["update"]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("first"))
+    });
+    adapter.turn(&fork, "in the fork [[script:hello]]");
+    adapter.turn(&session, "in the source [[script:hello]]");
     adapter.finish();
 }
 
 #[test]
-fn compact_reaches_the_hosts_compaction() {
-    if !enabled("compact_reaches_the_hosts_compaction") {
+fn compact_on_a_short_session_ends_with_muses_reason() {
+    if !enabled("compact_on_a_short_session_ends_with_muses_reason") {
         return;
     }
     let host = Host::start(json!({"hello": {"text": "loopback says hello"}}), None);
     let mut adapter = Adapter::launch(&host);
     let session = adapter.new_session(&host, json!([]));
-    assert_eq!(
-        adapter.turn(&session, "context [[script:hello]]"),
-        "end_turn"
+    adapter.turn(&session, "context [[script:hello]]");
+    let calls = replies(&host).len();
+    adapter.turn(&session, "/compact");
+    // Every pinned build declines a session this short, and the command
+    // goes to Muse's compaction, never to the model as text.
+    assert!(
+        adapter
+            .text("agent_message_chunk")
+            .contains("Muse did not compact this session ("),
+        "{:?}",
+        adapter.updates("agent_message_chunk")
     );
-    let id = adapter.prompt(&session, "/compact");
-    let response = adapter.wait("the /compact response", |frame| {
-        frame["id"] == id && frame.get("method").is_none()
-    });
-    // Muse may decline to compact so short a session; either way the
-    // command reached its native compaction rather than the model.
-    let compacted = response["result"]["stopReason"] == "end_turn";
-    let declined = response["error"]["message"]
-        .as_str()
-        .is_some_and(|message| message.contains("compaction_unavailable"));
-    assert!(compacted || declined, "{response}");
-    assert_eq!(adapter.turn(&session, "after [[script:hello]]"), "end_turn");
+    assert!(
+        !replies(&host)[calls..]
+            .iter()
+            .any(|reply| reply["text"] == "ok"),
+        "/compact must not reach the model as a prompt"
+    );
+    adapter.turn(&session, "after [[script:hello]]");
     adapter.finish();
 }
 
@@ -656,17 +684,19 @@ fn a_goal_runs_until_the_model_completes_it() {
     );
     let mut adapter = Adapter::launch(&host);
     let session = adapter.new_session(&host, json!([]));
-    // The goal's own turn completes it right away.
-    assert_eq!(
-        adapter.turn(&session, "/goal say hello once [[script:goal]]"),
-        "end_turn"
+    adapter.turn(&session, "/goal say hello once [[script:goal]]");
+    assert!(
+        replies(&host)
+            .iter()
+            .any(|reply| reply["tool"]["name"] == "update_goal"),
+        "the goal's turn must have reached the model and completed the goal"
     );
     adapter.finish();
 }
 
 #[test]
-fn each_stage_of_a_piped_shell_command_asks_first() {
-    if !enabled("each_stage_of_a_piped_shell_command_asks_first") {
+fn a_piped_shell_command_asks_with_every_stage() {
+    if !enabled("a_piped_shell_command_asks_with_every_stage") {
         return;
     }
     let host = Host::start(
@@ -680,7 +710,7 @@ fn each_stage_of_a_piped_shell_command_asks_first() {
     let session = adapter.new_session(&host, json!([]));
     let id = adapter.prompt(&session, "pipe it [[script:pipe]]");
     let mut answered = Vec::new();
-    // Each stage is its own permission request; answer them in turn.
+    // Answer every permission request until the turn ends.
     let result = loop {
         let next = adapter.wait("a permission request or the turn's end", |frame| {
             (frame["method"] == "session/request_permission" && !answered.contains(&frame["id"]))
@@ -690,6 +720,13 @@ fn each_stage_of_a_piped_shell_command_asks_first() {
             break next;
         }
         answered.push(next["id"].clone());
+        if answered.len() == 1 {
+            let stages = next["params"]["toolCall"]["rawInput"]["stages"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(stages.len(), 2, "both stages reach the editor: {next}");
+        }
         adapter.choose(&next, "allow_once");
     };
     assert_eq!(result["result"]["stopReason"], "end_turn", "{result}");
@@ -717,13 +754,11 @@ fn todos_become_an_editor_plan() {
     );
     let mut adapter = Adapter::launch(&host);
     let session = adapter.new_session(&host, json!([]));
-    assert_eq!(
-        adapter.turn(&session, "plan it [[script:todos]]"),
-        "end_turn"
-    );
-    let plans = adapter.updates("plan");
-    let plan = plans.last().expect("a plan update");
-    let entries = plan["entries"].as_array().unwrap();
+    adapter.turn(&session, "plan it [[script:todos]]");
+    let plan = adapter.wait("a plan update", |frame| {
+        frame["params"]["update"]["sessionUpdate"] == "plan"
+    });
+    let entries = plan["params"]["update"]["entries"].as_array().unwrap();
     assert_eq!(entries.len(), 2, "{plan}");
     assert_eq!(entries[0]["content"], "Write the parser");
     assert_eq!(entries[0]["status"], "in_progress");
@@ -747,23 +782,30 @@ fn a_requested_file_change_report_lists_the_written_file() {
         json!({"_meta": {"jetbrains": {"air": {"version": 1, "capabilities": ["agentFileChangeReport"]}}}}),
     );
     let session = adapter.new_session(&host, json!([]));
-    let id = adapter.request(
-        "session/prompt",
-        json!({
-            "sessionId": session,
-            "prompt": [{"type": "text", "text": "write it [[script:write]]"}],
-            "_meta": {"jetbrains": {"air": {"agentFileChangeReportRequest": {"version": 1, "requestId": "report-1"}}}},
-        }),
+    let id = adapter.prompt_with(
+        &session,
+        "write it [[script:write]]",
+        json!({"jetbrains": {"air": {"agentFileChangeReportRequest": {"version": 1, "requestId": "report-1"}}}}),
     );
     assert_eq!(adapter.result(id)["stopReason"], "end_turn");
-    let report = adapter.wait("the file change report", |frame| {
-        frame.to_string().contains("\"agentFileChangeReport\":{")
+    let frame = adapter.wait("the file change report", |frame| {
+        !frame["params"]["update"]["_meta"]["jetbrains"]["air"]["agentFileChangeReport"].is_null()
     });
-    assert!(report.to_string().contains("src/lib.rs"), "{report}");
-    assert_eq!(
-        std::fs::read_to_string(host.workspace().join("src/lib.rs")).unwrap(),
-        "written\n"
-    );
+    let report = &frame["params"]["update"]["_meta"]["jetbrains"]["air"]["agentFileChangeReport"];
+    assert_eq!(report["requestId"], "report-1", "{report}");
+    assert_eq!(report["declaredComplete"], true, "{report}");
+    let written = host.workspace().join("src/lib.rs").canonicalize().unwrap();
+    let paths: Vec<PathBuf> = report["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|path| {
+            PathBuf::from(path.as_str().unwrap())
+                .canonicalize()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(paths, vec![written], "{report}");
     adapter.finish();
 }
 
@@ -776,16 +818,14 @@ fn a_crashed_host_restarts_and_the_session_continues() {
     let host = Host::start(json!({"hello": {"text": "loopback says hello"}}), None);
     let mut adapter = Adapter::launch(&host);
     let session = adapter.new_session(&host, json!([]));
-    assert_eq!(
-        adapter.turn(&session, "before [[script:hello]]"),
-        "end_turn"
-    );
+    adapter.turn(&session, "before [[script:hello]]");
     let status = Command::new("kill")
         .args(["-9", &adapter.host_pid().to_string()])
         .status()
         .unwrap();
     assert!(status.success());
-    adapter.wait_log("host-restarted attempt=1");
-    assert_eq!(adapter.turn(&session, "after [[script:hello]]"), "end_turn");
+    // The session is re-attached to the new host, not lost.
+    adapter.wait_log("host-restarted attempt=1 sessions=1 failures=0");
+    adapter.turn(&session, "after [[script:hello]]");
     adapter.finish();
 }
