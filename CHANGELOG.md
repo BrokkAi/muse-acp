@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- With a saved `:auto-review` profile, files Muse creates while it runs, such
+  as the credential from a first login or a first workspace trust, now land
+  in your Muse configuration instead of the temporary settings view, where
+  they were lost when it was removed. A login completed in a terminal while
+  the agent runs now reaches it: right away, or on Windows without symbolic
+  links when the editor next authenticates.
 - Fix startup on Windows for a saved `:auto-review` permission profile
   without Developer Mode or administrator rights. The private settings view
   now links folders with directory junctions and, when symbolic links are not

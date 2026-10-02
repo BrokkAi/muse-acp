@@ -25,6 +25,17 @@ pub struct HostConfig {
     links: windows::Links,
 }
 
+impl HostConfig {
+    /// Brings files that changed in the real Muse folder while the host
+    /// runs, such as credentials from `muse login` in a terminal, into the
+    /// view. Only Windows hard links need this; links elsewhere resolve by
+    /// path.
+    pub fn refresh(&mut self) {
+        #[cfg(windows)]
+        self.links.refresh();
+    }
+}
+
 impl Drop for HostConfig {
     fn drop(&mut self) {
         #[cfg(windows)]
@@ -33,6 +44,17 @@ impl Drop for HostConfig {
         let _ = fs::remove_dir_all(&self.root);
     }
 }
+
+/// Files Muse keeps next to its settings that a session can create: the
+/// credential a login writes, workspace trust, and their locks. One that does
+/// not exist yet still gets an entry in the view, so Muse creates it in the
+/// real folder instead of in the view, where it would be lost.
+const MUSE_FILES: [&str; 4] = [
+    "auth.json",
+    ".auth.json.lock",
+    "trust.json",
+    ".trust.json.lock",
+];
 
 /// Why the latest launch ran without a view, for the editor-facing hint if
 /// Muse then refuses the saved profile.
@@ -123,6 +145,18 @@ fn link_entry(config: &mut HostConfig, source: &Path, target: &Path) -> io::Resu
     }
 }
 
+/// Links a Muse file that does not exist yet. A dangling symbolic link
+/// works: Muse follows it and creates the real file.
+#[cfg(unix)]
+fn link_missing(_config: &mut HostConfig, source: &Path, target: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(source, target)
+}
+
+#[cfg(windows)]
+fn link_missing(config: &mut HostConfig, source: &Path, target: &Path) -> io::Result<()> {
+    config.links.link_missing(source, target)
+}
+
 fn prepare(source: &Path) -> io::Result<Option<HostConfig>> {
     let source = std::path::absolute(source)?;
     let text = match fs::read_to_string(source.join("muse/settings.json")) {
@@ -157,6 +191,18 @@ fn prepare(source: &Path) -> io::Result<Option<HostConfig>> {
         let entry = entry?;
         if entry.file_name() != "settings.json" && entry.file_name() != ".settings.json.lock" {
             link_entry(&mut config, &entry.path(), &muse.join(entry.file_name()))?;
+        }
+    }
+    for name in MUSE_FILES {
+        let file = source.join("muse").join(name);
+        let missing = matches!(
+            fs::symlink_metadata(&file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound
+        );
+        if missing && let Err(error) = link_missing(&mut config, &file, &muse.join(name)) {
+            crate::msp::log(&format!(
+                "a new {name} would stay in the Muse settings view: {error}"
+            ));
         }
     }
     fs::write(muse.join("settings.json"), settings)?;
@@ -275,6 +321,46 @@ mod tests {
         assert!(muse.join("auth.json").exists());
         assert!(muse.join("skills").is_dir());
         assert!(source.root.join("other-app").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn files_muse_creates_later_land_in_the_real_folder() {
+        let source = private_temp_dir().unwrap();
+        let muse = source.root.join("muse");
+        fs::create_dir(&muse).unwrap();
+        fs::write(
+            muse.join("settings.json"),
+            r#"{"permissions":{"default_profile":":auto-review"}}"#,
+        )
+        .unwrap();
+        let overlay = prepare(&source.root).unwrap().unwrap();
+        let view = overlay.root.join("muse");
+        for name in MUSE_FILES {
+            assert_eq!(
+                fs::read_link(view.join(name)).unwrap(),
+                muse.join(name),
+                "{name}"
+            );
+            assert!(!muse.join(name).exists(), "{name}");
+        }
+        // Muse trusts a workspace for the first time.
+        fs::write(view.join("trust.json"), "first trust").unwrap();
+        // The user logs in from a terminal while the host runs.
+        fs::write(muse.join("auth.json"), "fresh credential").unwrap();
+        assert_eq!(
+            fs::read_to_string(view.join("auth.json")).unwrap(),
+            "fresh credential"
+        );
+        drop(overlay);
+        assert_eq!(
+            fs::read_to_string(muse.join("trust.json")).unwrap(),
+            "first trust"
+        );
+        assert_eq!(
+            fs::read_to_string(muse.join("auth.json")).unwrap(),
+            "fresh credential"
+        );
     }
 
     #[cfg(unix)]
@@ -408,6 +494,109 @@ mod tests {
         assert_eq!(
             fs::read_to_string(source.root.join("muse/auth.json")).unwrap(),
             "refreshed credential"
+        );
+    }
+
+    /// A config root with only auto-review settings, prepared as on a
+    /// standard Windows account.
+    #[cfg(windows)]
+    fn bare_windows_overlay() -> (HostConfig, HostConfig) {
+        windows::FILE_SYMLINKS_DENIED.store(true, Ordering::Relaxed);
+        let source = private_temp_dir().unwrap();
+        fs::create_dir(source.root.join("muse")).unwrap();
+        fs::write(
+            source.root.join("muse/settings.json"),
+            r#"{"permissions":{"default_profile":":auto-review"}}"#,
+        )
+        .unwrap();
+        let overlay = prepare(&source.root).unwrap().unwrap();
+        (source, overlay)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn without_symbolic_links_new_files_are_kept_and_a_login_reaches_the_host() {
+        let (source, mut overlay) = bare_windows_overlay();
+        let muse = source.root.join("muse");
+        let view = overlay.root.join("muse");
+        // Muse trusts a workspace for the first time, inside the view.
+        fs::write(view.join("trust.json"), "first trust").unwrap();
+        // The user logs in from a terminal; the editor then authenticates,
+        // which refreshes the view.
+        fs::write(muse.join("auth.json"), "first credential").unwrap();
+        assert!(!view.join("auth.json").exists());
+        overlay.refresh();
+        assert_eq!(
+            fs::read_to_string(view.join("auth.json")).unwrap(),
+            "first credential"
+        );
+        // A second login replaces the credential.
+        muse_save(&muse.join("auth.json"), "second credential");
+        assert_eq!(
+            fs::read_to_string(view.join("auth.json")).unwrap(),
+            "first credential"
+        );
+        overlay.refresh();
+        assert_eq!(
+            fs::read_to_string(view.join("auth.json")).unwrap(),
+            "second credential"
+        );
+        // Muse removes the view's entry; the next refresh links it again.
+        fs::remove_file(view.join("auth.json")).unwrap();
+        overlay.refresh();
+        assert_eq!(
+            fs::read_to_string(view.join("auth.json")).unwrap(),
+            "second credential"
+        );
+        drop(overlay);
+        assert_eq!(
+            fs::read_to_string(muse.join("trust.json")).unwrap(),
+            "first trust"
+        );
+        assert_eq!(
+            fs::read_to_string(muse.join("auth.json")).unwrap(),
+            "second credential"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_logout_is_not_undone_by_a_later_launch() {
+        let (source, mut overlay) = bare_windows_overlay();
+        let muse = source.root.join("muse");
+        let root = overlay.root.clone();
+        fs::write(muse.join("auth.json"), "credential").unwrap();
+        overlay.refresh();
+        assert!(root.join("muse/auth.json").exists());
+        // `muse logout` in a terminal, then the editor terminates the agent.
+        fs::remove_file(muse.join("auth.json")).unwrap();
+        overlay.links.abandon();
+        std::mem::forget(overlay);
+        windows::sweep();
+        assert!(!root.exists());
+        assert!(!muse.join("auth.json").exists(), "the logout must stand");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_later_launch_keeps_the_new_files_of_a_terminated_adapter() {
+        let (source, mut overlay) = bare_windows_overlay();
+        let root = overlay.root.clone();
+        fs::write(root.join("muse/trust.json"), "first trust").unwrap();
+        // A file that also appeared in the real folder is never replaced.
+        fs::write(root.join("muse/auth.json"), "view credential").unwrap();
+        fs::write(source.root.join("muse/auth.json"), "real credential").unwrap();
+        overlay.links.abandon();
+        std::mem::forget(overlay);
+        windows::sweep();
+        assert!(!root.exists());
+        assert_eq!(
+            fs::read_to_string(source.root.join("muse/trust.json")).unwrap(),
+            "first trust"
+        );
+        assert_eq!(
+            fs::read_to_string(source.root.join("muse/auth.json")).unwrap(),
+            "real credential"
         );
     }
 

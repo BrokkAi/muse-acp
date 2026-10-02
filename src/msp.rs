@@ -716,6 +716,19 @@ impl MspHost {
         }
     }
 
+    /// Brings changes made to the real Muse config while the host runs, such
+    /// as a login in a terminal, into its private settings view, if any.
+    pub fn refresh_config(&self) {
+        if let Some(config) = self
+            .host_config
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+        {
+            config.refresh();
+        }
+    }
+
     /// Handshake facts captured at launch, for diagnostics and support output.
     pub fn handshake(&self) -> HandshakeInfo {
         self.handshake
