@@ -148,6 +148,7 @@ APPROVAL_PARAMS = {
         {"choiceId": "c-deny", "label": "Deny",
          "decision": "denied", "scope": "once"},
     ],
+    "protectedWrite": False, "judgeEscalated": False,
 }
 if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "file-write":
     APPROVAL_PARAMS["toolName"] = "workspace-files"
@@ -167,6 +168,19 @@ if os.environ.get("FAKE_APPROVAL_FEEDBACK", "") == "deny":
     for choice in APPROVAL_PARAMS["availableChoices"]:
         if choice.get("decision") == "denied":
             choice["acceptsFeedback"] = True
+
+
+def approval_params():
+    """APPROVAL_PARAMS, aimed inside the session workspace on request."""
+    params = dict(APPROVAL_PARAMS)
+    if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "workspace-file":
+        params["toolName"] = "write_file"
+        params["subject"] = {
+            "kind": "fileAccess",
+            "access": os.environ.get("FAKE_APPROVAL_ACCESS", "write"),
+            "path": os.path.join(ACTIVE_WORKSPACE[0], "src", "lib.rs"),
+        }
+    return params
 
 
 def log_method(method):
@@ -506,9 +520,9 @@ def on_turn_start(params):
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO in ("approval_hang", "approval_queue"):
         # The turn stays open until the client answers or cancels.
-        notify("approval/requested", dict(APPROVAL_PARAMS))
+        notify("approval/requested", approval_params())
         if SCENARIO == "approval_queue":
-            notify("approval/requested", {**APPROVAL_PARAMS, "approvalId": "approval-second"})
+            notify("approval/requested", {**approval_params(), "approvalId": "approval-second"})
     elif SCENARIO == "approval_resolved_elsewhere":
         # Another actor (policy, reviewer, or a second client) decides the
         # approval while the editor still shows the permission prompt.

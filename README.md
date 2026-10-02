@@ -18,6 +18,13 @@ authentication, and approval flow.
 The adapter is one small Rust binary with no runtime dependencies. It supports
 ACP v1 and v2, and installs on macOS, Linux, and Windows.
 
+**Auto-review: stop clicking "Allow" for routine edits.** Choose
+**Auto-review** in your editor's approval-mode selector, and `muse-acp`
+approves Muse's requests to read and edit ordinary files in your workspace for
+you, one request at a time. Shell commands, network access, MCP tools,
+deletes, and anything outside the workspace or under a hidden folder such as
+`.git` or `.github` still ask you first. See [Auto-review](#auto-review).
+
 > `muse-acp` is an independent community project. Muse Code and Muse Spark are
 > products of Meta Platforms, Inc. This project is not affiliated with,
 > endorsed by, or supported by Meta.
@@ -180,7 +187,7 @@ adapter.
 | --- | --- | --- |
 | `MUSE_CLI` | `muse` | Muse host binary to launch. Use an absolute path when the editor's `PATH` differs from your shell's. On Windows the default also finds the `muse.cmd` launcher that the Muse installer puts on `PATH`. When `PATH` has no `muse`, the default falls back to the Muse installer's location (`MUSE_INSTALL_DIR`, else `~/.local/bin`, or `%LOCALAPPDATA%\Programs\muse` on Windows). |
 | `MUSE_SERVE_ARGS` | none | Extra host-lifetime flags for `muse serve` (see `muse serve --help`). Split on whitespace; no shell quoting or expansion. |
-| `MUSE_APPROVAL_MODE` | host default | Force an approval posture: `allowAll`, `promptUnmatched`, `onRequest`, or `denyUnmatched`. `promptUnmatched` sends every unmatched tool call through `session/request_permission`. |
+| `MUSE_APPROVAL_MODE` | host default | Force an approval posture: `allowAll`, `autoReview`, `promptUnmatched`, `onRequest`, or `denyUnmatched`. `promptUnmatched` sends every unmatched tool call through `session/request_permission`. `autoReview` is `promptUnmatched` with [auto-review](#auto-review), and also applies to sessions you load or resume. |
 | `MUSE_COMMAND_TIMEOUT_MS` | method-specific | Override the host admission-ack deadline, in milliseconds. |
 | `MUSE_SHUTDOWN_TIMEOUT_MS` | `8000` | Shutdown deadline, 100–60000 ms. |
 | `MUSE_TOOL_OUTPUT_LIMIT` | `8000` | Editor-facing tool output bound, in characters (minimum 200). |
@@ -192,6 +199,42 @@ handshake, queries, and approval or input decisions; 180 seconds for session
 start, resume, and read and for view paging; and 60 seconds for other methods.
 These bound how long the adapter waits for a command response, not how long a
 model turn may run.
+
+### Auto-review
+
+Auto-review approves routine file work for you, so you only answer the
+requests that need a person. Turn it on by choosing **Auto-review** in the
+editor's approval-mode selector, or start every session with it by setting
+`MUSE_APPROVAL_MODE=autoReview`. Muse itself runs in **Prompt unmatched**
+mode, and `muse-acp` answers each approval request Muse sends:
+
+- **Approved for you:** reading, listing, searching, writing, creating, and
+  editing a file whose real path, after following symbolic links, is inside
+  the session's workspace roots (the editor's working directory and any
+  additional directories). A file that does not exist yet counts when its
+  nearest existing folder is inside.
+- **Still asks you:** shell commands and processes, network access, MCP and
+  other tools, deleting or moving files, and any file outside the workspace.
+  It also asks about anything under a hidden file or folder inside the
+  workspace, such as `.git`, `.github`, `.env`, or `.vscode`, since those hold
+  credentials and settings that run code. Requests Muse marks as protected
+  writes or escalates for review, and any kind of request `muse-acp` does not
+  recognize, still ask you as well.
+
+Auto-review only ever picks Muse's allow-once choice. It never saves an
+"allow for this session" or "always allow" rule, so turning it off takes
+effect on the very next request. Each approval it makes is logged to the
+agent log as `auto-review approved <access> <path> once`, and each request it
+leaves to you is logged with the reason.
+
+Muse remembers every other approval mode with the session, but it does not
+know about auto-review. A session you load or resume therefore comes back in
+Prompt unmatched, unless `MUSE_APPROVAL_MODE=autoReview` is set. A fork keeps
+its source's mode.
+
+This is not Muse's own `:auto-review` permission profile, which asks an AI
+reviewer and which `muse serve` cannot run (see below). `muse-acp`'s
+auto-review is a fixed set of rules and never consults a model.
 
 ### Approval-profile compatibility
 
@@ -224,7 +267,9 @@ error the editor shows if Muse then refuses the profile says why.
   cancellation with a terminal event, and exact-turn steering over the ACP v2
   `_session/steering` extension.
 - **Approvals** — Muse approval requests surfaced as
-  `session/request_permission`, with a deny-safe fallback.
+  `session/request_permission`, with a deny-safe fallback, and
+  [auto-review](#auto-review) to approve workspace file reads and edits for
+  you.
 - **MCP servers** — stdio and HTTP MCP servers attached by the editor load
   into the Muse session on Muse 1.3.0 and newer; see
   [Client-provided MCP servers](#client-provided-mcp-servers).

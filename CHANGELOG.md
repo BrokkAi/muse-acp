@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add **Auto-review**, a new approval mode in the editor's selector (and
+  `MUSE_APPROVAL_MODE=autoReview`). Muse runs in Prompt unmatched, and the
+  adapter approves its requests to read and edit ordinary files inside the
+  workspace roots for you. It follows symbolic links, picks only Muse's
+  allow-once choice, and logs every approval. Shell commands, network, MCP
+  tools, deletes, moves, hidden paths such as `.git`, files outside the
+  workspace, protected writes, and escalated or unknown requests still ask
+  you.
 - Fix startup on Windows for a saved `:auto-review` permission profile
   without Developer Mode or administrator rights. The private settings view
   now links folders with directory junctions and, when symbolic links are not

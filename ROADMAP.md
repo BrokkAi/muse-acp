@@ -1062,7 +1062,11 @@ tests pin that prompt text cannot leak into trace output.
   remain useful elsewhere, but they are not this adapter's architecture.
 - **Do not fabricate ACP extensions** for host concepts MSP cannot authorize or
   restore.
-- **Do not weaken approvals to improve automation convenience.**
+- **Do not weaken approvals to improve automation convenience.** A shortcut
+  must be one the user explicitly chooses, and it must fail closed. Auto-review
+  is the model: an approval mode the user selects, which approves only
+  allow-once reads and edits of ordinary files inside the workspace roots and
+  sends everything else to the editor.
 - **Do not silently expand filesystem scope.**
 - **Do not present local price estimates as Muse billing.**
 - **Do not add runtime dependencies solely for convenience.**

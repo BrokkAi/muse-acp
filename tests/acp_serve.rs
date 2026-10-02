@@ -8367,3 +8367,104 @@ fn invalid_utf8_editor_frame_is_rejected_without_disconnect() {
     assert!(frame.contains("\"stopReason\":\"end_turn\""), "{frame}");
     c.finish();
 }
+
+fn asked_the_editor(c: &Client) -> bool {
+    c.frames
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|frame| frame.contains("request_permission"))
+}
+
+#[test]
+fn auto_review_approves_workspace_edits_once_without_asking() {
+    let mut c = Client::spawn(
+        "approval_queue",
+        &[
+            ("MUSE_APPROVAL_MODE", "autoReview"),
+            ("FAKE_APPROVAL_SUBJECT", "workspace-file"),
+        ],
+    );
+    let sid = c.new_session(2, "");
+    assert!(
+        c.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame.contains("\"currentValue\":\"autoReview\"")),
+        "the selector must show auto-review"
+    );
+    c.prompt(&sid, "edit the library");
+    c.wait_input("approval-second", Duration::from_secs(15));
+    c.wait_stderr("auto-review approved write", Duration::from_secs(15));
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    let decisions: Vec<serde_json::Value> = inputs
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|params| params.get("choiceId").is_some())
+        .collect();
+    assert_eq!(decisions.len(), 2, "{inputs}");
+    for decision in decisions {
+        assert_eq!(decision["choiceId"], "c-allow", "only the once choice");
+    }
+    assert!(!asked_the_editor(&c), "auto-review must not ask the editor");
+    c.finish();
+}
+
+#[test]
+fn auto_review_still_asks_about_commands_and_files_outside_the_workspace() {
+    // The default fixture subject is a shell command; `file-write` targets
+    // /tmp/output.txt, outside the session workspace.
+    for subject in ["", "file-write"] {
+        let mut env = vec![("MUSE_APPROVAL_MODE", "autoReview")];
+        if !subject.is_empty() {
+            env.push(("FAKE_APPROVAL_SUBJECT", subject));
+        }
+        let mut c = Client::spawn("approval_hang", &env);
+        let sid = c.new_session(2, "");
+        c.prompt(&sid, "run it");
+        c.wait_for("request_permission", Duration::from_secs(15));
+        c.wait_stderr(
+            "auto-review: asking the editor about approval ap-1",
+            Duration::from_secs(15),
+        );
+        let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap_or_default();
+        assert!(!inputs.contains("c-allow"), "{subject}: {inputs}");
+        c.finish();
+    }
+}
+
+#[test]
+fn auto_review_is_an_approval_mode_the_editor_can_select() {
+    let mut c = Client::spawn(
+        "approval_hang",
+        &[("FAKE_APPROVAL_SUBJECT", "workspace-file")],
+    );
+    let sid = c.new_session(2, "");
+    let id = c.req(
+        "session/set_config_option",
+        &serde_json::json!({"sessionId": sid, "configId": "mode", "value": "autoReview"})
+            .to_string(),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"currentValue\":\"autoReview\""),
+        "selector must keep auto-review: {frame}"
+    );
+    // The host runs promptUnmatched underneath.
+    c.wait_frame_contains("\"mode\": \"promptUnmatched\"", Duration::from_secs(15));
+    c.prompt(&sid, "edit the library");
+    c.wait_input("c-allow", Duration::from_secs(15));
+    assert!(!asked_the_editor(&c), "auto-review must not ask the editor");
+    let id = c.req(
+        "session/set_config_option",
+        &serde_json::json!({"sessionId": sid, "configId": "mode", "value": "promptUnmatched"})
+            .to_string(),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"currentValue\":\"promptUnmatched\""),
+        "{frame}"
+    );
+    c.finish();
+}

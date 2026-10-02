@@ -5,6 +5,7 @@
 //! view, so turns stream in as `item/*` + `turn/*` notifications.
 
 mod acp;
+mod auto_review;
 mod compat;
 mod fold;
 mod host_config;
@@ -548,6 +549,20 @@ fn host_mode(res: &J) -> Option<String> {
         .get("mode")?
         .as_str()
         .map(|s| s.to_string())
+}
+
+/// The selector value a loaded session starts from before the host reports
+/// its mode. The host persists every mode but auto-review, which only the
+/// adapter knows, so `MUSE_APPROVAL_MODE=autoReview` reapplies it.
+fn loaded_mode_seed() -> &'static str {
+    match std::env::var("MUSE_APPROVAL_MODE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some(acp::AUTO_REVIEW) => acp::AUTO_REVIEW,
+        _ => "promptUnmatched",
+    }
 }
 
 /// MSP keeps these values open on the wire. Preserve the three values the
@@ -2057,7 +2072,8 @@ fn restart_durable_host(
                                         .and_then(|v| v.as_str())
                                         .map(str::to_string);
                                     if let Some(m) = host_mode(&r) {
-                                        s.mode_value = acp::mode_from_msp(&m).to_string();
+                                        s.mode_value =
+                                            acp::fold_mode(&s.mode_value, &m).to_string();
                                     }
                                     if let Some(model) = r
                                         .get("session")
@@ -2857,7 +2873,7 @@ fn handle_acp(
                 String::new()
             } else {
                 match resolved_env {
-                    Some(m) => format!(",\"approvalMode\":{}", esc(m)),
+                    Some(m) => format!(",\"approvalMode\":{}", esc(acp::host_approval_mode(m))),
                     None => {
                         acp::send_error(
                             stdout,
@@ -2925,7 +2941,7 @@ fn handle_acp(
                     let mut applied_mode =
                         host_mode(&r).unwrap_or_else(|| "promptUnmatched".to_string());
                     if !start_mode.is_empty() {
-                        match (resolved_env, host_mode(&r)) {
+                        match (resolved_env.map(acp::host_approval_mode), host_mode(&r)) {
                             (Some(want), Some(got)) if got.as_str() == want => {
                                 applied_mode = got;
                             }
@@ -2951,7 +2967,7 @@ fn handle_acp(
                     // id directly; an adapter-local `sess-*` id loses its
                     // mapping on restart and is then invalid to `muse serve`.
                     let sid = msp_sid.clone();
-                    let cur_mode = applied_mode;
+                    let cur_mode = acp::fold_mode(resolved_env.unwrap_or(""), &applied_mode);
                     let cur_model = r
                         .get("session")
                         .and_then(|s| s.get("modelId"))
@@ -2986,7 +3002,7 @@ fn handle_acp(
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
-                            mode_value: acp::mode_from_msp(&cur_mode).to_string(),
+                            mode_value: cur_mode.to_string(),
                             model_value: cur_model.clone(),
                             reasoning_effort: acp::REASONING_DEFAULT.to_string(),
                             reasoning_effort_source: None,
@@ -3038,7 +3054,7 @@ fn handle_acp(
                             esc(&msp_sid),
                             acp::config_options(
                                 ver,
-                                acp::mode_from_msp(&cur_mode),
+                                cur_mode,
                                 &cur_model,
                                 acp::REASONING_DEFAULT,
                                 true,
@@ -3053,14 +3069,14 @@ fn handle_acp(
                             esc(&msp_sid),
                             acp::config_options(
                                 ver,
-                                acp::mode_from_msp(&cur_mode),
+                                cur_mode,
                                 &cur_model,
                                 acp::REASONING_DEFAULT,
                                 true,
                                 &models,
                                 (recommended_model(&models).as_deref(), None),
                             ),
-                            acp::session_modes(acp::mode_from_msp(&cur_mode))
+                            acp::session_modes(cur_mode)
                         )
                     };
                     let skills = skill_catalog(host, &msp_sid);
@@ -3263,7 +3279,7 @@ fn handle_acp(
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
-                            mode_value: "promptUnmatched".to_string(),
+                            mode_value: loaded_mode_seed().to_string(),
                             model_value: String::new(),
                             reasoning_effort: acp::REASONING_DEFAULT.to_string(),
                             reasoning_effort_source: None,
@@ -3326,7 +3342,7 @@ fn handle_acp(
                         // Refresh the mode selector from the folded host
                         // mode so resumed clients are not stuck stale.
                         if let Some(m) = host_mode(&r) {
-                            entry.mode_value = acp::mode_from_msp(&m).to_string();
+                            entry.mode_value = acp::fold_mode(&entry.mode_value, &m).to_string();
                         }
                         if let Some(name) = &session_name {
                             entry.title_facts.name = name.clone();
@@ -3622,6 +3638,14 @@ fn handle_acp(
                         s.reasoning_effort_source.clone(),
                     )
                 });
+            // A fork keeps its source's auto-review, which the host cannot
+            // copy because only the adapter knows about it.
+            let parent_mode = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&src_sid)
+                .map(|s| s.mode_value.clone())
+                .unwrap_or_else(|| loaded_mode_seed().to_string());
             let cut_point = match resolve_fork_cut_point(host, &msp_sid, params.as_ref()) {
                 Ok(c) => c,
                 Err(e) => {
@@ -3689,7 +3713,7 @@ fn handle_acp(
                     };
                     let mut mode_value = "promptUnmatched".to_string();
                     if let Some(m) = host_mode(&r) {
-                        mode_value = acp::mode_from_msp(&m).to_string();
+                        mode_value = acp::fold_mode(&parent_mode, &m).to_string();
                     }
                     let (history_items, history_cursors) = match collect_history(host, &new_msp, &r)
                     {
@@ -4828,7 +4852,7 @@ fn handle_acp(
                             "{{\"commandId\":{},\"sessionId\":{},\"mode\":{}}}",
                             esc(&cmd),
                             esc(&msp_sid),
-                            esc(m)
+                            esc(acp::host_approval_mode(m))
                         ),
                     ),
                     None => {
@@ -4927,9 +4951,11 @@ fn handle_acp(
                             "mode" => {
                                 let m = folded
                                     .as_deref()
-                                    .or_else(|| acp::resolve_mode(&value))
+                                    .or_else(|| {
+                                        acp::resolve_mode(&value).map(acp::host_approval_mode)
+                                    })
                                     .unwrap_or("promptUnmatched");
-                                s.mode_value = acp::mode_from_msp(m).to_string();
+                                s.mode_value = acp::fold_mode(&value, m).to_string();
                             }
                             "model" => s.model_value = value.clone(),
                             "reasoning_effort" => {
@@ -5002,7 +5028,7 @@ fn handle_acp(
                             "{{\"commandId\":{},\"sessionId\":{},\"mode\":{}}}",
                             esc(&cmd),
                             esc(&msp_sid),
-                            esc(m)
+                            esc(acp::host_approval_mode(m))
                         ),
                     ) {
                         Ok(res) => {
@@ -5014,8 +5040,10 @@ fn handle_acp(
                                 .and_then(|e| e.get("mode"))
                                 .and_then(|v| v.as_str())
                                 .map(|s| s.to_string());
-                            let m = folded.as_deref().or(Some(m)).unwrap_or("promptUnmatched");
-                            let m = acp::mode_from_msp(m);
+                            let reported = folded
+                                .as_deref()
+                                .unwrap_or_else(|| acp::host_approval_mode(m));
+                            let m = acp::fold_mode(m, reported);
                             if let Some(s) = sessions
                                 .lock()
                                 .unwrap_or_else(|p| p.into_inner())
@@ -6884,7 +6912,7 @@ fn handle_msp(
                     .unwrap_or_else(|p| p.into_inner())
                     .get_mut(&acp_sid)
                 {
-                    s.mode_value = acp::mode_from_msp(mode).to_string();
+                    s.mode_value = acp::fold_mode(&s.mode_value, mode).to_string();
                 }
                 let _ = acp_sid;
             }
@@ -7310,7 +7338,20 @@ fn invalidate_pending_approval(
 /// approval id so multi-stage/resumed flows bridge exactly once. Never leaves
 /// an approval silently unresolved: without displayable choices there is
 /// nothing the client could answer, so fail closed by cancelling the turn.
+/// In the auto-review mode, an eligible request is approved without asking.
 fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions, params: &J) {
+    show_approval(host, stdout, sessions, params, true);
+}
+
+/// `open_approval`, or with `auto_review` false, asking the editor about a
+/// request the host would not take from auto-review.
+fn show_approval(
+    host: &Arc<MspHost>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    params: &J,
+    auto_review: bool,
+) {
     let msp_sid = params
         .get("sessionId")
         .and_then(|v| v.as_str())
@@ -7340,6 +7381,11 @@ fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions
         .unwrap_or(J::Null);
     let requirement_json = j_to_string(&requirement);
     let approval_key = format!("{}:{requirement_json}", approval_id);
+    let review = if auto_review {
+        review_on_behalf(sessions, &acp_sid, params)
+    } else {
+        None
+    };
     let mut stale_request = None;
     let mut duplicate = false;
     let mut queued = false;
@@ -7381,11 +7427,12 @@ fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions
                 }
             }
             if !duplicate {
-                if s.pending_perm.is_some() {
+                // Auto-review decides now, even behind a displayed prompt.
+                if s.pending_perm.is_some() && !matches!(review, Some(Ok(_))) {
                     s.perm_queue.push(params.clone());
                     queued = true;
                 } else {
-                    s.approval_seen.insert(approval_key);
+                    s.approval_seen.insert(approval_key.clone());
                 }
             }
         }
@@ -7400,6 +7447,35 @@ fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions
             ));
         }
         return;
+    }
+    match review {
+        Some(Ok(choice)) => {
+            if approve_on_behalf(
+                host,
+                &owner_msp_sid,
+                &approval_id,
+                &requirement,
+                &choice,
+                params,
+            ) {
+                // A stale displayed stage may have been withdrawn above.
+                pop_queued_approval(host, stdout, sessions, &acp_sid);
+            } else {
+                if let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&acp_sid)
+                {
+                    s.approval_seen.remove(&approval_key);
+                }
+                show_approval(host, stdout, sessions, params, false);
+            }
+            return;
+        }
+        Some(Err(reason)) => log(&format!(
+            "auto-review: asking the editor about approval {approval_id} because {reason}"
+        )),
+        None => {}
     }
     let tool_call_id = params
         .get("toolCallId")
@@ -7513,6 +7589,73 @@ fn open_approval(host: &Arc<MspHost>, stdout: &StdoutShared, sessions: &Sessions
             j_to_string(&req_id),
         ),
     );
+}
+
+/// Auto-review's verdict on an approval request: `None` outside the
+/// auto-review mode, otherwise the choice to send or why the editor decides.
+fn review_on_behalf(
+    sessions: &Sessions,
+    acp_sid: &str,
+    params: &J,
+) -> Option<Result<String, &'static str>> {
+    let roots = {
+        let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let s = map.get(acp_sid)?;
+        if s.mode_value != acp::AUTO_REVIEW {
+            return None;
+        }
+        s.roots.clone()
+    };
+    // Path checks touch the filesystem, so they run outside the lock.
+    Some(auto_review::review(params, &roots))
+}
+
+/// Sends auto-review's approval, logging each one for the user to audit.
+/// Returns false when the host refused it, so the editor decides instead.
+fn approve_on_behalf(
+    host: &Arc<MspHost>,
+    msp_sid: &str,
+    approval_id: &str,
+    requirement: &J,
+    choice: &str,
+    params: &J,
+) -> bool {
+    let subject = params.get("subject");
+    let field = |key: &str| {
+        subject
+            .and_then(|subject| subject.get(key))
+            .and_then(|v| v.as_str())
+            .unwrap_or("?")
+            .to_string()
+    };
+    let cmd = host.mint_cmd("cmd-");
+    match host.command(
+        "approval/decide",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{},\"approvalId\":{},\"requirementId\":{},\"choiceId\":{}}}",
+            esc(&cmd),
+            esc(msp_sid),
+            esc(approval_id),
+            j_to_string(requirement),
+            esc(choice),
+        ),
+    ) {
+        Ok(_) => {
+            log(&format!(
+                "auto-review approved {} {} once (approval {approval_id})",
+                field("access"),
+                field("path")
+            ));
+            true
+        }
+        Err(e) => {
+            log(&format!(
+                "auto-review could not approve {approval_id} ({}); asking the editor",
+                err_message(&e)
+            ));
+            false
+        }
+    }
 }
 
 /// Offer optional guidance after an explicitly selected eligible rejection.

@@ -650,12 +650,18 @@ pub fn fallback_deny(choices: &[PermChoice]) -> Option<String> {
     None
 }
 
-/// The MSP `ApprovalMode` enum, in the order the selector lists it. The ACP
-/// mode ids ARE these names: a client selects one of the host's
-/// preconfigured modes and never authors a policy, so renaming them on the
-/// editor side only hid one mode (`onRequest`) and confused the other three.
-pub const APPROVAL_MODES: [(&str, &str, &str); 4] = [
+/// The MSP `ApprovalMode` enum plus the adapter's auto-review mode, in the
+/// order the selector lists it. The host mode ids ARE the MSP names: a
+/// client selects one of the host's preconfigured modes and never authors a
+/// policy, so renaming them on the editor side only hid one mode
+/// (`onRequest`) and confused the other three.
+pub const APPROVAL_MODES: [(&str, &str, &str); 5] = [
     ("allowAll", "Allow all", "Allow everything"),
+    (
+        AUTO_REVIEW,
+        "Auto-review",
+        "Approve reading and editing workspace files for you; ask about everything else",
+    ),
     (
         "promptUnmatched",
         "Prompt unmatched",
@@ -665,19 +671,47 @@ pub const APPROVAL_MODES: [(&str, &str, &str); 4] = [
     ("denyUnmatched", "Deny unmatched", "Deny unmatched subjects"),
 ];
 
+/// The adapter's own mode: the host runs `promptUnmatched`, and the adapter
+/// answers eligible approval requests itself (see `crate::auto_review`).
+pub const AUTO_REVIEW: &str = "autoReview";
+
+/// The MSP `ApprovalMode` to send for a selector mode id.
+pub fn host_approval_mode(mode: &str) -> &str {
+    if mode == AUTO_REVIEW {
+        "promptUnmatched"
+    } else {
+        mode
+    }
+}
+
 /// Host-reported ApprovalMode -> the id we show the client. Identity for
 /// the four known modes; an unknown spelling (a future host) falls back to
-/// the conservative prompting mode rather than claiming `allowAll`.
+/// the conservative prompting mode rather than claiming `allowAll`. The
+/// host never reports auto-review, which only the adapter knows.
 pub fn mode_from_msp(mode: &str) -> &'static str {
     APPROVAL_MODES
         .iter()
-        .find(|(id, _, _)| *id == mode)
+        .find(|(id, _, _)| *id == mode && *id != AUTO_REVIEW)
         .map(|(id, _, _)| *id)
         .unwrap_or("promptUnmatched")
 }
 
-/// Validate a requested mode: only the MSP `ApprovalMode` spellings are
-/// accepted. There is no adapter-side vocabulary.
+/// The selector value after the host reports `host_mode` for a session
+/// whose selector shows (or was asked to show) `current`. Auto-review runs
+/// on the host's `promptUnmatched`, so it survives that report and ends with
+/// any other mode.
+pub fn fold_mode(current: &str, host_mode: &str) -> &'static str {
+    // An unknown host mode displays as promptUnmatched, but its posture is
+    // unknown, so it ends auto-review too.
+    if current == AUTO_REVIEW && host_mode == "promptUnmatched" {
+        AUTO_REVIEW
+    } else {
+        mode_from_msp(host_mode)
+    }
+}
+
+/// Validate a requested mode id: the MSP `ApprovalMode` spellings and the
+/// adapter's `autoReview`.
 pub fn resolve_mode(value: &str) -> Option<&'static str> {
     APPROVAL_MODES
         .iter()
@@ -686,7 +720,7 @@ pub fn resolve_mode(value: &str) -> Option<&'static str> {
 }
 
 /// Human-readable list of accepted mode ids for error text.
-pub const MODE_HELP: &str = "allowAll|promptUnmatched|onRequest|denyUnmatched";
+pub const MODE_HELP: &str = "allowAll|autoReview|promptUnmatched|onRequest|denyUnmatched";
 
 fn mode_options_json(key: &str) -> String {
     APPROVAL_MODES
@@ -989,6 +1023,31 @@ pub fn send_session_title(stdout: &StdoutShared, acp_sid: &str, title: Option<&s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_review_runs_on_prompt_unmatched_and_only_the_adapter_reports_it() {
+        assert_eq!(resolve_mode("autoReview"), Some(AUTO_REVIEW));
+        assert_eq!(host_approval_mode(AUTO_REVIEW), "promptUnmatched");
+        for (mode, _, _) in APPROVAL_MODES {
+            if mode != AUTO_REVIEW {
+                assert_eq!(host_approval_mode(mode), mode);
+                assert_eq!(mode_from_msp(mode), mode);
+            }
+        }
+        // The host never names auto-review, so it cannot switch it on.
+        assert_eq!(mode_from_msp(AUTO_REVIEW), "promptUnmatched");
+        assert_eq!(fold_mode("promptUnmatched", AUTO_REVIEW), "promptUnmatched");
+        // It survives the host's promptUnmatched and ends with any other mode.
+        assert_eq!(fold_mode(AUTO_REVIEW, "promptUnmatched"), AUTO_REVIEW);
+        for host in ["allowAll", "onRequest", "denyUnmatched", "futureMode"] {
+            assert_ne!(fold_mode(AUTO_REVIEW, host), AUTO_REVIEW, "{host}");
+        }
+        assert!(
+            MODE_HELP
+                .split('|')
+                .all(|mode| resolve_mode(mode).is_some())
+        );
+    }
 
     #[test]
     fn selector_and_command_literals_are_valid_json() {
