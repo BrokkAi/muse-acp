@@ -835,3 +835,103 @@ fn a_crashed_host_restarts_and_the_session_continues() {
     adapter.turn(&session, "after [[script:hello]]");
     adapter.finish();
 }
+
+fn write_step() -> Value {
+    json!({"tool": {"name": "write_file", "arguments": {
+        "path": "notes.txt", "content": "written\n",
+    }}})
+}
+
+fn set_mode(adapter: &mut Adapter, session: &str, mode: &str) -> Value {
+    let id = adapter.request(
+        "session/set_config_option",
+        json!({"sessionId": session, "configId": "mode", "value": mode}),
+    );
+    adapter.result(id)
+}
+
+/// The text of every tool result the editor saw.
+fn tool_output(adapter: &Adapter) -> String {
+    adapter
+        .updates("tool_call_update")
+        .iter()
+        .map(|update| update["content"].to_string())
+        .collect()
+}
+
+#[test]
+fn read_only_mode_blocks_writes_until_switched_back() {
+    if !enabled("read_only_mode_blocks_writes_until_switched_back") {
+        return;
+    }
+    let host = Host::start(json!({"write": write_step()}), None);
+    let notes = host.workspace().join("notes.txt");
+    let mut adapter = Adapter::launch(&host);
+    let session = adapter.new_session(&host, json!([]));
+    set_mode(&mut adapter, &session, "readOnly");
+    adapter.turn(&session, "write it [[script:write]]");
+    assert!(!notes.exists(), "a read-only session must not write");
+    assert!(
+        tool_output(&adapter).contains("denied"),
+        "Muse reports the refusal: {}",
+        tool_output(&adapter)
+    );
+    set_mode(&mut adapter, &session, "default");
+    adapter.turn(&session, "write it now [[script:write]]");
+    assert_eq!(std::fs::read_to_string(&notes).unwrap(), "written\n");
+    adapter.finish();
+}
+
+#[test]
+fn a_mode_change_keeps_other_new_sessions_usable() {
+    if !enabled("a_mode_change_keeps_other_new_sessions_usable") {
+        return;
+    }
+    let host = Host::start(json!({"write": write_step()}), None);
+    let mut adapter = Adapter::launch(&host);
+    // Neither session has run a turn, so Muse has not saved either. Moving
+    // one restarts the main host, which must start the other again.
+    let waiting = adapter.new_session(&host, json!([]));
+    let planning = adapter.new_session(&host, json!([]));
+    set_mode(&mut adapter, &planning, "plan");
+    adapter.turn(&waiting, "write it [[script:write]]");
+    assert_eq!(
+        std::fs::read_to_string(host.workspace().join("notes.txt")).unwrap(),
+        "written\n"
+    );
+    adapter.finish();
+}
+
+#[test]
+fn plan_mode_survives_an_adapter_restart() {
+    if !enabled("plan_mode_survives_an_adapter_restart") {
+        return;
+    }
+    let host = Host::start(json!({"write": write_step()}), None);
+    let mut first = Adapter::launch(&host);
+    let session = first.new_session(&host, json!([]));
+    first.turn(&session, "/plan");
+    // Muse saves a session with its first turn; one that never ran cannot be
+    // loaded again.
+    first.turn(&session, "look around");
+    first.finish();
+
+    let mut second = Adapter::launch(&host);
+    let id = second.request(
+        "session/load",
+        json!({"sessionId": session, "cwd": host.workspace(), "mcpServers": []}),
+    );
+    let loaded = second.result(id);
+    assert_eq!(loaded["modes"]["currentModeId"], "plan", "{loaded}");
+    second.turn(&session, "write it [[script:write]]");
+    assert!(
+        !host.workspace().join("notes.txt").exists(),
+        "a reloaded plan session must still not write"
+    );
+    assert!(
+        tool_output(&second).contains("denied"),
+        "Muse reports the refusal: {}",
+        tool_output(&second)
+    );
+    second.finish();
+}

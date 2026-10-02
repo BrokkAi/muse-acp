@@ -169,10 +169,15 @@ if os.environ.get("FAKE_APPROVAL_FEEDBACK", "") == "deny":
             choice["acceptsFeedback"] = True
 
 
+# A host launched read-only logs its methods as `ro:<method>`, so tests can
+# tell which of the adapter's two hosts handled a request.
+READ_ONLY = "--disable-write" in sys.argv and "--disable-shell" in sys.argv
+
+
 def log_method(method):
     if LOG:
         with open(LOG, "a") as f:
-            f.write(method + "\n")
+            f.write(("ro:" if READ_ONLY else "") + method + "\n")
 
 
 def log_input(params):

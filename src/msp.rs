@@ -879,12 +879,14 @@ impl MspHost {
 }
 
 impl MspHost {
+    /// Launches `muse serve` with `extra_args` after `MUSE_SERVE_ARGS`.
     pub fn launch(
         user_input_dialogs: bool,
         user_shell: bool,
+        extra_args: &[&str],
     ) -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
         let bin = muse_cli();
-        let (mut cmd, host_config) = serve_command(&bin);
+        let (mut cmd, host_config) = serve_command(&bin, extra_args);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1227,7 +1229,10 @@ impl MspHost {
 
 /// All host launches, including restarts and support probes, use the same
 /// process-local settings and host-lifetime flags.
-fn serve_command(bin: &str) -> (Command, Option<crate::host_config::HostConfig>) {
+fn serve_command(
+    bin: &str,
+    extra_args: &[&str],
+) -> (Command, Option<crate::host_config::HostConfig>) {
     let mut cmd = Command::new(bin);
     cmd.arg("serve");
     for arg in std::env::var("MUSE_SERVE_ARGS")
@@ -1236,6 +1241,7 @@ fn serve_command(bin: &str) -> (Command, Option<crate::host_config::HostConfig>)
     {
         cmd.arg(arg);
     }
+    cmd.args(extra_args);
     let config = crate::host_config::configure(&mut cmd);
     (cmd, config)
 }
@@ -1245,7 +1251,7 @@ fn serve_command(bin: &str) -> (Command, Option<crate::host_config::HostConfig>)
 /// bounded stderr evidence for a human diagnostic.
 pub fn probe_serve_exit(timeout: Duration) -> Result<Option<ExitClassification>, String> {
     let bin = muse_cli();
-    let (mut cmd, _host_config) = serve_command(&bin);
+    let (mut cmd, _host_config) = serve_command(&bin, &[]);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())

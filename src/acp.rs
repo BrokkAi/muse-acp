@@ -136,7 +136,10 @@ pub struct AcpSession {
     /// User-input ids already presented or auto-cancelled, so reconciliation
     /// cannot replay a settled question.
     pub ui_seen: std::collections::HashSet<String>,
+    /// The approval mode selector's value.
     pub mode_value: String,
+    /// The session mode: `default`, `readOnly`, or `plan`.
+    pub session_mode: String,
     pub model_value: String,
     pub reasoning_effort: String,
     /// Source of the host's standing reasoning default. `None` means the
@@ -688,8 +691,48 @@ pub fn resolve_mode(value: &str) -> Option<&'static str> {
 /// Human-readable list of accepted mode ids for error text.
 pub const MODE_HELP: &str = "allowAll|promptUnmatched|onRequest|denyUnmatched";
 
-fn mode_options_json(key: &str) -> String {
-    APPROVAL_MODES
+/// Session modes: what the agent may change. Read-only and plan sessions
+/// run on a Muse host launched with `--disable-write --disable-shell`, so
+/// Muse itself refuses writes and shell commands (see `crate::hosts`).
+pub const SESSION_MODES: [(&str, &str, &str); 3] = [
+    (
+        DEFAULT_MODE,
+        "Default",
+        "Muse can edit files and run commands, as the approval mode allows",
+    ),
+    (
+        READ_ONLY_MODE,
+        "Read-only",
+        "Muse can read and answer, but cannot write files or run shell commands",
+    ),
+    (
+        PLAN_MODE,
+        "Plan",
+        "Read-only, and Muse plans instead of implementing; switch modes to implement",
+    ),
+];
+
+pub const DEFAULT_MODE: &str = "default";
+pub const READ_ONLY_MODE: &str = "readOnly";
+pub const PLAN_MODE: &str = "plan";
+
+/// Human-readable list of accepted session mode ids for error text.
+pub const SESSION_MODE_HELP: &str = "default|readOnly|plan";
+
+pub fn resolve_session_mode(value: &str) -> Option<&'static str> {
+    SESSION_MODES
+        .iter()
+        .find(|(id, _, _)| *id == value)
+        .map(|(id, _, _)| *id)
+}
+
+/// Whether a session mode runs on the read-only host.
+pub fn is_read_only_mode(mode: &str) -> bool {
+    mode == READ_ONLY_MODE || mode == PLAN_MODE
+}
+
+fn mode_options_json(key: &str, modes: &[(&str, &str, &str)]) -> String {
+    modes
         .iter()
         .map(|(id, name, desc)| {
             format!(
@@ -715,12 +758,13 @@ pub fn is_reasoning_effort(value: &str) -> bool {
     )
 }
 
-/// `configOptions`: mode, model, and reasoning selectors. ACP v1 calls the
-/// selector key `id`; v2 renamed it to `configId` (the setter still uses
-/// `configId` in both versions).
+/// `configOptions`: session mode, approval mode, model, and reasoning
+/// selectors. ACP v1 calls the selector key `id`; v2 renamed it to
+/// `configId` (the setter still uses `configId` in both versions). `modes`
+/// is the session mode and the approval mode.
 pub fn config_options(
     ver: u8,
-    current_mode: &str,
+    modes: (&str, &str),
     current_model: &str,
     reasoning_effort: &str,
     offer_muse_default: bool,
@@ -753,21 +797,24 @@ pub fn config_options(
         ""
     };
     format!(
-        "[{{\"{id_key}\":\"mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]{reasoning_meta}}}]",
-        esc(current_mode),
-        mode_options_json("value"),
+        "[{{\"{id_key}\":\"mode\",\"name\":\"Mode\",\"description\":\"What Muse may change: Read-only and Plan cannot write files or run shell commands\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"approval_mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]{reasoning_meta}}}]",
+        esc(modes.0),
+        mode_options_json("value", &SESSION_MODES),
+        esc(modes.1),
+        mode_options_json("value", &APPROVAL_MODES),
         esc(current_model),
         model_opts.join(","),
         esc(reasoning_effort)
     )
 }
 
-/// Legacy v1 mode state for clients which predate `configOptions`.
-pub fn session_modes(current_mode: &str) -> String {
+/// Legacy v1 mode state for clients which predate `configOptions`: the
+/// session modes.
+pub fn session_modes(session_mode: &str) -> String {
     format!(
         "{{\"currentModeId\":{},\"availableModes\":[{}]}}",
-        esc(current_mode),
-        mode_options_json("id")
+        esc(session_mode),
+        mode_options_json("id", &SESSION_MODES)
     )
 }
 
@@ -996,7 +1043,7 @@ mod tests {
         for ver in [1, 2] {
             let options = config_options(
                 ver,
-                "promptUnmatched",
+                ("default", "promptUnmatched"),
                 "fake-model",
                 "medium",
                 true,
@@ -1007,7 +1054,7 @@ mod tests {
             let J::Arr(items) = parsed else {
                 panic!("config options must be an array");
             };
-            assert_eq!(items.len(), 3);
+            assert_eq!(items.len(), 4);
 
             let skills = vec![
                 (
@@ -1031,7 +1078,7 @@ mod tests {
             assert!(commands.contains("\"name\":\"workflow-child\""));
             assert!(!commands.contains("Host rename skill"));
         }
-        assert!(crate::json::parse_json(&session_modes("promptUnmatched")).is_ok());
+        assert!(crate::json::parse_json(&session_modes("default")).is_ok());
     }
 
     #[test]
@@ -1045,7 +1092,7 @@ mod tests {
         let models = vec![("fake-model".to_string(), "Fake".to_string(), true)];
         let options = config_options(
             1,
-            "promptUnmatched",
+            ("default", "promptUnmatched"),
             "fake-model",
             "max",
             false,
