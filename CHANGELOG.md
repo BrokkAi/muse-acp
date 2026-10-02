@@ -5,12 +5,15 @@
 - Fix startup on Windows for a saved `:auto-review` permission profile
   without Developer Mode or administrator rights. The private settings view
   now links folders with directory junctions and, when symbolic links are not
-  allowed, files with hard links. A file Muse replaces through a hard link is
-  moved back over the original when the host exits. Previously every request
-  failed with `A required privilege is not held by the client (os error
-  1314)`.
-- If the settings view cannot be built, log why and start `muse serve` with
-  the saved settings instead of failing every request.
+  allowed, files with hard links. A file Muse replaces through a hard link,
+  such as a refreshed credential, is moved back over the original when the
+  host exits, or at the next launch if the editor terminated the agent.
+  Previously every request failed with `A required privilege is not held by
+  the client (os error 1314)`.
+- If the settings view cannot be built, start `muse serve` with the saved
+  settings instead of failing every request, and name the cause in the error
+  shown when Muse then refuses the profile. Another app's configuration entry
+  that cannot be linked is now left out of the view instead of failing it.
 
 ## 0.9.0
 

@@ -229,8 +229,15 @@ pub fn session_profile_hint(host_message: &str) -> Option<String> {
         .filter(|name| !name.is_empty())
         .map(|name| format!(" ({name})"))
         .unwrap_or_default();
+    let view = crate::host_config::view_failure()
+        .map(|error| {
+            format!(
+                " It could not do so for this host: preparing its settings view failed ({error})."
+            )
+        })
+        .unwrap_or_default();
     Some(format!(
-        " Hint: muse serve refused its permission profile{profile}. Check Muse settings (`permissions.default_profile`) and managed policy. muse-acp substitutes :ask-me for the saved built-in :auto-review profile at host launch unless its log says it could not prepare the settings view; other profiles must be usable by muse serve."
+        " Hint: muse serve refused its permission profile{profile}. Check Muse settings (`permissions.default_profile`) and managed policy. muse-acp substitutes :ask-me for the saved built-in :auto-review profile at host launch; other profiles must be usable by muse serve.{view}"
     ))
 }
 
