@@ -10347,7 +10347,7 @@ mod tests {
             let _ = std::fs::remove_file(&escape);
             std::os::unix::fs::symlink(&outside_file, &escape).unwrap();
             assert_eq!(
-                choice(&build("", "", "\"fileAccess\"", &json_path(&escape), ONCE)),
+                choice(&build("", "\"fileAccess\"", &json_path(&escape), ONCE)),
                 None,
                 "a symlink that resolves outside the root is never auto-approved"
             );
@@ -10355,13 +10355,7 @@ mod tests {
             let _ = std::fs::remove_file(&dangling);
             std::os::unix::fs::symlink(outside.with_extension("missing"), &dangling).unwrap();
             assert_eq!(
-                choice(&build(
-                    "",
-                    "",
-                    "\"fileAccess\"",
-                    &json_path(&dangling),
-                    ONCE
-                )),
+                choice(&build("", "\"fileAccess\"", &json_path(&dangling), ONCE)),
                 None,
                 "a dangling symlink is never auto-approved"
             );
