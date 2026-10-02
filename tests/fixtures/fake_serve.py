@@ -1672,15 +1672,20 @@ def main():
                                                  "reason": "session_configuration_conflict",
                                                  "retryable": False}}})
                         continue
-                if method == "session/compact" and SCENARIO == "compact_unavailable":
-                    # Mirrors live 1.3-1.4 hosts on a session too short to compact.
+                if method == "session/compact" and SCENARIO in (
+                        "compact_unavailable", "compact_rejected"):
+                    # compaction_unavailable mirrors live 1.3-1.4 hosts on a
+                    # session too short to compact; the other is any refusal.
+                    log_input(msg.get("params", {}))
                     command = msg["params"].get("commandId", "")
+                    reason = ("compaction_unavailable" if SCENARIO == "compact_unavailable"
+                              else "turn_in_progress")
                     send({"jsonrpc": "2.0", "id": ident,
                           "error": {"code": -32030,
-                                    "message": "session/compact command " + command + " rejected: compaction_unavailable",
+                                    "message": "session/compact command " + command + " rejected: " + reason,
                                     "data": {"kind": "commandRejected",
                                              "commandId": command,
-                                             "reason": "compaction_unavailable",
+                                             "reason": reason,
                                              "retryable": False}}})
                     continue
                 if (method == "session/start"

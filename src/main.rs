@@ -2514,6 +2514,24 @@ fn send_v2_user_message(stdout: &StdoutShared, sid: &str, content: &str) {
 
 /// Echo accepted prompt content (`content` is its ACP JSON array) as v1 user
 /// message chunks sharing one message id.
+/// An agent message the adapter writes itself. Only ACP v2 chunks carry a
+/// `messageId`.
+fn send_agent_text(stdout: &StdoutShared, sid: &str, ver: u8, text: &str) {
+    let message_id = if ver == 2 {
+        format!(",\"messageId\":{}", esc(&mint_id("msg-", &ID_COUNTER)))
+    } else {
+        String::new()
+    };
+    acp::send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"agent_message_chunk\"{message_id},\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
+            esc(sid),
+            esc(text)
+        ),
+    );
+}
+
 fn send_v1_user_message(stdout: &StdoutShared, sid: &str, content: &str) {
     let msg_id = mint_id("msg-", &ID_COUNTER);
     if let Ok(J::Arr(blocks)) = parse_json(content) {
@@ -4082,69 +4100,67 @@ fn handle_acp(
             });
             if is_compact.is_some() {
                 let cmd = host.mint_cmd("cmd-");
-                let note = match host.command(
+                let result = host.command(
                     "session/compact",
                     &format!(
                         "{{\"commandId\":{},\"sessionId\":{}}}",
                         esc(&cmd),
                         esc(&msp_sid)
                     ),
-                ) {
-                    Ok(r) => {
-                        let status = r.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                        if status == "noop" {
-                            log(&format!(
-                                "compact noop: {}",
-                                r.get("reason").and_then(|v| v.as_str()).unwrap_or("?")
-                            ));
+                );
+                // Muse says there is nothing to compact as a noop ack or as a
+                // rejection (a session too short, or without a run yet). That
+                // is an answer, not a failure: settle with Muse's reason.
+                let declined = match &result {
+                    Ok(r) if r.get("status").and_then(|v| v.as_str()) == Some("noop") => {
+                        Some(r.get("reason").and_then(|v| v.as_str()).unwrap_or("noop"))
+                    }
+                    Ok(_) => None,
+                    Err(e) => match msp::rejection_reason(e) {
+                        Some(reason @ ("compaction_unavailable" | "missing_run")) => Some(reason),
+                        _ => {
+                            acp::send_error(
+                                stdout,
+                                &id,
+                                msp::acp_error_code(e, -32603),
+                                &format!("session/compact failed: {}", err_message(e)),
+                            );
+                            return;
                         }
-                        None
-                    }
-                    // Muse declines a session with too little history to
-                    // compact. That is an answer, not a failure.
-                    Err(e) if msp::rejection_reason(&e) == Some("compaction_unavailable") => {
-                        log("compact declined: compaction_unavailable");
-                        Some("Nothing to compact yet.")
-                    }
-                    Err(e) => {
-                        acp::send_error(
-                            stdout,
-                            &id,
-                            msp::acp_error_code(&e, -32603),
-                            &format!("session/compact failed: {}", err_message(&e)),
-                        );
-                        return;
-                    }
+                    },
                 };
-                let agent_note = |stdout: &StdoutShared| {
-                    if let Some(note) = note {
-                        acp::send_raw(
+                if let Some(reason) = declined {
+                    log(&format!("compact declined: {reason}"));
+                }
+                let note = |stdout: &StdoutShared| {
+                    if let Some(reason) = declined {
+                        send_agent_text(
                             stdout,
-                            &format!(
-                                "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
-                                esc(&sid),
-                                esc(&mint_id("msg-", &ID_COUNTER)),
-                                esc(note)
-                            ),
+                            &sid,
+                            ver,
+                            &format!("Muse did not compact this session ({reason})."),
                         );
                     }
                 };
                 if ver == 2 {
+                    let busy = sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&sid)
+                        .is_some_and(|s| s.active_turn.is_some() || !s.in_flight.is_empty());
                     acp::send_result(stdout, &id, "{}");
                     send_v2_user_message(stdout, &sid, &acp_content);
-                    agent_note(stdout);
-                    acp::send_state(stdout, &sid, "idle", Some("end_turn"));
+                    note(stdout);
+                    // The command is done, not the session: a turn that is
+                    // still running keeps it running.
+                    if busy {
+                        acp::send_state(stdout, &sid, "running", None);
+                    } else {
+                        acp::send_state(stdout, &sid, "idle", Some("end_turn"));
+                    }
                 } else {
-                    let msg_id = mint_id("msg-", &ID_COUNTER);
-                    acp::send_raw(
-                        stdout,
-                        &format!(
-                            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":\"/compact\"}}}}}}}}",
-                            esc(&sid),
-                            esc(&msg_id)
-                        ),
-                    );
-                    agent_note(stdout);
+                    send_v1_user_message(stdout, &sid, &acp_content);
+                    note(stdout);
                     acp::send_result(stdout, &id, "{\"stopReason\":\"end_turn\"}");
                 }
                 return;

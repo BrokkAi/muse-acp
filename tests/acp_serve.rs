@@ -5307,7 +5307,7 @@ fn compact_noop_settles_the_prompt_without_faking_work() {
         "noop compact must settle honestly: {frame}"
     );
     c.wait_stderr(
-        "compact noop: no_compactable_history",
+        "compact declined: no_compactable_history",
         Duration::from_secs(10),
     );
     c.finish();
@@ -5315,6 +5315,7 @@ fn compact_noop_settles_the_prompt_without_faking_work() {
 
 #[test]
 fn compact_on_a_session_with_too_little_history_settles_with_a_note() {
+    let note = "Muse did not compact this session (compaction_unavailable).";
     for ver in [1, 2] {
         let mut c = Client::spawn("compact_unavailable", &[]);
         let sid = c.new_session(ver, "");
@@ -5324,16 +5325,41 @@ fn compact_on_a_session_with_too_little_history_settles_with_a_note() {
             !frame.contains("\"error\""),
             "v{ver}: a declined compaction is not a failure: {frame}"
         );
+        let shown = c.wait_for(note, Duration::from_secs(15));
+        assert!(shown.contains("\"agent_message_chunk\""), "{shown}");
         if ver == 1 {
             assert!(frame.contains("\"stopReason\":\"end_turn\""), "{frame}");
+            assert!(
+                !shown.contains("messageId"),
+                "v1 chunks carry none: {shown}"
+            );
+            assert!(
+                frame_index(&c, note) < frame_index(&c, &format!("\"id\":{pid}")),
+                "the note precedes the v1 prompt response"
+            );
+        } else {
+            c.wait_for("\"end_turn\"", Duration::from_secs(15));
         }
-        c.wait_for("Nothing to compact yet.", Duration::from_secs(15));
+        c.wait_input("\"sessionId\"", Duration::from_secs(10));
         c.wait_stderr(
             "compact declined: compaction_unavailable",
             Duration::from_secs(10),
         );
         c.finish();
     }
+}
+
+#[test]
+fn compact_still_fails_for_other_host_refusals() {
+    let mut c = Client::spawn("compact_rejected", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "/compact");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"error\"") && frame.contains("turn_in_progress"),
+        "{frame}"
+    );
+    c.finish();
 }
 
 #[test]
