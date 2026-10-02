@@ -334,6 +334,7 @@ impl Adapter {
     }
 
     /// Waits until the adapter's log contains `needle`.
+    #[cfg(target_os = "linux")]
     fn wait_log(&self, needle: &str) {
         let deadline = Instant::now() + TIMEOUT;
         loop {
