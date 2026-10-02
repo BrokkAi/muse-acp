@@ -112,17 +112,23 @@ jobs:
       - if: runner.os == 'macOS'
         name: Diagnose muse serve startup (temporary)
         run: |
-          d="$RUNNER_TEMP/diag"; mkdir -p "$d/config/muse" "$d/home"
-          echo '{"schema_version":1,"model":"fake-model","reasoning_effort":"none","endpoint_transport":{"base_url":"http://127.0.0.1:9","auth":"bearer"}}' > "$d/config/muse/settings.json"
-          echo '{"schema_version":1,"providers":{"meta":{"api_key":"test-dummy-key"}}}' > "$d/config/muse/auth.json"
-          (printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"probe","version":"0"},"capabilities":{}}}'; sleep 60) \
-            | env XDG_CONFIG_HOME="$d/config" HOME="$d/home" MUSE_NO_AUTO_UPDATE=1 "$MUSE_CLI" serve > "$d/out.txt" 2> "$d/err.txt" &
-          pid=$!
-          sleep 55
-          kill "$pid" 2>/dev/null || true
-          echo "--- stdout"; head -c 3000 "$d/out.txt"; echo
-          echo "--- stderr"; tail -c 6000 "$d/err.txt"
-          echo "--- processes"; ps -ax -o pid,ppid,stat,etime,command | grep -i muse | grep -v grep || true
+          probe() {
+            label="$1"; shift
+            d="$RUNNER_TEMP/diag-$label"; mkdir -p "$d/config/muse" "$d/home"
+            echo '{"schema_version":1,"model":"fake-model","reasoning_effort":"none","endpoint_transport":{"base_url":"http://127.0.0.1:9","auth":"bearer"}}' > "$d/config/muse/settings.json"
+            echo '{"schema_version":1,"providers":{"meta":{"api_key":"test-dummy-key"}}}' > "$d/config/muse/auth.json"
+            (printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"probe","version":"0"},"capabilities":{}}}'; sleep 30) \
+              | env XDG_CONFIG_HOME="$d/config" HOME="$d/home" MUSE_NO_AUTO_UPDATE=1 "$@" "$MUSE_CLI" serve > "$d/out.txt" 2> "$d/err.txt" &
+            pid=$!
+            sleep 25
+            kill "$pid" 2>/dev/null || true
+            echo "=== $label: stdout"; head -c 600 "$d/out.txt"; echo
+            echo "=== $label: stderr"; tail -c 1500 "$d/err.txt"; echo
+          }
+          probe file-backend TBH_CREDENTIAL_BACKEND=file
+          probe env-key META_API_KEY=test-dummy-key
+          security unlock-keychain -p "" ~/Library/Keychains/login.keychain-db 2>&1 || true
+          probe unlocked-keychain
       - run: cargo test --locked --test live_loopback -- --test-threads 2
         env:
           MUSE_ACP_LOOPBACK: '1'
