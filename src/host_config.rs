@@ -3,25 +3,46 @@
 //! `muse serve` has no permission-profile flag or settings-file override. Use
 //! a private XDG config view only when the saved built-in profile needs the
 //! unavailable reviewer. Everything except settings is linked, not copied.
+//! Windows links folders with junctions and, without the symbolic-link
+//! privilege, files with hard links; neither needs Developer Mode.
+
+#[cfg(windows)]
+mod windows;
 
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::json::{J, j_to_string, parse_json};
 
 pub struct HostConfig {
     root: PathBuf,
+    #[cfg(windows)]
+    links: windows::Links,
 }
 
 impl Drop for HostConfig {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        self.links.restore();
         // remove_dir_all removes the links themselves, never their targets.
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+/// Why the latest launch ran without a view, for the editor-facing hint if
+/// Muse then refuses the saved profile.
+static VIEW_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn view_failure() -> Option<String> {
+    VIEW_FAILURE
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
 }
 
 fn config_root(xdg: Option<OsString>, home: Option<OsString>) -> Option<PathBuf> {
@@ -75,25 +96,30 @@ fn private_temp_dir() -> io::Result<HostConfig> {
             builder.mode(0o700);
         }
         match builder.create(&root) {
-            Ok(()) => return Ok(HostConfig { root }),
+            Ok(()) => {
+                return Ok(HostConfig {
+                    root,
+                    #[cfg(windows)]
+                    links: windows::Links::default(),
+                });
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
     }
 }
 
-fn link_entry(source: &Path, target: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(source, target)
-    }
-    #[cfg(windows)]
-    {
-        if source.is_dir() {
-            std::os::windows::fs::symlink_dir(source, target)
-        } else {
-            std::os::windows::fs::symlink_file(source, target)
-        }
+#[cfg(unix)]
+fn link_entry(_config: &mut HostConfig, source: &Path, target: &Path) -> io::Result<()> {
+    std::os::unix::fs::symlink(source, target)
+}
+
+#[cfg(windows)]
+fn link_entry(config: &mut HostConfig, source: &Path, target: &Path) -> io::Result<()> {
+    if source.is_dir() {
+        windows::link_dir(source, target)
+    } else {
+        config.links.link_file(source, target)
     }
 }
 
@@ -108,11 +134,21 @@ fn prepare(source: &Path) -> io::Result<Option<HostConfig>> {
     let Some(settings) = host_settings(&text) else {
         return Ok(None);
     };
-    let config = private_temp_dir()?;
+    let mut config = private_temp_dir()?;
+    #[cfg(windows)]
+    config.links.claim(&config.root)?;
     for entry in fs::read_dir(&source)? {
         let entry = entry?;
         if entry.file_name() != "muse" {
-            link_entry(&entry.path(), &config.root.join(entry.file_name()))?;
+            // Other apps' settings only matter to tools muse serve runs, so
+            // one that cannot be linked is left out instead of failing.
+            let target = config.root.join(entry.file_name());
+            if let Err(error) = link_entry(&mut config, &entry.path(), &target) {
+                crate::msp::log(&format!(
+                    "left {} out of the Muse settings view: {error}",
+                    entry.path().display()
+                ));
+            }
         }
     }
     let muse = config.root.join("muse");
@@ -120,29 +156,41 @@ fn prepare(source: &Path) -> io::Result<Option<HostConfig>> {
     for entry in fs::read_dir(source.join("muse"))? {
         let entry = entry?;
         if entry.file_name() != "settings.json" && entry.file_name() != ".settings.json.lock" {
-            link_entry(&entry.path(), &muse.join(entry.file_name()))?;
+            link_entry(&mut config, &entry.path(), &muse.join(entry.file_name()))?;
         }
     }
     fs::write(muse.join("settings.json"), settings)?;
     Ok(Some(config))
 }
 
-pub fn configure(cmd: &mut Command) -> Result<Option<HostConfig>, String> {
-    let Some(source) = config_root(
+/// Never fails the launch: without a view, `muse serve` reads the saved
+/// settings itself, and a refused profile reaches the editor with guidance.
+pub fn configure(cmd: &mut Command) -> Option<HostConfig> {
+    let source = config_root(
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
-    ) else {
-        return Ok(None);
+    )?;
+    configure_from(cmd, &source)
+}
+
+fn configure_from(cmd: &mut Command, source: &Path) -> Option<HostConfig> {
+    #[cfg(windows)]
+    windows::sweep();
+    let prepared = prepare(source);
+    *VIEW_FAILURE.lock().unwrap_or_else(|p| p.into_inner()) =
+        prepared.as_ref().err().map(ToString::to_string);
+    let config = match prepared {
+        Ok(config) => config?,
+        Err(error) => {
+            crate::msp::log(&format!(
+                "could not prepare the settings view for human approvals ({error}); muse serve uses the saved Muse settings, which may refuse a saved :auto-review profile"
+            ));
+            return None;
+        }
     };
-    let config = prepare(&source)
-        .map_err(|error| format!("prepare Muse host settings for human approvals: {error}"))?;
-    if let Some(config) = &config {
-        cmd.env("XDG_CONFIG_HOME", &config.root);
-        crate::msp::log(
-            "using :ask-me for muse serve; saved :auto-review settings remain unchanged",
-        );
-    }
-    Ok(config)
+    cmd.env("XDG_CONFIG_HOME", &config.root);
+    crate::msp::log("using :ask-me for muse serve; saved :auto-review settings remain unchanged");
+    Some(config)
 }
 
 #[cfg(test)]
@@ -227,5 +275,207 @@ mod tests {
         assert!(muse.join("auth.json").exists());
         assert!(muse.join("skills").is_dir());
         assert!(source.root.join("other-app").is_dir());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unprepared_view_launches_with_saved_settings() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = private_temp_dir().unwrap();
+        let muse = source.root.join("muse");
+        fs::create_dir(&muse).unwrap();
+        fs::write(
+            muse.join("settings.json"),
+            r#"{"permissions":{"default_profile":":auto-review"}}"#,
+        )
+        .unwrap();
+        // The settings stay readable, but the folder cannot be listed.
+        fs::set_permissions(&muse, fs::Permissions::from_mode(0o100)).unwrap();
+        let listable = fs::read_dir(&muse).is_ok();
+        let mut cmd = Command::new("muse");
+        let config = configure_from(&mut cmd, &source.root);
+        fs::set_permissions(&muse, fs::Permissions::from_mode(0o700)).unwrap();
+        if listable {
+            // Permissions do not bind this user (for example, root).
+            return;
+        }
+        assert!(config.is_none());
+        assert!(cmd.get_envs().all(|(key, _)| key != "XDG_CONFIG_HOME"));
+    }
+
+    /// How Muse saves a file: write a new one, then rename it over the old.
+    #[cfg(windows)]
+    fn muse_save(path: &Path, text: &str) {
+        let temp = path.with_extension("tmp");
+        fs::write(&temp, text).unwrap();
+        fs::rename(&temp, path).unwrap();
+    }
+
+    /// A source config root and the view prepared from it, with files
+    /// hard-linked as on a standard Windows account (CI runs elevated).
+    #[cfg(windows)]
+    fn windows_overlay(original: &str) -> (HostConfig, HostConfig) {
+        windows::FILE_SYMLINKS_DENIED.store(true, Ordering::Relaxed);
+        let source = private_temp_dir().unwrap();
+        let muse = source.root.join("muse");
+        fs::create_dir(&muse).unwrap();
+        fs::create_dir(muse.join("skills")).unwrap();
+        fs::write(muse.join("skills/SKILL.md"), "fixture skill").unwrap();
+        fs::create_dir(source.root.join("other-app")).unwrap();
+        fs::write(source.root.join("other-app/config"), "fixture other").unwrap();
+        fs::write(muse.join("settings.json"), original).unwrap();
+        fs::write(muse.join("auth.json"), "fixture credential").unwrap();
+        fs::write(muse.join("trust.json"), "fixture trust").unwrap();
+        fs::write(muse.join(".settings.json.lock"), "original lock").unwrap();
+        let overlay = prepare(&source.root).unwrap().unwrap();
+        (source, overlay)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn overlay_links_other_config_and_cleans_up_without_changing_sources() {
+        let original = r#"{"permissions":{"default_profile":":auto-review"},"model":"chosen"}"#;
+        let (source, overlay) = windows_overlay(original);
+        let muse = source.root.join("muse");
+        let root = overlay.root.clone();
+        assert!(overlay.links.hard.len() >= 2, "files must be hard links");
+        for (name, text) in [
+            ("muse/auth.json", "fixture credential"),
+            ("muse/trust.json", "fixture trust"),
+            ("muse/skills/SKILL.md", "fixture skill"),
+            ("other-app/config", "fixture other"),
+        ] {
+            assert_eq!(fs::read_to_string(root.join(name)).unwrap(), text, "{name}");
+        }
+        for name in ["muse/skills", "other-app"] {
+            let kind = fs::symlink_metadata(root.join(name)).unwrap().file_type();
+            assert!(kind.is_symlink(), "{name} must be a link, not a copy");
+        }
+        fs::write(root.join("other-app/new"), "through the view").unwrap();
+        assert_eq!(
+            fs::read_to_string(source.root.join("other-app/new")).unwrap(),
+            "through the view"
+        );
+        assert!(!root.join("muse/.settings.json.lock").exists());
+        assert_eq!(
+            fs::read_to_string(root.join("muse/settings.json")).unwrap(),
+            original.replace(":auto-review", ":ask-me")
+        );
+        // Muse refreshes a credential while the host runs.
+        muse_save(&root.join("muse/auth.json"), "refreshed credential");
+        assert_eq!(
+            fs::read_to_string(muse.join("auth.json")).unwrap(),
+            "fixture credential"
+        );
+        drop(overlay);
+        assert!(!root.exists());
+        assert_eq!(
+            fs::read_to_string(muse.join("settings.json")).unwrap(),
+            original
+        );
+        assert_eq!(
+            fs::read_to_string(muse.join("auth.json")).unwrap(),
+            "refreshed credential"
+        );
+        assert_eq!(
+            fs::read_to_string(muse.join("trust.json")).unwrap(),
+            "fixture trust"
+        );
+        assert_eq!(
+            fs::read_to_string(muse.join("skills/SKILL.md")).unwrap(),
+            "fixture skill"
+        );
+        assert!(source.root.join("other-app/config").exists());
+        assert!(source.root.join("other-app/new").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_later_launch_restores_a_view_whose_adapter_was_terminated() {
+        let original = r#"{"permissions":{"default_profile":":auto-review"}}"#;
+        let (source, mut overlay) = windows_overlay(original);
+        let root = overlay.root.clone();
+        muse_save(&root.join("muse/auth.json"), "refreshed credential");
+        // Live views are left alone.
+        windows::sweep();
+        assert!(root.exists());
+        // Terminated: the owner file closes, and Drop never runs.
+        overlay.links.abandon();
+        std::mem::forget(overlay);
+        windows::sweep();
+        assert!(!root.exists());
+        assert_eq!(
+            fs::read_to_string(source.root.join("muse/auth.json")).unwrap(),
+            "refreshed credential"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn junctions_need_a_local_absolute_target() {
+        let view = private_temp_dir().unwrap();
+        for target in [r"\\server\share\config", r"relative\config", r"C:relative"] {
+            let error = windows::junction(Path::new(target), &view.root.join("link")).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Unsupported, "{target}");
+            assert!(!view.root.join("link").exists());
+        }
+        // A target that does not resolve leaves no junction behind.
+        let missing = view.root.join("missing");
+        assert!(windows::junction(&missing, &view.root.join("dangling")).is_err());
+        assert!(!view.root.join("dangling").exists());
+        let source = private_temp_dir().unwrap();
+        fs::write(source.root.join("kept.txt"), "verbatim").unwrap();
+        let verbatim = PathBuf::from(format!(r"\\?\{}", source.root.display()));
+        windows::junction(&verbatim, &view.root.join("verbatim")).unwrap();
+        assert_eq!(
+            fs::read_to_string(view.root.join("verbatim/kept.txt")).unwrap(),
+            "verbatim"
+        );
+        drop(view);
+        assert!(source.root.join("kept.txt").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hard_link_replacements_move_back_only_over_an_unchanged_source() {
+        let dir = private_temp_dir().unwrap();
+        let source = dir.root.join("auth.json");
+        let target = dir.root.join("view-auth.json");
+
+        // Muse's save moves back.
+        fs::write(&source, "one").unwrap();
+        let link = windows::HardLink::create(&source, &target).unwrap();
+        muse_save(&target, "two");
+        assert_eq!(fs::read_to_string(&source).unwrap(), "one");
+        link.restore();
+        assert_eq!(fs::read_to_string(&source).unwrap(), "two");
+        assert!(!target.exists(), "the file is moved, not copied");
+
+        // In-place writes already reach the source.
+        let link = windows::HardLink::create(&source, &target).unwrap();
+        fs::write(&target, "three").unwrap();
+        link.restore();
+        assert_eq!(fs::read_to_string(&source).unwrap(), "three");
+
+        // A removed link never removes its source.
+        fs::remove_file(&target).unwrap();
+        link.restore();
+        assert_eq!(fs::read_to_string(&source).unwrap(), "three");
+
+        // A source replaced outside the host is newer, so it is kept.
+        let link = windows::HardLink::create(&source, &target).unwrap();
+        muse_save(&target, "host change");
+        muse_save(&source, "outside change");
+        link.restore();
+        assert_eq!(fs::read_to_string(&source).unwrap(), "outside change");
+        fs::remove_file(&target).unwrap();
+
+        // So is a source rewritten in place.
+        let link = windows::HardLink::create(&source, &target).unwrap();
+        muse_save(&target, "host change");
+        fs::write(&source, "outside edit, longer").unwrap();
+        link.restore();
+        assert_eq!(fs::read_to_string(&source).unwrap(), "outside edit, longer");
     }
 }

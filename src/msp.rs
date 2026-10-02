@@ -229,8 +229,15 @@ pub fn session_profile_hint(host_message: &str) -> Option<String> {
         .filter(|name| !name.is_empty())
         .map(|name| format!(" ({name})"))
         .unwrap_or_default();
+    let view = crate::host_config::view_failure()
+        .map(|error| {
+            format!(
+                " It could not do so for this host: preparing its settings view failed ({error})."
+            )
+        })
+        .unwrap_or_default();
     Some(format!(
-        " Hint: muse serve refused its permission profile{profile}. Check Muse settings (`permissions.default_profile`) and managed policy. muse-acp substitutes :ask-me for the saved built-in :auto-review profile at host launch; other profiles must be usable by muse serve."
+        " Hint: muse serve refused its permission profile{profile}. Check Muse settings (`permissions.default_profile`) and managed policy. muse-acp substitutes :ask-me for the saved built-in :auto-review profile at host launch; other profiles must be usable by muse serve.{view}"
     ))
 }
 
@@ -864,7 +871,7 @@ impl MspHost {
         user_shell: bool,
     ) -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
         let bin = muse_cli();
-        let (mut cmd, host_config) = serve_command(&bin).map_err(LaunchError::Startup)?;
+        let (mut cmd, host_config) = serve_command(&bin);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -1207,7 +1214,7 @@ impl MspHost {
 
 /// All host launches, including restarts and support probes, use the same
 /// process-local settings and host-lifetime flags.
-fn serve_command(bin: &str) -> Result<(Command, Option<crate::host_config::HostConfig>), String> {
+fn serve_command(bin: &str) -> (Command, Option<crate::host_config::HostConfig>) {
     let mut cmd = Command::new(bin);
     cmd.arg("serve");
     for arg in std::env::var("MUSE_SERVE_ARGS")
@@ -1216,8 +1223,8 @@ fn serve_command(bin: &str) -> Result<(Command, Option<crate::host_config::HostC
     {
         cmd.arg(arg);
     }
-    let config = crate::host_config::configure(&mut cmd)?;
-    Ok((cmd, config))
+    let config = crate::host_config::configure(&mut cmd);
+    (cmd, config)
 }
 
 /// Run a bounded, stdin-EOF-only serve probe for `--support`. The probe does
@@ -1225,7 +1232,7 @@ fn serve_command(bin: &str) -> Result<(Command, Option<crate::host_config::HostC
 /// bounded stderr evidence for a human diagnostic.
 pub fn probe_serve_exit(timeout: Duration) -> Result<Option<ExitClassification>, String> {
     let bin = muse_cli();
-    let (mut cmd, _host_config) = serve_command(&bin)?;
+    let (mut cmd, _host_config) = serve_command(&bin);
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::null())
