@@ -7,6 +7,17 @@ be kept up to date as work proceeds.
 This plan is maintained in accordance with `.agents/PLANS.md` from the
 repository root. Read that file before changing this one.
 
+> REVISED 2026-10-02: the deterministic workspace policy described below was
+> rejected in review and replaced by an LLM reviewer. The shipped design is a
+> second, memory-only, read-only Muse session (`--no-session-log
+> --disable-write --disable-shell`) that receives a Codex-style guardian
+> policy, the trusted user instructions, bounded recent evidence, and the
+> exact approval request, then answers with strict JSON
+> (`risk_level`, `user_authorization`, `outcome`, `rationale`). Allow answers
+> select a host allowing choice; deny answers select the host reject choice
+> with the rationale as feedback; reviewer failures deny. The sections below
+> are kept as history of the first attempt.
+
 ## Purpose / Big Picture
 
 Today, someone using Muse Code through an editor has two unpleasant choices.

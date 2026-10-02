@@ -145,6 +145,10 @@ pub struct AcpSession {
     /// never sent to the host, and independent of the host approval mode in
     /// `mode_value`.
     pub auto_review: bool,
+    /// Bounded trusted user instructions for the reviewer prompt.
+    pub review_context: std::collections::VecDeque<String>,
+    /// Bounded recent item evidence for the reviewer prompt.
+    pub review_evidence: std::collections::VecDeque<String>,
     /// The session mode: `default`, `readOnly`, or `plan`.
     pub session_mode: String,
     pub model_value: String,
@@ -714,19 +718,18 @@ pub const MODE_HELP: &str = "allowAll|promptUnmatched|onRequest|denyUnmatched";
 
 /// The client-side auto-review selector. This is adapter policy, not an MSP
 /// `ApprovalMode`: it is never sent to the host and never changes the host's
-/// approval mode. `workspace` answers eligible file access inside the
-/// session's approved roots; every other request still opens the editor
-/// prompt.
+/// approval mode. `on` sends every permission request to the auto-review
+/// agent; the agent can approve or deny it without asking the editor.
 pub const AUTO_REVIEW_OFF: &str = "off";
-pub const AUTO_REVIEW_WORKSPACE: &str = "workspace";
+pub const AUTO_REVIEW_ON: &str = "on";
 
 /// Human-readable list of accepted auto-review ids for error text.
-pub const AUTO_REVIEW_HELP: &str = "off|workspace";
+pub const AUTO_REVIEW_HELP: &str = "off|on";
 
 pub fn resolve_auto_review(value: &str) -> Option<&'static str> {
     match value {
         AUTO_REVIEW_OFF => Some(AUTO_REVIEW_OFF),
-        AUTO_REVIEW_WORKSPACE => Some(AUTO_REVIEW_WORKSPACE),
+        AUTO_REVIEW_ON => Some(AUTO_REVIEW_ON),
         _ => None,
     }
 }
@@ -807,7 +810,7 @@ pub struct ConfigOptions<'a> {
     pub reasoning_effort: &'a str,
     /// Whether the "Muse default" reasoning option is offered.
     pub offer_muse_default: bool,
-    /// True when the adapter-side auto-review selector is `workspace`.
+    /// True when the adapter-side auto-review selector is `on`.
     pub auto_review: bool,
     /// AIR recommended model and reasoning values, when negotiated.
     pub recommendations: (Option<&'a str>, Option<&'a str>),
@@ -849,12 +852,12 @@ pub fn config_options(
         ""
     };
     let auto_review_value = if options.auto_review {
-        AUTO_REVIEW_WORKSPACE
+        AUTO_REVIEW_ON
     } else {
         AUTO_REVIEW_OFF
     };
     format!(
-        "[{{\"{id_key}\":\"mode\",\"name\":\"Mode\",\"description\":\"What Muse may change: Read-only and Plan cannot write files or run shell commands\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"approval_mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"auto_review\",\"name\":\"Auto-review\",\"description\":\"Dangerous: approve eligible workspace-scoped requests without asking; shell, network, and outside-workspace actions still prompt\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"off\",\"name\":\"Off\"}},{{\"value\":\"workspace\",\"name\":\"Workspace\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]{reasoning_meta}}}]",
+        "[{{\"{id_key}\":\"mode\",\"name\":\"Mode\",\"description\":\"What Muse may change: Read-only and Plan cannot write files or run shell commands\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"approval_mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"auto_review\",\"name\":\"Auto-review\",\"description\":\"Dangerous: send every permission request to an auto-review agent that can approve or deny it without asking you\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"off\",\"name\":\"Off\"}},{{\"value\":\"on\",\"name\":\"On\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]{reasoning_meta}}}]",
         esc(options.session_mode),
         mode_options_json("value", &SESSION_MODES),
         esc(options.approval_mode),
@@ -1126,7 +1129,7 @@ mod tests {
                 auto_review.get("currentValue").and_then(|v| v.as_str()),
                 Some(AUTO_REVIEW_OFF)
             );
-            assert!(options.contains("\"value\":\"workspace\""));
+            assert!(options.contains("\"value\":\"on\""));
 
             let skills = vec![
                 (
@@ -1181,7 +1184,7 @@ mod tests {
             "max tier must be advertised: {options}"
         );
         assert!(
-            options.contains("\"currentValue\":\"workspace\""),
+            options.contains("\"currentValue\":\"on\""),
             "auto-review state must be advertised: {options}"
         );
     }
@@ -1189,10 +1192,7 @@ mod tests {
     #[test]
     fn auto_review_selector_defaults_off_and_resolves_two_values() {
         assert_eq!(resolve_auto_review("off"), Some(AUTO_REVIEW_OFF));
-        assert_eq!(
-            resolve_auto_review("workspace"),
-            Some(AUTO_REVIEW_WORKSPACE)
-        );
+        assert_eq!(resolve_auto_review("on"), Some(AUTO_REVIEW_ON));
         assert!(resolve_auto_review("allowAll").is_none());
         assert!(resolve_auto_review("").is_none());
     }

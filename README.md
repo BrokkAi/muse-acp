@@ -22,40 +22,40 @@ ACP v1 and v2, and installs on macOS, Linux, and Windows.
 > products of Meta Platforms, Inc. This project is not affiliated with,
 > endorsed by, or supported by Meta.
 
-## Auto-review: keep the boundary, lose the busywork
+## Auto-review: let an agent decide every prompt
 
 Muse Code's own `:auto-review` permission profile is a TUI feature. Under
 `muse serve`, a saved `:auto-review` session falls back to asking you for
-everything, so editor users choose between clicking through every
-workspace-local edit or switching to `allowAll` and giving up review entirely.
-`muse-acp` gives you the middle path: a per-session **Auto-review** selector
-that works in every ACP client.
+everything, so editor users choose between clicking through every prompt or
+switching to `allowAll` and giving up review entirely. `muse-acp` gives you
+the middle path: a per-session **Auto-review** selector that sends every
+permission request to a reviewer agent instead of to you.
 
-Turn it on and ordinary file access inside your approved workspace roots is
-approved once, immediately, on your behalf. Shell commands, network access,
-protected files, requests Muse's own judge escalated, subagent approvals, and
-any path that resolves outside your workspace still stop and ask you, exactly
-as they do today. Auto-review never changes Muse's sandbox or approval mode,
-never creates a standing "allow always" rule, and never widens your workspace.
-Every automatic decision is written to the adapter's stderr log so you can
-audit it later.
+The reviewer is a second Muse model session on its own memory-only, read-only
+host (`--no-session-log`), so reviews are never saved and never touch your
+files. It gets the same kind of input Codex's guardian gets: a fixed safety
+policy, your trusted instructions, recent evidence, and the exact approval
+request. It answers with strict JSON - `risk_level`, `user_authorization`,
+`outcome`, and a rationale. Low and medium risk actions proceed; critical
+risk is denied; high risk proceeds only when your instructions authorize it.
+A reviewer failure or an unusable answer denies the action rather than
+letting it run. Every decision is logged to stderr with its rationale.
 
 ```mermaid
 flowchart TD
-    A[Muse asks for approval] --> B{Auto-review set to workspace?}
+    A[Muse sends a permission request] --> B{Auto-review on?}
     B -- No --> P[Editor permission prompt]
-    B -- Yes --> C{Eligible file access inside approved roots?}
-    C -- No --> P
-    C -- Yes --> D[Approve once on your behalf]
-    D --> E[Write an audit line]
-    P --> F[You decide]
+    B -- Yes --> R[Reviewer agent: policy + instructions + action]
+    R --> D{allow or deny?}
+    D -- allow --> E[approval/decide with an allowing choice]
+    D -- deny --> F[approval/decide with a rejecting choice + rationale]
 ```
 
-Auto-review is off by default. Select **Workspace** in the **Auto-review**
+Auto-review is off by default. Select **On** in the **Auto-review**
 selector, next to Approval Mode in clients that render ACP `configOptions`,
 and it applies to that session only. See the
-[Auto-review guide](docs/auto-review.md) for the exact eligibility rules,
-fail-closed behavior, and limitations.
+[Auto-review guide](docs/auto-review.md) for the policy, the reviewer's
+inputs, the decision thresholds, and the failure behavior.
 
 ## Requirements
 

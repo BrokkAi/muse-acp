@@ -3,12 +3,12 @@
 ## Unreleased
 
 - Add session-scoped **Auto-review**. A new default-off `auto_review`
-  selector lets the adapter approve eligible workspace-local file access for
-  one action at a time while shell, network, protected, host-escalated,
-  subagent, and out-of-workspace requests keep prompting. The selector is
-  adapter policy, not a Muse approval mode: it never changes the host's mode,
-  never selects a session or permanent grant, and writes one audit line per
-  automatic decision. See the README Auto-review section and
+  selector sends every permission request to a reviewer agent instead of the
+  editor. The reviewer runs on a memory-only, read-only Muse host, follows a
+  Codex-style safety policy, and answers with a risk level, user-authorization
+  score, allow/deny outcome, and rationale; failures deny. The selector never
+  changes the host's approval mode, and each decision is logged with its
+  rationale. See the README Auto-review section and
   [docs/auto-review.md](docs/auto-review.md).
 - Add **Read-only** and **Plan** session modes. The editor's Mode selector
   now offers Default, Read-only, and Plan. Read-only and Plan sessions run on

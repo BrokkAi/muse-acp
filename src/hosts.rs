@@ -19,11 +19,15 @@ use crate::msp::{HandshakeInfo, LaunchError, MspEvent, MspHost, mk_err};
 
 /// Flags that make Muse refuse workspace writes and shell commands.
 pub const READ_ONLY_ARGS: [&str; 2] = ["--disable-write", "--disable-shell"];
+/// The reviewer host is read-only and memory-only: `--no-session-log` keeps
+/// every review out of the user's saved session list.
+pub const REVIEWER_ARGS: [&str; 3] = ["--no-session-log", "--disable-write", "--disable-shell"];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostKind {
     Main,
     ReadOnly,
+    Reviewer,
 }
 
 impl HostKind {
@@ -31,6 +35,7 @@ impl HostKind {
         match self {
             HostKind::Main => "main",
             HostKind::ReadOnly => "read-only",
+            HostKind::Reviewer => "reviewer",
         }
     }
 
@@ -38,6 +43,7 @@ impl HostKind {
         match self {
             HostKind::Main => &[],
             HostKind::ReadOnly => &READ_ONLY_ARGS,
+            HostKind::Reviewer => &REVIEWER_ARGS,
         }
     }
 }
@@ -61,6 +67,7 @@ struct Current {
 pub struct Hosts {
     main: Mutex<Current>,
     read_only: Mutex<Option<Current>>,
+    reviewer: Mutex<Option<Current>>,
     owners: Mutex<HashMap<String, HostKind>>,
     /// Held while the read-only host launches, so two callers never start two.
     launching: Mutex<()>,
@@ -83,6 +90,7 @@ impl Hosts {
         Ok(Arc::new(Hosts {
             main: Mutex::new(Current { host, generation }),
             read_only: Mutex::new(None),
+            reviewer: Mutex::new(None),
             owners: Mutex::new(HashMap::new()),
             launching: Mutex::new(()),
             user_input_dialogs,
@@ -108,6 +116,7 @@ impl Hosts {
         match kind {
             HostKind::Main => *lock(&self.main) = current,
             HostKind::ReadOnly => *lock(&self.read_only) = Some(current),
+            HostKind::Reviewer => *lock(&self.reviewer) = Some(current),
         }
     }
 
@@ -117,11 +126,17 @@ impl Hosts {
         lock(&self.read_only).take();
     }
 
+    /// Forgets the reviewer process; the next review launches a new one.
+    pub fn clear_reviewer(&self) {
+        lock(&self.reviewer).take();
+    }
+
     /// The current process of this kind, if one is running.
     pub fn host(&self, kind: HostKind) -> Option<Arc<MspHost>> {
         match kind {
             HostKind::Main => Some(lock(&self.main).host.clone()),
             HostKind::ReadOnly => lock(&self.read_only).as_ref().map(|c| c.host.clone()),
+            HostKind::Reviewer => lock(&self.reviewer).as_ref().map(|c| c.host.clone()),
         }
     }
 
@@ -146,11 +161,33 @@ impl Hosts {
         Ok(host)
     }
 
+    /// The memory-only, read-only reviewer process, launched on first use.
+    pub fn reviewer_host(&self) -> Result<Arc<MspHost>, String> {
+        if let Some(host) = self.host(HostKind::Reviewer) {
+            return Ok(host);
+        }
+        let _launching = lock(&self.launching);
+        if let Some(host) = self.host(HostKind::Reviewer) {
+            return Ok(host);
+        }
+        let (host, generation) = self
+            .launch_kind(HostKind::Reviewer)
+            .map_err(|e| format!("could not start the reviewer Muse host: {e}"))?;
+        crate::msp::log(
+            "reviewer Muse host started (--no-session-log --disable-write --disable-shell)",
+        );
+        self.replace(HostKind::Reviewer, host.clone(), generation);
+        Ok(host)
+    }
+
     /// Whether events with this tag come from a current process.
     pub fn is_current(&self, tag: HostTag) -> bool {
         match tag.kind {
             HostKind::Main => lock(&self.main).generation == tag.generation,
             HostKind::ReadOnly => lock(&self.read_only)
+                .as_ref()
+                .is_some_and(|c| c.generation == tag.generation),
+            HostKind::Reviewer => lock(&self.reviewer)
                 .as_ref()
                 .is_some_and(|c| c.generation == tag.generation),
         }
@@ -192,7 +229,7 @@ impl Hosts {
         // Most adapters never run a read-only session; skip parsing then.
         let any_read_only = lock(&self.owners)
             .values()
-            .any(|kind| *kind == HostKind::ReadOnly);
+            .any(|kind| matches!(*kind, HostKind::ReadOnly | HostKind::Reviewer));
         if !any_read_only {
             return Ok(self.main_host());
         }
@@ -210,6 +247,9 @@ impl Hosts {
             HostKind::Main => Ok(self.main_host()),
             HostKind::ReadOnly => self
                 .read_only_host()
+                .map_err(|message| mk_err(-32603, &message)),
+            HostKind::Reviewer => self
+                .reviewer_host()
                 .map_err(|message| mk_err(-32603, &message)),
         }
     }
@@ -251,6 +291,7 @@ impl Hosts {
     fn all(&self) -> Vec<Arc<MspHost>> {
         let mut hosts = vec![self.main_host()];
         hosts.extend(self.host(HostKind::ReadOnly));
+        hosts.extend(self.host(HostKind::Reviewer));
         hosts
     }
 }

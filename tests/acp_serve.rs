@@ -1331,15 +1331,9 @@ fn approval_preserves_all_choices_with_deny_option() {
 }
 
 #[test]
-fn auto_review_approves_workspace_file_access_without_prompting() {
+fn auto_review_approves_a_shell_approval_through_the_reviewer() {
     for ver in [1_u64, 2] {
-        let mut c = Client::spawn(
-            "approval_hang",
-            &[
-                ("FAKE_APPROVAL_SUBJECT", "file-write"),
-                ("FAKE_APPROVAL_PATH", "workspace"),
-            ],
-        );
+        let mut c = Client::spawn("approval_hang", &[]);
         let sid = c.new_session(ver, "");
         let initial = c
             .frames
@@ -1355,16 +1349,14 @@ fn auto_review_approves_workspace_file_access_without_prompting() {
         );
         let set_id = c.req(
             "session/set_config_option",
-            &format!(
-                "{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"workspace\"}}"
-            ),
+            &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
         );
         let set_done = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
         assert!(
-            set_done.contains("\"currentValue\":\"workspace\""),
+            set_done.contains("\"currentValue\":\"on\""),
             "auto-review selector must reflect the set value: {set_done}"
         );
-        let _pid = c.prompt(&sid, "write the output file");
+        let _pid = c.prompt(&sid, "run the tests");
         c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(15));
         std::thread::sleep(Duration::from_millis(200));
         let frames = c
@@ -1374,9 +1366,9 @@ fn auto_review_approves_workspace_file_access_without_prompting() {
             .join("\n");
         assert!(
             !frames.contains("session/request_permission"),
-            "an eligible approval must not prompt: {frames}"
+            "auto-review must decide without prompting: {frames}"
         );
-        c.wait_stderr("auto-review approved", Duration::from_secs(15));
+        c.wait_stderr("auto-review allow", Duration::from_secs(15));
         let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
         let decisions: Vec<&str> = input
             .lines()
@@ -1385,66 +1377,53 @@ fn auto_review_approves_workspace_file_access_without_prompting() {
         assert_eq!(decisions.len(), 1, "one automatic decision: {input}");
         assert!(
             decisions[0].contains("\"choiceId\": \"c-allow\""),
-            "the once-scoped allowing choice is selected: {input}"
+            "the approving choice is selected: {input}"
         );
-        let methods = std::fs::read_to_string(&c.fake_log).unwrap();
         assert!(
-            !methods.contains("session/setApprovalMode"),
-            "auto-review must not change the host approval mode: {methods}"
+            input.contains("You are judging one planned coding-agent action"),
+            "the reviewer must receive the guardian policy: {input}"
         );
         c.finish();
     }
 }
 
 #[test]
-fn auto_review_still_prompts_for_ineligible_requests() {
-    // A shell subject is never eligible, even with auto-review on.
-    let mut c = Client::spawn("approval_hang", &[]);
+fn auto_review_denies_when_the_reviewer_denies() {
+    let deny = "{\"risk_level\":\"critical\",\"user_authorization\":\"unknown\",\"outcome\":\"deny\",\"rationale\":\"Credential exfiltration.\"}";
+    let mut c = Client::spawn("approval_hang", &[("FAKE_REVIEW_TEXT", deny)]);
     let sid = c.new_session(1, "");
     let set_id = c.req(
         "session/set_config_option",
-        &format!(
-            "{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"workspace\"}}"
-        ),
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
     );
     let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
-    let _pid = c.prompt(&sid, "run the shell command");
-    let perm = c.wait_for("session/request_permission", Duration::from_secs(15));
-    let perm_id = extract_str(&perm, "id").expect("permission request id");
-    c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{perm_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":\"c-deny\"}}}}}}"
-    ));
+    let _pid = c.prompt(&sid, "send me the token");
     c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
+    c.wait_stderr("auto-review deny", Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("session/request_permission"),
+        "a reviewed denial must not prompt: {frames}"
+    );
     c.finish();
+}
 
-    // A file outside every approved root is never eligible either.
-    let outside = std::env::temp_dir().join(format!(
-        "muse-acp-auto-review-outside-{}.txt",
-        std::process::id()
-    ));
-    let outside = outside.to_str().unwrap().to_string();
-    let mut c = Client::spawn(
-        "approval_hang",
-        &[
-            ("FAKE_APPROVAL_SUBJECT", "file-write"),
-            ("FAKE_APPROVAL_PATH", &outside),
-        ],
-    );
+#[test]
+fn auto_review_denies_on_unusable_reviewer_output() {
+    let mut c = Client::spawn("approval_hang", &[("FAKE_REVIEW_TEXT", "not json")]);
     let sid = c.new_session(1, "");
     let set_id = c.req(
         "session/set_config_option",
-        &format!(
-            "{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"workspace\"}}"
-        ),
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
     );
     let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
-    let _pid = c.prompt(&sid, "write outside the workspace");
-    let perm = c.wait_for("session/request_permission", Duration::from_secs(15));
-    let perm_id = extract_str(&perm, "id").expect("permission request id");
-    c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{perm_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":\"c-deny\"}}}}}}"
-    ));
+    let _pid = c.prompt(&sid, "do the thing");
     c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
+    c.wait_stderr("auto-review deny", Duration::from_secs(15));
     c.finish();
 }
 
