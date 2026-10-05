@@ -1416,6 +1416,100 @@ fn same_workspace_root(left: &str, right: &str) -> bool {
     }
 }
 
+/// Canonical path text the host accepts. On Windows, `canonicalize` returns a
+/// verbatim `\\?\C:\...` path; strip the prefix back to the plain drive form
+/// so what the adapter sends matches what the host itself reports.
+fn host_path_string(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return rest.to_string();
+        }
+    }
+    text
+}
+
+/// Canonical MSP `workspaceRoots` for a session: the primary root first, then
+/// each extra root. Every entry must name an existing directory; canonical
+/// duplicates are dropped keeping the first occurrence, which ACP allows
+/// because it never expands scope.
+fn host_workspace_roots(cwd: &str, extras: &[String]) -> Result<Vec<String>, String> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut roots = Vec::new();
+    let entries = std::iter::once(("params.cwd", cwd)).chain(
+        extras
+            .iter()
+            .map(|root| ("params.additionalDirectories", root.as_str())),
+    );
+    for (label, path) in entries {
+        let resolved = std::fs::canonicalize(path)
+            .map_err(|e| format!("{label} entry is not an existing directory: {path} ({e})"))?;
+        if !resolved.is_dir() {
+            return Err(format!(
+                "{label} entry is not an existing directory: {path}"
+            ));
+        }
+        if seen.iter().any(|seen| seen == &resolved) {
+            continue;
+        }
+        roots.push(host_path_string(&resolved));
+        seen.push(resolved);
+    }
+    Ok(roots)
+}
+
+/// Validate the extra roots of a load, resume, or fork before any host call.
+/// The request may omit `cwd` (the host's own workspace root is used once it
+/// answers), so only the extras can be checked up front.
+fn validate_host_extra_roots(extras: &[String]) -> Result<(), String> {
+    for path in extras {
+        let resolved = std::fs::canonicalize(path).map_err(|e| {
+            format!("params.additionalDirectories entry is not an existing directory: {path} ({e})")
+        })?;
+        if !resolved.is_dir() {
+            return Err(format!(
+                "params.additionalDirectories entry is not an existing directory: {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `,"workspaceRoots":[...]` for MSP `session/start` and `turn/start`.
+fn workspace_roots_param(roots: Option<&[String]>) -> String {
+    match roots {
+        Some(roots) => format!(
+            ",\"workspaceRoots\":[{}]",
+            roots
+                .iter()
+                .map(|root| esc(root))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        None => String::new(),
+    }
+}
+
+static LEGACY_ROOTS_LOGGED: LazyLock<Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// Log once per session that this host cannot see the extra roots: on older
+/// hosts the adapter still confines itself to them, but Muse's own tools only
+/// see the primary root.
+fn log_legacy_workspace_roots(msp_sid: &str, cwd: &str) {
+    let first = LEGACY_ROOTS_LOGGED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(msp_sid.to_string());
+    if first {
+        log(&format!(
+            "this Muse host does not support workspaceRoots (needs 1.4.1); Muse's own tools only see {cwd}"
+        ));
+    }
+}
+
 fn same_workspace_roots(left: &[String], right: &[String]) -> bool {
     left.len() == right.len()
         && left
@@ -1535,13 +1629,14 @@ fn restart_unsaved_session(
     msp_sid: &str,
     mcp_servers: Option<&str>,
 ) -> Result<J, J> {
-    let (cwd, approval, model, reasoning) = sessions
+    let (cwd, roots, approval, model, reasoning) = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(acp_sid)
         .map(|s| {
             (
                 s.cwd.clone(),
+                s.roots.clone(),
                 s.mode_value.clone(),
                 s.model_value.clone(),
                 s.reasoning_effort_source
@@ -1550,16 +1645,22 @@ fn restart_unsaved_session(
             )
         })
         .ok_or_else(|| msp::mk_err(-32602, "unknown sessionId"))?;
+    let start_roots = if hosts.handshake().supports_workspace_roots() && roots.len() > 1 {
+        host_workspace_roots(&cwd, &roots[1..]).map_err(|message| msp::mk_err(-32602, &message))?
+    } else {
+        Vec::new()
+    };
     let cmd = hosts.mint_cmd("cmd-");
     let r = hosts.command(
         "session/start",
         &format!(
-            "{{\"commandId\":{},\"sessionId\":{},\"workspaceRoot\":{},\"approvalMode\":{}{}}}",
+            "{{\"commandId\":{},\"sessionId\":{},\"workspaceRoot\":{},\"approvalMode\":{}{}{}}}",
             esc(&cmd),
             esc(msp_sid),
             esc(&cwd),
             esc(&approval),
-            mcp_config_field(mcp_servers)
+            mcp_config_field(mcp_servers),
+            workspace_roots_param((!start_roots.is_empty()).then_some(start_roots.as_slice()))
         ),
     )?;
     let started = r
@@ -2460,6 +2561,9 @@ fn adopt_reattached(
             {
                 s.model_value = model.to_string();
             }
+            // A re-attached host holds no root set of its own: the session's
+            // next user turn must carry the full set again.
+            s.host_roots_pending = hosts.handshake().supports_workspace_roots();
             reconcile_active_tasks(stdout, s, r, false);
             if let Some(session) = r.get("session") {
                 adopt_session_projection(s, session);
@@ -3454,15 +3558,32 @@ fn handle_acp(
             // JetBrains IDE server) to session setup; MSP 1.3.0 loads them
             // into this session's runtime.
             let mcp_servers = client_mcp_servers(host, params.as_ref(), true);
+            // MSP 1.4.1+ carries the whole root set to the host, so Muse's
+            // own tools work in the extra folders instead of being confined
+            // by the adapter alone. Roots are validated before the session
+            // exists, as ACP requires.
+            let supports_host_roots = host.handshake().supports_workspace_roots();
+            let start_roots = if supports_host_roots && roots.len() > 1 {
+                match host_workspace_roots(&cwd, &roots[1..]) {
+                    Ok(roots) => Some(roots),
+                    Err(message) => {
+                        acp::send_error(stdout, &id, -32602, &message);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let cmd = host.mint_cmd("cmd-");
             let res = host.command(
                 "session/start",
                 &format!(
-                    "{{\"commandId\":{},\"workspaceRoot\":{}{}{}}}",
+                    "{{\"commandId\":{},\"workspaceRoot\":{}{}{}{}}}",
                     esc(&cmd),
                     esc(&cwd),
                     start_mode,
-                    mcp_config_field(mcp_servers.as_deref())
+                    mcp_config_field(mcp_servers.as_deref()),
+                    workspace_roots_param(start_roots.as_deref())
                 ),
             );
             match res {
@@ -3497,6 +3618,9 @@ fn handle_acp(
                             return;
                         }
                     };
+                    if !supports_host_roots && roots.len() > 1 {
+                        log_legacy_workspace_roots(&msp_sid, &cwd);
+                    }
                     // The host reports the folded mode in
                     // session.approvalMode.mode; without an explicit request
                     // we adopt the host default, with one we require a match.
@@ -3557,6 +3681,7 @@ fn handle_acp(
                             msp_sid: msp_sid.clone(),
                             cwd: cwd.clone(),
                             roots: roots.clone(),
+                            host_roots_pending: false,
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
@@ -3701,10 +3826,13 @@ fn handle_acp(
                     return;
                 }
             }
-            if let Err(message) = additional_directories(params.as_ref()) {
-                acp::send_error(stdout, &id, -32602, &message);
-                return;
-            }
+            let request_extras = match additional_directories(params.as_ref()) {
+                Ok(roots) => roots,
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
             let resume_cwd = params
                 .as_ref()
                 .and_then(|p| p.get("cwd"))
@@ -3725,6 +3853,22 @@ fn handle_acp(
                     "session resume requires params.sessionId",
                 );
                 return;
+            }
+            // On hosts that carry the root set, the request's roots are
+            // validated before any host call: a load with a missing extra
+            // folder must fail, not silently activate nothing.
+            let supports_host_roots = host.handshake().supports_workspace_roots();
+            if supports_host_roots {
+                if let Err(message) = validate_host_extra_roots(&request_extras) {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+                if !resume_cwd.is_empty()
+                    && let Err(message) = host_workspace_roots(&resume_cwd, &request_extras)
+                {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
             }
             if reject_if_logged_out(host, stdout, &id) {
                 return;
@@ -3860,6 +4004,7 @@ fn handle_acp(
                             msp_sid: real_msp.clone(),
                             cwd: restored_cwd.clone(),
                             roots: roots.clone(),
+                            host_roots_pending: false,
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
@@ -3902,6 +4047,9 @@ fn handle_acp(
                         });
                         entry.msp_sid = real_msp.clone();
                         entry.ver = ver;
+                        // The next user turn replaces the host's sticky root
+                        // set, even when the request activated no extras.
+                        entry.host_roots_pending = supports_host_roots;
                         // The client's latest set, even when a conflict kept
                         // the loaded one: a restarted host loads this.
                         entry.mcp_servers = mcp_servers;
@@ -3915,6 +4063,9 @@ fn handle_acp(
                         // additional list explicitly drops previously active
                         // extra roots instead of silently restoring access.
                         entry.roots = roots;
+                        if !supports_host_roots && !request_extras.is_empty() {
+                            log_legacy_workspace_roots(&real_msp, &entry.cwd);
+                        }
                         if !real_model.is_empty() {
                             entry.model_value = real_model;
                         }
@@ -4227,9 +4378,25 @@ fn handle_acp(
                 acp::send_error(stdout, &id, -32602, "params.cwd must be an absolute path");
                 return;
             }
-            if let Err(message) = additional_directories(params.as_ref()) {
-                acp::send_error(stdout, &id, -32602, &message);
-                return;
+            let request_extras = match additional_directories(params.as_ref()) {
+                Ok(roots) => roots,
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
+            let supports_host_roots = host.handshake().supports_workspace_roots();
+            if supports_host_roots {
+                if let Err(message) = validate_host_extra_roots(&request_extras) {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+                if !fork_cwd.is_empty()
+                    && let Err(message) = host_workspace_roots(&fork_cwd, &request_extras)
+                {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
             }
             // MSP session/fork takes no configuration, and the fork is loaded
             // without MCP servers. Keep the client's set on the record so a
@@ -4378,6 +4545,7 @@ fn handle_acp(
                             msp_sid: new_msp.clone(),
                             cwd: restored_cwd.clone(),
                             roots: roots.clone(),
+                            host_roots_pending: false,
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
@@ -4430,6 +4598,12 @@ fn handle_acp(
                         adopt_session_projection(entry, &new_session);
                         entry.cwd = restored_cwd;
                         entry.roots = roots;
+                        // The fork inherits the source's runtime roots; the
+                        // next user turn replaces them with the requested set.
+                        entry.host_roots_pending = supports_host_roots;
+                        if !supports_host_roots && !request_extras.is_empty() {
+                            log_legacy_workspace_roots(&new_msp, &entry.cwd);
+                        }
                         if !new_model.is_empty() {
                             entry.model_value = new_model;
                         }
@@ -4573,29 +4747,38 @@ fn handle_acp(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let (msp_sid, roots, skills, reasoning_effort, pending_approval) =
-                match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
-                    Some(s) => (
-                        s.msp_sid.clone(),
-                        s.roots.clone(),
-                        s.skill_selectors.clone(),
-                        reasoning_effort_override(s),
-                        s.pending_perm
-                            .as_ref()
-                            .map(|p| p.approval_id.clone())
-                            .or_else(|| {
-                                s.perm_queue
-                                    .first()
-                                    .and_then(|q| q.get("approvalId"))
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string)
-                            }),
-                    ),
-                    None => {
-                        acp::send_error(stdout, &id, -32602, "unknown sessionId");
-                        return;
-                    }
-                };
+            let (
+                msp_sid,
+                cwd,
+                roots,
+                skills,
+                reasoning_effort,
+                pending_approval,
+                host_roots_pending,
+            ) = match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
+                Some(s) => (
+                    s.msp_sid.clone(),
+                    s.cwd.clone(),
+                    s.roots.clone(),
+                    s.skill_selectors.clone(),
+                    reasoning_effort_override(s),
+                    s.pending_perm
+                        .as_ref()
+                        .map(|p| p.approval_id.clone())
+                        .or_else(|| {
+                            s.perm_queue
+                                .first()
+                                .and_then(|q| q.get("approvalId"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        }),
+                    s.host_roots_pending,
+                ),
+                None => {
+                    acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                    return;
+                }
+            };
             let (parts, acp_content) =
                 match extract_prompt_parts(params.as_ref(), &roots, skills.as_ref()) {
                     Ok((p, c)) if !p.is_empty() => (p, c),
@@ -4891,14 +5074,29 @@ fn handle_acp(
             // prompt response.
             let cmd = host.mint_cmd("cmd-");
             let input = format!("[{}]", parts.join(","));
+            // After a load, resume, fork, or host re-attach, the next user
+            // turn replaces the host's sticky root set explicitly, as ACP
+            // requires. A failure here is a local refusal, never a turn that
+            // silently runs with the wrong scope.
+            let roots_param = if host_roots_pending && host.handshake().supports_workspace_roots() {
+                match host_workspace_roots(&cwd, &roots[1..]) {
+                    Ok(roots) => workspace_roots_param(Some(&roots)),
+                    Err(message) => {
+                        acp::send_error(stdout, &id, -32602, &message);
+                        return;
+                    }
+                }
+            } else {
+                String::new()
+            };
             match host.command(
                 "turn/start",
                 &format!(
-                    "{{\"commandId\":{},\"sessionId\":{},\"input\":{}{}{display_field}}}",
+                    "{{\"commandId\":{},\"sessionId\":{},\"input\":{}{}{display_field}{roots_param}}}",
                     esc(&cmd),
                     esc(&msp_sid),
                     input,
-                    reasoning_effort_param(reasoning_effort.as_deref())
+                    reasoning_effort_param(reasoning_effort.as_deref()),
                 ),
             ) {
                 Ok(r) => {
@@ -4920,6 +5118,7 @@ fn handle_acp(
                         .unwrap_or_else(|p| p.into_inner())
                         .get_mut(&sid)
                     {
+                        s.host_roots_pending = false;
                         s.in_flight.push(InFlight {
                             msp_turn: turn.clone(),
                             req_id: id.clone().unwrap_or(J::Null),

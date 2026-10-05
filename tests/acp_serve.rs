@@ -48,6 +48,30 @@ fn fresh_state_dir() -> std::path::PathBuf {
     ))
 }
 
+/// A unique existing directory for workspace-roots tests.
+fn fresh_workspace_dir(label: &str) -> std::path::PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "muse-acp-roots-{label}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("workspace dir");
+    dir
+}
+
+/// Canonical path text as the host receives it (Windows drops the verbatim
+/// prefix on a plain drive path).
+fn canonical_text(path: &std::path::Path) -> String {
+    let canonical = std::fs::canonicalize(path).expect("canonical path");
+    let text = canonical.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+    } else {
+        text
+    }
+}
+
 struct Client {
     child: Child,
     stdin: std::process::ChildStdin,
@@ -5199,6 +5223,252 @@ fn session_list_skips_rows_without_a_workspace_root() {
     );
     c.wait_stderr(
         "session/list skipped 1 row(s) without a workspace root",
+        Duration::from_secs(15),
+    );
+    c.finish();
+}
+
+#[test]
+fn session_new_sends_canonical_workspace_roots() {
+    let primary = fresh_workspace_dir("primary");
+    let extra1 = fresh_workspace_dir("extra-1");
+    let extra2 = fresh_workspace_dir("extra-2");
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+    let sid = c.new_session_at(1, &primary, &[&extra1, &extra2]);
+    assert!(!sid.is_empty());
+    let starts = host_requests(&c, "session/start");
+    assert_eq!(starts.len(), 1, "{starts:?}");
+    let roots: Vec<String> = starts[0]["workspaceRoots"]
+        .as_array()
+        .expect("workspaceRoots on session/start")
+        .iter()
+        .map(|root| root.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        roots,
+        vec![
+            canonical_text(&primary),
+            canonical_text(&extra1),
+            canonical_text(&extra2)
+        ],
+        "the host must see canonical roots in request order"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_new_rejects_a_missing_additional_directory() {
+    let primary = fresh_workspace_dir("primary");
+    let missing = fresh_workspace_dir("missing").join("gone");
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+    c.initialize(1, "");
+    let id = c.req(
+        "session/new",
+        &serde_json::json!({
+            "cwd": primary.to_str().unwrap(),
+            "additionalDirectories": [missing.to_str().unwrap()],
+        })
+        .to_string(),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("-32602"), "{frame}");
+    assert!(
+        frame.contains("gone") && frame.contains("not an existing directory"),
+        "the error must name the offending entry: {frame}"
+    );
+    assert!(
+        host_requests(&c, "session/start").is_empty(),
+        "a refused session must never reach the host"
+    );
+    c.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn session_new_deduplicates_canonical_roots() {
+    let primary = fresh_workspace_dir("primary");
+    let real = fresh_workspace_dir("real");
+    let link = fresh_workspace_dir("link-parent").join("linked");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+    c.new_session_at(1, &primary, &[&real, &link]);
+    let starts = host_requests(&c, "session/start");
+    let roots = starts[0]["workspaceRoots"].as_array().expect("roots");
+    assert_eq!(
+        roots.len(),
+        2,
+        "the symlink resolves to the same folder and must be dropped: {roots:?}"
+    );
+    assert_eq!(roots[1].as_str().unwrap(), canonical_text(&real));
+    c.finish();
+}
+
+#[test]
+fn the_first_turn_after_load_replaces_the_root_set() {
+    let workspace = fresh_workspace_dir("resume");
+    let mut c = Client::spawn(
+        "happy",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_WORKSPACE_ROOT", workspace.to_str().unwrap()),
+        ],
+    );
+    c.initialize(1, "");
+    let load = c.req("session/load", "{\"sessionId\":\"msp-sess-1\"}");
+    let attached = c.wait_for(&format!("\"id\":{load}"), Duration::from_secs(15));
+    assert!(attached.contains("\"result\""), "{attached}");
+    for text in ["first", "second"] {
+        let prompt = c.prompt("msp-sess-1", text);
+        let done = c.wait_for(&format!("\"id\":{prompt}"), Duration::from_secs(15));
+        assert!(done.contains("end_turn"), "{done}");
+    }
+    let starts = host_requests(&c, "turn/start");
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    // Omitting the field on a load activates no extra roots, so the next
+    // turn must explicitly replace the sticky set with the primary root.
+    assert_eq!(
+        starts[0]["workspaceRoots"],
+        serde_json::json!([canonical_text(&workspace)]),
+        "{:?}",
+        starts[0]
+    );
+    assert!(
+        starts[1].get("workspaceRoots").is_none(),
+        "the replacement is a one-shot: {:?}",
+        starts[1]
+    );
+    c.finish();
+}
+
+#[test]
+fn a_resumed_session_sends_its_extra_roots_on_the_first_turn() {
+    let workspace = fresh_workspace_dir("resume-with-extras");
+    let extra = fresh_workspace_dir("resume-extra");
+    let mut c = Client::spawn(
+        "happy",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_WORKSPACE_ROOT", workspace.to_str().unwrap()),
+        ],
+    );
+    c.initialize(1, "");
+    let load = c.req(
+        "session/load",
+        &serde_json::json!({
+            "sessionId": "msp-sess-1",
+            "cwd": workspace.to_str().unwrap(),
+            "additionalDirectories": [extra.to_str().unwrap()],
+        })
+        .to_string(),
+    );
+    let attached = c.wait_for(&format!("\"id\":{load}"), Duration::from_secs(15));
+    assert!(attached.contains("\"result\""), "{attached}");
+    let prompt = c.prompt("msp-sess-1", "first");
+    c.wait_for(&format!("\"id\":{prompt}"), Duration::from_secs(15));
+    let starts = host_requests(&c, "turn/start");
+    assert_eq!(
+        starts[0]["workspaceRoots"],
+        serde_json::json!([canonical_text(&workspace), canonical_text(&extra)]),
+        "{:?}",
+        starts[0]
+    );
+    c.finish();
+}
+
+#[test]
+fn resume_rejects_a_missing_additional_directory_before_the_host_call() {
+    let workspace = fresh_workspace_dir("resume-missing");
+    let missing = fresh_workspace_dir("missing-extra").join("gone");
+    let mut c = Client::spawn(
+        "happy",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_WORKSPACE_ROOT", workspace.to_str().unwrap()),
+        ],
+    );
+    c.initialize(1, "");
+    let id = c.req(
+        "session/load",
+        &serde_json::json!({
+            "sessionId": "msp-sess-1",
+            "cwd": workspace.to_str().unwrap(),
+            "additionalDirectories": [missing.to_str().unwrap()],
+        })
+        .to_string(),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("-32602"), "{frame}");
+    assert!(frame.contains("gone"), "{frame}");
+    assert!(
+        host_requests(&c, "session/resume").is_empty(),
+        "a refused load must never reach the host"
+    );
+    c.finish();
+}
+
+#[test]
+fn steering_never_carries_workspace_roots() {
+    let extra = fresh_workspace_dir("steer-extra");
+    let mut c = Client::spawn("resume_active", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+    let init = c.req("initialize", "{\"protocolVersion\":2}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let resume = c.req(
+        "session/resume",
+        &serde_json::json!({
+            "sessionId": "existing-session",
+            "cwd": "/tmp",
+            "additionalDirectories": [extra.to_str().unwrap()],
+        })
+        .to_string(),
+    );
+    let resumed = c.wait_for(&format!("\"id\":{resume}"), Duration::from_secs(15));
+    assert!(resumed.contains("\"result\""), "{resumed}");
+    let steer = c.req(
+        "_session/steering",
+        "{\"sessionId\":\"existing-session\",\"prompt\":[{\"type\":\"text\",\"text\":\"continue\"}]}",
+    );
+    let steered = c.wait_for(&format!("\"id\":{steer}"), Duration::from_secs(15));
+    assert!(steered.contains("\"outcome\":\"injected\""), "{steered}");
+    let steers = host_requests(&c, "turn/steer");
+    assert_eq!(steers.len(), 1, "{steers:?}");
+    assert!(
+        steers[0].get("workspaceRoots").is_none(),
+        "steering may not carry a sticky replacement: {:?}",
+        steers[0]
+    );
+    // Steering does not consume the pending replacement: a real user turn
+    // still carries the full set.
+    let prompt = c.prompt("existing-session", "for real");
+    c.wait_input("\"workspaceRoots\"", Duration::from_secs(15));
+    let starts = host_requests(&c, "turn/start");
+    assert_eq!(
+        starts[0]["workspaceRoots"],
+        serde_json::json!([
+            canonical_text(std::path::Path::new("/tmp")),
+            canonical_text(&extra)
+        ]),
+        "{:?}",
+        starts[0]
+    );
+    let _ = prompt;
+    c.finish();
+}
+
+#[test]
+fn older_hosts_never_receive_workspace_roots() {
+    let primary = fresh_workspace_dir("legacy-primary");
+    let extra = fresh_workspace_dir("legacy-extra");
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.3.0")]);
+    c.new_session_at(1, &primary, &[&extra]);
+    let starts = host_requests(&c, "session/start");
+    assert!(
+        starts[0].get("workspaceRoots").is_none(),
+        "a 1.3.0 host must not receive workspaceRoots: {:?}",
+        starts[0]
+    );
+    c.wait_stderr(
+        "does not support workspaceRoots (needs 1.4.1)",
         Duration::from_secs(15),
     );
     c.finish();

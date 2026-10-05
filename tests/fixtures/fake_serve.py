@@ -216,6 +216,26 @@ def send(obj):
     sys.stdout.flush()
 
 
+def validate_workspace_roots(roots, primary):
+    """The live host's workspaceRoots rules, so tests catch bad frames."""
+    if not isinstance(roots, list) or not roots:
+        return ("workspaceRoots must be non-empty (omit the field for "
+                "single-root behavior)")
+    if not all(isinstance(root, str) and os.path.isabs(root) for root in roots):
+        return "workspaceRoots entries must be absolute paths"
+    seen = []
+    for root in roots:
+        canonical = os.path.realpath(root)
+        if canonical in seen:
+            return "duplicate root " + root
+        if not os.path.isdir(root):
+            return "not an existing directory: " + root
+        seen.append(canonical)
+    if primary and os.path.realpath(primary) != seen[0]:
+        return "workspaceRoots[0] must name the same folder as workspaceRoot"
+    return None
+
+
 def notify(method, params):
     send({"jsonrpc": "2.0", "method": method, "params": params})
 
@@ -286,7 +306,7 @@ def on_goal_command(method, params):
     return result
 
 
-ACTIVE_WORKSPACE = ["/tmp/fake-ws"]
+ACTIVE_WORKSPACE = [os.environ.get("FAKE_WORKSPACE_ROOT", "/tmp/fake-ws")]
 
 
 def approval_params(**overrides):
@@ -1834,6 +1854,19 @@ def main():
                                     "data": {"kind": "sessionNotFound",
                                              "sessionId": msg.get("params", {}).get("sessionId")}}})
                     continue
+                if method in ("session/start", "turn/start", "turn/steer"):
+                    params = msg.get("params", {})
+                    roots = params.get("workspaceRoots")
+                    if roots is not None:
+                        problem = validate_workspace_roots(
+                            roots, params.get("workspaceRoot", ACTIVE_WORKSPACE[0]))
+                        if problem:
+                            log_input(params)
+                            send({"jsonrpc": "2.0", "id": ident,
+                                  "error": {"code": -32602,
+                                            "message": "Invalid params: " + problem,
+                                            "data": {"kind": "invalidParams"}}})
+                            continue
                 if (method == "workflow/childControl"
                         and msg.get("params", {}).get("attempt")
                         != WORKFLOW_CHILD_ATTEMPT[0]):

@@ -124,6 +124,11 @@ pub struct AcpSession {
     /// Ordered ACP workspace scope: `cwd` followed by each explicitly
     /// supplied additional directory (with exact duplicates removed).
     pub roots: Vec<String>,
+    /// True when the next user `turn/start` must carry MSP `workspaceRoots`.
+    /// The host applies `turn/start.workspaceRoots` as a sticky replacement,
+    /// so after a load, resume, fork, or host re-attach with no extras the
+    /// next turn must explicitly replace the set with `[cwd]`.
+    pub host_roots_pending: bool,
     pub ver: u8,
     pub in_flight: Vec<InFlight>,
     pub pending_perm: Option<PendingPerm>,
