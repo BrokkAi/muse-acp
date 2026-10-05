@@ -691,8 +691,27 @@ fn session_delete_removes_a_fresh_session() {
     let id = adapter.prompt(&session, "say hello [[script:hello]]");
     assert_eq!(adapter.result(id)["stopReason"], "end_turn");
     let delete = adapter.request("session/delete", json!({"sessionId": session}));
-    let result = adapter.result(delete);
-    assert_eq!(result, json!({}), "a fresh session must delete");
+    let response = adapter.response(delete);
+    if let Some(error) = response.get("error") {
+        // macOS Muse 1.4.2 can fail a fresh delete's cleanup after removing
+        // some data; the adapter must surface the host's evidence rather than
+        // claim the session was deleted. Any other failure is a regression.
+        assert!(
+            cfg!(target_os = "macos"),
+            "a fresh session must delete: {response}"
+        );
+        assert_eq!(error["data"]["reason"], "cleanupIncomplete", "{error}");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Some of its data may already be removed."),
+            "{error}"
+        );
+        adapter.finish();
+        return;
+    }
+    assert_eq!(response["result"], json!({}), "a fresh session must delete");
     let list = adapter.request(
         "session/list",
         json!({"cwd": host.workspace().to_string_lossy()}),
