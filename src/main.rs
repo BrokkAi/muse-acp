@@ -3672,6 +3672,7 @@ fn handle_acp(
         if id.is_some() {
             complete_permission(host, stdout, sessions, &id, msg);
             complete_permission_feedback(host, stdout, sessions, &id, msg);
+            complete_feedback(host, stdout, sessions, &id, msg);
             complete_elicitation(host, stdout, sessions, &id, msg);
         }
         return;
@@ -3855,6 +3856,7 @@ fn handle_acp(
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
+                            pending_feedback: None,
                             mode_value: acp::mode_from_msp(&cur_mode).to_string(),
                             auto_review: false,
                             review_context: std::collections::VecDeque::new(),
@@ -3975,7 +3977,13 @@ fn handle_acp(
                     if let Some(title) = initial_title_facts.selected() {
                         acp::send_session_title(stdout, &sid, Some(title));
                     }
-                    acp::send_available_commands(stdout, &sid, ver, &skills);
+                    acp::send_available_commands(
+                        stdout,
+                        &sid,
+                        ver,
+                        &skills,
+                        host.handshake().feedback,
+                    );
                     // Subscription usage is host-global and may already be
                     // known before the first session usage event arrives.
                     refresh_subscription_usage(host, stdout, sessions, &sid);
@@ -4189,6 +4197,7 @@ fn handle_acp(
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
+                            pending_feedback: None,
                             mode_value: "promptUnmatched".to_string(),
                             auto_review: false,
                             review_context: std::collections::VecDeque::new(),
@@ -4451,7 +4460,13 @@ fn handle_acp(
                     adopt_skill_catalog(sessions, &sid, skills.as_deref());
                     let skills = skills.unwrap_or_default();
                     acp::send_result(stdout, &id, &result);
-                    acp::send_available_commands(stdout, &sid, ver, &skills);
+                    acp::send_available_commands(
+                        stdout,
+                        &sid,
+                        ver,
+                        &skills,
+                        host.handshake().feedback,
+                    );
                 }
                 Err(e) => {
                     if err_code(&e) == -32020
@@ -4737,6 +4752,7 @@ fn handle_acp(
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
+                            pending_feedback: None,
                             mode_value: mode_value.clone(),
                             auto_review: false,
                             review_context: std::collections::VecDeque::new(),
@@ -4912,6 +4928,7 @@ fn handle_acp(
                         &new_msp,
                         ver,
                         &skills.unwrap_or_default(),
+                        host.handshake().feedback,
                     );
                 }
                 Err(e) => acp::send_error(
@@ -4997,6 +5014,25 @@ fn handle_acp(
                 _ => None,
             };
             if let Some(line) = command_line {
+                // `/feedback` is adapter-local: it collects explicit consent,
+                // then submits through the host's feedback surface and ends
+                // the turn with the host's receipt.
+                if let Ok(text) = &line
+                    && let Some(argument) = text.strip_prefix("/feedback")
+                    && (argument.is_empty() || argument.starts_with(char::is_whitespace))
+                {
+                    start_feedback(
+                        host,
+                        stdout,
+                        sessions,
+                        &sid,
+                        ver,
+                        id.clone(),
+                        &acp_content,
+                        argument.trim(),
+                    );
+                    return;
+                }
                 let workflow_children = || {
                     sessions
                         .lock()
@@ -5826,6 +5862,7 @@ fn handle_acp(
             // A feedback form belongs to the cancelled turn. End it locally
             // so a late form response cannot decide a newer host state.
             invalidate_pending_approval(stdout, sessions, &sid, None, true);
+            settle_feedback_cancelled(stdout, sessions, &sid);
         }
         "$/cancel_request" => {
             // ACP cancellation is scoped to the original request id. A
@@ -6997,7 +7034,7 @@ fn parse_workflow_child_command(
 type ProtocolCommand = (String, Vec<(&'static str, J)>);
 
 /// Adapter-local slash commands that map onto one host method.
-const PROTOCOL_COMMANDS: [&str; 3] = ["goal", "rename", "workflow-child"];
+const PROTOCOL_COMMANDS: [&str; 4] = ["feedback", "goal", "rename", "workflow-child"];
 
 /// The command line of a protocol-command prompt, or `None` when the prompt
 /// is not one. The first block decides: it must be text naming a protocol
@@ -8240,7 +8277,13 @@ fn handle_msp(
                     "skill catalog refreshed for session {msp_sid}: {} row(s)",
                     skills.len()
                 ));
-                acp::send_available_commands(stdout, &acp_sid, ver, &skills);
+                acp::send_available_commands(
+                    stdout,
+                    &acp_sid,
+                    ver,
+                    &skills,
+                    host.handshake().feedback,
+                );
             }
         }
         "view/gap" => {
@@ -10276,6 +10319,19 @@ fn drop_acp_session(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) -
                 let request_id = p.feedback.map(|f| f.req_id).unwrap_or(p.req_id);
                 acp::send_cancel_request(stdout, &request_id);
             }
+            if let Some(f) = s.pending_feedback {
+                acp::send_cancel_request(stdout, &f.req_id);
+                if s.ver == 2 {
+                    acp::send_result(stdout, &Some(f.prompt_req), "{}");
+                    acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
+                } else {
+                    acp::send_result(
+                        stdout,
+                        &Some(f.prompt_req),
+                        "{\"stopReason\":\"cancelled\"}",
+                    );
+                }
+            }
             true
         }
         None => false,
@@ -10635,6 +10691,401 @@ fn ui_answers(questions: &[acp::UiQuestion], content: &J) -> String {
 
 fn clarification_schema() -> &'static str {
     "{\"type\":\"object\",\"properties\":{\"clarification\":{\"type\":\"string\",\"maxLength\":500}},\"required\":[\"clarification\"]}"
+}
+
+const FEEDBACK_HELP: &str = "Usage: /feedback [bug|bad|good|other] <note>";
+
+/// Parse `/feedback <classification> <note>`. Accepts the short spellings and
+/// the MSP names. The note is the rest of the argument.
+fn parse_feedback_argument(argument: &str) -> Option<(String, String)> {
+    let mut parts = argument.trim().splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or("");
+    let note = parts.next().unwrap_or("").trim().to_string();
+    let classification = match first.to_ascii_lowercase().as_str() {
+        "bug" => "bug",
+        "bad" | "badresult" => "badResult",
+        "good" | "goodresult" => "goodResult",
+        "other" => "other",
+        _ => return None,
+    };
+    Some((classification.to_string(), note))
+}
+
+/// The `/feedback` elicitation form. Attachments default to off: consent is
+/// explicit for every one of them.
+fn feedback_form_schema(classification: Option<&str>, note: &str) -> String {
+    let class_default = classification
+        .map(|value| format!(",\"default\":{}", esc(value)))
+        .unwrap_or_default();
+    let note_default = if note.is_empty() {
+        String::new()
+    } else {
+        format!(",\"default\":{}", esc(note))
+    };
+    format!(
+        "{{\"type\":\"object\",\"properties\":{{\
+         \"classification\":{{\"type\":\"string\",\"enum\":[\"bug\",\"badResult\",\"goodResult\",\"other\"],\"title\":\"Classification\"{class_default}}},\
+         \"note\":{{\"type\":\"string\",\"title\":\"Note\"{note_default}}},\
+         \"withFiles\":{{\"type\":\"boolean\",\"title\":\"Include local tracing\",\"description\":\"Selected-session diagnostics, redacted\",\"default\":false}},\
+         \"attachSessionRecord\":{{\"type\":\"boolean\",\"title\":\"Attach the session record\",\"description\":\"This whole conversation's replayable trajectory, redacted. Only for Bug or Bad result, and only with local tracing.\",\"default\":false}}\
+         }},\"required\":[\"classification\",\"note\"]}}"
+    )
+}
+
+/// End the `/feedback` turn with the receipt or refusal text.
+fn settle_feedback_turn(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    ver: u8,
+    prompt_req: &J,
+    prompt_content: &str,
+    text: &str,
+) {
+    let prompt_req = Some(prompt_req.clone());
+    if ver == 2 {
+        acp::send_result(stdout, &prompt_req, "{}");
+        if !prompt_content.is_empty() {
+            send_v2_user_message(stdout, acp_sid, prompt_content);
+        }
+        send_agent_text(stdout, acp_sid, ver, text);
+        acp::send_state(stdout, acp_sid, "idle", Some("end_turn"));
+    } else {
+        if !prompt_content.is_empty() {
+            send_v1_user_message(stdout, acp_sid, prompt_content);
+        }
+        send_agent_text(stdout, acp_sid, ver, text);
+        acp::send_result(stdout, &prompt_req, "{\"stopReason\":\"end_turn\"}");
+    }
+}
+
+/// Human text for a `feedback/submit` result, following the host's outcome
+/// vocabulary. An unknown outcome is reported as a failure, never silently
+/// as success.
+fn feedback_result_text(result: &J) -> String {
+    let outcome = result
+        .get("outcome")
+        .and_then(J::as_str)
+        .unwrap_or("unknown");
+    let cause = result.get("cause").and_then(J::as_str);
+    let with_cause = |name: &str| match cause {
+        Some(cause) => format!("Feedback was not sent ({name}: {cause})."),
+        None => format!("Feedback was not sent ({name})."),
+    };
+    let mut lines = match outcome {
+        "uploaded" => vec![format!(
+            "Feedback sent (id {}).",
+            result
+                .get("uploadId")
+                .and_then(J::as_str)
+                .unwrap_or("unknown")
+        )],
+        "recorded" => vec!["Feedback recorded.".to_string()],
+        "rateLimited" => {
+            let seconds = result
+                .get("retryAfterMs")
+                .and_then(J::as_u64)
+                .map(|ms| ms.div_ceil(1000));
+            vec![match seconds {
+                Some(seconds) => {
+                    format!("Feedback was not sent: rate limited, try again in {seconds} seconds.")
+                }
+                None => "Feedback was not sent: rate limited, try again later.".to_string(),
+            }]
+        }
+        "acceptedWithoutReceipt" | "trackingFailed" | "trackingUncertain" => vec![format!(
+            "Feedback was sent, but Muse could not confirm the receipt ({outcome})."
+        )],
+        name @ ("noCredential" | "authRejected" | "disabled" | "dark" | "failed") => {
+            vec![with_cause(name)]
+        }
+        unknown => vec![with_cause(unknown)],
+    };
+    if let Some(path) = result.get("bundlePath").and_then(J::as_str)
+        && !path.is_empty()
+    {
+        lines.push(format!("A local copy is at {path}."));
+    }
+    if let Some(note) = result.get("sessionNote").and_then(J::as_str)
+        && !note.is_empty()
+    {
+        lines.push(note.to_string());
+    }
+    if let Some(note) = result.get("localTracingNote").and_then(J::as_str)
+        && !note.is_empty()
+    {
+        lines.push(note.to_string());
+    }
+    lines.join("\n")
+}
+
+/// Submit one consented feedback report through the main host and settle the
+/// prompt with the result. Never retried automatically: the method has no
+/// idempotency key.
+#[allow(clippy::too_many_arguments)]
+fn submit_feedback(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    ver: u8,
+    prompt_req: &J,
+    prompt_content: &str,
+    classification: &str,
+    note: &str,
+    with_files: bool,
+    attach_record: bool,
+) {
+    let Some(msp_sid) = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(acp_sid)
+        .map(|s| s.msp_sid.clone())
+    else {
+        return;
+    };
+    let main = host.main_host();
+    let cmd = main.mint_cmd("cmd-");
+    let result = main.command(
+        "feedback/submit",
+        &format!(
+            "{{\"commandId\":{},\"classification\":{},\"note\":{},\"sessionId\":{},\"withFiles\":{with_files},\"attachSessionRecord\":{attach_record}}}",
+            esc(&cmd),
+            esc(classification),
+            esc(note),
+            esc(&msp_sid),
+        ),
+    );
+    let text = match result {
+        Ok(result) => feedback_result_text(&result),
+        Err(error) => format!("Feedback was not sent: {}.", err_message(&error)),
+    };
+    settle_feedback_turn(stdout, acp_sid, ver, prompt_req, prompt_content, &text);
+}
+
+/// Start a `/feedback` command: with forms, an elicitation with explicit
+/// consent for each attachment; without, the plain classified syntax.
+#[allow(clippy::too_many_arguments)]
+fn start_feedback(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    ver: u8,
+    prompt_req: Option<J>,
+    prompt_content: &str,
+    argument: &str,
+) {
+    if ELICIT_FORM.load(Ordering::SeqCst) == 1 {
+        // A classification token leads; anything else is all note.
+        let (classification, note) = match parse_feedback_argument(argument) {
+            Some((classification, note)) => (Some(classification), note),
+            None => (None, argument.trim().to_string()),
+        };
+        let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
+        let stored = {
+            let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+            match map.get_mut(acp_sid) {
+                Some(s) => {
+                    s.pending_feedback = Some(acp::PendingFeedbackForm {
+                        req_id: req_id.clone(),
+                        prompt_req: prompt_req.clone().unwrap_or(J::Null),
+                        prompt_content: prompt_content.to_string(),
+                        ver,
+                    });
+                    true
+                }
+                None => false,
+            }
+        };
+        if !stored {
+            return;
+        }
+        if ver == 2 {
+            acp::send_state(stdout, acp_sid, "requires_action", None);
+        }
+        send_elicitation_form(
+            stdout,
+            acp_sid,
+            &req_id,
+            "",
+            "Send feedback about Muse",
+            &feedback_form_schema(classification.as_deref(), &note),
+        );
+        return;
+    }
+    let prompt_req = prompt_req.unwrap_or(J::Null);
+    match parse_feedback_argument(argument) {
+        Some((classification, note)) if !note.is_empty() => submit_feedback(
+            host,
+            stdout,
+            sessions,
+            acp_sid,
+            ver,
+            &prompt_req,
+            prompt_content,
+            &classification,
+            &note,
+            false,
+            false,
+        ),
+        _ => settle_feedback_turn(
+            stdout,
+            acp_sid,
+            ver,
+            &prompt_req,
+            prompt_content,
+            FEEDBACK_HELP,
+        ),
+    }
+}
+
+/// Cancel an open `/feedback` form and settle its prompt as cancelled.
+fn settle_feedback_cancelled(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) -> bool {
+    let pending = {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        map.get_mut(acp_sid).and_then(|s| s.pending_feedback.take())
+    };
+    let Some(pending) = pending else {
+        return false;
+    };
+    acp::send_cancel_request(stdout, &pending.req_id);
+    if pending.ver == 2 {
+        acp::send_result(stdout, &Some(pending.prompt_req), "{}");
+        acp::send_state(stdout, acp_sid, "idle", Some("cancelled"));
+    } else {
+        acp::send_result(
+            stdout,
+            &Some(pending.prompt_req),
+            "{\"stopReason\":\"cancelled\"}",
+        );
+    }
+    true
+}
+
+/// Client reply to an open `/feedback` form (matched by id).
+fn complete_feedback(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    id: &Option<J>,
+    msg: &J,
+) {
+    let Some(idv) = id.clone() else {
+        return;
+    };
+    let found = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find_map(|(sid, s)| {
+            s.pending_feedback
+                .as_ref()
+                .filter(|p| j_to_string(&p.req_id) == j_to_string(&idv))
+                .map(|p| (sid.clone(), p.clone()))
+        });
+    let Some((acp_sid, pending)) = found else {
+        return;
+    };
+    let accepted = msg.get("error").is_none()
+        && msg
+            .get("result")
+            .and_then(|r| r.get("action"))
+            .and_then(|v| v.as_str())
+            == Some("accept");
+    if !accepted {
+        if let Some(s) = sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(&acp_sid)
+        {
+            s.pending_feedback = None;
+        }
+        settle_feedback_turn(
+            stdout,
+            &acp_sid,
+            pending.ver,
+            &pending.prompt_req,
+            &pending.prompt_content,
+            "Feedback not sent.",
+        );
+        return;
+    }
+    let content = msg
+        .get("result")
+        .and_then(|r| r.get("content"))
+        .cloned()
+        .unwrap_or(J::Null);
+    let classification = content
+        .get("classification")
+        .and_then(J::as_str)
+        .unwrap_or("")
+        .to_string();
+    let note = content
+        .get("note")
+        .and_then(J::as_str)
+        .unwrap_or("")
+        .to_string();
+    let with_files = matches!(content.get("withFiles"), Some(J::Bool(true)));
+    let attach_record = matches!(content.get("attachSessionRecord"), Some(J::Bool(true)));
+    let problem = if !matches!(
+        classification.as_str(),
+        "bug" | "badResult" | "goodResult" | "other"
+    ) {
+        Some("Choose Bug, Bad result, Good result, or Other.")
+    } else if classification == "bug" && note.trim().is_empty() {
+        Some("A bug report needs a note.")
+    } else if attach_record
+        && !(with_files && matches!(classification.as_str(), "bug" | "badResult"))
+    {
+        Some(
+            "Attaching the session record requires local tracing and a Bug or Bad result classification.",
+        )
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
+        // Reissue with the submitted values so correcting one field does not
+        // lose the others.
+        let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get_mut(&acp_sid) else {
+            return;
+        };
+        let Some(pending) = s.pending_feedback.as_mut() else {
+            return;
+        };
+        pending.req_id = req_id.clone();
+        drop(map);
+        send_elicitation_form(
+            stdout,
+            &acp_sid,
+            &req_id,
+            "",
+            &format!("{problem}\n\nSend feedback about Muse"),
+            &feedback_form_schema(Some(&classification), &note),
+        );
+        return;
+    }
+    if let Some(s) = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(&acp_sid)
+    {
+        s.pending_feedback = None;
+    }
+    submit_feedback(
+        host,
+        stdout,
+        sessions,
+        &acp_sid,
+        pending.ver,
+        &pending.prompt_req,
+        &pending.prompt_content,
+        &classification,
+        &note,
+        with_files,
+        attach_record,
+    );
 }
 
 /// Client reply to our `elicitation/create` (matched by id).

@@ -99,6 +99,19 @@ pub struct PendingUi {
     pub tool_call_id: String,
 }
 
+/// One in-flight `/feedback` form. The command's ACP prompt request stays
+/// pending until the form is answered or declined, then settles normally.
+#[derive(Clone)]
+pub struct PendingFeedbackForm {
+    /// ACP `elicitation/create` request id awaiting the client reply.
+    pub req_id: J,
+    /// The `session/prompt` request that ran `/feedback`.
+    pub prompt_req: J,
+    /// The prompt's ACP content blocks, echoed when the turn settles.
+    pub prompt_content: String,
+    pub ver: u8,
+}
+
 /// Host-authored title candidates. The adapter never derives a title from
 /// transcript items; it only chooses among facts the host explicitly sends.
 #[derive(Clone, Default)]
@@ -144,6 +157,8 @@ pub struct AcpSession {
     /// User-input ids already presented or auto-cancelled, so reconciliation
     /// cannot replay a settled question.
     pub ui_seen: std::collections::HashSet<String>,
+    /// The `/feedback` form awaiting its answer, if one is open.
+    pub pending_feedback: Option<PendingFeedbackForm>,
     /// The approval mode selector's value.
     pub mode_value: String,
     /// Adapter-side auto-review policy for this session. Off by default,
@@ -1001,7 +1016,11 @@ pub fn session_modes(session_mode: &str) -> String {
 /// Catalog
 /// rows with a local command's name are deduplicated below so each local
 /// command is advertised exactly once.
-fn available_commands_json(ver: u8, skills: &[(String, String, Option<String>)]) -> String {
+fn available_commands_json(
+    ver: u8,
+    skills: &[(String, String, Option<String>)],
+    feedback: bool,
+) -> String {
     let input = |hint: &str| {
         if ver == 1 {
             format!("{{\"hint\":{}}}", esc(hint))
@@ -1041,6 +1060,12 @@ fn available_commands_json(ver: u8, skills: &[(String, String, Option<String>)])
                 )
             }),
     );
+    if feedback {
+        items.push(format!(
+            "{{\"name\":\"feedback\",\"description\":\"Send feedback about Muse\",\"input\":{}}}",
+            input("[bug|bad|good|other] <note>")
+        ));
+    }
     format!("[{}]", items.join(","))
 }
 
@@ -1049,13 +1074,14 @@ pub fn send_available_commands(
     acp_sid: &str,
     ver: u8,
     skills: &[(String, String, Option<String>)],
+    feedback: bool,
 ) {
     send_raw(
         stdout,
         &format!(
             "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":{}}}}}}}",
             esc(acp_sid),
-            available_commands_json(ver, skills)
+            available_commands_json(ver, skills, feedback)
         ),
     );
 }
@@ -1256,13 +1282,17 @@ mod tests {
                 ),
                 ("rename".to_string(), "Host rename skill".to_string(), None),
             ];
-            let commands = available_commands_json(ver, &skills);
+            let commands = available_commands_json(ver, &skills, true);
+            assert!(
+                commands.contains("\"name\":\"feedback\""),
+                "a granted feedback capability must be advertised: {commands}"
+            );
             let parsed = crate::json::parse_json(&commands).expect("available commands JSON");
             let J::Arr(items) = parsed else {
                 panic!("available commands must be an array");
             };
             // The host's `rename` row is shadowed by the local command.
-            assert_eq!(items.len(), 5);
+            assert_eq!(items.len(), 6);
             assert!(commands.contains("\"name\":\"plan\""));
             assert!(commands.contains("\"name\":\"goal\""));
             assert!(commands.contains("\"name\":\"compact\""));

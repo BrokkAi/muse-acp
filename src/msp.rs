@@ -40,6 +40,9 @@ pub struct HandshakeInfo {
     /// `config.mcpServers`. Without the grant a non-empty map is rejected
     /// with `capabilityRequired`, so client MCP servers are dropped instead.
     pub session_mcp: bool,
+    /// Whether `feedback/submit` is granted (Muse 1.4.2+). The adapter only
+    /// advertises `/feedback` on such a host.
+    pub feedback: bool,
 }
 
 impl HandshakeInfo {
@@ -1022,7 +1025,7 @@ impl MspHost {
         // lets session/new report a logged-out host before the first turn
         // (see `MspHost::logged_out`). On Muse 1.4.0 it gates nothing else.
         let init_params = format!(
-            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"experimentalApi":true,"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream","sessionMcp"{shell_capability}]}}}}"#,
+            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"experimentalApi":true,"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream","sessionMcp","feedback"{shell_capability}]}}}}"#,
             ver = crate::json::esc(env!("CARGO_PKG_VERSION")),
             user_input_dialogs = user_input_dialogs
         );
@@ -1079,6 +1082,10 @@ impl MspHost {
             session_mcp: matches!(
                 res.get("grantedCapabilities"),
                 Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("sessionMcp"))
+            ),
+            feedback: matches!(
+                res.get("grantedCapabilities"),
+                Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("feedback"))
             ),
         };
         if verdict.is_fatal() {
@@ -1775,6 +1782,7 @@ mod durability_tests {
             session_list_stream: false,
             user_shell: false,
             session_mcp: false,
+            feedback: false,
         }
     }
 

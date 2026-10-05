@@ -115,6 +115,12 @@ session/list results. FAKE_LIST_NULL_ROOT=1 adds a row without a workspace
 root; FAKE_LIST_REJECT_CURSOR=1 rejects a paged session/list with invalid
 params.
 
+Feedback: `feedback/submit` is granted when `feedback` is requested unless
+FAKE_NO_FEEDBACK=1 (which makes the method fail with capabilityRequired).
+FAKE_FEEDBACK_OUTCOME selects the result outcome (default uploaded);
+FAKE_FEEDBACK_NOTES=1 adds sessionNote and localTracingNote;
+FAKE_FEEDBACK_HOST_ERROR=1 fails the method with an internal error.
+
 Session MCP (every scenario): `sessionMcp` is granted when requested unless
 FAKE_NO_SESSION_MCP=1. As on the live host, a non-empty config.mcpServers
 without the grant fails with capabilityRequired. FAKE_MCP_CONFLICT=1 rejects
@@ -147,6 +153,7 @@ CATALOG_READS = [0]
 USER_INPUT_DIALOGS = [True]
 EXPERIMENTAL_API = [False]
 SESSION_MCP = [False]
+FEEDBACK = [False]
 MCP_CONFLICTED = [False]
 USAGE_READS = [0]
 SKILL_READS = [0]
@@ -1114,6 +1121,10 @@ def result_for(method, msg):
                           and os.environ.get("FAKE_NO_SESSION_MCP") != "1")
         if SESSION_MCP[0]:
             granted.append("sessionMcp")
+        FEEDBACK[0] = ("feedback" in requested
+                       and os.environ.get("FAKE_NO_FEEDBACK") != "1")
+        if FEEDBACK[0]:
+            granted.append("feedback")
         USER_INPUT_DIALOGS[0] = msg.get("params", {}).get("capabilities", {}).get(
             "userInputDialogs", True) is not False
         EXPERIMENTAL_API[0] = msg.get("params", {}).get("capabilities", {}).get(
@@ -1381,6 +1392,26 @@ def result_for(method, msg):
         params = msg.get("params", {})
         log_input(params)
         return {"commandId": params.get("commandId", ""), "status": "accepted"}
+    if method == "feedback/submit":
+        params = msg.get("params", {})
+        log_input(params)
+        outcome = os.environ.get("FAKE_FEEDBACK_OUTCOME", "uploaded")
+        result = {
+            "bundlePath": "/tmp/fixture-feedback.zip",
+            "outcome": outcome,
+            "sessionRecordAttached": bool(params.get("attachSessionRecord")),
+            "sessionRecordTruncated": False,
+        }
+        if outcome == "uploaded":
+            result["uploadId"] = "fixture-upload-1"
+        elif outcome == "rateLimited":
+            result["retryAfterMs"] = 5000
+        elif outcome in ("dark", "failed", "noCredential", "authRejected"):
+            result["cause"] = "fixture cause"
+        if os.environ.get("FAKE_FEEDBACK_NOTES") == "1":
+            result["sessionNote"] = "Session note from the fixture"
+            result["localTracingNote"] = "Tracing note from the fixture"
+        return result
     if method == "session/setApprovalMode":
         # The real host applies the selected mode and echoes it back.
         mode = FOLDED_MODE or msg.get("params", {}).get("mode", MODE)
@@ -1897,6 +1928,26 @@ def main():
                                             "message": "Invalid params: " + problem,
                                             "data": {"kind": "invalidParams"}}})
                             continue
+                if method == "feedback/submit":
+                    params = msg.get("params", {})
+                    error = None
+                    if not FEEDBACK[0]:
+                        error = {"code": -32010,
+                                 "message": "feedback/submit requires the feedback capability",
+                                 "data": {"kind": "capabilityRequired",
+                                          "capability": "feedback", "retryable": False}}
+                    elif (params.get("classification") == "bug"
+                          and not (params.get("note") or "").strip()):
+                        error = {"code": -32602,
+                                 "message": "Invalid params: note must be non-empty for bug",
+                                 "data": {"kind": "invalidParams"}}
+                    elif os.environ.get("FAKE_FEEDBACK_HOST_ERROR") == "1":
+                        error = {"code": -32603, "message": "feedback upload failed",
+                                 "data": {"kind": "internal"}}
+                    if error:
+                        log_input(params)
+                        send({"jsonrpc": "2.0", "id": ident, "error": error})
+                        continue
                 if (method == "workflow/childControl"
                         and msg.get("params", {}).get("attempt")
                         != WORKFLOW_CHILD_ATTEMPT[0]):

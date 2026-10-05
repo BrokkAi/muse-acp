@@ -5759,6 +5759,239 @@ fn older_hosts_never_receive_workspace_roots() {
 }
 
 #[test]
+fn feedback_is_advertised_only_with_the_host_grant() {
+    for (env, expected) in [(vec![], true), (vec![("FAKE_NO_FEEDBACK", "1")], false)] {
+        let mut c = Client::spawn("quiet", &env);
+        let _sid = c.new_session(1, "");
+        let commands = c.wait_for("available_commands_update", Duration::from_secs(15));
+        assert_eq!(
+            commands.contains("\"name\":\"feedback\""),
+            expected,
+            "feedback advertising must follow the grant: {commands}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn feedback_form_collects_consent_and_submits() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let pid = c.prompt(&sid, "/feedback bug it broke");
+    let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+    assert!(
+        form.contains("\"default\":\"bug\"") && form.contains("\"default\":\"it broke\""),
+        "the argument seeds the form defaults: {form}"
+    );
+    assert!(
+        form.contains("\"default\":false"),
+        "attachments must default off: {form}"
+    );
+    assert!(
+        form.contains("Include local tracing") && form.contains("Attach the session record"),
+        "both consents must be explicit: {form}"
+    );
+    let form_id = extract_str(&form, "id").expect("feedback form id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"classification\":\"bug\",\"note\":\"it broke\",\"withFiles\":false,\"attachSessionRecord\":false}}}}}}"
+    ));
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let sent = c.wait_for(
+        "Feedback sent (id fixture-upload-1)",
+        Duration::from_secs(15),
+    );
+    assert!(sent.contains("agent_message_chunk"), "{sent}");
+    let submitted = host_requests(&c, "feedback/submit");
+    assert_eq!(submitted.len(), 1, "{submitted:?}");
+    assert_eq!(submitted[0]["classification"], "bug");
+    assert_eq!(submitted[0]["note"], "it broke");
+    assert_eq!(submitted[0]["withFiles"], false);
+    assert_eq!(submitted[0]["attachSessionRecord"], false);
+    assert_eq!(submitted[0]["sessionId"], sid);
+    c.finish();
+}
+
+#[test]
+fn feedback_form_sends_exactly_the_consented_attachments() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "/feedback bad the answer was wrong");
+    let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let form_id = extract_str(&form, "id").expect("feedback form id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"classification\":\"badResult\",\"note\":\"the answer was wrong\",\"withFiles\":true,\"attachSessionRecord\":true}}}}}}"
+    ));
+    c.wait_for(
+        "Feedback sent (id fixture-upload-1)",
+        Duration::from_secs(15),
+    );
+    let submitted = host_requests(&c, "feedback/submit");
+    assert_eq!(submitted.len(), 1, "{submitted:?}");
+    assert_eq!(submitted[0]["classification"], "badResult");
+    assert_eq!(submitted[0]["withFiles"], true);
+    assert_eq!(submitted[0]["attachSessionRecord"], true);
+    c.finish();
+}
+
+#[test]
+fn declined_feedback_form_sends_nothing() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let pid = c.prompt(&sid, "/feedback bug nope");
+    let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let form_id = extract_str(&form, "id").expect("feedback form id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"decline\"}}}}"
+    ));
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let message = c.wait_for("Feedback not sent.", Duration::from_secs(15));
+    assert!(message.contains("agent_message_chunk"), "{message}");
+    assert!(
+        host_requests(&c, "feedback/submit").is_empty(),
+        "a declined form must never submit"
+    );
+    c.finish();
+}
+
+#[test]
+fn feedback_form_requires_local_tracing_for_the_session_record() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "/feedback bug needs a trace");
+    let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let form_id = extract_str(&form, "id").expect("feedback form id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"classification\":\"bug\",\"note\":\"needs a trace\",\"withFiles\":false,\"attachSessionRecord\":true}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    assert!(
+        forms[1].contains("requires local tracing"),
+        "the correction must explain the rule: {forms:?}"
+    );
+    assert!(
+        host_requests(&c, "feedback/submit").is_empty(),
+        "an invalid consent combination must not submit"
+    );
+    // The corrected second form keeps the note default.
+    let second_id = extract_str(&forms[1], "id").expect("second form id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{second_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"classification\":\"bug\",\"note\":\"needs a trace\",\"withFiles\":true,\"attachSessionRecord\":true}}}}}}"
+    ));
+    c.wait_for(
+        "Feedback sent (id fixture-upload-1)",
+        Duration::from_secs(15),
+    );
+    let submitted = host_requests(&c, "feedback/submit");
+    assert_eq!(submitted.len(), 1, "{submitted:?}");
+    assert_eq!(submitted[0]["attachSessionRecord"], true);
+    assert_eq!(submitted[0]["withFiles"], true);
+    c.finish();
+}
+
+#[test]
+fn feedback_without_forms_uses_the_classified_syntax() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "/feedback bad something went wrong");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "{done}");
+    c.wait_for(
+        "Feedback sent (id fixture-upload-1)",
+        Duration::from_secs(15),
+    );
+    let submitted = host_requests(&c, "feedback/submit");
+    assert_eq!(submitted.len(), 1, "{submitted:?}");
+    assert_eq!(submitted[0]["classification"], "badResult");
+    assert_eq!(submitted[0]["note"], "something went wrong");
+    assert_eq!(submitted[0]["withFiles"], false);
+    assert_eq!(submitted[0]["attachSessionRecord"], false);
+    c.finish();
+}
+
+#[test]
+fn feedback_without_an_argument_ends_with_usage() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "/feedback");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "{done}");
+    c.wait_for("Usage: /feedback", Duration::from_secs(15));
+    assert!(host_requests(&c, "feedback/submit").is_empty());
+    c.finish();
+}
+
+#[test]
+fn feedback_outcomes_map_to_plain_language() {
+    for (outcome, env, want) in [
+        ("uploaded", vec![], "Feedback sent (id fixture-upload-1)."),
+        (
+            "rateLimited",
+            vec![],
+            "rate limited, try again in 5 seconds",
+        ),
+        (
+            "noCredential",
+            vec![],
+            "Feedback was not sent (noCredential: fixture cause).",
+        ),
+        (
+            "dark",
+            vec![],
+            "Feedback was not sent (dark: fixture cause).",
+        ),
+        (
+            "trackingFailed",
+            vec![],
+            "Feedback was sent, but Muse could not confirm the receipt (trackingFailed).",
+        ),
+        ("mystery", vec![], "Feedback was not sent (mystery)."),
+        (
+            "recorded",
+            vec![("FAKE_FEEDBACK_NOTES", "1")],
+            "Feedback recorded.",
+        ),
+    ] {
+        let mut env = env;
+        env.push(("FAKE_FEEDBACK_OUTCOME", outcome));
+        let mut c = Client::spawn("quiet", &env);
+        let sid = c.new_session(1, "");
+        let _pid = c.prompt(&sid, "/feedback other a note");
+        let message = c.wait_for(want, Duration::from_secs(15));
+        assert!(message.contains("agent_message_chunk"), "{message}");
+        if outcome == "recorded" {
+            assert!(
+                message.contains("A local copy is at /tmp/fixture-feedback.zip.")
+                    && message.contains("Session note from the fixture")
+                    && message.contains("Tracing note from the fixture"),
+                "receipt notes ride the message: {message}"
+            );
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn feedback_host_errors_are_shown_not_swallowed() {
+    for (env, want) in [
+        (
+            vec![("FAKE_FEEDBACK_HOST_ERROR", "1")],
+            "Feedback was not sent: feedback upload failed.",
+        ),
+        (
+            vec![("FAKE_NO_FEEDBACK", "1")],
+            "Feedback was not sent: feedback/submit requires the feedback capability.",
+        ),
+    ] {
+        let mut c = Client::spawn("quiet", &env);
+        let sid = c.new_session(1, "");
+        let _pid = c.prompt(&sid, "/feedback bug x");
+        let message = c.wait_for(want, Duration::from_secs(15));
+        assert!(message.contains("agent_message_chunk"), "{message}");
+        c.finish();
+    }
+}
+
+#[test]
 fn retired_sdk_manifest_fingerprint_is_unknown() {
     // The fbce769 manifest fingerprint was never a live host; once the pin
     // moved it must not keep a compatibility entry.
