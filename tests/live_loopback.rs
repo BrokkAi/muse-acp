@@ -700,14 +700,21 @@ fn session_delete_removes_a_fresh_session() {
         panic!("a fresh session must delete: {response} ({error})");
         #[cfg(target_os = "macos")]
         {
-            assert_eq!(error["data"]["reason"], "cleanupIncomplete", "{error}");
-            assert!(
-                error["message"]
-                    .as_str()
-                    .unwrap_or("")
-                    .contains("Some of its data may already be removed."),
-                "{error}"
-            );
+            let reason = error["data"]["reason"].as_str().unwrap_or("");
+            let message = error["message"].as_str().unwrap_or("");
+            match reason {
+                // A background reminder observer can still be finishing, so
+                // the host refuses the delete as busy.
+                "writerBusy" | "quiescenceFailed" => assert!(
+                    message.contains("work is still running"),
+                    "busy refusal mapped: {error}"
+                ),
+                "cleanupIncomplete" => assert!(
+                    message.contains("Some of its data may already be removed."),
+                    "cleanup refusal mapped: {error}"
+                ),
+                other => panic!("unexpected fresh-delete refusal on macOS: {other} ({response})"),
+            }
             adapter.finish();
             return;
         }
