@@ -1261,7 +1261,8 @@ def result_for(method, msg):
                 history["snapshot"]["state"]["pendingUserInputs"] = [
                     {"userInputId": "ui-1", "itemId": "item-ui-1",
                      "viewCursor": "cur-8"}]
-        workspace_root = "/tmp" if SCENARIO == "resume_active" else None
+        workspace_root = (os.environ.get("FAKE_WORKSPACE_ROOT", "/tmp")
+                          if SCENARIO == "resume_active" else None)
         session = session_obj(params.get("sessionId", MSP_SID), workspace_root)
         if SCENARIO == "cancel_request" and os.environ.get("FAKE_RESUME_QUEUED"):
             session["activeTurnId"] = "turn-2"

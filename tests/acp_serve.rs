@@ -5693,7 +5693,14 @@ fn resume_rejects_a_missing_additional_directory_before_the_host_call() {
 #[test]
 fn steering_never_carries_workspace_roots() {
     let extra = fresh_workspace_dir("steer-extra");
-    let mut c = Client::spawn("resume_active", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+    let workspace = fresh_workspace_dir("steer-workspace");
+    let mut c = Client::spawn(
+        "resume_active",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_WORKSPACE_ROOT", workspace.to_str().unwrap()),
+        ],
+    );
     let init = c.req("initialize", "{\"protocolVersion\":2}");
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
@@ -5701,7 +5708,7 @@ fn steering_never_carries_workspace_roots() {
         "session/resume",
         &serde_json::json!({
             "sessionId": "existing-session",
-            "cwd": "/tmp",
+            "cwd": workspace.to_str().unwrap(),
             "additionalDirectories": [extra.to_str().unwrap()],
         })
         .to_string(),
@@ -5728,10 +5735,7 @@ fn steering_never_carries_workspace_roots() {
     let starts = host_requests(&c, "turn/start");
     assert_eq!(
         starts[0]["workspaceRoots"],
-        serde_json::json!([
-            canonical_text(std::path::Path::new("/tmp")),
-            canonical_text(&extra)
-        ]),
+        serde_json::json!([canonical_text(&workspace), canonical_text(&extra)]),
         "{:?}",
         starts[0]
     );
