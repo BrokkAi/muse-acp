@@ -42,7 +42,9 @@
   with the host's terminal event, a completed delete disappears from
   `session/list`, and a refusal keeps the session and explains why (Muse only
   deletes sessions its current process started). Deleting a session that
-  never existed succeeds silently, as ACP asks.
+  never existed succeeds silently where the host's listing filters can prove
+  the absence (Muse 1.4.2+); on hosts without them the refusal is reported
+  rather than pretended away.
 - ACP `additionalDirectories` now reach Muse itself as MSP `workspaceRoots`
   on 1.4.1+ hosts, so Muse's own tools work in the extra folders. Roots are
   validated and canonicalized up front, duplicates collapse, and a load,

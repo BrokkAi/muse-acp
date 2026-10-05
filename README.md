@@ -303,7 +303,9 @@ error the editor shows if Muse then refuses the profile says why.
   Muse 1.4.1+ with durable session logs; Muse deletes only sessions started
   by the host process that is running now, so deleting a session from an
   earlier editor run is refused with an explanation instead of being
-  pretended.
+  pretended. Deleting a session that never existed succeeds silently when
+  Muse's listing filters can prove the absence (1.4.2+); without them the
+  refusal is reported.
 - **Turns** — streamed text and tool updates, queued concurrent prompts,
   cancellation with a terminal event, and exact-turn steering over the ACP v2
   `_session/steering` extension.

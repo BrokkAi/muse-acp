@@ -742,20 +742,34 @@ fn session_delete_of_an_earlier_run_reports_ownership() {
         session
     };
     // A second adapter run starts a new muse serve process, which cannot
-    // prove it owns the earlier process's logs.
+    // always prove it owns the earlier process's logs. Muse 1.4.x either
+    // refuses with `ownershipUnavailable` or, when the log is provably
+    // ownerless, completes the delete; both are honest outcomes.
     let mut adapter = Adapter::launch(&host);
     let delete = adapter.request("session/delete", json!({"sessionId": session}));
     let response = adapter.response(delete);
-    let error = response.get("error").expect("an unowned session is kept");
-    assert_eq!(error["code"], -32603, "{error}");
-    assert_eq!(error["data"]["reason"], "ownershipUnavailable", "{error}");
-    assert!(
-        error["message"]
-            .as_str()
-            .unwrap_or("")
-            .contains("cannot prove it owns"),
-        "{error}"
-    );
+    match response.get("error") {
+        Some(error) => {
+            assert_eq!(error["code"], -32603, "{error}");
+            assert_eq!(error["data"]["reason"], "ownershipUnavailable", "{error}");
+            assert!(
+                error["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("cannot prove it owns"),
+                "{error}"
+            );
+        }
+        None => {
+            assert_eq!(response["result"], json!({}), "{response}");
+            let load = adapter.request("session/load", json!({"sessionId": session}));
+            let load_response = adapter.response(load);
+            let error = load_response
+                .get("error")
+                .expect("a completed delete must remove the session");
+            assert_eq!(error["code"], -32002, "{error}");
+        }
+    }
     adapter.finish();
 }
 
@@ -774,8 +788,23 @@ fn session_delete_of_an_unknown_uuid_succeeds() {
     let _session = adapter.new_session(&host, json!([]));
     let ghost = "01a10c8b-2222-7333-8444-555566667777";
     let delete = adapter.request("session/delete", json!({"sessionId": ghost}));
-    let result = adapter.result(delete);
-    assert_eq!(result, json!({}), "a session that never existed deletes");
+    let response = adapter.response(delete);
+    if release >= (1, 4, 2) {
+        assert!(
+            response.get("error").is_none(),
+            "list filters prove a session never existed: {response}"
+        );
+        assert_eq!(response["result"], json!({}));
+    } else {
+        // 1.4.1 has no `session/list` filters, so the host's
+        // `ownershipUnavailable` terminal cannot be told apart from a real
+        // session it cannot prove it owns. Reporting the refusal is the
+        // honest answer; claiming success could hide a kept session.
+        let error = response
+            .get("error")
+            .expect("without list filters the absence cannot be proven");
+        assert_eq!(error["data"]["reason"], "ownershipUnavailable", "{error}");
+    }
     adapter.finish();
 }
 
