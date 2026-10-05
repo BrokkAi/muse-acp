@@ -315,6 +315,33 @@ impl Client {
         }
     }
 
+    /// Wait for one frame that contains every needle (an AND match), for
+    /// frames whose full body matters, such as `config_option_update`.
+    fn wait_for_all(&self, needles: &[&str], timeout: Duration) -> String {
+        let start = Instant::now();
+        loop {
+            {
+                let frames = self.frames.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(frame) = frames
+                    .iter()
+                    .find(|frame| needles.iter().all(|needle| frame.contains(needle)))
+                {
+                    return frame.clone();
+                }
+            }
+            if start.elapsed() > timeout {
+                panic!(
+                    "timed out waiting for a frame containing {needles:?}; got:\n{}",
+                    self.frames
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .join("\n")
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn elicitation_frames(&self) -> Vec<String> {
         self.frames
             .lock()
@@ -3958,12 +3985,19 @@ fn reasoning_effort_is_selected_and_sent_to_msp() {
         "1.2.1 max tier not selectable: {maxed}"
     );
     c.wait_log("session/setReasoningEffort", Duration::from_secs(15));
-    let changed = c.wait_for(
-        "\"sessionUpdate\":\"config_option_update\",\"configId\":\"reasoning_effort\",\"currentValue\":\"max\"",
+    // A host-side change must resend the complete selector list, not just the
+    // changed selector (ACP `config_option_update` requires `configOptions`).
+    let changed = c.wait_for_all(
+        &[
+            "\"sessionUpdate\":\"config_option_update\"",
+            "\"currentValue\":\"max\"",
+        ],
         Duration::from_secs(15),
     );
     assert!(
-        changed.contains("\"currentValue\":\"max\""),
+        changed.contains("\"configId\":\"mode\"")
+            && changed.contains("\"configId\":\"approval_mode\"")
+            && changed.contains("\"configId\":\"model\""),
         "host default change updates the selector: {changed}"
     );
 
@@ -3993,6 +4027,179 @@ fn reasoning_effort_is_selected_and_sent_to_msp() {
     assert!(
         reset.contains("\"error\"") && reset.contains("cannot be cleared"),
         "a standing host default cannot be reset: {reset}"
+    );
+    c.finish();
+}
+
+#[test]
+fn reasoning_selector_offers_only_the_models_tiers() {
+    let mut c = Client::spawn("quiet", &[]);
+    let _sid = c.new_session(2, "");
+    let frame = c.wait_for("\"configId\":\"reasoning_effort\"", Duration::from_secs(15));
+    let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    let option = value["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["configId"] == "reasoning_effort")
+        .expect("reasoning selector");
+    let values: Vec<&str> = option["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(values, vec!["default", "low", "medium", "high"], "{frame}");
+    assert_eq!(option["options"][1]["description"], "Quick answers");
+    assert_eq!(option["options"][3]["description"], "Deep reasoning");
+    assert_eq!(option["currentValue"], "default");
+    c.finish();
+}
+
+#[test]
+fn switching_models_resends_the_new_tier_list() {
+    let mut c = Client::spawn("quiet", &[("FAKE_SECOND_MODEL", "1")]);
+    let sid = c.new_session(2, "");
+    let id = c.req(
+        "session/set_config_option",
+        &serde_json::json!({"sessionId":sid,"configId":"model","value":"second-model"}).to_string(),
+    );
+    let done = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(done.contains("\"currentValue\":\"second-model\""), "{done}");
+    let changed = c.wait_for_all(
+        &[
+            "\"sessionUpdate\":\"config_option_update\"",
+            "\"currentValue\":\"second-model\"",
+        ],
+        Duration::from_secs(15),
+    );
+    let value: serde_json::Value = serde_json::from_str(&changed).unwrap();
+    let option = value["params"]["update"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["configId"] == "reasoning_effort")
+        .expect("reasoning selector");
+    let values: Vec<&str> = option["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        values,
+        vec!["default", "minimal", "high", "xhigh"],
+        "{changed}"
+    );
+    assert!(
+        changed.contains("Most thorough"),
+        "the new model's descriptions ride along: {changed}"
+    );
+    c.finish();
+}
+
+#[test]
+fn a_model_change_resets_an_unsupported_per_turn_tier() {
+    let mut c = Client::spawn("reasoning_legacy", &[("FAKE_SECOND_MODEL", "1")]);
+    let sid = c.new_session(2, "");
+    // The legacy host keeps "low" as a per-turn override (it serves
+    // fake-model's tiers). second-model does not serve it.
+    let set = c.req(
+        "session/set_config_option",
+        &serde_json::json!({"sessionId":sid,"configId":"reasoning_effort","value":"low"})
+            .to_string(),
+    );
+    let done = c.wait_for(&format!("\"id\":{set}"), Duration::from_secs(15));
+    assert!(done.contains("\"currentValue\":\"low\""), "{done}");
+    let switch = c.req(
+        "session/set_config_option",
+        &serde_json::json!({"sessionId":sid,"configId":"model","value":"second-model"}).to_string(),
+    );
+    c.wait_for(&format!("\"id\":{switch}"), Duration::from_secs(15));
+    c.wait_stderr("reset to Muse default", Duration::from_secs(15));
+    let changed = c.wait_for_all(
+        &[
+            "\"sessionUpdate\":\"config_option_update\"",
+            "\"currentValue\":\"default\"",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(
+        changed.contains("\"value\":\"xhigh\""),
+        "the second model's tiers are offered after the reset: {changed}"
+    );
+    c.finish();
+}
+
+#[test]
+fn unknown_variants_keep_the_fixed_tier_list() {
+    let mut c = Client::spawn("quiet", &[("FAKE_VARIANTS_UNKNOWN", "1")]);
+    let _sid = c.new_session(2, "");
+    let frame = c.wait_for("\"configId\":\"reasoning_effort\"", Duration::from_secs(15));
+    let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    let option = value["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["configId"] == "reasoning_effort")
+        .expect("reasoning selector");
+    let values: Vec<&str> = option["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            "default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
+        ],
+        "a model that cannot describe its tiers keeps the full list: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn air_recommended_reasoning_falls_back_to_the_model_default() {
+    let mut c = Client::spawn("quiet", &[("FAKE_SECOND_MODEL", "1")]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"recommendedValue\"]}}}}",
+    );
+    let id = c.req(
+        "session/set_config_option",
+        &serde_json::json!({"sessionId":sid,"configId":"auto_review","value":"off"}).to_string(),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    let option = value["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["configId"] == "reasoning_effort")
+        .expect("reasoning selector");
+    assert_eq!(
+        option["_meta"]["jetbrains"]["air"]["recommendedValue"].as_str(),
+        Some("medium"),
+        "{frame}"
+    );
+    // Switching models moves the recommendation to the new model's default.
+    let switch = c.req(
+        "session/set_config_option",
+        &serde_json::json!({"sessionId":sid,"configId":"model","value":"second-model"}).to_string(),
+    );
+    let frame = c.wait_for(&format!("\"id\":{switch}"), Duration::from_secs(15));
+    let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    let option = value["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["configId"] == "reasoning_effort")
+        .expect("reasoning selector");
+    assert_eq!(
+        option["_meta"]["jetbrains"]["air"]["recommendedValue"].as_str(),
+        Some("xhigh"),
+        "{frame}"
     );
     c.finish();
 }
@@ -9033,7 +9240,15 @@ fn reasoning_recommendations_require_negotiation_and_host_default_facts() {
                 .unwrap();
             assert_eq!(
                 option["_meta"]["jetbrains"]["air"]["recommendedValue"].as_str(),
-                (negotiated && default).then_some("high"),
+                if !negotiated {
+                    None
+                } else if default {
+                    Some("high")
+                } else {
+                    // No host recommendation: fall back to the current
+                    // model's catalog default.
+                    Some("medium")
+                },
                 "{frame}"
             );
             // A user selection must stay selected even while an earlier host
@@ -9054,7 +9269,13 @@ fn reasoning_recommendations_require_negotiation_and_host_default_facts() {
             assert_eq!(option["currentValue"], "low", "{frame}");
             assert_eq!(
                 option["_meta"]["jetbrains"]["air"]["recommendedValue"].as_str(),
-                (negotiated && default).then_some("high"),
+                if !negotiated {
+                    None
+                } else if default {
+                    Some("high")
+                } else {
+                    Some("medium")
+                },
                 "{frame}"
             );
             c.finish();
@@ -9284,9 +9505,16 @@ fn bare_plan_switches_to_plan_without_a_turn() {
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
     assert!(!frame.contains("\"error\""), "{frame}");
     c.wait_for("Plan mode is on", Duration::from_secs(15));
-    c.wait_for(
-        "\"sessionUpdate\":\"config_option_update\",\"configId\":\"mode\",\"currentValue\":\"plan\"",
+    let moved = c.wait_for_all(
+        &[
+            "\"sessionUpdate\":\"config_option_update\"",
+            "\"currentValue\":\"plan\"",
+        ],
         Duration::from_secs(15),
+    );
+    assert!(
+        moved.contains("\"configId\":\"reasoning_effort\""),
+        "the mode move must resend the full selector list: {moved}"
     );
     assert!(
         !fake_methods(&c).iter().any(|m| m.ends_with("turn/start")),

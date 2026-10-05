@@ -1391,8 +1391,28 @@ def result_for(method, msg):
                 return {"models": [], "source": "unresolvedCatalog"}
         models = [{"modelId": "fake-model", "displayLabel": "Fake",
                    "isDefault": True,
+                   "variants": ["low", "medium", "high"],
+                   "reasoningEffortVariants": [
+                       {"tier": "low", "description": "Quick answers"},
+                       {"tier": "medium", "description": "Balanced effort"},
+                       {"tier": "high", "description": "Deep reasoning"},
+                   ],
+                   "defaultReasoningEffort": "medium",
                    "cost": {"input": "3.00", "output": "15.00",
                             "cached": "0.30", "currency": "USD"}}]
+        if os.environ.get("FAKE_VARIANTS_UNKNOWN") == "1":
+            models[0]["variants"] = "unknown"
+            models[0].pop("reasoningEffortVariants", None)
+        if os.environ.get("FAKE_SECOND_MODEL") == "1":
+            models.append({
+                "modelId": "second-model", "displayLabel": "Second",
+                "variants": ["minimal", "high", "xhigh"],
+                "reasoningEffortVariants": [
+                    {"tier": "minimal", "description": "Fastest"},
+                    {"tier": "xhigh", "description": "Most thorough"},
+                ],
+                "defaultReasoningEffort": "xhigh",
+            })
         if CATALOG_READS[0] > 1:
             if SCENARIO == "usage_rates_dropped":
                 models[0]["cost"] = None
@@ -1946,6 +1966,14 @@ def main():
                         "viewCursor": "cur-reasoning-1",
                         "sourceRange": {"start": 1, "end": 1},
                     })
+                if method == "session/setModel":
+                    model = ((msg.get("params", {}).get("model") or {})
+                             .get("modelId", ""))
+                    if model:
+                        notify("session/modelChanged", {
+                            "sessionId": msg.get("params", {}).get("sessionId", MSP_SID),
+                            "modelId": model,
+                        })
                 if SCENARIO == "rename_live" and method == "session/start":
                     notify("session/nameChanged", {
                         "sessionId": MSP_SID,

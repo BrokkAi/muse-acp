@@ -375,9 +375,7 @@ fn send_file_report(stdout: &StdoutShared, acp_sid: &str, report: FileChangeRepo
     acp::send_raw(stdout, &line);
 }
 /// Last successful model catalog, used only when a refresh fails.
-/// Rows are (modelId, displayLabel, isDefault).
-static CATALOG: std::sync::OnceLock<Mutex<Vec<(String, String, bool)>>> =
-    std::sync::OnceLock::new();
+static CATALOG: std::sync::OnceLock<Mutex<Vec<acp::CatalogModel>>> = std::sync::OnceLock::new();
 /// Per-model catalog rates, parsed once per refresh for client-local math.
 #[derive(Debug, Clone, PartialEq)]
 struct CostRate {
@@ -708,6 +706,34 @@ fn adopt_reasoning_effort(s: &mut AcpSession, state: &J) -> bool {
 fn reasoning_effort_override(s: &AcpSession) -> Option<String> {
     (s.reasoning_effort_source.is_none() && acp::is_reasoning_effort(&s.reasoning_effort))
         .then(|| s.reasoning_effort.clone())
+}
+
+/// A model change can leave the held per-turn tier outside the new model's
+/// known `variants`. Reset the override to Muse default so the adapter never
+/// sends a tier the model does not serve. A model whose catalog row does not
+/// publish tiers cannot disagree, so nothing resets. Returns true when the
+/// override was reset.
+fn reset_unsupported_reasoning_tier(
+    sessions: &Sessions,
+    acp_sid: &str,
+    model: &str,
+    models: &[acp::CatalogModel],
+) -> bool {
+    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(s) = map.get_mut(acp_sid) else {
+        return false;
+    };
+    let unsupported = reasoning_effort_override(s).is_some_and(|effort| {
+        models
+            .iter()
+            .find(|row| row.id == model)
+            .and_then(|row| row.variants.as_ref())
+            .is_some_and(|variants| !variants.iter().any(|tier| tier == &effort))
+    });
+    if unsupported {
+        s.reasoning_effort = acp::REASONING_DEFAULT.to_string();
+    }
+    unsupported
 }
 
 fn reasoning_effort_param(effort: Option<&str>) -> String {
@@ -1059,7 +1085,7 @@ fn backfill_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions,
     }
 }
 
-fn catalog(host: &Arc<Hosts>) -> Vec<(String, String, bool)> {
+fn catalog(host: &Arc<Hosts>) -> Vec<acp::CatalogModel> {
     let cell = CATALOG.get_or_init(|| Mutex::new(Vec::new()));
     // MSP exposes a point-in-time snapshot, with no catalog subscription.
     // Refresh whenever we return config options: a nonempty startup catalog
@@ -1104,7 +1130,60 @@ fn catalog(host: &Arc<Hosts>) -> Vec<(String, String, bool)> {
         {
             rates.insert(id.clone(), parsed);
         }
-        out.push((id, label, def));
+        // `variants` is the model's tier list, or the string "unknown" when
+        // the catalog cannot describe it. Tiers outside MSP's closed
+        // `ReasoningEffort` set are skipped rather than offered.
+        let variants = match m.get("variants") {
+            Some(J::Arr(values)) => {
+                let mut tiers = Vec::new();
+                for value in values {
+                    let Some(tier) = value.as_str() else {
+                        continue;
+                    };
+                    if !acp::is_reasoning_effort(tier) {
+                        log(&format!(
+                            "model {id}: ignoring unknown reasoning variant {tier:?}"
+                        ));
+                        continue;
+                    }
+                    if !tiers.iter().any(|known| known == tier) {
+                        tiers.push(tier.to_string());
+                    }
+                }
+                Some(tiers)
+            }
+            _ => None,
+        };
+        let mut tier_descriptions = Vec::new();
+        if let Some(J::Arr(rows)) = m.get("reasoningEffortVariants") {
+            for row in rows {
+                let Some(tier) = row.get("tier").and_then(J::as_str) else {
+                    continue;
+                };
+                if !acp::is_reasoning_effort(tier) {
+                    continue;
+                }
+                let description = row
+                    .get("description")
+                    .and_then(J::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string);
+                tier_descriptions.push((tier.to_string(), description));
+            }
+        }
+        let default_effort = m
+            .get("defaultReasoningEffort")
+            .and_then(J::as_str)
+            .filter(|tier| acp::is_reasoning_effort(tier))
+            .map(str::to_string);
+        out.push(acp::CatalogModel {
+            id,
+            label,
+            is_default: def,
+            variants,
+            tier_descriptions,
+            default_effort,
+        });
     }
     let source = r.get("source").and_then(J::as_str).unwrap_or("unknown");
     log(&format!(
@@ -2356,7 +2435,7 @@ fn switch_session_mode(
         s.ver
     };
     modes::save(&msp_sid, target);
-    acp::send_config_option_update(stdout, acp_sid, "mode", target, None);
+    publish_config_options(stdout, sessions, acp_sid);
     if ver == 1 {
         acp::send_raw(
             stdout,
@@ -2587,30 +2666,63 @@ fn adopt_reattached(
     reconcile_in_flight(stdout, sessions, acp_sid, r);
 }
 
-/// The session's full selector set, as a `session/set_config_option` result.
-fn config_options_result(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) -> Option<String> {
+/// The session's full selector set as raw `configOptions` JSON.
+fn config_options_json(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) -> Option<String> {
     let models = catalog(host);
+    config_options_with_models(sessions, acp_sid, &models)
+}
+
+/// The session's full selector set built from an already-fetched catalog, so
+/// one model/list read serves both a model-change reset and the update frame.
+fn config_options_with_models(
+    sessions: &Sessions,
+    acp_sid: &str,
+    models: &[acp::CatalogModel],
+) -> Option<String> {
     let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     let s = map.get(acp_sid)?;
-    Some(format!(
-        "{{\"configOptions\":{}}}",
-        acp::config_options(
-            s.ver,
-            acp::ConfigOptions {
-                session_mode: &s.session_mode,
-                approval_mode: &s.mode_value,
-                model: &s.model_value,
-                reasoning_effort: &s.reasoning_effort,
-                offer_muse_default: s.reasoning_effort_source.is_none(),
-                auto_review: s.auto_review,
-                recommendations: (
-                    recommended_model(&models).as_deref(),
-                    recommended_reasoning(s).as_deref(),
-                ),
-            },
-            &models,
-        )
+    Some(acp::config_options(
+        s.ver,
+        acp::ConfigOptions {
+            session_mode: &s.session_mode,
+            approval_mode: &s.mode_value,
+            model: &s.model_value,
+            reasoning_effort: &s.reasoning_effort,
+            offer_muse_default: s.reasoning_effort_source.is_none(),
+            auto_review: s.auto_review,
+            recommendations: (
+                recommended_model(models).as_deref(),
+                recommended_reasoning(s, models).as_deref(),
+            ),
+        },
+        models,
     ))
+}
+
+/// The last successful catalog snapshot, without a host read.
+fn catalog_cached() -> Vec<acp::CatalogModel> {
+    CATALOG
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// The session's full selector set, as a `session/set_config_option` result.
+fn config_options_result(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) -> Option<String> {
+    config_options_json(host, sessions, acp_sid)
+        .map(|options| format!("{{\"configOptions\":{options}}}"))
+}
+
+/// Publish the complete selector list after a state change the host just
+/// reported. ACP requires the full `configOptions` array, not the changed
+/// selector. Built from the cached catalog so a notification costs no host
+/// read; the next config read refreshes it.
+fn publish_config_options(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
+    let models = catalog_cached();
+    if let Some(options) = config_options_with_models(sessions, acp_sid, &models) {
+        acp::send_config_options_update(stdout, acp_sid, &options);
+    }
 }
 
 /// Relaunches the `kind` host and re-attaches the sessions it owned, except
@@ -3109,20 +3221,43 @@ fn main() {
 
 /// The catalog's default model, but only when the client asked for AIR
 /// recommendedValue metadata. Never fabricates a default of its own.
-fn recommended_model(models: &[(String, String, bool)]) -> Option<String> {
+fn recommended_model(models: &[acp::CatalogModel]) -> Option<String> {
     if AIR_RECOMMENDED.load(Ordering::SeqCst) == 0 {
         return None;
     }
     models
         .iter()
-        .find(|(_, _, is_default)| *is_default)
-        .map(|(id, _, _)| id.clone())
+        .find(|model| model.is_default)
+        .map(|model| model.id.clone())
 }
 
-fn recommended_reasoning(session: &AcpSession) -> Option<String> {
-    (AIR_RECOMMENDED.load(Ordering::SeqCst) == 1)
-        .then(|| session.reasoning_recommendation.clone())
-        .flatten()
+/// The reasoning tier to recommend to AIR clients: the host's session-level
+/// recommendation when it set one, else the current model's catalog default.
+/// Never fabricated, and only emitted when the client negotiated it.
+fn recommended_reasoning(session: &AcpSession, models: &[acp::CatalogModel]) -> Option<String> {
+    recommended_reasoning_for(
+        &session.model_value,
+        session.reasoning_recommendation.as_deref(),
+        models,
+    )
+}
+
+/// [`recommended_reasoning`] for a session that is not in the table yet, such
+/// as the one `session/new` is about to insert.
+fn recommended_reasoning_for(
+    model: &str,
+    host_recommendation: Option<&str>,
+    models: &[acp::CatalogModel],
+) -> Option<String> {
+    if AIR_RECOMMENDED.load(Ordering::SeqCst) != 1 {
+        return None;
+    }
+    host_recommendation.map(str::to_string).or_else(|| {
+        models
+            .iter()
+            .find(|row| row.id == model)
+            .and_then(|row| row.default_effort.clone())
+    })
 }
 
 /// A fresh fold configured with the connection's subagent negotiation.
@@ -3752,7 +3887,11 @@ fn handle_acp(
                                     reasoning_effort: acp::REASONING_DEFAULT,
                                     offer_muse_default: true,
                                     auto_review: false,
-                                    recommendations: (recommended_model(&models).as_deref(), None),
+                                    recommendations: (
+                                        recommended_model(&models).as_deref(),
+                                        recommended_reasoning_for(&cur_model, None, &models)
+                                            .as_deref(),
+                                    ),
                                 },
                                 &models,
                             )
@@ -3771,7 +3910,11 @@ fn handle_acp(
                                     reasoning_effort: acp::REASONING_DEFAULT,
                                     offer_muse_default: true,
                                     auto_review: false,
-                                    recommendations: (recommended_model(&models).as_deref(), None),
+                                    recommendations: (
+                                        recommended_model(&models).as_deref(),
+                                        recommended_reasoning_for(&cur_model, None, &models)
+                                            .as_deref(),
+                                    ),
                                 },
                                 &models,
                             ),
@@ -4189,6 +4332,7 @@ fn handle_acp(
                         .get(&sid)
                         .map(|s| s.msp_sid.clone())
                         .unwrap_or_default();
+                    let models = catalog(host);
                     let (
                         session_mode_v,
                         mode_v,
@@ -4208,7 +4352,7 @@ fn handle_acp(
                                 s.model_value.clone(),
                                 s.reasoning_effort.clone(),
                                 s.reasoning_effort_source.is_none(),
-                                recommended_reasoning(s),
+                                recommended_reasoning(s, &models),
                                 s.auto_review,
                             )
                         })
@@ -4216,7 +4360,6 @@ fn handle_acp(
                     // Both versions report current selectors; v1 also keeps the
                     // legacy mode state for clients which predate config options.
                     let result = if ver == 2 {
-                        let models = catalog(host);
                         format!(
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
                             esc(&sid),
@@ -4239,7 +4382,6 @@ fn handle_acp(
                             )
                         )
                     } else {
-                        let models = catalog(host);
                         format!(
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{},\"modes\":{}}}",
                             esc(&sid),
@@ -4624,6 +4766,7 @@ fn handle_acp(
                             adopt_reasoning_effort(entry, state);
                         }
                     }
+                    let models = catalog(host);
                     let (
                         session_mode_out,
                         mode_out,
@@ -4643,12 +4786,11 @@ fn handle_acp(
                                 s.model_value.clone(),
                                 s.reasoning_effort.clone(),
                                 s.reasoning_effort_source.is_none(),
-                                recommended_reasoning(s),
+                                recommended_reasoning(s, &models),
                                 s.auto_review,
                             )
                         })
                         .unwrap_or_default();
-                    let models = catalog(host);
                     let result = if ver == 2 {
                         format!(
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}{provenance}}},\"configOptions\":{}}}",
@@ -6083,8 +6225,20 @@ fn handle_acp(
                             _ => unreachable!(),
                         }
                     }
-                    match config_options_result(host, sessions, &sid) {
-                        Some(result) => acp::send_result(stdout, &id, &result),
+                    let models = catalog(host);
+                    if key == "model"
+                        && reset_unsupported_reasoning_tier(sessions, &sid, &value, &models)
+                    {
+                        log(&format!(
+                            "model {value} does not serve the held reasoning tier; reset to Muse default"
+                        ));
+                    }
+                    match config_options_with_models(sessions, &sid, &models) {
+                        Some(options) => acp::send_result(
+                            stdout,
+                            &id,
+                            &format!("{{\"configOptions\":{options}}}"),
+                        ),
                         None => acp::send_error(stdout, &id, -32602, "unknown sessionId"),
                     }
                 }
@@ -8656,7 +8810,7 @@ fn handle_msp(
                 {
                     s.mode_value = acp::mode_from_msp(mode).to_string();
                 }
-                let _ = acp_sid;
+                publish_config_options(stdout, sessions, &acp_sid);
             }
         }
         "session/reasoningEffortChanged" => {
@@ -8681,7 +8835,7 @@ fn handle_msp(
                 .unwrap_or("unknown")
                 .to_string();
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
-                let recommendation = if let Some(s) = sessions
+                if let Some(s) = sessions
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .get_mut(&acp_sid)
@@ -8691,17 +8845,8 @@ fn handle_msp(
                     }
                     s.reasoning_effort = effort.to_string();
                     s.reasoning_effort_source = Some(source);
-                    recommended_reasoning(s)
-                } else {
-                    None
-                };
-                acp::send_config_option_update(
-                    stdout,
-                    &acp_sid,
-                    "reasoning_effort",
-                    effort,
-                    recommendation.as_deref(),
-                );
+                }
+                publish_config_options(stdout, sessions, &acp_sid);
             }
         }
         "session/modelChanged" => {
@@ -8717,6 +8862,7 @@ fn handle_msp(
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
                 && !model.is_empty()
             {
+                let models = catalog(host);
                 if let Some(s) = sessions
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -8724,7 +8870,16 @@ fn handle_msp(
                 {
                     s.model_value = model.to_string();
                 }
-                let _ = acp_sid;
+                // A held per-turn override must not outlive a model that
+                // does not serve that tier.
+                if reset_unsupported_reasoning_tier(sessions, &acp_sid, model, &models) {
+                    log(&format!(
+                        "model {model} does not serve the held reasoning tier; reset to Muse default"
+                    ));
+                }
+                if let Some(options) = config_options_with_models(sessions, &acp_sid, &models) {
+                    acp::send_config_options_update(stdout, &acp_sid, &options);
+                }
             }
         }
         "session/statusChanged" => {

@@ -560,24 +560,15 @@ pub fn send_state(stdout: &StdoutShared, acp_sid: &str, state: &str, stop: Optio
     );
 }
 
-/// Reflect a host-side configuration change in the client's selector.
-pub fn send_config_option_update(
-    stdout: &StdoutShared,
-    acp_sid: &str,
-    config_id: &str,
-    value: &str,
-    recommended: Option<&str>,
-) {
-    let meta = recommended.filter(|value| is_reasoning_effort(value))
-        .map(|value| format!(",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}", esc(value)))
-        .unwrap_or_default();
+/// Reflect a host-side configuration change in the client's selector. ACP
+/// requires the complete `configOptions` list, not the changed selector, so
+/// callers pass the same JSON the selector result uses.
+pub fn send_config_options_update(stdout: &StdoutShared, acp_sid: &str, config_options_json: &str) {
     send_raw(
         stdout,
         &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"config_option_update\",\"configId\":{},\"currentValue\":{}{meta}}}}}}}",
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"config_option_update\",\"configOptions\":{config_options_json}}}}}}}",
             esc(acp_sid),
-            esc(config_id),
-            esc(value),
         ),
     );
 }
@@ -806,6 +797,41 @@ pub fn is_reasoning_effort(value: &str) -> bool {
     )
 }
 
+/// The tiers offered when a model's catalog row does not publish `variants`.
+pub const FIXED_REASONING_TIERS: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+/// Display name for one MSP `ReasoningEffort`.
+pub fn reasoning_tier_name(tier: &str) -> &str {
+    match tier {
+        "none" => "None",
+        "minimal" => "Minimal",
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "Extra High",
+        "max" => "Max",
+        "ultra" => "Ultra",
+        other => other,
+    }
+}
+
+/// One selectable model from the host's `model/list`.
+#[derive(Clone, Default)]
+pub struct CatalogModel {
+    pub id: String,
+    pub label: String,
+    pub is_default: bool,
+    /// Reasoning tiers the model serves, in catalog order. `None` when the
+    /// host sent no `variants` or the string `"unknown"`.
+    pub variants: Option<Vec<String>>,
+    /// `reasoningEffortVariants` descriptions, keyed by tier.
+    pub tier_descriptions: Vec<(String, Option<String>)>,
+    /// The model's `defaultReasoningEffort`, when the host set one.
+    pub default_effort: Option<String>,
+}
+
 /// Per-session values rendered by `config_options`. Keeping them in one
 /// struct keeps the selector builder readable as the selector set grows.
 pub struct ConfigOptions<'a> {
@@ -826,24 +852,75 @@ pub struct ConfigOptions<'a> {
 /// `configId` (the setter still uses `configId` in both versions).
 /// Auto-review is adapter policy: see [`AUTO_REVIEW_OFF`] and
 /// [`AUTO_REVIEW_WORKSPACE`].
-pub fn config_options(
-    ver: u8,
-    options: ConfigOptions<'_>,
-    models_json: &[(String, String, bool)],
-) -> String {
+pub fn config_options(ver: u8, options: ConfigOptions<'_>, models: &[CatalogModel]) -> String {
     let mut model_opts = Vec::new();
-    for (id, label, _) in models_json {
-        model_opts.push(format!("{{\"value\":{},\"name\":{}}}", esc(id), esc(label)));
+    for model in models {
+        model_opts.push(format!(
+            "{{\"value\":{},\"name\":{}}}",
+            esc(&model.id),
+            esc(&model.label)
+        ));
     }
     let id_key = if ver == 1 { "id" } else { "configId" };
+    // The reasoning selector offers exactly the tiers the current model
+    // serves, with the catalog's own descriptions. A model whose row does not
+    // publish tiers keeps today's fixed list. The current value always stays
+    // among the options, even when the catalog disagrees with it.
+    let current_model = models.iter().find(|model| model.id == options.model);
+    let tier_description = |tier: &str| -> Option<String> {
+        current_model?
+            .tier_descriptions
+            .iter()
+            .find(|(name, _)| name == tier)
+            .and_then(|(_, description)| description.clone())
+    };
+    let mut reasoning_options: Vec<(String, Option<String>)> =
+        match current_model.and_then(|model| model.variants.as_ref()) {
+            Some(variants) => variants
+                .iter()
+                .map(|tier| (tier.clone(), tier_description(tier)))
+                .collect(),
+            None => FIXED_REASONING_TIERS
+                .iter()
+                .map(|tier| (tier.to_string(), None))
+                .collect(),
+        };
+    if is_reasoning_effort(options.reasoning_effort)
+        && !reasoning_options
+            .iter()
+            .any(|(tier, _)| tier == options.reasoning_effort)
+    {
+        reasoning_options.push((
+            options.reasoning_effort.to_string(),
+            tier_description(options.reasoning_effort),
+        ));
+    }
+    let reasoning_options_json = reasoning_options
+        .iter()
+        .map(|(tier, description)| match description {
+            Some(description) if !description.is_empty() => format!(
+                "{{\"value\":{},\"name\":{},\"description\":{}}}",
+                esc(tier),
+                esc(reasoning_tier_name(tier)),
+                esc(description)
+            ),
+            _ => format!(
+                "{{\"value\":{},\"name\":{}}}",
+                esc(tier),
+                esc(reasoning_tier_name(tier))
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     // AIR recommendedValue is additive metadata: emit it only when the client
     // negotiated it and the value is present among this selector's options.
     let (recommended_model, recommended_reasoning) = options.recommendations;
-    let reasoning_meta = recommended_reasoning.filter(|value| is_reasoning_effort(value))
+    let reasoning_meta = recommended_reasoning
+        .filter(|value| reasoning_options.iter().any(|(tier, _)| tier == value))
         .map(|value| format!(",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}", esc(value)))
         .unwrap_or_default();
     let recommended_meta = match recommended_model {
-        Some(model) if models_json.iter().any(|(id, _, _)| id == model) => format!(
+        Some(model) if models.iter().any(|row| row.id == model) => format!(
             ",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}",
             esc(model)
         ),
@@ -862,7 +939,7 @@ pub fn config_options(
         AUTO_REVIEW_OFF
     };
     format!(
-        "[{{\"{id_key}\":\"mode\",\"name\":\"Mode\",\"description\":\"What Muse may change: Read-only and Plan cannot write files or run shell commands\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"approval_mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"auto_review\",\"name\":\"Auto-review\",\"description\":\"Dangerous: send every permission request to an auto-review agent that can approve or deny it without asking you\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"off\",\"name\":\"Off\"}},{{\"value\":\"on\",\"name\":\"On\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]{reasoning_meta}}}]",
+        "[{{\"{id_key}\":\"mode\",\"name\":\"Mode\",\"description\":\"What Muse may change: Read-only and Plan cannot write files or run shell commands\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"approval_mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"auto_review\",\"name\":\"Auto-review\",\"description\":\"Dangerous: send every permission request to an auto-review agent that can approve or deny it without asking you\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"off\",\"name\":\"Off\"}},{{\"value\":\"on\",\"name\":\"On\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{reasoning_options_json}]{reasoning_meta}}}]",
         esc(options.session_mode),
         mode_options_json("value", &SESSION_MODES),
         esc(options.approval_mode),
@@ -1105,7 +1182,12 @@ mod tests {
 
     #[test]
     fn selector_and_command_literals_are_valid_json() {
-        let models = vec![("fake-model".to_string(), "Fake".to_string(), true)];
+        let models = vec![CatalogModel {
+            id: "fake-model".to_string(),
+            label: "Fake".to_string(),
+            is_default: true,
+            ..CatalogModel::default()
+        }];
         for ver in [1, 2] {
             let options = config_options(
                 ver,
@@ -1169,7 +1251,12 @@ mod tests {
             assert!(is_reasoning_effort(tier), "{tier} must be selectable");
         }
         assert!(!is_reasoning_effort("extreme"));
-        let models = vec![("fake-model".to_string(), "Fake".to_string(), true)];
+        let models = vec![CatalogModel {
+            id: "fake-model".to_string(),
+            label: "Fake".to_string(),
+            is_default: true,
+            ..CatalogModel::default()
+        }];
         let options = config_options(
             1,
             ConfigOptions {
