@@ -38,14 +38,14 @@ client-to-server entry; all other rows below are emitted by the MSP host.
 | `session/deleteCompleted` | Mapped to ACP | Settles a pending ACP `session/delete` with `{}` on `completed`, or an error carrying the host's reason and physical-change evidence on `failed`. A `failed` terminal whose filtered listing shows the session is gone counts as success; an unknown outcome leaves the request pending. A completed delete also removes the session from ACP `session/list`. |
 | `session/goalChanged` | Mapped to ACP | Stores replacement-or-clear semantics and emits the goal in `session/update` metadata together with branch state. |
 | `session/listChanged` | Mapped to ACP | Replaces a cached list row when `sessionListStream` is granted; pushes a changed active-session title through `session_info_update`. |
-| `session/modelChanged` | Internally tracked | Updates the selected model value used in later ACP configuration snapshots. |
+| `session/modelChanged` | Mapped to ACP | Updates the selected model value, resets a held per-turn reasoning tier the new model does not serve, and resends the complete `configOptions` list. |
 | `session/modelRouteUnserved` | Intentionally ignored | No ACP mapping; the unhandled-notification path logs a diagnostic. |
 | `session/nameChanged` | Mapped to ACP | Updates host title facts and publishes a changed title through `session_info_update`. |
 | `session/reasoningEffortChanged` | Mapped to ACP | Updates the standing reasoning default and emits `config_option_update`; negotiated recommendations require a host `default` or `policy` source. |
 | `session/started` | Internally tracked | Caches the new session's list row when Muse grants `sessionListStream`. The row may arrive before or after the `session/start` result. Clients still request `session/list` to discover membership changes. |
 | `session/statusChanged` | Mapped to ACP | Publishes host status and attention metadata and ACP v2 state; directs pending-request reconciliation without inventing unknown status values. |
 | `session/todoListChanged` | Mapped to ACP | Replaces the ACP plan with the reported todo list; an empty list clears the plan. |
-| `session/tokenUsage` | Mapped to ACP | Deduplicates completion usage, tracks cumulative and per-turn totals, estimates catalog-priced cost when possible, and emits ACP `usage_update` once context occupancy is known. |
+| `session/tokenUsage` | Mapped to ACP | Deduplicates completion usage, tracks cumulative, cache, and per-turn totals, prefers the host's own session `cost` (with its partial flag) over the catalog estimate on hosts that report it, and emits ACP `usage_update` once context occupancy is known. |
 | `session/viewHealthChanged` | Consumed | Logs the view health and reason with guidance to reattach through resume. |
 | `skill/changed` | Mapped to ACP | Refreshes `skill/list` and the ACP available-command catalog. |
 | `turn/completed` | Mapped to ACP | Settles the matching ACP prompt, reports its stop reason and per-turn usage, and moves ACP v2 to idle when no work remains. Failures also receive host detail. |

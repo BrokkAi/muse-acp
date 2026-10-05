@@ -19,12 +19,12 @@ To see it working: run `cargo test --locked` and see the new tests pass; then, w
 - [x] (2026-10-05 17:10Z) Read the SDK diff `a7c10c5..bb44be3` in full, the ACP v1 and v2 specs (docs and schemas at agent-client-protocol v1.10.2), and the adapter; probed a live Muse 1.4.2 host (see Surprises & Discoveries).
 - [x] (2026-10-05 17:40Z) Wrote this plan.
 - [x] (2026-10-05 15:55Z) Milestone 1: re-pinned `tests/protocol/` to `bb44be3`, pointed `SDK_MANIFEST_FINGERPRINT` at the 1.4.2 entry, moved `session/started`, `session/closed`, and `session/deleteCompleted` into the event matrix, stopped `session/closed` from hiding sessions, added the version gates on `HandshakeInfo` with a `host-features` startup log line, gave the experimental `mcpServer/oauthLoginCompleted` an explicit arm, and updated `ROADMAP.md`, `PROVENANCE.md`, and `CHANGELOG.md`. Full contributor gate green; live suite green against Muse 1.4.2 (19 tests, including the new `host_feature_gates_read_the_installed_muse_version`). Times before this entry were recorded in local time (CEST, UTC+2) although labeled Z; from here on they are true UTC.
-- [ ] Milestone 2: ACP `session/delete` for v1 and v2, plus the `session/list` fixes it depends on.
-- [ ] Milestone 3: ACP `additionalDirectories` sent to Muse as `workspaceRoots`.
-- [ ] Milestone 4: per-model reasoning tiers and a spec-conformant `config_option_update`.
-- [ ] Milestone 5: host-computed session cost and cache totals in `usage_update`.
-- [ ] Milestone 6: `/feedback` backed by MSP `feedback/submit`.
-- [ ] Milestone 7: live-host coverage, documentation, full contributor gate, pull request.
+- [x] (2026-10-05 15:55Z) Milestone 2: ACP `session/delete` for v1 and v2, plus the `session/list` fixes it depends on. Landed as `22b4af9`.
+- [x] (2026-10-05 15:59Z) Milestone 3: ACP `additionalDirectories` sent to Muse as `workspaceRoots`. Landed as `2124720`.
+- [x] (2026-10-05 16:06Z) Milestone 4: per-model reasoning tiers and a spec-conformant `config_option_update`. Landed as `ce32c0d`.
+- [x] (2026-10-05 16:11Z) Milestone 5: host-computed session cost and cache totals in `usage_update`. Landed as `49107e8`.
+- [x] (2026-10-05 16:16Z) Milestone 6: `/feedback` backed by MSP `feedback/submit`. Landed as `e7d8d63`.
+- [x] (2026-10-05 16:20Z) Milestone 7: live-host coverage, documentation, full contributor gate, pull request.
 
 
 ## Surprises & Discoveries
@@ -159,6 +159,18 @@ To see it working: run `cargo test --locked` and see the new tests pass; then, w
 
 
 Milestone 1 (2026-10-05): the vendored corpus is the Muse 1.4.2 surface (`bb44be3`), the selftest prints `kind=sdk-manifest ... fingerprint=sha256:61afea31... status=tested detail=validated against live host 1.4.2`, and the event matrix lists exactly the 34 published notifications. A session that Muse unloads now stays in ACP `session/list`; the test `session_list_stream_updates_titles_filters_rows_and_keeps_unloaded_sessions` fails with the old tombstone code. The version gates exist and are logged at startup; nothing acts on them yet (Milestones 2, 3, and 5 do). The experimental OAuth terminal no longer reaches the unhandled-notification path. Lesson: an unused public method fails this crate's clippy gate, so a gate method needs a real caller in the same milestone.
+
+Milestone 2 (2026-10-05, `22b4af9`): ACP `session/delete` is advertised only on durable 1.4.1+ hosts, settles on `session/deleteCompleted` (never the admission ack), joins concurrent deletes onto one host command, treats a non-UUID or `session_deleted`/`-32020` or a `ownershipUnavailable`-plus-empty-filtered-listing target as success, and reports every other refusal with the host's reason and physical-change evidence. `session/list` no longer repeats adapter-held sessions across pages, errors on a rejected cursor, skips rows without an absolute root, and hides deleted ids whether or not the listing stream is granted; load/resume of a deleted session answers -32002. The `ownershipUnavailable` existence check costs no extra host command except on that one failure path. Lesson: the fake host's session ids are deliberately not UUIDs, so delete tests need the `FAKE_SESSION_ID` knob.
+
+Milestone 3 (2026-10-05, `2124720`): `session/new` sends canonical `workspaceRoots` when extras exist, a load/resume/fork/re-attach arms a one-shot replacement for the next user turn (never a steered one), and a bad root fails with -32602 naming the entry before any host call. The live test proves Muse's own `read_file` sees an extra root; a 1.3.0 fake host receives no `workspaceRoots` and logs the adapter-side limit.
+
+Milestone 4 (2026-10-05, `ce32c0d`): `CatalogModel` carries `variants`, `tier_descriptions`, and `default_effort`; the reasoning selector offers the model's tiers plus "Muse default" and always keeps the current value; unknown variants keep the fixed list; AIR falls back to the model default; `config_option_update` now carries the full list (built from the cached catalog for host notifications so read-counted fixtures do not shift); and a model change resets a held per-turn tier the new model does not serve.
+
+Milestone 5 (2026-10-05, `49107e8`): `adopt_cumulative` reads cache and host cost; on 1.4.2+ `usage_update.cost` is the host figure with its partial flag and the estimate is not emitted; older hosts keep the estimate with provenance in `cost._meta`; cache totals ride `_meta.museCumulative`.
+
+Milestone 6 (2026-10-05, `e7d8d63`): `/feedback` is advertised only with the host grant; the form path collects classification, note, and two explicit consents (both default off), validates the attachment rules locally and reissues with the submitted values on correction; the no-form path takes the classified syntax and a malformed line ends with usage; every host outcome maps to plain language, including rate-limit seconds, bundle path, and notes; cancel/close cancels an open form and settles its prompt.
+
+Milestone 7 (2026-10-05): five live tests were added (fresh delete, earlier-run ownership refusal, unknown-UUID success, extra-root read, selector vs live catalog) and the whole 24-test live suite passes against installed Muse 1.4.2. README, ROADMAP, CHANGELOG, and the event matrix were updated; the full contributor gate and the loopback live suite are green. No live test submits feedback: it would upload to Meta.
 
 
 ## Context and Orientation
@@ -349,3 +361,5 @@ Names may change during implementation if the surrounding code suggests better o
 
 
 Revision note (2026-10-05, Milestone 1): ticked Milestone 1; recorded the live 1.4.2 version string and shutdown ordering, the unverified idle-unload policy, and the fake host's frame spacing in Surprises & Discoveries; logged the Milestone 1 choices (the `host-features` caller for the gates, the fake knobs moved forward, the tombstone rename, the kept extensions section, and the CHANGELOG entry and live test pulled forward from Milestone 7) in the Decision Log; filled Outcomes for Milestone 1; and adjusted the Milestone 1 and 2 prose to match. The earlier Progress times were local CEST labeled Z; that is noted there rather than rewritten.
+
+Revision note (2026-10-05, Milestones 2-7): ticked the remaining milestones and recorded their outcomes; the one implementation deviation worth naming is that host-side reasoning, approval-mode, and (as a publish step) model-change updates are built from the cached catalog instead of a fresh `model/list`, because a notification has no new catalog facts to fetch and read-counted fixtures depend on the old command counts; the `session/modelChanged` arm still refetches once, since the new model may not be in the last snapshot. `PendingFeedbackForm` (not `PendingFeedback`, which already names the approval-guidance form) holds the open `/feedback` form, and the existing `send_agent_text` helper was reused for the receipt message.

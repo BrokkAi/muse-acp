@@ -164,9 +164,17 @@ carries both stages, cancel during a streaming model step, reload after an
 adapter restart, a crashed host's durable restart that re-attaches the
 session, fork with its source history, `/compact` (declined on a short
 session), `/goal`, `write_todos` as an editor plan, the AIR file-change
-report, editor MCP forwarding, and a saved `:auto-review` profile. Still to
-come (#176): the `userInput` form and subagent spawn, since Muse offers
-neither tool to a model it does not know.
+report, editor MCP forwarding, the `userInput` form, and a saved
+`:auto-review` profile. Still to come (#176): subagent spawn, since Muse
+offers no subagent tool to a model it does not know.
+
+The 1.4.2 re-pin is adopted: the live suite now also covers ACP
+`session/delete` against a session this run created, the ownership refusal
+for a session an earlier run created, a delete of a session that never
+existed, Muse's own read tool inside an ACP `additionalDirectories` root, and
+the reasoning selector against the host's own `model/list` variants.
+`/feedback` is covered by the fake host only: a live submit would upload
+feedback to Meta, which the suite never does.
 
 **Work items**
 
@@ -177,14 +185,14 @@ neither tool to a model it does not know.
   compaction, cursor/gap recovery, goals, handshakes, models, pending-command
   reconciliation, resume, subagents, user input, user shell, workflows, and
   unknown-kind/state/stream tolerance.
-- Adopt the Muse 1.4 additive methods and fields that the `bb44be3` pin
-  publishes (the re-pin itself is done; see §1). `workspaceRoots` on
-  `session/start` and `turn/start` lets the host apply its workspace rules to
-  ACP `additionalDirectories` instead of the adapter alone (§8).
-  `session/delete` and `session/deleteCompleted` back ACP `session/delete`
-  in v1 and v2. The catalog's per-model `variants`,
-  `defaultReasoningEffort`, and `reasoningEffortVariants` let the reasoning
-  selector offer only the tiers a model supports.
+- ~~Adopt the Muse 1.4 additive methods and fields that the `bb44be3` pin
+  publishes.~~ Done: ACP `additionalDirectories` reach the host as
+  `workspaceRoots` on `session/start` and `turn/start` (§8),
+  `session/delete`/`session/deleteCompleted` back ACP `session/delete` in v1
+  and v2, the catalog's per-model `variants`, `defaultReasoningEffort`, and
+  `reasoningEffortVariants` drive the reasoning selector, cumulative cost
+  and cache fields feed `usage_update` (§11), and `/feedback` uses
+  `feedback/submit`.
 - Validate JSON payloads emitted by the adapter against the schema bundle.
 - Replay recorded MSP transcripts through the notification fold and permission
   paths.
@@ -378,13 +386,17 @@ local-read confinement.
 Status: **implemented.** The adapter checks canonical paths against `cwd` plus
 the explicit additional-directory list on each attach, validates local file
 URIs and UTF-8 text, and bounds text expansion to 256 KiB. Tests cover symlinks,
-repeated/nested roots, path traversal, hard links, and Windows paths. Extra
-read roots do not expand Muse's own single tool workspace.
+repeated/nested roots, path traversal, hard links, and Windows paths. On Muse
+1.4.1+ the same canonical root set is sent to the host as MSP `workspaceRoots`
+(`session/start`, and a one-shot sticky replacement on the first user
+`turn/start` after a load, resume, fork, or host re-attach), so Muse's own
+tools work in the extra folders; older hosts keep adapter-side confinement and
+log that Muse's own tools see only the primary root.
 
 **Work items**
 
-- Document how ACP `cwd`, additional workspace directories, and MSP session
-   roots map to one another.
+- ~~Document how ACP `cwd`, additional workspace directories, and MSP session
+  roots map to one another.~~ Done in the README workspace section.
 - Add tests for nested roots, repeated roots, symlinked roots, and unrelated
    roots.
 - Audit textual resource links for symlink, path normalization, hard-link,
@@ -579,10 +591,18 @@ Status: **implemented — largely pre-existing.** The usage-forwarding work
 separation, replay-once accounting, rate-refresh replacement, attach-time
 restore, and the scope documentation before this roadmap was written; this
 item existed to protect those semantics. The two genuinely open pieces landed
-afterwards: the explicit estimate labeling (`cost.source: adapter-estimate`,
-`basis: catalog-list-price`, `billing: false`) and cached-input pricing at
-the catalog `cached` rate (clamped to prompt tokens, from the per-completion
-`usage.cachedTokens` the host already reports).
+afterwards: the explicit estimate labeling (now
+`cost._meta.muse: {source: adapter-estimate, basis: catalog-list-price,
+billing: false}`, after ACP's `Cost` shape demanded the move into `_meta`)
+and cached-input pricing at the catalog `cached` rate (clamped to prompt
+tokens, from the per-completion `usage.cachedTokens` the host already reports).
+
+Muse 1.4.2's own session cost is **mapped to ACP**: when the host reports
+`session/tokenUsage.cost`, `usage_update.cost` is the host's figure with its
+`partial` flag and the adapter's catalog estimate is not emitted at all; a
+cumulative object without `cost` clears it. The estimate's provenance moved
+into `_meta` because ACP's `Cost` has no root-level extension points, and the
+host's `cacheReadTokens`/`cacheWriteTokens` ride `_meta.museCumulative`.
 
 Muse 1.3.0 subscription usage is **mapped to ACP**. The adapter queries
 `usage/read` when a session is attached and adopts `usage/changed` as a
@@ -598,12 +618,15 @@ and uses `session_info_update` when it is not; it never fabricates `used` or
 **Work items**
 
 - Keep host-provided context/cumulative usage separate from derived values.
-- Mark cost explicitly as a local list-price estimate in metadata.
+- ~~Mark cost explicitly as a local list-price estimate in metadata.~~ Done;
+  on 1.4.2+ hosts the host's own cost replaces the estimate.
 - Omit numeric cost unless all required rate fields are available.
 - Preserve replay-once accounting.
 - Handle model catalog updates without resurrecting stale rates.
 - Surface host-observed subscription usage without merging it into token totals
   or local cost estimates.
+- Prefer the host's own session cost over the local estimate wherever the
+  host reports one, and never present a partial host figure as final.
 - Document exclusions: historic completions, unavailable rates, cached-input
   differences, taxes/discounts, regional pricing, and actual billing.
 
@@ -683,7 +706,10 @@ with no observed deltas emits the committed summary (or raw text) exactly
 once, and host-side truncation is logged rather than presented as complete.
 Unknown future item kinds render generically from `fallbackText` (with the
 source kind in `_meta.muse.itemKind`) and stay invisible when the host
-supplies no summary.
+supplies no summary. On Muse 1.4.1+ the reasoning-effort selector offers
+exactly the selected model's `variants`, with the catalog's
+`reasoningEffortVariants` descriptions, and refreshes on a model change; a
+model that cannot describe its tiers keeps the fixed list.
 
 **Work items**
 
@@ -909,9 +935,10 @@ value appears among the advertised options; recommendation metadata never
 overrides the current selection and is omitted without negotiation.
 Reasoning recommendations require an explicit valid `reasoningEffort` fact with
 source `default` or `policy`, from a snapshot or live host event, under the same
-negotiation gate. User-authored defaults and unknown sources do not create a
-recommendation; later user selection does not overwrite a known recommendation.
-Current hosts may publish no default/policy facts, in which case it stays absent.
+negotiation gate; when the host set no session-level fact, the current model's
+catalog `defaultReasoningEffort` is used instead. User-authored defaults and
+unknown sources do not create a recommendation; later user selection does not
+overwrite a known recommendation.
 Session titles use host `name`, `title`, then `firstUserPrompt` facts; transcript
 text is never mined to invent a title.
 
@@ -920,8 +947,10 @@ text is never mined to invent a title.
 - ~~Implement the AIR `recommendedValue` extension for the model selector from
   the catalog's `isDefault` row, after client capability negotiation; emit a
   recommendation only when the value is present among advertised options.~~
-- Consider reasoning-effort recommendations if the host ever publishes a
-  default; do not fabricate one.
+- ~~Consider reasoning-effort recommendations if the host ever publishes a
+  default; do not fabricate one.~~ Done: a session-level `default`/`policy`
+  fact wins, else the current model's catalog `defaultReasoningEffort`, and
+  only when the value is among the offered options.
 - Consider lightweight session titles for `session/list` if clients render
   them; derive only from host-provided facts, never from prompt text mining.
 

@@ -299,7 +299,11 @@ error the editor shows if Muse then refuses the profile says why.
 ## What's supported
 
 - **Sessions** — new, load, resume, list, close, and fork, with durable Muse
-  session IDs that survive adapter and host restarts.
+  session IDs that survive adapter and host restarts. Delete is available on
+  Muse 1.4.1+ with durable session logs; Muse deletes only sessions started
+  by the host process that is running now, so deleting a session from an
+  earlier editor run is refused with an explanation instead of being
+  pretended.
 - **Turns** — streamed text and tool updates, queued concurrent prompts,
   cancellation with a terminal event, and exact-turn steering over the ACP v2
   `_session/steering` extension.
@@ -318,7 +322,9 @@ error the editor shows if Muse then refuses the profile says why.
 - **Configuration** — mode, approval mode, auto-review, model, and reasoning
   effort exposed as ACP `configOptions` selectors, refreshed from Muse on
   create, load, resume, and config change. The reasoning selector starts at
-  `Muse default` and sends no override until you pick a tier.
+  `Muse default` and sends no override until you pick a tier; on Muse 1.4.1+
+  it offers exactly the tiers the selected model serves, with Muse's own
+  descriptions, and follows a model change.
 - **Skills** — Muse's skill catalog drives ACP `available_commands_update`.
   Slash prompts such as `/plan` use native skill turn parts; `/compact` invokes
   Muse's native compaction.
@@ -341,8 +347,14 @@ error the editor shows if Muse then refuses the profile says why.
   is closed to `text` and `image`.
 - **Usage** — context occupancy as `usage_update`, cumulative session totals,
   subscription observations under `_meta.museSubscriptionUsage`, and a
-  client-local list-price cost estimate explicitly labeled as not a billing
-  figure.
+  session cost that on Muse 1.4.2+ is Muse's own figure (with its partial
+  flag) and otherwise is a client-local list-price estimate explicitly
+  labeled as not a billing figure.
+- **Feedback** — `/feedback [bug|bad|good|other] <note>` sends feedback about
+  Muse through the host's `feedback/submit` when Muse grants the capability.
+  With form elicitation, one form collects the classification, the note, and
+  explicit consent for each attachment (local tracing, the session record),
+  both defaulting off.
 - **Tasks and subagents** — backgrounded shell commands, workflows, and native
   subagents surfaced through negotiated ACP extensions where the client
   advertises support, with synthesized tool cards otherwise.
@@ -473,11 +485,14 @@ is logged, not fatal.
 
 ACP's `cwd` is the primary workspace root and the base for relative resource
 paths; the adapter passes it to Muse as MSP's single `workspaceRoot`. If a
-client sends `additionalDirectories`, each must be absolute, and the adapter
-treats `[cwd, ...additionalDirectories]` as the ordered set of roots approved
-for local image and textual `resource_link` expansion. MSP v1 has no
-additional-root field, so extra roots do not widen Muse's own tool workspace or
-sandbox policy.
+client sends `additionalDirectories`, each must be absolute and name an
+existing directory, and the adapter treats
+`[cwd, ...additionalDirectories]` as the ordered set of roots approved for
+local image and textual `resource_link` expansion. On Muse 1.4.1+ the same
+canonical set is sent to the host as MSP `workspaceRoots`, so Muse's own tools
+work in the extra folders too, with duplicates collapsed and no root silently
+dropped. Older hosts keep adapter-side confinement only, and the adapter logs
+that Muse's own tools see just the primary root.
 
 Local reads are confined to that root set. The adapter resolves each path and
 root through the filesystem before checking containment, so `..`,
