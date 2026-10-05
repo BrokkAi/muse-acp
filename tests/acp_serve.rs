@@ -4889,6 +4889,322 @@ fn host_feature_gates_follow_the_reported_muse_version() {
 }
 
 #[test]
+fn session_delete_is_advertised_only_where_the_host_supports_it() {
+    // ACP v1 advertises `session/delete` in agentCapabilities.
+    // sessionCapabilities; v2 in capabilities.session. It needs Muse 1.4.1+
+    // and a durable host (a memory-only host has nothing to delete).
+    for ver in [1u64, 2] {
+        let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+        let id = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"delete\":{}"),
+            "delete capability missing in v{ver}: {frame}"
+        );
+        c.finish();
+    }
+    for env in [
+        vec![("FAKE_SERVER_VERSION", "1.3.0")],
+        vec![
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_DURABILITY", "ephemeral"),
+        ],
+    ] {
+        let mut c = Client::spawn("quiet", &env);
+        let id = c.req("initialize", "{\"protocolVersion\":1}");
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            !frame.contains("\"delete\":{}"),
+            "delete advertised without host support: {frame}"
+        );
+        c.finish();
+    }
+}
+
+/// A session id in the durable UUID shape `session/delete` requires. The
+/// fixture's default session id ("msp-sess-1") is deliberately not a UUID:
+/// MSP session ids are UUIDv7, and the adapter never asks a host to delete
+/// anything else.
+const DELETE_SESSION_ID: &str = "01a10c8b-5a52-7c3d-8b6e-1f2a3b4c5d6e";
+
+#[test]
+fn session_delete_waits_for_the_host_terminal_and_removes_the_session() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_DELAY_MS", "400"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    assert_eq!(sid, DELETE_SESSION_ID);
+    let del = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    // The MSP admission ack is not the outcome. No ACP answer may arrive
+    // before the host's deleteCompleted notification.
+    std::thread::sleep(Duration::from_millis(150));
+    {
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            !frames.iter().any(|f| f.contains(&format!("\"id\":{del}"))),
+            "session/delete answered before the host terminal: {frames:?}"
+        );
+    }
+    let done = c.wait_for(&format!("\"id\":{del}"), Duration::from_secs(15));
+    assert!(done.contains("\"result\":{}"), "{done}");
+    let list = c.req("session/list", "{}");
+    let listed = c.wait_for(&format!("\"id\":{list}"), Duration::from_secs(15));
+    assert!(
+        !listed.contains(&sid),
+        "deleted session still listed: {listed}"
+    );
+    let prompt = c.prompt(&sid, "still there?");
+    let refused = c.wait_for(&format!("\"id\":{prompt}"), Duration::from_secs(15));
+    assert!(refused.contains("unknown sessionId"), "{refused}");
+    c.finish();
+}
+
+#[test]
+fn session_delete_of_missing_or_already_deleted_sessions_succeeds() {
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+    c.new_session(1, "");
+    let ghost = c.req("session/delete", "{\"sessionId\":\"not-a-session\"}");
+    let frame = c.wait_for(&format!("\"id\":{ghost}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\":{}"), "{frame}");
+    assert!(
+        host_requests(&c, "session/delete").is_empty(),
+        "a non-UUID session id must not reach the host"
+    );
+    c.finish();
+
+    // A session another client already deleted is rejected at admission with
+    // `session_deleted`; ACP wants that to succeed silently.
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_REJECT", "session_deleted"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let id = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\":{}"), "{frame}");
+    c.finish();
+}
+
+#[test]
+fn resume_of_a_deleted_session_reports_not_found() {
+    let mut c = Client::spawn("quiet", &[("FAKE_RESUME_NOT_FOUND", "1")]);
+    c.initialize(1, "");
+    let id = c.req(
+        "session/resume",
+        &format!("{{\"sessionId\":\"{DELETE_SESSION_ID}\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("-32002") && frame.contains("session not found (it may have been deleted)"),
+        "{frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_delete_of_an_unknown_uuid_uses_the_host_existence_check() {
+    // Muse reports a never-existed id exactly like a real session the host
+    // cannot prove it owns. The adapter then asks the host's own filtered
+    // listing; a missing session succeeds silently.
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_OUTCOME", "failed"),
+            ("FAKE_DELETE_REASON", "ownershipUnavailable"),
+        ],
+    );
+    c.new_session(1, "");
+    let ghost = "01a10c8b-1111-7222-8333-444455556666";
+    let id = c.req("session/delete", &format!("{{\"sessionId\":\"{ghost}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\":{}"), "{frame}");
+    let probes = host_requests(&c, "session/list");
+    assert!(
+        probes
+            .iter()
+            .any(|p| p.get("filter").and_then(|f| f.get("sessionId")).is_some()),
+        "no sessionId existence probe: {probes:?}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_delete_reports_an_existing_session_the_host_cannot_own() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_OUTCOME", "failed"),
+            ("FAKE_DELETE_REASON", "ownershipUnavailable"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let id = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("-32603"), "{frame}");
+    assert!(
+        frame.contains("\"reason\":\"ownershipUnavailable\"")
+            && frame.contains("\"physicalChange\":\"none\""),
+        "typed evidence missing: {frame}"
+    );
+    assert!(frame.contains("cannot prove it owns"), "{frame}");
+    assert!(!frame.contains("may already be removed"), "{frame}");
+    c.finish();
+}
+
+#[test]
+fn session_delete_reports_running_work_and_possible_data_loss() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_OUTCOME", "failed"),
+            ("FAKE_DELETE_REASON", "writerBusy"),
+            ("FAKE_DELETE_PHYSICAL", "possible"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let id = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("work is still running in it. Stop it and try again."),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("Some of its data may already be removed."),
+        "possible data loss must be said out loud: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_delete_reports_a_host_busy_with_the_session() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_REJECT", "runtime_busy"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let id = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("-32603"), "{frame}");
+    assert!(frame.contains("Muse is busy with this session"), "{frame}");
+    c.finish();
+}
+
+#[test]
+fn concurrent_session_deletes_share_one_host_command() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_DELAY_MS", "400"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let first = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let second = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    for id in [first, second] {
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\":{}"), "{frame}");
+    }
+    assert_eq!(
+        host_requests(&c, "session/delete").len(),
+        1,
+        "a second delete for the same session must join the first"
+    );
+    c.finish();
+}
+
+#[test]
+fn host_exit_with_a_pending_delete_settles_it() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_EXIT", "1"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let id = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("-32603"), "{frame}");
+    assert!(
+        frame.contains("Muse exited before it confirmed the deletion"),
+        "{frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_list_pages_do_not_repeat_a_held_session() {
+    let mut c = Client::spawn("session_list_pagination", &[]);
+    let sid = c.new_session(1, "");
+    let first = c.req("session/list", "{}");
+    let page1 = c.wait_for(&format!("\"id\":{first}"), Duration::from_secs(15));
+    assert!(
+        page1.contains(&format!("\"sessionId\":\"{sid}\"")),
+        "the held session belongs on the first page: {page1}"
+    );
+    let second = c.req("session/list", "{\"cursor\":\"page-2\"}");
+    let page2 = c.wait_for(&format!("\"id\":{second}"), Duration::from_secs(15));
+    assert!(
+        !page2.contains(&format!("\"sessionId\":\"{sid}\"")),
+        "a held session repeated on a later page: {page2}"
+    );
+    assert!(page2.contains("stored-201"), "{page2}");
+    c.finish();
+}
+
+#[test]
+fn session_list_with_a_rejected_cursor_is_an_error() {
+    let mut c = Client::spawn("quiet", &[("FAKE_LIST_REJECT_CURSOR", "1")]);
+    c.initialize(1, "");
+    let id = c.req("session/list", "{\"cursor\":\"stale\"}");
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("-32602") && frame.contains("invalid cursor"),
+        "a rejected cursor must surface: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_list_skips_rows_without_a_workspace_root() {
+    let mut c = Client::spawn("quiet", &[("FAKE_LIST_NULL_ROOT", "1")]);
+    c.initialize(1, "");
+    let id = c.req("session/list", "{}");
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        !frame.contains("msp-sess-noroot"),
+        "a row without an absolute cwd cannot be an ACP row: {frame}"
+    );
+    c.wait_stderr(
+        "session/list skipped 1 row(s) without a workspace root",
+        Duration::from_secs(15),
+    );
+    c.finish();
+}
+
+#[test]
 fn retired_sdk_manifest_fingerprint_is_unknown() {
     // The fbce769 manifest fingerprint was never a live host; once the pin
     // moved it must not keep a compatibility entry.
@@ -7328,7 +7644,13 @@ fn emitted_frames_conform_to_the_vendored_schema() {
     };
 
     // Drive one broad session touching the main command families.
-    let mut c = Client::spawn("approval", &[]);
+    let mut c = Client::spawn(
+        "approval",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+        ],
+    );
     let caps = ",\"capabilities\":{\"elicitation\":{\"form\":{}},\"subagents\":{}}";
     let sid = c.new_session(2, caps);
     let _pid = c.prompt(&sid, "needs approval");
@@ -7369,6 +7691,8 @@ fn emitted_frames_conform_to_the_vendored_schema() {
     );
     c.wait_for(&format!("\"id\":{oid}"), Duration::from_secs(15));
     c.req("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let did = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_for(&format!("\"id\":{did}"), Duration::from_secs(15));
     let frames_path = format!("{}.frames", c.fake_log);
     c.finish();
 
@@ -7424,6 +7748,7 @@ fn emitted_frames_conform_to_the_vendored_schema() {
         "goal/set",
         "goal/pause",
         "session/rename",
+        "session/delete",
     ] {
         assert!(
             methods.contains(expected),

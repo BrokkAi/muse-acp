@@ -105,6 +105,16 @@ Host identity (every scenario): FAKE_SERVER_VERSION sets serverInfo.version
 FAKE_SESSION_DURABILITY sets sessionDurability (absent by default, which MSP
 reads as durable).
 
+Session delete: `session/delete` acks, then reports `session/deleteCompleted`.
+FAKE_DELETE_OUTCOME=failed sends a failed terminal with FAKE_DELETE_REASON
+(default ownershipUnavailable) and FAKE_DELETE_PHYSICAL (default none);
+FAKE_DELETE_REJECT=session_deleted|runtime_busy|sessionNotFound rejects at
+admission; FAKE_DELETE_DELAY_MS delays the terminal; FAKE_DELETE_EXIT=1 exits
+after the ack instead of reporting. A completed delete hides the id from later
+session/list results. FAKE_LIST_NULL_ROOT=1 adds a row without a workspace
+root; FAKE_LIST_REJECT_CURSOR=1 rejects a paged session/list with invalid
+params.
+
 Session MCP (every scenario): `sessionMcp` is granted when requested unless
 FAKE_NO_SESSION_MCP=1. As on the live host, a non-empty config.mcpServers
 without the grant fails with capabilityRequired. FAKE_MCP_CONFLICT=1 rejects
@@ -118,7 +128,7 @@ import time
 
 FP = "sha256:03312c213efd14277a0e0a102f70adeae497a469ca4edf7242f479953ed758b7"
 SCHEMA = {"fingerprint": FP, "version": 1}
-MSP_SID = "msp-sess-1"
+MSP_SID = os.environ.get("FAKE_SESSION_ID", "msp-sess-1")
 SCENARIO = os.environ.get("FAKE_SCENARIO", "happy")
 MODE = os.environ.get("FAKE_MODE", "promptUnmatched")
 # The adapter launches a third, memory-only host for auto-review. It serves
@@ -141,6 +151,8 @@ MCP_CONFLICTED = [False]
 USAGE_READS = [0]
 SKILL_READS = [0]
 FORK_ITEMS = []
+# Durable session ids a successful `session/delete` removed.
+DELETED_SESSIONS = []
 
 # Compatibility-diagnostics knobs: the fixture defaults to the validated
 # host shape, but tests can present an unknown fingerprint or a future
@@ -1301,12 +1313,12 @@ def result_for(method, msg):
         # Every other session pages back to nothing usable.
         return {"events": [], "nextCursor": None}
     if method == "session/list":
+        params = msg.get("params", {})
+        filter_id = ((params.get("filter") or {}).get("sessionId") or {}).get("anyOf")
         if SCENARIO == "session_list_workspace_filter":
-            params = msg.get("params", {})
             if params.get("workspaceRoot") == "/tmp/unrelated-ws":
                 return {"sessions": [], "nextCursor": None}
         if SCENARIO == "session_list_pagination":
-            params = msg.get("params", {})
             if params.get("cursor") == "page-2":
                 return {"sessions": [session_obj("stored-201", "/tmp/page-2")],
                         "nextCursor": None}
@@ -1314,13 +1326,31 @@ def result_for(method, msg):
                         session_obj(f"stored-{n}", f"/tmp/session-{n}")
                         for n in range(1, 201)],
                     "nextCursor": "page-2"}
+        if filter_id is not None:
+            rows = [session_obj(), session_obj("msp-sess-old", "/tmp/old-ws"),
+                    session_obj("msp-sess-untitled", "/tmp/untitled-ws"),
+                    session_obj("msp-sess-bare", "/tmp/bare-ws")]
+            rows = [row for row in rows
+                    if row["sessionId"] in filter_id
+                    and row["sessionId"] not in DELETED_SESSIONS]
+            return {"sessions": rows,
+                    "appliedFilter": params.get("filter"),
+                    "nextCursor": None}
         live = session_obj()
         old = session_obj("msp-sess-old", "/tmp/old-ws")
         untitled = session_obj("msp-sess-untitled", "/tmp/untitled-ws")
         bare = session_obj("msp-sess-bare", "/tmp/bare-ws")
         old["updatedAt"] = "2026-08-01T00:00:00Z"
         live["updatedAt"] = "2026-09-04T00:00:00Z"
-        return {"sessions": [live, old, untitled, bare], "nextCursor": None}
+        rows = [live, old, untitled, bare]
+        if os.environ.get("FAKE_LIST_NULL_ROOT") == "1":
+            rows.append({"sessionId": "msp-sess-noroot", "workspaceRoot": None})
+        rows = [row for row in rows if row["sessionId"] not in DELETED_SESSIONS]
+        return {"sessions": rows, "nextCursor": None}
+    if method == "session/delete":
+        params = msg.get("params", {})
+        log_input(params)
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
     if method == "session/setApprovalMode":
         # The real host applies the selected mode and echoes it back.
         mode = FOLDED_MODE or msg.get("params", {}).get("mode", MODE)
@@ -1778,6 +1808,32 @@ def main():
                                     "message": "method not found: session/setReasoningEffort",
                                     "data": {"kind": "methodNotFound"}}})
                     continue
+                if (method == "session/delete"
+                        and os.environ.get("FAKE_DELETE_REJECT")):
+                    log_input(msg.get("params", {}))
+                    reason = os.environ["FAKE_DELETE_REJECT"]
+                    if reason == "sessionNotFound":
+                        error = {"code": -32020, "message": "session not found",
+                                 "data": {"kind": "sessionNotFound"}}
+                    else:
+                        error = {"code": -32030, "message": reason,
+                                 "data": {"kind": "commandRejected",
+                                          "reason": reason, "retryable": False}}
+                    send({"jsonrpc": "2.0", "id": ident, "error": error})
+                    continue
+                if (method == "session/list" and os.environ.get("FAKE_LIST_REJECT_CURSOR") == "1"
+                        and msg.get("params", {}).get("cursor")):
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32602, "message": "invalid cursor",
+                                    "data": {"kind": "invalidParams"}}})
+                    continue
+                if (method == "session/resume"
+                        and os.environ.get("FAKE_RESUME_NOT_FOUND") == "1"):
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32020, "message": "session not found",
+                                    "data": {"kind": "sessionNotFound",
+                                             "sessionId": msg.get("params", {}).get("sessionId")}}})
+                    continue
                 if (method == "workflow/childControl"
                         and msg.get("params", {}).get("attempt")
                         != WORKFLOW_CHILD_ATTEMPT[0]):
@@ -1873,6 +1929,33 @@ def main():
                 if method == "model/list" and SCENARIO == "stdout_close_stays_alive":
                     os.close(1)
                     time.sleep(1.0)
+                if method == "session/delete":
+                    # The ack is out; now report the outcome as the host's
+                    # later terminal notification.
+                    params = msg.get("params", {})
+                    sid = params.get("sessionId", "")
+                    if os.environ.get("FAKE_DELETE_EXIT") == "1":
+                        sys.stdout.flush()
+                        os._exit(int(os.environ.get("FAKE_DELETE_EXIT_CODE", "1")))
+                    if os.environ.get("FAKE_DELETE_DELAY_MS"):
+                        time.sleep(int(os.environ["FAKE_DELETE_DELAY_MS"]) / 1000.0)
+                    if os.environ.get("FAKE_DELETE_OUTCOME", "completed") == "failed":
+                        notify("session/deleteCompleted", {
+                            "commandId": params.get("commandId", ""),
+                            "sessionId": sid,
+                            "outcome": "failed",
+                            "reason": os.environ.get("FAKE_DELETE_REASON",
+                                                     "ownershipUnavailable"),
+                            "physicalChange": os.environ.get("FAKE_DELETE_PHYSICAL",
+                                                             "none"),
+                        })
+                    else:
+                        DELETED_SESSIONS.append(sid)
+                        notify("session/deleteCompleted", {
+                            "commandId": params.get("commandId", ""),
+                            "sessionId": sid,
+                            "outcome": "completed",
+                        })
                 if CRASH_AFTER_ACK[0]:
                     sys.stdout.flush()
                     message = os.environ.get("FAKE_HOST_STDERR", "")

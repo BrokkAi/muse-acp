@@ -35,7 +35,7 @@ client-to-server entry; all other rows below are emitted by the MSP host.
 | `session/branchChanged` | Mapped to ACP | Stores the latest branch fact and emits it in `session/update` metadata together with the current goal. |
 | `session/closed` | Consumed | Logs the unload and its reason. An unload is not a deletion: the session is `notLoaded`, its log stays on disk, and `session/resume` reloads it, so it stays in ACP `session/list`. |
 | `session/contextUsage` | Mapped to ACP | Replaces the tracked context occupancy and emits ACP `usage_update` with used tokens, window size, and Muse pressure metadata. |
-| `session/deleteCompleted` | Unsupported pending protocol decision | The adapter does not send `session/delete` yet, so any deletion terminal that reaches it is logged by the unhandled-notification path. |
+| `session/deleteCompleted` | Mapped to ACP | Settles a pending ACP `session/delete` with `{}` on `completed`, or an error carrying the host's reason and physical-change evidence on `failed`. A `failed` terminal whose filtered listing shows the session is gone counts as success; an unknown outcome leaves the request pending. A completed delete also removes the session from ACP `session/list`. |
 | `session/goalChanged` | Mapped to ACP | Stores replacement-or-clear semantics and emits the goal in `session/update` metadata together with branch state. |
 | `session/listChanged` | Mapped to ACP | Replaces a cached list row when `sessionListStream` is granted; pushes a changed active-session title through `session_info_update`. |
 | `session/modelChanged` | Internally tracked | Updates the selected model value used in later ACP configuration snapshots. |

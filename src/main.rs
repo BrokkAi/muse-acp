@@ -69,6 +69,19 @@ struct SessionListCache {
 
 type SessionLists = Arc<Mutex<SessionListCache>>;
 
+/// One in-flight MSP `session/delete`. The host answers the request with an
+/// admission ack and reports the outcome later as `session/deleteCompleted`,
+/// so the ACP request stays pending until that terminal arrives. Every ACP
+/// `session/delete` for the same session joins the first one's command.
+struct PendingDelete {
+    waiters: Vec<J>,
+    msp_sid: String,
+    host_kind: HostKind,
+}
+
+static DELETES: LazyLock<Mutex<HashMap<String, PendingDelete>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 fn session_row_id(row: &J) -> Option<&str> {
     row.get("sessionId")
         .and_then(|v| v.as_str())
@@ -1196,11 +1209,17 @@ enum LoopMsg {
 /// ACP initialize payloads. `session_mcp` is the host's `sessionMcp` grant:
 /// with it, client stdio and HTTP MCP servers are forwarded to Muse. Without
 /// it no MCP transport is advertised beyond the stdio support ACP v1 always
-/// implies, and client servers are dropped.
-fn v2_init(session_mcp: bool) -> String {
-    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
+/// implies, and client servers are dropped. `session_delete` is the host's
+/// MSP `session/delete` support (Muse 1.4.1+ and a durable profile); clients
+/// must not call `session/delete` unless it is advertised.
+fn v2_init(session_mcp: bool, session_delete: bool) -> String {
+    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v2())
+        .replace(
+            "__DELETE__",
+            if session_delete { r#""delete":{},"# } else { "" },
+        )
         .replace(
             "__MCP__",
             if session_mcp {
@@ -1211,18 +1230,22 @@ fn v2_init(session_mcp: bool) -> String {
         )
 }
 
-fn v1_init(session_mcp: bool) -> String {
-    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}},"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__}}"#
+fn v1_init(session_mcp: bool, session_delete: bool) -> String {
+    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v1())
         .replace("__MCP_HTTP__", if session_mcp { "true" } else { "false" })
+        .replace(
+            "__DELETE__",
+            if session_delete { r#","delete":{}"# } else { "" },
+        )
 }
 
-fn send_initialize(stdout: &StdoutShared, id: &Option<J>, session_mcp: bool) {
+fn send_initialize(stdout: &StdoutShared, id: &Option<J>, session_mcp: bool, session_delete: bool) {
     if negotiated_ver() == 2 {
-        acp::send_result(stdout, id, &v2_init(session_mcp));
+        acp::send_result(stdout, id, &v2_init(session_mcp, session_delete));
     } else {
-        acp::send_result(stdout, id, &v1_init(session_mcp));
+        acp::send_result(stdout, id, &v1_init(session_mcp, session_delete));
     }
 }
 
@@ -1234,7 +1257,7 @@ fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
     match msg.get("method").and_then(J::as_str) {
         Some("initialize") => {
             negotiate_acp(msg);
-            send_initialize(stdout, &id, false);
+            send_initialize(stdout, &id, false, false);
         }
         Some(method @ ("shutdown" | "exit")) => {
             if method == "shutdown" {
@@ -1706,7 +1729,16 @@ fn resolve_fork_cut_point(
 fn selftest() -> i32 {
     // Validate every static emitted literal with our own parser, so a
     // misplaced brace fails here instead of at a live client.
-    for lit in [v2_init(true), v2_init(false), v1_init(true), v1_init(false)] {
+    for lit in [
+        v2_init(true, true),
+        v2_init(true, false),
+        v2_init(false, true),
+        v2_init(false, false),
+        v1_init(true, true),
+        v1_init(true, false),
+        v1_init(false, true),
+        v1_init(false, false),
+    ] {
         if let Err(e) = parse_json(&lit) {
             eprintln!("[muse-acp] selftest FAIL: {e} in {lit}");
             return 1;
@@ -2130,6 +2162,11 @@ fn recover_read_only_host(
     why: &str,
 ) {
     log(&format!("read-only serve host gone ({why})"));
+    fail_pending_deletes_for(
+        stdout,
+        HostKind::ReadOnly,
+        "Muse exited before it confirmed the deletion. List sessions to see whether it was removed.",
+    );
     if let Some(old) = hosts.host(HostKind::ReadOnly) {
         if let Some(exit) = old.reap() {
             for line in exit.support_lines("read-only-serve-exit") {
@@ -2826,6 +2863,11 @@ fn main() {
                     continue;
                 }
                 if tag.kind == HostKind::Reviewer {
+                    fail_pending_deletes_for(
+                        &stdout,
+                        HostKind::Reviewer,
+                        "Muse exited before it confirmed the deletion. List sessions to see whether it was removed.",
+                    );
                     hosts.clear_reviewer();
                     let job = REVIEW_STATE
                         .lock()
@@ -2857,6 +2899,11 @@ fn main() {
                 }
                 let cleanup_deadline = shutdown::deadline("host disconnect");
                 log(&format!("serve host gone ({why})"));
+                fail_pending_deletes_for(
+                    &stdout,
+                    HostKind::Main,
+                    "Muse exited before it confirmed the deletion. List sessions to see whether it was removed.",
+                );
                 let old_host = hosts.main_host();
                 let observed_exit = old_host.reap();
                 old_host.shutdown();
@@ -3361,7 +3408,12 @@ fn handle_acp(
     }
 
     match method.as_str() {
-        "initialize" => send_initialize(stdout, &id, host.handshake().session_mcp),
+        "initialize" => send_initialize(
+            stdout,
+            &id,
+            host.handshake().session_mcp,
+            host.handshake().supports_session_delete(),
+        ),
         "session/new" => {
             let ver = negotiated_ver();
             if !validate_session_roots(stdout, &id, params.as_ref()) {
@@ -4067,6 +4119,19 @@ fn handle_acp(
                     acp::send_available_commands(stdout, &sid, ver, &skills);
                 }
                 Err(e) => {
+                    if err_code(&e) == -32020
+                        || msp::rejection_reason(&e) == Some("session_deleted")
+                    {
+                        // The host has no such session: it was deleted, or
+                        // never existed. Say so instead of a raw resume error.
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32002,
+                            "session not found (it may have been deleted)",
+                        );
+                        return;
+                    }
                     let msg = err_message(&e);
                     let mut text = format!("resume failed: {msg}");
                     if let Some(hint) = msp::session_profile_hint(&msg) {
@@ -5206,33 +5271,122 @@ fn handle_acp(
                 return;
             }
             cancel_session_turns(host, sessions, &sid);
-            let removed = sessions
+            if drop_acp_session(stdout, sessions, &sid) {
+                acp::send_result(stdout, &id, "{}");
+            } else {
+                acp::send_error(stdout, &id, -32602, "unknown sessionId");
+            }
+        }
+        "session/delete" => {
+            // MSP answers `session/delete` with an admission ack and reports
+            // the outcome later as `session/deleteCompleted`, so the ACP
+            // request stays pending until that terminal arrives. Answering on
+            // the ack could tell the editor a kept session was deleted.
+            if !host.handshake().supports_session_delete() {
+                acp::send_error(stdout, &id, -32601, "this Muse host cannot delete sessions");
+                return;
+            }
+            let sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if sid.is_empty() {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    "session/delete requires params.sessionId",
+                );
+                return;
+            }
+            // Resolve the durable MSP id the way resume does: the live
+            // session, then preserved metadata, then the id itself.
+            let meta_msp_sid = params
+                .as_ref()
+                .and_then(|p| p.get("_meta"))
+                .and_then(|m| m.get("mspSessionId"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let msp_sid = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .remove(&sid);
-            match removed {
-                Some(s) => {
-                    for f in s.in_flight {
-                        if s.ver == 2 {
-                            acp::send_state(stdout, &sid, "idle", Some("cancelled"));
-                        } else {
-                            acp::send_result(
-                                stdout,
-                                &Some(f.req_id),
-                                "{\"stopReason\":\"cancelled\"}",
-                            );
-                        }
+                .get(&sid)
+                .map(|s| s.msp_sid.clone())
+                .or(meta_msp_sid)
+                .unwrap_or_else(|| sid.clone());
+            if !is_session_uuid(&msp_sid) {
+                // Not a UUID, so it cannot name a Muse session: ACP says
+                // deleting a session that never existed succeeds silently.
+                acp::send_result(stdout, &id, "{}");
+                return;
+            }
+            if let Some(cmd) = pending_delete_for_session(&msp_sid) {
+                // A delete for this session is already in flight; join it so
+                // the host never sees two concurrent deletes (it rejects the
+                // second with `runtime_busy`).
+                if let Some(waiter) = id.clone() {
+                    let mut deletes = DELETES.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(pending) = deletes.get_mut(&cmd) {
+                        pending.waiters.push(waiter);
                     }
-                    for p in s.pending_ui {
-                        acp::send_cancel_request(stdout, &p.req_id);
-                    }
-                    if let Some(p) = s.pending_perm {
-                        let request_id = p.feedback.map(|f| f.req_id).unwrap_or(p.req_id);
-                        acp::send_cancel_request(stdout, &request_id);
-                    }
-                    acp::send_result(stdout, &id, "{}");
                 }
-                None => acp::send_error(stdout, &id, -32602, "unknown sessionId"),
+                return;
+            }
+            let cmd = host.mint_cmd("cmd-");
+            let host_kind = host.owner(&msp_sid);
+            DELETES.lock().unwrap_or_else(|p| p.into_inner()).insert(
+                cmd.clone(),
+                PendingDelete {
+                    waiters: id.clone().into_iter().collect(),
+                    msp_sid: msp_sid.clone(),
+                    host_kind,
+                },
+            );
+            let params_json = format!(
+                "{{\"commandId\":{},\"sessionId\":{}}}",
+                esc(&cmd),
+                esc(&msp_sid)
+            );
+            if let Err(e) = host.command("session/delete", &params_json) {
+                let waiters = take_pending_delete(&cmd)
+                    .map(|pending| pending.waiters)
+                    .unwrap_or_default();
+                let reason = msp::rejection_reason(&e);
+                if reason == Some("session_deleted") || err_code(&e) == -32020 {
+                    // Already deleted (or the host cannot find it): ACP asks
+                    // for success, and local state must go either way.
+                    forget_deleted_session(host, stdout, sessions, lists, &msp_sid);
+                    answer_delete_waiters(stdout, waiters, Ok(()));
+                } else if reason == Some("runtime_busy") {
+                    answer_delete_waiters(
+                        stdout,
+                        waiters,
+                        Err((
+                            -32603,
+                            "Muse is busy with this session; try again.".to_string(),
+                            None,
+                        )),
+                    );
+                } else if msp::is_method_not_found(&e) {
+                    answer_delete_waiters(
+                        stdout,
+                        waiters,
+                        Err((
+                            -32601,
+                            "This Muse host cannot delete sessions".to_string(),
+                            None,
+                        )),
+                    );
+                } else {
+                    answer_delete_waiters(
+                        stdout,
+                        waiters,
+                        Err((msp::acp_error_code(&e, -32603), err_message(&e), None)),
+                    );
+                }
             }
         }
         "session/cancel" => {
@@ -5380,9 +5534,11 @@ fn handle_acp(
             host_params.push('}');
             match host.command("session/list", &host_params) {
                 Ok(r) => {
+                    let first_page = list_cursor.is_none();
                     let mut listed = std::collections::HashSet::new();
                     let mut entries = Vec::new();
                     let mut title_updates = Vec::new();
+                    let mut skipped_null_root = 0usize;
                     if let Some(J::Arr(items)) = r.get("sessions") {
                         let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                         for item in items {
@@ -5390,16 +5546,24 @@ fn handle_acp(
                             if msp_id.is_empty() {
                                 continue;
                             }
-                            listed.insert(msp_id.to_string());
-                            let streamed = if list_stream {
+                            // A deleted session never comes back, streamed or
+                            // paged; the tombstone is not gated on the stream
+                            // grant.
+                            let (deleted, streamed) = {
                                 let cache = lists.lock().unwrap_or_else(|p| p.into_inner());
-                                if cache.deleted.contains(msp_id) {
-                                    continue;
-                                }
-                                cache.rows.get(msp_id).cloned()
-                            } else {
-                                None
+                                (
+                                    cache.deleted.contains(msp_id),
+                                    if list_stream {
+                                        cache.rows.get(msp_id).cloned()
+                                    } else {
+                                        None
+                                    },
+                                )
                             };
+                            if deleted {
+                                continue;
+                            }
+                            listed.insert(msp_id.to_string());
                             let item = streamed.as_ref().unwrap_or(item);
                             if !session_row_matches_workspace(item, &filter_root) {
                                 continue;
@@ -5411,6 +5575,11 @@ fn handle_acp(
                                         session.title_facts.selected().map(str::to_string),
                                     ));
                                 }
+                                // A held session is appended to the first
+                                // page below; a later page must not repeat it.
+                                if !first_page {
+                                    continue;
+                                }
                                 if session_matches_filter(session, &filter_root, &filter_additional)
                                 {
                                     entries.push(owned_session_row(
@@ -5421,6 +5590,13 @@ fn handle_acp(
                             } else {
                                 let cwd =
                                     item.get("workspaceRoot").and_then(J::as_str).unwrap_or("");
+                                // ACP rows need an absolute `cwd`; a host row
+                                // without one is skipped rather than emitted
+                                // with an empty path.
+                                if cwd.is_empty() {
+                                    skipped_null_root += 1;
+                                    continue;
+                                }
                                 if !filter_additional.is_empty()
                                     || (!filter_root.is_empty()
                                         && !same_workspace_root(cwd, &filter_root))
@@ -5438,18 +5614,28 @@ fn handle_acp(
                             }
                         }
                     }
+                    if skipped_null_root > 0 {
+                        log(&format!(
+                            "session/list skipped {skipped_null_root} row(s) without a workspace root"
+                        ));
+                    }
                     for (sid, title) in title_updates {
                         acp::send_session_title(stdout, &sid, title.as_deref());
                     }
-                    for (sid, row) in owned_session_rows(
-                        sessions,
-                        lists,
-                        list_stream,
-                        &filter_root,
-                        &filter_additional,
-                    ) {
-                        if !listed.contains(&sid) {
-                            entries.push(row);
+                    // Adapter-held sessions the host page did not mention are
+                    // appended to the first page only, so a client paging
+                    // through the cursor never sees one twice.
+                    if first_page {
+                        for (sid, row) in owned_session_rows(
+                            sessions,
+                            lists,
+                            list_stream,
+                            &filter_root,
+                            &filter_additional,
+                        ) {
+                            if !listed.contains(&sid) {
+                                entries.push(row);
+                            }
                         }
                     }
                     let next_cursor = r
@@ -5468,6 +5654,13 @@ fn handle_acp(
                 Err(e) => {
                     if msp::acp_error_code(&e, -32603) == -32000 {
                         acp::send_error(stdout, &id, -32000, &err_message(&e));
+                        return;
+                    }
+                    // A cursor this host no longer accepts must surface; the
+                    // silent first-page fallback would hide a broken page
+                    // walk behind duplicated rows.
+                    if list_cursor.is_some() {
+                        acp::send_error(stdout, &id, -32602, "invalid cursor");
                         return;
                     }
                     log(&format!("session/list failed: {}", err_message(&e)));
@@ -7259,6 +7452,168 @@ fn owned_session_row(session: &AcpSession, updated_at: Option<&str>) -> String {
     row
 }
 
+/// Whether a session id can exist on an MSP host at all: a non-nil UUID in
+/// the legacy-valid `8-4-4-4-12` form, any version. Anything else can never
+/// name a Muse session, so ACP's "deleting a session that never existed
+/// should succeed silently" applies without asking the host.
+fn is_session_uuid(s: &str) -> bool {
+    let mut groups = s.split('-');
+    let mut all_zero = true;
+    for size in [8usize, 4, 4, 4, 12] {
+        let Some(part) = groups.next() else {
+            return false;
+        };
+        if part.len() != size || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+        if part.bytes().any(|b| b != b'0') {
+            all_zero = false;
+        }
+    }
+    groups.next().is_none() && !all_zero
+}
+
+/// The user-facing reason Muse kept a session, using the host's own TUI
+/// wording where it exists. A `physicalChange` other than `none` (including
+/// an absent one, which the schema treats as unknown) means the delete may
+/// already have removed data.
+fn delete_failure_message(reason: Option<&str>, physical_change: Option<&str>) -> String {
+    let mut message = match reason {
+        Some("ownershipUnavailable") => "Muse kept this session because it cannot prove it owns \
+             all of the session's logs. Muse deletes only sessions started by the Muse host \
+             that is running now, so sessions from an earlier editor run cannot be deleted \
+             here."
+            .to_string(),
+        Some("writerBusy" | "quiescenceFailed") => {
+            "Muse kept this session because work is still running in it. Stop it and try again."
+                .to_string()
+        }
+        Some("sharedSource") => {
+            "Muse kept this session because some of its logs are shared with another session."
+                .to_string()
+        }
+        Some(reason) => format!("Muse could not delete this session ({reason})."),
+        None => "Muse could not delete this session.".to_string(),
+    };
+    if !matches!(physical_change, Some("none")) {
+        message.push_str(" Some of its data may already be removed.");
+    }
+    message
+}
+
+/// Answer every ACP waiter of one delete command with the same outcome.
+fn answer_delete_waiters(
+    stdout: &StdoutShared,
+    waiters: Vec<J>,
+    outcome: Result<(), (i64, String, Option<String>)>,
+) {
+    match outcome {
+        Ok(()) => {
+            for waiter in waiters {
+                acp::send_result(stdout, &Some(waiter), "{}");
+            }
+        }
+        Err((code, message, data)) => {
+            for waiter in waiters {
+                match &data {
+                    Some(data) => {
+                        acp::send_error_with_data(stdout, &Some(waiter), code, &message, data)
+                    }
+                    None => acp::send_error(stdout, &Some(waiter), code, &message),
+                }
+            }
+        }
+    }
+}
+
+/// Remove one pending delete by command id.
+fn take_pending_delete(cmd: &str) -> Option<PendingDelete> {
+    DELETES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(cmd)
+}
+
+/// The command id of the pending delete that already covers this session.
+fn pending_delete_for_session(msp_sid: &str) -> Option<String> {
+    DELETES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(_, pending)| pending.msp_sid == msp_sid)
+        .map(|(cmd, _)| cmd.clone())
+}
+
+/// Forget every trace of a session Muse deleted: ACP state, the list cache,
+/// any remembered mode, and the host owner.
+fn forget_deleted_session(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    lists: &SessionLists,
+    msp_sid: &str,
+) {
+    if msp_sid.is_empty() {
+        return;
+    }
+    if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+        drop_acp_session(stdout, sessions, &acp_sid);
+    }
+    {
+        let mut cache = lists.lock().unwrap_or_else(|p| p.into_inner());
+        cache.rows.remove(msp_sid);
+        cache.deleted.insert(msp_sid.to_string());
+    }
+    modes::forget(msp_sid);
+    host.forget_owner(msp_sid);
+}
+
+/// Ask the host whether a session id exists, using the `sessionId` filter
+/// whose echo the schema names as the support probe. True only when the host
+/// echoes `appliedFilter.sessionId` and returns no rows: any error or a
+/// missing echo cannot prove absence, so the caller reports the failure.
+fn session_absent_on_host(host: &Arc<Hosts>, msp_sid: &str) -> bool {
+    let cmd = host.mint_cmd("cmd-");
+    let r = host.command(
+        "session/list",
+        &format!(
+            "{{\"commandId\":{},\"limit\":1,\"filter\":{{\"sessionId\":{{\"anyOf\":[{}]}}}}}}",
+            esc(&cmd),
+            esc(msp_sid)
+        ),
+    );
+    match r {
+        Ok(r) => {
+            r.get("appliedFilter")
+                .and_then(|f| f.get("sessionId"))
+                .is_some()
+                && matches!(r.get("sessions"), Some(J::Arr(rows)) if rows.is_empty())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Fail every pending delete sent to a host that has exited: the command
+/// died with the process.
+fn fail_pending_deletes_for(stdout: &StdoutShared, kind: HostKind, message: &str) {
+    let drained: Vec<PendingDelete> = {
+        let mut deletes = DELETES.lock().unwrap_or_else(|p| p.into_inner());
+        let keys: Vec<String> = deletes
+            .iter()
+            .filter(|(_, pending)| pending.host_kind == kind)
+            .map(|(cmd, _)| cmd.clone())
+            .collect();
+        keys.into_iter()
+            .filter_map(|cmd| deletes.remove(&cmd))
+            .collect()
+    };
+    for pending in drained {
+        for waiter in pending.waiters {
+            acp::send_error(stdout, &Some(waiter), -32603, message);
+        }
+    }
+}
+
 fn owned_session_rows(
     sessions: &Sessions,
     lists: &SessionLists,
@@ -8470,6 +8825,85 @@ fn handle_msp(
             }
         }
 
+        "session/deleteCompleted" => {
+            // The terminal for an admitted MSP `session/delete`. `outcome` is
+            // an open enum: an unknown value leaves the command pending, as
+            // the schema says, so only `completed` and `failed` settle it.
+            let cmd = params
+                .get("commandId")
+                .and_then(J::as_str)
+                .unwrap_or("")
+                .to_string();
+            let outcome = params
+                .get("outcome")
+                .and_then(J::as_str)
+                .unwrap_or("unknown");
+            let mut msp_sid = params
+                .get("sessionId")
+                .and_then(J::as_str)
+                .unwrap_or("")
+                .to_string();
+            let reason = params.get("reason").and_then(J::as_str);
+            let physical_change = params.get("physicalChange").and_then(J::as_str);
+            match outcome {
+                "completed" => {
+                    let pending = take_pending_delete(&cmd);
+                    if msp_sid.is_empty()
+                        && let Some(pending) = &pending
+                    {
+                        msp_sid = pending.msp_sid.clone();
+                    }
+                    if pending.is_none() {
+                        // Another client deleted a session this adapter was
+                        // not asked to delete; still stop listing it.
+                        log(&format!(
+                            "session/deleteCompleted for an untracked command: session={msp_sid}"
+                        ));
+                    }
+                    forget_deleted_session(host, stdout, sessions, lists, &msp_sid);
+                    if let Some(pending) = pending {
+                        answer_delete_waiters(stdout, pending.waiters, Ok(()));
+                    }
+                }
+                "failed" => {
+                    // A never-existed id fails with the same
+                    // `ownershipUnavailable` terminal as an unowned one. The
+                    // host's own filtered listing is the existence check, and
+                    // ACP wants a missing session deleted silently.
+                    if reason == Some("ownershipUnavailable")
+                        && !msp_sid.is_empty()
+                        && session_absent_on_host(host, &msp_sid)
+                    {
+                        let pending = take_pending_delete(&cmd);
+                        forget_deleted_session(host, stdout, sessions, lists, &msp_sid);
+                        if let Some(pending) = pending {
+                            answer_delete_waiters(stdout, pending.waiters, Ok(()));
+                        }
+                        return;
+                    }
+                    let pending = take_pending_delete(&cmd);
+                    let message = delete_failure_message(reason, physical_change);
+                    let data = format!(
+                        "{{\"reason\":{},\"physicalChange\":{}}}",
+                        j_to_string(&params.get("reason").cloned().unwrap_or(J::Null)),
+                        j_to_string(&params.get("physicalChange").cloned().unwrap_or(J::Null))
+                    );
+                    match pending {
+                        Some(pending) => answer_delete_waiters(
+                            stdout,
+                            pending.waiters,
+                            Err((-32603, message, Some(data))),
+                        ),
+                        None => log(&format!(
+                            "session/deleteCompleted failed for an untracked command: session={msp_sid} reason={reason:?}"
+                        )),
+                    }
+                }
+                _ => log(&format!(
+                    "session/deleteCompleted: unknown outcome {outcome} for command {cmd}; leaving it pending"
+                )),
+            }
+        }
         "session/closed" => {
             // An unload, not a deletion: the session is `notLoaded`, its log
             // stays on disk, and `session/resume` reloads it. It therefore
@@ -9409,6 +9843,36 @@ fn cancel_session_turns(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) {
                 esc(&turn_id)
             ),
         );
+    }
+}
+
+/// Remove one ACP session and settle everything still open on it as
+/// cancelled, exactly as `session/close` does. Returns false when the
+/// session was not held.
+fn drop_acp_session(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) -> bool {
+    let removed = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(acp_sid);
+    match removed {
+        Some(s) => {
+            for f in s.in_flight {
+                if s.ver == 2 {
+                    acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
+                } else {
+                    acp::send_result(stdout, &Some(f.req_id), "{\"stopReason\":\"cancelled\"}");
+                }
+            }
+            for p in s.pending_ui {
+                acp::send_cancel_request(stdout, &p.req_id);
+            }
+            if let Some(p) = s.pending_perm {
+                let request_id = p.feedback.map(|f| f.req_id).unwrap_or(p.req_id);
+                acp::send_cancel_request(stdout, &request_id);
+            }
+            true
+        }
+        None => false,
     }
 }
 
@@ -10653,7 +11117,16 @@ mod tests {
 
     #[test]
     fn initialization_payloads_report_the_cargo_version() {
-        for payload in [v2_init(true), v2_init(false), v1_init(true), v1_init(false)] {
+        for payload in [
+            v2_init(true, true),
+            v2_init(true, false),
+            v2_init(false, true),
+            v2_init(false, false),
+            v1_init(true, true),
+            v1_init(true, false),
+            v1_init(false, true),
+            v1_init(false, false),
+        ] {
             let parsed = parse_json(&payload).expect("initialization payload JSON");
             let version = ["info", "agentInfo"]
                 .iter()
