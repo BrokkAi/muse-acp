@@ -379,6 +379,21 @@ def history_items():
     ]
 
 
+def cumulative_totals(prompt, output):
+    """A session cumulative block, with the optional 1.4.2 cache and cost."""
+    cumulative = {"promptTokens": prompt, "outputTokens": output,
+                  "totalTokens": prompt + output}
+    if os.environ.get("FAKE_CUMULATIVE_CACHE") == "1":
+        cumulative["cacheReadTokens"] = min(prompt, 100)
+        cumulative["cacheWriteTokens"] = min(prompt, 25)
+    if os.environ.get("FAKE_CUMULATIVE_COST") == "1":
+        cumulative["cost"] = {
+            "usd": float(os.environ.get("FAKE_CUMULATIVE_USD", "0.25")),
+            "partial": os.environ.get("FAKE_CUMULATIVE_PARTIAL") == "1",
+        }
+    return cumulative
+
+
 def token_usage(cursor, prompt, output, cumulative_prompt, cumulative_output):
     """One `session/tokenUsage` completion leg, identified by view cursor."""
     return {"sessionId": MSP_SID, "turnId": f"turn-{TURNS[0]}",
@@ -388,9 +403,7 @@ def token_usage(cursor, prompt, output, cumulative_prompt, cumulative_output):
                       "cachedTokens": 0, "reasoningTokens": 0},
             "viewCursor": cursor,
             "sourceRange": {"start": 0, "end": int(cursor.split("-")[1])},
-            "cumulative": {"promptTokens": cumulative_prompt,
-                           "outputTokens": cumulative_output,
-                           "totalTokens": cumulative_prompt + cumulative_output}}
+            "cumulative": cumulative_totals(cumulative_prompt, cumulative_output)}
 
 
 def context_usage(used, cursor):
@@ -920,8 +933,7 @@ def on_turn_start(params):
             "usage": {"inputTokens": 100, "outputTokens": 20,
                       "cachedTokens": 0, "reasoningTokens": 0},
             "viewCursor": "cur-0", "sourceRange": {"start": 0, "end": 1},
-            "cumulative": {"promptTokens": 100, "outputTokens": 20,
-                           "totalTokens": 120}})
+            "cumulative": cumulative_totals(100, 20)})
         notify("session/contextUsage", {
             "sessionId": MSP_SID, "usedTokens": 1234, "windowTokens": 200000,
             "pressure": "normal", "viewCursor": "cur-1",
@@ -932,8 +944,7 @@ def on_turn_start(params):
             "usage": {"inputTokens": 1000, "outputTokens": 500,
                       "cachedTokens": 0, "reasoningTokens": 0},
             "viewCursor": "cur-2", "sourceRange": {"start": 0, "end": 2},
-            "cumulative": {"promptTokens": 5000, "outputTokens": 2500,
-                           "totalTokens": 7500}})
+            "cumulative": cumulative_totals(5000, 2500)})
         # Pre-schema record: no modelId, so an unpriced leg. Totals still
         # advance; the running cost must not.
         notify("session/tokenUsage", {
@@ -942,8 +953,7 @@ def on_turn_start(params):
             "usage": {"inputTokens": 1000, "outputTokens": 500,
                       "cachedTokens": 0, "reasoningTokens": 0},
             "viewCursor": "cur-3", "sourceRange": {"start": 0, "end": 3},
-            "cumulative": {"promptTokens": 6000, "outputTokens": 3000,
-                           "totalTokens": 9000}})
+            "cumulative": cumulative_totals(6000, 3000)})
         notify("item/completed", {**base, "item": {
             "itemId": "it-1", "kind": "agentMessage",
             "status": "completed", "text": "done"}})

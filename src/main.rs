@@ -776,6 +776,22 @@ fn adopt_cumulative(s: &mut AcpSession, c: &J) {
     s.cum_prompt = c.get("promptTokens").and_then(|v| v.as_u64());
     s.cum_output = c.get("outputTokens").and_then(|v| v.as_u64());
     s.cum_total = c.get("totalTokens").and_then(|v| v.as_u64());
+    s.cum_cache_read = c.get("cacheReadTokens").and_then(|v| v.as_u64());
+    s.cum_cache_write = c.get("cacheWriteTokens").and_then(|v| v.as_u64());
+    // The host's own cost replaces the previous value whenever a cumulative
+    // object arrives (it can go down), and an object without `cost` clears
+    // it: the host is the pricing authority on the hosts that report it.
+    s.host_cost = c.get("cost").and_then(|cost| {
+        let usd = match cost.get("usd") {
+            Some(J::Num(n)) => n.parse::<f64>().ok(),
+            _ => None,
+        }?;
+        let partial = match cost.get("partial") {
+            Some(J::Bool(value)) => *value,
+            _ => return None,
+        };
+        Some((usd, partial))
+    });
 }
 
 /// Validate the stable fields of the Muse 1.3.0 `SubscriptionUsage` object
@@ -823,7 +839,12 @@ fn read_subscription_usage(host: &Arc<Hosts>) -> Option<Option<String>> {
 /// Store a subscription snapshot and expose it on the next valid ACP usage
 /// frame. A session without context occupancy gets a metadata-only update so
 /// the adapter never invents `used` or `size` just to show the host fact.
-fn adopt_subscription_usage(stdout: &StdoutShared, s: &mut AcpSession, next: Option<String>) {
+fn adopt_subscription_usage(
+    stdout: &StdoutShared,
+    s: &mut AcpSession,
+    next: Option<String>,
+    host_reports_cost: bool,
+) {
     if s.subscription_usage == next {
         return;
     }
@@ -833,7 +854,7 @@ fn adopt_subscription_usage(stdout: &StdoutShared, s: &mut AcpSession, next: Opt
         if clear {
             acp::send_subscription_usage(stdout, s, true);
         }
-        acp::send_usage(stdout, s, None);
+        acp::send_usage(stdout, s, None, host_reports_cost);
     } else {
         acp::send_subscription_usage(stdout, s, clear);
     }
@@ -851,7 +872,7 @@ fn refresh_subscription_usage(
     };
     let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(s) = map.get_mut(acp_sid) {
-        adopt_subscription_usage(stdout, s, next);
+        adopt_subscription_usage(stdout, s, next, host.handshake().reports_session_cost());
     }
 }
 
@@ -864,7 +885,12 @@ fn refresh_all_subscription_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sess
     };
     let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     for s in map.values_mut() {
-        adopt_subscription_usage(stdout, s, next.clone());
+        adopt_subscription_usage(
+            stdout,
+            s,
+            next.clone(),
+            host.handshake().reports_session_cost(),
+        );
     }
 }
 
@@ -1081,7 +1107,12 @@ fn backfill_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions,
         acp::send_session_title(stdout, acp_sid, name.as_deref());
     }
     if adopted {
-        acp::send_usage(stdout, s, pressure.as_deref());
+        acp::send_usage(
+            stdout,
+            s,
+            pressure.as_deref(),
+            host.handshake().reports_session_cost(),
+        );
     }
 }
 
@@ -3852,6 +3883,9 @@ fn handle_acp(
                             cum_prompt: None,
                             cum_output: None,
                             cum_total: None,
+                            cum_cache_read: None,
+                            cum_cache_write: None,
+                            host_cost: None,
                             cost_amount: None,
                             usage_seen: std::collections::HashSet::new(),
                             subscription_usage: None,
@@ -4176,6 +4210,9 @@ fn handle_acp(
                             cum_prompt: None,
                             cum_output: None,
                             cum_total: None,
+                            cum_cache_read: None,
+                            cum_cache_write: None,
+                            host_cost: None,
                             cost_amount: None,
                             usage_seen: std::collections::HashSet::new(),
                             subscription_usage: None,
@@ -4291,7 +4328,12 @@ fn handle_acp(
                             replay_history(stdout, entry, &r);
                         }
                         reconcile_active_tasks(stdout, entry, &r, replay);
-                        acp::send_usage(stdout, entry, pressure.as_deref());
+                        acp::send_usage(
+                            stdout,
+                            entry,
+                            pressure.as_deref(),
+                            host.handshake().reports_session_cost(),
+                        );
                     }
                     let (status, attention) = sessions
                         .lock()
@@ -4722,6 +4764,9 @@ fn handle_acp(
                             cum_prompt: None,
                             cum_output: None,
                             cum_total: None,
+                            cum_cache_read: None,
+                            cum_cache_write: None,
+                            host_cost: None,
                             cost_amount: None,
                             usage_seen: std::collections::HashSet::new(),
                             subscription_usage: None,
@@ -9036,7 +9081,12 @@ fn handle_msp(
             let next = Some(j_to_string(params));
             let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
             for s in map.values_mut() {
-                adopt_subscription_usage(stdout, s, next.clone());
+                adopt_subscription_usage(
+                    stdout,
+                    s,
+                    next.clone(),
+                    host.handshake().reports_session_cost(),
+                );
             }
         }
         "session/contextUsage" => {
@@ -9049,11 +9099,12 @@ fn handle_msp(
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let host_reports_cost = host.handshake().reports_session_cost();
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
                 let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(s) = map.get_mut(&acp_sid) {
                     let pressure = adopt_context_usage(s, params);
-                    acp::send_usage(stdout, s, pressure.as_deref());
+                    acp::send_usage(stdout, s, pressure.as_deref(), host_reports_cost);
                 }
             }
         }
@@ -9066,6 +9117,7 @@ fn handle_msp(
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let host_reports_cost = host.handshake().reports_session_cost();
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
                 let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(s) = map.get_mut(&acp_sid) {
@@ -9133,7 +9185,7 @@ fn handle_msp(
                             None => s.cost_amount = Some((leg, rate.currency)),
                         }
                     }
-                    acp::send_usage(stdout, s, None);
+                    acp::send_usage(stdout, s, None, host_reports_cost);
                 }
             }
         }

@@ -523,8 +523,9 @@ fn usage_events_forward_msp_usage_as_acp_usage_update() {
         );
         // Two priced legs so far: (100·3 + 20·15)/1M + (1000·3 + 500·15)/1M.
         assert!(
-            update.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\"")
-                && update.contains("\"billing\":false"),
+            update.contains(
+                "\"cost\":{\"amount\":0.0111,\"currency\":\"USD\",\"_meta\":{\"muse\":{\"source\":\"adapter-estimate\",\"basis\":\"catalog-list-price\",\"billing\":false}}}"
+            ),
             "per-completion cost accumulated and labeled as an estimate: {update}"
         );
         // The unpriced (no modelId) leg advances totals but not cost.
@@ -557,6 +558,82 @@ fn usage_events_forward_msp_usage_as_acp_usage_update() {
         }
         c.finish();
     }
+}
+
+#[test]
+fn host_session_cost_replaces_the_adapter_estimate() {
+    // A 1.4.2 host that reports cost: the host figure wins, with its
+    // partial flag, and the local catalog estimate is not even computed into
+    // the frame.
+    for partial in [false, true] {
+        let mut c = Client::spawn(
+            "usage",
+            &[
+                ("FAKE_SERVER_VERSION", "1.4.2"),
+                ("FAKE_CUMULATIVE_COST", "1"),
+                ("FAKE_CUMULATIVE_PARTIAL", if partial { "1" } else { "0" }),
+            ],
+        );
+        let sid = c.new_session(1, "");
+        let _pid = c.prompt(&sid, "hi");
+        let update = c.wait_for("\"totalTokens\":7500", Duration::from_secs(15));
+        assert!(
+            update.contains(&format!(
+                "\"cost\":{{\"amount\":0.25,\"currency\":\"USD\",\"_meta\":{{\"muse\":{{\"source\":\"muse-host\",\"estimate\":true,\"partial\":{partial}}}}}"
+            )),
+            "host cost with partial={partial}: {update}"
+        );
+        assert!(
+            !update.contains("adapter-estimate"),
+            "the host figure replaces the local estimate: {update}"
+        );
+        c.finish();
+    }
+
+    // The same host class, but the cumulative object has no cost: nothing is
+    // sent, because the adapter's estimate is not the host's truth.
+    let mut c = Client::spawn("usage", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "hi");
+    let update = c.wait_for("\"totalTokens\":7500", Duration::from_secs(15));
+    assert!(
+        !update.contains("\"cost\""),
+        "a cost-reporting host without a price sends no cost: {update}"
+    );
+    c.finish();
+
+    // A host that predates host cost keeps the adapter's estimate, with its
+    // provenance inside `_meta`.
+    let mut c = Client::spawn("usage", &[("FAKE_SERVER_VERSION", "1.3.0")]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "hi");
+    let update = c.wait_for("\"totalTokens\":7500", Duration::from_secs(15));
+    assert!(
+        update.contains(
+            "\"cost\":{\"amount\":0.0111,\"currency\":\"USD\",\"_meta\":{\"muse\":{\"source\":\"adapter-estimate\",\"basis\":\"catalog-list-price\",\"billing\":false}}}"
+        ),
+        "{update}"
+    );
+    c.finish();
+}
+
+#[test]
+fn host_cache_totals_ride_the_cumulative_metadata() {
+    let mut c = Client::spawn(
+        "usage",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_CUMULATIVE_CACHE", "1"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "hi");
+    let update = c.wait_for("\"totalTokens\":7500", Duration::from_secs(15));
+    assert!(
+        update.contains("\"cacheReadTokens\":100") && update.contains("\"cacheWriteTokens\":25"),
+        "host cache splits must ride museCumulative: {update}"
+    );
+    c.finish();
 }
 
 #[test]

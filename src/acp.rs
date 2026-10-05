@@ -194,11 +194,17 @@ pub struct AcpSession {
     pub cum_prompt: Option<u64>,
     pub cum_output: Option<u64>,
     pub cum_total: Option<u64>,
+    /// Counted-once session cache totals, when the host reports them.
+    pub cum_cache_read: Option<u64>,
+    pub cum_cache_write: Option<u64>,
+    /// Host-computed session cost `(usd, partial)`. Only Muse 1.4.2+ reports
+    /// it, and a later cumulative object without `cost` clears it.
+    pub host_cost: Option<(f64, bool)>,
     /// Running list-price estimate, accumulated per completion from catalog
-    /// per-1M rates: (amount, currency). Partial in both directions —
-    /// historic and unpriceable completions are excluded, while cached input
-    /// is charged at the full input rate — so it is never a billing figure
-    /// on plan subscriptions.
+    /// per-1M rates: (amount, currency). Partial in both directions:
+    /// historic and unpriceable completions are excluded, so this is an
+    /// estimate, never a billing figure on plan subscriptions. Emitted only
+    /// on hosts that do not report their own session cost.
     pub cost_amount: Option<(f64, String)>,
     /// View cursors of completions already folded into the totals above.
     /// `view/gap` recovery can replay a completion that also arrives live.
@@ -488,7 +494,15 @@ pub fn send_error_with_data(
 /// `usage_update` for both ACP versions (`{used, size}` plus counted-once
 /// session cumulative totals in `_meta`). Emits only when both `used` and
 /// `size` are known; callers stash partial state on the session instead.
-pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>) {
+/// `host_reports_cost` is the host's version gate: with it, `cost` comes only
+/// from the host's own figure; without it, from the adapter's catalog
+/// estimate.
+pub fn send_usage(
+    stdout: &StdoutShared,
+    s: &AcpSession,
+    pressure: Option<&str>,
+    host_reports_cost: bool,
+) {
     let (Some(used), Some(size)) = (s.usage_used, s.usage_size) else {
         return;
     };
@@ -499,6 +513,12 @@ pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>)
         s.cum_output.map(|v| v.to_string()).unwrap_or("null".into()),
         s.cum_total.map(|v| v.to_string()).unwrap_or("null".into()),
     ));
+    if let Some(v) = s.cum_cache_read {
+        meta.push_str(&format!(",\"cacheReadTokens\":{v}"));
+    }
+    if let Some(v) = s.cum_cache_write {
+        meta.push_str(&format!(",\"cacheWriteTokens\":{v}"));
+    }
     meta.push('}');
     if let Some(p) = pressure {
         meta.push_str(&format!(",\"musePressure\":{}", esc(p)));
@@ -509,13 +529,23 @@ pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>)
         ));
     }
     // `amount` must be a JSON number: Rust's Display prints `inf`/`NaN`
-    // verbatim, which would corrupt the whole frame.
-    let cost_f = match &s.cost_amount {
-        Some((amount, currency)) if amount.is_finite() => format!(
-            ",\"cost\":{{\"amount\":{amount},\"currency\":{},\"source\":\"adapter-estimate\",\"basis\":\"catalog-list-price\",\"billing\":false}}",
-            esc(currency)
-        ),
-        _ => String::new(),
+    // verbatim, which would corrupt the whole frame. ACP's `Cost` allows only
+    // `amount`, `currency`, and `_meta`, so the provenance lives in `_meta`.
+    let cost_f = if host_reports_cost {
+        match &s.host_cost {
+            Some((amount, partial)) if amount.is_finite() => format!(
+                ",\"cost\":{{\"amount\":{amount},\"currency\":\"USD\",\"_meta\":{{\"muse\":{{\"source\":\"muse-host\",\"estimate\":true,\"partial\":{partial}}}}}}}"
+            ),
+            _ => String::new(),
+        }
+    } else {
+        match &s.cost_amount {
+            Some((amount, currency)) if amount.is_finite() => format!(
+                ",\"cost\":{{\"amount\":{amount},\"currency\":{},\"_meta\":{{\"muse\":{{\"source\":\"adapter-estimate\",\"basis\":\"catalog-list-price\",\"billing\":false}}}}}}",
+                esc(currency)
+            ),
+            _ => String::new(),
+        }
     };
     send_raw(
         stdout,
