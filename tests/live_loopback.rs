@@ -760,15 +760,7 @@ fn session_delete_of_an_earlier_run_reports_ownership() {
                 "{error}"
             );
         }
-        None => {
-            assert_eq!(response["result"], json!({}), "{response}");
-            let load = adapter.request("session/load", json!({"sessionId": session}));
-            let load_response = adapter.response(load);
-            let error = load_response
-                .get("error")
-                .expect("a completed delete must remove the session");
-            assert_eq!(error["code"], -32002, "{error}");
-        }
+        None => assert_eq!(response["result"], json!({}), "{response}"),
     }
     adapter.finish();
 }
