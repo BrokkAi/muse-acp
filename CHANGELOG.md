@@ -32,6 +32,15 @@
 - Classify Muse 1.4.2 as a tested host. Its stable schema only adds to
   1.4.1's, and the live-host suite passes against it, so startup logs now
   report `status=tested` instead of `status=unknown`.
+- Re-pin the vendored Muse SDK conformance corpus to `bb44be3`. It publishes
+  the Muse 1.4.2 stable surface, including `session/delete`, workspace roots,
+  session-list filters, per-model reasoning tiers, cost totals, and feedback.
+  Startup now logs a `host-features` line saying whether the host's version
+  offers session delete, workspace roots, and host-computed session cost.
+- A session that Muse unloads, for example when its host shuts down or the
+  session sits idle, now stays in the editor's session list. With Muse's live
+  listing stream it used to disappear until it changed again, although Muse
+  keeps it on disk and can reload it.
 - With a saved `:auto-review` profile, files Muse creates while it runs, such
   as the credential from a first login or a first workspace trust, now land
   in your Muse configuration instead of the temporary settings view, where

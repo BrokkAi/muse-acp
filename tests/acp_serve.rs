@@ -4820,18 +4820,72 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 
 #[test]
 fn sdk_manifest_fingerprint_is_tested() {
-    // The vendored SDK manifest (a7c10c5) equals the live-validated
-    // 1.3.0-R3401.1 host surface.
+    // The vendored SDK manifest (bb44be3) equals the live-validated 1.4.2
+    // host surface.
     let mut c = Client::spawn(
         "quiet",
         &[(
             "FAKE_FINGERPRINT",
-            "sha256:7469c9e352e67def4a59df7e439984d7194fa351e1c8b7abb34060fd977ced81",
+            "sha256:61afea3112e0906e9dc3a536144278a74cb4b36fc6e20901a91d4432ba3568e2",
         )],
     );
     c.initialize(1, "");
     c.wait_stderr("status=tested", Duration::from_secs(10));
+    c.wait_stderr("validated against live host 1.4.2", Duration::from_secs(10));
     c.finish();
+}
+
+#[test]
+fn host_feature_gates_follow_the_reported_muse_version() {
+    // Features are gated on `serverInfo.version`, not on the fingerprint
+    // table, and `session/delete` also needs a durable host.
+    for (version, durability, want) in [
+        (
+            None,
+            None,
+            "0.0.0-fixture session_delete=false workspace_roots=false session_cost=false",
+        ),
+        (
+            Some("1.3.0"),
+            None,
+            "1.3.0 session_delete=false workspace_roots=false session_cost=false",
+        ),
+        (
+            Some("1.4.1"),
+            Some("durable"),
+            "1.4.1 session_delete=true workspace_roots=true session_cost=false",
+        ),
+        (
+            Some("1.4.2-R4684.1"),
+            None,
+            "1.4.2-R4684.1 session_delete=true workspace_roots=true session_cost=true",
+        ),
+        (
+            Some("1.10.0"),
+            None,
+            "1.10.0 session_delete=true workspace_roots=true session_cost=true",
+        ),
+        (
+            Some("1.4.2"),
+            Some("ephemeral"),
+            "1.4.2 session_delete=false workspace_roots=true session_cost=true",
+        ),
+    ] {
+        let mut env = Vec::new();
+        if let Some(version) = version {
+            env.push(("FAKE_SERVER_VERSION", version));
+        }
+        if let Some(durability) = durability {
+            env.push(("FAKE_SESSION_DURABILITY", durability));
+        }
+        let mut c = Client::spawn("quiet", &env);
+        c.initialize(1, "");
+        c.wait_stderr(
+            &format!("host-features server=muse-session-server-fixture/{want}"),
+            Duration::from_secs(10),
+        );
+        c.finish();
+    }
 }
 
 #[test]
@@ -8075,9 +8129,12 @@ fn resumed_active_prompt_cannot_be_unqueued() {
 }
 
 #[test]
-fn session_list_stream_updates_titles_filters_rows_and_unloads_sessions() {
-    // The delay separates the fake's "sent" marker from the notification, so
-    // the test must wait for the adapter to apply the close.
+fn session_list_stream_updates_titles_filters_rows_and_keeps_unloaded_sessions() {
+    // MSP `session/closed` unloads a session from the host; it does not
+    // delete it. The log stays on disk and `session/resume` reloads it, so the
+    // session must stay listed. The delay separates the fake's "sent" marker
+    // from the notification, so the test must wait for the adapter to apply
+    // the unload.
     let mut c = Client::spawn("session_list_stream", &[("FAKE_CLOSE_DELAY_MS", "300")]);
     let sid = c.new_session(1, "");
     c.wait_frame_contains("sessionListStream", Duration::from_secs(15));
@@ -8097,18 +8154,55 @@ fn session_list_stream_updates_titles_filters_rows_and_unloads_sessions() {
         "unrelated streamed row leaked: {filtered}"
     );
     // The fake's "sent" marker precedes delivery; wait until the adapter has
-    // applied the close, or the next listing races the notification.
+    // applied the unload, or the next listing races the notification.
     c.wait_stderr(
-        "session list row closed: session=msp-sess-1",
+        "session unloaded by Muse: session=msp-sess-1 reason=idle",
         Duration::from_secs(15),
     );
 
     let listed_id = c.req("session/list", "{}");
     let listed = c.wait_for(&format!("\"id\":{listed_id}"), Duration::from_secs(15));
     assert!(
-        !listed.contains(&sid),
-        "closed streamed row was resurrected: {listed}"
+        listed.contains(&format!("\"sessionId\":\"{sid}\"")),
+        "an unloaded session must stay listed: {listed}"
     );
+    assert!(
+        listed.contains("Renamed elsewhere"),
+        "the unload must keep the streamed row: {listed}"
+    );
+    c.finish();
+}
+
+#[test]
+fn experimental_mcp_oauth_completion_is_logged_and_ignored() {
+    // The adapter negotiates `experimentalApi`, so another client's MCP OAuth
+    // terminal reaches it (the fixture sends it only to an experimental
+    // connection). It has an explicit arm, not the unhandled path, and
+    // nothing reaches the editor.
+    let mut c = Client::spawn("mcp_oauth_completed", &[]);
+    c.new_session(1, "");
+    c.wait_stderr(
+        "MCP OAuth login completed elsewhere (ignored): server=fixture-mcp outcome=granted",
+        Duration::from_secs(15),
+    );
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap();
+    assert!(
+        !stderr.contains("unhandled MSP notification: mcpServer/oauthLoginCompleted"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("fixture login detail"),
+        "the free-text message must not be logged: {stderr}"
+    );
+    // A request round trip drains anything the notification could have sent.
+    let barrier = c.req("session/list", "{}");
+    c.wait_for(&format!("\"id\":{barrier}"), Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(!frames.contains("fixture-mcp"), "{frames}");
     c.finish();
 }
 

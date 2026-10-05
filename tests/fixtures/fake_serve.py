@@ -64,7 +64,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
-  session_list_stream grants sessionListStream and emits row replace/close events
+  session_list_stream grants sessionListStream and emits row replace events,
+               then a schema-shaped session/closed unload after session/list
   session_list_stream_denied sends the notification without granting the capability
   session_list_pagination returns a second page when its cursor is forwarded
   status_flags   session/statusChanged status, attention, open-enum, and null
@@ -96,6 +97,13 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
                the goal; a later wake verb names it as the busy turn
   goal_continuation the woken goal turn completes, then the host starts its
                own follow-up turn that runs until turn/interrupt
+  mcp_oauth_completed an experimental mcpServer/oauthLoginCompleted from
+               another client's login flow follows the session/start ack
+
+Host identity (every scenario): FAKE_SERVER_VERSION sets serverInfo.version
+(default 0.0.0-fixture, which no version gate accepts), and
+FAKE_SESSION_DURABILITY sets sessionDurability (absent by default, which MSP
+reads as durable).
 
 Session MCP (every scenario): `sessionMcp` is granted when requested unless
 FAKE_NO_SESSION_MCP=1. As on the live host, a non-empty config.mcpServers
@@ -1068,14 +1076,17 @@ def result_for(method, msg):
             "userInputDialogs", True) is not False
         EXPERIMENTAL_API[0] = msg.get("params", {}).get("capabilities", {}).get(
             "experimentalApi") is True
-        return {
+        result = {
             "schema": SCHEMA,
             "grantedCapabilities": granted,
             "serverInfo": {
                 "name": "muse-session-server-fixture",
-                "version": "0.0.0-fixture",
+                "version": os.environ.get("FAKE_SERVER_VERSION", "0.0.0-fixture"),
             },
         }
+        if os.environ.get("FAKE_SESSION_DURABILITY", ""):
+            result["sessionDurability"] = os.environ["FAKE_SESSION_DURABILITY"]
+        return result
     if method == "approval/listPending":
         if SCENARIO == "pending_reconcile":
             return {"approvals": [dict(APPROVAL_PARAMS, approvalId="ap-reconcile")],
@@ -1833,8 +1844,11 @@ def main():
                     # so tests cannot synchronize on the marker by luck.
                     if os.environ.get("FAKE_CLOSE_DELAY_MS"):
                         time.sleep(int(os.environ["FAKE_CLOSE_DELAY_MS"]) / 1000.0)
+                    # An idle unload, shaped as SessionClosedParams: the
+                    # session is notLoaded, not deleted.
                     send({"jsonrpc": "2.0", "method": "session/closed",
-                          "params": {"sessionId": MSP_SID}})
+                          "params": {"reason": "idle", "sessionId": MSP_SID,
+                                     "viewCursor": "cur-closed"}})
                 if method == "session/setReasoningEffort":
                     notify("session/reasoningEffortChanged", {
                         "sessionId": msg.get("params", {}).get("sessionId", MSP_SID),
@@ -1869,6 +1883,13 @@ def main():
                     os._exit(int(os.environ.get("FAKE_HOST_EXIT_CODE", default_code)))
                 if SCENARIO == "skills_changed" and method == "session/start":
                     notify("skill/changed", {"sessionId": MSP_SID})
+                if (SCENARIO == "mcp_oauth_completed" and method == "session/start"
+                        and EXPERIMENTAL_API[0]):
+                    # Delivered to every experimental connection, initiator
+                    # or not; never carries the authorization URL or keys.
+                    notify("mcpServer/oauthLoginCompleted", {
+                        "outcome": "granted", "server": "fixture-mcp",
+                        "message": "fixture login detail"})
                 if SCENARIO == "questions_resume" and method == "session/resume":
                     # MSP reissues pending requests after the resume response.
                     send({"jsonrpc": "2.0", "id": 9100 + ident,

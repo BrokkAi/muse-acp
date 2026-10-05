@@ -57,12 +57,14 @@ const FILE_REPORT_MAX_ENCODED_PATH_BYTES: usize = 255 * 1024;
 /// The host's live `session/list` rows, keyed by durable MSP session id.
 ///
 /// A row is always replaced as a whole when `session/listChanged` arrives.
-/// Closed ids stay as tombstones for this adapter connection so a stale paged
-/// `session/list` response cannot resurrect an unloaded session.
+/// Deleted ids stay as tombstones for this adapter connection so a stale paged
+/// `session/list` response cannot resurrect a deleted session. MSP
+/// `session/closed` is not a deletion: it only unloads the session from the
+/// host, the log stays on disk, and the session stays listed.
 #[derive(Default)]
 struct SessionListCache {
     rows: HashMap<String, J>,
-    closed: std::collections::HashSet<String>,
+    deleted: std::collections::HashSet<String>,
 }
 
 type SessionLists = Arc<Mutex<SessionListCache>>;
@@ -86,21 +88,11 @@ fn cache_session_row(lists: &SessionLists, row: &J) -> Option<(Option<String>, O
     let id = session_row_id(row)?.to_string();
     let title = title_facts(Some(row)).selected().map(str::to_string);
     let mut cache = lists.lock().unwrap_or_else(|p| p.into_inner());
-    cache.closed.remove(&id);
     let previous_title = cache
         .rows
         .insert(id, row.clone())
         .and_then(|previous| title_facts(Some(&previous)).selected().map(str::to_string));
     Some((previous_title, title))
-}
-
-fn cache_session_closed(lists: &SessionLists, msp_sid: &str) {
-    if msp_sid.is_empty() {
-        return;
-    }
-    let mut cache = lists.lock().unwrap_or_else(|p| p.into_inner());
-    cache.rows.remove(msp_sid);
-    cache.closed.insert(msp_sid.to_string());
 }
 
 /// True when the client's `_meta.jetbrains.air.capabilities` advertises a key.
@@ -2758,6 +2750,7 @@ fn main() {
                                 hi.status,
                                 hi.detail
                             ));
+                            log(&hi.features_line());
                             log(if hi.session_mcp {
                                 "client MCP servers: forwarded to Muse (sessionMcp granted)"
                             } else {
@@ -5400,7 +5393,7 @@ fn handle_acp(
                             listed.insert(msp_id.to_string());
                             let streamed = if list_stream {
                                 let cache = lists.lock().unwrap_or_else(|p| p.into_inner());
-                                if cache.closed.contains(msp_id) {
+                                if cache.deleted.contains(msp_id) {
                                     continue;
                                 }
                                 cache.rows.get(msp_id).cloned()
@@ -7281,7 +7274,7 @@ fn owned_session_rows(
             session_matches_filter(s, root, additional)
                 && (!list_stream || {
                     let cache = lists.lock().unwrap_or_else(|p| p.into_inner());
-                    !cache.closed.contains(&s.msp_sid)
+                    !cache.deleted.contains(&s.msp_sid)
                         && cache
                             .rows
                             .get(&s.msp_sid)
@@ -8478,15 +8471,35 @@ fn handle_msp(
         }
 
         "session/closed" => {
-            if host.handshake().session_list_stream {
-                let msp_sid = params
-                    .get("sessionId")
-                    .or_else(|| params.get("session").and_then(|s| s.get("sessionId")))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                cache_session_closed(lists, msp_sid);
-                log(&format!("session list row closed: session={msp_sid}"));
-            }
+            // An unload, not a deletion: the session is `notLoaded`, its log
+            // stays on disk, and `session/resume` reloads it. It therefore
+            // stays listed; the host follows with `session/statusChanged`
+            // and, when streaming, a replacement `session/listChanged` row.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let reason = params
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            log(&format!(
+                "session unloaded by Muse: session={msp_sid} reason={reason}"
+            ));
+        }
+        "mcpServer/oauthLoginCompleted" => {
+            // Experimental: reaches this connection because it negotiates
+            // `experimentalApi`. The adapter never starts an MCP OAuth login,
+            // so this terminal belongs to another client's flow. It carries
+            // no URL or key material; only the server and outcome are logged.
+            let server = params.get("server").and_then(|v| v.as_str()).unwrap_or("");
+            let outcome = params
+                .get("outcome")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            log(&format!(
+                "MCP OAuth login completed elsewhere (ignored): server={server} outcome={outcome}"
+            ));
         }
         _ => {
             log(&format!("unhandled MSP notification: {method}"));

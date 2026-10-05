@@ -527,6 +527,46 @@ fn cancel_stops_a_streaming_turn() {
 }
 
 #[test]
+fn host_feature_gates_read_the_installed_muse_version() {
+    if !enabled("host_feature_gates_read_the_installed_muse_version") {
+        return;
+    }
+    // Session delete, workspace roots, and host cost are gated on the
+    // reported `serverInfo.version`. A version the gate cannot read would
+    // silently turn them all off, so the real host's version must parse and
+    // give the gates the release that added each feature.
+    let host = Host::start(json!({}), None);
+    let adapter = Adapter::launch(&host);
+    let log = std::fs::read_to_string(&adapter.log).unwrap();
+    let label = log
+        .lines()
+        .find_map(|line| line.split("host-ready server=").nth(1))
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap_or_else(|| panic!("no host-ready line:\n{log}"))
+        .to_string();
+    let version = label.rsplit('/').next().unwrap();
+    let release: Vec<u64> = version
+        .split(|c: char| !c.is_ascii_digit())
+        .take(3)
+        .map(|part| {
+            part.parse()
+                .unwrap_or_else(|_| panic!("unreadable host version {version:?}"))
+        })
+        .collect();
+    assert_eq!(release.len(), 3, "unreadable host version {version:?}");
+    let release = (release[0], release[1], release[2]);
+    // `muse serve` without --no-session-log is durable.
+    let want = format!(
+        "host-features server={label} session_delete={} workspace_roots={} session_cost={}",
+        release >= (1, 4, 1),
+        release >= (1, 4, 1),
+        release >= (1, 4, 2)
+    );
+    assert!(log.contains(&want), "expected {want:?} in:\n{log}");
+    adapter.finish();
+}
+
+#[test]
 fn a_restarted_adapter_loads_the_session_with_its_history() {
     if !enabled("a_restarted_adapter_loads_the_session_with_its_history") {
         return;

@@ -18,7 +18,7 @@ To see it working: run `cargo test --locked` and see the new tests pass; then, w
 
 - [x] (2026-10-05 17:10Z) Read the SDK diff `a7c10c5..bb44be3` in full, the ACP v1 and v2 specs (docs and schemas at agent-client-protocol v1.10.2), and the adapter; probed a live Muse 1.4.2 host (see Surprises & Discoveries).
 - [x] (2026-10-05 17:40Z) Wrote this plan.
-- [ ] Milestone 1: re-pin `tests/protocol/` to `bb44be3`, update the compatibility table and event matrix, fix `session/closed` handling, record host feature gates.
+- [x] (2026-10-05 15:55Z) Milestone 1: re-pinned `tests/protocol/` to `bb44be3`, pointed `SDK_MANIFEST_FINGERPRINT` at the 1.4.2 entry, moved `session/started`, `session/closed`, and `session/deleteCompleted` into the event matrix, stopped `session/closed` from hiding sessions, added the version gates on `HandshakeInfo` with a `host-features` startup log line, gave the experimental `mcpServer/oauthLoginCompleted` an explicit arm, and updated `ROADMAP.md`, `PROVENANCE.md`, and `CHANGELOG.md`. Full contributor gate green; live suite green against Muse 1.4.2 (19 tests, including the new `host_feature_gates_read_the_installed_muse_version`). Times before this entry were recorded in local time (CEST, UTC+2) although labeled Z; from here on they are true UTC.
 - [ ] Milestone 2: ACP `session/delete` for v1 and v2, plus the `session/list` fixes it depends on.
 - [ ] Milestone 3: ACP `additionalDirectories` sent to Muse as `workspaceRoots`.
 - [ ] Milestone 4: per-model reasoning tiers and a spec-conformant `config_option_update`.
@@ -65,6 +65,18 @@ To see it working: run `cargo test --locked` and see the new tests pass; then, w
 - Observation: `session/started` usually arrives before the `session/start` result, but not always (one of sixteen live calls delivered it after the result). Code must not depend on the order.
 
 - Observation: the host's own TUI names the two feedback attachments: "local tracing — selected-session diagnostics, redacted (local-tracing.zip)" and "session record — this whole conversation's replayable trajectory, redacted (session.jsonl)". These map to MSP `withFiles` and `attachSessionRecord`.
+
+- Observation (Milestone 1): the live 1.4.2 host reports `serverInfo.version` as plain `1.4.2`, without the `-R4684.1` build label that `muse --version` prints, and the version gates read it as expected. The host's `hostShutdown` `session/closed` frames at adapter exit reach the adapter's reader thread but not its main loop, which has already stopped, so the new unload log line is not written at exit. That is harmless: the adapter is ending, and the session stays on disk.
+  Evidence (adapter driven against `~/.local/bin/muse` 1.4.2 with an isolated `HOME`/XDG and the loopback provider, `MUSE_LOG=debug`; the real `~/.local/share/muse` was unchanged before and after, compared by file times):
+
+      [muse-acp] host-ready server=muse/1.4.2 schema_version=1 fingerprint=sha256:61afea31... status=tested detail=validated against live host 1.4.2
+      [muse-acp] host-features server=muse/1.4.2 session_delete=true workspace_roots=true session_cost=true
+      ...
+      [muse-acp] trace msp<-host method=session/closed      (after stdin closed; no "session unloaded by Muse" line follows)
+
+- Observation (Milestone 1): no live run has produced `session/closed` with `reason: "idle"`, so it is still unknown when the host idle-unloads a session. The SDK's `view/unsubscribe` text says "It does not unload the session; unloading is the idle policy (tdd SS2.8)", and the adapter keeps a view subscription on every session it holds, so an idle unload of a held session is not expected. The adapter has never re-attached a session after an unload; Milestone 1 only stops hiding it.
+
+- Observation (Milestone 1): the fake host records adapter-to-host frames in `FAKE_FRAMES` with Python's default `json.dumps` spacing, so `wait_frame_contains` needles must be written as `"experimentalApi": true` (colon then space), not the adapter's compact form.
 
 
 ## Decision Log
@@ -122,11 +134,31 @@ To see it working: run `cargo test --locked` and see the new tests pass; then, w
   Rationale: `feedback/submit` says "The call itself is the explicit confirm", so the adapter must collect explicit consent first; attachments must never be sent by default.
   Date/Author: 2026-10-05, Claude.
 
+- Decision (Milestone 1): the version gates are used from Milestone 1 on through `HandshakeInfo::features_line()`, logged right after `host-ready` as `host-features server=<name>/<version> session_delete=<bool> workspace_roots=<bool> session_cost=<bool>`. A private `release()` parses the version; `at_least` compares tuples, so `1.10.0` is newer than `1.4.2`. Each part must be plain decimal digits (Rust's integer parser would accept a leading `+`), and the patch number stops at the first non-digit, so `1.4.2-R4684.1` reads as 1.4.2.
+  Rationale: the binary crate builds with `-D warnings`, so public methods nothing calls fail `dead_code` until Milestone 2. The log line also gives support a way to see why a feature is off, and lets an integration test and a live test check the gates against a real version string.
+  Date/Author: 2026-10-05, Claude.
+
+- Decision (Milestone 1): the fake host's `FAKE_SERVER_VERSION` knob is added now (the plan had it in Milestone 2), with `FAKE_SESSION_DURABILITY` beside it. The default version stays `0.0.0-fixture`, which no gate accepts, so no existing test changes. Milestone 2 still decides whether to make `1.4.2` the default.
+  Rationale: the new test `host_feature_gates_follow_the_reported_muse_version` needs both knobs, and an existing test asserts the `0.0.0-fixture` label.
+  Date/Author: 2026-10-05, Claude.
+
+- Decision (Milestone 1): `SessionListCache::closed` is renamed `deleted`, `cache_session_closed` is removed (Milestone 2 adds the delete-side helper), and `cache_session_row` no longer clears a tombstone when a row arrives. The `session/closed` arm logs `session unloaded by Muse: session=<id> reason=<reason>` for every connection, granted stream or not, and reads only the schema's top-level `sessionId` (the old `session.sessionId` fallback is not in `SessionClosedParams`). Its `viewCursor` is still adopted by the generic cursor tracking at the top of `handle_msp`.
+  Rationale: a deletion is final (the host fences a deleted id against reuse), so a late row must not undo it; the list paths check `deleted` before they read a cached row, so caching that row is harmless. Nothing fills `deleted` until Milestone 2, so this is behavior-neutral now.
+  Date/Author: 2026-10-05, Claude.
+
+- Decision (Milestone 1): `docs/event-compatibility.md` keeps its "Host-emitted extensions" section, now holding only the experimental `mcpServer/oauthLoginCompleted` (Intentionally ignored), instead of removing the section. `session/closed` is "Consumed" (it only logs), `session/started` stays "Internally tracked", and `session/deleteCompleted` is "Unsupported pending protocol decision" until Milestone 2. The oauth arm logs the server name and outcome but never the free-text `message`.
+  Rationale: the adapter now handles a notification outside the stable index, and the matrix should say so. The adapter's logs never carry payload text.
+  Date/Author: 2026-10-05, Claude.
+
+- Decision (Milestone 1): two items from Milestone 7 are pulled forward: a `CHANGELOG.md` `## Unreleased` entry for the re-pin and the list fix, and the live test `host_feature_gates_read_the_installed_muse_version` in `tests/live_loopback.rs`. On a 1.3.0 host the live test expects all three gates off instead of skipping.
+  Rationale: Milestone 1 already changes what users see (unloaded sessions stay listed), and the gates only matter if they parse the real host's version string. The live test reads the version from the adapter's own `host-ready` line, so it works against every CI build.
+  Date/Author: 2026-10-05, Claude.
+
 
 ## Outcomes & Retrospective
 
 
-(To be filled at milestone completion.)
+Milestone 1 (2026-10-05): the vendored corpus is the Muse 1.4.2 surface (`bb44be3`), the selftest prints `kind=sdk-manifest ... fingerprint=sha256:61afea31... status=tested detail=validated against live host 1.4.2`, and the event matrix lists exactly the 34 published notifications. A session that Muse unloads now stays in ACP `session/list`; the test `session_list_stream_updates_titles_filters_rows_and_keeps_unloaded_sessions` fails with the old tombstone code. The version gates exist and are logged at startup; nothing acts on them yet (Milestones 2, 3, and 5 do). The experimental OAuth terminal no longer reaches the unhandled-notification path. Lesson: an unused public method fails this crate's clippy gate, so a gate method needs a real caller in the same milestone.
 
 
 ## Context and Orientation
@@ -162,13 +194,13 @@ Copy `schema/msp/stable/manifest.json`, `schema/msp/stable/msp.schema.json`, and
 
 In `src/compat.rs`, alias `SDK_MANIFEST_FINGERPRINT` to `HOST_142_FINGERPRINT`, rewrite the test that asserted equality with the R3401.1 fingerprint so it asserts the SDK pin is the 1.4.2 surface, and drop the 1.4.1 comment sentence "No published SDK carries this surface yet." In `tests/acp_serve.rs`, point `sdk_manifest_fingerprint_is_tested` at the new fingerprint.
 
-In `src/msp.rs`, add `HandshakeInfo::at_least(&self, major: u64, minor: u64, patch: u64) -> bool`, which parses the leading `MAJOR.MINOR.PATCH` of `server_version` (ignoring any suffix) and returns false when it cannot. Add `supports_session_delete()` (durable host and at least 1.4.1; read how `durability` is spelled in the handshake and in `restartable()`), `supports_workspace_roots()` (at least 1.4.1), and `reports_session_cost()` (at least 1.4.2). Unit-test the parser with `"1.4.2"`, `"1.4.1"`, `"1.3.0"`, `"1.10.0"`, `"1.4.2-R4684.1"`, `""`, and `"garbage"`.
+In `src/msp.rs`, add `HandshakeInfo::at_least(&self, major: u64, minor: u64, patch: u64) -> bool`, which parses the leading `MAJOR.MINOR.PATCH` of `server_version` (ignoring any suffix) and returns false when it cannot. Add `supports_session_delete()` (durable host and at least 1.4.1; read how `durability` is spelled in the handshake and in `restartable()`), `supports_workspace_roots()` (at least 1.4.1), and `reports_session_cost()` (at least 1.4.2). Unit-test the parser with `"1.4.2"`, `"1.4.1"`, `"1.3.0"`, `"1.10.0"`, `"1.4.2-R4684.1"`, `""`, and `"garbage"`. Add `features_line()` and log it in `fn main` right after the `host-ready` line, so the gates have a caller and are visible (see the Decision Log). In the fake host, add `FAKE_SERVER_VERSION` and `FAKE_SESSION_DURABILITY`; test the line with `host_feature_gates_follow_the_reported_muse_version` in `tests/acp_serve.rs` and against a real host with `host_feature_gates_read_the_installed_muse_version` in `tests/live_loopback.rs`.
 
-Fix `session/closed`: it must no longer tombstone. Rename `SessionListCache::closed` to `deleted` (it will be filled by Milestone 2), stop calling the tombstone helper from the `session/closed` arm, and make that arm log the unload with its `reason`. Update the test that pinned the old behavior (`session_list_stream_updates_titles_filters_rows_and_unloads_sessions`) so an unloaded session stays listed. Update the fake host to send schema-shaped `session/closed {reason, sessionId, viewCursor}` frames.
+Fix `session/closed`: it must no longer tombstone. Rename `SessionListCache::closed` to `deleted` (it will be filled by Milestone 2), stop calling the tombstone helper from the `session/closed` arm, and make that arm log the unload with its `reason`. Update the test that pinned the old behavior (`session_list_stream_updates_titles_filters_rows_and_unloads_sessions`, now named `session_list_stream_updates_titles_filters_rows_and_keeps_unloaded_sessions`) so an unloaded session stays listed. Update the fake host to send schema-shaped `session/closed {reason, sessionId, viewCursor}` frames.
 
-Add an explicit `handle_msp` arm for the experimental `mcpServer/oauthLoginCompleted` notification (the adapter connects with `experimentalApi: true`, so it can arrive) that logs and ignores it, instead of falling to "unhandled MSP notification".
+Add an explicit `handle_msp` arm for the experimental `mcpServer/oauthLoginCompleted` notification (the adapter connects with `experimentalApi: true`, so it can arrive) that logs and ignores it, instead of falling to "unhandled MSP notification". Its params are `{outcome, server, message?}` (SDK `python/clients/msp-py/src/muse_code_msp/experimental/__init__.py`); log `server` and `outcome` only. The fake host's `mcp_oauth_completed` scenario sends it after the `session/start` ack, and `experimental_mcp_oauth_completion_is_logged_and_ignored` covers it.
 
-In `docs/event-compatibility.md`, move `session/started` and `session/closed` into the schema matrix (they are now in the published notification index) with accurate dispositions, add `session/deleteCompleted` (disposition "Unsupported pending protocol decision" in this milestone; Milestone 2 changes it to "Mapped to ACP"), and remove the now-wrong "Host-emitted extensions" rows. Fix `ROADMAP.md` statements that `session/started` is absent from the published index and that no published SDK carries the 1.4 surface, and update the reference-snapshot header and §2 pin text.
+In `docs/event-compatibility.md`, move `session/started` and `session/closed` into the schema matrix (they are now in the published notification index) with accurate dispositions, add `session/deleteCompleted` (disposition "Unsupported pending protocol decision" in this milestone; Milestone 2 changes it to "Mapped to ACP"), and replace the now-wrong "Host-emitted extensions" rows with one for `mcpServer/oauthLoginCompleted`. Fix `ROADMAP.md` statements that `session/started` is absent from the published index and that no published SDK carries the 1.4 surface, and update the reference-snapshot header and §2 pin text.
 
 Acceptance: `cargo test --locked` passes, including `vendored_sdk_manifest_matches_the_compatibility_table`, `every_schema_notification_has_an_explicit_matrix_disposition`, and the transcript replay tests in `src/fold.rs`; `cargo run --locked -- --selftest` prints `sdk-manifest` as tested.
 
@@ -190,7 +222,7 @@ When a host exits, every pending delete sent to that host kind is answered with 
 
 `session/load` and `session/resume` of a session the host reports as `sessionNotFound` (-32020) answer -32002 with "session not found (it may have been deleted)". Check the existing error path first and keep the auth (-32000) mapping intact.
 
-Fake host: add `session/delete` (ack `{commandId, status:"accepted"}`, then `session/deleteCompleted` after the ack) with knobs to produce `completed`, `failed` with a chosen reason and physical change, a `commandRejected` `session_deleted`, `runtime_busy`, and a `session/list` `filter` echo (`appliedFilter`) with `sessions` filtered by id. Make its `initialize` report `serverInfo.version` from a `FAKE_SERVER_VERSION` knob so tests can exercise the version gates (default it to `1.4.2` only if every existing test still passes; otherwise keep the current default and set the knob in the new tests).
+Fake host: add `session/delete` (ack `{commandId, status:"accepted"}`, then `session/deleteCompleted` after the ack) with knobs to produce `completed`, `failed` with a chosen reason and physical change, a `commandRejected` `session_deleted`, `runtime_busy`, and a `session/list` `filter` echo (`appliedFilter`) with `sessions` filtered by id. Its `initialize` already reports `serverInfo.version` from the `FAKE_SERVER_VERSION` knob (added in Milestone 1, default `0.0.0-fixture`) and `sessionDurability` from `FAKE_SESSION_DURABILITY`; default the version to `1.4.2` only if every existing test still passes, otherwise keep the current default and set the knob in the new tests.
 
 Tests (all in `tests/acp_serve.rs`): delete advertised in v1 and v2 on a 1.4.2 host and absent on a 1.3.0 host and on an ephemeral host; delete of a live idle session answers `{}` only after `deleteCompleted`, removes it from `session/list`, and later prompts get "unknown sessionId"; non-UUID and `session_deleted` and never-existed (`ownershipUnavailable` plus empty filtered list) answer `{}`; `ownershipUnavailable` for an existing session, `writerBusy`, and a failure with `physicalChange: possible` answer -32603 with the right message and data; two concurrent deletes for one session are both answered from one host command; host exit with a pending delete answers it; list paging no longer duplicates live sessions; invalid cursor errors; null-root rows are skipped; the emitted `session/delete` frame passes the schema gate. Update `docs/event-compatibility.md` (`session/deleteCompleted` becomes "Mapped to ACP").
 
@@ -305,7 +337,7 @@ ACP v2 placement (from `docs/protocol/v2/session-delete.mdx`):
 
 No new dependencies. At the end of the work these exist:
 
-In `src/msp.rs`: `impl HandshakeInfo { pub fn at_least(&self, major: u64, minor: u64, patch: u64) -> bool; pub fn supports_session_delete(&self) -> bool; pub fn supports_workspace_roots(&self) -> bool; pub fn reports_session_cost(&self) -> bool; }` and `pub feedback: bool` on `HandshakeInfo`.
+In `src/msp.rs`: `impl HandshakeInfo { pub fn at_least(&self, major: u64, minor: u64, patch: u64) -> bool; pub fn supports_session_delete(&self) -> bool; pub fn supports_workspace_roots(&self) -> bool; pub fn reports_session_cost(&self) -> bool; pub fn features_line(&self) -> String; }` (done in Milestone 1) and `pub feedback: bool` on `HandshakeInfo`.
 
 In `src/hosts.rs`: `impl Hosts { pub fn forget_owner(&self, msp_sid: &str); }`.
 
@@ -314,3 +346,6 @@ In `src/main.rs`: `fn v1_init(session_mcp: bool, session_delete: bool) -> String
 In `src/acp.rs`: `pub fn send_config_options_update(stdout: &StdoutShared, acp_sid: &str, config_options_json: &str)`; `AcpSession` fields `host_roots_pending: bool`, `cum_cache_read: Option<u64>`, `cum_cache_write: Option<u64>`, `host_cost: Option<(f64, bool)>`.
 
 Names may change during implementation if the surrounding code suggests better ones; record any change in the Decision Log.
+
+
+Revision note (2026-10-05, Milestone 1): ticked Milestone 1; recorded the live 1.4.2 version string and shutdown ordering, the unverified idle-unload policy, and the fake host's frame spacing in Surprises & Discoveries; logged the Milestone 1 choices (the `host-features` caller for the gates, the fake knobs moved forward, the tombstone rename, the kept extensions section, and the CHANGELOG entry and live test pulled forward from Milestone 7) in the Decision Log; filled Outcomes for Milestone 1; and adjusted the Milestone 1 and 2 prose to match. The earlier Progress times were local CEST labeled Z; that is noted there rather than rewritten.
