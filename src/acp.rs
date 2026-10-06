@@ -1047,7 +1047,10 @@ fn available_commands_json(
     items.extend(
         skills
             .iter()
-            .filter(|(name, _, _)| !matches!(name.as_str(), "goal" | "rename" | "workflow-child"))
+            .filter(|(name, _, _)| {
+                !matches!(name.as_str(), "goal" | "rename" | "workflow-child")
+                    && !(feedback && name.as_str() == "feedback")
+            })
             .map(|(name, description, hint)| {
                 let input = hint
                     .as_deref()
@@ -1281,6 +1284,11 @@ mod tests {
                     Some("what to plan".to_string()),
                 ),
                 ("rename".to_string(), "Host rename skill".to_string(), None),
+                (
+                    "feedback".to_string(),
+                    "Host feedback skill".to_string(),
+                    None,
+                ),
             ];
             let commands = available_commands_json(ver, &skills, true);
             assert!(
@@ -1293,6 +1301,11 @@ mod tests {
             };
             // The host's `rename` row is shadowed by the local command.
             assert_eq!(items.len(), 6);
+            assert_eq!(
+                commands.matches("\"name\":\"feedback\"").count(),
+                1,
+                "the local feedback command absorbs a host skill of the same name: {commands}"
+            );
             assert!(commands.contains("\"name\":\"plan\""));
             assert!(commands.contains("\"name\":\"goal\""));
             assert!(commands.contains("\"name\":\"compact\""));
