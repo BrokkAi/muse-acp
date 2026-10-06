@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.10.0
 
 - Add session-scoped **Auto-review**. A new default-off `auto_review`
   selector sends every permission request to a reviewer agent instead of the
