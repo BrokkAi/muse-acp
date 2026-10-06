@@ -5010,7 +5010,7 @@ fn handle_acp(
             // `session/nameChanged`, workflow item updates) arrive as their
             // own updates.
             let command_line = match parse_json(&acp_content) {
-                Ok(J::Arr(blocks)) => protocol_command_text(&blocks),
+                Ok(J::Arr(blocks)) => protocol_command_text(&blocks, host.handshake().feedback),
                 _ => None,
             };
             if let Some(line) = command_line {
@@ -5300,10 +5300,17 @@ fn handle_acp(
             // After a load, resume, fork, or host re-attach, the next user
             // turn replaces the host's sticky root set explicitly, as ACP
             // requires. A failure here is a local refusal, never a turn that
-            // silently runs with the wrong scope.
+            // silently runs with the wrong scope. Without extras, a primary
+            // root that no longer resolves (a resume that omitted `cwd`, or a
+            // removed folder) leaves the host on its own root, as before
+            // explicit roots; the next turn tries again.
             let roots_param = if host_roots_pending && host.handshake().supports_workspace_roots() {
                 match host_workspace_roots(&cwd, &roots[1..]) {
                     Ok(roots) => workspace_roots_param(Some(&roots)),
+                    Err(message) if roots.len() <= 1 => {
+                        log(&format!("workspaceRoots omitted: {message}"));
+                        String::new()
+                    }
                     Err(message) => {
                         acp::send_error(stdout, &id, -32602, &message);
                         return;
@@ -5341,7 +5348,9 @@ fn handle_acp(
                         .unwrap_or_else(|p| p.into_inner())
                         .get_mut(&sid)
                     {
-                        s.host_roots_pending = false;
+                        if !roots_param.is_empty() {
+                            s.host_roots_pending = false;
+                        }
                         s.in_flight.push(InFlight {
                             msp_turn: turn.clone(),
                             req_id: id.clone().unwrap_or(J::Null),
@@ -7042,7 +7051,7 @@ const PROTOCOL_COMMANDS: [&str; 4] = ["feedback", "goal", "rename", "workflow-ch
 /// own block, so later text and mention blocks join the line, a mention as
 /// its `[@name](uri)` link text (a reference only, never embedded contents);
 /// any other block cannot be part of a command and is a usage error.
-fn protocol_command_text(blocks: &[J]) -> Option<Result<String, String>> {
+fn protocol_command_text(blocks: &[J], feedback: bool) -> Option<Result<String, String>> {
     let first = blocks.first()?;
     if first.get("type").and_then(J::as_str) != Some("text") {
         return None;
@@ -7053,7 +7062,9 @@ fn protocol_command_text(blocks: &[J]) -> Option<Result<String, String>> {
         .strip_prefix('/')?
         .split(char::is_whitespace)
         .next()?;
-    if !PROTOCOL_COMMANDS.contains(&name) {
+    // Without the host's grant, `/feedback` stays an ordinary prompt so a
+    // host skill of that name still runs.
+    if !PROTOCOL_COMMANDS.contains(&name) || (name == "feedback" && !feedback) {
         return None;
     }
     let mention = |label: &str, uri: &str| format!("[@{label}]({uri})");
@@ -10735,6 +10746,7 @@ fn feedback_form_schema(classification: Option<&str>, note: &str) -> String {
 /// End the `/feedback` turn with the receipt or refusal text.
 fn settle_feedback_turn(
     stdout: &StdoutShared,
+    sessions: &Sessions,
     acp_sid: &str,
     ver: u8,
     prompt_req: &J,
@@ -10748,7 +10760,18 @@ fn settle_feedback_turn(
             send_v2_user_message(stdout, acp_sid, prompt_content);
         }
         send_agent_text(stdout, acp_sid, ver, text);
-        acp::send_state(stdout, acp_sid, "idle", Some("end_turn"));
+        // The command is done, not the session: a turn that is still running
+        // keeps it running.
+        let busy = sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(acp_sid)
+            .is_some_and(|s| s.active_turn.is_some() || !s.in_flight.is_empty());
+        if busy {
+            acp::send_state(stdout, acp_sid, "running", None);
+        } else {
+            acp::send_state(stdout, acp_sid, "idle", Some("end_turn"));
+        }
     } else {
         if !prompt_content.is_empty() {
             send_v1_user_message(stdout, acp_sid, prompt_content);
@@ -10818,7 +10841,7 @@ fn feedback_result_text(result: &J) -> String {
     lines.join("\n")
 }
 
-/// Submit one consented feedback report through the main host and settle the
+/// Submit one consented feedback report through the session's host and settle the
 /// prompt with the result. Never retried automatically: the method has no
 /// idempotency key.
 #[allow(clippy::too_many_arguments)]
@@ -10843,9 +10866,10 @@ fn submit_feedback(
     else {
         return;
     };
-    let main = host.main_host();
-    let cmd = main.mint_cmd("cmd-");
-    let result = main.command(
+    // A Read-only or Plan session lives on the read-only host; the command
+    // goes to the process that owns it.
+    let cmd = host.mint_cmd("cmd-");
+    let result = host.command(
         "feedback/submit",
         &format!(
             "{{\"commandId\":{},\"classification\":{},\"note\":{},\"sessionId\":{},\"withFiles\":{with_files},\"attachSessionRecord\":{attach_record}}}",
@@ -10859,7 +10883,15 @@ fn submit_feedback(
         Ok(result) => feedback_result_text(&result),
         Err(error) => format!("Feedback was not sent: {}.", err_message(&error)),
     };
-    settle_feedback_turn(stdout, acp_sid, ver, prompt_req, prompt_content, &text);
+    settle_feedback_turn(
+        stdout,
+        sessions,
+        acp_sid,
+        ver,
+        prompt_req,
+        prompt_content,
+        &text,
+    );
 }
 
 /// Start a `/feedback` command: with forms, an elicitation with explicit
@@ -10885,6 +10917,8 @@ fn start_feedback(
         let stored = {
             let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
             match map.get_mut(acp_sid) {
+                // One form at a time: replacing it would strand its prompt.
+                Some(s) if s.pending_feedback.is_some() => Some(false),
                 Some(s) => {
                     s.pending_feedback = Some(acp::PendingFeedbackForm {
                         req_id: req_id.clone(),
@@ -10892,13 +10926,23 @@ fn start_feedback(
                         prompt_content: prompt_content.to_string(),
                         ver,
                     });
-                    true
+                    Some(true)
                 }
-                None => false,
+                None => None,
             }
         };
-        if !stored {
-            return;
+        match stored {
+            Some(true) => {}
+            Some(false) => {
+                acp::send_error(
+                    stdout,
+                    &prompt_req,
+                    -32602,
+                    "A feedback form is already open; answer or cancel it first.",
+                );
+                return;
+            }
+            None => return,
         }
         if ver == 2 {
             acp::send_state(stdout, acp_sid, "requires_action", None);
@@ -10930,6 +10974,7 @@ fn start_feedback(
         ),
         _ => settle_feedback_turn(
             stdout,
+            sessions,
             acp_sid,
             ver,
             &prompt_req,
@@ -11002,6 +11047,7 @@ fn complete_feedback(
         }
         settle_feedback_turn(
             stdout,
+            sessions,
             &acp_sid,
             pending.ver,
             &pending.prompt_req,
@@ -11379,7 +11425,8 @@ mod tests {
 
     #[test]
     fn protocol_command_text_joins_text_and_mentions() {
-        use super::protocol_command_text as line;
+        use crate::json::J;
+        let line = |blocks: &[J]| super::protocol_command_text(blocks, true);
         let blocks = |raw: &str| match crate::json::parse_json(raw) {
             Ok(crate::json::J::Arr(blocks)) => blocks,
             other => panic!("test blocks must be an array: {other:?}"),
@@ -11415,6 +11462,14 @@ mod tests {
         ] {
             assert_eq!(line(&blocks(raw)), None, "{raw} is not a protocol command");
         }
+        // `/feedback` is local only while the host grants it; otherwise it
+        // reaches the host as a prompt.
+        let feedback = blocks(r#"[{"type":"text","text":"/feedback bug x"}]"#);
+        assert_eq!(
+            super::protocol_command_text(&feedback, true),
+            Some(Ok("/feedback bug x".to_string()))
+        );
+        assert_eq!(super::protocol_command_text(&feedback, false), None);
     }
 
     #[test]

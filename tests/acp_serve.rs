@@ -5925,6 +5925,134 @@ fn feedback_without_an_argument_ends_with_usage() {
 }
 
 #[test]
+fn feedback_without_the_grant_reaches_the_host_as_a_prompt() {
+    let mut c = Client::spawn("happy", &[("FAKE_NO_FEEDBACK", "1")]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "/feedback bug it broke");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "{done}");
+    c.wait_input("/feedback bug it broke", Duration::from_secs(15));
+    assert!(
+        host_requests(&c, "feedback/submit").is_empty(),
+        "without the grant the adapter must not intercept /feedback"
+    );
+    c.finish();
+}
+
+#[test]
+fn feedback_in_read_only_mode_goes_to_the_session_host() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(1, "");
+    set_session_mode(&mut c, &sid, "readOnly");
+    c.wait_log("ro:session/resume", Duration::from_secs(15));
+    let pid = c.prompt(&sid, "/feedback bug it broke");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    c.wait_log("ro:feedback/submit", Duration::from_secs(15));
+    c.wait_for(
+        "Feedback sent (id fixture-upload-1)",
+        Duration::from_secs(15),
+    );
+    assert!(
+        !fake_methods(&c).iter().any(|m| m == "feedback/submit"),
+        "the main host does not own a read-only session"
+    );
+    c.finish();
+}
+
+#[test]
+fn a_second_feedback_form_is_refused_while_one_is_open() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let first = c.prompt(&sid, "/feedback bug first");
+    let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let form_id = extract_str(&form, "id").expect("feedback form id");
+    let second = c.prompt(&sid, "/feedback bug second");
+    let refused = c.wait_for(&format!("\"id\":{second}"), Duration::from_secs(15));
+    assert!(
+        refused.contains("-32602") && refused.contains("already open"),
+        "{refused}"
+    );
+    // The first form still settles its own prompt.
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"classification\":\"bug\",\"note\":\"first\",\"withFiles\":false,\"attachSessionRecord\":false}}}}}}"
+    ));
+    c.wait_for(&format!("\"id\":{first}"), Duration::from_secs(15));
+    c.wait_for(
+        "Feedback sent (id fixture-upload-1)",
+        Duration::from_secs(15),
+    );
+    let submitted = host_requests(&c, "feedback/submit");
+    assert_eq!(submitted.len(), 1, "{submitted:?}");
+    assert_eq!(submitted[0]["note"], "first");
+    c.finish();
+}
+
+#[test]
+fn feedback_during_a_running_turn_keeps_the_session_running() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let _work = c.prompt(&sid, "long work");
+    c.wait_for("\"state\":\"running\"", Duration::from_secs(15));
+    let pid = c.prompt(&sid, "/feedback");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    c.wait_for("Usage: /feedback", Duration::from_secs(15));
+    let usage = frame_index(&c, "Usage: /feedback");
+    let start = Instant::now();
+    loop {
+        let after: Vec<String> = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .skip(usage + 1)
+            .filter(|f| f.contains("\"state_update\""))
+            .cloned()
+            .collect();
+        if let Some(state) = after.first() {
+            assert!(
+                state.contains("\"state\":\"running\""),
+                "a running turn keeps the session running: {state}"
+            );
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "no state after the feedback reply"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    c.finish();
+}
+
+#[test]
+fn a_resume_without_a_resolvable_root_still_runs_turns() {
+    let gone = fresh_workspace_dir("resume-gone-root").join("gone");
+    let mut c = Client::spawn(
+        "happy",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_WORKSPACE_ROOT", gone.to_str().unwrap()),
+        ],
+    );
+    c.initialize(1, "");
+    let load = c.req("session/load", "{\"sessionId\":\"msp-sess-1\"}");
+    let attached = c.wait_for(&format!("\"id\":{load}"), Duration::from_secs(15));
+    assert!(attached.contains("\"result\""), "{attached}");
+    for text in ["first", "second"] {
+        let prompt = c.prompt("msp-sess-1", text);
+        let done = c.wait_for(&format!("\"id\":{prompt}"), Duration::from_secs(15));
+        assert!(done.contains("end_turn"), "{done}");
+    }
+    let starts = host_requests(&c, "turn/start");
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    assert!(
+        starts.iter().all(|s| s.get("workspaceRoots").is_none()),
+        "an unresolvable primary root leaves the host on its own: {starts:?}"
+    );
+    c.finish();
+}
+
+#[test]
 fn feedback_outcomes_map_to_plain_language() {
     for (outcome, env, want) in [
         ("uploaded", vec![], "Feedback sent (id fixture-upload-1)."),
@@ -5976,23 +6104,15 @@ fn feedback_outcomes_map_to_plain_language() {
 
 #[test]
 fn feedback_host_errors_are_shown_not_swallowed() {
-    for (env, want) in [
-        (
-            vec![("FAKE_FEEDBACK_HOST_ERROR", "1")],
-            "Feedback was not sent: feedback upload failed.",
-        ),
-        (
-            vec![("FAKE_NO_FEEDBACK", "1")],
-            "Feedback was not sent: feedback/submit requires the feedback capability.",
-        ),
-    ] {
-        let mut c = Client::spawn("quiet", &env);
-        let sid = c.new_session(1, "");
-        let _pid = c.prompt(&sid, "/feedback bug x");
-        let message = c.wait_for(want, Duration::from_secs(15));
-        assert!(message.contains("agent_message_chunk"), "{message}");
-        c.finish();
-    }
+    let mut c = Client::spawn("quiet", &[("FAKE_FEEDBACK_HOST_ERROR", "1")]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "/feedback bug x");
+    let message = c.wait_for(
+        "Feedback was not sent: feedback upload failed.",
+        Duration::from_secs(15),
+    );
+    assert!(message.contains("agent_message_chunk"), "{message}");
+    c.finish();
 }
 
 #[test]
