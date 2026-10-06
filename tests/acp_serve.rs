@@ -48,6 +48,30 @@ fn fresh_state_dir() -> std::path::PathBuf {
     ))
 }
 
+/// A unique existing directory for workspace-roots tests.
+fn fresh_workspace_dir(label: &str) -> std::path::PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let dir = std::env::temp_dir().join(format!(
+        "muse-acp-roots-{label}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("workspace dir");
+    dir
+}
+
+/// Canonical path text as the host receives it (Windows drops the verbatim
+/// prefix on a plain drive path).
+fn canonical_text(path: &std::path::Path) -> String {
+    let canonical = std::fs::canonicalize(path).expect("canonical path");
+    let text = canonical.to_string_lossy().into_owned();
+    if cfg!(windows) {
+        text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
+    } else {
+        text
+    }
+}
+
 struct Client {
     child: Child,
     stdin: std::process::ChildStdin,
@@ -291,6 +315,33 @@ impl Client {
         }
     }
 
+    /// Wait for one frame that contains every needle (an AND match), for
+    /// frames whose full body matters, such as `config_option_update`.
+    fn wait_for_all(&self, needles: &[&str], timeout: Duration) -> String {
+        let start = Instant::now();
+        loop {
+            {
+                let frames = self.frames.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(frame) = frames
+                    .iter()
+                    .find(|frame| needles.iter().all(|needle| frame.contains(needle)))
+                {
+                    return frame.clone();
+                }
+            }
+            if start.elapsed() > timeout {
+                panic!(
+                    "timed out waiting for a frame containing {needles:?}; got:\n{}",
+                    self.frames
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .join("\n")
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn elicitation_frames(&self) -> Vec<String> {
         self.frames
             .lock()
@@ -472,8 +523,9 @@ fn usage_events_forward_msp_usage_as_acp_usage_update() {
         );
         // Two priced legs so far: (100·3 + 20·15)/1M + (1000·3 + 500·15)/1M.
         assert!(
-            update.contains("\"cost\":{\"amount\":0.0111,\"currency\":\"USD\"")
-                && update.contains("\"billing\":false"),
+            update.contains(
+                "\"cost\":{\"amount\":0.0111,\"currency\":\"USD\",\"_meta\":{\"muse\":{\"source\":\"adapter-estimate\",\"basis\":\"catalog-list-price\",\"billing\":false}}}"
+            ),
             "per-completion cost accumulated and labeled as an estimate: {update}"
         );
         // The unpriced (no modelId) leg advances totals but not cost.
@@ -506,6 +558,82 @@ fn usage_events_forward_msp_usage_as_acp_usage_update() {
         }
         c.finish();
     }
+}
+
+#[test]
+fn host_session_cost_replaces_the_adapter_estimate() {
+    // A 1.4.2 host that reports cost: the host figure wins, with its
+    // partial flag, and the local catalog estimate is not even computed into
+    // the frame.
+    for partial in [false, true] {
+        let mut c = Client::spawn(
+            "usage",
+            &[
+                ("FAKE_SERVER_VERSION", "1.4.2"),
+                ("FAKE_CUMULATIVE_COST", "1"),
+                ("FAKE_CUMULATIVE_PARTIAL", if partial { "1" } else { "0" }),
+            ],
+        );
+        let sid = c.new_session(1, "");
+        let _pid = c.prompt(&sid, "hi");
+        let update = c.wait_for("\"totalTokens\":7500", Duration::from_secs(15));
+        assert!(
+            update.contains(&format!(
+                "\"cost\":{{\"amount\":0.25,\"currency\":\"USD\",\"_meta\":{{\"muse\":{{\"source\":\"muse-host\",\"estimate\":true,\"partial\":{partial}}}}}"
+            )),
+            "host cost with partial={partial}: {update}"
+        );
+        assert!(
+            !update.contains("adapter-estimate"),
+            "the host figure replaces the local estimate: {update}"
+        );
+        c.finish();
+    }
+
+    // The same host class, but the cumulative object has no cost: nothing is
+    // sent, because the adapter's estimate is not the host's truth.
+    let mut c = Client::spawn("usage", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "hi");
+    let update = c.wait_for("\"totalTokens\":7500", Duration::from_secs(15));
+    assert!(
+        !update.contains("\"cost\""),
+        "a cost-reporting host without a price sends no cost: {update}"
+    );
+    c.finish();
+
+    // A host that predates host cost keeps the adapter's estimate, with its
+    // provenance inside `_meta`.
+    let mut c = Client::spawn("usage", &[("FAKE_SERVER_VERSION", "1.3.0")]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "hi");
+    let update = c.wait_for("\"totalTokens\":7500", Duration::from_secs(15));
+    assert!(
+        update.contains(
+            "\"cost\":{\"amount\":0.0111,\"currency\":\"USD\",\"_meta\":{\"muse\":{\"source\":\"adapter-estimate\",\"basis\":\"catalog-list-price\",\"billing\":false}}}"
+        ),
+        "{update}"
+    );
+    c.finish();
+}
+
+#[test]
+fn host_cache_totals_ride_the_cumulative_metadata() {
+    let mut c = Client::spawn(
+        "usage",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_CUMULATIVE_CACHE", "1"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "hi");
+    let update = c.wait_for("\"totalTokens\":7500", Duration::from_secs(15));
+    assert!(
+        update.contains("\"cacheReadTokens\":100") && update.contains("\"cacheWriteTokens\":25"),
+        "host cache splits must ride museCumulative: {update}"
+    );
+    c.finish();
 }
 
 #[test]
@@ -3934,12 +4062,19 @@ fn reasoning_effort_is_selected_and_sent_to_msp() {
         "1.2.1 max tier not selectable: {maxed}"
     );
     c.wait_log("session/setReasoningEffort", Duration::from_secs(15));
-    let changed = c.wait_for(
-        "\"sessionUpdate\":\"config_option_update\",\"configId\":\"reasoning_effort\",\"currentValue\":\"max\"",
+    // A host-side change must resend the complete selector list, not just the
+    // changed selector (ACP `config_option_update` requires `configOptions`).
+    let changed = c.wait_for_all(
+        &[
+            "\"sessionUpdate\":\"config_option_update\"",
+            "\"currentValue\":\"max\"",
+        ],
         Duration::from_secs(15),
     );
     assert!(
-        changed.contains("\"currentValue\":\"max\""),
+        changed.contains("\"configId\":\"mode\"")
+            && changed.contains("\"configId\":\"approval_mode\"")
+            && changed.contains("\"configId\":\"model\""),
         "host default change updates the selector: {changed}"
     );
 
@@ -3969,6 +4104,179 @@ fn reasoning_effort_is_selected_and_sent_to_msp() {
     assert!(
         reset.contains("\"error\"") && reset.contains("cannot be cleared"),
         "a standing host default cannot be reset: {reset}"
+    );
+    c.finish();
+}
+
+#[test]
+fn reasoning_selector_offers_only_the_models_tiers() {
+    let mut c = Client::spawn("quiet", &[]);
+    let _sid = c.new_session(2, "");
+    let frame = c.wait_for("\"configId\":\"reasoning_effort\"", Duration::from_secs(15));
+    let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    let option = value["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["configId"] == "reasoning_effort")
+        .expect("reasoning selector");
+    let values: Vec<&str> = option["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(values, vec!["default", "low", "medium", "high"], "{frame}");
+    assert_eq!(option["options"][1]["description"], "Quick answers");
+    assert_eq!(option["options"][3]["description"], "Deep reasoning");
+    assert_eq!(option["currentValue"], "default");
+    c.finish();
+}
+
+#[test]
+fn switching_models_resends_the_new_tier_list() {
+    let mut c = Client::spawn("quiet", &[("FAKE_SECOND_MODEL", "1")]);
+    let sid = c.new_session(2, "");
+    let id = c.req(
+        "session/set_config_option",
+        &serde_json::json!({"sessionId":sid,"configId":"model","value":"second-model"}).to_string(),
+    );
+    let done = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(done.contains("\"currentValue\":\"second-model\""), "{done}");
+    let changed = c.wait_for_all(
+        &[
+            "\"sessionUpdate\":\"config_option_update\"",
+            "\"currentValue\":\"second-model\"",
+        ],
+        Duration::from_secs(15),
+    );
+    let value: serde_json::Value = serde_json::from_str(&changed).unwrap();
+    let option = value["params"]["update"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["configId"] == "reasoning_effort")
+        .expect("reasoning selector");
+    let values: Vec<&str> = option["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        values,
+        vec!["default", "minimal", "high", "xhigh"],
+        "{changed}"
+    );
+    assert!(
+        changed.contains("Most thorough"),
+        "the new model's descriptions ride along: {changed}"
+    );
+    c.finish();
+}
+
+#[test]
+fn a_model_change_resets_an_unsupported_per_turn_tier() {
+    let mut c = Client::spawn("reasoning_legacy", &[("FAKE_SECOND_MODEL", "1")]);
+    let sid = c.new_session(2, "");
+    // The legacy host keeps "low" as a per-turn override (it serves
+    // fake-model's tiers). second-model does not serve it.
+    let set = c.req(
+        "session/set_config_option",
+        &serde_json::json!({"sessionId":sid,"configId":"reasoning_effort","value":"low"})
+            .to_string(),
+    );
+    let done = c.wait_for(&format!("\"id\":{set}"), Duration::from_secs(15));
+    assert!(done.contains("\"currentValue\":\"low\""), "{done}");
+    let switch = c.req(
+        "session/set_config_option",
+        &serde_json::json!({"sessionId":sid,"configId":"model","value":"second-model"}).to_string(),
+    );
+    c.wait_for(&format!("\"id\":{switch}"), Duration::from_secs(15));
+    c.wait_stderr("reset to Muse default", Duration::from_secs(15));
+    let changed = c.wait_for_all(
+        &[
+            "\"sessionUpdate\":\"config_option_update\"",
+            "\"currentValue\":\"default\"",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(
+        changed.contains("\"value\":\"xhigh\""),
+        "the second model's tiers are offered after the reset: {changed}"
+    );
+    c.finish();
+}
+
+#[test]
+fn unknown_variants_keep_the_fixed_tier_list() {
+    let mut c = Client::spawn("quiet", &[("FAKE_VARIANTS_UNKNOWN", "1")]);
+    let _sid = c.new_session(2, "");
+    let frame = c.wait_for("\"configId\":\"reasoning_effort\"", Duration::from_secs(15));
+    let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    let option = value["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["configId"] == "reasoning_effort")
+        .expect("reasoning selector");
+    let values: Vec<&str> = option["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["value"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        values,
+        vec![
+            "default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
+        ],
+        "a model that cannot describe its tiers keeps the full list: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn air_recommended_reasoning_falls_back_to_the_model_default() {
+    let mut c = Client::spawn("quiet", &[("FAKE_SECOND_MODEL", "1")]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"recommendedValue\"]}}}}",
+    );
+    let id = c.req(
+        "session/set_config_option",
+        &serde_json::json!({"sessionId":sid,"configId":"auto_review","value":"off"}).to_string(),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    let option = value["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["configId"] == "reasoning_effort")
+        .expect("reasoning selector");
+    assert_eq!(
+        option["_meta"]["jetbrains"]["air"]["recommendedValue"].as_str(),
+        Some("medium"),
+        "{frame}"
+    );
+    // Switching models moves the recommendation to the new model's default.
+    let switch = c.req(
+        "session/set_config_option",
+        &serde_json::json!({"sessionId":sid,"configId":"model","value":"second-model"}).to_string(),
+    );
+    let frame = c.wait_for(&format!("\"id\":{switch}"), Duration::from_secs(15));
+    let value: serde_json::Value = serde_json::from_str(&frame).unwrap();
+    let option = value["result"]["configOptions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["configId"] == "reasoning_effort")
+        .expect("reasoning selector");
+    assert_eq!(
+        option["_meta"]["jetbrains"]["air"]["recommendedValue"].as_str(),
+        Some("xhigh"),
+        "{frame}"
     );
     c.finish();
 }
@@ -4820,17 +5128,990 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 
 #[test]
 fn sdk_manifest_fingerprint_is_tested() {
-    // The vendored SDK manifest (a7c10c5) equals the live-validated
-    // 1.3.0-R3401.1 host surface.
+    // The vendored SDK manifest (bb44be3) equals the live-validated 1.4.2
+    // host surface.
     let mut c = Client::spawn(
         "quiet",
         &[(
             "FAKE_FINGERPRINT",
-            "sha256:7469c9e352e67def4a59df7e439984d7194fa351e1c8b7abb34060fd977ced81",
+            "sha256:61afea3112e0906e9dc3a536144278a74cb4b36fc6e20901a91d4432ba3568e2",
         )],
     );
     c.initialize(1, "");
     c.wait_stderr("status=tested", Duration::from_secs(10));
+    c.wait_stderr("validated against live host 1.4.2", Duration::from_secs(10));
+    c.finish();
+}
+
+#[test]
+fn host_feature_gates_follow_the_reported_muse_version() {
+    // Features are gated on `serverInfo.version`, not on the fingerprint
+    // table, and `session/delete` also needs a durable host.
+    for (version, durability, want) in [
+        (
+            None,
+            None,
+            "0.0.0-fixture session_delete=false workspace_roots=false session_cost=false",
+        ),
+        (
+            Some("1.3.0"),
+            None,
+            "1.3.0 session_delete=false workspace_roots=false session_cost=false",
+        ),
+        (
+            Some("1.4.1"),
+            Some("durable"),
+            "1.4.1 session_delete=true workspace_roots=true session_cost=false",
+        ),
+        (
+            Some("1.4.2-R4684.1"),
+            None,
+            "1.4.2-R4684.1 session_delete=true workspace_roots=true session_cost=true",
+        ),
+        (
+            Some("1.10.0"),
+            None,
+            "1.10.0 session_delete=true workspace_roots=true session_cost=true",
+        ),
+        (
+            Some("1.4.2"),
+            Some("ephemeral"),
+            "1.4.2 session_delete=false workspace_roots=true session_cost=true",
+        ),
+    ] {
+        let mut env = Vec::new();
+        if let Some(version) = version {
+            env.push(("FAKE_SERVER_VERSION", version));
+        }
+        if let Some(durability) = durability {
+            env.push(("FAKE_SESSION_DURABILITY", durability));
+        }
+        let mut c = Client::spawn("quiet", &env);
+        c.initialize(1, "");
+        c.wait_stderr(
+            &format!("host-features server=muse-session-server-fixture/{want}"),
+            Duration::from_secs(10),
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn session_delete_is_advertised_only_where_the_host_supports_it() {
+    // ACP v1 advertises `session/delete` in agentCapabilities.
+    // sessionCapabilities; v2 in capabilities.session. It needs Muse 1.4.1+
+    // and a durable host (a memory-only host has nothing to delete).
+    for ver in [1u64, 2] {
+        let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+        let id = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"delete\":{}"),
+            "delete capability missing in v{ver}: {frame}"
+        );
+        c.finish();
+    }
+    for env in [
+        vec![("FAKE_SERVER_VERSION", "1.3.0")],
+        vec![
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_DURABILITY", "ephemeral"),
+        ],
+    ] {
+        let mut c = Client::spawn("quiet", &env);
+        let id = c.req("initialize", "{\"protocolVersion\":1}");
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            !frame.contains("\"delete\":{}"),
+            "delete advertised without host support: {frame}"
+        );
+        c.finish();
+    }
+}
+
+/// A session id in the durable UUID shape `session/delete` requires. The
+/// fixture's default session id ("msp-sess-1") is deliberately not a UUID:
+/// MSP session ids are UUIDv7, and the adapter never asks a host to delete
+/// anything else.
+const DELETE_SESSION_ID: &str = "01a10c8b-5a52-7c3d-8b6e-1f2a3b4c5d6e";
+
+#[test]
+fn session_delete_waits_for_the_host_terminal_and_removes_the_session() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_DELAY_MS", "400"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    assert_eq!(sid, DELETE_SESSION_ID);
+    let del = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    // The MSP admission ack is not the outcome. No ACP answer may arrive
+    // before the host's deleteCompleted notification.
+    std::thread::sleep(Duration::from_millis(150));
+    {
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            !frames.iter().any(|f| f.contains(&format!("\"id\":{del}"))),
+            "session/delete answered before the host terminal: {frames:?}"
+        );
+    }
+    let done = c.wait_for(&format!("\"id\":{del}"), Duration::from_secs(15));
+    assert!(done.contains("\"result\":{}"), "{done}");
+    let list = c.req("session/list", "{}");
+    let listed = c.wait_for(&format!("\"id\":{list}"), Duration::from_secs(15));
+    assert!(
+        !listed.contains(&sid),
+        "deleted session still listed: {listed}"
+    );
+    let prompt = c.prompt(&sid, "still there?");
+    let refused = c.wait_for(&format!("\"id\":{prompt}"), Duration::from_secs(15));
+    assert!(refused.contains("unknown sessionId"), "{refused}");
+    c.finish();
+}
+
+#[test]
+fn session_delete_of_missing_or_already_deleted_sessions_succeeds() {
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+    c.new_session(1, "");
+    let ghost = c.req("session/delete", "{\"sessionId\":\"not-a-session\"}");
+    let frame = c.wait_for(&format!("\"id\":{ghost}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\":{}"), "{frame}");
+    assert!(
+        host_requests(&c, "session/delete").is_empty(),
+        "a non-UUID session id must not reach the host"
+    );
+    c.finish();
+
+    // A session another client already deleted is rejected at admission with
+    // `session_deleted`; ACP wants that to succeed silently.
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_REJECT", "session_deleted"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let id = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\":{}"), "{frame}");
+    c.finish();
+}
+
+#[test]
+fn resume_of_a_deleted_session_reports_not_found() {
+    let mut c = Client::spawn("quiet", &[("FAKE_RESUME_NOT_FOUND", "1")]);
+    c.initialize(1, "");
+    let id = c.req(
+        "session/resume",
+        &format!("{{\"sessionId\":\"{DELETE_SESSION_ID}\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("-32002") && frame.contains("session not found (it may have been deleted)"),
+        "{frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_delete_of_an_unknown_uuid_uses_the_host_existence_check() {
+    // Muse reports a never-existed id exactly like a real session the host
+    // cannot prove it owns. The adapter then asks the host's own filtered
+    // listing; a missing session succeeds silently.
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_OUTCOME", "failed"),
+            ("FAKE_DELETE_REASON", "ownershipUnavailable"),
+        ],
+    );
+    c.new_session(1, "");
+    let ghost = "01a10c8b-1111-7222-8333-444455556666";
+    let id = c.req("session/delete", &format!("{{\"sessionId\":\"{ghost}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\":{}"), "{frame}");
+    let probes = host_requests(&c, "session/list");
+    assert!(
+        probes
+            .iter()
+            .any(|p| p.get("filter").and_then(|f| f.get("sessionId")).is_some()),
+        "no sessionId existence probe: {probes:?}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_delete_reports_an_existing_session_the_host_cannot_own() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_OUTCOME", "failed"),
+            ("FAKE_DELETE_REASON", "ownershipUnavailable"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let id = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("-32603"), "{frame}");
+    assert!(
+        frame.contains("\"reason\":\"ownershipUnavailable\"")
+            && frame.contains("\"physicalChange\":\"none\""),
+        "typed evidence missing: {frame}"
+    );
+    assert!(frame.contains("cannot prove it owns"), "{frame}");
+    assert!(!frame.contains("may already be removed"), "{frame}");
+    c.finish();
+}
+
+#[test]
+fn session_delete_reports_running_work_and_possible_data_loss() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_OUTCOME", "failed"),
+            ("FAKE_DELETE_REASON", "writerBusy"),
+            ("FAKE_DELETE_PHYSICAL", "possible"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let id = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("work is still running in it. Stop it and try again."),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("Some of its data may already be removed."),
+        "possible data loss must be said out loud: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_delete_reports_a_host_busy_with_the_session() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_REJECT", "runtime_busy"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let id = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("-32603"), "{frame}");
+    assert!(frame.contains("Muse is busy with this session"), "{frame}");
+    c.finish();
+}
+
+#[test]
+fn concurrent_session_deletes_share_one_host_command() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_DELAY_MS", "400"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let first = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let second = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    for id in [first, second] {
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\":{}"), "{frame}");
+    }
+    assert_eq!(
+        host_requests(&c, "session/delete").len(),
+        1,
+        "a second delete for the same session must join the first"
+    );
+    c.finish();
+}
+
+#[test]
+fn host_exit_with_a_pending_delete_settles_it() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+            ("FAKE_DELETE_EXIT", "1"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let id = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("-32603"), "{frame}");
+    assert!(
+        frame.contains("Muse exited before it confirmed the deletion"),
+        "{frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_list_pages_do_not_repeat_a_held_session() {
+    let mut c = Client::spawn("session_list_pagination", &[]);
+    let sid = c.new_session(1, "");
+    let first = c.req("session/list", "{}");
+    let page1 = c.wait_for(&format!("\"id\":{first}"), Duration::from_secs(15));
+    assert!(
+        page1.contains(&format!("\"sessionId\":\"{sid}\"")),
+        "the held session belongs on the first page: {page1}"
+    );
+    let second = c.req("session/list", "{\"cursor\":\"page-2\"}");
+    let page2 = c.wait_for(&format!("\"id\":{second}"), Duration::from_secs(15));
+    assert!(
+        !page2.contains(&format!("\"sessionId\":\"{sid}\"")),
+        "a held session repeated on a later page: {page2}"
+    );
+    assert!(page2.contains("stored-201"), "{page2}");
+    c.finish();
+}
+
+#[test]
+fn session_list_with_a_rejected_cursor_is_an_error() {
+    let mut c = Client::spawn("quiet", &[("FAKE_LIST_REJECT_CURSOR", "1")]);
+    c.initialize(1, "");
+    let id = c.req("session/list", "{\"cursor\":\"stale\"}");
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("-32602") && frame.contains("invalid cursor"),
+        "a rejected cursor must surface: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_list_skips_rows_without_a_workspace_root() {
+    let mut c = Client::spawn("quiet", &[("FAKE_LIST_NULL_ROOT", "1")]);
+    c.initialize(1, "");
+    let id = c.req("session/list", "{}");
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        !frame.contains("msp-sess-noroot"),
+        "a row without an absolute cwd cannot be an ACP row: {frame}"
+    );
+    c.wait_stderr(
+        "session/list skipped 1 row(s) without a workspace root",
+        Duration::from_secs(15),
+    );
+    c.finish();
+}
+
+#[test]
+fn session_new_sends_canonical_workspace_roots() {
+    let primary = fresh_workspace_dir("primary");
+    let extra1 = fresh_workspace_dir("extra-1");
+    let extra2 = fresh_workspace_dir("extra-2");
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+    let sid = c.new_session_at(1, &primary, &[&extra1, &extra2]);
+    assert!(!sid.is_empty());
+    let starts = host_requests(&c, "session/start");
+    assert_eq!(starts.len(), 1, "{starts:?}");
+    let roots: Vec<String> = starts[0]["workspaceRoots"]
+        .as_array()
+        .expect("workspaceRoots on session/start")
+        .iter()
+        .map(|root| root.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        roots,
+        vec![
+            canonical_text(&primary),
+            canonical_text(&extra1),
+            canonical_text(&extra2)
+        ],
+        "the host must see canonical roots in request order"
+    );
+    c.finish();
+}
+
+#[test]
+fn session_new_rejects_a_missing_additional_directory() {
+    let primary = fresh_workspace_dir("primary");
+    let missing = fresh_workspace_dir("missing").join("gone");
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+    c.initialize(1, "");
+    let id = c.req(
+        "session/new",
+        &serde_json::json!({
+            "cwd": primary.to_str().unwrap(),
+            "additionalDirectories": [missing.to_str().unwrap()],
+        })
+        .to_string(),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("-32602"), "{frame}");
+    assert!(
+        frame.contains("gone") && frame.contains("not an existing directory"),
+        "the error must name the offending entry: {frame}"
+    );
+    assert!(
+        host_requests(&c, "session/start").is_empty(),
+        "a refused session must never reach the host"
+    );
+    c.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn session_new_deduplicates_canonical_roots() {
+    let primary = fresh_workspace_dir("primary");
+    let real = fresh_workspace_dir("real");
+    let link = fresh_workspace_dir("link-parent").join("linked");
+    std::os::unix::fs::symlink(&real, &link).expect("symlink");
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+    c.new_session_at(1, &primary, &[&real, &link]);
+    let starts = host_requests(&c, "session/start");
+    let roots = starts[0]["workspaceRoots"].as_array().expect("roots");
+    assert_eq!(
+        roots.len(),
+        2,
+        "the symlink resolves to the same folder and must be dropped: {roots:?}"
+    );
+    assert_eq!(roots[1].as_str().unwrap(), canonical_text(&real));
+    c.finish();
+}
+
+#[test]
+fn the_first_turn_after_load_replaces_the_root_set() {
+    let workspace = fresh_workspace_dir("resume");
+    let mut c = Client::spawn(
+        "happy",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_WORKSPACE_ROOT", workspace.to_str().unwrap()),
+        ],
+    );
+    c.initialize(1, "");
+    let load = c.req("session/load", "{\"sessionId\":\"msp-sess-1\"}");
+    let attached = c.wait_for(&format!("\"id\":{load}"), Duration::from_secs(15));
+    assert!(attached.contains("\"result\""), "{attached}");
+    for text in ["first", "second"] {
+        let prompt = c.prompt("msp-sess-1", text);
+        let done = c.wait_for(&format!("\"id\":{prompt}"), Duration::from_secs(15));
+        assert!(done.contains("end_turn"), "{done}");
+    }
+    let starts = host_requests(&c, "turn/start");
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    // Omitting the field on a load activates no extra roots, so the next
+    // turn must explicitly replace the sticky set with the primary root.
+    assert_eq!(
+        starts[0]["workspaceRoots"],
+        serde_json::json!([canonical_text(&workspace)]),
+        "{:?}",
+        starts[0]
+    );
+    assert!(
+        starts[1].get("workspaceRoots").is_none(),
+        "the replacement is a one-shot: {:?}",
+        starts[1]
+    );
+    c.finish();
+}
+
+#[test]
+fn a_resumed_session_sends_its_extra_roots_on_the_first_turn() {
+    let workspace = fresh_workspace_dir("resume-with-extras");
+    let extra = fresh_workspace_dir("resume-extra");
+    let mut c = Client::spawn(
+        "happy",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_WORKSPACE_ROOT", workspace.to_str().unwrap()),
+        ],
+    );
+    c.initialize(1, "");
+    let load = c.req(
+        "session/load",
+        &serde_json::json!({
+            "sessionId": "msp-sess-1",
+            "cwd": workspace.to_str().unwrap(),
+            "additionalDirectories": [extra.to_str().unwrap()],
+        })
+        .to_string(),
+    );
+    let attached = c.wait_for(&format!("\"id\":{load}"), Duration::from_secs(15));
+    assert!(attached.contains("\"result\""), "{attached}");
+    let prompt = c.prompt("msp-sess-1", "first");
+    c.wait_for(&format!("\"id\":{prompt}"), Duration::from_secs(15));
+    let starts = host_requests(&c, "turn/start");
+    assert_eq!(
+        starts[0]["workspaceRoots"],
+        serde_json::json!([canonical_text(&workspace), canonical_text(&extra)]),
+        "{:?}",
+        starts[0]
+    );
+    c.finish();
+}
+
+#[test]
+fn resume_rejects_a_missing_additional_directory_before_the_host_call() {
+    let workspace = fresh_workspace_dir("resume-missing");
+    let missing = fresh_workspace_dir("missing-extra").join("gone");
+    let mut c = Client::spawn(
+        "happy",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_WORKSPACE_ROOT", workspace.to_str().unwrap()),
+        ],
+    );
+    c.initialize(1, "");
+    let id = c.req(
+        "session/load",
+        &serde_json::json!({
+            "sessionId": "msp-sess-1",
+            "cwd": workspace.to_str().unwrap(),
+            "additionalDirectories": [missing.to_str().unwrap()],
+        })
+        .to_string(),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("-32602"), "{frame}");
+    assert!(frame.contains("gone"), "{frame}");
+    assert!(
+        host_requests(&c, "session/resume").is_empty(),
+        "a refused load must never reach the host"
+    );
+    c.finish();
+}
+
+#[test]
+fn steering_never_carries_workspace_roots() {
+    let extra = fresh_workspace_dir("steer-extra");
+    let workspace = fresh_workspace_dir("steer-workspace");
+    let mut c = Client::spawn(
+        "resume_active",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_WORKSPACE_ROOT", workspace.to_str().unwrap()),
+        ],
+    );
+    let init = c.req("initialize", "{\"protocolVersion\":2}");
+    c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    c.notify("initialized", "{}");
+    let resume = c.req(
+        "session/resume",
+        &serde_json::json!({
+            "sessionId": "existing-session",
+            "cwd": workspace.to_str().unwrap(),
+            "additionalDirectories": [extra.to_str().unwrap()],
+        })
+        .to_string(),
+    );
+    let resumed = c.wait_for(&format!("\"id\":{resume}"), Duration::from_secs(15));
+    assert!(resumed.contains("\"result\""), "{resumed}");
+    let steer = c.req(
+        "_session/steering",
+        "{\"sessionId\":\"existing-session\",\"prompt\":[{\"type\":\"text\",\"text\":\"continue\"}]}",
+    );
+    let steered = c.wait_for(&format!("\"id\":{steer}"), Duration::from_secs(15));
+    assert!(steered.contains("\"outcome\":\"injected\""), "{steered}");
+    let steers = host_requests(&c, "turn/steer");
+    assert_eq!(steers.len(), 1, "{steers:?}");
+    assert!(
+        steers[0].get("workspaceRoots").is_none(),
+        "steering may not carry a sticky replacement: {:?}",
+        steers[0]
+    );
+    // Steering does not consume the pending replacement: a real user turn
+    // still carries the full set.
+    let prompt = c.prompt("existing-session", "for real");
+    c.wait_input("\"workspaceRoots\"", Duration::from_secs(15));
+    let starts = host_requests(&c, "turn/start");
+    assert_eq!(
+        starts[0]["workspaceRoots"],
+        serde_json::json!([canonical_text(&workspace), canonical_text(&extra)]),
+        "{:?}",
+        starts[0]
+    );
+    let _ = prompt;
+    c.finish();
+}
+
+#[test]
+fn older_hosts_never_receive_workspace_roots() {
+    let primary = fresh_workspace_dir("legacy-primary");
+    let extra = fresh_workspace_dir("legacy-extra");
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.3.0")]);
+    c.new_session_at(1, &primary, &[&extra]);
+    let starts = host_requests(&c, "session/start");
+    assert!(
+        starts[0].get("workspaceRoots").is_none(),
+        "a 1.3.0 host must not receive workspaceRoots: {:?}",
+        starts[0]
+    );
+    c.wait_stderr(
+        "does not support workspaceRoots (needs 1.4.1)",
+        Duration::from_secs(15),
+    );
+    c.finish();
+}
+
+#[test]
+fn feedback_is_advertised_only_with_the_host_grant() {
+    for (env, expected) in [(vec![], true), (vec![("FAKE_NO_FEEDBACK", "1")], false)] {
+        let mut c = Client::spawn("quiet", &env);
+        let _sid = c.new_session(1, "");
+        let commands = c.wait_for("available_commands_update", Duration::from_secs(15));
+        assert_eq!(
+            commands.contains("\"name\":\"feedback\""),
+            expected,
+            "feedback advertising must follow the grant: {commands}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn feedback_form_collects_consent_and_submits() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let pid = c.prompt(&sid, "/feedback bug it broke");
+    let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+    assert!(
+        form.contains("\"default\":\"bug\"") && form.contains("\"default\":\"it broke\""),
+        "the argument seeds the form defaults: {form}"
+    );
+    assert!(
+        form.contains("\"default\":false"),
+        "attachments must default off: {form}"
+    );
+    assert!(
+        form.contains("Include local tracing") && form.contains("Attach the session record"),
+        "both consents must be explicit: {form}"
+    );
+    let form_id = extract_str(&form, "id").expect("feedback form id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"classification\":\"bug\",\"note\":\"it broke\",\"withFiles\":false,\"attachSessionRecord\":false}}}}}}"
+    ));
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let sent = c.wait_for(
+        "Feedback sent (id fixture-upload-1)",
+        Duration::from_secs(15),
+    );
+    assert!(sent.contains("agent_message_chunk"), "{sent}");
+    let submitted = host_requests(&c, "feedback/submit");
+    assert_eq!(submitted.len(), 1, "{submitted:?}");
+    assert_eq!(submitted[0]["classification"], "bug");
+    assert_eq!(submitted[0]["note"], "it broke");
+    assert_eq!(submitted[0]["withFiles"], false);
+    assert_eq!(submitted[0]["attachSessionRecord"], false);
+    assert_eq!(submitted[0]["sessionId"], sid);
+    c.finish();
+}
+
+#[test]
+fn feedback_form_sends_exactly_the_consented_attachments() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "/feedback bad the answer was wrong");
+    let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let form_id = extract_str(&form, "id").expect("feedback form id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"classification\":\"badResult\",\"note\":\"the answer was wrong\",\"withFiles\":true,\"attachSessionRecord\":true}}}}}}"
+    ));
+    c.wait_for(
+        "Feedback sent (id fixture-upload-1)",
+        Duration::from_secs(15),
+    );
+    let submitted = host_requests(&c, "feedback/submit");
+    assert_eq!(submitted.len(), 1, "{submitted:?}");
+    assert_eq!(submitted[0]["classification"], "badResult");
+    assert_eq!(submitted[0]["withFiles"], true);
+    assert_eq!(submitted[0]["attachSessionRecord"], true);
+    c.finish();
+}
+
+#[test]
+fn declined_feedback_form_sends_nothing() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let pid = c.prompt(&sid, "/feedback bug nope");
+    let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let form_id = extract_str(&form, "id").expect("feedback form id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"decline\"}}}}"
+    ));
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let message = c.wait_for("Feedback not sent.", Duration::from_secs(15));
+    assert!(message.contains("agent_message_chunk"), "{message}");
+    assert!(
+        host_requests(&c, "feedback/submit").is_empty(),
+        "a declined form must never submit"
+    );
+    c.finish();
+}
+
+#[test]
+fn feedback_form_requires_local_tracing_for_the_session_record() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "/feedback bug needs a trace");
+    let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let form_id = extract_str(&form, "id").expect("feedback form id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"classification\":\"bug\",\"note\":\"needs a trace\",\"withFiles\":false,\"attachSessionRecord\":true}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    assert!(
+        forms[1].contains("requires local tracing"),
+        "the correction must explain the rule: {forms:?}"
+    );
+    assert!(
+        host_requests(&c, "feedback/submit").is_empty(),
+        "an invalid consent combination must not submit"
+    );
+    // The corrected second form keeps the note default.
+    let second_id = extract_str(&forms[1], "id").expect("second form id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{second_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"classification\":\"bug\",\"note\":\"needs a trace\",\"withFiles\":true,\"attachSessionRecord\":true}}}}}}"
+    ));
+    c.wait_for(
+        "Feedback sent (id fixture-upload-1)",
+        Duration::from_secs(15),
+    );
+    let submitted = host_requests(&c, "feedback/submit");
+    assert_eq!(submitted.len(), 1, "{submitted:?}");
+    assert_eq!(submitted[0]["attachSessionRecord"], true);
+    assert_eq!(submitted[0]["withFiles"], true);
+    c.finish();
+}
+
+#[test]
+fn feedback_without_forms_uses_the_classified_syntax() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "/feedback bad something went wrong");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "{done}");
+    c.wait_for(
+        "Feedback sent (id fixture-upload-1)",
+        Duration::from_secs(15),
+    );
+    let submitted = host_requests(&c, "feedback/submit");
+    assert_eq!(submitted.len(), 1, "{submitted:?}");
+    assert_eq!(submitted[0]["classification"], "badResult");
+    assert_eq!(submitted[0]["note"], "something went wrong");
+    assert_eq!(submitted[0]["withFiles"], false);
+    assert_eq!(submitted[0]["attachSessionRecord"], false);
+    c.finish();
+}
+
+#[test]
+fn feedback_without_an_argument_ends_with_usage() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "/feedback");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "{done}");
+    c.wait_for("Usage: /feedback", Duration::from_secs(15));
+    assert!(host_requests(&c, "feedback/submit").is_empty());
+    c.finish();
+}
+
+#[test]
+fn feedback_without_the_grant_reaches_the_host_as_a_prompt() {
+    let mut c = Client::spawn("happy", &[("FAKE_NO_FEEDBACK", "1")]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "/feedback bug it broke");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "{done}");
+    c.wait_input("/feedback bug it broke", Duration::from_secs(15));
+    assert!(
+        host_requests(&c, "feedback/submit").is_empty(),
+        "without the grant the adapter must not intercept /feedback"
+    );
+    c.finish();
+}
+
+#[test]
+fn feedback_in_read_only_mode_goes_to_the_session_host() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(1, "");
+    set_session_mode(&mut c, &sid, "readOnly");
+    c.wait_log("ro:session/resume", Duration::from_secs(15));
+    let pid = c.prompt(&sid, "/feedback bug it broke");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    c.wait_log("ro:feedback/submit", Duration::from_secs(15));
+    c.wait_for(
+        "Feedback sent (id fixture-upload-1)",
+        Duration::from_secs(15),
+    );
+    assert!(
+        !fake_methods(&c).iter().any(|m| m == "feedback/submit"),
+        "the main host does not own a read-only session"
+    );
+    c.finish();
+}
+
+#[test]
+fn a_second_feedback_form_is_refused_while_one_is_open() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let first = c.prompt(&sid, "/feedback bug first");
+    let form = c.wait_for("elicitation/create", Duration::from_secs(15));
+    let form_id = extract_str(&form, "id").expect("feedback form id");
+    let second = c.prompt(&sid, "/feedback bug second");
+    let refused = c.wait_for(&format!("\"id\":{second}"), Duration::from_secs(15));
+    assert!(
+        refused.contains("-32602") && refused.contains("already open"),
+        "{refused}"
+    );
+    // The first form still settles its own prompt.
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"classification\":\"bug\",\"note\":\"first\",\"withFiles\":false,\"attachSessionRecord\":false}}}}}}"
+    ));
+    c.wait_for(&format!("\"id\":{first}"), Duration::from_secs(15));
+    c.wait_for(
+        "Feedback sent (id fixture-upload-1)",
+        Duration::from_secs(15),
+    );
+    let submitted = host_requests(&c, "feedback/submit");
+    assert_eq!(submitted.len(), 1, "{submitted:?}");
+    assert_eq!(submitted[0]["note"], "first");
+    c.finish();
+}
+
+#[test]
+fn feedback_during_a_running_turn_keeps_the_session_running() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let _work = c.prompt(&sid, "long work");
+    c.wait_for("\"state\":\"running\"", Duration::from_secs(15));
+    let pid = c.prompt(&sid, "/feedback");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    c.wait_for("Usage: /feedback", Duration::from_secs(15));
+    let usage = frame_index(&c, "Usage: /feedback");
+    let start = Instant::now();
+    loop {
+        let after: Vec<String> = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .skip(usage + 1)
+            .filter(|f| f.contains("\"state_update\""))
+            .cloned()
+            .collect();
+        if let Some(state) = after.first() {
+            assert!(
+                state.contains("\"state\":\"running\""),
+                "a running turn keeps the session running: {state}"
+            );
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "no state after the feedback reply"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    c.finish();
+}
+
+#[test]
+fn a_resume_without_a_resolvable_root_still_runs_turns() {
+    let gone = fresh_workspace_dir("resume-gone-root").join("gone");
+    let mut c = Client::spawn(
+        "happy",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_WORKSPACE_ROOT", gone.to_str().unwrap()),
+        ],
+    );
+    c.initialize(1, "");
+    let load = c.req("session/load", "{\"sessionId\":\"msp-sess-1\"}");
+    let attached = c.wait_for(&format!("\"id\":{load}"), Duration::from_secs(15));
+    assert!(attached.contains("\"result\""), "{attached}");
+    for text in ["first", "second"] {
+        let prompt = c.prompt("msp-sess-1", text);
+        let done = c.wait_for(&format!("\"id\":{prompt}"), Duration::from_secs(15));
+        assert!(done.contains("end_turn"), "{done}");
+    }
+    let starts = host_requests(&c, "turn/start");
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    assert!(
+        starts.iter().all(|s| s.get("workspaceRoots").is_none()),
+        "an unresolvable primary root leaves the host on its own: {starts:?}"
+    );
+    c.finish();
+}
+
+#[test]
+fn feedback_outcomes_map_to_plain_language() {
+    for (outcome, env, want) in [
+        ("uploaded", vec![], "Feedback sent (id fixture-upload-1)."),
+        (
+            "rateLimited",
+            vec![],
+            "rate limited, try again in 5 seconds",
+        ),
+        (
+            "noCredential",
+            vec![],
+            "Feedback was not sent (noCredential: fixture cause).",
+        ),
+        (
+            "dark",
+            vec![],
+            "Feedback was not sent (dark: fixture cause).",
+        ),
+        (
+            "trackingFailed",
+            vec![],
+            "Feedback was sent, but Muse could not confirm the receipt (trackingFailed).",
+        ),
+        ("mystery", vec![], "Feedback was not sent (mystery)."),
+        (
+            "recorded",
+            vec![("FAKE_FEEDBACK_NOTES", "1")],
+            "Feedback recorded.",
+        ),
+    ] {
+        let mut env = env;
+        env.push(("FAKE_FEEDBACK_OUTCOME", outcome));
+        let mut c = Client::spawn("quiet", &env);
+        let sid = c.new_session(1, "");
+        let _pid = c.prompt(&sid, "/feedback other a note");
+        let message = c.wait_for(want, Duration::from_secs(15));
+        assert!(message.contains("agent_message_chunk"), "{message}");
+        if outcome == "recorded" {
+            assert!(
+                message.contains("A local copy is at /tmp/fixture-feedback.zip.")
+                    && message.contains("Session note from the fixture")
+                    && message.contains("Tracing note from the fixture"),
+                "receipt notes ride the message: {message}"
+            );
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn feedback_host_errors_are_shown_not_swallowed() {
+    let mut c = Client::spawn("quiet", &[("FAKE_FEEDBACK_HOST_ERROR", "1")]);
+    let sid = c.new_session(1, "");
+    let _pid = c.prompt(&sid, "/feedback bug x");
+    let message = c.wait_for(
+        "Feedback was not sent: feedback upload failed.",
+        Duration::from_secs(15),
+    );
+    assert!(message.contains("agent_message_chunk"), "{message}");
     c.finish();
 }
 
@@ -7274,7 +8555,13 @@ fn emitted_frames_conform_to_the_vendored_schema() {
     };
 
     // Drive one broad session touching the main command families.
-    let mut c = Client::spawn("approval", &[]);
+    let mut c = Client::spawn(
+        "approval",
+        &[
+            ("FAKE_SERVER_VERSION", "1.4.2"),
+            ("FAKE_SESSION_ID", DELETE_SESSION_ID),
+        ],
+    );
     let caps = ",\"capabilities\":{\"elicitation\":{\"form\":{}},\"subagents\":{}}";
     let sid = c.new_session(2, caps);
     let _pid = c.prompt(&sid, "needs approval");
@@ -7315,6 +8602,8 @@ fn emitted_frames_conform_to_the_vendored_schema() {
     );
     c.wait_for(&format!("\"id\":{oid}"), Duration::from_secs(15));
     c.req("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let did = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_for(&format!("\"id\":{did}"), Duration::from_secs(15));
     let frames_path = format!("{}.frames", c.fake_log);
     c.finish();
 
@@ -7370,6 +8659,7 @@ fn emitted_frames_conform_to_the_vendored_schema() {
         "goal/set",
         "goal/pause",
         "session/rename",
+        "session/delete",
     ] {
         assert!(
             methods.contains(expected),
@@ -8075,9 +9365,12 @@ fn resumed_active_prompt_cannot_be_unqueued() {
 }
 
 #[test]
-fn session_list_stream_updates_titles_filters_rows_and_unloads_sessions() {
-    // The delay separates the fake's "sent" marker from the notification, so
-    // the test must wait for the adapter to apply the close.
+fn session_list_stream_updates_titles_filters_rows_and_keeps_unloaded_sessions() {
+    // MSP `session/closed` unloads a session from the host; it does not
+    // delete it. The log stays on disk and `session/resume` reloads it, so the
+    // session must stay listed. The delay separates the fake's "sent" marker
+    // from the notification, so the test must wait for the adapter to apply
+    // the unload.
     let mut c = Client::spawn("session_list_stream", &[("FAKE_CLOSE_DELAY_MS", "300")]);
     let sid = c.new_session(1, "");
     c.wait_frame_contains("sessionListStream", Duration::from_secs(15));
@@ -8097,18 +9390,55 @@ fn session_list_stream_updates_titles_filters_rows_and_unloads_sessions() {
         "unrelated streamed row leaked: {filtered}"
     );
     // The fake's "sent" marker precedes delivery; wait until the adapter has
-    // applied the close, or the next listing races the notification.
+    // applied the unload, or the next listing races the notification.
     c.wait_stderr(
-        "session list row closed: session=msp-sess-1",
+        "session unloaded by Muse: session=msp-sess-1 reason=idle",
         Duration::from_secs(15),
     );
 
     let listed_id = c.req("session/list", "{}");
     let listed = c.wait_for(&format!("\"id\":{listed_id}"), Duration::from_secs(15));
     assert!(
-        !listed.contains(&sid),
-        "closed streamed row was resurrected: {listed}"
+        listed.contains(&format!("\"sessionId\":\"{sid}\"")),
+        "an unloaded session must stay listed: {listed}"
     );
+    assert!(
+        listed.contains("Renamed elsewhere"),
+        "the unload must keep the streamed row: {listed}"
+    );
+    c.finish();
+}
+
+#[test]
+fn experimental_mcp_oauth_completion_is_logged_and_ignored() {
+    // The adapter negotiates `experimentalApi`, so another client's MCP OAuth
+    // terminal reaches it (the fixture sends it only to an experimental
+    // connection). It has an explicit arm, not the unhandled path, and
+    // nothing reaches the editor.
+    let mut c = Client::spawn("mcp_oauth_completed", &[]);
+    c.new_session(1, "");
+    c.wait_stderr(
+        "MCP OAuth login completed elsewhere (ignored): server=fixture-mcp outcome=granted",
+        Duration::from_secs(15),
+    );
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap();
+    assert!(
+        !stderr.contains("unhandled MSP notification: mcpServer/oauthLoginCompleted"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("fixture login detail"),
+        "the free-text message must not be logged: {stderr}"
+    );
+    // A request round trip drains anything the notification could have sent.
+    let barrier = c.req("session/list", "{}");
+    c.wait_for(&format!("\"id\":{barrier}"), Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(!frames.contains("fixture-mcp"), "{frames}");
     c.finish();
 }
 
@@ -8344,7 +9674,15 @@ fn reasoning_recommendations_require_negotiation_and_host_default_facts() {
                 .unwrap();
             assert_eq!(
                 option["_meta"]["jetbrains"]["air"]["recommendedValue"].as_str(),
-                (negotiated && default).then_some("high"),
+                if !negotiated {
+                    None
+                } else if default {
+                    Some("high")
+                } else {
+                    // No host recommendation: fall back to the current
+                    // model's catalog default.
+                    Some("medium")
+                },
                 "{frame}"
             );
             // A user selection must stay selected even while an earlier host
@@ -8365,7 +9703,13 @@ fn reasoning_recommendations_require_negotiation_and_host_default_facts() {
             assert_eq!(option["currentValue"], "low", "{frame}");
             assert_eq!(
                 option["_meta"]["jetbrains"]["air"]["recommendedValue"].as_str(),
-                (negotiated && default).then_some("high"),
+                if !negotiated {
+                    None
+                } else if default {
+                    Some("high")
+                } else {
+                    Some("medium")
+                },
                 "{frame}"
             );
             c.finish();
@@ -8595,9 +9939,16 @@ fn bare_plan_switches_to_plan_without_a_turn() {
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
     assert!(!frame.contains("\"error\""), "{frame}");
     c.wait_for("Plan mode is on", Duration::from_secs(15));
-    c.wait_for(
-        "\"sessionUpdate\":\"config_option_update\",\"configId\":\"mode\",\"currentValue\":\"plan\"",
+    let moved = c.wait_for_all(
+        &[
+            "\"sessionUpdate\":\"config_option_update\"",
+            "\"currentValue\":\"plan\"",
+        ],
         Duration::from_secs(15),
+    );
+    assert!(
+        moved.contains("\"configId\":\"reasoning_effort\""),
+        "the mode move must resend the full selector list: {moved}"
     );
     assert!(
         !fake_methods(&c).iter().any(|m| m.ends_with("turn/start")),

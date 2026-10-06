@@ -527,6 +527,413 @@ fn cancel_stops_a_streaming_turn() {
 }
 
 #[test]
+fn host_feature_gates_read_the_installed_muse_version() {
+    if !enabled("host_feature_gates_read_the_installed_muse_version") {
+        return;
+    }
+    // Session delete, workspace roots, and host cost are gated on the
+    // reported `serverInfo.version`. A version the gate cannot read would
+    // silently turn them all off, so the real host's version must parse and
+    // give the gates the release that added each feature.
+    let host = Host::start(json!({}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, label) = adapter_host_release(&adapter);
+    // `muse serve` without --no-session-log is durable.
+    let want = format!(
+        "host-features server={label} session_delete={} workspace_roots={} session_cost={}",
+        release >= (1, 4, 1),
+        release >= (1, 4, 1),
+        release >= (1, 4, 2)
+    );
+    let log = std::fs::read_to_string(&adapter.log).unwrap();
+    assert!(log.contains(&want), "expected {want:?} in:\n{log}");
+    adapter.finish();
+}
+
+/// The Muse release and full label the adapter reported for its host, read
+/// from its own `host-ready` line.
+fn adapter_host_release(adapter: &Adapter) -> ((u64, u64, u64), String) {
+    let log = std::fs::read_to_string(&adapter.log).unwrap();
+    let label = log
+        .lines()
+        .find_map(|line| line.split("host-ready server=").nth(1))
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap_or_else(|| panic!("no host-ready line:\n{log}"))
+        .to_string();
+    let version = label.rsplit('/').next().unwrap();
+    let parts: Vec<u64> = version
+        .split(|c: char| !c.is_ascii_digit())
+        .take(3)
+        .map(|part| {
+            part.parse()
+                .unwrap_or_else(|_| panic!("unreadable host version {version:?}"))
+        })
+        .collect();
+    assert_eq!(parts.len(), 3, "unreadable host version {version:?}");
+    ((parts[0], parts[1], parts[2]), label)
+}
+
+/// Returns the adapter when the host is new enough, else closes it and
+/// reports the skip. Feature tests use this instead of an assertion so CI's
+/// older pinned builds report a skip, not a failure.
+fn require_release(
+    adapter: Adapter,
+    release: (u64, u64, u64),
+    want: (u64, u64, u64),
+    test: &str,
+) -> Option<Adapter> {
+    if release < want {
+        eprintln!("skipped {test}: host release {release:?} predates {want:?}");
+        adapter.finish();
+        return None;
+    }
+    Some(adapter)
+}
+
+/// The live host's own model catalog, fetched over a direct MSP handshake in
+/// the same throwaway environment the adapter uses.
+fn host_catalog(host: &Host) -> Vec<Value> {
+    let home = host.dir.join("home");
+    let mut command = Command::new(muse_cli());
+    command.env_clear();
+    for name in KEPT_ENV {
+        if let Some(value) = std::env::var_os(name) {
+            command.env(name, value);
+        }
+    }
+    if cfg!(target_os = "macos") {
+        command.env("TBH_CREDENTIAL_BACKEND", "file");
+    }
+    let mut child = command
+        .env("MUSE_NO_AUTO_UPDATE", "1")
+        .env("XDG_CONFIG_HOME", host.dir.join("config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_STATE_HOME", home.join(".local/state"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        .env("HOME", &home)
+        .current_dir(host.workspace())
+        .arg("serve")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn a probe muse serve");
+    let mut stdin = child.stdin.take().unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    let wait_for =
+        |lines: &mut std::io::Lines<BufReader<std::process::ChildStdout>>, id: u64| -> Value {
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                assert!(
+                    Instant::now() < deadline,
+                    "probe host never answered request {id}"
+                );
+                let Some(Ok(line)) = lines.next() else {
+                    panic!("probe host closed before answering request {id}");
+                };
+                let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if frame["id"] == id && frame.get("method").is_none() {
+                    return frame;
+                }
+            }
+        };
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "clientInfo": {"name": "muse_acp_probe", "version": "0"},
+            "capabilities": {"experimentalApi": true},
+        }})
+    )
+    .unwrap();
+    let init = wait_for(&mut lines, 1);
+    assert!(init.get("error").is_none(), "probe initialize: {init}");
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        "{}",
+        json!({"jsonrpc": "2.0", "id": 2, "method": "model/list", "params": {}})
+    )
+    .unwrap();
+    let catalog = wait_for(&mut lines, 2);
+    assert!(
+        catalog.get("error").is_none(),
+        "probe model/list: {catalog}"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    catalog["result"]["models"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[test]
+fn session_delete_removes_a_fresh_session() {
+    let test = "session_delete_removes_a_fresh_session";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 1), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.prompt(&session, "say hello [[script:hello]]");
+    assert_eq!(adapter.result(id)["stopReason"], "end_turn");
+    let delete = adapter.request("session/delete", json!({"sessionId": session}));
+    let response = adapter.response(delete);
+    if let Some(error) = response.get("error") {
+        // macOS Muse 1.4.2 can fail a fresh delete's cleanup after removing
+        // some data; the adapter must surface the host's evidence rather than
+        // claim the session was deleted. Any other failure is a regression.
+        #[cfg(not(target_os = "macos"))]
+        panic!("a fresh session must delete: {response} ({error})");
+        #[cfg(target_os = "macos")]
+        {
+            let reason = error["data"]["reason"].as_str().unwrap_or("");
+            let message = error["message"].as_str().unwrap_or("");
+            match reason {
+                // A background reminder observer can still be finishing, so
+                // the host refuses the delete as busy.
+                "writerBusy" | "quiescenceFailed" => assert!(
+                    message.contains("work is still running"),
+                    "busy refusal mapped: {error}"
+                ),
+                "cleanupIncomplete" => assert!(
+                    message.contains("Some of its data may already be removed."),
+                    "cleanup refusal mapped: {error}"
+                ),
+                other => panic!("unexpected fresh-delete refusal on macOS: {other} ({response})"),
+            }
+            adapter.finish();
+            return;
+        }
+    }
+    assert_eq!(response["result"], json!({}), "a fresh session must delete");
+    let list = adapter.request(
+        "session/list",
+        json!({"cwd": host.workspace().to_string_lossy()}),
+    );
+    let listed = adapter.result(list);
+    assert!(
+        !listed["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["sessionId"] == session),
+        "a deleted session must not be listed: {listed}"
+    );
+    let load = adapter.request("session/load", json!({"sessionId": session}));
+    let response = adapter.response(load);
+    let error = response
+        .get("error")
+        .expect("loading a deleted session fails");
+    assert_eq!(error["code"], -32002, "{error}");
+    assert!(
+        error["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("may have been deleted"),
+        "{error}"
+    );
+    adapter.finish();
+}
+
+#[test]
+fn session_delete_of_an_earlier_run_reports_ownership() {
+    let test = "session_delete_of_an_earlier_run_reports_ownership";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    let session = {
+        let adapter = Adapter::launch(&host);
+        let (release, _) = adapter_host_release(&adapter);
+        let Some(mut adapter) = require_release(adapter, release, (1, 4, 1), test) else {
+            return;
+        };
+        let session = adapter.new_session(&host, json!([]));
+        let id = adapter.prompt(&session, "say hello [[script:hello]]");
+        assert_eq!(adapter.result(id)["stopReason"], "end_turn");
+        adapter.finish();
+        session
+    };
+    // A second adapter run starts a new muse serve process, which cannot
+    // always prove it owns the earlier process's logs. Muse 1.4.x either
+    // refuses with `ownershipUnavailable` or, when the log is provably
+    // ownerless, completes the delete; both are honest outcomes.
+    let mut adapter = Adapter::launch(&host);
+    let delete = adapter.request("session/delete", json!({"sessionId": session}));
+    let response = adapter.response(delete);
+    match response.get("error") {
+        Some(error) => {
+            assert_eq!(error["code"], -32603, "{error}");
+            assert_eq!(error["data"]["reason"], "ownershipUnavailable", "{error}");
+            assert!(
+                error["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("cannot prove it owns"),
+                "{error}"
+            );
+        }
+        None => assert_eq!(response["result"], json!({}), "{response}"),
+    }
+    adapter.finish();
+}
+
+#[test]
+fn session_delete_of_an_unknown_uuid_succeeds() {
+    let test = "session_delete_of_an_unknown_uuid_succeeds";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 1), test) else {
+        return;
+    };
+    let _session = adapter.new_session(&host, json!([]));
+    let ghost = "01a10c8b-2222-7333-8444-555566667777";
+    let delete = adapter.request("session/delete", json!({"sessionId": ghost}));
+    let response = adapter.response(delete);
+    if release >= (1, 4, 2) {
+        assert!(
+            response.get("error").is_none(),
+            "list filters prove a session never existed: {response}"
+        );
+        assert_eq!(response["result"], json!({}));
+    } else {
+        // 1.4.1 has no `session/list` filters, so the host's
+        // `ownershipUnavailable` terminal cannot be told apart from a real
+        // session it cannot prove it owns. Reporting the refusal is the
+        // honest answer; claiming success could hide a kept session.
+        let error = response
+            .get("error")
+            .expect("without list filters the absence cannot be proven");
+        assert_eq!(error["data"]["reason"], "ownershipUnavailable", "{error}");
+    }
+    adapter.finish();
+}
+
+#[test]
+fn workspace_roots_let_muse_read_an_extra_directory() {
+    let test = "workspace_roots_let_muse_read_an_extra_directory";
+    if !enabled(test) {
+        return;
+    }
+    let extra = std::env::temp_dir().join(format!(
+        "muse-acp-live-extra-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&extra);
+    std::fs::create_dir_all(&extra).unwrap();
+    std::fs::write(extra.join("secret.txt"), "extra-root-secret\n").unwrap();
+    let secret = extra.join("secret.txt");
+    let host = Host::start(
+        json!({"read": {"tool": {"name": "read_file", "arguments": {
+            "path": secret.to_string_lossy(),
+        }}}}),
+        None,
+    );
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 1), test) else {
+        return;
+    };
+    let id = adapter.request(
+        "session/new",
+        json!({
+            "cwd": host.workspace(),
+            "additionalDirectories": [extra],
+            "mcpServers": [],
+        }),
+    );
+    let session = adapter.result(id)["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    adapter.turn(&session, "read the secret [[script:read]]");
+    let results = tool_results(&host);
+    assert!(
+        results
+            .iter()
+            .any(|result| result.contains("extra-root-secret")),
+        "Muse's own read tool must see the extra root: {results:?}"
+    );
+    adapter.finish();
+    let _ = std::fs::remove_dir_all(&extra);
+}
+
+#[test]
+fn reasoning_selector_matches_the_live_model_catalog() {
+    let test = "reasoning_selector_matches_the_live_model_catalog";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({}), None);
+    let mut adapter = Adapter::launch(&host);
+    let session = adapter.new_session(&host, json!([]));
+    let frame = adapter.wait("the session/new result", |frame| {
+        frame["result"]["sessionId"] == session
+    });
+    let options = frame["result"]["configOptions"].as_array().unwrap();
+    let model = options
+        .iter()
+        .find(|option| option["configId"] == "model" || option["id"] == "model")
+        .unwrap()["currentValue"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let reasoning = options
+        .iter()
+        .find(|option| {
+            option["configId"] == "reasoning_effort" || option["id"] == "reasoning_effort"
+        })
+        .unwrap();
+    let values: Vec<&str> = reasoning["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|option| option["value"].as_str().unwrap())
+        .collect();
+    let catalog = host_catalog(&host);
+    let row = catalog
+        .iter()
+        .find(|row| row["modelId"] == model.as_str())
+        .unwrap_or_else(|| panic!("no catalog row for {model}: {catalog:?}"));
+    let want: Vec<&str> = match row["variants"].as_array() {
+        Some(variants) => variants.iter().map(|v| v.as_str().unwrap()).collect(),
+        // A catalog that cannot describe its tiers keeps the fixed list.
+        None => vec![
+            "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+        ],
+    };
+    let have: Vec<&str> = values.iter().copied().filter(|v| *v != "default").collect();
+    assert_eq!(
+        have, want,
+        "selector vs live catalog for {model}: {reasoning}"
+    );
+    assert_eq!(values[0], "default", "{reasoning}");
+    adapter.finish();
+}
+
+#[test]
 fn a_restarted_adapter_loads_the_session_with_its_history() {
     if !enabled("a_restarted_adapter_loads_the_session_with_its_history") {
         return;

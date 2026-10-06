@@ -215,6 +215,12 @@ impl Hosts {
         lock(&self.owners).get(msp_sid).copied()
     }
 
+    /// Forgets a session Muse deleted, so no later command routes to the
+    /// host that used to hold it.
+    pub fn forget_owner(&self, msp_sid: &str) {
+        lock(&self.owners).remove(msp_sid);
+    }
+
     pub fn owner(&self, msp_sid: &str) -> HostKind {
         lock(&self.owners)
             .get(msp_sid)

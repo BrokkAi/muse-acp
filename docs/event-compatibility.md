@@ -33,16 +33,19 @@ client-to-server entry; all other rows below are emitted by the MSP host.
 | `item/updated` | Mapped to ACP | Upserts the corresponding ACP item from its higher-revision snapshot. |
 | `session/approvalModeChanged` | Internally tracked | Updates the selected approval-mode value used in later ACP configuration snapshots. |
 | `session/branchChanged` | Mapped to ACP | Stores the latest branch fact and emits it in `session/update` metadata together with the current goal. |
+| `session/closed` | Consumed | Logs the unload and its reason. An unload is not a deletion: the session is `notLoaded`, its log stays on disk, and `session/resume` reloads it, so it stays in ACP `session/list`. |
 | `session/contextUsage` | Mapped to ACP | Replaces the tracked context occupancy and emits ACP `usage_update` with used tokens, window size, and Muse pressure metadata. |
+| `session/deleteCompleted` | Mapped to ACP | Settles a pending ACP `session/delete` with `{}` on `completed`, or an error carrying the host's reason and physical-change evidence on `failed`. A `failed` terminal whose filtered listing shows the session is gone counts as success; an unknown outcome leaves the request pending. A completed delete also removes the session from ACP `session/list`. |
 | `session/goalChanged` | Mapped to ACP | Stores replacement-or-clear semantics and emits the goal in `session/update` metadata together with branch state. |
 | `session/listChanged` | Mapped to ACP | Replaces a cached list row when `sessionListStream` is granted; pushes a changed active-session title through `session_info_update`. |
-| `session/modelChanged` | Internally tracked | Updates the selected model value used in later ACP configuration snapshots. |
+| `session/modelChanged` | Mapped to ACP | Updates the selected model value, resets a held per-turn reasoning tier the new model does not serve, and resends the complete `configOptions` list. |
 | `session/modelRouteUnserved` | Intentionally ignored | No ACP mapping; the unhandled-notification path logs a diagnostic. |
 | `session/nameChanged` | Mapped to ACP | Updates host title facts and publishes a changed title through `session_info_update`. |
 | `session/reasoningEffortChanged` | Mapped to ACP | Updates the standing reasoning default and emits `config_option_update`; negotiated recommendations require a host `default` or `policy` source. |
+| `session/started` | Internally tracked | Caches the new session's list row when Muse grants `sessionListStream`. The row may arrive before or after the `session/start` result. Clients still request `session/list` to discover membership changes. |
 | `session/statusChanged` | Mapped to ACP | Publishes host status and attention metadata and ACP v2 state; directs pending-request reconciliation without inventing unknown status values. |
 | `session/todoListChanged` | Mapped to ACP | Replaces the ACP plan with the reported todo list; an empty list clears the plan. |
-| `session/tokenUsage` | Mapped to ACP | Deduplicates completion usage, tracks cumulative and per-turn totals, estimates catalog-priced cost when possible, and emits ACP `usage_update` once context occupancy is known. |
+| `session/tokenUsage` | Mapped to ACP | Deduplicates completion usage, tracks cumulative, cache, and per-turn totals, prefers the host's own session `cost` (with its partial flag) over the catalog estimate on hosts that report it, and emits ACP `usage_update` once context occupancy is known. |
 | `session/viewHealthChanged` | Consumed | Logs the view health and reason with guidance to reattach through resume. |
 | `skill/changed` | Mapped to ACP | Refreshes `skill/list` and the ACP available-command catalog. |
 | `turn/completed` | Mapped to ACP | Settles the matching ACP prompt, reports its stop reason and per-turn usage, and moves ACP v2 to idle when no work remains. Failures also receive host detail. |
@@ -59,15 +62,15 @@ client-to-server entry; all other rows below are emitted by the MSP host.
 ## Host-emitted extensions
 
 These notifications are handled by the adapter but are absent from the
-vendored schema's `notifications` index. The [Muse 1.3.0 disposition
+vendored stable schema's `notifications` index. They belong to Muse's
+experimental surface, which reaches the adapter because it connects with
+`experimentalApi` (needed for `account/read`). The [Muse 1.3.0 disposition
 matrix](../ROADMAP.md#9-richer-event-compatibility-matrix) also records host methods,
-errors, and deliberate omissions; the vendored schema is not the complete
-surface of newer hosts.
+errors, and deliberate omissions.
 
 | MSP notification | Disposition | ACP behavior |
 | --- | --- | --- |
-| `session/started` | Internally tracked | Caches a new session-list row when Muse grants `sessionListStream`. Clients still request `session/list` to discover membership changes. |
-| `session/closed` | Internally tracked | Removes the list row and records a tombstone when `sessionListStream` is granted. |
+| `mcpServer/oauthLoginCompleted` | Intentionally ignored | The terminal of an MCP OAuth login, sent to every experimental connection. The adapter never starts such a login, so it logs the server name and outcome (never the free-text message) and sends nothing to the editor. |
 
 ## Server-initiated requests
 

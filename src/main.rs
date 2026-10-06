@@ -57,15 +57,30 @@ const FILE_REPORT_MAX_ENCODED_PATH_BYTES: usize = 255 * 1024;
 /// The host's live `session/list` rows, keyed by durable MSP session id.
 ///
 /// A row is always replaced as a whole when `session/listChanged` arrives.
-/// Closed ids stay as tombstones for this adapter connection so a stale paged
-/// `session/list` response cannot resurrect an unloaded session.
+/// Deleted ids stay as tombstones for this adapter connection so a stale paged
+/// `session/list` response cannot resurrect a deleted session. MSP
+/// `session/closed` is not a deletion: it only unloads the session from the
+/// host, the log stays on disk, and the session stays listed.
 #[derive(Default)]
 struct SessionListCache {
     rows: HashMap<String, J>,
-    closed: std::collections::HashSet<String>,
+    deleted: std::collections::HashSet<String>,
 }
 
 type SessionLists = Arc<Mutex<SessionListCache>>;
+
+/// One in-flight MSP `session/delete`. The host answers the request with an
+/// admission ack and reports the outcome later as `session/deleteCompleted`,
+/// so the ACP request stays pending until that terminal arrives. Every ACP
+/// `session/delete` for the same session joins the first one's command.
+struct PendingDelete {
+    waiters: Vec<J>,
+    msp_sid: String,
+    host_kind: HostKind,
+}
+
+static DELETES: LazyLock<Mutex<HashMap<String, PendingDelete>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn session_row_id(row: &J) -> Option<&str> {
     row.get("sessionId")
@@ -86,21 +101,11 @@ fn cache_session_row(lists: &SessionLists, row: &J) -> Option<(Option<String>, O
     let id = session_row_id(row)?.to_string();
     let title = title_facts(Some(row)).selected().map(str::to_string);
     let mut cache = lists.lock().unwrap_or_else(|p| p.into_inner());
-    cache.closed.remove(&id);
     let previous_title = cache
         .rows
         .insert(id, row.clone())
         .and_then(|previous| title_facts(Some(&previous)).selected().map(str::to_string));
     Some((previous_title, title))
-}
-
-fn cache_session_closed(lists: &SessionLists, msp_sid: &str) {
-    if msp_sid.is_empty() {
-        return;
-    }
-    let mut cache = lists.lock().unwrap_or_else(|p| p.into_inner());
-    cache.rows.remove(msp_sid);
-    cache.closed.insert(msp_sid.to_string());
 }
 
 /// True when the client's `_meta.jetbrains.air.capabilities` advertises a key.
@@ -370,9 +375,7 @@ fn send_file_report(stdout: &StdoutShared, acp_sid: &str, report: FileChangeRepo
     acp::send_raw(stdout, &line);
 }
 /// Last successful model catalog, used only when a refresh fails.
-/// Rows are (modelId, displayLabel, isDefault).
-static CATALOG: std::sync::OnceLock<Mutex<Vec<(String, String, bool)>>> =
-    std::sync::OnceLock::new();
+static CATALOG: std::sync::OnceLock<Mutex<Vec<acp::CatalogModel>>> = std::sync::OnceLock::new();
 /// Per-model catalog rates, parsed once per refresh for client-local math.
 #[derive(Debug, Clone, PartialEq)]
 struct CostRate {
@@ -705,6 +708,34 @@ fn reasoning_effort_override(s: &AcpSession) -> Option<String> {
         .then(|| s.reasoning_effort.clone())
 }
 
+/// A model change can leave the held per-turn tier outside the new model's
+/// known `variants`. Reset the override to Muse default so the adapter never
+/// sends a tier the model does not serve. A model whose catalog row does not
+/// publish tiers cannot disagree, so nothing resets. Returns true when the
+/// override was reset.
+fn reset_unsupported_reasoning_tier(
+    sessions: &Sessions,
+    acp_sid: &str,
+    model: &str,
+    models: &[acp::CatalogModel],
+) -> bool {
+    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(s) = map.get_mut(acp_sid) else {
+        return false;
+    };
+    let unsupported = reasoning_effort_override(s).is_some_and(|effort| {
+        models
+            .iter()
+            .find(|row| row.id == model)
+            .and_then(|row| row.variants.as_ref())
+            .is_some_and(|variants| !variants.iter().any(|tier| tier == &effort))
+    });
+    if unsupported {
+        s.reasoning_effort = acp::REASONING_DEFAULT.to_string();
+    }
+    unsupported
+}
+
 fn reasoning_effort_param(effort: Option<&str>) -> String {
     effort
         .map(|value| format!(",\"reasoningEffort\":{}", esc(value)))
@@ -745,6 +776,22 @@ fn adopt_cumulative(s: &mut AcpSession, c: &J) {
     s.cum_prompt = c.get("promptTokens").and_then(|v| v.as_u64());
     s.cum_output = c.get("outputTokens").and_then(|v| v.as_u64());
     s.cum_total = c.get("totalTokens").and_then(|v| v.as_u64());
+    s.cum_cache_read = c.get("cacheReadTokens").and_then(|v| v.as_u64());
+    s.cum_cache_write = c.get("cacheWriteTokens").and_then(|v| v.as_u64());
+    // The host's own cost replaces the previous value whenever a cumulative
+    // object arrives (it can go down), and an object without `cost` clears
+    // it: the host is the pricing authority on the hosts that report it.
+    s.host_cost = c.get("cost").and_then(|cost| {
+        let usd = match cost.get("usd") {
+            Some(J::Num(n)) => n.parse::<f64>().ok(),
+            _ => None,
+        }?;
+        let partial = match cost.get("partial") {
+            Some(J::Bool(value)) => *value,
+            _ => return None,
+        };
+        Some((usd, partial))
+    });
 }
 
 /// Validate the stable fields of the Muse 1.3.0 `SubscriptionUsage` object
@@ -792,7 +839,12 @@ fn read_subscription_usage(host: &Arc<Hosts>) -> Option<Option<String>> {
 /// Store a subscription snapshot and expose it on the next valid ACP usage
 /// frame. A session without context occupancy gets a metadata-only update so
 /// the adapter never invents `used` or `size` just to show the host fact.
-fn adopt_subscription_usage(stdout: &StdoutShared, s: &mut AcpSession, next: Option<String>) {
+fn adopt_subscription_usage(
+    stdout: &StdoutShared,
+    s: &mut AcpSession,
+    next: Option<String>,
+    host_reports_cost: bool,
+) {
     if s.subscription_usage == next {
         return;
     }
@@ -802,7 +854,7 @@ fn adopt_subscription_usage(stdout: &StdoutShared, s: &mut AcpSession, next: Opt
         if clear {
             acp::send_subscription_usage(stdout, s, true);
         }
-        acp::send_usage(stdout, s, None);
+        acp::send_usage(stdout, s, None, host_reports_cost);
     } else {
         acp::send_subscription_usage(stdout, s, clear);
     }
@@ -820,7 +872,7 @@ fn refresh_subscription_usage(
     };
     let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     if let Some(s) = map.get_mut(acp_sid) {
-        adopt_subscription_usage(stdout, s, next);
+        adopt_subscription_usage(stdout, s, next, host.handshake().reports_session_cost());
     }
 }
 
@@ -833,7 +885,12 @@ fn refresh_all_subscription_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sess
     };
     let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     for s in map.values_mut() {
-        adopt_subscription_usage(stdout, s, next.clone());
+        adopt_subscription_usage(
+            stdout,
+            s,
+            next.clone(),
+            host.handshake().reports_session_cost(),
+        );
     }
 }
 
@@ -1050,11 +1107,16 @@ fn backfill_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions,
         acp::send_session_title(stdout, acp_sid, name.as_deref());
     }
     if adopted {
-        acp::send_usage(stdout, s, pressure.as_deref());
+        acp::send_usage(
+            stdout,
+            s,
+            pressure.as_deref(),
+            host.handshake().reports_session_cost(),
+        );
     }
 }
 
-fn catalog(host: &Arc<Hosts>) -> Vec<(String, String, bool)> {
+fn catalog(host: &Arc<Hosts>) -> Vec<acp::CatalogModel> {
     let cell = CATALOG.get_or_init(|| Mutex::new(Vec::new()));
     // MSP exposes a point-in-time snapshot, with no catalog subscription.
     // Refresh whenever we return config options: a nonempty startup catalog
@@ -1099,7 +1161,60 @@ fn catalog(host: &Arc<Hosts>) -> Vec<(String, String, bool)> {
         {
             rates.insert(id.clone(), parsed);
         }
-        out.push((id, label, def));
+        // `variants` is the model's tier list, or the string "unknown" when
+        // the catalog cannot describe it. Tiers outside MSP's closed
+        // `ReasoningEffort` set are skipped rather than offered.
+        let variants = match m.get("variants") {
+            Some(J::Arr(values)) => {
+                let mut tiers = Vec::new();
+                for value in values {
+                    let Some(tier) = value.as_str() else {
+                        continue;
+                    };
+                    if !acp::is_reasoning_effort(tier) {
+                        log(&format!(
+                            "model {id}: ignoring unknown reasoning variant {tier:?}"
+                        ));
+                        continue;
+                    }
+                    if !tiers.iter().any(|known| known == tier) {
+                        tiers.push(tier.to_string());
+                    }
+                }
+                Some(tiers)
+            }
+            _ => None,
+        };
+        let mut tier_descriptions = Vec::new();
+        if let Some(J::Arr(rows)) = m.get("reasoningEffortVariants") {
+            for row in rows {
+                let Some(tier) = row.get("tier").and_then(J::as_str) else {
+                    continue;
+                };
+                if !acp::is_reasoning_effort(tier) {
+                    continue;
+                }
+                let description = row
+                    .get("description")
+                    .and_then(J::as_str)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_string);
+                tier_descriptions.push((tier.to_string(), description));
+            }
+        }
+        let default_effort = m
+            .get("defaultReasoningEffort")
+            .and_then(J::as_str)
+            .filter(|tier| acp::is_reasoning_effort(tier))
+            .map(str::to_string);
+        out.push(acp::CatalogModel {
+            id,
+            label,
+            is_default: def,
+            variants,
+            tier_descriptions,
+            default_effort,
+        });
     }
     let source = r.get("source").and_then(J::as_str).unwrap_or("unknown");
     log(&format!(
@@ -1204,11 +1319,17 @@ enum LoopMsg {
 /// ACP initialize payloads. `session_mcp` is the host's `sessionMcp` grant:
 /// with it, client stdio and HTTP MCP servers are forwarded to Muse. Without
 /// it no MCP transport is advertised beyond the stdio support ACP v1 always
-/// implies, and client servers are dropped.
-fn v2_init(session_mcp: bool) -> String {
-    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
+/// implies, and client servers are dropped. `session_delete` is the host's
+/// MSP `session/delete` support (Muse 1.4.1+ and a durable profile); clients
+/// must not call `session/delete` unless it is advertised.
+fn v2_init(session_mcp: bool, session_delete: bool) -> String {
+    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v2())
+        .replace(
+            "__DELETE__",
+            if session_delete { r#""delete":{},"# } else { "" },
+        )
         .replace(
             "__MCP__",
             if session_mcp {
@@ -1219,18 +1340,22 @@ fn v2_init(session_mcp: bool) -> String {
         )
 }
 
-fn v1_init(session_mcp: bool) -> String {
-    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}},"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__}}"#
+fn v1_init(session_mcp: bool, session_delete: bool) -> String {
+    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v1())
         .replace("__MCP_HTTP__", if session_mcp { "true" } else { "false" })
+        .replace(
+            "__DELETE__",
+            if session_delete { r#","delete":{}"# } else { "" },
+        )
 }
 
-fn send_initialize(stdout: &StdoutShared, id: &Option<J>, session_mcp: bool) {
+fn send_initialize(stdout: &StdoutShared, id: &Option<J>, session_mcp: bool, session_delete: bool) {
     if negotiated_ver() == 2 {
-        acp::send_result(stdout, id, &v2_init(session_mcp));
+        acp::send_result(stdout, id, &v2_init(session_mcp, session_delete));
     } else {
-        acp::send_result(stdout, id, &v1_init(session_mcp));
+        acp::send_result(stdout, id, &v1_init(session_mcp, session_delete));
     }
 }
 
@@ -1242,7 +1367,7 @@ fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
     match msg.get("method").and_then(J::as_str) {
         Some("initialize") => {
             negotiate_acp(msg);
-            send_initialize(stdout, &id, false);
+            send_initialize(stdout, &id, false, false);
         }
         Some(method @ ("shutdown" | "exit")) => {
             if method == "shutdown" {
@@ -1401,6 +1526,100 @@ fn same_workspace_root(left: &str, right: &str) -> bool {
     }
 }
 
+/// Canonical path text the host accepts. On Windows, `canonicalize` returns a
+/// verbatim `\\?\C:\...` path; strip the prefix back to the plain drive form
+/// so what the adapter sends matches what the host itself reports.
+fn host_path_string(path: &Path) -> String {
+    let text = path.to_string_lossy().into_owned();
+    #[cfg(windows)]
+    if let Some(rest) = text.strip_prefix(r"\\?\") {
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            return rest.to_string();
+        }
+    }
+    text
+}
+
+/// Canonical MSP `workspaceRoots` for a session: the primary root first, then
+/// each extra root. Every entry must name an existing directory; canonical
+/// duplicates are dropped keeping the first occurrence, which ACP allows
+/// because it never expands scope.
+fn host_workspace_roots(cwd: &str, extras: &[String]) -> Result<Vec<String>, String> {
+    let mut seen: Vec<PathBuf> = Vec::new();
+    let mut roots = Vec::new();
+    let entries = std::iter::once(("params.cwd", cwd)).chain(
+        extras
+            .iter()
+            .map(|root| ("params.additionalDirectories", root.as_str())),
+    );
+    for (label, path) in entries {
+        let resolved = std::fs::canonicalize(path)
+            .map_err(|e| format!("{label} entry is not an existing directory: {path} ({e})"))?;
+        if !resolved.is_dir() {
+            return Err(format!(
+                "{label} entry is not an existing directory: {path}"
+            ));
+        }
+        if seen.iter().any(|seen| seen == &resolved) {
+            continue;
+        }
+        roots.push(host_path_string(&resolved));
+        seen.push(resolved);
+    }
+    Ok(roots)
+}
+
+/// Validate the extra roots of a load, resume, or fork before any host call.
+/// The request may omit `cwd` (the host's own workspace root is used once it
+/// answers), so only the extras can be checked up front.
+fn validate_host_extra_roots(extras: &[String]) -> Result<(), String> {
+    for path in extras {
+        let resolved = std::fs::canonicalize(path).map_err(|e| {
+            format!("params.additionalDirectories entry is not an existing directory: {path} ({e})")
+        })?;
+        if !resolved.is_dir() {
+            return Err(format!(
+                "params.additionalDirectories entry is not an existing directory: {path}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `,"workspaceRoots":[...]` for MSP `session/start` and `turn/start`.
+fn workspace_roots_param(roots: Option<&[String]>) -> String {
+    match roots {
+        Some(roots) => format!(
+            ",\"workspaceRoots\":[{}]",
+            roots
+                .iter()
+                .map(|root| esc(root))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        None => String::new(),
+    }
+}
+
+static LEGACY_ROOTS_LOGGED: LazyLock<Mutex<std::collections::HashSet<String>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
+
+/// Log once per session that this host cannot see the extra roots: on older
+/// hosts the adapter still confines itself to them, but Muse's own tools only
+/// see the primary root.
+fn log_legacy_workspace_roots(msp_sid: &str, cwd: &str) {
+    let first = LEGACY_ROOTS_LOGGED
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(msp_sid.to_string());
+    if first {
+        log(&format!(
+            "this Muse host does not support workspaceRoots (needs 1.4.1); Muse's own tools only see {cwd}"
+        ));
+    }
+}
+
 fn same_workspace_roots(left: &[String], right: &[String]) -> bool {
     left.len() == right.len()
         && left
@@ -1520,13 +1739,14 @@ fn restart_unsaved_session(
     msp_sid: &str,
     mcp_servers: Option<&str>,
 ) -> Result<J, J> {
-    let (cwd, approval, model, reasoning) = sessions
+    let (cwd, roots, approval, model, reasoning) = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(acp_sid)
         .map(|s| {
             (
                 s.cwd.clone(),
+                s.roots.clone(),
                 s.mode_value.clone(),
                 s.model_value.clone(),
                 s.reasoning_effort_source
@@ -1535,16 +1755,22 @@ fn restart_unsaved_session(
             )
         })
         .ok_or_else(|| msp::mk_err(-32602, "unknown sessionId"))?;
+    let start_roots = if hosts.handshake().supports_workspace_roots() && roots.len() > 1 {
+        host_workspace_roots(&cwd, &roots[1..]).map_err(|message| msp::mk_err(-32602, &message))?
+    } else {
+        Vec::new()
+    };
     let cmd = hosts.mint_cmd("cmd-");
     let r = hosts.command(
         "session/start",
         &format!(
-            "{{\"commandId\":{},\"sessionId\":{},\"workspaceRoot\":{},\"approvalMode\":{}{}}}",
+            "{{\"commandId\":{},\"sessionId\":{},\"workspaceRoot\":{},\"approvalMode\":{}{}{}}}",
             esc(&cmd),
             esc(msp_sid),
             esc(&cwd),
             esc(&approval),
-            mcp_config_field(mcp_servers)
+            mcp_config_field(mcp_servers),
+            workspace_roots_param((!start_roots.is_empty()).then_some(start_roots.as_slice()))
         ),
     )?;
     let started = r
@@ -1714,7 +1940,16 @@ fn resolve_fork_cut_point(
 fn selftest() -> i32 {
     // Validate every static emitted literal with our own parser, so a
     // misplaced brace fails here instead of at a live client.
-    for lit in [v2_init(true), v2_init(false), v1_init(true), v1_init(false)] {
+    for lit in [
+        v2_init(true, true),
+        v2_init(true, false),
+        v2_init(false, true),
+        v2_init(false, false),
+        v1_init(true, true),
+        v1_init(true, false),
+        v1_init(false, true),
+        v1_init(false, false),
+    ] {
         if let Err(e) = parse_json(&lit) {
             eprintln!("[muse-acp] selftest FAIL: {e} in {lit}");
             return 1;
@@ -2138,6 +2373,11 @@ fn recover_read_only_host(
     why: &str,
 ) {
     log(&format!("read-only serve host gone ({why})"));
+    fail_pending_deletes_for(
+        stdout,
+        HostKind::ReadOnly,
+        "Muse exited before it confirmed the deletion. List sessions to see whether it was removed.",
+    );
     if let Some(old) = hosts.host(HostKind::ReadOnly) {
         if let Some(exit) = old.reap() {
             for line in exit.support_lines("read-only-serve-exit") {
@@ -2226,7 +2466,7 @@ fn switch_session_mode(
         s.ver
     };
     modes::save(&msp_sid, target);
-    acp::send_config_option_update(stdout, acp_sid, "mode", target, None);
+    publish_config_options(stdout, sessions, acp_sid);
     if ver == 1 {
         acp::send_raw(
             stdout,
@@ -2431,6 +2671,9 @@ fn adopt_reattached(
             {
                 s.model_value = model.to_string();
             }
+            // A re-attached host holds no root set of its own: the session's
+            // next user turn must carry the full set again.
+            s.host_roots_pending = hosts.handshake().supports_workspace_roots();
             reconcile_active_tasks(stdout, s, r, false);
             if let Some(session) = r.get("session") {
                 adopt_session_projection(s, session);
@@ -2454,30 +2697,63 @@ fn adopt_reattached(
     reconcile_in_flight(stdout, sessions, acp_sid, r);
 }
 
-/// The session's full selector set, as a `session/set_config_option` result.
-fn config_options_result(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) -> Option<String> {
+/// The session's full selector set as raw `configOptions` JSON.
+fn config_options_json(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) -> Option<String> {
     let models = catalog(host);
+    config_options_with_models(sessions, acp_sid, &models)
+}
+
+/// The session's full selector set built from an already-fetched catalog, so
+/// one model/list read serves both a model-change reset and the update frame.
+fn config_options_with_models(
+    sessions: &Sessions,
+    acp_sid: &str,
+    models: &[acp::CatalogModel],
+) -> Option<String> {
     let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     let s = map.get(acp_sid)?;
-    Some(format!(
-        "{{\"configOptions\":{}}}",
-        acp::config_options(
-            s.ver,
-            acp::ConfigOptions {
-                session_mode: &s.session_mode,
-                approval_mode: &s.mode_value,
-                model: &s.model_value,
-                reasoning_effort: &s.reasoning_effort,
-                offer_muse_default: s.reasoning_effort_source.is_none(),
-                auto_review: s.auto_review,
-                recommendations: (
-                    recommended_model(&models).as_deref(),
-                    recommended_reasoning(s).as_deref(),
-                ),
-            },
-            &models,
-        )
+    Some(acp::config_options(
+        s.ver,
+        acp::ConfigOptions {
+            session_mode: &s.session_mode,
+            approval_mode: &s.mode_value,
+            model: &s.model_value,
+            reasoning_effort: &s.reasoning_effort,
+            offer_muse_default: s.reasoning_effort_source.is_none(),
+            auto_review: s.auto_review,
+            recommendations: (
+                recommended_model(models).as_deref(),
+                recommended_reasoning(s, models).as_deref(),
+            ),
+        },
+        models,
     ))
+}
+
+/// The last successful catalog snapshot, without a host read.
+fn catalog_cached() -> Vec<acp::CatalogModel> {
+    CATALOG
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// The session's full selector set, as a `session/set_config_option` result.
+fn config_options_result(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) -> Option<String> {
+    config_options_json(host, sessions, acp_sid)
+        .map(|options| format!("{{\"configOptions\":{options}}}"))
+}
+
+/// Publish the complete selector list after a state change the host just
+/// reported. ACP requires the full `configOptions` array, not the changed
+/// selector. Built from the cached catalog so a notification costs no host
+/// read; the next config read refreshes it.
+fn publish_config_options(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
+    let models = catalog_cached();
+    if let Some(options) = config_options_with_models(sessions, acp_sid, &models) {
+        acp::send_config_options_update(stdout, acp_sid, &options);
+    }
 }
 
 /// Relaunches the `kind` host and re-attaches the sessions it owned, except
@@ -2758,6 +3034,7 @@ fn main() {
                                 hi.status,
                                 hi.detail
                             ));
+                            log(&hi.features_line());
                             log(if hi.session_mcp {
                                 "client MCP servers: forwarded to Muse (sessionMcp granted)"
                             } else {
@@ -2833,6 +3110,11 @@ fn main() {
                     continue;
                 }
                 if tag.kind == HostKind::Reviewer {
+                    fail_pending_deletes_for(
+                        &stdout,
+                        HostKind::Reviewer,
+                        "Muse exited before it confirmed the deletion. List sessions to see whether it was removed.",
+                    );
                     hosts.clear_reviewer();
                     let job = REVIEW_STATE
                         .lock()
@@ -2864,6 +3146,11 @@ fn main() {
                 }
                 let cleanup_deadline = shutdown::deadline("host disconnect");
                 log(&format!("serve host gone ({why})"));
+                fail_pending_deletes_for(
+                    &stdout,
+                    HostKind::Main,
+                    "Muse exited before it confirmed the deletion. List sessions to see whether it was removed.",
+                );
                 let old_host = hosts.main_host();
                 let observed_exit = old_host.reap();
                 old_host.shutdown();
@@ -2965,20 +3252,43 @@ fn main() {
 
 /// The catalog's default model, but only when the client asked for AIR
 /// recommendedValue metadata. Never fabricates a default of its own.
-fn recommended_model(models: &[(String, String, bool)]) -> Option<String> {
+fn recommended_model(models: &[acp::CatalogModel]) -> Option<String> {
     if AIR_RECOMMENDED.load(Ordering::SeqCst) == 0 {
         return None;
     }
     models
         .iter()
-        .find(|(_, _, is_default)| *is_default)
-        .map(|(id, _, _)| id.clone())
+        .find(|model| model.is_default)
+        .map(|model| model.id.clone())
 }
 
-fn recommended_reasoning(session: &AcpSession) -> Option<String> {
-    (AIR_RECOMMENDED.load(Ordering::SeqCst) == 1)
-        .then(|| session.reasoning_recommendation.clone())
-        .flatten()
+/// The reasoning tier to recommend to AIR clients: the host's session-level
+/// recommendation when it set one, else the current model's catalog default.
+/// Never fabricated, and only emitted when the client negotiated it.
+fn recommended_reasoning(session: &AcpSession, models: &[acp::CatalogModel]) -> Option<String> {
+    recommended_reasoning_for(
+        &session.model_value,
+        session.reasoning_recommendation.as_deref(),
+        models,
+    )
+}
+
+/// [`recommended_reasoning`] for a session that is not in the table yet, such
+/// as the one `session/new` is about to insert.
+fn recommended_reasoning_for(
+    model: &str,
+    host_recommendation: Option<&str>,
+    models: &[acp::CatalogModel],
+) -> Option<String> {
+    if AIR_RECOMMENDED.load(Ordering::SeqCst) != 1 {
+        return None;
+    }
+    host_recommendation.map(str::to_string).or_else(|| {
+        models
+            .iter()
+            .find(|row| row.id == model)
+            .and_then(|row| row.default_effort.clone())
+    })
 }
 
 /// A fresh fold configured with the connection's subagent negotiation.
@@ -3362,13 +3672,19 @@ fn handle_acp(
         if id.is_some() {
             complete_permission(host, stdout, sessions, &id, msg);
             complete_permission_feedback(host, stdout, sessions, &id, msg);
+            complete_feedback(host, stdout, sessions, &id, msg);
             complete_elicitation(host, stdout, sessions, &id, msg);
         }
         return;
     }
 
     match method.as_str() {
-        "initialize" => send_initialize(stdout, &id, host.handshake().session_mcp),
+        "initialize" => send_initialize(
+            stdout,
+            &id,
+            host.handshake().session_mcp,
+            host.handshake().supports_session_delete(),
+        ),
         "session/new" => {
             let ver = negotiated_ver();
             if !validate_session_roots(stdout, &id, params.as_ref()) {
@@ -3409,15 +3725,32 @@ fn handle_acp(
             // JetBrains IDE server) to session setup; MSP 1.3.0 loads them
             // into this session's runtime.
             let mcp_servers = client_mcp_servers(host, params.as_ref(), true);
+            // MSP 1.4.1+ carries the whole root set to the host, so Muse's
+            // own tools work in the extra folders instead of being confined
+            // by the adapter alone. Roots are validated before the session
+            // exists, as ACP requires.
+            let supports_host_roots = host.handshake().supports_workspace_roots();
+            let start_roots = if supports_host_roots && roots.len() > 1 {
+                match host_workspace_roots(&cwd, &roots[1..]) {
+                    Ok(roots) => Some(roots),
+                    Err(message) => {
+                        acp::send_error(stdout, &id, -32602, &message);
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
             let cmd = host.mint_cmd("cmd-");
             let res = host.command(
                 "session/start",
                 &format!(
-                    "{{\"commandId\":{},\"workspaceRoot\":{}{}{}}}",
+                    "{{\"commandId\":{},\"workspaceRoot\":{}{}{}{}}}",
                     esc(&cmd),
                     esc(&cwd),
                     start_mode,
-                    mcp_config_field(mcp_servers.as_deref())
+                    mcp_config_field(mcp_servers.as_deref()),
+                    workspace_roots_param(start_roots.as_deref())
                 ),
             );
             match res {
@@ -3452,6 +3785,9 @@ fn handle_acp(
                             return;
                         }
                     };
+                    if !supports_host_roots && roots.len() > 1 {
+                        log_legacy_workspace_roots(&msp_sid, &cwd);
+                    }
                     // The host reports the folded mode in
                     // session.approvalMode.mode; without an explicit request
                     // we adopt the host default, with one we require a match.
@@ -3512,6 +3848,7 @@ fn handle_acp(
                             msp_sid: msp_sid.clone(),
                             cwd: cwd.clone(),
                             roots: roots.clone(),
+                            host_roots_pending: false,
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
@@ -3519,6 +3856,7 @@ fn handle_acp(
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
+                            pending_feedback: None,
                             mode_value: acp::mode_from_msp(&cur_mode).to_string(),
                             auto_review: false,
                             review_context: std::collections::VecDeque::new(),
@@ -3547,6 +3885,9 @@ fn handle_acp(
                             cum_prompt: None,
                             cum_output: None,
                             cum_total: None,
+                            cum_cache_read: None,
+                            cum_cache_write: None,
+                            host_cost: None,
                             cost_amount: None,
                             usage_seen: std::collections::HashSet::new(),
                             subscription_usage: None,
@@ -3582,7 +3923,11 @@ fn handle_acp(
                                     reasoning_effort: acp::REASONING_DEFAULT,
                                     offer_muse_default: true,
                                     auto_review: false,
-                                    recommendations: (recommended_model(&models).as_deref(), None),
+                                    recommendations: (
+                                        recommended_model(&models).as_deref(),
+                                        recommended_reasoning_for(&cur_model, None, &models)
+                                            .as_deref(),
+                                    ),
                                 },
                                 &models,
                             )
@@ -3601,7 +3946,11 @@ fn handle_acp(
                                     reasoning_effort: acp::REASONING_DEFAULT,
                                     offer_muse_default: true,
                                     auto_review: false,
-                                    recommendations: (recommended_model(&models).as_deref(), None),
+                                    recommendations: (
+                                        recommended_model(&models).as_deref(),
+                                        recommended_reasoning_for(&cur_model, None, &models)
+                                            .as_deref(),
+                                    ),
                                 },
                                 &models,
                             ),
@@ -3628,7 +3977,13 @@ fn handle_acp(
                     if let Some(title) = initial_title_facts.selected() {
                         acp::send_session_title(stdout, &sid, Some(title));
                     }
-                    acp::send_available_commands(stdout, &sid, ver, &skills);
+                    acp::send_available_commands(
+                        stdout,
+                        &sid,
+                        ver,
+                        &skills,
+                        host.handshake().feedback,
+                    );
                     // Subscription usage is host-global and may already be
                     // known before the first session usage event arrives.
                     refresh_subscription_usage(host, stdout, sessions, &sid);
@@ -3656,10 +4011,13 @@ fn handle_acp(
                     return;
                 }
             }
-            if let Err(message) = additional_directories(params.as_ref()) {
-                acp::send_error(stdout, &id, -32602, &message);
-                return;
-            }
+            let request_extras = match additional_directories(params.as_ref()) {
+                Ok(roots) => roots,
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
             let resume_cwd = params
                 .as_ref()
                 .and_then(|p| p.get("cwd"))
@@ -3680,6 +4038,22 @@ fn handle_acp(
                     "session resume requires params.sessionId",
                 );
                 return;
+            }
+            // On hosts that carry the root set, the request's roots are
+            // validated before any host call: a load with a missing extra
+            // folder must fail, not silently activate nothing.
+            let supports_host_roots = host.handshake().supports_workspace_roots();
+            if supports_host_roots {
+                if let Err(message) = validate_host_extra_roots(&request_extras) {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+                if !resume_cwd.is_empty()
+                    && let Err(message) = host_workspace_roots(&resume_cwd, &request_extras)
+                {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
             }
             if reject_if_logged_out(host, stdout, &id) {
                 return;
@@ -3815,6 +4189,7 @@ fn handle_acp(
                             msp_sid: real_msp.clone(),
                             cwd: restored_cwd.clone(),
                             roots: roots.clone(),
+                            host_roots_pending: false,
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
@@ -3822,6 +4197,7 @@ fn handle_acp(
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
+                            pending_feedback: None,
                             mode_value: "promptUnmatched".to_string(),
                             auto_review: false,
                             review_context: std::collections::VecDeque::new(),
@@ -3843,6 +4219,9 @@ fn handle_acp(
                             cum_prompt: None,
                             cum_output: None,
                             cum_total: None,
+                            cum_cache_read: None,
+                            cum_cache_write: None,
+                            host_cost: None,
                             cost_amount: None,
                             usage_seen: std::collections::HashSet::new(),
                             subscription_usage: None,
@@ -3857,6 +4236,9 @@ fn handle_acp(
                         });
                         entry.msp_sid = real_msp.clone();
                         entry.ver = ver;
+                        // The next user turn replaces the host's sticky root
+                        // set, even when the request activated no extras.
+                        entry.host_roots_pending = supports_host_roots;
                         // The client's latest set, even when a conflict kept
                         // the loaded one: a restarted host loads this.
                         entry.mcp_servers = mcp_servers;
@@ -3870,6 +4252,9 @@ fn handle_acp(
                         // additional list explicitly drops previously active
                         // extra roots instead of silently restoring access.
                         entry.roots = roots;
+                        if !supports_host_roots && !request_extras.is_empty() {
+                            log_legacy_workspace_roots(&real_msp, &entry.cwd);
+                        }
                         if !real_model.is_empty() {
                             entry.model_value = real_model;
                         }
@@ -3952,7 +4337,12 @@ fn handle_acp(
                             replay_history(stdout, entry, &r);
                         }
                         reconcile_active_tasks(stdout, entry, &r, replay);
-                        acp::send_usage(stdout, entry, pressure.as_deref());
+                        acp::send_usage(
+                            stdout,
+                            entry,
+                            pressure.as_deref(),
+                            host.handshake().reports_session_cost(),
+                        );
                     }
                     let (status, attention) = sessions
                         .lock()
@@ -3993,6 +4383,7 @@ fn handle_acp(
                         .get(&sid)
                         .map(|s| s.msp_sid.clone())
                         .unwrap_or_default();
+                    let models = catalog(host);
                     let (
                         session_mode_v,
                         mode_v,
@@ -4012,7 +4403,7 @@ fn handle_acp(
                                 s.model_value.clone(),
                                 s.reasoning_effort.clone(),
                                 s.reasoning_effort_source.is_none(),
-                                recommended_reasoning(s),
+                                recommended_reasoning(s, &models),
                                 s.auto_review,
                             )
                         })
@@ -4020,7 +4411,6 @@ fn handle_acp(
                     // Both versions report current selectors; v1 also keeps the
                     // legacy mode state for clients which predate config options.
                     let result = if ver == 2 {
-                        let models = catalog(host);
                         format!(
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
                             esc(&sid),
@@ -4043,7 +4433,6 @@ fn handle_acp(
                             )
                         )
                     } else {
-                        let models = catalog(host);
                         format!(
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{},\"modes\":{}}}",
                             esc(&sid),
@@ -4071,9 +4460,28 @@ fn handle_acp(
                     adopt_skill_catalog(sessions, &sid, skills.as_deref());
                     let skills = skills.unwrap_or_default();
                     acp::send_result(stdout, &id, &result);
-                    acp::send_available_commands(stdout, &sid, ver, &skills);
+                    acp::send_available_commands(
+                        stdout,
+                        &sid,
+                        ver,
+                        &skills,
+                        host.handshake().feedback,
+                    );
                 }
                 Err(e) => {
+                    if err_code(&e) == -32020
+                        || msp::rejection_reason(&e) == Some("session_deleted")
+                    {
+                        // The host has no such session: it was deleted, or
+                        // never existed. Say so instead of a raw resume error.
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32002,
+                            "session not found (it may have been deleted)",
+                        );
+                        return;
+                    }
                     let msg = err_message(&e);
                     let mut text = format!("resume failed: {msg}");
                     if let Some(hint) = msp::session_profile_hint(&msg) {
@@ -4169,9 +4577,25 @@ fn handle_acp(
                 acp::send_error(stdout, &id, -32602, "params.cwd must be an absolute path");
                 return;
             }
-            if let Err(message) = additional_directories(params.as_ref()) {
-                acp::send_error(stdout, &id, -32602, &message);
-                return;
+            let request_extras = match additional_directories(params.as_ref()) {
+                Ok(roots) => roots,
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
+            let supports_host_roots = host.handshake().supports_workspace_roots();
+            if supports_host_roots {
+                if let Err(message) = validate_host_extra_roots(&request_extras) {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+                if !fork_cwd.is_empty()
+                    && let Err(message) = host_workspace_roots(&fork_cwd, &request_extras)
+                {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
             }
             // MSP session/fork takes no configuration, and the fork is loaded
             // without MCP servers. Keep the client's set on the record so a
@@ -4320,6 +4744,7 @@ fn handle_acp(
                             msp_sid: new_msp.clone(),
                             cwd: restored_cwd.clone(),
                             roots: roots.clone(),
+                            host_roots_pending: false,
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
@@ -4327,6 +4752,7 @@ fn handle_acp(
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
+                            pending_feedback: None,
                             mode_value: mode_value.clone(),
                             auto_review: false,
                             review_context: std::collections::VecDeque::new(),
@@ -4354,6 +4780,9 @@ fn handle_acp(
                             cum_prompt: None,
                             cum_output: None,
                             cum_total: None,
+                            cum_cache_read: None,
+                            cum_cache_write: None,
+                            host_cost: None,
                             cost_amount: None,
                             usage_seen: std::collections::HashSet::new(),
                             subscription_usage: None,
@@ -4372,6 +4801,12 @@ fn handle_acp(
                         adopt_session_projection(entry, &new_session);
                         entry.cwd = restored_cwd;
                         entry.roots = roots;
+                        // The fork inherits the source's runtime roots; the
+                        // next user turn replaces them with the requested set.
+                        entry.host_roots_pending = supports_host_roots;
+                        if !supports_host_roots && !request_extras.is_empty() {
+                            log_legacy_workspace_roots(&new_msp, &entry.cwd);
+                        }
                         if !new_model.is_empty() {
                             entry.model_value = new_model;
                         }
@@ -4392,6 +4827,7 @@ fn handle_acp(
                             adopt_reasoning_effort(entry, state);
                         }
                     }
+                    let models = catalog(host);
                     let (
                         session_mode_out,
                         mode_out,
@@ -4411,12 +4847,11 @@ fn handle_acp(
                                 s.model_value.clone(),
                                 s.reasoning_effort.clone(),
                                 s.reasoning_effort_source.is_none(),
-                                recommended_reasoning(s),
+                                recommended_reasoning(s, &models),
                                 s.auto_review,
                             )
                         })
                         .unwrap_or_default();
-                    let models = catalog(host);
                     let result = if ver == 2 {
                         format!(
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}{provenance}}},\"configOptions\":{}}}",
@@ -4493,6 +4928,7 @@ fn handle_acp(
                         &new_msp,
                         ver,
                         &skills.unwrap_or_default(),
+                        host.handshake().feedback,
                     );
                 }
                 Err(e) => acp::send_error(
@@ -4515,29 +4951,38 @@ fn handle_acp(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let (msp_sid, roots, skills, reasoning_effort, pending_approval) =
-                match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
-                    Some(s) => (
-                        s.msp_sid.clone(),
-                        s.roots.clone(),
-                        s.skill_selectors.clone(),
-                        reasoning_effort_override(s),
-                        s.pending_perm
-                            .as_ref()
-                            .map(|p| p.approval_id.clone())
-                            .or_else(|| {
-                                s.perm_queue
-                                    .first()
-                                    .and_then(|q| q.get("approvalId"))
-                                    .and_then(|v| v.as_str())
-                                    .map(str::to_string)
-                            }),
-                    ),
-                    None => {
-                        acp::send_error(stdout, &id, -32602, "unknown sessionId");
-                        return;
-                    }
-                };
+            let (
+                msp_sid,
+                cwd,
+                roots,
+                skills,
+                reasoning_effort,
+                pending_approval,
+                host_roots_pending,
+            ) = match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
+                Some(s) => (
+                    s.msp_sid.clone(),
+                    s.cwd.clone(),
+                    s.roots.clone(),
+                    s.skill_selectors.clone(),
+                    reasoning_effort_override(s),
+                    s.pending_perm
+                        .as_ref()
+                        .map(|p| p.approval_id.clone())
+                        .or_else(|| {
+                            s.perm_queue
+                                .first()
+                                .and_then(|q| q.get("approvalId"))
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        }),
+                    s.host_roots_pending,
+                ),
+                None => {
+                    acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                    return;
+                }
+            };
             let (parts, acp_content) =
                 match extract_prompt_parts(params.as_ref(), &roots, skills.as_ref()) {
                     Ok((p, c)) if !p.is_empty() => (p, c),
@@ -4565,10 +5010,29 @@ fn handle_acp(
             // `session/nameChanged`, workflow item updates) arrive as their
             // own updates.
             let command_line = match parse_json(&acp_content) {
-                Ok(J::Arr(blocks)) => protocol_command_text(&blocks),
+                Ok(J::Arr(blocks)) => protocol_command_text(&blocks, host.handshake().feedback),
                 _ => None,
             };
             if let Some(line) = command_line {
+                // `/feedback` is adapter-local: it collects explicit consent,
+                // then submits through the host's feedback surface and ends
+                // the turn with the host's receipt.
+                if let Ok(text) = &line
+                    && let Some(argument) = text.strip_prefix("/feedback")
+                    && (argument.is_empty() || argument.starts_with(char::is_whitespace))
+                {
+                    start_feedback(
+                        host,
+                        stdout,
+                        sessions,
+                        &sid,
+                        ver,
+                        id.clone(),
+                        &acp_content,
+                        argument.trim(),
+                    );
+                    return;
+                }
                 let workflow_children = || {
                     sessions
                         .lock()
@@ -4833,14 +5297,36 @@ fn handle_acp(
             // prompt response.
             let cmd = host.mint_cmd("cmd-");
             let input = format!("[{}]", parts.join(","));
+            // After a load, resume, fork, or host re-attach, the next user
+            // turn replaces the host's sticky root set explicitly, as ACP
+            // requires. A failure here is a local refusal, never a turn that
+            // silently runs with the wrong scope. Without extras, a primary
+            // root that no longer resolves (a resume that omitted `cwd`, or a
+            // removed folder) leaves the host on its own root, as before
+            // explicit roots; the next turn tries again.
+            let roots_param = if host_roots_pending && host.handshake().supports_workspace_roots() {
+                match host_workspace_roots(&cwd, &roots[1..]) {
+                    Ok(roots) => workspace_roots_param(Some(&roots)),
+                    Err(message) if roots.len() <= 1 => {
+                        log(&format!("workspaceRoots omitted: {message}"));
+                        String::new()
+                    }
+                    Err(message) => {
+                        acp::send_error(stdout, &id, -32602, &message);
+                        return;
+                    }
+                }
+            } else {
+                String::new()
+            };
             match host.command(
                 "turn/start",
                 &format!(
-                    "{{\"commandId\":{},\"sessionId\":{},\"input\":{}{}{display_field}}}",
+                    "{{\"commandId\":{},\"sessionId\":{},\"input\":{}{}{display_field}{roots_param}}}",
                     esc(&cmd),
                     esc(&msp_sid),
                     input,
-                    reasoning_effort_param(reasoning_effort.as_deref())
+                    reasoning_effort_param(reasoning_effort.as_deref()),
                 ),
             ) {
                 Ok(r) => {
@@ -4862,6 +5348,9 @@ fn handle_acp(
                         .unwrap_or_else(|p| p.into_inner())
                         .get_mut(&sid)
                     {
+                        if !roots_param.is_empty() {
+                            s.host_roots_pending = false;
+                        }
                         s.in_flight.push(InFlight {
                             msp_turn: turn.clone(),
                             req_id: id.clone().unwrap_or(J::Null),
@@ -5213,33 +5702,122 @@ fn handle_acp(
                 return;
             }
             cancel_session_turns(host, sessions, &sid);
-            let removed = sessions
+            if drop_acp_session(stdout, sessions, &sid) {
+                acp::send_result(stdout, &id, "{}");
+            } else {
+                acp::send_error(stdout, &id, -32602, "unknown sessionId");
+            }
+        }
+        "session/delete" => {
+            // MSP answers `session/delete` with an admission ack and reports
+            // the outcome later as `session/deleteCompleted`, so the ACP
+            // request stays pending until that terminal arrives. Answering on
+            // the ack could tell the editor a kept session was deleted.
+            if !host.handshake().supports_session_delete() {
+                acp::send_error(stdout, &id, -32601, "this Muse host cannot delete sessions");
+                return;
+            }
+            let sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if sid.is_empty() {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    "session/delete requires params.sessionId",
+                );
+                return;
+            }
+            // Resolve the durable MSP id the way resume does: the live
+            // session, then preserved metadata, then the id itself.
+            let meta_msp_sid = params
+                .as_ref()
+                .and_then(|p| p.get("_meta"))
+                .and_then(|m| m.get("mspSessionId"))
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let msp_sid = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .remove(&sid);
-            match removed {
-                Some(s) => {
-                    for f in s.in_flight {
-                        if s.ver == 2 {
-                            acp::send_state(stdout, &sid, "idle", Some("cancelled"));
-                        } else {
-                            acp::send_result(
-                                stdout,
-                                &Some(f.req_id),
-                                "{\"stopReason\":\"cancelled\"}",
-                            );
-                        }
+                .get(&sid)
+                .map(|s| s.msp_sid.clone())
+                .or(meta_msp_sid)
+                .unwrap_or_else(|| sid.clone());
+            if !is_session_uuid(&msp_sid) {
+                // Not a UUID, so it cannot name a Muse session: ACP says
+                // deleting a session that never existed succeeds silently.
+                acp::send_result(stdout, &id, "{}");
+                return;
+            }
+            if let Some(cmd) = pending_delete_for_session(&msp_sid) {
+                // A delete for this session is already in flight; join it so
+                // the host never sees two concurrent deletes (it rejects the
+                // second with `runtime_busy`).
+                if let Some(waiter) = id.clone() {
+                    let mut deletes = DELETES.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(pending) = deletes.get_mut(&cmd) {
+                        pending.waiters.push(waiter);
                     }
-                    for p in s.pending_ui {
-                        acp::send_cancel_request(stdout, &p.req_id);
-                    }
-                    if let Some(p) = s.pending_perm {
-                        let request_id = p.feedback.map(|f| f.req_id).unwrap_or(p.req_id);
-                        acp::send_cancel_request(stdout, &request_id);
-                    }
-                    acp::send_result(stdout, &id, "{}");
                 }
-                None => acp::send_error(stdout, &id, -32602, "unknown sessionId"),
+                return;
+            }
+            let cmd = host.mint_cmd("cmd-");
+            let host_kind = host.owner(&msp_sid);
+            DELETES.lock().unwrap_or_else(|p| p.into_inner()).insert(
+                cmd.clone(),
+                PendingDelete {
+                    waiters: id.clone().into_iter().collect(),
+                    msp_sid: msp_sid.clone(),
+                    host_kind,
+                },
+            );
+            let params_json = format!(
+                "{{\"commandId\":{},\"sessionId\":{}}}",
+                esc(&cmd),
+                esc(&msp_sid)
+            );
+            if let Err(e) = host.command("session/delete", &params_json) {
+                let waiters = take_pending_delete(&cmd)
+                    .map(|pending| pending.waiters)
+                    .unwrap_or_default();
+                let reason = msp::rejection_reason(&e);
+                if reason == Some("session_deleted") || err_code(&e) == -32020 {
+                    // Already deleted (or the host cannot find it): ACP asks
+                    // for success, and local state must go either way.
+                    forget_deleted_session(host, stdout, sessions, lists, &msp_sid);
+                    answer_delete_waiters(stdout, waiters, Ok(()));
+                } else if reason == Some("runtime_busy") {
+                    answer_delete_waiters(
+                        stdout,
+                        waiters,
+                        Err((
+                            -32603,
+                            "Muse is busy with this session; try again.".to_string(),
+                            None,
+                        )),
+                    );
+                } else if msp::is_method_not_found(&e) {
+                    answer_delete_waiters(
+                        stdout,
+                        waiters,
+                        Err((
+                            -32601,
+                            "This Muse host cannot delete sessions".to_string(),
+                            None,
+                        )),
+                    );
+                } else {
+                    answer_delete_waiters(
+                        stdout,
+                        waiters,
+                        Err((msp::acp_error_code(&e, -32603), err_message(&e), None)),
+                    );
+                }
             }
         }
         "session/cancel" => {
@@ -5293,6 +5871,7 @@ fn handle_acp(
             // A feedback form belongs to the cancelled turn. End it locally
             // so a late form response cannot decide a newer host state.
             invalidate_pending_approval(stdout, sessions, &sid, None, true);
+            settle_feedback_cancelled(stdout, sessions, &sid);
         }
         "$/cancel_request" => {
             // ACP cancellation is scoped to the original request id. A
@@ -5387,9 +5966,11 @@ fn handle_acp(
             host_params.push('}');
             match host.command("session/list", &host_params) {
                 Ok(r) => {
+                    let first_page = list_cursor.is_none();
                     let mut listed = std::collections::HashSet::new();
                     let mut entries = Vec::new();
                     let mut title_updates = Vec::new();
+                    let mut skipped_null_root = 0usize;
                     if let Some(J::Arr(items)) = r.get("sessions") {
                         let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                         for item in items {
@@ -5397,16 +5978,24 @@ fn handle_acp(
                             if msp_id.is_empty() {
                                 continue;
                             }
-                            listed.insert(msp_id.to_string());
-                            let streamed = if list_stream {
+                            // A deleted session never comes back, streamed or
+                            // paged; the tombstone is not gated on the stream
+                            // grant.
+                            let (deleted, streamed) = {
                                 let cache = lists.lock().unwrap_or_else(|p| p.into_inner());
-                                if cache.closed.contains(msp_id) {
-                                    continue;
-                                }
-                                cache.rows.get(msp_id).cloned()
-                            } else {
-                                None
+                                (
+                                    cache.deleted.contains(msp_id),
+                                    if list_stream {
+                                        cache.rows.get(msp_id).cloned()
+                                    } else {
+                                        None
+                                    },
+                                )
                             };
+                            if deleted {
+                                continue;
+                            }
+                            listed.insert(msp_id.to_string());
                             let item = streamed.as_ref().unwrap_or(item);
                             if !session_row_matches_workspace(item, &filter_root) {
                                 continue;
@@ -5418,6 +6007,11 @@ fn handle_acp(
                                         session.title_facts.selected().map(str::to_string),
                                     ));
                                 }
+                                // A held session is appended to the first
+                                // page below; a later page must not repeat it.
+                                if !first_page {
+                                    continue;
+                                }
                                 if session_matches_filter(session, &filter_root, &filter_additional)
                                 {
                                     entries.push(owned_session_row(
@@ -5428,6 +6022,13 @@ fn handle_acp(
                             } else {
                                 let cwd =
                                     item.get("workspaceRoot").and_then(J::as_str).unwrap_or("");
+                                // ACP rows need an absolute `cwd`; a host row
+                                // without one is skipped rather than emitted
+                                // with an empty path.
+                                if cwd.is_empty() {
+                                    skipped_null_root += 1;
+                                    continue;
+                                }
                                 if !filter_additional.is_empty()
                                     || (!filter_root.is_empty()
                                         && !same_workspace_root(cwd, &filter_root))
@@ -5445,18 +6046,28 @@ fn handle_acp(
                             }
                         }
                     }
+                    if skipped_null_root > 0 {
+                        log(&format!(
+                            "session/list skipped {skipped_null_root} row(s) without a workspace root"
+                        ));
+                    }
                     for (sid, title) in title_updates {
                         acp::send_session_title(stdout, &sid, title.as_deref());
                     }
-                    for (sid, row) in owned_session_rows(
-                        sessions,
-                        lists,
-                        list_stream,
-                        &filter_root,
-                        &filter_additional,
-                    ) {
-                        if !listed.contains(&sid) {
-                            entries.push(row);
+                    // Adapter-held sessions the host page did not mention are
+                    // appended to the first page only, so a client paging
+                    // through the cursor never sees one twice.
+                    if first_page {
+                        for (sid, row) in owned_session_rows(
+                            sessions,
+                            lists,
+                            list_stream,
+                            &filter_root,
+                            &filter_additional,
+                        ) {
+                            if !listed.contains(&sid) {
+                                entries.push(row);
+                            }
                         }
                     }
                     let next_cursor = r
@@ -5475,6 +6086,13 @@ fn handle_acp(
                 Err(e) => {
                     if msp::acp_error_code(&e, -32603) == -32000 {
                         acp::send_error(stdout, &id, -32000, &err_message(&e));
+                        return;
+                    }
+                    // A cursor this host no longer accepts must surface; the
+                    // silent first-page fallback would hide a broken page
+                    // walk behind duplicated rows.
+                    if list_cursor.is_some() {
+                        acp::send_error(stdout, &id, -32602, "invalid cursor");
                         return;
                     }
                     log(&format!("session/list failed: {}", err_message(&e)));
@@ -5698,8 +6316,20 @@ fn handle_acp(
                             _ => unreachable!(),
                         }
                     }
-                    match config_options_result(host, sessions, &sid) {
-                        Some(result) => acp::send_result(stdout, &id, &result),
+                    let models = catalog(host);
+                    if key == "model"
+                        && reset_unsupported_reasoning_tier(sessions, &sid, &value, &models)
+                    {
+                        log(&format!(
+                            "model {value} does not serve the held reasoning tier; reset to Muse default"
+                        ));
+                    }
+                    match config_options_with_models(sessions, &sid, &models) {
+                        Some(options) => acp::send_result(
+                            stdout,
+                            &id,
+                            &format!("{{\"configOptions\":{options}}}"),
+                        ),
                         None => acp::send_error(stdout, &id, -32602, "unknown sessionId"),
                     }
                 }
@@ -6413,7 +7043,7 @@ fn parse_workflow_child_command(
 type ProtocolCommand = (String, Vec<(&'static str, J)>);
 
 /// Adapter-local slash commands that map onto one host method.
-const PROTOCOL_COMMANDS: [&str; 3] = ["goal", "rename", "workflow-child"];
+const PROTOCOL_COMMANDS: [&str; 4] = ["feedback", "goal", "rename", "workflow-child"];
 
 /// The command line of a protocol-command prompt, or `None` when the prompt
 /// is not one. The first block decides: it must be text naming a protocol
@@ -6421,7 +7051,7 @@ const PROTOCOL_COMMANDS: [&str; 3] = ["goal", "rename", "workflow-child"];
 /// own block, so later text and mention blocks join the line, a mention as
 /// its `[@name](uri)` link text (a reference only, never embedded contents);
 /// any other block cannot be part of a command and is a usage error.
-fn protocol_command_text(blocks: &[J]) -> Option<Result<String, String>> {
+fn protocol_command_text(blocks: &[J], feedback: bool) -> Option<Result<String, String>> {
     let first = blocks.first()?;
     if first.get("type").and_then(J::as_str) != Some("text") {
         return None;
@@ -6432,7 +7062,9 @@ fn protocol_command_text(blocks: &[J]) -> Option<Result<String, String>> {
         .strip_prefix('/')?
         .split(char::is_whitespace)
         .next()?;
-    if !PROTOCOL_COMMANDS.contains(&name) {
+    // Without the host's grant, `/feedback` stays an ordinary prompt so a
+    // host skill of that name still runs.
+    if !PROTOCOL_COMMANDS.contains(&name) || (name == "feedback" && !feedback) {
         return None;
     }
     let mention = |label: &str, uri: &str| format!("[@{label}]({uri})");
@@ -7266,6 +7898,168 @@ fn owned_session_row(session: &AcpSession, updated_at: Option<&str>) -> String {
     row
 }
 
+/// Whether a session id can exist on an MSP host at all: a non-nil UUID in
+/// the legacy-valid `8-4-4-4-12` form, any version. Anything else can never
+/// name a Muse session, so ACP's "deleting a session that never existed
+/// should succeed silently" applies without asking the host.
+fn is_session_uuid(s: &str) -> bool {
+    let mut groups = s.split('-');
+    let mut all_zero = true;
+    for size in [8usize, 4, 4, 4, 12] {
+        let Some(part) = groups.next() else {
+            return false;
+        };
+        if part.len() != size || !part.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return false;
+        }
+        if part.bytes().any(|b| b != b'0') {
+            all_zero = false;
+        }
+    }
+    groups.next().is_none() && !all_zero
+}
+
+/// The user-facing reason Muse kept a session, using the host's own TUI
+/// wording where it exists. A `physicalChange` other than `none` (including
+/// an absent one, which the schema treats as unknown) means the delete may
+/// already have removed data.
+fn delete_failure_message(reason: Option<&str>, physical_change: Option<&str>) -> String {
+    let mut message = match reason {
+        Some("ownershipUnavailable") => "Muse kept this session because it cannot prove it owns \
+             all of the session's logs. Muse deletes only sessions started by the Muse host \
+             that is running now, so sessions from an earlier editor run cannot be deleted \
+             here."
+            .to_string(),
+        Some("writerBusy" | "quiescenceFailed") => {
+            "Muse kept this session because work is still running in it. Stop it and try again."
+                .to_string()
+        }
+        Some("sharedSource") => {
+            "Muse kept this session because some of its logs are shared with another session."
+                .to_string()
+        }
+        Some(reason) => format!("Muse could not delete this session ({reason})."),
+        None => "Muse could not delete this session.".to_string(),
+    };
+    if !matches!(physical_change, Some("none")) {
+        message.push_str(" Some of its data may already be removed.");
+    }
+    message
+}
+
+/// Answer every ACP waiter of one delete command with the same outcome.
+fn answer_delete_waiters(
+    stdout: &StdoutShared,
+    waiters: Vec<J>,
+    outcome: Result<(), (i64, String, Option<String>)>,
+) {
+    match outcome {
+        Ok(()) => {
+            for waiter in waiters {
+                acp::send_result(stdout, &Some(waiter), "{}");
+            }
+        }
+        Err((code, message, data)) => {
+            for waiter in waiters {
+                match &data {
+                    Some(data) => {
+                        acp::send_error_with_data(stdout, &Some(waiter), code, &message, data)
+                    }
+                    None => acp::send_error(stdout, &Some(waiter), code, &message),
+                }
+            }
+        }
+    }
+}
+
+/// Remove one pending delete by command id.
+fn take_pending_delete(cmd: &str) -> Option<PendingDelete> {
+    DELETES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(cmd)
+}
+
+/// The command id of the pending delete that already covers this session.
+fn pending_delete_for_session(msp_sid: &str) -> Option<String> {
+    DELETES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find(|(_, pending)| pending.msp_sid == msp_sid)
+        .map(|(cmd, _)| cmd.clone())
+}
+
+/// Forget every trace of a session Muse deleted: ACP state, the list cache,
+/// any remembered mode, and the host owner.
+fn forget_deleted_session(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    lists: &SessionLists,
+    msp_sid: &str,
+) {
+    if msp_sid.is_empty() {
+        return;
+    }
+    if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+        drop_acp_session(stdout, sessions, &acp_sid);
+    }
+    {
+        let mut cache = lists.lock().unwrap_or_else(|p| p.into_inner());
+        cache.rows.remove(msp_sid);
+        cache.deleted.insert(msp_sid.to_string());
+    }
+    modes::forget(msp_sid);
+    host.forget_owner(msp_sid);
+}
+
+/// Ask the host whether a session id exists, using the `sessionId` filter
+/// whose echo the schema names as the support probe. True only when the host
+/// echoes `appliedFilter.sessionId` and returns no rows: any error or a
+/// missing echo cannot prove absence, so the caller reports the failure.
+fn session_absent_on_host(host: &Arc<Hosts>, msp_sid: &str) -> bool {
+    let cmd = host.mint_cmd("cmd-");
+    let r = host.command(
+        "session/list",
+        &format!(
+            "{{\"commandId\":{},\"limit\":1,\"filter\":{{\"sessionId\":{{\"anyOf\":[{}]}}}}}}",
+            esc(&cmd),
+            esc(msp_sid)
+        ),
+    );
+    match r {
+        Ok(r) => {
+            r.get("appliedFilter")
+                .and_then(|f| f.get("sessionId"))
+                .is_some()
+                && matches!(r.get("sessions"), Some(J::Arr(rows)) if rows.is_empty())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Fail every pending delete sent to a host that has exited: the command
+/// died with the process.
+fn fail_pending_deletes_for(stdout: &StdoutShared, kind: HostKind, message: &str) {
+    let drained: Vec<PendingDelete> = {
+        let mut deletes = DELETES.lock().unwrap_or_else(|p| p.into_inner());
+        let keys: Vec<String> = deletes
+            .iter()
+            .filter(|(_, pending)| pending.host_kind == kind)
+            .map(|(cmd, _)| cmd.clone())
+            .collect();
+        keys.into_iter()
+            .filter_map(|cmd| deletes.remove(&cmd))
+            .collect()
+    };
+    for pending in drained {
+        for waiter in pending.waiters {
+            acp::send_error(stdout, &Some(waiter), -32603, message);
+        }
+    }
+}
+
 fn owned_session_rows(
     sessions: &Sessions,
     lists: &SessionLists,
@@ -7281,7 +8075,7 @@ fn owned_session_rows(
             session_matches_filter(s, root, additional)
                 && (!list_stream || {
                     let cache = lists.lock().unwrap_or_else(|p| p.into_inner());
-                    !cache.closed.contains(&s.msp_sid)
+                    !cache.deleted.contains(&s.msp_sid)
                         && cache
                             .rows
                             .get(&s.msp_sid)
@@ -7494,7 +8288,13 @@ fn handle_msp(
                     "skill catalog refreshed for session {msp_sid}: {} row(s)",
                     skills.len()
                 ));
-                acp::send_available_commands(stdout, &acp_sid, ver, &skills);
+                acp::send_available_commands(
+                    stdout,
+                    &acp_sid,
+                    ver,
+                    &skills,
+                    host.handshake().feedback,
+                );
             }
         }
         "view/gap" => {
@@ -8109,7 +8909,7 @@ fn handle_msp(
                 {
                     s.mode_value = acp::mode_from_msp(mode).to_string();
                 }
-                let _ = acp_sid;
+                publish_config_options(stdout, sessions, &acp_sid);
             }
         }
         "session/reasoningEffortChanged" => {
@@ -8134,7 +8934,7 @@ fn handle_msp(
                 .unwrap_or("unknown")
                 .to_string();
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
-                let recommendation = if let Some(s) = sessions
+                if let Some(s) = sessions
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .get_mut(&acp_sid)
@@ -8144,17 +8944,8 @@ fn handle_msp(
                     }
                     s.reasoning_effort = effort.to_string();
                     s.reasoning_effort_source = Some(source);
-                    recommended_reasoning(s)
-                } else {
-                    None
-                };
-                acp::send_config_option_update(
-                    stdout,
-                    &acp_sid,
-                    "reasoning_effort",
-                    effort,
-                    recommendation.as_deref(),
-                );
+                }
+                publish_config_options(stdout, sessions, &acp_sid);
             }
         }
         "session/modelChanged" => {
@@ -8170,6 +8961,7 @@ fn handle_msp(
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
                 && !model.is_empty()
             {
+                let models = catalog(host);
                 if let Some(s) = sessions
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -8177,7 +8969,16 @@ fn handle_msp(
                 {
                     s.model_value = model.to_string();
                 }
-                let _ = acp_sid;
+                // A held per-turn override must not outlive a model that
+                // does not serve that tier.
+                if reset_unsupported_reasoning_tier(sessions, &acp_sid, model, &models) {
+                    log(&format!(
+                        "model {model} does not serve the held reasoning tier; reset to Muse default"
+                    ));
+                }
+                if let Some(options) = config_options_with_models(sessions, &acp_sid, &models) {
+                    acp::send_config_options_update(stdout, &acp_sid, &options);
+                }
             }
         }
         "session/statusChanged" => {
@@ -8334,7 +9135,12 @@ fn handle_msp(
             let next = Some(j_to_string(params));
             let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
             for s in map.values_mut() {
-                adopt_subscription_usage(stdout, s, next.clone());
+                adopt_subscription_usage(
+                    stdout,
+                    s,
+                    next.clone(),
+                    host.handshake().reports_session_cost(),
+                );
             }
         }
         "session/contextUsage" => {
@@ -8347,11 +9153,12 @@ fn handle_msp(
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let host_reports_cost = host.handshake().reports_session_cost();
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
                 let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(s) = map.get_mut(&acp_sid) {
                     let pressure = adopt_context_usage(s, params);
-                    acp::send_usage(stdout, s, pressure.as_deref());
+                    acp::send_usage(stdout, s, pressure.as_deref(), host_reports_cost);
                 }
             }
         }
@@ -8364,6 +9171,7 @@ fn handle_msp(
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            let host_reports_cost = host.handshake().reports_session_cost();
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
                 let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(s) = map.get_mut(&acp_sid) {
@@ -8431,7 +9239,7 @@ fn handle_msp(
                             None => s.cost_amount = Some((leg, rate.currency)),
                         }
                     }
-                    acp::send_usage(stdout, s, None);
+                    acp::send_usage(stdout, s, None, host_reports_cost);
                 }
             }
         }
@@ -8477,16 +9285,115 @@ fn handle_msp(
             }
         }
 
-        "session/closed" => {
-            if host.handshake().session_list_stream {
-                let msp_sid = params
-                    .get("sessionId")
-                    .or_else(|| params.get("session").and_then(|s| s.get("sessionId")))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                cache_session_closed(lists, msp_sid);
-                log(&format!("session list row closed: session={msp_sid}"));
+        "session/deleteCompleted" => {
+            // The terminal for an admitted MSP `session/delete`. `outcome` is
+            // an open enum: an unknown value leaves the command pending, as
+            // the schema says, so only `completed` and `failed` settle it.
+            let cmd = params
+                .get("commandId")
+                .and_then(J::as_str)
+                .unwrap_or("")
+                .to_string();
+            let outcome = params
+                .get("outcome")
+                .and_then(J::as_str)
+                .unwrap_or("unknown");
+            let mut msp_sid = params
+                .get("sessionId")
+                .and_then(J::as_str)
+                .unwrap_or("")
+                .to_string();
+            let reason = params.get("reason").and_then(J::as_str);
+            let physical_change = params.get("physicalChange").and_then(J::as_str);
+            match outcome {
+                "completed" => {
+                    let pending = take_pending_delete(&cmd);
+                    if msp_sid.is_empty()
+                        && let Some(pending) = &pending
+                    {
+                        msp_sid = pending.msp_sid.clone();
+                    }
+                    if pending.is_none() {
+                        // Another client deleted a session this adapter was
+                        // not asked to delete; still stop listing it.
+                        log(&format!(
+                            "session/deleteCompleted for an untracked command: session={msp_sid}"
+                        ));
+                    }
+                    forget_deleted_session(host, stdout, sessions, lists, &msp_sid);
+                    if let Some(pending) = pending {
+                        answer_delete_waiters(stdout, pending.waiters, Ok(()));
+                    }
+                }
+                "failed" => {
+                    // A never-existed id fails with the same
+                    // `ownershipUnavailable` terminal as an unowned one. The
+                    // host's own filtered listing is the existence check, and
+                    // ACP wants a missing session deleted silently.
+                    if reason == Some("ownershipUnavailable")
+                        && !msp_sid.is_empty()
+                        && session_absent_on_host(host, &msp_sid)
+                    {
+                        let pending = take_pending_delete(&cmd);
+                        forget_deleted_session(host, stdout, sessions, lists, &msp_sid);
+                        if let Some(pending) = pending {
+                            answer_delete_waiters(stdout, pending.waiters, Ok(()));
+                        }
+                        return;
+                    }
+                    let pending = take_pending_delete(&cmd);
+                    let message = delete_failure_message(reason, physical_change);
+                    let data = format!(
+                        "{{\"reason\":{},\"physicalChange\":{}}}",
+                        j_to_string(&params.get("reason").cloned().unwrap_or(J::Null)),
+                        j_to_string(&params.get("physicalChange").cloned().unwrap_or(J::Null))
+                    );
+                    match pending {
+                        Some(pending) => answer_delete_waiters(
+                            stdout,
+                            pending.waiters,
+                            Err((-32603, message, Some(data))),
+                        ),
+                        None => log(&format!(
+                            "session/deleteCompleted failed for an untracked command: session={msp_sid} reason={reason:?}"
+                        )),
+                    }
+                }
+                _ => log(&format!(
+                    "session/deleteCompleted: unknown outcome {outcome} for command {cmd}; leaving it pending"
+                )),
             }
+        }
+        "session/closed" => {
+            // An unload, not a deletion: the session is `notLoaded`, its log
+            // stays on disk, and `session/resume` reloads it. It therefore
+            // stays listed; the host follows with `session/statusChanged`
+            // and, when streaming, a replacement `session/listChanged` row.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let reason = params
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            log(&format!(
+                "session unloaded by Muse: session={msp_sid} reason={reason}"
+            ));
+        }
+        "mcpServer/oauthLoginCompleted" => {
+            // Experimental: reaches this connection because it negotiates
+            // `experimentalApi`. The adapter never starts an MCP OAuth login,
+            // so this terminal belongs to another client's flow. It carries
+            // no URL or key material; only the server and outcome are logged.
+            let server = params.get("server").and_then(|v| v.as_str()).unwrap_or("");
+            let outcome = params
+                .get("outcome")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            log(&format!(
+                "MCP OAuth login completed elsewhere (ignored): server={server} outcome={outcome}"
+            ));
         }
         _ => {
             log(&format!("unhandled MSP notification: {method}"));
@@ -9399,6 +10306,49 @@ fn cancel_session_turns(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) {
     }
 }
 
+/// Remove one ACP session and settle everything still open on it as
+/// cancelled, exactly as `session/close` does. Returns false when the
+/// session was not held.
+fn drop_acp_session(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) -> bool {
+    let removed = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(acp_sid);
+    match removed {
+        Some(s) => {
+            for f in s.in_flight {
+                if s.ver == 2 {
+                    acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
+                } else {
+                    acp::send_result(stdout, &Some(f.req_id), "{\"stopReason\":\"cancelled\"}");
+                }
+            }
+            for p in s.pending_ui {
+                acp::send_cancel_request(stdout, &p.req_id);
+            }
+            if let Some(p) = s.pending_perm {
+                let request_id = p.feedback.map(|f| f.req_id).unwrap_or(p.req_id);
+                acp::send_cancel_request(stdout, &request_id);
+            }
+            if let Some(f) = s.pending_feedback {
+                acp::send_cancel_request(stdout, &f.req_id);
+                if s.ver == 2 {
+                    acp::send_result(stdout, &Some(f.prompt_req), "{}");
+                    acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
+                } else {
+                    acp::send_result(
+                        stdout,
+                        &Some(f.prompt_req),
+                        "{\"stopReason\":\"cancelled\"}",
+                    );
+                }
+            }
+            true
+        }
+        None => false,
+    }
+}
+
 /// Settle prompts that cannot receive an MSP terminal because the host died.
 /// A launch/configuration exit is a host admission problem, so v2 gets an
 /// explanatory transcript message and a cancelled idle state; v1 gets an
@@ -9754,6 +10704,436 @@ fn clarification_schema() -> &'static str {
     "{\"type\":\"object\",\"properties\":{\"clarification\":{\"type\":\"string\",\"maxLength\":500}},\"required\":[\"clarification\"]}"
 }
 
+const FEEDBACK_HELP: &str = "Usage: /feedback [bug|bad|good|other] <note>";
+
+/// Parse `/feedback <classification> <note>`. Accepts the short spellings and
+/// the MSP names. The note is the rest of the argument.
+fn parse_feedback_argument(argument: &str) -> Option<(String, String)> {
+    let mut parts = argument.trim().splitn(2, char::is_whitespace);
+    let first = parts.next().unwrap_or("");
+    let note = parts.next().unwrap_or("").trim().to_string();
+    let classification = match first.to_ascii_lowercase().as_str() {
+        "bug" => "bug",
+        "bad" | "badresult" => "badResult",
+        "good" | "goodresult" => "goodResult",
+        "other" => "other",
+        _ => return None,
+    };
+    Some((classification.to_string(), note))
+}
+
+/// The `/feedback` elicitation form. Attachments default to off: consent is
+/// explicit for every one of them.
+fn feedback_form_schema(classification: Option<&str>, note: &str) -> String {
+    let class_default = classification
+        .map(|value| format!(",\"default\":{}", esc(value)))
+        .unwrap_or_default();
+    let note_default = if note.is_empty() {
+        String::new()
+    } else {
+        format!(",\"default\":{}", esc(note))
+    };
+    format!(
+        "{{\"type\":\"object\",\"properties\":{{\
+         \"classification\":{{\"type\":\"string\",\"enum\":[\"bug\",\"badResult\",\"goodResult\",\"other\"],\"title\":\"Classification\"{class_default}}},\
+         \"note\":{{\"type\":\"string\",\"title\":\"Note\"{note_default}}},\
+         \"withFiles\":{{\"type\":\"boolean\",\"title\":\"Include local tracing\",\"description\":\"Selected-session diagnostics, redacted\",\"default\":false}},\
+         \"attachSessionRecord\":{{\"type\":\"boolean\",\"title\":\"Attach the session record\",\"description\":\"This whole conversation's replayable trajectory, redacted. Only for Bug or Bad result, and only with local tracing.\",\"default\":false}}\
+         }},\"required\":[\"classification\",\"note\"]}}"
+    )
+}
+
+/// End the `/feedback` turn with the receipt or refusal text.
+fn settle_feedback_turn(
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    ver: u8,
+    prompt_req: &J,
+    prompt_content: &str,
+    text: &str,
+) {
+    let prompt_req = Some(prompt_req.clone());
+    if ver == 2 {
+        acp::send_result(stdout, &prompt_req, "{}");
+        if !prompt_content.is_empty() {
+            send_v2_user_message(stdout, acp_sid, prompt_content);
+        }
+        send_agent_text(stdout, acp_sid, ver, text);
+        // The command is done, not the session: a turn that is still running
+        // keeps it running.
+        let busy = sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(acp_sid)
+            .is_some_and(|s| s.active_turn.is_some() || !s.in_flight.is_empty());
+        if busy {
+            acp::send_state(stdout, acp_sid, "running", None);
+        } else {
+            acp::send_state(stdout, acp_sid, "idle", Some("end_turn"));
+        }
+    } else {
+        if !prompt_content.is_empty() {
+            send_v1_user_message(stdout, acp_sid, prompt_content);
+        }
+        send_agent_text(stdout, acp_sid, ver, text);
+        acp::send_result(stdout, &prompt_req, "{\"stopReason\":\"end_turn\"}");
+    }
+}
+
+/// Human text for a `feedback/submit` result, following the host's outcome
+/// vocabulary. An unknown outcome is reported as a failure, never silently
+/// as success.
+fn feedback_result_text(result: &J) -> String {
+    let outcome = result
+        .get("outcome")
+        .and_then(J::as_str)
+        .unwrap_or("unknown");
+    let cause = result.get("cause").and_then(J::as_str);
+    let with_cause = |name: &str| match cause {
+        Some(cause) => format!("Feedback was not sent ({name}: {cause})."),
+        None => format!("Feedback was not sent ({name})."),
+    };
+    let mut lines = match outcome {
+        "uploaded" => vec![format!(
+            "Feedback sent (id {}).",
+            result
+                .get("uploadId")
+                .and_then(J::as_str)
+                .unwrap_or("unknown")
+        )],
+        "recorded" => vec!["Feedback recorded.".to_string()],
+        "rateLimited" => {
+            let seconds = result
+                .get("retryAfterMs")
+                .and_then(J::as_u64)
+                .map(|ms| ms.div_ceil(1000));
+            vec![match seconds {
+                Some(seconds) => {
+                    format!("Feedback was not sent: rate limited, try again in {seconds} seconds.")
+                }
+                None => "Feedback was not sent: rate limited, try again later.".to_string(),
+            }]
+        }
+        "acceptedWithoutReceipt" | "trackingFailed" | "trackingUncertain" => vec![format!(
+            "Feedback was sent, but Muse could not confirm the receipt ({outcome})."
+        )],
+        name @ ("noCredential" | "authRejected" | "disabled" | "dark" | "failed") => {
+            vec![with_cause(name)]
+        }
+        unknown => vec![with_cause(unknown)],
+    };
+    if let Some(path) = result.get("bundlePath").and_then(J::as_str)
+        && !path.is_empty()
+    {
+        lines.push(format!("A local copy is at {path}."));
+    }
+    if let Some(note) = result.get("sessionNote").and_then(J::as_str)
+        && !note.is_empty()
+    {
+        lines.push(note.to_string());
+    }
+    if let Some(note) = result.get("localTracingNote").and_then(J::as_str)
+        && !note.is_empty()
+    {
+        lines.push(note.to_string());
+    }
+    lines.join("\n")
+}
+
+/// Submit one consented feedback report through the session's host and settle the
+/// prompt with the result. Never retried automatically: the method has no
+/// idempotency key.
+#[allow(clippy::too_many_arguments)]
+fn submit_feedback(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    ver: u8,
+    prompt_req: &J,
+    prompt_content: &str,
+    classification: &str,
+    note: &str,
+    with_files: bool,
+    attach_record: bool,
+) {
+    let Some(msp_sid) = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(acp_sid)
+        .map(|s| s.msp_sid.clone())
+    else {
+        return;
+    };
+    // A Read-only or Plan session lives on the read-only host; the command
+    // goes to the process that owns it.
+    let cmd = host.mint_cmd("cmd-");
+    let result = host.command(
+        "feedback/submit",
+        &format!(
+            "{{\"commandId\":{},\"classification\":{},\"note\":{},\"sessionId\":{},\"withFiles\":{with_files},\"attachSessionRecord\":{attach_record}}}",
+            esc(&cmd),
+            esc(classification),
+            esc(note),
+            esc(&msp_sid),
+        ),
+    );
+    let text = match result {
+        Ok(result) => feedback_result_text(&result),
+        Err(error) => format!("Feedback was not sent: {}.", err_message(&error)),
+    };
+    settle_feedback_turn(
+        stdout,
+        sessions,
+        acp_sid,
+        ver,
+        prompt_req,
+        prompt_content,
+        &text,
+    );
+}
+
+/// Start a `/feedback` command: with forms, an elicitation with explicit
+/// consent for each attachment; without, the plain classified syntax.
+#[allow(clippy::too_many_arguments)]
+fn start_feedback(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    ver: u8,
+    prompt_req: Option<J>,
+    prompt_content: &str,
+    argument: &str,
+) {
+    if ELICIT_FORM.load(Ordering::SeqCst) == 1 {
+        // A classification token leads; anything else is all note.
+        let (classification, note) = match parse_feedback_argument(argument) {
+            Some((classification, note)) => (Some(classification), note),
+            None => (None, argument.trim().to_string()),
+        };
+        let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
+        let stored = {
+            let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+            match map.get_mut(acp_sid) {
+                // One form at a time: replacing it would strand its prompt.
+                Some(s) if s.pending_feedback.is_some() => Some(false),
+                Some(s) => {
+                    s.pending_feedback = Some(acp::PendingFeedbackForm {
+                        req_id: req_id.clone(),
+                        prompt_req: prompt_req.clone().unwrap_or(J::Null),
+                        prompt_content: prompt_content.to_string(),
+                        ver,
+                    });
+                    Some(true)
+                }
+                None => None,
+            }
+        };
+        match stored {
+            Some(true) => {}
+            Some(false) => {
+                acp::send_error(
+                    stdout,
+                    &prompt_req,
+                    -32602,
+                    "A feedback form is already open; answer or cancel it first.",
+                );
+                return;
+            }
+            None => return,
+        }
+        if ver == 2 {
+            acp::send_state(stdout, acp_sid, "requires_action", None);
+        }
+        send_elicitation_form(
+            stdout,
+            acp_sid,
+            &req_id,
+            "",
+            "Send feedback about Muse",
+            &feedback_form_schema(classification.as_deref(), &note),
+        );
+        return;
+    }
+    let prompt_req = prompt_req.unwrap_or(J::Null);
+    match parse_feedback_argument(argument) {
+        Some((classification, note)) if !note.is_empty() => submit_feedback(
+            host,
+            stdout,
+            sessions,
+            acp_sid,
+            ver,
+            &prompt_req,
+            prompt_content,
+            &classification,
+            &note,
+            false,
+            false,
+        ),
+        _ => settle_feedback_turn(
+            stdout,
+            sessions,
+            acp_sid,
+            ver,
+            &prompt_req,
+            prompt_content,
+            FEEDBACK_HELP,
+        ),
+    }
+}
+
+/// Cancel an open `/feedback` form and settle its prompt as cancelled.
+fn settle_feedback_cancelled(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) -> bool {
+    let pending = {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        map.get_mut(acp_sid).and_then(|s| s.pending_feedback.take())
+    };
+    let Some(pending) = pending else {
+        return false;
+    };
+    acp::send_cancel_request(stdout, &pending.req_id);
+    if pending.ver == 2 {
+        acp::send_result(stdout, &Some(pending.prompt_req), "{}");
+        acp::send_state(stdout, acp_sid, "idle", Some("cancelled"));
+    } else {
+        acp::send_result(
+            stdout,
+            &Some(pending.prompt_req),
+            "{\"stopReason\":\"cancelled\"}",
+        );
+    }
+    true
+}
+
+/// Client reply to an open `/feedback` form (matched by id).
+fn complete_feedback(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    id: &Option<J>,
+    msg: &J,
+) {
+    let Some(idv) = id.clone() else {
+        return;
+    };
+    let found = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .find_map(|(sid, s)| {
+            s.pending_feedback
+                .as_ref()
+                .filter(|p| j_to_string(&p.req_id) == j_to_string(&idv))
+                .map(|p| (sid.clone(), p.clone()))
+        });
+    let Some((acp_sid, pending)) = found else {
+        return;
+    };
+    let accepted = msg.get("error").is_none()
+        && msg
+            .get("result")
+            .and_then(|r| r.get("action"))
+            .and_then(|v| v.as_str())
+            == Some("accept");
+    if !accepted {
+        if let Some(s) = sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(&acp_sid)
+        {
+            s.pending_feedback = None;
+        }
+        settle_feedback_turn(
+            stdout,
+            sessions,
+            &acp_sid,
+            pending.ver,
+            &pending.prompt_req,
+            &pending.prompt_content,
+            "Feedback not sent.",
+        );
+        return;
+    }
+    let content = msg
+        .get("result")
+        .and_then(|r| r.get("content"))
+        .cloned()
+        .unwrap_or(J::Null);
+    let classification = content
+        .get("classification")
+        .and_then(J::as_str)
+        .unwrap_or("")
+        .to_string();
+    let note = content
+        .get("note")
+        .and_then(J::as_str)
+        .unwrap_or("")
+        .to_string();
+    let with_files = matches!(content.get("withFiles"), Some(J::Bool(true)));
+    let attach_record = matches!(content.get("attachSessionRecord"), Some(J::Bool(true)));
+    let problem = if !matches!(
+        classification.as_str(),
+        "bug" | "badResult" | "goodResult" | "other"
+    ) {
+        Some("Choose Bug, Bad result, Good result, or Other.")
+    } else if classification == "bug" && note.trim().is_empty() {
+        Some("A bug report needs a note.")
+    } else if attach_record
+        && !(with_files && matches!(classification.as_str(), "bug" | "badResult"))
+    {
+        Some(
+            "Attaching the session record requires local tracing and a Bug or Bad result classification.",
+        )
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
+        // Reissue with the submitted values so correcting one field does not
+        // lose the others.
+        let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get_mut(&acp_sid) else {
+            return;
+        };
+        let Some(pending) = s.pending_feedback.as_mut() else {
+            return;
+        };
+        pending.req_id = req_id.clone();
+        drop(map);
+        send_elicitation_form(
+            stdout,
+            &acp_sid,
+            &req_id,
+            "",
+            &format!("{problem}\n\nSend feedback about Muse"),
+            &feedback_form_schema(Some(&classification), &note),
+        );
+        return;
+    }
+    if let Some(s) = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(&acp_sid)
+    {
+        s.pending_feedback = None;
+    }
+    submit_feedback(
+        host,
+        stdout,
+        sessions,
+        &acp_sid,
+        pending.ver,
+        &pending.prompt_req,
+        &pending.prompt_content,
+        &classification,
+        &note,
+        with_files,
+        attach_record,
+    );
+}
+
 /// Client reply to our `elicitation/create` (matched by id).
 fn complete_elicitation(
     host: &Arc<Hosts>,
@@ -10045,7 +11425,8 @@ mod tests {
 
     #[test]
     fn protocol_command_text_joins_text_and_mentions() {
-        use super::protocol_command_text as line;
+        use crate::json::J;
+        let line = |blocks: &[J]| super::protocol_command_text(blocks, true);
         let blocks = |raw: &str| match crate::json::parse_json(raw) {
             Ok(crate::json::J::Arr(blocks)) => blocks,
             other => panic!("test blocks must be an array: {other:?}"),
@@ -10081,6 +11462,14 @@ mod tests {
         ] {
             assert_eq!(line(&blocks(raw)), None, "{raw} is not a protocol command");
         }
+        // `/feedback` is local only while the host grants it; otherwise it
+        // reaches the host as a prompt.
+        let feedback = blocks(r#"[{"type":"text","text":"/feedback bug x"}]"#);
+        assert_eq!(
+            super::protocol_command_text(&feedback, true),
+            Some(Ok("/feedback bug x".to_string()))
+        );
+        assert_eq!(super::protocol_command_text(&feedback, false), None);
     }
 
     #[test]
@@ -10640,7 +12029,16 @@ mod tests {
 
     #[test]
     fn initialization_payloads_report_the_cargo_version() {
-        for payload in [v2_init(true), v2_init(false), v1_init(true), v1_init(false)] {
+        for payload in [
+            v2_init(true, true),
+            v2_init(true, false),
+            v2_init(false, true),
+            v2_init(false, false),
+            v1_init(true, true),
+            v1_init(true, false),
+            v1_init(false, true),
+            v1_init(false, false),
+        ] {
             let parsed = parse_json(&payload).expect("initialization payload JSON");
             let version = ["info", "agentInfo"]
                 .iter()

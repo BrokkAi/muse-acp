@@ -62,9 +62,6 @@ pub fn load(msp_sid: &str) -> &'static str {
 /// for as long as this adapter runs.
 pub fn save(msp_sid: &str, mode: &str) {
     let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(path) = store_path() else {
-        return;
-    };
     let mut entries: Vec<(String, String)> = read_all()
         .into_iter()
         .filter(|(sid, _)| sid != msp_sid)
@@ -72,6 +69,24 @@ pub fn save(msp_sid: &str, mode: &str) {
     if crate::acp::is_read_only_mode(mode) {
         entries.push((msp_sid.to_string(), mode.to_string()));
     }
+    write_all(&entries);
+}
+
+/// Forgets a session Muse deleted, so a later session that reuses the id
+/// cannot inherit its old mode.
+pub fn forget(msp_sid: &str) {
+    let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+    let entries: Vec<(String, String)> = read_all()
+        .into_iter()
+        .filter(|(sid, _)| sid != msp_sid)
+        .collect();
+    write_all(&entries);
+}
+
+fn write_all(entries: &[(String, String)]) {
+    let Some(path) = store_path() else {
+        return;
+    };
     let body = entries
         .iter()
         .map(|(sid, mode)| format!("{}:{}", esc(sid), esc(mode)))
@@ -91,7 +106,7 @@ pub fn save(msp_sid: &str, mode: &str) {
     };
     if let Err(error) = write() {
         crate::msp::log(&format!(
-            "could not remember the mode of session {msp_sid} in {}: {error}",
+            "could not update the session mode store in {}: {error}",
             path.display()
         ));
     }

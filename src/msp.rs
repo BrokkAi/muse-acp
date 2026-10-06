@@ -40,6 +40,9 @@ pub struct HandshakeInfo {
     /// `config.mcpServers`. Without the grant a non-empty map is rejected
     /// with `capabilityRequired`, so client MCP servers are dropped instead.
     pub session_mcp: bool,
+    /// Whether `feedback/submit` is granted (Muse 1.4.2+). The adapter only
+    /// advertises `/feedback` on such a host.
+    pub feedback: bool,
 }
 
 impl HandshakeInfo {
@@ -48,6 +51,66 @@ impl HandshakeInfo {
     /// carries the recovery guarantee.
     pub fn restartable(&self) -> bool {
         matches!(self.durability.as_deref(), None | Some("durable"))
+    }
+
+    /// The leading `MAJOR.MINOR.PATCH` of `serverInfo.version`, ignoring any
+    /// suffix such as the `-R4684.1` build label. `None` when the version
+    /// does not start with three dot-separated decimal numbers.
+    fn release(&self) -> Option<(u64, u64, u64)> {
+        fn number(s: &str) -> Option<u64> {
+            if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            s.parse().ok()
+        }
+        let mut parts = self.server_version.splitn(3, '.');
+        let major = number(parts.next()?)?;
+        let minor = number(parts.next()?)?;
+        let rest = parts.next()?;
+        let end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        let patch = number(&rest[..end])?;
+        Some((major, minor, patch))
+    }
+
+    /// Whether the host reports at least this release. An unparseable
+    /// version answers false, so a feature gated on it stays off. Features
+    /// are gated on the reported version rather than the fingerprint table,
+    /// which only knows released builds.
+    pub fn at_least(&self, major: u64, minor: u64, patch: u64) -> bool {
+        self.release()
+            .is_some_and(|release| release >= (major, minor, patch))
+    }
+
+    /// MSP `session/delete` (Muse 1.4.1+). A memory-only host has nothing
+    /// durable to delete and does not offer the method, so this also needs
+    /// the durable profile.
+    pub fn supports_session_delete(&self) -> bool {
+        self.restartable() && self.at_least(1, 4, 1)
+    }
+
+    /// `workspaceRoots` on `session/start` and `turn/start` (Muse 1.4.1+).
+    pub fn supports_workspace_roots(&self) -> bool {
+        self.at_least(1, 4, 1)
+    }
+
+    /// Host-computed `cost` and cache totals on cumulative token usage
+    /// (Muse 1.4.2+).
+    pub fn reports_session_cost(&self) -> bool {
+        self.at_least(1, 4, 2)
+    }
+
+    /// One machine-readable line naming the version-gated MSP features this
+    /// host offers.
+    pub fn features_line(&self) -> String {
+        format!(
+            "host-features server={} session_delete={} workspace_roots={} session_cost={}",
+            self.host_label(),
+            self.supports_session_delete(),
+            self.supports_workspace_roots(),
+            self.reports_session_cost()
+        )
     }
 }
 
@@ -962,7 +1025,7 @@ impl MspHost {
         // lets session/new report a logged-out host before the first turn
         // (see `MspHost::logged_out`). On Muse 1.4.0 it gates nothing else.
         let init_params = format!(
-            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"experimentalApi":true,"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream","sessionMcp"{shell_capability}]}}}}"#,
+            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"experimentalApi":true,"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream","sessionMcp","feedback"{shell_capability}]}}}}"#,
             ver = crate::json::esc(env!("CARGO_PKG_VERSION")),
             user_input_dialogs = user_input_dialogs
         );
@@ -1019,6 +1082,10 @@ impl MspHost {
             session_mcp: matches!(
                 res.get("grantedCapabilities"),
                 Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("sessionMcp"))
+            ),
+            feedback: matches!(
+                res.get("grantedCapabilities"),
+                Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("feedback"))
             ),
         };
         if verdict.is_fatal() {
@@ -1715,6 +1782,7 @@ mod durability_tests {
             session_list_stream: false,
             user_shell: false,
             session_mcp: false,
+            feedback: false,
         }
     }
 
@@ -1726,6 +1794,78 @@ mod durability_tests {
         // Unknown values carry no recovery guarantee: fail closed.
         assert!(!info(Some("ephemeral")).restartable());
         assert!(!info(Some("future-profile")).restartable());
+    }
+
+    fn version(server_version: &str, durability: Option<&str>) -> HandshakeInfo {
+        HandshakeInfo {
+            server_version: server_version.into(),
+            ..info(durability)
+        }
+    }
+
+    #[test]
+    fn release_comparison_reads_the_leading_version_only() {
+        let at_least_141 = |v: &str| version(v, None).at_least(1, 4, 1);
+        assert!(at_least_141("1.4.2"));
+        assert!(at_least_141("1.4.1"));
+        assert!(!at_least_141("1.3.0"));
+        // Numeric, not lexical: 1.10 is newer than 1.4.
+        assert!(at_least_141("1.10.0"));
+        assert!(at_least_141("2.0.0"));
+        // The build label is a suffix, not part of the release.
+        assert!(at_least_141("1.4.2-R4684.1"));
+        assert!(at_least_141("1.4.1-R4503.1"));
+        assert!(!at_least_141("1.3.0-R3401.1"));
+        assert!(version("1.4.2-R4684.1", None).at_least(1, 4, 2));
+        assert!(!version("1.4.2-R4684.1", None).at_least(1, 4, 3));
+        // Anything that does not start with three numbers fails closed.
+        for unknown in [
+            "",
+            "garbage",
+            "unknown",
+            "0.0.0-fixture",
+            "1.4",
+            "v1.4.2",
+            "+1.4.2",
+            "1.+4.2",
+            "1..4.2",
+            "1.4.-2",
+            "99999999999999999999.0.0",
+        ] {
+            assert!(!at_least_141(unknown), "{unknown:?} must not pass the gate");
+        }
+    }
+
+    #[test]
+    fn session_features_follow_the_release_that_added_them() {
+        let v130 = version("1.3.0", None);
+        assert!(!v130.supports_session_delete());
+        assert!(!v130.supports_workspace_roots());
+        assert!(!v130.reports_session_cost());
+
+        let v141 = version("1.4.1", Some("durable"));
+        assert!(v141.supports_session_delete());
+        assert!(v141.supports_workspace_roots());
+        assert!(!v141.reports_session_cost());
+
+        let v142 = version("1.4.2-R4684.1", None);
+        assert!(v142.supports_session_delete());
+        assert!(v142.supports_workspace_roots());
+        assert!(v142.reports_session_cost());
+
+        // A memory-only host has no `session/delete`; an unknown profile
+        // carries no durability guarantee either.
+        for profile in ["ephemeral", "future-profile"] {
+            let host = version("1.4.2", Some(profile));
+            assert!(!host.supports_session_delete(), "{profile}");
+            assert!(host.supports_workspace_roots(), "{profile}");
+            assert!(host.reports_session_cost(), "{profile}");
+        }
+
+        assert_eq!(
+            v142.features_line(),
+            "host-features server=s/1.4.2-R4684.1 session_delete=true workspace_roots=true session_cost=true"
+        );
     }
 }
 

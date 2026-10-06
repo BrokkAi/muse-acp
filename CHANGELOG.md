@@ -32,6 +32,47 @@
 - Classify Muse 1.4.2 as a tested host. Its stable schema only adds to
   1.4.1's, and the live-host suite passes against it, so startup logs now
   report `status=tested` instead of `status=unknown`.
+- Re-pin the vendored Muse SDK conformance corpus to `bb44be3`. It publishes
+  the Muse 1.4.2 stable surface, including `session/delete`, workspace roots,
+  session-list filters, per-model reasoning tiers, cost totals, and feedback.
+  Startup now logs a `host-features` line saying whether the host's version
+  offers session delete, workspace roots, and host-computed session cost.
+- ACP `session/delete` is advertised and backed by MSP `session/delete` on
+  Muse 1.4.1+ hosts with durable session logs. The editor's answer arrives
+  with the host's terminal event, a completed delete disappears from
+  `session/list`, and a refusal keeps the session and explains why. Muse only
+  deletes sessions it can prove the running host owns, so a session from an
+  earlier editor run may be kept; the host's own reason and physical-change
+  evidence are shown either way. Deleting a session that never existed
+  succeeds silently where the host's listing filters can prove the absence
+  (Muse 1.4.2+); on hosts without them the refusal is reported rather than
+  pretended away.
+- ACP `additionalDirectories` now reach Muse itself as MSP `workspaceRoots`
+  on 1.4.1+ hosts, so Muse's own tools work in the extra folders. Roots are
+  validated and canonicalized up front, duplicates collapse, and a load,
+  resume, fork, or host re-attach replaces the host's sticky root set on the
+  next turn. Older hosts keep adapter-side confinement and log the limit.
+- The reasoning selector offers exactly the selected model's tiers, with
+  Muse's descriptions, on hosts that publish per-model variants, and follows
+  a model change; a model that cannot describe its tiers keeps the fixed
+  list. `config_option_update` now carries the complete `configOptions` list
+  as ACP requires, and host-reported model, reasoning, and approval changes
+  refresh it. AIR clients see the current model's default when the host set
+  no session-level recommendation.
+- Session cost now comes from Muse's own `session/tokenUsage.cost` on 1.4.2+
+  hosts, including whether it is partial, instead of the adapter's catalog
+  estimate; hosts without it keep the labeled estimate. Host cache read and
+  write totals ride `_meta.museCumulative`, and the estimate's provenance
+  moves into `cost._meta` where ACP allows extensions.
+- Add `/feedback`. On hosts that grant the feedback capability it sends
+  `feedback/submit` and shows the host's receipt; with form elicitation, one
+  form collects the classification, note, and explicit consent for local
+  tracing and the session record, both defaulting off. Without forms the
+  classified `/feedback <bug|bad|good|other> <note>` syntax submits directly.
+- A session that Muse unloads, for example when its host shuts down or the
+  session sits idle, now stays in the editor's session list. With Muse's live
+  listing stream it used to disappear until it changed again, although Muse
+  keeps it on disk and can reload it.
 - With a saved `:auto-review` profile, files Muse creates while it runs, such
   as the credential from a first login or a first workspace trust, now land
   in your Muse configuration instead of the temporary settings view, where

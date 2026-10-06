@@ -99,6 +99,19 @@ pub struct PendingUi {
     pub tool_call_id: String,
 }
 
+/// One in-flight `/feedback` form. The command's ACP prompt request stays
+/// pending until the form is answered or declined, then settles normally.
+#[derive(Clone)]
+pub struct PendingFeedbackForm {
+    /// ACP `elicitation/create` request id awaiting the client reply.
+    pub req_id: J,
+    /// The `session/prompt` request that ran `/feedback`.
+    pub prompt_req: J,
+    /// The prompt's ACP content blocks, echoed when the turn settles.
+    pub prompt_content: String,
+    pub ver: u8,
+}
+
 /// Host-authored title candidates. The adapter never derives a title from
 /// transcript items; it only chooses among facts the host explicitly sends.
 #[derive(Clone, Default)]
@@ -124,6 +137,11 @@ pub struct AcpSession {
     /// Ordered ACP workspace scope: `cwd` followed by each explicitly
     /// supplied additional directory (with exact duplicates removed).
     pub roots: Vec<String>,
+    /// True when the next user `turn/start` must carry MSP `workspaceRoots`.
+    /// The host applies `turn/start.workspaceRoots` as a sticky replacement,
+    /// so after a load, resume, fork, or host re-attach with no extras the
+    /// next turn must explicitly replace the set with `[cwd]`.
+    pub host_roots_pending: bool,
     pub ver: u8,
     pub in_flight: Vec<InFlight>,
     pub pending_perm: Option<PendingPerm>,
@@ -139,6 +157,8 @@ pub struct AcpSession {
     /// User-input ids already presented or auto-cancelled, so reconciliation
     /// cannot replay a settled question.
     pub ui_seen: std::collections::HashSet<String>,
+    /// The `/feedback` form awaiting its answer, if one is open.
+    pub pending_feedback: Option<PendingFeedbackForm>,
     /// The approval mode selector's value.
     pub mode_value: String,
     /// Adapter-side auto-review policy for this session. Off by default,
@@ -189,11 +209,17 @@ pub struct AcpSession {
     pub cum_prompt: Option<u64>,
     pub cum_output: Option<u64>,
     pub cum_total: Option<u64>,
+    /// Counted-once session cache totals, when the host reports them.
+    pub cum_cache_read: Option<u64>,
+    pub cum_cache_write: Option<u64>,
+    /// Host-computed session cost `(usd, partial)`. Only Muse 1.4.2+ reports
+    /// it, and a later cumulative object without `cost` clears it.
+    pub host_cost: Option<(f64, bool)>,
     /// Running list-price estimate, accumulated per completion from catalog
-    /// per-1M rates: (amount, currency). Partial in both directions —
-    /// historic and unpriceable completions are excluded, while cached input
-    /// is charged at the full input rate — so it is never a billing figure
-    /// on plan subscriptions.
+    /// per-1M rates: (amount, currency). Partial in both directions:
+    /// historic and unpriceable completions are excluded, so this is an
+    /// estimate, never a billing figure on plan subscriptions. Emitted only
+    /// on hosts that do not report their own session cost.
     pub cost_amount: Option<(f64, String)>,
     /// View cursors of completions already folded into the totals above.
     /// `view/gap` recovery can replay a completion that also arrives live.
@@ -483,7 +509,15 @@ pub fn send_error_with_data(
 /// `usage_update` for both ACP versions (`{used, size}` plus counted-once
 /// session cumulative totals in `_meta`). Emits only when both `used` and
 /// `size` are known; callers stash partial state on the session instead.
-pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>) {
+/// `host_reports_cost` is the host's version gate: with it, `cost` comes only
+/// from the host's own figure; without it, from the adapter's catalog
+/// estimate.
+pub fn send_usage(
+    stdout: &StdoutShared,
+    s: &AcpSession,
+    pressure: Option<&str>,
+    host_reports_cost: bool,
+) {
     let (Some(used), Some(size)) = (s.usage_used, s.usage_size) else {
         return;
     };
@@ -494,6 +528,12 @@ pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>)
         s.cum_output.map(|v| v.to_string()).unwrap_or("null".into()),
         s.cum_total.map(|v| v.to_string()).unwrap_or("null".into()),
     ));
+    if let Some(v) = s.cum_cache_read {
+        meta.push_str(&format!(",\"cacheReadTokens\":{v}"));
+    }
+    if let Some(v) = s.cum_cache_write {
+        meta.push_str(&format!(",\"cacheWriteTokens\":{v}"));
+    }
     meta.push('}');
     if let Some(p) = pressure {
         meta.push_str(&format!(",\"musePressure\":{}", esc(p)));
@@ -504,13 +544,23 @@ pub fn send_usage(stdout: &StdoutShared, s: &AcpSession, pressure: Option<&str>)
         ));
     }
     // `amount` must be a JSON number: Rust's Display prints `inf`/`NaN`
-    // verbatim, which would corrupt the whole frame.
-    let cost_f = match &s.cost_amount {
-        Some((amount, currency)) if amount.is_finite() => format!(
-            ",\"cost\":{{\"amount\":{amount},\"currency\":{},\"source\":\"adapter-estimate\",\"basis\":\"catalog-list-price\",\"billing\":false}}",
-            esc(currency)
-        ),
-        _ => String::new(),
+    // verbatim, which would corrupt the whole frame. ACP's `Cost` allows only
+    // `amount`, `currency`, and `_meta`, so the provenance lives in `_meta`.
+    let cost_f = if host_reports_cost {
+        match &s.host_cost {
+            Some((amount, partial)) if amount.is_finite() => format!(
+                ",\"cost\":{{\"amount\":{amount},\"currency\":\"USD\",\"_meta\":{{\"muse\":{{\"source\":\"muse-host\",\"estimate\":true,\"partial\":{partial}}}}}}}"
+            ),
+            _ => String::new(),
+        }
+    } else {
+        match &s.cost_amount {
+            Some((amount, currency)) if amount.is_finite() => format!(
+                ",\"cost\":{{\"amount\":{amount},\"currency\":{},\"_meta\":{{\"muse\":{{\"source\":\"adapter-estimate\",\"basis\":\"catalog-list-price\",\"billing\":false}}}}}}",
+                esc(currency)
+            ),
+            _ => String::new(),
+        }
     };
     send_raw(
         stdout,
@@ -555,24 +605,15 @@ pub fn send_state(stdout: &StdoutShared, acp_sid: &str, state: &str, stop: Optio
     );
 }
 
-/// Reflect a host-side configuration change in the client's selector.
-pub fn send_config_option_update(
-    stdout: &StdoutShared,
-    acp_sid: &str,
-    config_id: &str,
-    value: &str,
-    recommended: Option<&str>,
-) {
-    let meta = recommended.filter(|value| is_reasoning_effort(value))
-        .map(|value| format!(",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}", esc(value)))
-        .unwrap_or_default();
+/// Reflect a host-side configuration change in the client's selector. ACP
+/// requires the complete `configOptions` list, not the changed selector, so
+/// callers pass the same JSON the selector result uses.
+pub fn send_config_options_update(stdout: &StdoutShared, acp_sid: &str, config_options_json: &str) {
     send_raw(
         stdout,
         &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"config_option_update\",\"configId\":{},\"currentValue\":{}{meta}}}}}}}",
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"config_option_update\",\"configOptions\":{config_options_json}}}}}}}",
             esc(acp_sid),
-            esc(config_id),
-            esc(value),
         ),
     );
 }
@@ -801,6 +842,41 @@ pub fn is_reasoning_effort(value: &str) -> bool {
     )
 }
 
+/// The tiers offered when a model's catalog row does not publish `variants`.
+pub const FIXED_REASONING_TIERS: [&str; 8] = [
+    "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+];
+
+/// Display name for one MSP `ReasoningEffort`.
+pub fn reasoning_tier_name(tier: &str) -> &str {
+    match tier {
+        "none" => "None",
+        "minimal" => "Minimal",
+        "low" => "Low",
+        "medium" => "Medium",
+        "high" => "High",
+        "xhigh" => "Extra High",
+        "max" => "Max",
+        "ultra" => "Ultra",
+        other => other,
+    }
+}
+
+/// One selectable model from the host's `model/list`.
+#[derive(Clone, Default)]
+pub struct CatalogModel {
+    pub id: String,
+    pub label: String,
+    pub is_default: bool,
+    /// Reasoning tiers the model serves, in catalog order. `None` when the
+    /// host sent no `variants` or the string `"unknown"`.
+    pub variants: Option<Vec<String>>,
+    /// `reasoningEffortVariants` descriptions, keyed by tier.
+    pub tier_descriptions: Vec<(String, Option<String>)>,
+    /// The model's `defaultReasoningEffort`, when the host set one.
+    pub default_effort: Option<String>,
+}
+
 /// Per-session values rendered by `config_options`. Keeping them in one
 /// struct keeps the selector builder readable as the selector set grows.
 pub struct ConfigOptions<'a> {
@@ -821,24 +897,75 @@ pub struct ConfigOptions<'a> {
 /// `configId` (the setter still uses `configId` in both versions).
 /// Auto-review is adapter policy: see [`AUTO_REVIEW_OFF`] and
 /// [`AUTO_REVIEW_WORKSPACE`].
-pub fn config_options(
-    ver: u8,
-    options: ConfigOptions<'_>,
-    models_json: &[(String, String, bool)],
-) -> String {
+pub fn config_options(ver: u8, options: ConfigOptions<'_>, models: &[CatalogModel]) -> String {
     let mut model_opts = Vec::new();
-    for (id, label, _) in models_json {
-        model_opts.push(format!("{{\"value\":{},\"name\":{}}}", esc(id), esc(label)));
+    for model in models {
+        model_opts.push(format!(
+            "{{\"value\":{},\"name\":{}}}",
+            esc(&model.id),
+            esc(&model.label)
+        ));
     }
     let id_key = if ver == 1 { "id" } else { "configId" };
+    // The reasoning selector offers exactly the tiers the current model
+    // serves, with the catalog's own descriptions. A model whose row does not
+    // publish tiers keeps today's fixed list. The current value always stays
+    // among the options, even when the catalog disagrees with it.
+    let current_model = models.iter().find(|model| model.id == options.model);
+    let tier_description = |tier: &str| -> Option<String> {
+        current_model?
+            .tier_descriptions
+            .iter()
+            .find(|(name, _)| name == tier)
+            .and_then(|(_, description)| description.clone())
+    };
+    let mut reasoning_options: Vec<(String, Option<String>)> =
+        match current_model.and_then(|model| model.variants.as_ref()) {
+            Some(variants) => variants
+                .iter()
+                .map(|tier| (tier.clone(), tier_description(tier)))
+                .collect(),
+            None => FIXED_REASONING_TIERS
+                .iter()
+                .map(|tier| (tier.to_string(), None))
+                .collect(),
+        };
+    if is_reasoning_effort(options.reasoning_effort)
+        && !reasoning_options
+            .iter()
+            .any(|(tier, _)| tier == options.reasoning_effort)
+    {
+        reasoning_options.push((
+            options.reasoning_effort.to_string(),
+            tier_description(options.reasoning_effort),
+        ));
+    }
+    let reasoning_options_json = reasoning_options
+        .iter()
+        .map(|(tier, description)| match description {
+            Some(description) if !description.is_empty() => format!(
+                "{{\"value\":{},\"name\":{},\"description\":{}}}",
+                esc(tier),
+                esc(reasoning_tier_name(tier)),
+                esc(description)
+            ),
+            _ => format!(
+                "{{\"value\":{},\"name\":{}}}",
+                esc(tier),
+                esc(reasoning_tier_name(tier))
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     // AIR recommendedValue is additive metadata: emit it only when the client
     // negotiated it and the value is present among this selector's options.
     let (recommended_model, recommended_reasoning) = options.recommendations;
-    let reasoning_meta = recommended_reasoning.filter(|value| is_reasoning_effort(value))
+    let reasoning_meta = recommended_reasoning
+        .filter(|value| reasoning_options.iter().any(|(tier, _)| tier == value))
         .map(|value| format!(",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}", esc(value)))
         .unwrap_or_default();
     let recommended_meta = match recommended_model {
-        Some(model) if models_json.iter().any(|(id, _, _)| id == model) => format!(
+        Some(model) if models.iter().any(|row| row.id == model) => format!(
             ",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}",
             esc(model)
         ),
@@ -857,7 +984,7 @@ pub fn config_options(
         AUTO_REVIEW_OFF
     };
     format!(
-        "[{{\"{id_key}\":\"mode\",\"name\":\"Mode\",\"description\":\"What Muse may change: Read-only and Plan cannot write files or run shell commands\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"approval_mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"auto_review\",\"name\":\"Auto-review\",\"description\":\"Dangerous: send every permission request to an auto-review agent that can approve or deny it without asking you\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"off\",\"name\":\"Off\"}},{{\"value\":\"on\",\"name\":\"On\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{{\"value\":\"none\",\"name\":\"None\"}},{{\"value\":\"minimal\",\"name\":\"Minimal\"}},{{\"value\":\"low\",\"name\":\"Low\"}},{{\"value\":\"medium\",\"name\":\"Medium\"}},{{\"value\":\"high\",\"name\":\"High\"}},{{\"value\":\"xhigh\",\"name\":\"Extra High\"}},{{\"value\":\"max\",\"name\":\"Max\"}},{{\"value\":\"ultra\",\"name\":\"Ultra\"}}]{reasoning_meta}}}]",
+        "[{{\"{id_key}\":\"mode\",\"name\":\"Mode\",\"description\":\"What Muse may change: Read-only and Plan cannot write files or run shell commands\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"approval_mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"auto_review\",\"name\":\"Auto-review\",\"description\":\"Dangerous: send every permission request to an auto-review agent that can approve or deny it without asking you\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"off\",\"name\":\"Off\"}},{{\"value\":\"on\",\"name\":\"On\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{reasoning_options_json}]{reasoning_meta}}}]",
         esc(options.session_mode),
         mode_options_json("value", &SESSION_MODES),
         esc(options.approval_mode),
@@ -889,7 +1016,11 @@ pub fn session_modes(session_mode: &str) -> String {
 /// Catalog
 /// rows with a local command's name are deduplicated below so each local
 /// command is advertised exactly once.
-fn available_commands_json(ver: u8, skills: &[(String, String, Option<String>)]) -> String {
+fn available_commands_json(
+    ver: u8,
+    skills: &[(String, String, Option<String>)],
+    feedback: bool,
+) -> String {
     let input = |hint: &str| {
         if ver == 1 {
             format!("{{\"hint\":{}}}", esc(hint))
@@ -916,7 +1047,10 @@ fn available_commands_json(ver: u8, skills: &[(String, String, Option<String>)])
     items.extend(
         skills
             .iter()
-            .filter(|(name, _, _)| !matches!(name.as_str(), "goal" | "rename" | "workflow-child"))
+            .filter(|(name, _, _)| {
+                !matches!(name.as_str(), "goal" | "rename" | "workflow-child")
+                    && !(feedback && name.as_str() == "feedback")
+            })
             .map(|(name, description, hint)| {
                 let input = hint
                     .as_deref()
@@ -929,6 +1063,12 @@ fn available_commands_json(ver: u8, skills: &[(String, String, Option<String>)])
                 )
             }),
     );
+    if feedback {
+        items.push(format!(
+            "{{\"name\":\"feedback\",\"description\":\"Send feedback about Muse\",\"input\":{}}}",
+            input("[bug|bad|good|other] <note>")
+        ));
+    }
     format!("[{}]", items.join(","))
 }
 
@@ -937,13 +1077,14 @@ pub fn send_available_commands(
     acp_sid: &str,
     ver: u8,
     skills: &[(String, String, Option<String>)],
+    feedback: bool,
 ) {
     send_raw(
         stdout,
         &format!(
             "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":{}}}}}}}",
             esc(acp_sid),
-            available_commands_json(ver, skills)
+            available_commands_json(ver, skills, feedback)
         ),
     );
 }
@@ -1100,7 +1241,12 @@ mod tests {
 
     #[test]
     fn selector_and_command_literals_are_valid_json() {
-        let models = vec![("fake-model".to_string(), "Fake".to_string(), true)];
+        let models = vec![CatalogModel {
+            id: "fake-model".to_string(),
+            label: "Fake".to_string(),
+            is_default: true,
+            ..CatalogModel::default()
+        }];
         for ver in [1, 2] {
             let options = config_options(
                 ver,
@@ -1138,14 +1284,28 @@ mod tests {
                     Some("what to plan".to_string()),
                 ),
                 ("rename".to_string(), "Host rename skill".to_string(), None),
+                (
+                    "feedback".to_string(),
+                    "Host feedback skill".to_string(),
+                    None,
+                ),
             ];
-            let commands = available_commands_json(ver, &skills);
+            let commands = available_commands_json(ver, &skills, true);
+            assert!(
+                commands.contains("\"name\":\"feedback\""),
+                "a granted feedback capability must be advertised: {commands}"
+            );
             let parsed = crate::json::parse_json(&commands).expect("available commands JSON");
             let J::Arr(items) = parsed else {
                 panic!("available commands must be an array");
             };
             // The host's `rename` row is shadowed by the local command.
-            assert_eq!(items.len(), 5);
+            assert_eq!(items.len(), 6);
+            assert_eq!(
+                commands.matches("\"name\":\"feedback\"").count(),
+                1,
+                "the local feedback command absorbs a host skill of the same name: {commands}"
+            );
             assert!(commands.contains("\"name\":\"plan\""));
             assert!(commands.contains("\"name\":\"goal\""));
             assert!(commands.contains("\"name\":\"compact\""));
@@ -1164,7 +1324,12 @@ mod tests {
             assert!(is_reasoning_effort(tier), "{tier} must be selectable");
         }
         assert!(!is_reasoning_effort("extreme"));
-        let models = vec![("fake-model".to_string(), "Fake".to_string(), true)];
+        let models = vec![CatalogModel {
+            id: "fake-model".to_string(),
+            label: "Fake".to_string(),
+            is_default: true,
+            ..CatalogModel::default()
+        }];
         let options = config_options(
             1,
             ConfigOptions {

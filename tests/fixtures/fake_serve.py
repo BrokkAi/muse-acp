@@ -64,7 +64,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   usage_inline inline by default; the explicit snapshot rung carries usage
   usage_inline_nosnapshot every rung downgrades; only the durable page has
                totals, and contextUsage is never durable (as on the real host)
-  session_list_stream grants sessionListStream and emits row replace/close events
+  session_list_stream grants sessionListStream and emits row replace events,
+               then a schema-shaped session/closed unload after session/list
   session_list_stream_denied sends the notification without granting the capability
   session_list_pagination returns a second page when its cursor is forwarded
   status_flags   session/statusChanged status, attention, open-enum, and null
@@ -96,6 +97,29 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
                the goal; a later wake verb names it as the busy turn
   goal_continuation the woken goal turn completes, then the host starts its
                own follow-up turn that runs until turn/interrupt
+  mcp_oauth_completed an experimental mcpServer/oauthLoginCompleted from
+               another client's login flow follows the session/start ack
+
+Host identity (every scenario): FAKE_SERVER_VERSION sets serverInfo.version
+(default 0.0.0-fixture, which no version gate accepts), and
+FAKE_SESSION_DURABILITY sets sessionDurability (absent by default, which MSP
+reads as durable).
+
+Session delete: `session/delete` acks, then reports `session/deleteCompleted`.
+FAKE_DELETE_OUTCOME=failed sends a failed terminal with FAKE_DELETE_REASON
+(default ownershipUnavailable) and FAKE_DELETE_PHYSICAL (default none);
+FAKE_DELETE_REJECT=session_deleted|runtime_busy|sessionNotFound rejects at
+admission; FAKE_DELETE_DELAY_MS delays the terminal; FAKE_DELETE_EXIT=1 exits
+after the ack instead of reporting. A completed delete hides the id from later
+session/list results. FAKE_LIST_NULL_ROOT=1 adds a row without a workspace
+root; FAKE_LIST_REJECT_CURSOR=1 rejects a paged session/list with invalid
+params.
+
+Feedback: `feedback/submit` is granted when `feedback` is requested unless
+FAKE_NO_FEEDBACK=1 (which makes the method fail with capabilityRequired).
+FAKE_FEEDBACK_OUTCOME selects the result outcome (default uploaded);
+FAKE_FEEDBACK_NOTES=1 adds sessionNote and localTracingNote;
+FAKE_FEEDBACK_HOST_ERROR=1 fails the method with an internal error.
 
 Session MCP (every scenario): `sessionMcp` is granted when requested unless
 FAKE_NO_SESSION_MCP=1. As on the live host, a non-empty config.mcpServers
@@ -110,7 +134,7 @@ import time
 
 FP = "sha256:03312c213efd14277a0e0a102f70adeae497a469ca4edf7242f479953ed758b7"
 SCHEMA = {"fingerprint": FP, "version": 1}
-MSP_SID = "msp-sess-1"
+MSP_SID = os.environ.get("FAKE_SESSION_ID", "msp-sess-1")
 SCENARIO = os.environ.get("FAKE_SCENARIO", "happy")
 MODE = os.environ.get("FAKE_MODE", "promptUnmatched")
 # The adapter launches a third, memory-only host for auto-review. It serves
@@ -129,10 +153,13 @@ CATALOG_READS = [0]
 USER_INPUT_DIALOGS = [True]
 EXPERIMENTAL_API = [False]
 SESSION_MCP = [False]
+FEEDBACK = [False]
 MCP_CONFLICTED = [False]
 USAGE_READS = [0]
 SKILL_READS = [0]
 FORK_ITEMS = []
+# Durable session ids a successful `session/delete` removed.
+DELETED_SESSIONS = []
 
 # Compatibility-diagnostics knobs: the fixture defaults to the validated
 # host shape, but tests can present an unknown fingerprint or a future
@@ -194,6 +221,26 @@ def log_input(params):
 def send(obj):
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
+
+
+def validate_workspace_roots(roots, primary):
+    """The live host's workspaceRoots rules, so tests catch bad frames."""
+    if not isinstance(roots, list) or not roots:
+        return ("workspaceRoots must be non-empty (omit the field for "
+                "single-root behavior)")
+    if not all(isinstance(root, str) and os.path.isabs(root) for root in roots):
+        return "workspaceRoots entries must be absolute paths"
+    seen = []
+    for root in roots:
+        canonical = os.path.realpath(root)
+        if canonical in seen:
+            return "duplicate root " + root
+        if not os.path.isdir(root):
+            return "not an existing directory: " + root
+        seen.append(canonical)
+    if primary and os.path.realpath(primary) != seen[0]:
+        return "workspaceRoots[0] must name the same folder as workspaceRoot"
+    return None
 
 
 def notify(method, params):
@@ -266,7 +313,7 @@ def on_goal_command(method, params):
     return result
 
 
-ACTIVE_WORKSPACE = ["/tmp/fake-ws"]
+ACTIVE_WORKSPACE = [os.environ.get("FAKE_WORKSPACE_ROOT", "/tmp/fake-ws")]
 
 
 def approval_params(**overrides):
@@ -339,6 +386,21 @@ def history_items():
     ]
 
 
+def cumulative_totals(prompt, output):
+    """A session cumulative block, with the optional 1.4.2 cache and cost."""
+    cumulative = {"promptTokens": prompt, "outputTokens": output,
+                  "totalTokens": prompt + output}
+    if os.environ.get("FAKE_CUMULATIVE_CACHE") == "1":
+        cumulative["cacheReadTokens"] = min(prompt, 100)
+        cumulative["cacheWriteTokens"] = min(prompt, 25)
+    if os.environ.get("FAKE_CUMULATIVE_COST") == "1":
+        cumulative["cost"] = {
+            "usd": float(os.environ.get("FAKE_CUMULATIVE_USD", "0.25")),
+            "partial": os.environ.get("FAKE_CUMULATIVE_PARTIAL") == "1",
+        }
+    return cumulative
+
+
 def token_usage(cursor, prompt, output, cumulative_prompt, cumulative_output):
     """One `session/tokenUsage` completion leg, identified by view cursor."""
     return {"sessionId": MSP_SID, "turnId": f"turn-{TURNS[0]}",
@@ -348,9 +410,7 @@ def token_usage(cursor, prompt, output, cumulative_prompt, cumulative_output):
                       "cachedTokens": 0, "reasoningTokens": 0},
             "viewCursor": cursor,
             "sourceRange": {"start": 0, "end": int(cursor.split("-")[1])},
-            "cumulative": {"promptTokens": cumulative_prompt,
-                           "outputTokens": cumulative_output,
-                           "totalTokens": cumulative_prompt + cumulative_output}}
+            "cumulative": cumulative_totals(cumulative_prompt, cumulative_output)}
 
 
 def context_usage(used, cursor):
@@ -880,8 +940,7 @@ def on_turn_start(params):
             "usage": {"inputTokens": 100, "outputTokens": 20,
                       "cachedTokens": 0, "reasoningTokens": 0},
             "viewCursor": "cur-0", "sourceRange": {"start": 0, "end": 1},
-            "cumulative": {"promptTokens": 100, "outputTokens": 20,
-                           "totalTokens": 120}})
+            "cumulative": cumulative_totals(100, 20)})
         notify("session/contextUsage", {
             "sessionId": MSP_SID, "usedTokens": 1234, "windowTokens": 200000,
             "pressure": "normal", "viewCursor": "cur-1",
@@ -892,8 +951,7 @@ def on_turn_start(params):
             "usage": {"inputTokens": 1000, "outputTokens": 500,
                       "cachedTokens": 0, "reasoningTokens": 0},
             "viewCursor": "cur-2", "sourceRange": {"start": 0, "end": 2},
-            "cumulative": {"promptTokens": 5000, "outputTokens": 2500,
-                           "totalTokens": 7500}})
+            "cumulative": cumulative_totals(5000, 2500)})
         # Pre-schema record: no modelId, so an unpriced leg. Totals still
         # advance; the running cost must not.
         notify("session/tokenUsage", {
@@ -902,8 +960,7 @@ def on_turn_start(params):
             "usage": {"inputTokens": 1000, "outputTokens": 500,
                       "cachedTokens": 0, "reasoningTokens": 0},
             "viewCursor": "cur-3", "sourceRange": {"start": 0, "end": 3},
-            "cumulative": {"promptTokens": 6000, "outputTokens": 3000,
-                           "totalTokens": 9000}})
+            "cumulative": cumulative_totals(6000, 3000)})
         notify("item/completed", {**base, "item": {
             "itemId": "it-1", "kind": "agentMessage",
             "status": "completed", "text": "done"}})
@@ -1064,18 +1121,25 @@ def result_for(method, msg):
                           and os.environ.get("FAKE_NO_SESSION_MCP") != "1")
         if SESSION_MCP[0]:
             granted.append("sessionMcp")
+        FEEDBACK[0] = ("feedback" in requested
+                       and os.environ.get("FAKE_NO_FEEDBACK") != "1")
+        if FEEDBACK[0]:
+            granted.append("feedback")
         USER_INPUT_DIALOGS[0] = msg.get("params", {}).get("capabilities", {}).get(
             "userInputDialogs", True) is not False
         EXPERIMENTAL_API[0] = msg.get("params", {}).get("capabilities", {}).get(
             "experimentalApi") is True
-        return {
+        result = {
             "schema": SCHEMA,
             "grantedCapabilities": granted,
             "serverInfo": {
                 "name": "muse-session-server-fixture",
-                "version": "0.0.0-fixture",
+                "version": os.environ.get("FAKE_SERVER_VERSION", "0.0.0-fixture"),
             },
         }
+        if os.environ.get("FAKE_SESSION_DURABILITY", ""):
+            result["sessionDurability"] = os.environ["FAKE_SESSION_DURABILITY"]
+        return result
     if method == "approval/listPending":
         if SCENARIO == "pending_reconcile":
             return {"approvals": [dict(APPROVAL_PARAMS, approvalId="ap-reconcile")],
@@ -1197,7 +1261,8 @@ def result_for(method, msg):
                 history["snapshot"]["state"]["pendingUserInputs"] = [
                     {"userInputId": "ui-1", "itemId": "item-ui-1",
                      "viewCursor": "cur-8"}]
-        workspace_root = "/tmp" if SCENARIO == "resume_active" else None
+        workspace_root = (os.environ.get("FAKE_WORKSPACE_ROOT", "/tmp")
+                          if SCENARIO == "resume_active" else None)
         session = session_obj(params.get("sessionId", MSP_SID), workspace_root)
         if SCENARIO == "cancel_request" and os.environ.get("FAKE_RESUME_QUEUED"):
             session["activeTurnId"] = "turn-2"
@@ -1290,12 +1355,12 @@ def result_for(method, msg):
         # Every other session pages back to nothing usable.
         return {"events": [], "nextCursor": None}
     if method == "session/list":
+        params = msg.get("params", {})
+        filter_id = ((params.get("filter") or {}).get("sessionId") or {}).get("anyOf")
         if SCENARIO == "session_list_workspace_filter":
-            params = msg.get("params", {})
             if params.get("workspaceRoot") == "/tmp/unrelated-ws":
                 return {"sessions": [], "nextCursor": None}
         if SCENARIO == "session_list_pagination":
-            params = msg.get("params", {})
             if params.get("cursor") == "page-2":
                 return {"sessions": [session_obj("stored-201", "/tmp/page-2")],
                         "nextCursor": None}
@@ -1303,13 +1368,51 @@ def result_for(method, msg):
                         session_obj(f"stored-{n}", f"/tmp/session-{n}")
                         for n in range(1, 201)],
                     "nextCursor": "page-2"}
+        if filter_id is not None:
+            rows = [session_obj(), session_obj("msp-sess-old", "/tmp/old-ws"),
+                    session_obj("msp-sess-untitled", "/tmp/untitled-ws"),
+                    session_obj("msp-sess-bare", "/tmp/bare-ws")]
+            rows = [row for row in rows
+                    if row["sessionId"] in filter_id
+                    and row["sessionId"] not in DELETED_SESSIONS]
+            return {"sessions": rows,
+                    "appliedFilter": params.get("filter"),
+                    "nextCursor": None}
         live = session_obj()
         old = session_obj("msp-sess-old", "/tmp/old-ws")
         untitled = session_obj("msp-sess-untitled", "/tmp/untitled-ws")
         bare = session_obj("msp-sess-bare", "/tmp/bare-ws")
         old["updatedAt"] = "2026-08-01T00:00:00Z"
         live["updatedAt"] = "2026-09-04T00:00:00Z"
-        return {"sessions": [live, old, untitled, bare], "nextCursor": None}
+        rows = [live, old, untitled, bare]
+        if os.environ.get("FAKE_LIST_NULL_ROOT") == "1":
+            rows.append({"sessionId": "msp-sess-noroot", "workspaceRoot": None})
+        rows = [row for row in rows if row["sessionId"] not in DELETED_SESSIONS]
+        return {"sessions": rows, "nextCursor": None}
+    if method == "session/delete":
+        params = msg.get("params", {})
+        log_input(params)
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
+    if method == "feedback/submit":
+        params = msg.get("params", {})
+        log_input(params)
+        outcome = os.environ.get("FAKE_FEEDBACK_OUTCOME", "uploaded")
+        result = {
+            "bundlePath": "/tmp/fixture-feedback.zip",
+            "outcome": outcome,
+            "sessionRecordAttached": bool(params.get("attachSessionRecord")),
+            "sessionRecordTruncated": False,
+        }
+        if outcome == "uploaded":
+            result["uploadId"] = "fixture-upload-1"
+        elif outcome == "rateLimited":
+            result["retryAfterMs"] = 5000
+        elif outcome in ("dark", "failed", "noCredential", "authRejected"):
+            result["cause"] = "fixture cause"
+        if os.environ.get("FAKE_FEEDBACK_NOTES") == "1":
+            result["sessionNote"] = "Session note from the fixture"
+            result["localTracingNote"] = "Tracing note from the fixture"
+        return result
     if method == "session/setApprovalMode":
         # The real host applies the selected mode and echoes it back.
         mode = FOLDED_MODE or msg.get("params", {}).get("mode", MODE)
@@ -1330,8 +1433,28 @@ def result_for(method, msg):
                 return {"models": [], "source": "unresolvedCatalog"}
         models = [{"modelId": "fake-model", "displayLabel": "Fake",
                    "isDefault": True,
+                   "variants": ["low", "medium", "high"],
+                   "reasoningEffortVariants": [
+                       {"tier": "low", "description": "Quick answers"},
+                       {"tier": "medium", "description": "Balanced effort"},
+                       {"tier": "high", "description": "Deep reasoning"},
+                   ],
+                   "defaultReasoningEffort": "medium",
                    "cost": {"input": "3.00", "output": "15.00",
                             "cached": "0.30", "currency": "USD"}}]
+        if os.environ.get("FAKE_VARIANTS_UNKNOWN") == "1":
+            models[0]["variants"] = "unknown"
+            models[0].pop("reasoningEffortVariants", None)
+        if os.environ.get("FAKE_SECOND_MODEL") == "1":
+            models.append({
+                "modelId": "second-model", "displayLabel": "Second",
+                "variants": ["minimal", "high", "xhigh"],
+                "reasoningEffortVariants": [
+                    {"tier": "minimal", "description": "Fastest"},
+                    {"tier": "xhigh", "description": "Most thorough"},
+                ],
+                "defaultReasoningEffort": "xhigh",
+            })
         if CATALOG_READS[0] > 1:
             if SCENARIO == "usage_rates_dropped":
                 models[0]["cost"] = None
@@ -1767,6 +1890,65 @@ def main():
                                     "message": "method not found: session/setReasoningEffort",
                                     "data": {"kind": "methodNotFound"}}})
                     continue
+                if (method == "session/delete"
+                        and os.environ.get("FAKE_DELETE_REJECT")):
+                    log_input(msg.get("params", {}))
+                    reason = os.environ["FAKE_DELETE_REJECT"]
+                    if reason == "sessionNotFound":
+                        error = {"code": -32020, "message": "session not found",
+                                 "data": {"kind": "sessionNotFound"}}
+                    else:
+                        error = {"code": -32030, "message": reason,
+                                 "data": {"kind": "commandRejected",
+                                          "reason": reason, "retryable": False}}
+                    send({"jsonrpc": "2.0", "id": ident, "error": error})
+                    continue
+                if (method == "session/list" and os.environ.get("FAKE_LIST_REJECT_CURSOR") == "1"
+                        and msg.get("params", {}).get("cursor")):
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32602, "message": "invalid cursor",
+                                    "data": {"kind": "invalidParams"}}})
+                    continue
+                if (method == "session/resume"
+                        and os.environ.get("FAKE_RESUME_NOT_FOUND") == "1"):
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32020, "message": "session not found",
+                                    "data": {"kind": "sessionNotFound",
+                                             "sessionId": msg.get("params", {}).get("sessionId")}}})
+                    continue
+                if method in ("session/start", "turn/start", "turn/steer"):
+                    params = msg.get("params", {})
+                    roots = params.get("workspaceRoots")
+                    if roots is not None:
+                        problem = validate_workspace_roots(
+                            roots, params.get("workspaceRoot", ACTIVE_WORKSPACE[0]))
+                        if problem:
+                            log_input(params)
+                            send({"jsonrpc": "2.0", "id": ident,
+                                  "error": {"code": -32602,
+                                            "message": "Invalid params: " + problem,
+                                            "data": {"kind": "invalidParams"}}})
+                            continue
+                if method == "feedback/submit":
+                    params = msg.get("params", {})
+                    error = None
+                    if not FEEDBACK[0]:
+                        error = {"code": -32010,
+                                 "message": "feedback/submit requires the feedback capability",
+                                 "data": {"kind": "capabilityRequired",
+                                          "capability": "feedback", "retryable": False}}
+                    elif (params.get("classification") == "bug"
+                          and not (params.get("note") or "").strip()):
+                        error = {"code": -32602,
+                                 "message": "Invalid params: note must be non-empty for bug",
+                                 "data": {"kind": "invalidParams"}}
+                    elif os.environ.get("FAKE_FEEDBACK_HOST_ERROR") == "1":
+                        error = {"code": -32603, "message": "feedback upload failed",
+                                 "data": {"kind": "internal"}}
+                    if error:
+                        log_input(params)
+                        send({"jsonrpc": "2.0", "id": ident, "error": error})
+                        continue
                 if (method == "workflow/childControl"
                         and msg.get("params", {}).get("attempt")
                         != WORKFLOW_CHILD_ATTEMPT[0]):
@@ -1833,8 +2015,11 @@ def main():
                     # so tests cannot synchronize on the marker by luck.
                     if os.environ.get("FAKE_CLOSE_DELAY_MS"):
                         time.sleep(int(os.environ["FAKE_CLOSE_DELAY_MS"]) / 1000.0)
+                    # An idle unload, shaped as SessionClosedParams: the
+                    # session is notLoaded, not deleted.
                     send({"jsonrpc": "2.0", "method": "session/closed",
-                          "params": {"sessionId": MSP_SID}})
+                          "params": {"reason": "idle", "sessionId": MSP_SID,
+                                     "viewCursor": "cur-closed"}})
                 if method == "session/setReasoningEffort":
                     notify("session/reasoningEffortChanged", {
                         "sessionId": msg.get("params", {}).get("sessionId", MSP_SID),
@@ -1843,6 +2028,14 @@ def main():
                         "viewCursor": "cur-reasoning-1",
                         "sourceRange": {"start": 1, "end": 1},
                     })
+                if method == "session/setModel":
+                    model = ((msg.get("params", {}).get("model") or {})
+                             .get("modelId", ""))
+                    if model:
+                        notify("session/modelChanged", {
+                            "sessionId": msg.get("params", {}).get("sessionId", MSP_SID),
+                            "modelId": model,
+                        })
                 if SCENARIO == "rename_live" and method == "session/start":
                     notify("session/nameChanged", {
                         "sessionId": MSP_SID,
@@ -1859,6 +2052,33 @@ def main():
                 if method == "model/list" and SCENARIO == "stdout_close_stays_alive":
                     os.close(1)
                     time.sleep(1.0)
+                if method == "session/delete":
+                    # The ack is out; now report the outcome as the host's
+                    # later terminal notification.
+                    params = msg.get("params", {})
+                    sid = params.get("sessionId", "")
+                    if os.environ.get("FAKE_DELETE_EXIT") == "1":
+                        sys.stdout.flush()
+                        os._exit(int(os.environ.get("FAKE_DELETE_EXIT_CODE", "1")))
+                    if os.environ.get("FAKE_DELETE_DELAY_MS"):
+                        time.sleep(int(os.environ["FAKE_DELETE_DELAY_MS"]) / 1000.0)
+                    if os.environ.get("FAKE_DELETE_OUTCOME", "completed") == "failed":
+                        notify("session/deleteCompleted", {
+                            "commandId": params.get("commandId", ""),
+                            "sessionId": sid,
+                            "outcome": "failed",
+                            "reason": os.environ.get("FAKE_DELETE_REASON",
+                                                     "ownershipUnavailable"),
+                            "physicalChange": os.environ.get("FAKE_DELETE_PHYSICAL",
+                                                             "none"),
+                        })
+                    else:
+                        DELETED_SESSIONS.append(sid)
+                        notify("session/deleteCompleted", {
+                            "commandId": params.get("commandId", ""),
+                            "sessionId": sid,
+                            "outcome": "completed",
+                        })
                 if CRASH_AFTER_ACK[0]:
                     sys.stdout.flush()
                     message = os.environ.get("FAKE_HOST_STDERR", "")
@@ -1869,6 +2089,13 @@ def main():
                     os._exit(int(os.environ.get("FAKE_HOST_EXIT_CODE", default_code)))
                 if SCENARIO == "skills_changed" and method == "session/start":
                     notify("skill/changed", {"sessionId": MSP_SID})
+                if (SCENARIO == "mcp_oauth_completed" and method == "session/start"
+                        and EXPERIMENTAL_API[0]):
+                    # Delivered to every experimental connection, initiator
+                    # or not; never carries the authorization URL or keys.
+                    notify("mcpServer/oauthLoginCompleted", {
+                        "outcome": "granted", "server": "fixture-mcp",
+                        "message": "fixture login detail"})
                 if SCENARIO == "questions_resume" and method == "session/resume":
                     # MSP reissues pending requests after the resume response.
                     send({"jsonrpc": "2.0", "id": 9100 + ident,
