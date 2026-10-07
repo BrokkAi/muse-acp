@@ -11,11 +11,12 @@ function targetFor(platform, arch, glibc) {
     'linux-x64': 'x86_64-unknown-linux-gnu',
     'linux-arm64': 'aarch64-unknown-linux-gnu',
     'win32-x64': 'x86_64-pc-windows-msvc',
+    'win32-arm64': 'aarch64-pc-windows-msvc',
   };
   const target = targets[`${platform}-${arch}`];
   if (!target || (platform === 'linux' && !glibc)) {
     throw new Error(`Unsupported platform: ${platform}/${arch}${platform === 'linux' && !glibc ? ' (musl)' : ''}. ` +
-      'muse-acp supports macOS x64/arm64, Linux glibc x64/arm64, and Windows x64.');
+      'muse-acp supports macOS x64/arm64, Linux glibc x64/arm64, and Windows x64/arm64.');
   }
   return target;
 }

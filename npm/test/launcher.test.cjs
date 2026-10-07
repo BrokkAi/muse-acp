@@ -33,8 +33,9 @@ test('all supported platforms resolve, unsupported architectures and musl fail',
     ['linux', 'x64', 'x86_64-unknown-linux-gnu'],
     ['linux', 'arm64', 'aarch64-unknown-linux-gnu'],
     ['win32', 'x64', 'x86_64-pc-windows-msvc'],
+    ['win32', 'arm64', 'aarch64-pc-windows-msvc'],
   ]) assert.equal(targetFor(platform, arch, true), target);
-  for (const args of [['linux', 'x64', false], ['win32', 'arm64', true], ['linux', 'ia32', true], ['freebsd', 'x64', true]]) {
+  for (const args of [['linux', 'x64', false], ['win32', 'ia32', true], ['linux', 'ia32', true], ['freebsd', 'x64', true]]) {
     assert.throws(() => targetFor(...args), /Unsupported platform/);
   }
 });

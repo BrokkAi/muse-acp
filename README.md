@@ -123,16 +123,18 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   | MUSE_ACP_INSTALL_DIR="$HOME/bin" MUSE_ACP_VERSION=vX.Y.Z sh
 ```
 
-On Windows x86_64, run the PowerShell installer for the MSVC release:
+On Windows x86_64 or arm64, run the PowerShell installer for the MSVC release:
 
 ```powershell
 irm https://github.com/BrokkAi/muse-acp/releases/latest/download/install.ps1 | iex
 ```
 
-It verifies the ZIP's SHA-256 checksum and installs `muse-acp.exe` to
-`$env:LOCALAPPDATA\Programs\muse-acp`, leaving `PATH` untouched. Set
-`MUSE_ACP_VERSION` or `MUSE_ACP_INSTALL_DIR` to pin a version or choose another
-absolute directory, then add the reported directory to your user `PATH`.
+It picks the build for the machine's architecture, even from an emulated x64
+PowerShell on arm64, verifies the ZIP's SHA-256 checksum, and installs
+`muse-acp.exe` to `$env:LOCALAPPDATA\Programs\muse-acp`, leaving `PATH`
+untouched. Set `MUSE_ACP_VERSION` or `MUSE_ACP_INSTALL_DIR` to pin a version or
+choose another absolute directory, then add the reported directory to your user
+`PATH`.
 
 From a checkout, build and install with Cargo:
 
@@ -589,10 +591,10 @@ it records a diagnostic and exits nonzero.
 | --- | --- | --- |
 | macOS | x86_64, arm64 | Supported |
 | Linux | x86_64, arm64 | glibc; see the Linux arm64 sandbox advisory above |
-| Windows | x86_64 | MSVC release |
+| Windows | x86_64, arm64 | MSVC release |
 
-Windows arm64, Linux musl, 32-bit systems, and other operating systems have no
-published release target.
+Linux musl, 32-bit systems, and other operating systems have no published
+release target.
 
 ## Development
 

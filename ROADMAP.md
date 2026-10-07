@@ -1072,7 +1072,7 @@ fails), and a test pins that no temp files leak. Comment/sibling preservation,
 idempotency, and existing-file shapes were already covered; the README states
 the supported OS/architecture/runtime matrix. Releases publish checksum-
 verifying `install.sh` and `install.ps1` installers for the Unix targets and
-Windows x86_64 MSVC target.
+the Windows x86_64 and arm64 MSVC targets.
 
 **Work items**
 

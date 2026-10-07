@@ -2,7 +2,7 @@
 
 The public package is `@brokkai/muse-acp`; its executable is `muse-acp`.
 `npm/package.json` is a private packaging template. The packager takes the
-version from `Cargo.toml`, removes `private`, and bundles the five verified
+version from `Cargo.toml`, removes `private`, and bundles the six verified
 native release binaries with a small Node.js launcher. It includes no npm
 dependencies or install scripts. Do not publish the template directory.
 
