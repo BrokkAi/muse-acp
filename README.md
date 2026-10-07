@@ -250,9 +250,10 @@ The editor's **Mode** selector chooses what Muse may change in a session:
 
 Read-only and Plan are enforced by Muse, not by the adapter: those sessions
 run on a second `muse serve` that `muse-acp` starts with `--disable-write
---disable-shell` the first time it is needed, and Muse answers a write with
-"tool policy denied filesystem write". MCP tools are not covered by those
-flags; their calls still go through approvals.
+--disable-shell` the first time it is needed. Through Muse 1.4.2, Muse
+answers a write with "tool policy denied filesystem write"; from 1.4.3 it
+does not offer write or shell tools in those sessions at all. MCP tools are
+not covered by those flags; their calls still go through approvals.
 
 Muse lets only one host hold a session, and releases it only when that host
 exits. Changing the mode of an open session therefore restarts the host that
