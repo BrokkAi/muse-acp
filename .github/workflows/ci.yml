@@ -78,11 +78,15 @@ jobs:
             runner: ubuntu-24.04
             file: muse-x86-linux
             sha256: dfb3096c91f4767c4d98006460800b7ba906a0b1a408280a926a8dc19a1af64f
+          - version: 1.4.3-R5018.1
+            runner: ubuntu-24.04
+            file: muse-x86-linux
+            sha256: e671790882bc88d65edb4ae0f713becf378ebf91011034ab75abebe3592dde4f
           # macOS arm64 runs only the newest pin, to spare runner time.
-          - version: 1.4.2-R4684.1
+          - version: 1.4.3-R5018.1
             runner: macos-15
             file: muse-aarch64-macos
-            sha256: e9987ef4267a648dc1931c2836a23f6f16f8b4417368b126a810bece2abd308d
+            sha256: 4b6e018667a7a4f98c417b3656e524d7f3bef240873f06bb8fba35d06bb1ddb7
     runs-on: ${{ matrix.muse.runner }}
     timeout-minutes: 20
     steps:

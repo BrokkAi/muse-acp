@@ -58,6 +58,19 @@ pub const HOST_141_FINGERPRINT: &str =
 pub const HOST_142_FINGERPRINT: &str =
     "sha256:61afea3112e0906e9dc3a536144278a74cb4b36fc6e20901a91d4432ba3568e2";
 
+/// Stable-surface fingerprint of the Muse 1.4.3 host (schema version 1). Its
+/// schema export removes `session/delete` and `session/deleteCompleted`
+/// (the host answers the method with `methodNotFound`, so the adapter stops
+/// offering delete). Everything else is additive over 1.4.2: `hook/list`,
+/// `plugin/list`, `userInput/interrupt`, the `turn/foregroundCompleted` and
+/// `userInput/engaged` notifications, the `hookRun` item kind, tool
+/// receipts, `lastTurn` on resume and read, and session `kind` and
+/// `parentSessionId`. `userInput/settled` now requires a nullable
+/// `decidedAt` and `feedback/submit` no longer requires `sessionId`.
+/// Validated by the loopback live-host suite (`tests/live_loopback.rs`).
+pub const HOST_143_FINGERPRINT: &str =
+    "sha256:4cb671082574037fc1070a136db7c0c8dc24e65e78cf3d209a10944ff9f9845f";
+
 /// Fingerprint published by the vendored Muse SDK manifest at revision
 /// `bb44be3` (schema version 1). It is the same stable surface the Muse 1.4.2
 /// host reports, so it classifies through that live-validated entry rather
@@ -134,6 +147,7 @@ fn table_entry(fingerprint: &str) -> Option<(Status, &'static str)> {
         }
         HOST_141_FINGERPRINT => (Status::Tested, "validated against live host 1.4.1"),
         HOST_142_FINGERPRINT => (Status::Tested, "validated against live host 1.4.2"),
+        HOST_143_FINGERPRINT => (Status::Tested, "validated against live host 1.4.3"),
         TRANSCRIPT_FIXTURE_FINGERPRINT => (
             Status::Fixture,
             "transcript fixture fingerprint; never a live-host result",
@@ -194,6 +208,7 @@ pub fn selftest_lines(adapter_version: &str) -> Vec<String> {
         (HOST_130_R3401_1_FINGERPRINT, "host-1.3.0-r3401.1"),
         (HOST_141_FINGERPRINT, "host-1.4.1"),
         (HOST_142_FINGERPRINT, "host-1.4.2"),
+        (HOST_143_FINGERPRINT, "host-1.4.3"),
         (TRANSCRIPT_FIXTURE_FINGERPRINT, "transcript-fixture"),
     ] {
         let c = classify(Some(SUPPORTED_SCHEMA_VERSION), fp);
@@ -267,6 +282,14 @@ mod tests {
     }
 
     #[test]
+    fn host_143_fingerprint_is_tested() {
+        let c = classify(Some(1), HOST_143_FINGERPRINT);
+        assert_eq!(c.status, Status::Tested);
+        assert_eq!(c.detail, "validated against live host 1.4.3");
+        assert!(!c.is_fatal());
+    }
+
+    #[test]
     fn transcript_fixture_fingerprint_is_never_host_compatibility() {
         let c = classify(Some(1), TRANSCRIPT_FIXTURE_FINGERPRINT);
         assert_eq!(c.status, Status::Fixture);
@@ -309,13 +332,14 @@ mod tests {
         let lines = selftest_lines("0.2.5");
         assert!(lines[0].contains("adapter=0.2.5"));
         assert!(lines[0].contains("host=offline"));
-        assert_eq!(lines.len(), 9);
+        assert_eq!(lines.len(), 10);
         assert!(lines.iter().any(|l| l.contains("kind=sdk-manifest")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.2.1")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.3.0")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.3.0-r3401.1")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.1")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.2")));
+        assert!(lines.iter().any(|l| l.contains("kind=host-1.4.3")));
         assert!(lines.iter().any(|l| l.contains("kind=transcript-fixture")));
     }
 }

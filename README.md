@@ -300,11 +300,13 @@ error the editor shows if Muse then refuses the profile says why.
 
 - **Sessions** — new, load, resume, list, close, and fork, with durable Muse
   session IDs that survive adapter and host restarts. Delete is available on
-  Muse 1.4.1+ with durable session logs; Muse deletes only sessions it can
-  prove the running host owns, so a session from an earlier editor run is
-  kept and the editor is told why instead of being pretended. Deleting a
-  session that never existed succeeds silently when Muse's listing filters
-  can prove the absence (1.4.2+); without them the refusal is reported.
+  Muse 1.4.1 and 1.4.2 with durable session logs; Muse 1.4.3 no longer
+  serves it, so the adapter does not offer it there. Muse deletes only
+  sessions it can prove the running host owns, so a session from an earlier
+  editor run is kept and the editor is told why instead of being pretended.
+  Deleting a session that never existed succeeds silently when Muse's
+  listing filters can prove the absence (1.4.2); without them the refusal is
+  reported.
 - **Turns** — streamed text and tool updates, queued concurrent prompts,
   cancellation with a terminal event, and exact-turn steering over the ACP v2
   `_session/steering` extension.
