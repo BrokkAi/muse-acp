@@ -126,6 +126,10 @@ FAKE_NO_SESSION_MCP=1. As on the live host, a non-empty config.mcpServers
 without the grant fails with capabilityRequired. FAKE_MCP_CONFLICT=1 rejects
 the first session/resume that carries a non-empty config.mcpServers with the
 live `session_configuration_conflict` error.
+
+Log flood (fixture self-test): FAKE_LOG_FLOOD=N speaks no MSP. The process
+prints `ready`, waits for one stdin line, then appends N lines
+`<FAKE_FLOOD_TAG>-<i>` to FAKE_LOG, so a test can start several at once.
 """
 import json
 import os
@@ -1717,7 +1721,21 @@ def scenario_after_restart():
 SCENARIO = scenario_after_restart()
 
 
+def flood_log():
+    """Appends numbered lines to FAKE_LOG alongside other fixture processes,
+    as the adapter's main and read-only hosts do."""
+    sys.stdout.write("ready\n")
+    sys.stdout.flush()
+    sys.stdin.readline()
+    tag = os.environ.get("FAKE_FLOOD_TAG", "")
+    for i in range(int(os.environ["FAKE_LOG_FLOOD"])):
+        log_method("%s-%d" % (tag, i))
+
+
 def main():
+    if os.environ.get("FAKE_LOG_FLOOD"):
+        flood_log()
+        return
     if os.environ.get("FAKE_CHECK_HOST_CONFIG") == "1" and sys.argv[1:2] == ["serve"]:
         root = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
         with open(os.path.join(root, "muse", "settings.json")) as source:
