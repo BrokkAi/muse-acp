@@ -83,11 +83,13 @@ impl HandshakeInfo {
             .is_some_and(|release| release >= (major, minor, patch))
     }
 
-    /// MSP `session/delete` (Muse 1.4.1+). A memory-only host has nothing
-    /// durable to delete and does not offer the method, so this also needs
-    /// the durable profile.
+    /// MSP `session/delete` (Muse 1.4.1 and 1.4.2). A memory-only host has
+    /// nothing durable to delete and does not offer the method, so this also
+    /// needs the durable profile. Muse 1.4.3 dropped the method from its
+    /// schema and answers it with `methodNotFound`, so later releases stay
+    /// off until one is shown to serve it again.
     pub fn supports_session_delete(&self) -> bool {
-        self.restartable() && self.at_least(1, 4, 1)
+        self.restartable() && self.at_least(1, 4, 1) && !self.at_least(1, 4, 3)
     }
 
     /// `workspaceRoots` on `session/start` and `turn/start` (Muse 1.4.1+).
@@ -1852,6 +1854,13 @@ mod durability_tests {
         assert!(v142.supports_session_delete());
         assert!(v142.supports_workspace_roots());
         assert!(v142.reports_session_cost());
+
+        // 1.4.3 no longer serves `session/delete`, even when durable.
+        let v143 = version("1.4.3-R5018.1", Some("durable"));
+        assert!(!v143.supports_session_delete());
+        assert!(v143.supports_workspace_roots());
+        assert!(v143.reports_session_cost());
+        assert!(!version("1.5.0", None).supports_session_delete());
 
         // A memory-only host has no `session/delete`; an unknown profile
         // carries no durability guarantee either.

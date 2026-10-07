@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- Run the live-host suite against Muse 1.4.3 (`1.4.3-R5018.1`) on Linux and
+  macOS arm64, and classify its schema fingerprint as tested. On 1.4.3,
+  Read-only and Plan sessions no longer get write or shell tools at all,
+  instead of having the call denied; writes stay blocked either way.
+- Stop offering session delete on Muse 1.4.3. That release removed
+  `session/delete` and answers it with "method not found", so the adapter
+  no longer advertises delete there and refuses the request itself, keeping
+  the session. Delete still works on Muse 1.4.1 and 1.4.2.
+
 ## 0.10.0
 
 - Add session-scoped **Auto-review**. A new default-off `auto_review`

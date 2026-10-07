@@ -1320,7 +1320,7 @@ enum LoopMsg {
 /// with it, client stdio and HTTP MCP servers are forwarded to Muse. Without
 /// it no MCP transport is advertised beyond the stdio support ACP v1 always
 /// implies, and client servers are dropped. `session_delete` is the host's
-/// MSP `session/delete` support (Muse 1.4.1+ and a durable profile); clients
+/// MSP `session/delete` support (Muse 1.4.1 or 1.4.2, durable); clients
 /// must not call `session/delete` unless it is advertised.
 fn v2_init(session_mcp: bool, session_delete: bool) -> String {
     r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
