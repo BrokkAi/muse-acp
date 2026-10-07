@@ -9906,6 +9906,63 @@ fn fake_methods(c: &Client) -> Vec<String> {
         .collect()
 }
 
+/// The adapter's main and read-only hosts append to one fake log, so a line
+/// one host writes must never overwrite the other's. Windows' C runtime
+/// emulates append mode with a seek and then a write, which two processes
+/// can interleave.
+#[test]
+fn concurrent_fake_hosts_keep_every_log_line() {
+    const HOSTS: usize = 4;
+    const LINES: usize = 250;
+    let dir = std::env::temp_dir().join(format!("acp-fake-flood-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let log = dir.join("fake.log");
+    let _ = std::fs::remove_file(&log);
+    let mut hosts: Vec<Child> = (0..HOSTS)
+        .map(|n| {
+            Command::new(fixture())
+                .env("FAKE_LOG", &log)
+                .env("FAKE_LOG_FLOOD", LINES.to_string())
+                .env("FAKE_FLOOD_TAG", format!("host{n}"))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .expect("spawn fake host")
+        })
+        .collect();
+    // Start every flood at once, after each process is up.
+    for host in &mut hosts {
+        let mut ready = String::new();
+        BufReader::new(host.stdout.as_mut().expect("fake host stdout"))
+            .read_line(&mut ready)
+            .expect("fake host ready");
+        assert_eq!(ready.trim(), "ready");
+    }
+    for host in &mut hosts {
+        let stdin = host.stdin.as_mut().expect("fake host stdin");
+        stdin.write_all(b"go\n").expect("start flood");
+        stdin.flush().expect("flush");
+    }
+    for host in &mut hosts {
+        assert!(host.wait().expect("fake host exit").success());
+    }
+    let text = std::fs::read_to_string(&log).expect("fake log");
+    let mut seen: Vec<&str> = text.lines().collect();
+    seen.sort_unstable();
+    let lost: Vec<String> = (0..HOSTS)
+        .flat_map(|n| (0..LINES).map(move |i| format!("host{n}-{i}")))
+        .filter(|line| seen.binary_search(&line.as_str()).is_err())
+        .collect();
+    assert!(
+        lost.is_empty() && seen.len() == HOSTS * LINES,
+        "{} of {} appended lines were lost ({} lines in the log), first: {:?}",
+        lost.len(),
+        HOSTS * LINES,
+        seen.len(),
+        lost.first()
+    );
+}
+
 #[test]
 fn read_only_mode_moves_the_session_to_a_read_only_host_and_back() {
     let mut c = Client::spawn("happy", &[]);
