@@ -12,7 +12,6 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $repo = 'BrokkAi/muse-acp'
-$target = 'x86_64-pc-windows-msvc'
 
 function Say([string]$Message) {
     Write-Output $Message
@@ -62,12 +61,28 @@ try {
         Fail "invalid release version: $tag"
     }
 
-    $architecture = $env:PROCESSOR_ARCHITEW6432
+    # Prefer the OS architecture from the registry: an x64 PowerShell emulated
+    # on Arm64 Windows reports AMD64 in its environment, with no W6432 hint.
+    try {
+        $architecture = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE).PROCESSOR_ARCHITECTURE
+    }
+    catch {
+        $architecture = $null
+    }
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = $env:PROCESSOR_ARCHITEW6432
+    }
     if ([string]::IsNullOrWhiteSpace($architecture)) {
         $architecture = $env:PROCESSOR_ARCHITECTURE
     }
-    if ($architecture -notmatch '^(?i:AMD64|X86_64)$') {
-        Fail "unsupported architecture: $architecture (the Windows release supports x86_64 only)"
+    if ($architecture -match '^(?i:AMD64|X86_64)$') {
+        $target = 'x86_64-pc-windows-msvc'
+    }
+    elseif ($architecture -match '^(?i:ARM64|AARCH64)$') {
+        $target = 'aarch64-pc-windows-msvc'
+    }
+    else {
+        Fail "unsupported architecture: $architecture (the Windows release supports x86_64 and arm64)"
     }
 
     $configuredDir = $InstallDir

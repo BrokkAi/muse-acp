@@ -10,6 +10,11 @@
   `session/delete` and answers it with "method not found", so the adapter
   no longer advertises delete there and refuses the request itself, keeping
   the session. Delete still works on Muse 1.4.1 and 1.4.2.
+- Publish a native Windows arm64 build (`aarch64-pc-windows-msvc`). Releases
+  now carry its ZIP and checksum, the npm package bundles it for
+  `win32/arm64`, and `install.ps1` installs it on arm64 machines, including
+  from an emulated x64 PowerShell, which reports `AMD64` in its environment.
+  Previously the npm launcher and the installer refused Windows arm64.
 
 ## 0.10.0
 

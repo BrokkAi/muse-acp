@@ -3,11 +3,11 @@
 Releases publish to `BrokkAi/muse-acp` GitHub Releases and to npm as
 `@brokkai/muse-acp`. Cargo sets `publish = false`, so there is no crates.io
 package. The native binary has no runtime dependencies; the npm package bundles
-all five native binaries and a Node.js launcher. The same tag workflow publishes
+all six native binaries and a Node.js launcher. The same tag workflow publishes
 GitHub assets first, then npm. See [npm publishing](docs/npm-publishing.md) for
 trusted publisher setup, package verification, and recovery rules.
 
-Each `v<version>` release has twelve assets: `install.sh` and `install.ps1`, plus an archive and
+Each `v<version>` release has fourteen assets: `install.sh` and `install.ps1`, plus an archive and
 `.sha256` sidecar for each of:
 
 - `x86_64-unknown-linux-gnu` (tar.gz)
@@ -15,6 +15,7 @@ Each `v<version>` release has twelve assets: `install.sh` and `install.ps1`, plu
 - `x86_64-apple-darwin` (tar.gz)
 - `aarch64-apple-darwin` (tar.gz)
 - `x86_64-pc-windows-msvc` (zip)
+- `aarch64-pc-windows-msvc` (zip)
 
 Names are `muse-acp-v<version>-<target>.<format>`. Each archive includes the
 binary, README, LICENSE, NOTICE, and `release.json` with the exact commit,
@@ -29,7 +30,7 @@ paths; Unix archives retain the installer's versioned parent directory.
 2. Run the contributing checks and `python3 -m unittest discover -s scripts -p
    'test_*.py'`. Push the topic branch and open a PR to master. `ci.yml` runs on
    pushes and PRs. `release.yml` runs on master and release-topic pushes; these
-   runs build/test all five platforms and validate the publisher without
+   runs build/test all six platforms and validate the publisher without
    publishing. After a release, master keeps the released version until the
    next bump; its `release` runs still build and test every platform, but the
    publisher preflight passes as a no-op instead of failing on the existing
@@ -72,7 +73,7 @@ release action; everything else runs in the tag workflow. Push it from an
 authorized CLI identity; do not assume tags pushed with GITHUB_TOKEN will
 trigger Actions. Never create/push tags during preflight. The publication
 workflow builds all platforms before its publisher starts. Release builds pin
-Rust 1.98.1. Windows uses the MSVC `/Brepro` linker option to avoid changing
+Rust 1.98.1. Both Windows targets use the MSVC `/Brepro` linker option to avoid changing
 PE timestamps and identifiers (see [LLVM's reproducible-linking notes](https://blog.llvm.org/2019/11/deterministic-builds-with-clang-and-lld.html)).
 Before uploading, the tag run must compare every unpacked payload with the
 successful branch preflight artifacts at the same commit. A runner/toolchain
@@ -96,7 +97,7 @@ Never move tags or replace assets of a completed release.
 
 After publishing, the tag run's **Verify the published release** step runs
 `python3 scripts/release.py published`. It requires a public release, the exact
-tag commit and all twelve assets, validates every checksum and archive member,
+tag commit and all fourteen assets, validates every checksum and archive member,
 and compares payloads with the preflight build. The same command can be rerun
 locally with `RELEASE_COMMIT` and `RELEASE_TAG` set. Both `ci.yml` and `release.yml`
 must also succeed in the tag push context; branch evidence cannot replace tag
