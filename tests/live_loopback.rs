@@ -611,9 +611,22 @@ fn require_session_delete(
     require_release(adapter, release, (1, 4, 1), test)
 }
 
-/// The live host's own model catalog, fetched over a direct MSP handshake in
-/// the same throwaway environment the adapter uses.
+/// The live host's own model catalog, fetched over a direct MSP handshake.
 fn host_catalog(host: &Host) -> Vec<Value> {
+    let catalog = probe_host(host, "model/list", json!({}));
+    assert!(
+        catalog.get("error").is_none(),
+        "probe model/list: {catalog}"
+    );
+    catalog["result"]["models"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// The live host's response to one request, sent over a direct MSP
+/// handshake in the same throwaway environment the adapter uses.
+fn probe_host(host: &Host, method: &str, params: Value) -> Value {
     let home = host.dir.join("home");
     let mut command = Command::new(muse_cli());
     command.env_clear();
@@ -680,20 +693,13 @@ fn host_catalog(host: &Host) -> Vec<Value> {
     writeln!(
         stdin,
         "{}",
-        json!({"jsonrpc": "2.0", "id": 2, "method": "model/list", "params": {}})
+        json!({"jsonrpc": "2.0", "id": 2, "method": method, "params": params})
     )
     .unwrap();
-    let catalog = wait_for(&mut lines, 2);
-    assert!(
-        catalog.get("error").is_none(),
-        "probe model/list: {catalog}"
-    );
+    let response = wait_for(&mut lines, 2);
     let _ = child.kill();
     let _ = child.wait();
-    catalog["result"]["models"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default()
+    response
 }
 
 #[test]
@@ -863,6 +869,17 @@ fn session_delete_is_refused_once_the_host_drops_it() {
     let Some(mut adapter) = require_release(adapter, release, (1, 4, 3), test) else {
         return;
     };
+    // Muse itself, asked directly, does not serve the method. A later
+    // release that serves it again fails here, so the gate gets revisited.
+    let direct = probe_host(
+        &host,
+        "session/delete",
+        json!({
+            "sessionId": "01a10c8b-2222-7333-8444-555566667777",
+            "commandId": "01a10c8b-3333-7444-8555-666677778888",
+        }),
+    );
+    assert_eq!(direct["error"]["code"], -32601, "{direct}");
     let capabilities = adapter.result(1)["agentCapabilities"]["sessionCapabilities"].clone();
     assert!(
         capabilities.get("delete").is_none(),
@@ -1475,6 +1492,29 @@ fn tool_output(adapter: &Adapter) -> String {
         .collect()
 }
 
+/// Muse's refusal of a write in a read-only or plan session. Through 1.4.2
+/// the write tool is offered and denied, so the editor sees the denial;
+/// 1.4.3 no longer offers write tools at all, so the model's call comes back
+/// as an unknown tool.
+fn assert_write_refused(adapter: &Adapter, host: &Host) {
+    let (release, _) = adapter_host_release(adapter);
+    if release >= (1, 4, 3) {
+        let results = tool_results(host);
+        assert!(
+            results
+                .iter()
+                .any(|result| result.contains("unknown tool `write_file`")),
+            "Muse does not offer the write tool: {results:?}"
+        );
+    } else {
+        assert!(
+            tool_output(adapter).contains("denied"),
+            "Muse reports the refusal: {}",
+            tool_output(adapter)
+        );
+    }
+}
+
 #[test]
 fn read_only_mode_blocks_writes_until_switched_back() {
     if !enabled("read_only_mode_blocks_writes_until_switched_back") {
@@ -1487,11 +1527,7 @@ fn read_only_mode_blocks_writes_until_switched_back() {
     set_mode(&mut adapter, &session, "readOnly");
     adapter.turn(&session, "write it [[script:write]]");
     assert!(!notes.exists(), "a read-only session must not write");
-    assert!(
-        tool_output(&adapter).contains("denied"),
-        "Muse reports the refusal: {}",
-        tool_output(&adapter)
-    );
+    assert_write_refused(&adapter, &host);
     set_mode(&mut adapter, &session, "default");
     adapter.turn(&session, "write it now [[script:write]]");
     assert_eq!(std::fs::read_to_string(&notes).unwrap(), "written\n");
@@ -1544,10 +1580,6 @@ fn plan_mode_survives_an_adapter_restart() {
         !host.workspace().join("notes.txt").exists(),
         "a reloaded plan session must still not write"
     );
-    assert!(
-        tool_output(&second).contains("denied"),
-        "Muse reports the refusal: {}",
-        tool_output(&second)
-    );
+    assert_write_refused(&second, &host);
     second.finish();
 }

@@ -185,8 +185,11 @@ the reasoning selector against the host's own `model/list` variants.
 feedback to Meta, which the suite never does.
 
 Muse 1.4.3 is pinned too. It no longer serves `session/delete`, so the
-delete tests skip there and a separate test checks that the adapter stops
-advertising delete and refuses it while keeping the session.
+delete tests skip there and a separate test checks that the host itself
+answers `methodNotFound` and that the adapter stops advertising delete and
+refuses it while keeping the session. Its `--disable-write` host also no
+longer offers write tools at all (through 1.4.2 it offered them and denied
+the call), so the read-only and Plan tests accept either refusal.
 
 **Work items**
 
