@@ -105,7 +105,15 @@ the verdict into richer support bundles.
   `sha256:61afea3112e0906e9dc3a536144278a74cb4b36fc6e20901a91d4432ba3568e2`
   (schema version 1; additive over 1.4.1 with `feedback/submit`,
   `session/list` filters, and cumulative cost fields, and the loopback
-  live-host suite passed). The SDK's `bb44be3` revision publishes exactly
+  live-host suite passed). Host 1.4.3 reports
+  `sha256:4cb671082574037fc1070a136db7c0c8dc24e65e78cf3d209a10944ff9f9845f`
+  (schema version 1; it removes `session/delete` and
+  `session/deleteCompleted`, which the host now answers with
+  `methodNotFound`, and is otherwise additive over 1.4.2 with `hook/list`,
+  `plugin/list`, `userInput/interrupt`, `turn/foregroundCompleted`,
+  `userInput/engaged`, the `hookRun` item kind, and tool receipts; the
+  loopback live-host suite passed). No SDK revision mirrors 1.4.3 yet. The
+  SDK's `bb44be3` revision publishes exactly
   this 1.4.2 surface in both its top-level schema and its Python tree, with
   its packages at 1.4.2, and the adapter vendors it. Before it, the Python
   tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
@@ -175,6 +183,13 @@ existed, Muse's own read tool inside an ACP `additionalDirectories` root, and
 the reasoning selector against the host's own `model/list` variants.
 `/feedback` is covered by the fake host only: a live submit would upload
 feedback to Meta, which the suite never does.
+
+Muse 1.4.3 is pinned too. It no longer serves `session/delete`, so the
+delete tests skip there and a separate test checks that the host itself
+answers `methodNotFound` and that the adapter stops advertising delete and
+refuses it while keeping the session. Its `--disable-write` host also no
+longer offers write tools at all (through 1.4.2 it offered them and denied
+the call), so the read-only and Plan tests accept either refusal.
 
 **Work items**
 

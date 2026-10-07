@@ -5146,7 +5146,8 @@ fn sdk_manifest_fingerprint_is_tested() {
 #[test]
 fn host_feature_gates_follow_the_reported_muse_version() {
     // Features are gated on `serverInfo.version`, not on the fingerprint
-    // table, and `session/delete` also needs a durable host.
+    // table, and `session/delete` also needs a durable host. Muse 1.4.3
+    // dropped `session/delete`, so it stays off from that release on.
     for (version, durability, want) in [
         (
             None,
@@ -5169,9 +5170,14 @@ fn host_feature_gates_follow_the_reported_muse_version() {
             "1.4.2-R4684.1 session_delete=true workspace_roots=true session_cost=true",
         ),
         (
+            Some("1.4.3-R5018.1"),
+            Some("durable"),
+            "1.4.3-R5018.1 session_delete=false workspace_roots=true session_cost=true",
+        ),
+        (
             Some("1.10.0"),
             None,
-            "1.10.0 session_delete=true workspace_roots=true session_cost=true",
+            "1.10.0 session_delete=false workspace_roots=true session_cost=true",
         ),
         (
             Some("1.4.2"),

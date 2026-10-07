@@ -252,9 +252,10 @@ The editor's **Mode** selector chooses what Muse may change in a session:
 
 Read-only and Plan are enforced by Muse, not by the adapter: those sessions
 run on a second `muse serve` that `muse-acp` starts with `--disable-write
---disable-shell` the first time it is needed, and Muse answers a write with
-"tool policy denied filesystem write". MCP tools are not covered by those
-flags; their calls still go through approvals.
+--disable-shell` the first time it is needed. Through Muse 1.4.2, Muse
+answers a write with "tool policy denied filesystem write"; from 1.4.3 it
+does not offer write or shell tools in those sessions at all. MCP tools are
+not covered by those flags; their calls still go through approvals.
 
 Muse lets only one host hold a session, and releases it only when that host
 exits. Changing the mode of an open session therefore restarts the host that
@@ -302,11 +303,13 @@ error the editor shows if Muse then refuses the profile says why.
 
 - **Sessions** — new, load, resume, list, close, and fork, with durable Muse
   session IDs that survive adapter and host restarts. Delete is available on
-  Muse 1.4.1+ with durable session logs; Muse deletes only sessions it can
-  prove the running host owns, so a session from an earlier editor run is
-  kept and the editor is told why instead of being pretended. Deleting a
-  session that never existed succeeds silently when Muse's listing filters
-  can prove the absence (1.4.2+); without them the refusal is reported.
+  Muse 1.4.1 and 1.4.2 with durable session logs; Muse 1.4.3 no longer
+  serves it, so the adapter does not offer it there. Muse deletes only
+  sessions it can prove the running host owns, so a session from an earlier
+  editor run is kept and the editor is told why instead of being pretended.
+  Deleting a session that never existed succeeds silently when Muse's
+  listing filters can prove the absence (1.4.2); without them the refusal is
+  reported.
 - **Turns** — streamed text and tool updates, queued concurrent prompts,
   cancellation with a terminal event, and exact-turn steering over the ACP v2
   `_session/steering` extension.
