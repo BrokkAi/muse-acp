@@ -208,18 +208,70 @@ if os.environ.get("FAKE_APPROVAL_FEEDBACK", "") == "deny":
 # tell which of the adapter's two hosts handled a request.
 READ_ONLY = "--disable-write" in sys.argv and "--disable-shell" in sys.argv
 
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+
+    KERNEL32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    KERNEL32.CreateFileW.argtypes = (
+        wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+        wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    KERNEL32.CreateFileW.restype = wintypes.HANDLE
+    KERNEL32.WriteFile.argtypes = (
+        wintypes.HANDLE, ctypes.c_char_p, wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD), wintypes.LPVOID)
+    KERNEL32.WriteFile.restype = wintypes.BOOL
+    KERNEL32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    KERNEL32.CloseHandle.restype = wintypes.BOOL
+    FILE_APPEND_DATA = 0x0004
+    FILE_SHARE_ALL = 0x0001 | 0x0002 | 0x0004  # read, write, delete
+    OPEN_ALWAYS = 4
+    FILE_ATTRIBUTE_NORMAL = 0x0080
+    INVALID_HANDLE_VALUE = wintypes.HANDLE(-1).value
+
+
+def append_line(path, line):
+    """Appends `line` and a newline to `path` in one write at end of file.
+
+    The adapter's main and read-only hosts append to the same files. The
+    Windows C runtime emulates append mode by seeking to the end and then
+    writing, so two hosts that seek at once write at the same offset and one
+    line overwrites the other. A handle with only FILE_APPEND_DATA access
+    makes the file system put every write at the current end, as O_APPEND
+    does on POSIX.
+    """
+    data = (line + "\n").encode("utf-8")
+    if os.name != "nt":
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o666)
+        try:
+            os.write(fd, data)
+        finally:
+            os.close(fd)
+        return
+    handle = KERNEL32.CreateFileW(path, FILE_APPEND_DATA, FILE_SHARE_ALL, None,
+                                  OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, None)
+    if handle == INVALID_HANDLE_VALUE:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        written = wintypes.DWORD(0)
+        if not KERNEL32.WriteFile(handle, data, len(data),
+                                  ctypes.byref(written), None):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if written.value != len(data):
+            raise OSError("short append to %s" % path)
+    finally:
+        KERNEL32.CloseHandle(handle)
+
 
 def log_method(method):
     if LOG:
-        with open(LOG, "a") as f:
-            f.write(("ro:" if READ_ONLY else "") + method + "\n")
+        append_line(LOG, ("ro:" if READ_ONLY else "") + method)
 
 
 def log_input(params):
     path = os.environ.get("FAKE_INPUT", "")
     if path:
-        with open(path, "a") as f:
-            f.write(json.dumps(params) + "\n")
+        append_line(path, json.dumps(params))
 
 
 def send(obj):
@@ -1740,8 +1792,8 @@ def main():
         root = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
         with open(os.path.join(root, "muse", "settings.json")) as source:
             settings = json.load(source)
-        with open(LOG + ".config", "a") as log:
-            log.write(json.dumps({"root": root, "settings": settings, "args": sys.argv[1:]}) + "\n")
+        append_line(LOG + ".config",
+                    json.dumps({"root": root, "settings": settings, "args": sys.argv[1:]}))
         if settings.get("permissions", {}).get("default_profile") == ":auto-review":
             os.environ["FAKE_START_ERROR"] = "profile"
     if SCENARIO == "support_exit":
@@ -1758,9 +1810,7 @@ def main():
         )
     pid_path = os.environ.get("FAKE_PID", "")
     if pid_path:
-        with open(pid_path, "a") as f:
-            f.write(str(os.getpid()))
-            f.write("\n")
+        append_line(pid_path, str(os.getpid()))
     for line in sys.stdin:
         line = line.strip()
         if not line:
@@ -1775,9 +1825,9 @@ def main():
         # Every client->host request frame, method-tagged, for conformance
         # validation against the vendored schema bundle.
         if method and LOG:
-            with open(os.environ.get("FAKE_FRAMES", ""), "a") as f:
-                f.write(json.dumps({"method": method,
-                                    "params": msg.get("params", {})}) + "\n")
+            append_line(os.environ.get("FAKE_FRAMES", ""),
+                        json.dumps({"method": method,
+                                    "params": msg.get("params", {})}))
         if not method and ident == "srv-77":
             # The adapter's reply to the fixture's unknown server request.
             log_method("unknown-request-reply:" + json.dumps(msg))
