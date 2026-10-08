@@ -1527,18 +1527,11 @@ fn same_workspace_root(left: &str, right: &str) -> bool {
 }
 
 /// Canonical path text the host accepts. On Windows, `canonicalize` returns a
-/// verbatim `\\?\C:\...` path; strip the prefix back to the plain drive form
-/// so what the adapter sends matches what the host itself reports.
+/// verbatim `\\?\C:\...` path. Muse 1.4.3 validates `turn/start workspaceRoots`
+/// entries against that verbatim canonical form and rejects the stripped
+/// `C:\...` form ("expected a canonical path"), so keep the path as-is.
 fn host_path_string(path: &Path) -> String {
-    let text = path.to_string_lossy().into_owned();
-    #[cfg(windows)]
-    if let Some(rest) = text.strip_prefix(r"\\?\") {
-        let bytes = rest.as_bytes();
-        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-            return rest.to_string();
-        }
-    }
-    text
+    path.to_string_lossy().into_owned()
 }
 
 /// Canonical MSP `workspaceRoots` for a session: the primary root first, then
@@ -1760,6 +1753,7 @@ fn restart_unsaved_session(
     } else {
         Vec::new()
     };
+    let start_root_text = start_roots.first().cloned().unwrap_or_else(|| cwd.clone());
     let cmd = hosts.mint_cmd("cmd-");
     let r = hosts.command(
         "session/start",
@@ -1767,7 +1761,7 @@ fn restart_unsaved_session(
             "{{\"commandId\":{},\"sessionId\":{},\"workspaceRoot\":{},\"approvalMode\":{}{}{}}}",
             esc(&cmd),
             esc(msp_sid),
-            esc(&cwd),
+            esc(&start_root_text),
             esc(&approval),
             mcp_config_field(mcp_servers),
             workspace_roots_param((!start_roots.is_empty()).then_some(start_roots.as_slice()))
@@ -3741,13 +3735,18 @@ fn handle_acp(
             } else {
                 None
             };
+            let start_root_text = start_roots
+                .as_deref()
+                .and_then(|roots| roots.first())
+                .cloned()
+                .unwrap_or_else(|| cwd.clone());
             let cmd = host.mint_cmd("cmd-");
             let res = host.command(
                 "session/start",
                 &format!(
                     "{{\"commandId\":{},\"workspaceRoot\":{}{}{}{}}}",
                     esc(&cmd),
-                    esc(&cwd),
+                    esc(&start_root_text),
                     start_mode,
                     mcp_config_field(mcp_servers.as_deref()),
                     workspace_roots_param(start_roots.as_deref())
