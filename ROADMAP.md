@@ -4,15 +4,15 @@ This is a living roadmap for `muse-acp`. It records the direction that keeps the
 adapter close to Muse Session Protocol (MSP), safe around approvals and file
 access, and useful in real editor workflows.
 
-- **Last revised:** 2026-10-05
+- **Last revised:** 2026-10-08
 - **Original planning baseline:** `v0.2.5`; current release history is in
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
-- **Reference snapshots used for this revision:** Muse SDK `bb44be3`
-  (2026-09-30; stable schema version 1, manifest fingerprint
-  `sha256:61afea3112e0906e9dc3a536144278a74cb4b36fc6e20901a91d4432ba3568e2`,
-  identical to the live-validated 1.4.2 host surface)
+Reference snapshots used for this revision:** Muse SDK `537cc8d`
+  (2026-10-08; stable schema version 1, manifest fingerprint
+  `sha256:7c94f153c41659cb3f1bd3c3e04438be254644cb2a97d65d48edc7449b74858a`,
+  identical to the live-validated 1.4.4 host surface)
   and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
@@ -84,8 +84,9 @@ the verdict into richer support bundles.
   (host 1.0.2). The SDK manifest at the earlier `fbce769` pin published
   `sha256:cfd31ee77d78fdada9febc4edccd29b0434ff8f6bf157c7c03fd0ecfcbc29f5a`
   (schema version 1, never live-validated; now unknown); the `a7c10c5` pin
-  after it published the 1.3.0-R3401.1 fingerprint below, and the current
-  `bb44be3` pin publishes the 1.4.2 fingerprint. Host 1.2.1 reports
+  after it published the 1.3.0-R3401.1 fingerprint below, the `bb44be3`
+  pin after that published the 1.4.2 fingerprint, and the current `537cc8d`
+  pin publishes the 1.4.4 fingerprint. Host 1.2.1 reports
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
   bundle via the binary's own `muse schema` export, plus a live 1.2.1
@@ -112,10 +113,17 @@ the verdict into richer support bundles.
   `methodNotFound`, and is otherwise additive over 1.4.2 with `hook/list`,
   `plugin/list`, `userInput/interrupt`, `turn/foregroundCompleted`,
   `userInput/engaged`, the `hookRun` item kind, and tool receipts; the
-  loopback live-host suite passed). No SDK revision mirrors 1.4.3 yet. The
-  SDK's `bb44be3` revision publishes exactly
-  this 1.4.2 surface in both its top-level schema and its Python tree, with
-  its packages at 1.4.2, and the adapter vendors it. Before it, the Python
+  loopback live-host suite passed). Host 1.4.4 reports
+  `sha256:7c94f153c41659cb3f1bd3c3e04438be254644cb2a97d65d48edc7449b74858a`
+  (schema version 1; `session/delete` stays removed and the 1.4.4 surface
+  otherwise adds `computerUseSettings/read`, `computerUseSettings/update`,
+  `media/upload`, `session/sideChat`, `skill/setActivation`,
+  `workflow/pause`, task-list and status vocabulary, `SessionKind`, and
+  `SideProvenance`; validated by a live 1.4.4 handshake plus the binary's
+  own schema export, which is identical to the vendored bundle). The SDK's
+  `537cc8d` revision publishes exactly this 1.4.4 surface in both its
+  top-level schema and its Python tree, with its packages at 1.4.4, and the
+  adapter vendors it. Before it, the Python
   tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
   `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
   surface while the top-level schema stayed on 1.3.0-R3401.1. Transcript
@@ -151,8 +159,8 @@ The SDK publishes generated MSP types, a schema bundle, and recorded transcripts
 The Rust adapter should consume those artifacts as conformance inputs.
 
 Status: **emissions validated and permission paths replayed.**
-`tests/protocol/` pins SDK revision `bb44be3` (stable manifest, JSON schema
-bundle, 50 golden transcripts) with provenance and license. CI now replays
+`tests/protocol/` pins SDK revision `537cc8d` (stable manifest, JSON schema
+bundle, 51 golden transcripts) with provenance and license.
 every server-side item event through the notification fold (unknown kinds must
 tolerate), validates every emitted ACP frame with the adapter's own parser,
 fails if the vendored manifest fingerprint drifts from the compatibility
@@ -193,7 +201,7 @@ the call), so the read-only and Plan tests accept either refusal.
 
 **Work items**
 
-- Pin the SDK revision (currently `bb44be3`, 2026-09-30) and vendor
+- Pin the SDK revision (currently `537cc8d`, 2026-10-08) and vendor
   `schema/msp/stable/manifest.json`, `schema/msp/stable/msp.schema.json`, and
   the `schema/msp/transcripts/` corpus under `tests/protocol/`, or fetch that
   locked revision in CI. The corpus already covers approvals, cancellation,
@@ -442,8 +450,9 @@ events require an explicit documentation decision before CI passes.
 
 - `initialized`
 - `view/gap`
-- `session/started`, `session/closed`, and `session/deleteCompleted`
-  (published in the notification index since SDK `bb44be3`)
+- `session/started` and `session/closed`
+  (published in the notification index since SDK `bb44be3`;
+  `session/deleteCompleted` left the index again when 1.4.3 removed delete)
 - `session/todoListChanged`
 - `session/goalChanged`
 - `session/branchChanged`
@@ -491,7 +500,7 @@ usable cursor for the unload fold-failure arm.
 
 **Muse Code 1.3.0 stable-surface additions**
 
-The pinned schema bundle (`bb44be3`) includes the Muse 1.3.0 additions, and
+The pinned schema bundle (`537cc8d`) includes the Muse 1.3.0 additions, and
 its notifications are classified in
 [`docs/event-compatibility.md`](docs/event-compatibility.md). This inventory also
 covers the added methods, error kinds, and requests, which that matrix does not

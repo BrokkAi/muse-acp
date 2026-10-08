@@ -1862,6 +1862,13 @@ mod durability_tests {
         assert!(v143.reports_session_cost());
         assert!(!version("1.5.0", None).supports_session_delete());
 
+        // 1.4.4 keeps `session/delete` removed; workspace roots and the
+        // host-computed session cost stay on.
+        let v144 = version("1.4.4-R5419.1", Some("durable"));
+        assert!(!v144.supports_session_delete());
+        assert!(v144.supports_workspace_roots());
+        assert!(v144.reports_session_cost());
+
         // A memory-only host has no `session/delete`; an unknown profile
         // carries no durability guarantee either.
         for profile in ["ephemeral", "future-profile"] {
