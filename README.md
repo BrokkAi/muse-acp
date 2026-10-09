@@ -230,6 +230,7 @@ variable. See [Auto-review](#auto-review-keep-the-boundary-lose-the-busywork).
 | `MUSE_SHUTDOWN_TIMEOUT_MS` | `8000` | Shutdown deadline, 100–60000 ms. |
 | `MUSE_TOOL_OUTPUT_LIMIT` | `8000` | Editor-facing tool output bound, in characters (minimum 200). |
 | `MUSE_LOG` | `normal` | Set to `debug` for per-method protocol tracing (no payloads). |
+| `MUSE_SHOW_REMINDERS` | off | Set to `1`, `true`, `yes`, or `on` to render background reminder checks as transcript cards. |
 | `MUSE_ALLOW_UNSCOPED_READS` | off | **Dangerous.** Set to `1`, `true`, `yes`, or `on` to allow local reads outside the approved workspace roots. |
 
 Without `MUSE_COMMAND_TIMEOUT_MS`, admission deadlines are 30 seconds for the

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.12.1
+
+- Silence background reminder checks in the transcript. `reminderChild` items
+  (`skill-reminder`, `goal-reminder`, `verify-reminder`, …) hold the turn open
+  but carry no editor-facing content — the host shows nothing per agent — so
+  they no longer render `Reminder from <agent>` / `Reminder child session`
+  cards, keeping `in_progress` rows with weak detail out of the transcript.
+  The blocking agent ids are still logged on stderr with
+  `turn/foregroundCompleted`. Set `MUSE_SHOW_REMINDERS=1` (`true`/`yes`/`on`)
+  to render the per-agent cards again.
+
 ## 0.12.0
 
 - Fold reminder-child cards onto one card per reminder agent. The host mints a
