@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fix Windows sessions with extra workspace roots. Muse 1.4.3 requires
+  `turn/start workspaceRoots` entries in the verbatim `\\?\C:\...` canonical
+  form, so the adapter keeps that form instead of stripping it back to
+  `C:\...`, and `session/start` now names the same folder in `workspaceRoot`.
+  Previously a session that re-attached after a mode change, resume, or fork
+  could fail its next turn with "expected a canonical path".
 - Classify Muse 1.4.4 as a tested host. A live `muse serve --provider echo`
   1.4.4 handshake reports the new stable fingerprint, and the binary's own
   `muse schema` export is identical to the vendored bundle, so startup logs

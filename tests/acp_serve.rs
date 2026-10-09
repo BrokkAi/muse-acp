@@ -60,16 +60,11 @@ fn fresh_workspace_dir(label: &str) -> std::path::PathBuf {
     dir
 }
 
-/// Canonical path text as the host receives it (Windows drops the verbatim
-/// prefix on a plain drive path).
+/// Canonical path text as the host receives it (Windows keeps the verbatim
+/// `\\?\` prefix on a plain drive path).
 fn canonical_text(path: &std::path::Path) -> String {
     let canonical = std::fs::canonicalize(path).expect("canonical path");
-    let text = canonical.to_string_lossy().into_owned();
-    if cfg!(windows) {
-        text.strip_prefix(r"\\?\").unwrap_or(&text).to_string()
-    } else {
-        text
-    }
+    canonical.to_string_lossy().into_owned()
 }
 
 struct Client {

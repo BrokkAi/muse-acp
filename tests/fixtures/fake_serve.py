@@ -279,6 +279,14 @@ def send(obj):
     sys.stdout.flush()
 
 
+def folder_identity(path):
+    """Folder identity independent of the Win32 verbatim (`\\\\?\\`) prefix."""
+    resolved = os.path.realpath(path)
+    if os.name == "nt" and resolved.startswith("\\\\?\\"):
+        resolved = resolved[4:]
+    return os.path.normcase(resolved)
+
+
 def validate_workspace_roots(roots, primary):
     """The live host's workspaceRoots rules, so tests catch bad frames."""
     if not isinstance(roots, list) or not roots:
@@ -294,7 +302,7 @@ def validate_workspace_roots(roots, primary):
         if not os.path.isdir(root):
             return "not an existing directory: " + root
         seen.append(canonical)
-    if primary and os.path.realpath(primary) != seen[0]:
+    if primary and folder_identity(primary) != folder_identity(roots[0]):
         return "workspaceRoots[0] must name the same folder as workspaceRoot"
     return None
 
