@@ -155,7 +155,8 @@ fn expire(context: &'static str) -> ! {
             "[muse-acp] shutdown deadline expired ({context}); failing outstanding ACP requests; forcing exit"
         );
     });
-    std::thread::spawn(|| {
+    let (stop_tx, stop_rx) = mpsc::channel();
+    std::thread::spawn(move || {
         let hosts: Vec<Arc<MspHost>> = HOSTS
             .get()
             .and_then(|hosts| hosts.try_lock().ok())
@@ -164,6 +165,7 @@ fn expire(context: &'static str) -> ! {
         for host in hosts {
             host.force_stop();
         }
+        let _ = stop_tx.send(());
     });
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -176,6 +178,10 @@ fn expire(context: &'static str) -> ! {
     let started = std::time::Instant::now();
     let grace = Duration::from_millis(250);
     let _ = rx.recv_timeout(grace);
+    // The settings-view cleanup happens inside `force_stop`, which can spend
+    // seconds in `taskkill` on Windows. Wait for it before exiting, or the
+    // temporary view leaks; `process::exit` runs no destructors.
+    let _ = stop_rx.recv_timeout(Duration::from_secs(4).saturating_sub(started.elapsed()));
     std::thread::sleep(grace.saturating_sub(started.elapsed()));
     std::process::exit(1);
 }
