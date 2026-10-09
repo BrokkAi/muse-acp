@@ -130,6 +130,9 @@ live `session_configuration_conflict` error.
 Log flood (fixture self-test): FAKE_LOG_FLOOD=N speaks no MSP. The process
 prints `ready`, waits for one stdin line, then appends N lines
 `<FAKE_FLOOD_TAG>-<i>` to FAKE_LOG, so a test can start several at once.
+With FAKE_FLOOD_SYNC_EVERY=K it prints `sync` and waits for another stdin
+line every K lines, so the test can restart all writers together and recreate
+the t=0 contention the Windows seek-then-write race needs.
 """
 import json
 import os
@@ -1788,8 +1791,14 @@ def flood_log():
     sys.stdout.flush()
     sys.stdin.readline()
     tag = os.environ.get("FAKE_FLOOD_TAG", "")
-    for i in range(int(os.environ["FAKE_LOG_FLOOD"])):
+    total = int(os.environ["FAKE_LOG_FLOOD"])
+    sync_every = int(os.environ.get("FAKE_FLOOD_SYNC_EVERY", "0"))
+    for i in range(total):
         log_method("%s-%d" % (tag, i))
+        if sync_every and (i + 1) % sync_every == 0 and (i + 1) < total:
+            sys.stdout.write("sync\n")
+            sys.stdout.flush()
+            sys.stdin.readline()
 
 
 def main():
