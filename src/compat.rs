@@ -75,7 +75,7 @@ pub const HOST_143_FINGERPRINT: &str =
 /// `session/delete` stays removed; the additions over 1.4.3 are
 /// `computerUseSettings/read`, `computerUseSettings/update`, `media/upload`,
 /// `session/sideChat`, `skill/setActivation`, `workflow/pause`, the task-list
-/// and status vocabulary, `SessionKind`, and `SideProvenance`. Validated
+/// and status vocabulary, and `SideProvenance`. Validated
 /// against a live `muse serve --provider echo` 1.4.4 handshake (server
 /// `muse/1.4.4`, durable, all requested capabilities granted) and by diffing
 /// the vendored bundle against the binary's own

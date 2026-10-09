@@ -118,8 +118,8 @@ the verdict into richer support bundles.
   (schema version 1; `session/delete` stays removed and the 1.4.4 surface
   otherwise adds `computerUseSettings/read`, `computerUseSettings/update`,
   `media/upload`, `session/sideChat`, `skill/setActivation`,
-  `workflow/pause`, task-list and status vocabulary, `SessionKind`, and
-  `SideProvenance`; validated by a live 1.4.4 handshake plus the binary's
+  `workflow/pause`, task-list and status vocabulary, and `SideProvenance`;
+  validated by a live 1.4.4 handshake plus the binary's
   own schema export, which is identical to the vendored bundle). The SDK's
   `537cc8d` revision publishes exactly this 1.4.4 surface in both its
   top-level schema and its Python tree, with its packages at 1.4.4, and the
