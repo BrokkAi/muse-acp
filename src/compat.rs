@@ -71,11 +71,23 @@ pub const HOST_142_FINGERPRINT: &str =
 pub const HOST_143_FINGERPRINT: &str =
     "sha256:4cb671082574037fc1070a136db7c0c8dc24e65e78cf3d209a10944ff9f9845f";
 
+/// Stable-surface fingerprint of the Muse 1.4.4 host (schema version 1).
+/// `session/delete` stays removed; the additions over 1.4.3 are
+/// `computerUseSettings/read`, `computerUseSettings/update`, `media/upload`,
+/// `session/sideChat`, `skill/setActivation`, `workflow/pause`, the task-list
+/// and status vocabulary, and `SideProvenance`. Validated
+/// against a live `muse serve --provider echo` 1.4.4 handshake (server
+/// `muse/1.4.4`, durable, all requested capabilities granted) and by diffing
+/// the vendored bundle against the binary's own
+/// `muse schema generate-json-schema` export, which is identical.
+pub const HOST_144_FINGERPRINT: &str =
+    "sha256:7c94f153c41659cb3f1bd3c3e04438be254644cb2a97d65d48edc7449b74858a";
+
 /// Fingerprint published by the vendored Muse SDK manifest at revision
-/// `bb44be3` (schema version 1). It is the same stable surface the Muse 1.4.2
+/// `537cc8d` (schema version 1). It is the same stable surface the Muse 1.4.4
 /// host reports, so it classifies through that live-validated entry rather
 /// than a separate table arm.
-pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_142_FINGERPRINT;
+pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_144_FINGERPRINT;
 
 /// Fingerprint embedded in the SDK conformance-transcript fixtures. It is
 /// deliberately distinct from every host fingerprint and must never be
@@ -148,6 +160,7 @@ fn table_entry(fingerprint: &str) -> Option<(Status, &'static str)> {
         HOST_141_FINGERPRINT => (Status::Tested, "validated against live host 1.4.1"),
         HOST_142_FINGERPRINT => (Status::Tested, "validated against live host 1.4.2"),
         HOST_143_FINGERPRINT => (Status::Tested, "validated against live host 1.4.3"),
+        HOST_144_FINGERPRINT => (Status::Tested, "validated against live host 1.4.4"),
         TRANSCRIPT_FIXTURE_FINGERPRINT => (
             Status::Fixture,
             "transcript fixture fingerprint; never a live-host result",
@@ -209,6 +222,7 @@ pub fn selftest_lines(adapter_version: &str) -> Vec<String> {
         (HOST_141_FINGERPRINT, "host-1.4.1"),
         (HOST_142_FINGERPRINT, "host-1.4.2"),
         (HOST_143_FINGERPRINT, "host-1.4.3"),
+        (HOST_144_FINGERPRINT, "host-1.4.4"),
         (TRANSCRIPT_FIXTURE_FINGERPRINT, "transcript-fixture"),
     ] {
         let c = classify(Some(SUPPORTED_SCHEMA_VERSION), fp);
@@ -234,11 +248,11 @@ mod tests {
     }
 
     #[test]
-    fn sdk_manifest_matches_live_validated_142() {
-        // The vendored SDK manifest (bb44be3) publishes the exact surface the
-        // live 1.4.2 host was validated against, so it is tested, not merely
+    fn sdk_manifest_matches_live_validated_144() {
+        // The vendored SDK manifest (537cc8d) publishes the exact surface the
+        // live 1.4.4 host was validated against, so it is tested, not merely
         // a known shape.
-        assert_eq!(SDK_MANIFEST_FINGERPRINT, HOST_142_FINGERPRINT);
+        assert_eq!(SDK_MANIFEST_FINGERPRINT, HOST_144_FINGERPRINT);
         let c = classify(Some(1), SDK_MANIFEST_FINGERPRINT);
         assert_eq!(c.status, Status::Tested);
         assert!(!c.is_fatal());
@@ -290,6 +304,14 @@ mod tests {
     }
 
     #[test]
+    fn host_144_fingerprint_is_tested() {
+        let c = classify(Some(1), HOST_144_FINGERPRINT);
+        assert_eq!(c.status, Status::Tested);
+        assert_eq!(c.detail, "validated against live host 1.4.4");
+        assert!(!c.is_fatal());
+    }
+
+    #[test]
     fn transcript_fixture_fingerprint_is_never_host_compatibility() {
         let c = classify(Some(1), TRANSCRIPT_FIXTURE_FINGERPRINT);
         assert_eq!(c.status, Status::Fixture);
@@ -332,7 +354,7 @@ mod tests {
         let lines = selftest_lines("0.2.5");
         assert!(lines[0].contains("adapter=0.2.5"));
         assert!(lines[0].contains("host=offline"));
-        assert_eq!(lines.len(), 10);
+        assert_eq!(lines.len(), 11);
         assert!(lines.iter().any(|l| l.contains("kind=sdk-manifest")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.2.1")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.3.0")));
@@ -340,6 +362,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.1")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.2")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.3")));
+        assert!(lines.iter().any(|l| l.contains("kind=host-1.4.4")));
         assert!(lines.iter().any(|l| l.contains("kind=transcript-fixture")));
     }
 }

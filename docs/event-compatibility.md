@@ -17,8 +17,9 @@ secondary effects.
 
 ## Published schema notifications
 
-The schema includes notifications in both directions. `initialized` is the one
-client-to-server entry; all other rows below are emitted by the MSP host.
+The schema includes notifications in both directions. `initialized` and
+`userInput/engaged` are the client-to-server entries; all other rows below
+are emitted by the MSP host.
 
 <!-- schema-notifications:start -->
 | MSP notification | Disposition | ACP behavior |
@@ -35,7 +36,6 @@ client-to-server entry; all other rows below are emitted by the MSP host.
 | `session/branchChanged` | Mapped to ACP | Stores the latest branch fact and emits it in `session/update` metadata together with the current goal. |
 | `session/closed` | Consumed | Logs the unload and its reason. An unload is not a deletion: the session is `notLoaded`, its log stays on disk, and `session/resume` reloads it, so it stays in ACP `session/list`. |
 | `session/contextUsage` | Mapped to ACP | Replaces the tracked context occupancy and emits ACP `usage_update` with used tokens, window size, and Muse pressure metadata. |
-| `session/deleteCompleted` | Mapped to ACP | Muse 1.4.1 and 1.4.2 only; 1.4.3 removed delete. Settles a pending ACP `session/delete` with `{}` on `completed`, or an error carrying the host's reason and physical-change evidence on `failed`. A `failed` terminal whose filtered listing shows the session is gone counts as success; an unknown outcome leaves the request pending. A completed delete also removes the session from ACP `session/list`. |
 | `session/goalChanged` | Mapped to ACP | Stores replacement-or-clear semantics and emits the goal in `session/update` metadata together with branch state. |
 | `session/listChanged` | Mapped to ACP | Replaces a cached list row when `sessionListStream` is granted; pushes a changed active-session title through `session_info_update`. |
 | `session/modelChanged` | Mapped to ACP | Updates the selected model value, resets a held per-turn reasoning tier the new model does not serve, and resends the complete `configOptions` list. |
@@ -49,11 +49,13 @@ client-to-server entry; all other rows below are emitted by the MSP host.
 | `session/viewHealthChanged` | Consumed | Logs the view health and reason with guidance to reattach through resume. |
 | `skill/changed` | Mapped to ACP | Refreshes `skill/list` and the ACP available-command catalog. |
 | `turn/completed` | Mapped to ACP | Settles the matching ACP prompt, reports its stop reason and per-turn usage, and moves ACP v2 to idle when no work remains. Failures also receive host detail. |
+| `turn/foregroundCompleted` | Intentionally ignored | Explicitly non-terminal: foreground work is done while background checks hold the turn open, and the turn still ends at `turn/completed` / `turn/unqueued`. No ACP mapping; the unhandled-notification path logs a diagnostic. |
 | `turn/retracted` | Mapped to ACP | Removes the retracted turn from tracked work and settles its ACP prompt as cancelled. |
 | `turn/retryScheduled` | Consumed | Records attempt and backoff facts in diagnostics. It remains non-terminal and never settles the ACP prompt. |
 | `turn/started` | Internally tracked | Marks the active MSP turn so steering, cancellation, and reconciliation target the running work. |
 | `turn/unqueued` | Mapped to ACP | Removes the reclaimed queued turn from tracked work and settles its ACP prompt as cancelled. |
 | `usage/changed` | Mapped to ACP | Broadcasts the host's subscription observation to attached sessions as `_meta.museSubscriptionUsage`, separately from cost estimates. |
+| `userInput/engaged` | Intentionally ignored | A client-to-server engagement note: the user started interacting with a timed prompt, so the host disarms its auto-resolution countdown. The adapter sends no engagement notes itself; no ACP mapping, and an inbound copy would take the unhandled-notification path, which logs a diagnostic. |
 | `userInput/requested` | Mapped to ACP | Opens ACP `elicitation/create` when form elicitation was negotiated; otherwise sends `userInput/cancel` so the turn cannot hang. |
 | `userInput/settled` | Mapped to ACP | A question this adapter answered or cancelled is already cleared locally. A form still open for a question settled elsewhere (another client, an interrupt, auto-resolution) is withdrawn with `$/cancel_request`. |
 | `view/gap` | Consumed | Pages forward from the bracket's `after` cursor until the walk meets `next` and recursively processes the missing events. When `next` is ephemeral (never paged) the walk runs to the end of the durable view, and live twins of the events it delivered are refused once. |

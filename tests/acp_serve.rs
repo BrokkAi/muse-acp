@@ -5146,18 +5146,18 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 
 #[test]
 fn sdk_manifest_fingerprint_is_tested() {
-    // The vendored SDK manifest (bb44be3) equals the live-validated 1.4.2
+    // The vendored SDK manifest (537cc8d) equals the live-validated 1.4.4
     // host surface.
     let mut c = Client::spawn(
         "quiet",
         &[(
             "FAKE_FINGERPRINT",
-            "sha256:61afea3112e0906e9dc3a536144278a74cb4b36fc6e20901a91d4432ba3568e2",
+            "sha256:7c94f153c41659cb3f1bd3c3e04438be254644cb2a97d65d48edc7449b74858a",
         )],
     );
     c.initialize(1, "");
     c.wait_stderr("status=tested", Duration::from_secs(10));
-    c.wait_stderr("validated against live host 1.4.2", Duration::from_secs(10));
+    c.wait_stderr("validated against live host 1.4.4", Duration::from_secs(10));
     c.finish();
 }
 
@@ -5191,6 +5191,11 @@ fn host_feature_gates_follow_the_reported_muse_version() {
             Some("1.4.3-R5018.1"),
             Some("durable"),
             "1.4.3-R5018.1 session_delete=false workspace_roots=true session_cost=true",
+        ),
+        (
+            Some("1.4.4-R5419.1"),
+            Some("durable"),
+            "1.4.4-R5419.1 session_delete=false workspace_roots=true session_cost=true",
         ),
         (
             Some("1.10.0"),

@@ -20,6 +20,20 @@
   `C:\...`, and `session/start` now names the same folder in `workspaceRoot`.
   Previously a session that re-attached after a mode change, resume, or fork
   could fail its next turn with "expected a canonical path".
+- Classify Muse 1.4.4 as a tested host. A live `muse serve --provider echo`
+  1.4.4 handshake reports the new stable fingerprint, and the binary's own
+  `muse schema` export is identical to the vendored bundle, so startup logs
+  `status=tested` instead of `status=unknown`. `session/delete` stays
+  removed; the version-gated features are unchanged (no delete from 1.4.3
+  on, workspace roots and host-computed cost stay on). The live-host suite
+  now runs against 1.4.4 on Linux, and the newest macOS arm64 pin moves to
+  1.4.4.
+- Re-pin the vendored Muse SDK conformance corpus to `537cc8d`. It publishes
+  the Muse 1.4.4 stable surface, adds the `userinput-interrupt-round-trip`
+  transcript (51 scenarios), and drops `session/delete` and
+  `session/deleteCompleted` from the schema; the event-compatibility matrix
+  classifies the new `turn/foregroundCompleted` and `userInput/engaged`
+  notifications as intentionally ignored.
 - Run the live-host suite against Muse 1.4.3 (`1.4.3-R5018.1`) on Linux and
   macOS arm64, and classify its schema fingerprint as tested. On 1.4.3,
   Read-only and Plan sessions no longer get write or shell tools at all,

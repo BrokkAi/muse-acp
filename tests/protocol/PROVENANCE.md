@@ -1,11 +1,12 @@
 # Vendored Muse MSP conformance corpus
 
 - **Source:** <https://github.com/meta-models/muse-code-sdk>
-- **Upstream revision:** `bb44be3d36de46d2411bd9eaa4aee99006092546`
-  ("Merge pull request #67 from meta-models/sdk-1.4.2-remirror", 2026-09-30;
-  its change is "Re-mirror the SDK closure at tbh@fda770f (1.4.2 lockstep)").
-  This revision publishes the Muse 1.4.2 stable surface: its manifest
-  fingerprint equals what a live Muse 1.4.2 host reports. Only `schema/msp/`
+- **Upstream revision:** `537cc8dc72cf1347c16063fc13dcb93f9cde7f6e`
+  ("remirror: 1.4.4 from the internal source tree (tracked internally)",
+  2026-10-08).
+  This revision publishes the Muse 1.4.4 stable surface: its manifest
+  fingerprint equals what a live Muse 1.4.4 host reports, and the binary's
+  own `muse schema` export is identical to the vendored bundle. Only `schema/msp/`
   was copied, without `schema/msp/msp.d.ts`; the revision's `python/`,
   `clients/`, and `scripts/` trees are not vendored.
 - **License:** MIT — see `LICENSE.muse-code-sdk`
