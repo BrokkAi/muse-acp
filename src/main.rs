@@ -11375,6 +11375,24 @@ fn complete_elicitation(
 mod tests {
 
     #[test]
+    fn host_path_string_keeps_the_verbatim_windows_prefix() {
+        // Muse 1.4.3+ rejects workspaceRoots entries that lack the verbatim
+        // Win32 `\\?\` prefix that std::fs::canonicalize returns, so the
+        // host-facing text must keep it. POSIX canonical paths never carry the
+        // prefix, so this only asserts while running on Windows.
+        if !cfg!(windows) {
+            return;
+        }
+        let canonical = std::fs::canonicalize(std::env::temp_dir()).expect("canonical temp dir");
+        let text = canonical.to_string_lossy().into_owned();
+        assert!(
+            text.starts_with(r"\\?\"),
+            "canonicalize should yield a verbatim path: {text}"
+        );
+        assert_eq!(super::host_path_string(&canonical), text);
+    }
+
+    #[test]
     fn goal_command_parses_verbs_objectives_and_control_words() {
         use super::parse_goal_command as parse;
         let ok = |method: &str, objective: Option<&str>| {
