@@ -5200,8 +5200,9 @@ fn host_feature_gates_follow_the_reported_muse_version() {
 #[test]
 fn session_delete_is_advertised_only_where_the_host_supports_it() {
     // ACP v1 advertises `session/delete` in agentCapabilities.
-    // sessionCapabilities; v2 in capabilities.session. It needs Muse 1.4.1+
-    // and a durable host (a memory-only host has nothing to delete).
+    // sessionCapabilities; v2 in capabilities.session. It needs Muse 1.4.1
+    // or 1.4.2 and a durable host (a memory-only host has nothing to
+    // delete); 1.4.3 dropped the method, so it stays hidden there too.
     for ver in [1u64, 2] {
         let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
         let id = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
