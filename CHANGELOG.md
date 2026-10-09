@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Fix Windows sessions with extra workspace roots. Muse 1.4.3 requires
+  `turn/start workspaceRoots` entries in the verbatim `\\?\C:\...` canonical
+  form, so the adapter keeps that form instead of stripping it back to
+  `C:\...`, and `session/start` now names the same folder in `workspaceRoot`.
+  Previously a session that re-attached after a mode change, resume, or fork
+  could fail its next turn with "expected a canonical path".
 - Run the live-host suite against Muse 1.4.3 (`1.4.3-R5018.1`) on Linux and
   macOS arm64, and classify its schema fingerprint as tested. On 1.4.3,
   Read-only and Plan sessions no longer get write or shell tools at all,
