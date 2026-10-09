@@ -49,7 +49,7 @@ are emitted by the MSP host.
 | `session/viewHealthChanged` | Consumed | Logs the view health and reason with guidance to reattach through resume. |
 | `skill/changed` | Mapped to ACP | Refreshes `skill/list` and the ACP available-command catalog. |
 | `turn/completed` | Mapped to ACP | Settles the matching ACP prompt, reports its stop reason and per-turn usage, and moves ACP v2 to idle when no work remains. Failures also receive host detail. |
-| `turn/foregroundCompleted` | Intentionally ignored | Explicitly non-terminal: foreground work is done while background checks hold the turn open, and the turn still ends at `turn/completed` / `turn/unqueued`. No ACP mapping; the unhandled-notification path logs a diagnostic. |
+| `turn/foregroundCompleted` | Consumed | Explicitly non-terminal: foreground work is done while background reminder checks hold the turn open, so the ACP prompt stays open until `turn/completed` / `turn/unqueued`. ACP has no matching state; the adapter logs the turn, session, and blocking reminder-agent ids (agent ids, never display names). |
 | `turn/retracted` | Mapped to ACP | Removes the retracted turn from tracked work and settles its ACP prompt as cancelled. |
 | `turn/retryScheduled` | Consumed | Records attempt and backoff facts in diagnostics. It remains non-terminal and never settles the ACP prompt. |
 | `turn/started` | Internally tracked | Marks the active MSP turn so steering, cancellation, and reconciliation target the running work. |

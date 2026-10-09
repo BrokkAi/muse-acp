@@ -2382,6 +2382,37 @@ fn turn_retry_then_completed_settles_once_as_end_turn() {
 }
 
 #[test]
+fn turn_foreground_completed_is_consumed_and_the_turn_still_settles() {
+    // Foreground completion is explicitly non-terminal: background reminder
+    // checks hold the turn open, so the prompt must settle only on the later
+    // turn/completed. The event is recognized (never "unhandled") and its
+    // blocking reminder agents are logged.
+    let mut c = Client::spawn("foreground_then_completed", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"end_turn\""),
+        "the later completion settles the prompt: {done}"
+    );
+    let (count, log) = {
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+        let needle = format!("\"id\":{pid}");
+        let count = frames.iter().filter(|f| f.contains(&needle)).count();
+        (count, frames.join("\n"))
+    };
+    assert_eq!(count, 1, "exactly one settle for the prompt: {log}");
+    c.wait_stderr("turn foreground completed", Duration::from_secs(15));
+    c.wait_stderr("agents=agent-1,agent-2", Duration::from_secs(15));
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        !stderr.contains("unhandled MSP notification: turn/foregroundCompleted"),
+        "the event is handled, not unhandled: {stderr}"
+    );
+    c.finish();
+}
+
+#[test]
 fn queued_turns_share_running_until_drained() {
     let mut c = Client::spawn("queued", &[]);
     let sid = c.new_session(2, "");

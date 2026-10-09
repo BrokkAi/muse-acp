@@ -7515,7 +7515,7 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
     };
     let cmd = reviewer.mint_cmd("cmd-");
     let params = format!(
-        "{{\"commandId\":{},\"sessionId\":{},\"prompt\":[{{\"type\":\"text\",\"text\":{}}}]}}",
+        "{{\"commandId\":{},\"sessionId\":{},\"input\":[{{\"type\":\"text\",\"text\":{}}}]}}",
         esc(&cmd),
         esc(&session),
         esc(&job.prompt)
@@ -8929,6 +8929,34 @@ fn handle_msp(
                 }
                 let _ = req_id;
             }
+        }
+        "turn/foregroundCompleted" => {
+            // Non-terminal by schema: the turn's foreground work is done, but
+            // named background reminder checks hold it open, and it ends only
+            // at turn/completed / turn/unqueued. ACP has no matching state, so
+            // record the blocking reminder agents for diagnostics and leave the
+            // pending prompt alone.
+            let agents = match params.get("blockingAgents") {
+                Some(J::Arr(items)) => items
+                    .iter()
+                    .filter_map(|v| v.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                _ => String::new(),
+            };
+            log(&format!(
+                "turn foreground completed; background reminder checks hold it open turn={} sess={} agents={}",
+                params.get("turnId").and_then(|v| v.as_str()).unwrap_or("?"),
+                params
+                    .get("sessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?"),
+                if agents.is_empty() {
+                    "?"
+                } else {
+                    agents.as_str()
+                }
+            ));
         }
         "turn/retryScheduled" => {
             // Non-terminal by schema: it never resolves a turn-wait, so never

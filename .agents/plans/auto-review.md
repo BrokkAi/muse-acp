@@ -121,6 +121,21 @@ headline capability.
   `FAKE_APPROVAL_PATH=workspace` now points a file-access subject at the
   active `session/start` workspace.
   Evidence: `tests/fixtures/fake_serve.py`, `fn approval_params`.
+- Observation: The shipped reviewer (`31e35c2`) sent `turn/start` with the
+  pre-`input` `prompt` field, which a real Muse 1.4.x host rejects with
+  `-32602 invalidParams: invalid turn/start params: missing field \`input\``.
+  The reviewer turn therefore always failed, and because a reviewer failure
+  denies, every approval was answered with the host's reject choice and Muse
+  reported the tool as "approval aborted" on every client. The fake host and
+  the black-box suite could not catch this: the fixture never validated
+  `turn/start` params, and `tests/live_loopback.rs` had no test for the
+  adapter's own reviewer (only for the saved `:auto-review` profile).
+  Evidence: `muse serve --provider echo` 1.4.4 rejects
+  `turn/start` with `prompt` and accepts it with `input`; the temporary
+  revert of the one-word fix fails
+  `auto_review_decides_a_shell_approval_against_a_real_host` with
+  `auto-review deny …: reviewer turn failed: Invalid params: invalid
+  turn/start params: missing field \`input\``.
 
 ## Decision Log
 

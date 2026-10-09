@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.11.1
+
+- Fix Auto-review against a real Muse host. The reviewer session started its
+  turn with the pre-`input` `prompt` field, which Muse 1.4.x rejects with
+  "invalid turn/start params: missing field `input`". Every approval then
+  failed closed as `reviewer turn failed`, which Muse surfaced to the editor
+  as "approval aborted", on every approval and in every client. The reviewer
+  now submits `turn/start` with `input`, the shape the rest of the adapter
+  already used and the MSP schema requires. The fake MSP host now rejects a
+  `turn/start` without `input`, and the live-host suite covers the adapter's
+  own reviewer against a real `muse serve`.
+- Consume `turn/foregroundCompleted` instead of falling through to the
+  unhandled-notification diagnostic. Muse's newer hosts emit it when a turn's
+  foreground work is done but named background reminder checks still hold the
+  turn open; it is explicitly non-terminal, so the ACP prompt stays open until
+  `turn/completed` / `turn/unqueued`. The adapter now logs the turn, session,
+  and blocking reminder-agent ids.
+
 ## 0.11.0
 
 - Deny a hung auto-review past a deadline. A reviewer turn that never ends no

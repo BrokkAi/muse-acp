@@ -18,6 +18,11 @@ else gets the text "ok". A reply is {"text": "..."} or
 {"tool": {"name": "...", "arguments": {...}}}, optionally with "hold_ms" to
 hold the stream open before it completes.
 
+The adapter's auto-review turn asks a guardian-style reviewer instead of a
+user, so a request whose prompt carries the guardian policy gets the script's
+`review` reply when one is defined. That lets a test script both the agent
+turn and the reviewer's verdict.
+
 The first line on stdout is the port. The log gets one JSON line per model
 call: {"call", "reply", "last"}, where "last" is the type and role of the
 request's last input item, plus its "output" when it is a tool result and
@@ -99,7 +104,11 @@ def reply_for(request):
         if item.get("role") != "user":
             break
         prompt.append(text_of(item))
-    marker = re.search(r"\[\[script:([\w-]+)\]\]", "".join(prompt))
+    prompt_text = "".join(prompt)
+    if ("You are judging one planned coding-agent action" in prompt_text
+            and "review" in SCRIPT):
+        return SCRIPT["review"]
+    marker = re.search(r"\[\[script:([\w-]+)\]\]", prompt_text)
     if marker and marker.group(1) in SCRIPT:
         return SCRIPT[marker.group(1)]
     return {"text": "ok"}
