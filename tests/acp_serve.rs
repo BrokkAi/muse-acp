@@ -7,10 +7,11 @@
 //! `python3` on PATH.
 
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},
+    mpsc,
 };
 use std::time::{Duration, Instant};
 
@@ -10082,45 +10083,129 @@ fn fake_methods(c: &Client) -> Vec<String> {
         .collect()
 }
 
+/// Kill leftover flood children before failing, so a wedged child cannot
+/// outlive the test that caught it.
+fn kill_flood_children(hosts: &mut [Child]) {
+    for host in hosts.iter_mut() {
+        let _ = host.kill();
+    }
+}
+
 /// The adapter's main and read-only hosts append to one fake log, so a line
 /// one host writes must never overwrite the other's. Windows' C runtime
 /// emulates append mode with a seek and then a write, which two processes
 /// can interleave.
+///
+/// One mass start is not enough to catch that reliably: after t=0 the writers
+/// drift apart and may never overlap inside the tiny seek-then-write window
+/// again. The writers therefore re-synchronize every SYNC_EVERY lines, so
+/// each round restarts all of them together. Every wait around the children
+/// is bounded by one global deadline, so a wedged child fails the test
+/// instead of sitting until the job cap.
 #[test]
 fn concurrent_fake_hosts_keep_every_log_line() {
-    const HOSTS: usize = 4;
-    const LINES: usize = 250;
+    const HOSTS: usize = 8;
+    const LINES: usize = 2000;
+    const SYNC_EVERY: usize = 50;
+    const ROUNDS: usize = LINES / SYNC_EVERY - 1;
+    const _: () = assert!(
+        LINES.is_multiple_of(SYNC_EVERY),
+        "SYNC_EVERY must divide LINES so ROUNDS matches the fixture syncs"
+    );
+    // The flood itself takes seconds; a wedged child must still fail fast
+    // relative to the job cap.
+    const CHILD_TIMEOUT: Duration = Duration::from_secs(120);
+    let deadline = Instant::now() + CHILD_TIMEOUT;
+    let remaining = || deadline.saturating_duration_since(Instant::now());
     let dir = std::env::temp_dir().join(format!("acp-fake-flood-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("tmpdir");
     let log = dir.join("fake.log");
     let _ = std::fs::remove_file(&log);
-    let mut hosts: Vec<Child> = (0..HOSTS)
-        .map(|n| {
-            Command::new(fixture())
-                .env("FAKE_LOG", &log)
-                .env("FAKE_LOG_FLOOD", LINES.to_string())
-                .env("FAKE_FLOOD_TAG", format!("host{n}"))
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()
-                .expect("spawn fake host")
-        })
-        .collect();
+    // Reader threads own each child's stdout and forward every line; the
+    // main thread keeps the Child handles for bounded waits and kills.
+    let (lines_tx, lines_rx) = mpsc::channel::<(usize, Option<String>)>();
+    let mut hosts: Vec<Child> = Vec::with_capacity(HOSTS);
+    let mut stdins: Vec<ChildStdin> = Vec::with_capacity(HOSTS);
+    for n in 0..HOSTS {
+        let mut host = Command::new(fixture())
+            .env("FAKE_LOG", &log)
+            .env("FAKE_LOG_FLOOD", LINES.to_string())
+            .env("FAKE_FLOOD_TAG", format!("host{n}"))
+            .env("FAKE_FLOOD_SYNC_EVERY", SYNC_EVERY.to_string())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn fake host");
+        let stdout: ChildStdout = host.stdout.take().expect("fake host stdout");
+        stdins.push(host.stdin.take().expect("fake host stdin"));
+        let tx = lines_tx.clone();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if tx.send((n, line.ok())).is_err() {
+                    break;
+                }
+            }
+            let _ = tx.send((n, None));
+        });
+        hosts.push(host);
+    }
+    drop(lines_tx);
+    // Collect one marker line from every writer, in whatever order they
+    // arrive; a child that exits first reports itself instead of hanging us.
+    // Returns a failure message instead of panicking so the caller can kill
+    // the remaining children first.
+    let barrier = |want: &'static str| -> Option<String> {
+        for _ in 0..HOSTS {
+            match lines_rx.recv_timeout(remaining()) {
+                Ok((_, Some(line))) if line.trim() == want => {}
+                Ok((n, other)) => {
+                    return Some(format!("fake host {n} said {other:?} waiting for {want}"));
+                }
+                Err(_) => {
+                    return Some(format!(
+                        "flood writers never said {want} within the child timeout"
+                    ));
+                }
+            }
+        }
+        None
+    };
+    let mut fail = |message: String| -> ! {
+        kill_flood_children(&mut hosts);
+        panic!("{message}");
+    };
     // Start every flood at once, after each process is up.
-    for host in &mut hosts {
-        let mut ready = String::new();
-        BufReader::new(host.stdout.as_mut().expect("fake host stdout"))
-            .read_line(&mut ready)
-            .expect("fake host ready");
-        assert_eq!(ready.trim(), "ready");
+    if let Some(message) = barrier("ready") {
+        fail(message);
     }
-    for host in &mut hosts {
-        let stdin = host.stdin.as_mut().expect("fake host stdin");
-        stdin.write_all(b"go\n").expect("start flood");
-        stdin.flush().expect("flush");
+    let mut release = |line: &[u8]| {
+        for stdin in stdins.iter_mut() {
+            if stdin.write_all(line).is_err() || stdin.flush().is_err() {
+                return Some("fake host stdin closed while releasing the flood".to_string());
+            }
+        }
+        None
+    };
+    if let Some(message) = release(b"go\n") {
+        fail(message);
     }
-    for host in &mut hosts {
-        assert!(host.wait().expect("fake host exit").success());
+    // Restart all writers together at every sync point.
+    for _ in 0..ROUNDS {
+        if let Some(message) = barrier("sync") {
+            fail(message);
+        }
+        if let Some(message) = release(b"go\n") {
+            fail(message);
+        }
+    }
+    for (n, host) in hosts.iter_mut().enumerate() {
+        match host.wait_timeout(remaining()) {
+            Ok(Some(status)) => assert!(status.success(), "fake host {n} exit: {status}"),
+            _ => {
+                kill_flood_children(&mut hosts);
+                panic!("fake host {n} did not exit within the child timeout");
+            }
+        }
     }
     let text = std::fs::read_to_string(&log).expect("fake log");
     let mut seen: Vec<&str> = text.lines().collect();
