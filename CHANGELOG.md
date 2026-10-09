@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.12.0
+
+- Fold reminder-child cards onto one card per reminder agent. The host mints a
+  new `reminderChild` item for every background re-check and cancels the
+  previous generation, so naming the generation in the title appended a
+  transcript row per re-check, and every superseded generation settled as a
+  failed card. The title is now the stable `Reminder from <agent>` (then
+  `Reminder <task>`, then the server summary), the generation moves into the
+  card body, and a new generation updates the same card. A superseded
+  (`cancelled`) generation settles as completed instead of a failed card: the
+  cancellation is host churn, ACP has no `cancelled` tool status, and ADR 41191
+  D4 keeps the reminder's status word off the wire. A real
+  `failed`/`rejected`/`timedOut` outcome still shows as failed, parallel
+  reminder agents keep distinct cards, and a card announced at start still
+  settles when its terminal frame carries no title (#1007).
+- Refresh the README adapter comparison with October 2026 package metadata and
+  relative npm adoption.
+
 ## 0.11.1
 
 - Fix Auto-review against a real Muse host. The reviewer session started its
