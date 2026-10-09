@@ -226,6 +226,7 @@ variable. See [Auto-review](#auto-review-keep-the-boundary-lose-the-busywork).
 | `MUSE_SERVE_ARGS` | none | Extra host-lifetime flags for `muse serve` (see `muse serve --help`). Split on whitespace; no shell quoting or expansion. |
 | `MUSE_APPROVAL_MODE` | host default | Force an approval posture: `allowAll`, `promptUnmatched`, `onRequest`, or `denyUnmatched`. `promptUnmatched` sends every unmatched tool call through `session/request_permission`. |
 | `MUSE_COMMAND_TIMEOUT_MS` | method-specific | Override the host admission-ack deadline, in milliseconds. |
+| `MUSE_REVIEW_TIMEOUT_MS` | `90000` | Auto-review deadline: a reviewer turn that never finishes is denied after this long, 100–600000 ms. Follows Codex's 90-second guardian review timeout. |
 | `MUSE_SHUTDOWN_TIMEOUT_MS` | `8000` | Shutdown deadline, 100–60000 ms. |
 | `MUSE_TOOL_OUTPUT_LIMIT` | `8000` | Editor-facing tool output bound, in characters (minimum 200). |
 | `MUSE_LOG` | `normal` | Set to `debug` for per-method protocol tracing (no payloads). |

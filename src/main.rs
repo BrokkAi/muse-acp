@@ -2942,7 +2942,34 @@ fn main() {
     let mut restart_budget = RestartBudget::new();
     let mut read_only_budget = RestartBudget::new();
 
-    for msg in rx {
+    loop {
+        // A pending review deadline must wake the loop even when no host or
+        // editor message arrives; otherwise a hung reviewer turn would stall
+        // the approval indefinitely.
+        let msg = {
+            let deadline = REVIEW_STATE
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .deadline;
+            match deadline {
+                Some(deadline) => match rx
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                {
+                    Ok(msg) => msg,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if let Some(host) = host.as_ref() {
+                            expire_review_deadline(host, &stdout, &sessions);
+                        }
+                        continue;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                },
+                None => match rx.recv() {
+                    Ok(msg) => msg,
+                    Err(_) => break,
+                },
+            }
+        };
         if shutdown::expiring() {
             shutdown::settle(&stdout, "adapter shutdown deadline expired");
             if let Some(host) = host.as_ref() {
@@ -3110,11 +3137,11 @@ fn main() {
                         "Muse exited before it confirmed the deletion. List sessions to see whether it was removed.",
                     );
                     hosts.clear_reviewer();
-                    let job = REVIEW_STATE
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .active
-                        .take();
+                    let job = {
+                        let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+                        st.deadline = None;
+                        st.active.take()
+                    };
                     if let Some(job) = job {
                         deny_review_job(
                             &hosts,
@@ -7292,6 +7319,9 @@ struct ReviewState {
     text: String,
     /// Reviewer turn id, so stale events cannot settle a later review.
     turn: String,
+    /// When the active review expires: a reviewer turn that never ends must
+    /// not stall approvals indefinitely.
+    deadline: Option<std::time::Instant>,
 }
 
 static REVIEW_STATE: LazyLock<Mutex<ReviewState>> =
@@ -7505,6 +7535,7 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
             st.active = Some(job);
             st.text.clear();
             st.turn = turn;
+            st.deadline = Some(std::time::Instant::now() + reviewer::review_timeout());
         }
         Err(error) => {
             deny_review_job(
@@ -7633,6 +7664,36 @@ fn finish_review(
     start_next_review(host, stdout, sessions);
 }
 
+/// Deny the active review once its deadline passes: the reviewer turn never
+/// ended, so take the review, log the timeout, deny with a
+/// reviewer-unavailable rationale, reset the reviewer session, and start the
+/// next queued review. A turn that completed first already took the active
+/// review, leaving nothing to expire.
+fn expire_review_deadline(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions) {
+    let job = {
+        let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        match st.deadline {
+            Some(deadline) if std::time::Instant::now() >= deadline && st.active.is_some() => {
+                st.deadline = None;
+                st.active.take()
+            }
+            _ => None,
+        }
+    };
+    if let Some(job) = job {
+        log(&format!("auto-review timed out for {}", job.approval_id));
+        deny_review_job(
+            host,
+            stdout,
+            sessions,
+            job,
+            "reviewer unavailable: permission approval review timed out",
+        );
+        reset_reviewer_host(host);
+        start_next_review(host, stdout, sessions);
+    }
+}
+
 /// Route reviewer-session events. Returns true when the event belonged to the
 /// reviewer and must not reach the user-session handlers.
 fn handle_review_event(
@@ -7684,6 +7745,7 @@ fn handle_review_event(
                 if !st.turn.is_empty() && !turn.is_empty() && st.turn != turn {
                     return true;
                 }
+                st.deadline = None;
                 (st.active.take(), std::mem::take(&mut st.text))
             };
             if let Some(job) = job {

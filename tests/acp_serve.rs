@@ -1552,6 +1552,100 @@ fn auto_review_denies_on_unusable_reviewer_output() {
 }
 
 #[test]
+fn auto_review_denies_when_the_reviewer_hangs() {
+    let mut c = Client::spawn(
+        "approval_hang",
+        &[
+            ("FAKE_REVIEW_HANG", "1"),
+            ("MUSE_REVIEW_TIMEOUT_MS", "1000"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "do the thing");
+    c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
+    c.wait_stderr("auto-review timed out", Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("session/request_permission"),
+        "a timed-out review must not prompt: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn auto_review_times_out_queued_reviews_in_order() {
+    let mut c = Client::spawn(
+        "approval_queue",
+        &[
+            ("FAKE_REVIEW_HANG", "1"),
+            ("MUSE_REVIEW_TIMEOUT_MS", "1000"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "do the thing");
+    // Both queued approvals hang past the deadline and are denied in order.
+    c.wait_input(
+        "\"approvalId\": \"approval-second\"",
+        Duration::from_secs(20),
+    );
+    c.wait_stderr("auto-review timed out", Duration::from_secs(20));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    let first: Vec<&str> = input
+        .lines()
+        .filter(|line| line.contains("\"approvalId\": \"ap-1\""))
+        .collect();
+    let second: Vec<&str> = input
+        .lines()
+        .filter(|line| line.contains("\"approvalId\": \"approval-second\""))
+        .collect();
+    assert_eq!(first.len(), 1, "one decision per hung review: {input}");
+    assert_eq!(second.len(), 1, "one decision per hung review: {input}");
+    let first = input.lines().position(|line| line == first[0]).unwrap();
+    let second = input.lines().position(|line| line == second[0]).unwrap();
+    assert!(
+        second > first,
+        "the queued review decides after the first timeout: {input}"
+    );
+    for (approval, at) in [("ap-1", first), ("approval-second", second)] {
+        let line = input.lines().nth(at).unwrap();
+        assert!(
+            line.contains("\"choiceId\": \"c-deny\""),
+            "timed-out {approval} is denied: {line}"
+        );
+    }
+    let timeouts = std::fs::read_to_string(&c.stderr_log)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("auto-review timed out"))
+        .count();
+    assert_eq!(timeouts, 2, "one timeout per hung review");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("session/request_permission"),
+        "timed-out reviews must not prompt: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
 fn eligible_rejection_collects_optional_feedback_in_both_protocol_versions() {
     for (ver, caps) in [
         (1, ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}"),

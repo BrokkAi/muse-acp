@@ -2049,6 +2049,11 @@ def main():
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
                 if REVIEW_HOST and method == "turn/start":
+                    if os.environ.get("FAKE_REVIEW_HANG"):
+                        # The review turn never answers: no item events and
+                        # no turn/completed, so the adapter must time out
+                        # the review and deny the approval.
+                        continue
                     text = os.environ.get(
                         "FAKE_REVIEW_TEXT",
                         '{"outcome":"allow","rationale":"routine action"}')

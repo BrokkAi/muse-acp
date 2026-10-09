@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Deny a hung auto-review past a deadline. A reviewer turn that never ends no
+  longer stalls the approval indefinitely: after 90 seconds (Codex's guardian
+  review timeout, overridable with `MUSE_REVIEW_TIMEOUT_MS`) the adapter logs
+  the timeout, denies with a reviewer-unavailable rationale, resets the
+  reviewer session, and starts the next queued review.
+
 - Name reminder-child cards after their agent. A `reminderChild` item used to
   render as a generic card showing only "Reminder child session", so parallel
   reminders were indistinguishable. The card title now names the reminder
