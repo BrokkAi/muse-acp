@@ -9,7 +9,7 @@ access, and useful in real editor workflows.
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
-Reference snapshots used for this revision:** Muse SDK `537cc8d`
+- **Reference snapshots used for this revision:** Muse SDK `537cc8d`
   (2026-10-08; stable schema version 1, manifest fingerprint
   `sha256:7c94f153c41659cb3f1bd3c3e04438be254644cb2a97d65d48edc7449b74858a`,
   identical to the live-validated 1.4.4 host surface)
@@ -160,7 +160,7 @@ The Rust adapter should consume those artifacts as conformance inputs.
 
 Status: **emissions validated and permission paths replayed.**
 `tests/protocol/` pins SDK revision `537cc8d` (stable manifest, JSON schema
-bundle, 51 golden transcripts) with provenance and license.
+bundle, 51 golden transcripts) with provenance and license. CI now replays
 every server-side item event through the notification fold (unknown kinds must
 tolerate), validates every emitted ACP frame with the adapter's own parser,
 fails if the vendored manifest fingerprint drifts from the compatibility

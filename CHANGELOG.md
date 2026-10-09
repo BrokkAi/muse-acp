@@ -7,7 +7,9 @@
   `muse schema` export is identical to the vendored bundle, so startup logs
   `status=tested` instead of `status=unknown`. `session/delete` stays
   removed; the version-gated features are unchanged (no delete from 1.4.3
-  on, workspace roots and host-computed cost stay on).
+  on, workspace roots and host-computed cost stay on). The live-host suite
+  now runs against 1.4.4 on Linux, and the newest macOS arm64 pin moves to
+  1.4.4.
 - Re-pin the vendored Muse SDK conformance corpus to `537cc8d`. It publishes
   the Muse 1.4.4 stable surface, adds the `userinput-interrupt-round-trip`
   transcript (51 scenarios), and drops `session/delete` and
