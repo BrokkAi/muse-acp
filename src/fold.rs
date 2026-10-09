@@ -690,6 +690,63 @@ impl SessionFold {
                 );
                 (title, content, meta)
             }
+            "reminderChild" => {
+                let agent = str_field("reminderAgentId");
+                let task = str_field("taskId");
+                let child = str_field("childSessionId");
+                let log = str_field("childSessionLogPath");
+                let generation = item.get("generationId").and_then(|v| v.as_u64());
+                let fallback = str_field("fallbackText");
+                let title = match (!agent.is_empty(), !task.is_empty(), generation) {
+                    (true, _, Some(num)) => format!("Reminder from {agent} #{num}"),
+                    (true, _, None) => format!("Reminder from {agent}"),
+                    (false, true, Some(num)) => format!("Reminder {task} #{num}"),
+                    (false, true, None) => format!("Reminder {task}"),
+                    _ if !fallback.is_empty() => fallback.to_string(),
+                    _ if generation.is_some() || !child.is_empty() || !log.is_empty() => {
+                        fallback_card_title(kind)
+                    }
+                    _ => String::new(),
+                };
+                let mut lines = Vec::new();
+                // The legacy generic placeholder carries no signal once the
+                // title names the agent or task; any other distinct summary
+                // is kept as the first content line.
+                if !fallback.is_empty() && fallback != title && fallback != "Reminder child session"
+                {
+                    lines.push(fallback.to_string());
+                }
+                if !task.is_empty() {
+                    lines.push(format!("task: {task}"));
+                }
+                if !child.is_empty() {
+                    lines.push(format!("child session: {child}"));
+                }
+                if !log.is_empty() {
+                    lines.push(format!("log: {log}"));
+                }
+                let content = (!lines.is_empty()).then(|| lines.join("\n"));
+                let meta = meta_obj(
+                    "reminderChild",
+                    vec![
+                        (
+                            "reminderAgentId",
+                            item.get("reminderAgentId").unwrap_or(&J::Null),
+                        ),
+                        ("generationId", item.get("generationId").unwrap_or(&J::Null)),
+                        ("taskId", item.get("taskId").unwrap_or(&J::Null)),
+                        (
+                            "childSessionId",
+                            item.get("childSessionId").unwrap_or(&J::Null),
+                        ),
+                        (
+                            "childSessionLogPath",
+                            item.get("childSessionLogPath").unwrap_or(&J::Null),
+                        ),
+                    ],
+                );
+                (title, content, meta)
+            }
             _ => {
                 // Unknown future kinds: the schema says a one-line summary
                 // SHOULD ride `fallbackText`; without it there is nothing
@@ -2093,6 +2150,27 @@ mod corpus_tests {
             out.iter()
                 .any(|line| line.contains("\"toolCallId\"") && line.contains("\"completed\"")),
             "the reminder-child card settles to completed: {out:?}"
+        );
+    }
+
+    #[test]
+    fn reminder_child_card_names_the_agent_and_generation() {
+        let mut fold = SessionFold::new();
+        let started = parse_json(
+            r#"{"itemId":"r2","kind":"reminderChild","status":"in_progress","fallbackText":"Reminder child session","reminderAgentId":"agent-7","generationId":3,"taskId":"t-123","childSessionId":"sess-abc","childSessionLogPath":"child.log"}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 1, &started, &mut out);
+        assert!(
+            out.iter()
+                .any(|line| line.contains("Reminder from agent-7 #3")),
+            "the card names the agent and generation: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|line| line.contains("t-123") && line.contains("sess-abc")),
+            "the card surfaces the task and child session: {out:?}"
         );
     }
 

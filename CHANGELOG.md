@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Name reminder-child cards after their agent. A `reminderChild` item used to
+  render as a generic card showing only "Reminder child session", so parallel
+  reminders were indistinguishable. The card title now names the reminder
+  agent and generation, falling back to the task id and then the server
+  summary as before, with the task, child session, and log path in the card
+  body.
 - Support exact-turn steering on ACP v1. `_session/steering` now works on both
   protocol versions: the v1 `initialize` response advertises
   `steering.supported`, v1 connections are accepted instead of failing with
