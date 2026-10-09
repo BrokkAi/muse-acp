@@ -11,6 +11,10 @@
   already used and the MSP schema requires. The fake MSP host now rejects a
   `turn/start` without `input`, and the live-host suite covers the adapter's
   own reviewer against a real `muse serve`.
+- Document that Auto-review requires Muse 1.4.2 or newer. On Muse 1.3.0 and
+  1.4.1 the reviewer host's own background reminder checks hold the review
+  turn open, so the review times out and denies; the live-host reviewer test
+  now skips those pins instead of failing on a host-side limitation.
 - Consume `turn/foregroundCompleted` instead of falling through to the
   unhandled-notification diagnostic. Muse's newer hosts emit it when a turn's
   foreground work is done but named background reminder checks still hold the

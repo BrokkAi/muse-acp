@@ -1099,7 +1099,8 @@ fn a_saved_auto_review_profile_still_sends_approvals_to_the_editor() {
 
 #[test]
 fn auto_review_decides_a_shell_approval_against_a_real_host() {
-    if !enabled("auto_review_decides_a_shell_approval_against_a_real_host") {
+    let test = "auto_review_decides_a_shell_approval_against_a_real_host";
+    if !enabled(test) {
         return;
     }
     // The reviewer host runs a real `muse serve` too, so its turn must use the
@@ -1108,7 +1109,15 @@ fn auto_review_decides_a_shell_approval_against_a_real_host() {
     let allow = json!({"text":
         "{\"risk_level\":\"low\",\"user_authorization\":\"high\",\"outcome\":\"allow\",\"rationale\":\"Routine workspace command.\"}"});
     let host = Host::start(json!({"shell": shell_step(), "review": allow}), None);
-    let mut adapter = Adapter::launch(&host);
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    // Through Muse 1.4.1 the reviewer host's own background reminder checks
+    // hold the review turn open, so it never completes and every review times
+    // out and denies. 1.4.2 settles the turn, and Auto-review is documented as
+    // requiring 1.4.2 or newer.
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 2), test) else {
+        return;
+    };
     let session = adapter.new_session(&host, json!([]));
     let set = adapter.request(
         "session/set_config_option",

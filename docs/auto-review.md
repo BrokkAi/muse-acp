@@ -66,6 +66,11 @@ later approvals.
 
 ## Limits
 
+- **Muse 1.4.2 or newer.** On Muse 1.3.0 and 1.4.1 the reviewer host's own
+  background reminder checks hold the review turn open, so the review never
+  finishes and the approval is denied when the review timeout expires.
+  Auto-review is off by default, so this only affects sessions that select
+  it.
 - The reviewer is a model; it can make mistakes. The sandbox, approval mode,
   and host policy remain the enforcement layer.
 - Reviews cost an extra model call per permission request.

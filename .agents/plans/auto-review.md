@@ -136,6 +136,17 @@ headline capability.
   `auto_review_decides_a_shell_approval_against_a_real_host` with
   `auto-review deny …: reviewer turn failed: Invalid params: invalid
   turn/start params: missing field \`input\``.
+- Observation: Auto-review is only usable from Muse 1.4.2. On the pinned
+  1.3.0 and 1.4.1 builds the reviewer host accepts the review turn, the
+  model answers, but the host emits no item or turn terminal: the reviewer
+  session's own background reminder checks hold the turn open. The review
+  then expires on the 90 s deadline and denies the approval. The 1.4.2,
+  1.4.3, and 1.4.4 pins settle the turn and decide normally. The live-host
+  reviewer test now gates on 1.4.2 with `require_release`, and
+  `docs/auto-review.md` records the minimum. Raw MSP captures for 1.3.0
+  (a stdin/stdout logging shim around the pinned binary) show
+  `turn/start` accepted with no `item/*`, `turn/*`, or `approval/*` event
+  until the host shuts down 60 s later.
 
 ## Decision Log
 
