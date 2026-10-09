@@ -6,6 +6,29 @@
 //! evidence, and the exact approval request. It answers with strict JSON:
 //! `{"outcome":"allow"|"deny","risk_level":...,"user_authorization":...,"rationale":...}`.
 
+use std::time::Duration;
+
+/// Bound a hung reviewer turn, following Codex's guardian review timeout:
+/// Codex allows each review `REVIEW_TIMEOUT` before timing out the approval.
+pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(90);
+
+/// Resolve a review timeout from an optional environment override
+/// (`MUSE_REVIEW_TIMEOUT_MS`, milliseconds) and the Codex default.
+pub fn resolve_review_timeout(env_override: Option<&str>) -> Duration {
+    if let Some(raw) = env_override
+        && let Ok(ms) = raw.trim().parse::<u64>()
+        && (100..=600_000).contains(&ms)
+    {
+        return Duration::from_millis(ms);
+    }
+    REVIEW_TIMEOUT
+}
+
+/// The active review deadline, honoring the test override.
+pub fn review_timeout() -> Duration {
+    resolve_review_timeout(std::env::var("MUSE_REVIEW_TIMEOUT_MS").ok().as_deref())
+}
+
 pub const REVIEW_POLICY: &str = r#"You are judging one planned coding-agent action.
 Assess the exact action's intrinsic risk and whether the user's instructions
 authorize its target and side effects. Derive the outcome from the risk, the
@@ -238,5 +261,17 @@ mod tests {
             rationale: String::new(),
         };
         assert_eq!(effective_outcome(&high_authorized), Outcome::Allow);
+    }
+
+    #[test]
+    fn review_timeout_defaults_to_the_codex_timeout() {
+        assert_eq!(REVIEW_TIMEOUT, Duration::from_secs(90));
+        assert_eq!(resolve_review_timeout(None), REVIEW_TIMEOUT);
+        assert_eq!(resolve_review_timeout(Some("1000")), Duration::from_secs(1));
+        // Absurd and unparsable overrides fall back instead of hanging
+        // reviews nearly forever or expiring them immediately.
+        assert_eq!(resolve_review_timeout(Some("bogus")), REVIEW_TIMEOUT);
+        assert_eq!(resolve_review_timeout(Some("10")), REVIEW_TIMEOUT);
+        assert_eq!(resolve_review_timeout(Some("99999999")), REVIEW_TIMEOUT);
     }
 }

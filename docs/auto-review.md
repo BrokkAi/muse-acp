@@ -46,6 +46,11 @@ medium or high authorization; low and medium allow.
   rationale as feedback when the host accepts feedback.
 - Reviewer failure or unusable output: deny. The action does not run, and the
   reason is logged.
+- Reviewer timeout: a review whose turn never ends is denied after 90 seconds
+  (Codex's guardian review timeout, overridable with `MUSE_REVIEW_TIMEOUT_MS`).
+  The adapter logs the timeout, denies with a
+  reviewer-unavailable rationale, resets the reviewer session, and starts the
+  next queued review.
 
 Every decision is logged to the adapter's stderr:
 
