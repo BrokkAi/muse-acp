@@ -311,8 +311,8 @@ error the editor shows if Muse then refuses the profile says why.
   listing filters can prove the absence (1.4.2); without them the refusal is
   reported.
 - **Turns** — streamed text and tool updates, queued concurrent prompts,
-  cancellation with a terminal event, and exact-turn steering over the ACP v2
-  `_session/steering` extension.
+  cancellation with a terminal event, and exact-turn steering over the
+  `_session/steering` extension (ACP v1 and v2).
 - **Approvals** — Muse approval requests surfaced as
   `session/request_permission`, with a deny-safe fallback, plus optional
   [Auto-review](#auto-review-keep-the-boundary-lose-the-busywork) for
@@ -374,10 +374,10 @@ error the editor shows if Muse then refuses the profile says why.
 Beyond core ACP, the adapter negotiates these extensions. Each activates
 only when the client opts in too, with the documented fallback otherwise:
 
-- `_session/steering` (ACP v2 only) — exact-turn steering; rejected with
-  `-32601` on v1. Follows the ecosystem `_session/steering` convention
-  (`steering.supported`); the standards-track `session/inject` proposal is
-  still unmerged — adopting it is future work.
+- `_session/steering` — exact-turn steering on ACP v1 and v2. Follows the
+  ecosystem `_session/steering` convention (`steering.supported`); the
+  standards-track `session/inject` proposal is still unmerged — adopting it is
+  future work.
 - `_session/readOutput` — opt-in reads of host-stored tool output.
 - `_session/userShell` — shell commands outside any turn; needs editor
   opt-in, AIR `asyncTasks`, and a host grant all together.
@@ -480,7 +480,7 @@ messages:
 | `model/list`, `session/setModel`, `session/setApprovalMode`, `session/setReasoningEffort` | `configOptions` selectors and `session/set_config_option` |
 | `skill/list`, `skill/changed` | `available_commands_update` |
 | `session/contextUsage`, `session/tokenUsage` | `usage_update` |
-| `turn/steer` | `_session/steering` (ACP v2) |
+| `turn/steer` | `_session/steering` (ACP v1 and v2) |
 | Forks, subagents, async tasks, user shell, stored output | negotiated ACP extensions |
 
 Muse's stable schema is the authority for MSP shapes (`muse schema

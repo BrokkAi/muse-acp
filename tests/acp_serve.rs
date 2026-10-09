@@ -379,7 +379,8 @@ impl Client {
                 frame.contains("\"agentCapabilities\"")
                     && frame.contains("\"agentInfo\"")
                     && frame.contains("\"mcpCapabilities\":{")
-                    && frame.contains("\"sessionCapabilities\":"),
+                    && frame.contains("\"sessionCapabilities\":")
+                    && frame.contains("\"steering\":{\"supported\":true}"),
                 "invalid v1 initialize shape: {frame}"
             );
         } else {
@@ -4496,18 +4497,40 @@ fn steering_targets_a_turn_rehydrated_by_resume() {
 }
 
 #[test]
-fn steering_is_rejected_for_v1_connections() {
+fn steering_injects_on_v1_connections() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(1, "");
+    let _prompt_id = c.prompt(&sid, "start");
+    // The v1 prompt echo arrives only after the turn is admitted, so seeing it
+    // means the running turn is registered for steering.
+    c.wait_for("\"user_message_chunk\"", Duration::from_secs(15));
+
     let steer_id = c.req(
         "_session/steering",
-        &format!("{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"no\"}}]}}"),
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"change direction\"}}]}}"
+        ),
     );
     let response = c.wait_for(&format!("\"id\":{steer_id}"), Duration::from_secs(15));
+    assert!(response.contains("\"outcome\":\"injected\""), "{response}");
+    c.wait_log("turn/steer", Duration::from_secs(15));
+    c.wait_input("\"expectedTurnId\": \"turn-1\"", Duration::from_secs(15));
+
+    // v1 echoes the steered input as user-message chunks and never emits the
+    // v2-only user_message or state_update session updates.
+    let echo = c.wait_for("change direction", Duration::from_secs(15));
     assert!(
-        response.contains("\"code\":-32601"),
-        "v1 steering must be unavailable: {response}"
+        echo.contains("\"sessionUpdate\":\"user_message_chunk\""),
+        "v1 steering must echo as a user message chunk: {echo}"
     );
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+    assert!(
+        !frames
+            .iter()
+            .any(|f| f.contains("\"sessionUpdate\":\"state_update\"")),
+        "v1 must not receive a state_update"
+    );
+    drop(frames);
     c.finish();
 }
 
