@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.11.0
 
 - Deny a hung auto-review past a deadline. A reviewer turn that never ends no
   longer stalls the approval indefinitely: after 90 seconds (Codex's guardian
