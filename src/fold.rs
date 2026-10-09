@@ -171,10 +171,16 @@ pub struct SessionFold {
     /// item/updated + item/completed deliveries.
     async_task_states: HashMap<String, String>,
     /// Card ids for `reminderChild` items, keyed by reminder agent (or by host
-    /// item id when the item carries no agent). The host mints a new item for
+    /// item id when the item carries no agent). Only used when reminder cards
+    /// are opted in with `MUSE_SHOW_REMINDERS`: the host mints a new item for
     /// every reminder generation and cancels the previous one, so one card per
     /// agent stops the transcript from growing a row per re-check.
     reminder_cards: HashMap<String, String>,
+    /// Opt-in transcript cards for background reminder checks
+    /// (`MUSE_SHOW_REMINDERS`). Off by default: reminders hold the turn open
+    /// but carry no editor-facing content, so they stay out of the transcript
+    /// and only their agent ids reach the stderr diagnostics.
+    pub show_reminders: bool,
 }
 
 /// One child of a running workflow, as the latest workflow item reported it.
@@ -210,6 +216,7 @@ impl SessionFold {
             async_task_msp_ids: HashMap::new(),
             async_task_states: HashMap::new(),
             reminder_cards: HashMap::new(),
+            show_reminders: false,
         }
     }
 
@@ -1504,7 +1511,15 @@ impl SessionFold {
                 }
             }
             "reminderChild" => {
-                self.reminder_child_card(acp_sid, ver, &item_id, item, status, false, out);
+                if self.show_reminders {
+                    self.reminder_child_card(acp_sid, ver, &item_id, item, status, false, out);
+                } else {
+                    // Silent by default: background reminder checks hold the
+                    // turn open but carry no editor-facing content, so they
+                    // never reach the transcript. The blocking agent ids are
+                    // still logged with turn/foregroundCompleted.
+                    self.items.entry(item_id).or_insert(ItemRole::Ignored);
+                }
             }
             _ => {
                 let (title, content, meta) = Self::host_card_parts(kind, item);
@@ -1808,7 +1823,14 @@ impl SessionFold {
                 self.items.remove(&item_id);
             }
             "reminderChild" => {
-                self.reminder_child_card(acp_sid, ver, &item_id, item, status, true, out);
+                if self.show_reminders {
+                    self.reminder_child_card(acp_sid, ver, &item_id, item, status, true, out);
+                } else {
+                    // Silent by default (see the snapshot arm): release any
+                    // role so a terminal frame cannot strand a card that was
+                    // never announced.
+                    self.items.remove(&item_id);
+                }
             }
             _ => {
                 // An unknown future kind. If a card was announced at start (it
@@ -2243,92 +2265,51 @@ mod corpus_tests {
     }
 
     #[test]
-    fn an_announced_reminder_child_settles_even_without_a_terminal_title() {
+    fn reminder_child_start_emits_nothing() {
+        // Background reminder checks hold the turn open but carry no
+        // editor-facing content: the host shows nothing per agent, so the
+        // adapter emits no card at start and none at terminal.
         let mut fold = SessionFold::new();
-
-        // The card is announced at start with a title.
         let started = parse_json(
             r#"{"itemId":"r1","kind":"reminderChild","status":"in_progress","fallbackText":"Reminder child session"}"#,
         )
         .unwrap();
         let mut out = Vec::new();
         fold.on_item_snapshot("sid", 1, &started, &mut out);
-        assert!(
-            out.iter()
-                .any(|line| line.contains("Reminder child session")),
-            "the start announces the card: {out:?}"
-        );
+        assert!(out.is_empty(), "reminder start stays silent: {out:?}");
 
-        // The terminal snapshot carries no title, yet the card must settle
-        // instead of staying in_progress (#1007).
         let completed =
             parse_json(r#"{"item":{"itemId":"r1","kind":"reminderChild","status":"completed"}}"#)
                 .unwrap();
         let mut out = Vec::new();
         fold.on_item_completed("sid", 1, &completed, &mut out);
-        assert!(
-            out.iter()
-                .any(|line| line.contains("\"toolCallId\"") && line.contains("\"completed\"")),
-            "the reminder-child card settles to completed: {out:?}"
-        );
+        assert!(out.is_empty(), "reminder terminal stays silent: {out:?}");
     }
 
     #[test]
-    fn reminder_child_card_names_the_agent_and_generation() {
+    fn reminder_child_with_agent_and_generation_emits_nothing() {
         let mut fold = SessionFold::new();
         let started = parse_json(
-            r#"{"itemId":"r2","kind":"reminderChild","status":"in_progress","fallbackText":"Reminder child session","reminderAgentId":"agent-7","generationId":3,"taskId":"t-123","childSessionId":"sess-abc","childSessionLogPath":"child.log"}"#,
+            r#"{"itemId":"r2","kind":"reminderChild","status":"in_progress","fallbackText":"Reminder child session","reminderAgentId":"skill-reminder","generationId":3,"taskId":"t-123","childSessionId":"sess-abc","childSessionLogPath":"child.log"}"#,
         )
         .unwrap();
         let mut out = Vec::new();
         fold.on_item_snapshot("sid", 1, &started, &mut out);
-        assert!(
-            out.iter()
-                .any(|line| line.contains("Reminder from agent-7")),
-            "the card names the agent: {out:?}"
-        );
-        assert!(
-            !out.iter().any(|line| line.contains("#3")),
-            "the generation stays out of the title: {out:?}"
-        );
-        assert!(
-            out.iter().any(|line| line.contains("generation: 3")
-                && line.contains("t-123")
-                && line.contains("sess-abc")),
-            "the card surfaces the generation, task, and child session: {out:?}"
-        );
-    }
+        assert!(out.is_empty(), "named reminder start stays silent: {out:?}");
 
-    #[test]
-    fn a_new_reminder_generation_updates_the_agents_card() {
-        let mut fold = SessionFold::new();
+        // A superseded generation is host churn, not an editor-facing
+        // outcome, so it stays silent too.
+        let cancelled = parse_json(
+            r#"{"item":{"itemId":"r2","kind":"reminderChild","status":"cancelled","reminderAgentId":"skill-reminder","generationId":3}}"#,
+        )
+        .unwrap();
         let mut out = Vec::new();
-        for (item, generation) in [("r2", 3u64), ("r3", 4)] {
-            let started = parse_json(&format!(
-                r#"{{"itemId":"{item}","kind":"reminderChild","status":"in_progress","reminderAgentId":"agent-7","generationId":{generation}}}"#
-            ))
-            .unwrap();
-            fold.on_item_snapshot("sid", 1, &started, &mut out);
-        }
-        assert_eq!(out.len(), 2, "one frame per generation: {out:?}");
-        assert!(
-            out[0].contains(r#""sessionUpdate":"tool_call""#)
-                && out[0].contains(r#""toolCallId":"reminder-r2""#),
-            "the first generation creates the card: {out:?}"
-        );
-        assert!(
-            out[1].contains(r#""sessionUpdate":"tool_call_update""#)
-                && out[1].contains(r#""toolCallId":"reminder-r2""#),
-            "the next generation updates the same card instead of adding a row: {out:?}"
-        );
-        assert!(
-            out[1].contains("generation: 4"),
-            "the update carries the new generation: {out:?}"
-        );
+        fold.on_item_completed("sid", 1, &cancelled, &mut out);
+        assert!(out.is_empty(), "superseded reminder stays silent: {out:?}");
     }
 
     #[test]
-    fn parallel_reminder_agents_keep_distinct_cards() {
+    fn parallel_reminder_agents_emit_nothing() {
         let mut fold = SessionFold::new();
         let mut out = Vec::new();
         for (item, agent) in [("r2", "skill-reminder"), ("r3", "todo-reminder")] {
@@ -2338,42 +2319,29 @@ mod corpus_tests {
             .unwrap();
             fold.on_item_snapshot("sid", 1, &started, &mut out);
         }
-        assert!(out[0].contains(r#""toolCallId":"reminder-r2""#), "{out:?}");
-        assert!(out[1].contains(r#""toolCallId":"reminder-r3""#), "{out:?}");
+        assert!(out.is_empty(), "parallel reminders stay silent: {out:?}");
     }
 
     #[test]
-    fn a_superseded_reminder_generation_settles_as_completed() {
-        // The host cancels the previous check when a newer generation starts.
-        // That is churn, not an editor-facing failure (ADR 41191 D4 keeps the
-        // reminder's status word off the wire), and ACP has no `cancelled` tool
-        // status, so the card settles as completed rather than a red failure.
+    fn opted_in_reminder_cards_name_the_agent() {
+        // MUSE_SHOW_REMINDERS restores the per-agent card for debugging.
         let mut fold = SessionFold::new();
+        fold.show_reminders = true;
         let started = parse_json(
-            r#"{"itemId":"r2","kind":"reminderChild","status":"in_progress","reminderAgentId":"agent-7","generationId":3}"#,
+            r#"{"itemId":"r2","kind":"reminderChild","status":"in_progress","fallbackText":"Reminder child session","reminderAgentId":"skill-reminder","generationId":3}"#,
         )
         .unwrap();
         let mut out = Vec::new();
         fold.on_item_snapshot("sid", 1, &started, &mut out);
-        let cancelled = parse_json(
-            r#"{"item":{"itemId":"r2","kind":"reminderChild","status":"cancelled","reminderAgentId":"agent-7","generationId":3}}"#,
-        )
-        .unwrap();
-        let mut out = Vec::new();
-        fold.on_item_completed("sid", 1, &cancelled, &mut out);
         assert!(
             out.iter()
-                .any(|line| line.contains(r#""status":"completed""#)),
-            "a superseded check does not read as a failure: {out:?}"
-        );
-        assert!(
-            !out.iter().any(|line| line.contains(r#""status":"failed""#)),
-            "no invented failure: {out:?}"
+                .any(|line| line.contains("Reminder from skill-reminder")),
+            "opted-in card names the agent: {out:?}"
         );
     }
 
     #[test]
-    fn an_unannounced_titleless_item_emits_nothing() {
+    fn an_unannounced_titleless_reminder_emits_nothing() {
         // Never announced and no title: there is nothing honest to settle.
         let mut fold = SessionFold::new();
         let completed =

@@ -2134,6 +2134,7 @@ fn support_bundle() -> i32 {
         "MUSE_COMMAND_TIMEOUT_MS",
         "MUSE_TOOL_OUTPUT_LIMIT",
         "MUSE_LOG",
+        "MUSE_SHOW_REMINDERS",
     ];
     for key in safe {
         let value = std::env::var(key).unwrap_or_default();
@@ -3312,11 +3313,25 @@ fn recommended_reasoning_for(
     })
 }
 
+/// Whether background reminder checks render transcript cards. Off by default:
+/// `MUSE_SHOW_REMINDERS=1` (also `true`/`yes`/`on`, any case) opts back in.
+fn show_reminders() -> bool {
+    matches!(
+        std::env::var("MUSE_SHOW_REMINDERS")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
 /// A fresh fold configured with the connection's subagent negotiation.
 fn fresh_fold() -> SessionFold {
     let mut fold = SessionFold::new();
     fold.native_subagents = NATIVE_SUBAGENTS.load(Ordering::SeqCst) == 1;
     fold.air_async_tasks = AIR_ASYNC_TASKS.load(Ordering::SeqCst) == 1;
+    fold.show_reminders = show_reminders();
     fold
 }
 
