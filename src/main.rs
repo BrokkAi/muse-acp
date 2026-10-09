@@ -1341,7 +1341,7 @@ fn v2_init(session_mcp: bool, session_delete: bool) -> String {
 }
 
 fn v1_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__}}"#
+    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v1())
         .replace("__MCP_HTTP__", if session_mcp { "true" } else { "false" })
@@ -5514,10 +5514,6 @@ fn handle_acp(
             subagent_control(host, stdout, sessions, &id, &method, params.as_ref());
         }
         "_session/steering" => {
-            if negotiated_ver() != 2 {
-                acp::send_error(stdout, &id, -32601, "steering requires ACP v2");
-                return;
-            }
             let prompt_required = match steering_prompt_required(params.as_ref()) {
                 Ok(value) => value,
                 Err(message) => {
@@ -5678,9 +5674,15 @@ fn handle_acp(
                 });
             }
             // Acknowledge the extension before emitting the synthetic echo.
+            // v2 reports the synthetic user message and the running state; v1
+            // echoes chunks like its prompt flow and has no state update.
             acp::send_result(stdout, &id, &format!("{{\"outcome\":{}}}", esc(outcome)));
-            send_v2_user_message(stdout, &sid, &acp_content);
-            acp::send_state(stdout, &sid, "running", None);
+            if negotiated_ver() == 2 {
+                send_v2_user_message(stdout, &sid, &acp_content);
+                acp::send_state(stdout, &sid, "running", None);
+            } else {
+                send_v1_user_message(stdout, &sid, &acp_content);
+            }
         }
         "session/close" => {
             // v2 baseline: stop session work, drop local state, resolve

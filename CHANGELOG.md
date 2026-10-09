@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Support exact-turn steering on ACP v1. `_session/steering` now works on both
+  protocol versions: the v1 `initialize` response advertises
+  `steering.supported`, v1 connections are accepted instead of failing with
+  `-32601`, and the synthetic user echo uses the v1 `user_message_chunk` shape
+  without a `state_update`. Previously steering was reachable only from ACP v2
+  clients, so ACP v1 clients such as Mjolnir could not steer a Muse turn.
 - Fix Windows sessions with extra workspace roots. Muse 1.4.3 requires
   `turn/start workspaceRoots` entries in the verbatim `\\?\C:\...` canonical
   form, so the adapter keeps that form instead of stripping it back to
