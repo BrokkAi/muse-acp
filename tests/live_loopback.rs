@@ -1097,6 +1097,64 @@ fn a_saved_auto_review_profile_still_sends_approvals_to_the_editor() {
     assert_eq!(host.settings(), saved, "saved settings must not change");
 }
 
+#[test]
+fn auto_review_decides_a_shell_approval_against_a_real_host() {
+    let test = "auto_review_decides_a_shell_approval_against_a_real_host";
+    if !enabled(test) {
+        return;
+    }
+    // The reviewer host runs a real `muse serve` too, so its turn must use the
+    // same `input` shape the schema requires. The guardian marker routes this
+    // reply to the reviewer and `[[script:shell]]` to the agent.
+    let allow = json!({"text":
+        "{\"risk_level\":\"low\",\"user_authorization\":\"high\",\"outcome\":\"allow\",\"rationale\":\"Routine workspace command.\"}"});
+    let host = Host::start(json!({"shell": shell_step(), "review": allow}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    // Through Muse 1.4.1 the reviewer host's own background reminder checks
+    // hold the review turn open, so it never completes and every review times
+    // out and denies. 1.4.2 settles the turn, and Auto-review is documented as
+    // requiring 1.4.2 or newer.
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 2), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let set = adapter.request(
+        "session/set_config_option",
+        json!({"sessionId": session, "configId": "auto_review", "value": "on"}),
+    );
+    adapter.result(set);
+    let id = adapter.prompt(&session, "write it [[script:shell]]");
+    // The turn only ends once the reviewer has decided. If the reviewer host
+    // rejects the review turn, the adapter denies the approval instead.
+    let result = adapter.result(id);
+    assert_eq!(result["stopReason"], "end_turn", "{result}");
+    {
+        let output = adapter.frames.0.lock().unwrap();
+        assert!(
+            !output
+                .frames
+                .iter()
+                .any(|frame| frame["method"] == "session/request_permission"),
+            "auto-review must decide without prompting the editor: {:#?}",
+            output.frames
+        );
+    }
+    let log = std::fs::read_to_string(&adapter.log).unwrap_or_default();
+    assert!(
+        log.contains("auto-review allow"),
+        "the reviewer's decision is logged:\n{log}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(host.workspace().join("approved.txt"))
+            .ok()
+            .as_deref(),
+        Some("approved"),
+        "the reviewer-approved command ran"
+    );
+    adapter.finish();
+}
+
 /// The replies the provider sent, one per model call.
 fn replies(host: &Host) -> Vec<Value> {
     std::fs::read_to_string(host.dir.join("provider.log"))

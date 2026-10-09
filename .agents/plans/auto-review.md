@@ -121,6 +121,32 @@ headline capability.
   `FAKE_APPROVAL_PATH=workspace` now points a file-access subject at the
   active `session/start` workspace.
   Evidence: `tests/fixtures/fake_serve.py`, `fn approval_params`.
+- Observation: The shipped reviewer (`31e35c2`) sent `turn/start` with the
+  pre-`input` `prompt` field, which a real Muse 1.4.x host rejects with
+  `-32602 invalidParams: invalid turn/start params: missing field \`input\``.
+  The reviewer turn therefore always failed, and because a reviewer failure
+  denies, every approval was answered with the host's reject choice and Muse
+  reported the tool as "approval aborted" on every client. The fake host and
+  the black-box suite could not catch this: the fixture never validated
+  `turn/start` params, and `tests/live_loopback.rs` had no test for the
+  adapter's own reviewer (only for the saved `:auto-review` profile).
+  Evidence: `muse serve --provider echo` 1.4.4 rejects
+  `turn/start` with `prompt` and accepts it with `input`; the temporary
+  revert of the one-word fix fails
+  `auto_review_decides_a_shell_approval_against_a_real_host` with
+  `auto-review deny …: reviewer turn failed: Invalid params: invalid
+  turn/start params: missing field \`input\``.
+- Observation: Auto-review is only usable from Muse 1.4.2. On the pinned
+  1.3.0 and 1.4.1 builds the reviewer host accepts the review turn, the
+  model answers, but the host emits no item or turn terminal: the reviewer
+  session's own background reminder checks hold the turn open. The review
+  then expires on the 90 s deadline and denies the approval. The 1.4.2,
+  1.4.3, and 1.4.4 pins settle the turn and decide normally. The live-host
+  reviewer test now gates on 1.4.2 with `require_release`, and
+  `docs/auto-review.md` records the minimum. Raw MSP captures for 1.3.0
+  (a stdin/stdout logging shim around the pinned binary) show
+  `turn/start` accepted with no `item/*`, `turn/*`, or `approval/*` event
+  until the host shuts down 60 s later.
 
 ## Decision Log
 

@@ -27,6 +27,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   retracted    turn/retracted for the turn (no completion follows)
   retract_then_completed retract, then a late turn/completed (settle once)
   retry_then_completed turn/retryScheduled, then a normal completion
+  foreground_then_completed turn/foregroundCompleted (background checks hold
+                        the turn open), then a normal completion
   deferred_launch_error queued admission followed by a launchError terminal
   quiet        turn/start answers only; nothing follows (for close/cancel)
   subagent_control live native child; FAKE_SUBAGENT_CONTROL_STATUS selects its state
@@ -997,6 +999,17 @@ def on_turn_start(params):
         notify("item/completed", {**base, "item": {
             "itemId": "it-rt", "kind": "agentMessage",
             "status": "completed", "text": "recovered"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "foreground_then_completed":
+        # Foreground completion is non-terminal: background reminder checks
+        # still hold the turn open, so only the later completion settles.
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-fg", "kind": "agentMessage",
+            "status": "completed", "text": "foreground done"}})
+        notify("turn/foregroundCompleted", {**base,
+                                            "blockingAgents": ["agent-1", "agent-2"],
+                                            "viewCursor": "cur-fg",
+                                            "sourceRange": {"start": 0, "end": 1}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "usage":
         # A tokenUsage before any contextUsage has no used/size pair and
@@ -2014,6 +2027,19 @@ def main():
                                             "message": "Invalid params: " + problem,
                                             "data": {"kind": "invalidParams"}}})
                             continue
+                if method == "turn/start":
+                    # Mirror the real host (tdd SS3.2): `input` is required and
+                    # non-empty. Without this the fixture accepted the reviewer
+                    # host's old `prompt` shape and hid a wire bug.
+                    params = msg.get("params", {})
+                    if not isinstance(params.get("input"), list) or not params["input"]:
+                        log_input(params)
+                        send({"jsonrpc": "2.0", "id": ident,
+                              "error": {"code": -32602,
+                                        "message": "Invalid params: invalid turn/start params: missing field `input`",
+                                        "data": {"kind": "invalidParams",
+                                                 "retryable": False}}})
+                        continue
                 if method == "feedback/submit":
                     params = msg.get("params", {})
                     error = None
