@@ -5228,8 +5228,9 @@ fn host_feature_gates_follow_the_reported_muse_version() {
 #[test]
 fn session_delete_is_advertised_only_where_the_host_supports_it() {
     // ACP v1 advertises `session/delete` in agentCapabilities.
-    // sessionCapabilities; v2 in capabilities.session. It needs Muse 1.4.1+
-    // and a durable host (a memory-only host has nothing to delete).
+    // sessionCapabilities; v2 in capabilities.session. It needs Muse 1.4.1
+    // or 1.4.2 and a durable host (a memory-only host has nothing to
+    // delete); 1.4.3 dropped the method, so it stays hidden there too.
     for ver in [1u64, 2] {
         let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
         let id = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
@@ -5245,6 +5246,10 @@ fn session_delete_is_advertised_only_where_the_host_supports_it() {
         vec![
             ("FAKE_SERVER_VERSION", "1.4.2"),
             ("FAKE_SESSION_DURABILITY", "ephemeral"),
+        ],
+        vec![
+            ("FAKE_SERVER_VERSION", "1.4.3-R5018.1"),
+            ("FAKE_SESSION_DURABILITY", "durable"),
         ],
     ] {
         let mut c = Client::spawn("quiet", &env);
@@ -5613,6 +5618,60 @@ fn session_new_deduplicates_canonical_roots() {
         "the symlink resolves to the same folder and must be dropped: {roots:?}"
     );
     assert_eq!(roots[1].as_str().unwrap(), canonical_text(&real));
+    c.finish();
+}
+
+#[cfg(unix)]
+#[test]
+fn multi_root_session_canonicalizes_the_primary_cwd() {
+    // A symlinked PRIMARY cwd: #195 made the singular `workspaceRoot` the
+    // canonicalized primary root, so on POSIX the host must see the resolved
+    // path while the adapter keeps reporting the client's literal alias.
+    let primary = fresh_workspace_dir("primary-real");
+    let alias = fresh_workspace_dir("primary-alias").join("link");
+    std::os::unix::fs::symlink(&primary, &alias).expect("symlink");
+    let extra = fresh_workspace_dir("extra");
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
+    let sid = c.new_session_at(1, &alias, &[&extra]);
+    assert!(!sid.is_empty());
+    // The host-facing frames: the singular root and the ordered root set both
+    // name the resolved primary folder, never the symlink alias.
+    let starts = host_requests(&c, "session/start");
+    assert_eq!(starts.len(), 1, "{starts:?}");
+    assert_eq!(
+        starts[0]["workspaceRoot"],
+        serde_json::json!(canonical_text(&alias)),
+        "workspaceRoot must be the resolved primary root: {:?}",
+        starts[0]
+    );
+    let roots: Vec<String> = starts[0]["workspaceRoots"]
+        .as_array()
+        .expect("workspaceRoots on session/start")
+        .iter()
+        .map(|root| root.as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(
+        roots,
+        vec![canonical_text(&alias), canonical_text(&extra)],
+        "the host must see canonical roots in request order"
+    );
+    // The client-visible cwd stays the literal alias. The `session/new`
+    // result carries no cwd field, so the ACP surface that reports it is
+    // `session/list`.
+    let list_id = c.req("session/list", "{}");
+    let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
+    let listed: serde_json::Value = serde_json::from_str(&listed).expect("session/list JSON");
+    let row = listed["result"]["sessions"]
+        .as_array()
+        .expect("sessions array")
+        .iter()
+        .find(|row| row["sessionId"].as_str() == Some(sid.as_str()))
+        .expect("the new session is listed");
+    assert_eq!(
+        row["cwd"].as_str(),
+        Some(alias.to_str().unwrap()),
+        "the adapter must keep reporting the client's literal cwd: {listed}"
+    );
     c.finish();
 }
 

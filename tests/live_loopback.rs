@@ -1132,16 +1132,30 @@ fn wait_for_model_input(host: &Host, needle: &str) {
     }
 }
 
-/// The tool results Muse returned to the model, one per model call that
-/// followed a tool call.
-fn tool_results(host: &Host) -> Vec<String> {
-    std::fs::read_to_string(host.dir.join("provider.log"))
-        .unwrap_or_default()
+/// Byte length of the provider log, for scoping a later assertion to calls
+/// made after this point.
+fn provider_log_len(host: &Host) -> usize {
+    std::fs::metadata(host.dir.join("provider.log"))
+        .map(|meta| meta.len() as usize)
+        .unwrap_or(0)
+}
+
+/// The tool results Muse returned to the model after `since` bytes of the
+/// provider log, one per model call that followed a tool call.
+fn tool_results_since(host: &Host, since: usize) -> Vec<String> {
+    let log = std::fs::read(host.dir.join("provider.log")).unwrap_or_default();
+    String::from_utf8_lossy(log.get(since..).unwrap_or_default())
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
         .filter(|call| call["last"]["type"] == "function_call_output")
         .map(|call| call["last"]["output"].to_string())
         .collect()
+}
+
+/// The tool results Muse returned to the model, one per model call that
+/// followed a tool call.
+fn tool_results(host: &Host) -> Vec<String> {
+    tool_results_since(host, 0)
 }
 
 /// The adapter's `elicitation/create` form whose schema asks for `field`.
@@ -1495,11 +1509,13 @@ fn tool_output(adapter: &Adapter) -> String {
 /// Muse's refusal of a write in a read-only or plan session. Through 1.4.2
 /// the write tool is offered and denied, so the editor sees the denial;
 /// 1.4.3 no longer offers write tools at all, so the model's call comes back
-/// as an unknown tool.
-fn assert_write_refused(adapter: &Adapter, host: &Host) {
+/// as an unknown tool. Muse reports that only to the model: the editor gets
+/// no separate tool event, so the provider log is the strongest signal this
+/// test has for the 1.4.3 path.
+fn assert_write_refused(adapter: &Adapter, host: &Host, log_mark: usize) {
     let (release, _) = adapter_host_release(adapter);
     if release >= (1, 4, 3) {
-        let results = tool_results(host);
+        let results = tool_results_since(host, log_mark);
         assert!(
             results
                 .iter()
@@ -1525,9 +1541,10 @@ fn read_only_mode_blocks_writes_until_switched_back() {
     let mut adapter = Adapter::launch(&host);
     let session = adapter.new_session(&host, json!([]));
     set_mode(&mut adapter, &session, "readOnly");
+    let log_mark = provider_log_len(&host);
     adapter.turn(&session, "write it [[script:write]]");
     assert!(!notes.exists(), "a read-only session must not write");
-    assert_write_refused(&adapter, &host);
+    assert_write_refused(&adapter, &host, log_mark);
     set_mode(&mut adapter, &session, "default");
     adapter.turn(&session, "write it now [[script:write]]");
     assert_eq!(std::fs::read_to_string(&notes).unwrap(), "written\n");
@@ -1575,11 +1592,12 @@ fn plan_mode_survives_an_adapter_restart() {
     );
     let loaded = second.result(id);
     assert_eq!(loaded["modes"]["currentModeId"], "plan", "{loaded}");
+    let log_mark = provider_log_len(&host);
     second.turn(&session, "write it [[script:write]]");
     assert!(
         !host.workspace().join("notes.txt").exists(),
         "a reloaded plan session must still not write"
     );
-    assert_write_refused(&second, &host);
+    assert_write_refused(&second, &host, log_mark);
     second.finish();
 }
