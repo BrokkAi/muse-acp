@@ -761,13 +761,18 @@ impl MspHost {
             };
             terminate_child(&mut child);
             // The deadline exits the whole adapter without running Drop.
-            // Reap within our existing budget, then clean up the settings
-            // view even if the main loop is blocked writing to the editor.
+            // Reap within a fresh budget, then clean up the settings view even
+            // if the main loop is blocked writing to the editor. `terminate_child`
+            // can spend up to two seconds in `taskkill`, so re-arm the budget
+            // after it and never skip the cleanup: otherwise the reap loop sees
+            // an already-expired deadline and returns without taking
+            // `host_config`, leaking the temporary settings view.
+            let reap_until = Instant::now() + Duration::from_millis(200);
             loop {
                 match child.try_wait() {
                     Ok(Some(_)) => break,
-                    Ok(None) if Instant::now() < until => std::thread::sleep(SHUTDOWN_POLL),
-                    Ok(None) | Err(_) => return,
+                    Ok(None) if Instant::now() < reap_until => std::thread::sleep(SHUTDOWN_POLL),
+                    Ok(None) | Err(_) => break,
                 }
             }
             drop(child);
