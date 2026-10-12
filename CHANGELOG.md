@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Reconcile background tasks from the host's authoritative inventory. On
+  resume and re-attach, a Muse 1.4.6+ host with AIR async tasks negotiated is
+  asked once for `task/list`; rows the replayed history did not carry are
+  announced as stoppable async tasks keyed by the host's own task id, so the
+  item events that follow settle the same task instead of announcing a
+  duplicate, and a stop targets the host id directly. `task/background`
+  remains unsupported.
 - Support Muse side chats. The opt-in `_session/sideChat` extension (muse
   `sideChat` capability) opens a side chat from a loaded session through the
   host's `session/sideChat` and returns the new session id with its

@@ -48,6 +48,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   skill_not_found skill/list still lists `stale`; turn/start rejects it
   skill_control skill/setActivation writes and skill/import receipts
   side_chat    session/sideChat opens a side session with sideFrom provenance
+  task_list_seed task/list seeds async tasks after a resume whose history is
+               empty; the item terminal then settles the seeded task
   async_task_stop       background task then a targeted task/stop terminal
   async_task_stop_all   background tasks then task/stopAll terminals
   hook_run     a hookRun item around the turn; hook/list serves the inventory
@@ -923,6 +925,15 @@ def on_turn_start(params):
             "label": "Format on save", "runStatus": "completed",
             "reason": "formatted 2 files"}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "task_list_seed":
+        # A turn after the resume settles the seeded item-backed task; its
+        # item id is the host task id the seed announced.
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-bg-seed", "kind": "toolCall", "callId": "call-bg-seed",
+            "status": "completed", "revision": 2, "tool": "workspace-shell",
+            "args": {"command": "npm watch"}, "background": True,
+            "backgroundInitiator": "timeout"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "async_task":
         # A backgrounded toolCall plus a user-shell item: both are async work.
         notify("item/updated", {**base, "item": {
@@ -1370,6 +1381,10 @@ def result_for(method, msg):
                  "status": "completed", "turnId": None,
                  "commandText": "old command", "exitCode": 0},
             ]}
+        elif SCENARIO == "task_list_seed":
+            # The adapter must learn about running work from `task/list`;
+            # nothing in this history carries it.
+            history = {"mode": "inline", "items": [], "snapshot": None}
         elif SCENARIO in ("usage_inline", "questions_resume") and snapshot_rung:
             history = usage_snapshot_history(cumulative=(300, 60))
         else:
@@ -1751,6 +1766,23 @@ def result_for(method, msg):
             "status": "cancelled", "revision": 2, "tool": "workspace-shell",
             "args": {"command": "npm watch"}, "background": True,
             "backgroundInitiator": "user"}})
+        return {"commandId": params.get("commandId", ""),
+                "status": "accepted", "taskId": params.get("taskId", "")}
+    if method == "task/list":
+        log_input(msg.get("params", {}))
+        if SCENARIO != "task_list_seed":
+            return {"tasks": []}
+        return {"tasks": [
+            {"taskId": "it-bg-seed", "kind": "tool.workspace-shell",
+             "status": "inProgress", "tool": "workspace-shell",
+             "startedAt": "2026-10-12T10:00:00Z",
+             "backgroundInitiator": "timeout"},
+            {"taskId": "cron-1", "kind": "cron.run",
+             "status": "inProgress", "startedAt": "2026-10-12T09:00:00Z"},
+        ]}
+    if method == "task/stop" and SCENARIO == "task_list_seed":
+        params = msg.get("params", {})
+        log_input(params)
         return {"commandId": params.get("commandId", ""),
                 "status": "accepted", "taskId": params.get("taskId", "")}
     if method == "task/stopAll" and SCENARIO == "async_task_stop_all":

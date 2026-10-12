@@ -8884,6 +8884,82 @@ fn async_task_stop_is_rejected_honestly() {
 }
 
 #[test]
+fn task_list_seeds_the_async_task_inventory_after_resume() {
+    // The replayed history is empty: the host's task/list is the only source
+    // for work still running, and the seeded ids are the ones later item
+    // events and stops must keep using.
+    let mut c = Client::spawn("task_list_seed", &[("FAKE_SERVER_VERSION", "1.4.6")]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    let resume = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let resumed = c.wait_for(&format!("\"id\":{resume}"), Duration::from_secs(15));
+    assert!(resumed.contains("mspSessionId"), "{resumed}");
+    let item_row = c.wait_for("\"asyncTaskId\":\"it-bg-seed\"", Duration::from_secs(15));
+    assert!(
+        item_row.contains("async_task_spawned")
+            && item_row.contains("\"name\":\"workspace-shell\"")
+            && item_row.contains("\"taskType\":\"shell\"")
+            && item_row.contains("\"canStop\":true"),
+        "the item-backed row is announced: {item_row}"
+    );
+    let registry = c.wait_for("\"asyncTaskId\":\"cron-1\"", Duration::from_secs(15));
+    assert!(
+        registry.contains("async_task_spawned")
+            && registry.contains("\"name\":\"cron.run\"")
+            && registry.contains("\"taskType\":\"cron.run\""),
+        "the registry-only row is announced: {registry}"
+    );
+    c.wait_stderr("task/list seeded 2 async task(s)", Duration::from_secs(10));
+    c.wait_log("task/list", Duration::from_secs(10));
+
+    // Stopping a seeded task sends the host's own task id.
+    let rid = c.req(
+        "_session/async_task/stop",
+        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"cron-1\"}}"),
+    );
+    let ack = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(ack.contains("\"stopped\":true"), "stop admitted: {ack}");
+    let frames_path = format!("{}.frames", c.fake_log);
+
+    // The item's terminal settles the seeded task under its seeded id, never
+    // a second callId-keyed twin.
+    let _pid = c.prompt(&sid, "finish the task");
+    let start = std::time::Instant::now();
+    loop {
+        let frames = c.frames.lock().unwrap().clone();
+        if let Some(state) = frames.iter().find(|frame| {
+            frame.contains("async_task_state_update")
+                && frame.contains("\"asyncTaskId\":\"it-bg-seed\"")
+                && frame.contains("\"state\":\"completed\"")
+        }) {
+            assert!(!state.contains("call-bg-seed"), "{state}");
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "the seeded task never settled: {frames:?}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        !c.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame.contains("\"asyncTaskId\":\"call-bg-seed\"")),
+        "no twin task may be announced"
+    );
+    c.finish();
+    let frames = std::fs::read_to_string(frames_path).expect("fake host frames");
+    assert!(
+        frames.contains("\"method\": \"task/stop\"") && frames.contains("\"taskId\": \"cron-1\""),
+        "the seeded registry id is the stop target: {frames}"
+    );
+}
+
+#[test]
 fn async_task_stop_maps_to_msp_task_stop_and_folds_terminal_item_update() {
     let mut c = Client::spawn("async_task_stop", &[]);
     let sid = c.new_session(
