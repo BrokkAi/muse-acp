@@ -585,11 +585,11 @@ continues.
 | MSP addition | Disposition | Adapter behavior or tracking |
 | --- | --- | --- |
 | `feedback/submit` | Mapped to ACP | Backs the `/feedback` command on hosts that grant the `feedback` capability. |
-| `plugin/list` | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
-| `plugin/install` | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
-| `plugin/marketplaceAdd` | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
-| `plugin/marketplaceRemove` | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
-| `plugin/marketplaceUpdate` | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+| `plugin/list` | Mapped to ACP | Backs the opt-in `_session/plugins` extension (muse `plugins` capability), which returns the host's installed-plugin rows verbatim with no local cache. |
+| `plugin/install` | Mapped to ACP | The adapter-local `/plugin install <marketplace> <name>` and `/plugin install <path> [default\|user\|project]` slash commands map onto the marketplace and local-path arms and settle on the host ack; the hold-open request keeps a 180-second host deadline. |
+| `plugin/marketplaceAdd` | Mapped to ACP | The adapter-local `/plugin marketplace add <name> <source>` slash command adds a marketplace (`owner/repo`, git URL, `file://` URL, or host path) and settles on the host record ack. |
+| `plugin/marketplaceRemove` | Mapped to ACP | The adapter-local `/plugin marketplace remove <name>` slash command removes a marketplace and settles on the host ack. |
+| `plugin/marketplaceUpdate` | Mapped to ACP | The adapter-local `/plugin marketplace update <name>` slash command refreshes a marketplace and settles on the host record ack. |
 | `recap/request` | Mapped to ACP | The adapter-local `/recap` slash command sends the request and holds the ACP prompt open (one recap per session) until `recap/completed` settles it with the host's summary. |
 | `recap/cancel` | Mapped to ACP | `session/cancel` while a recap is in flight sends `recap/cancel` and settles the held prompt `cancelled`, so the host's 45-second timeout is never waited on. |
 | `computerUseSettings/read` | Unsupported pending protocol decision | [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
@@ -605,15 +605,15 @@ continues.
 | `media/upload` | Unsupported pending protocol decision | [#221](https://github.com/BrokkAi/muse-acp/issues/221) |
 | `session/sideChat` | Mapped to ACP | Backs the opt-in `_session/sideChat` extension (muse `sideChat` capability): the call opens a side chat from a loaded session and returns the new session id with its `sideFrom` provenance, which the client attaches with its ordinary session methods (`session/resume`/`session/load`). The side is routed to the source's host and inherits its mode. `sideFrom` — and `forkedFrom` — also ride `session_info_update._meta.muse` when the session is attached. |
 | `userInput/interrupt` | Mapped to ACP | A stop (`session/cancel`) or a decline of a staged question carrying confirmed answers settles the open prompt through `userInput/interrupt`, which hands the answers to the model and stops the turn; an unanswered prompt keeps the ordinary turn interrupt, and an unanswered decline keeps `userInput/cancel`. |
-| `plugin/changed` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
-| `plugin/marketplaceChanged` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+| `plugin/changed` | Consumed | Logged as an install-landed diagnostic; the adapter keeps no plugin cache, so clients re-read the opt-in `_session/plugins` view. |
+| `plugin/marketplaceChanged` | Consumed | Logged as a marketplace-change diagnostic; clients re-read `_session/plugins` rather than a local cache. |
 | `recap/completed` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#215](https://github.com/BrokkAi/muse-acp/issues/215) |
 | `computerUseSetup/changed` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
 | `computerUseSetup` capability | Unsupported pending protocol decision | Never requested; [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
-| `marketplaceNotFound` (-32034) | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
-| `pluginNotFound` (-32035) | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
-| `marketplaceAlreadyExists` (-32036) | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
-| `pluginMutationsDisabled` (-32037) | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+| `marketplaceNotFound` (-32034) | Mapped to ACP | Forwarded with its registry code and the host's typed data from the plugin commands and the `_session/plugins` read. |
+| `pluginNotFound` (-32035) | Mapped to ACP | Forwarded with its registry code and the host's typed data. |
+| `marketplaceAlreadyExists` (-32036) | Mapped to ACP | Forwarded with its registry code and the host's typed data. |
+| `pluginMutationsDisabled` (-32037) | Mapped to ACP | Forwarded with its registry code; the host's refusal never degrades to a generic failure. |
 
 The remaining 1.4.x field-level and vocabulary additions — the `webSearch`
 item kind, `mcpLinkError`, `TurnError.quota`, the retry/retraction detail

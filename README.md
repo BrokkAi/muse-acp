@@ -382,6 +382,11 @@ error the editor shows if Muse then refuses the profile says why.
   session id plus its `sideFrom` provenance. The side is an ordinary host
   session: attach it with `session/resume`/`session/load`, and its parent
   link arrives in `session_info_update._meta.muse.sideFrom`.
+- **Plugins** — the opt-in `_session/plugins` extension reads the session's
+  installed plugin rows (`plugin/list`), and `/plugin install <marketplace>
+  <name>` (or `/plugin install <path> [scope]`) plus `/plugin marketplace
+  add|remove|update` drive the host's install and marketplace writes. Change
+  notices are diagnostics; clients re-read the extension instead of a cache.
 - **Content** — text, inline and local-file images, `resource_link` text
   expansion, and embedded context. Audio is rejected, because Muse's input type
   is closed to `text` and `image`.
@@ -422,6 +427,7 @@ only when the client opts in too, with the documented fallback otherwise:
 - `_session/readOutput` — opt-in reads of host-stored tool output.
 - `_session/hooks` — opt-in reads of the session's installed hook handlers.
 - `_session/sideChat` — opt-in creation of a side chat from a loaded session.
+- `_session/plugins` — opt-in reads of the session's installed plugin rows.
 - `_session/userShell` — shell commands outside any turn; needs editor
   opt-in, AIR `asyncTasks`, and a host grant all together.
 - `_session/async_task/stop` — stop one background task; `session/cancel`

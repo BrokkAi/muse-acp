@@ -33,8 +33,8 @@ are emitted by the MSP host.
 | `item/delta` | Mapped to ACP | Streams supported item field appends as ACP message or tool-call updates. Unknown item fields and kinds are tolerated. |
 | `item/started` | Mapped to ACP | Opens or upserts the corresponding ACP item and starts negotiated async-task or subagent presentation where applicable. |
 | `item/updated` | Mapped to ACP | Upserts the corresponding ACP item from its higher-revision snapshot. |
-| `plugin/changed` | Intentionally ignored | Announces a change to the host's installed-plugin inventory. The adapter exposes no plugin catalog, so there is no ACP mapping; an inbound copy takes the unhandled-notification diagnostic path. |
-| `plugin/marketplaceChanged` | Intentionally ignored | Announces a change to a plugin marketplace the host knows. The adapter exposes no marketplace surface, so there is no ACP mapping; an inbound copy takes the unhandled-notification diagnostic path. |
+| `plugin/changed` | Consumed | Logs the installed row as a diagnostic. The adapter keeps no plugin cache, so a client re-reads the opt-in `_session/plugins` view after a change. |
+| `plugin/marketplaceChanged` | Consumed | Logs the marketplace and change as a diagnostic; clients re-read `_session/plugins` instead of a local cache. |
 | `recap/completed` | Mapped to ACP | The single settlement of each `recap/request` the adapter made: `completed` publishes the (title-prefixed) summary as agent text and settles the held prompt `end_turn`, `cancelled` settles it `cancelled`, and `failed`/`timedOut`/unknown outcomes surface as failures. A settlement whose correlation id matches no in-flight request is logged and ignored. |
 | `session/approvalModeChanged` | Internally tracked | Updates the selected approval-mode value used in later ACP configuration snapshots. |
 | `session/branchChanged` | Mapped to ACP | Stores the latest branch fact and emits it in `session/update` metadata together with the current goal. |

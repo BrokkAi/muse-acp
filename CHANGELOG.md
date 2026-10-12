@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Add plugin and marketplace management. The opt-in `_session/plugins`
+  extension (muse `plugins` capability) reads the session's installed plugin
+  rows through the host's `plugin/list`; `/plugin install <marketplace>
+  <name>` (or `/plugin install <path> [default|user|project]`) installs, and
+  `/plugin marketplace add <name> <source>`, `remove <name>`, and
+  `update <name>` manage marketplaces. The host's four write refusals
+  (`marketplaceNotFound`, `pluginNotFound`, `marketplaceAlreadyExists`,
+  `pluginMutationsDisabled`) keep their registry codes and typed data, and
+  `plugin/changed` / `plugin/marketplaceChanged` are consumed as diagnostics
+  with no local cache to invalidate.
 - Reconcile background tasks from the host's authoritative inventory. On
   resume and re-attach, a Muse 1.4.6+ host with AIR async tasks negotiated is
   asked once for `task/list`; rows the replayed history did not carry are

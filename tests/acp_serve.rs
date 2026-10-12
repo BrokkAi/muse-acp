@@ -8383,6 +8383,147 @@ fn output_unavailable_is_forwarded_as_typed_error() {
 /// host's `hook/list` rows verbatim; the read also seeds the fold's hook
 /// inventory.
 #[test]
+fn plugin_reads_require_opt_in_and_return_the_inventory() {
+    let mut c = Client::spawn("plugin_control", &[]);
+    let sid = c.new_session(2, "");
+    let id = c.req("_session/plugins", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32601") && frame.contains("plugins capability"),
+        "un-negotiated plugin reads must fail closed: {frame}"
+    );
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !calls.lines().any(|line| line == "plugin/list"),
+        "the refused read never reaches the host: {calls}"
+    );
+    c.finish();
+
+    let mut c = Client::spawn("plugin_control", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"plugins\"]}}}",
+    );
+    c.wait_stderr("client negotiated plugin reads", Duration::from_secs(10));
+    let id = c.req("_session/plugins", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"id\":\"threejs\"")
+            && frame.contains("\"source\":\"curated\"")
+            && frame.contains("\"enabled\":false"),
+        "the host inventory is returned verbatim: {frame}"
+    );
+    c.wait_log("plugin/list", Duration::from_secs(10));
+    c.finish();
+}
+
+#[test]
+fn plugin_commands_map_to_host_writes_and_keep_typed_errors() {
+    let mut c = Client::spawn("plugin_control", &[]);
+    let sid = c.new_session(2, "");
+    // Marketplace arm: two words, the second not a scope.
+    let pid = c.prompt(&sid, "/plugin install acme threejs");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    c.wait_input("\"marketplace\": \"acme\"", Duration::from_secs(10));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert!(input.contains("\"name\": \"threejs\""), "{input}");
+
+    // Local path arm with an explicit scope.
+    let pid = c.prompt(&sid, "/plugin install /tmp/plugin-dir project");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    c.wait_input("\"path\": \"/tmp/plugin-dir\"", Duration::from_secs(10));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert!(input.contains("\"scope\": \"project\""), "{input}");
+
+    // The marketplace verb family.
+    for (text, method, marker) in [
+        (
+            "/plugin marketplace add acme owner/repo",
+            "plugin/marketplaceAdd",
+            "\"source\": \"owner/repo\"",
+        ),
+        (
+            "/plugin marketplace remove acme",
+            "plugin/marketplaceRemove",
+            "\"name\": \"acme\"",
+        ),
+        (
+            "/plugin marketplace update acme",
+            "plugin/marketplaceUpdate",
+            "\"name\": \"acme\"",
+        ),
+    ] {
+        let pid = c.prompt(&sid, text);
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert_eq!(frame.matches("\"result\":{}").count(), 1, "{text}: {frame}");
+        c.wait_log(method, Duration::from_secs(10));
+        c.wait_input(marker, Duration::from_secs(10));
+    }
+    // The host's change notices are consumed as diagnostics, never errors.
+    let log = std::fs::read_to_string(format!("{}.frames", c.fake_log)).unwrap();
+    assert!(!log.is_empty());
+    c.wait_stderr("plugin/changed session=", Duration::from_secs(10));
+    c.wait_stderr(
+        "plugin/marketplaceChanged session=",
+        Duration::from_secs(10),
+    );
+
+    // Usage errors never reach the host.
+    let before = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    for text in [
+        "/plugin",
+        "/plugin install",
+        "/plugin install a b c",
+        "/plugin marketplace",
+        "/plugin marketplace add acme",
+        "/plugin marketplace remove",
+    ] {
+        let pid = c.prompt(&sid, text);
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"code\":-32602") && frame.contains("usage: /plugin"),
+            "{text} must fail closed: {frame}"
+        );
+    }
+    let after = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert_eq!(before, after, "usage errors never reach the host");
+
+    // Typed write refusals keep the host's data.
+    for (text, code, kind) in [
+        (
+            "/plugin marketplace remove missing",
+            -32034,
+            "marketplaceNotFound",
+        ),
+        (
+            "/plugin marketplace add taken acme/repo",
+            -32036,
+            "marketplaceAlreadyExists",
+        ),
+        (
+            "/plugin marketplace update locked",
+            -32037,
+            "pluginMutationsDisabled",
+        ),
+        (
+            "/plugin install acme missing-plugin",
+            -32035,
+            "pluginNotFound",
+        ),
+    ] {
+        let pid = c.prompt(&sid, text);
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(
+            frame.contains(&format!("\"code\":{code}")) && frame.contains(kind),
+            "{text} keeps the typed refusal: {frame}"
+        );
+    }
+    c.finish();
+}
+
+#[test]
 fn session_hook_reads_require_opt_in_and_return_the_inventory() {
     let mut c = Client::spawn("hook_run", &[]);
     let sid = c.new_session(2, "");
