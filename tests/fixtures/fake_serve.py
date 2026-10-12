@@ -49,6 +49,10 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   async_task_stop       background task then a targeted task/stop terminal
   async_task_stop_all   background tasks then task/stopAll terminals
   hook_run     a hookRun item around the turn; hook/list serves the inventory
+  recap        recap/request settles with a completed summary
+  recap_pending recap/request is accepted and never settles (for cancels)
+  recap_failed recap/request settles failed(providerFailed)
+  recap_timeout recap/request settles timedOut
   load         session/resume serves inline history (for session/load replay)
   resume_active session/resume reports a running turn (for steering reattach)
   async_resume session/resume reports running background work
@@ -1749,6 +1753,39 @@ def result_for(method, msg):
             {"key": "notify-slack", "event": "notification",
              "handlerKind": "plugin", "enabled": False},
         ]}
+    if method == "recap/request":
+        params = msg.get("params", {})
+        log_input(params)
+        settled = {
+            "recap": ("completed", "While you were away: the tests pass.",
+                      "Away recap"),
+            "recap_failed": ("failed", None, None),
+            "recap_timeout": ("timedOut", None, None),
+        }.get(SCENARIO)
+        if settled:
+            kind, text, title = settled
+            completion = {"sessionId": params.get("sessionId", MSP_SID),
+                          "commandId": params.get("commandId", ""),
+                          "outcome": kind}
+            if text is not None:
+                completion["text"] = text
+            if title is not None:
+                completion["title"] = title
+            if kind == "failed":
+                completion["reason"] = "providerFailed"
+            notify("recap/completed", completion)
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
+    if method == "recap/cancel":
+        # In flight -> the recap settles cancelled; the adapter has already
+        # settled its held prompt, so the late settlement is a no-op there.
+        params = msg.get("params", {})
+        log_input(params)
+        if SCENARIO == "recap_pending":
+            notify("recap/completed", {
+                "sessionId": params.get("sessionId", MSP_SID),
+                "commandId": params.get("commandId", ""),
+                "outcome": "cancelled"})
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
     if method == "userInput/interrupt":
         # The real host settles the open prompt with the confirmed partial
         # answers and stops its turn, all on the interrupt lane.

@@ -2692,6 +2692,19 @@ fn abandon_session_work(stdout: &StdoutShared, s: &mut AcpSession, message: &str
             .unwrap_or(permission.req_id);
         acp::send_cancel_request(stdout, &request_id);
     }
+    if let Some(recap) = s.pending_recap.take() {
+        // The host that owed `recap/completed` is gone; the held prompt must
+        // not outlive it.
+        if s.ver == 2 {
+            acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
+        } else {
+            acp::send_result(
+                stdout,
+                &Some(recap.prompt_req),
+                "{\"stopReason\":\"cancelled\"}",
+            );
+        }
+    }
     s.perm_queue.clear();
     s.active_turn = None;
     for line in s.fold.disconnect_tasks(&s.acp_sid) {
@@ -3976,6 +3989,7 @@ fn handle_acp(
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
                             pending_feedback: None,
+                            pending_recap: None,
                             mode_value: acp::mode_from_msp(&cur_mode).to_string(),
                             auto_review: false,
                             review_context: std::collections::VecDeque::new(),
@@ -4332,6 +4346,7 @@ fn handle_acp(
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
                             pending_feedback: None,
+                            pending_recap: None,
                             mode_value: "promptUnmatched".to_string(),
                             auto_review: false,
                             review_context: std::collections::VecDeque::new(),
@@ -4887,6 +4902,7 @@ fn handle_acp(
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
                             pending_feedback: None,
+                            pending_recap: None,
                             mode_value: mode_value.clone(),
                             auto_review: false,
                             review_context: std::collections::VecDeque::new(),
@@ -5156,6 +5172,25 @@ fn handle_acp(
                     && (argument.is_empty() || argument.starts_with(char::is_whitespace))
                 {
                     start_feedback(
+                        host,
+                        stdout,
+                        sessions,
+                        &sid,
+                        ver,
+                        id.clone(),
+                        &acp_content,
+                        argument.trim(),
+                    );
+                    return;
+                }
+                // `/recap` is adapter-local: the host produces the summary
+                // on its own side-call, and the prompt stays open until
+                // `recap/completed` settles it (or the user stops).
+                if let Ok(text) = &line
+                    && let Some(argument) = text.strip_prefix("/recap")
+                    && (argument.is_empty() || argument.starts_with(char::is_whitespace))
+                {
+                    start_recap(
                         host,
                         stdout,
                         sessions,
@@ -6078,6 +6113,31 @@ fn handle_acp(
                         err_message(&e)
                     )),
                 }
+            }
+            // A recap is a host side-call with its own cancel lane: settle
+            // the held prompt and free the host's in-flight slot instead of
+            // waiting for its 45-second timeout.
+            let pending_recap = {
+                let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                map.get_mut(&sid).and_then(|s| {
+                    let msp_sid = s.msp_sid.clone();
+                    s.pending_recap.take().map(|r| (msp_sid, r))
+                })
+            };
+            if let Some((msp_sid, pending)) = pending_recap {
+                let cmd = host.mint_cmd("cmd-");
+                match host.command(
+                    "recap/cancel",
+                    &format!(
+                        "{{\"commandId\":{},\"sessionId\":{}}}",
+                        esc(&cmd),
+                        esc(&msp_sid)
+                    ),
+                ) {
+                    Ok(_) => {}
+                    Err(e) => log(&format!("recap/cancel failed: {}", err_message(&e))),
+                }
+                settle_recap(stdout, sessions, &sid, &pending, None, "cancelled");
             }
             let turns = sessions
                 .lock()
@@ -7375,7 +7435,14 @@ fn parse_workflow_command(
 }
 
 /// Adapter-local slash commands that map onto one host method.
-const PROTOCOL_COMMANDS: [&str; 5] = ["feedback", "goal", "rename", "workflow", "workflow-child"];
+const PROTOCOL_COMMANDS: [&str; 6] = [
+    "feedback",
+    "goal",
+    "recap",
+    "rename",
+    "workflow",
+    "workflow-child",
+];
 
 /// The command line of a protocol-command prompt, or `None` when the prompt
 /// is not one. The first block decides: it must be text naming a protocol
@@ -8644,6 +8711,94 @@ fn handle_msp(
         }
     }
     match method {
+        "recap/completed" => {
+            // The single settlement of an in-flight `recap/request`,
+            // delivered to this connection outside the view stream.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let command_id = params
+                .get("commandId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let Some(acp_sid) = find_acp_sid(sessions, msp_sid) else {
+                return;
+            };
+            let pending = {
+                let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                let Some(s) = map.get_mut(&acp_sid) else {
+                    return;
+                };
+                match &s.pending_recap {
+                    Some(p) if p.retry_id == command_id => s.pending_recap.take(),
+                    _ => None,
+                }
+            };
+            let Some(pending) = pending else {
+                // A cancel or an earlier duplicate already settled it.
+                log(&format!(
+                    "recap/completed ignored: no in-flight recap for request {command_id}"
+                ));
+                return;
+            };
+            match params.get("outcome").and_then(|v| v.as_str()) {
+                Some("completed") => {
+                    let text = params.get("text").and_then(|v| v.as_str()).unwrap_or("");
+                    let title = params
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .trim();
+                    let summary = if title.is_empty() {
+                        text.to_string()
+                    } else {
+                        format!("{title}\n\n{text}")
+                    };
+                    settle_recap(
+                        stdout,
+                        sessions,
+                        &acp_sid,
+                        &pending,
+                        Some(&summary),
+                        "end_turn",
+                    );
+                }
+                Some("cancelled") => {
+                    settle_recap(stdout, sessions, &acp_sid, &pending, None, "cancelled");
+                }
+                Some("failed") => {
+                    let reason = params
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    fail_recap(
+                        stdout,
+                        sessions,
+                        &acp_sid,
+                        &pending,
+                        &format!("Recap failed ({reason})."),
+                    );
+                }
+                Some("timedOut") => fail_recap(
+                    stdout,
+                    sessions,
+                    &acp_sid,
+                    &pending,
+                    "Recap timed out before the host finished.",
+                ),
+                other => fail_recap(
+                    stdout,
+                    sessions,
+                    &acp_sid,
+                    &pending,
+                    &format!(
+                        "Recap failed (unknown outcome {}).",
+                        other.unwrap_or("missing")
+                    ),
+                ),
+            }
+        }
         "skill/changed" => {
             let msp_sid = params
                 .get("sessionId")
@@ -10754,6 +10909,17 @@ fn drop_acp_session(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) -
                     );
                 }
             }
+            if let Some(r) = s.pending_recap {
+                if s.ver == 2 {
+                    acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
+                } else {
+                    acp::send_result(
+                        stdout,
+                        &Some(r.prompt_req),
+                        "{\"stopReason\":\"cancelled\"}",
+                    );
+                }
+            }
             true
         }
         None => false,
@@ -11317,6 +11483,151 @@ fn settle_feedback_turn(
         }
         send_agent_text(stdout, acp_sid, ver, text);
         acp::send_result(stdout, &prompt_req, "{\"stopReason\":\"end_turn\"}");
+    }
+}
+
+/// Start `/recap`: ask the host for a while-you-were-away summary. The ACP
+/// prompt is echoed immediately and settles on `recap/completed`, or on a
+/// stop, which cancels the host's in-flight slot instead of waiting for its
+/// 45-second timeout. One recap is in flight per session, as MSP promises.
+#[allow(clippy::too_many_arguments)]
+fn start_recap(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    ver: u8,
+    prompt_req: Option<J>,
+    prompt_content: &str,
+    argument: &str,
+) {
+    if !argument.is_empty() {
+        acp::send_error(
+            stdout,
+            &prompt_req,
+            -32602,
+            "usage: /recap (takes no arguments)",
+        );
+        return;
+    }
+    let (msp_sid, recap_in_flight) = {
+        let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        match map.get(acp_sid) {
+            Some(s) => (s.msp_sid.clone(), s.pending_recap.is_some()),
+            None => return,
+        }
+    };
+    if recap_in_flight {
+        acp::send_error(
+            stdout,
+            &prompt_req,
+            -32602,
+            "A recap is already in flight for this session; wait for it or stop the session.",
+        );
+        return;
+    }
+    let retry_id = host.mint_cmd("cmd-");
+    match host.command(
+        "recap/request",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{}}}",
+            esc(&retry_id),
+            esc(&msp_sid)
+        ),
+    ) {
+        Ok(_) => {}
+        Err(error) => {
+            acp::send_error(
+                stdout,
+                &prompt_req,
+                msp::acp_error_code(&error, -32603),
+                &format!("recap/request failed: {}", err_message(&error)),
+            );
+            return;
+        }
+    }
+    let stored = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(acp_sid)
+        .map(|s| {
+            s.pending_recap = Some(acp::PendingRecap {
+                prompt_req: prompt_req.clone().unwrap_or(J::Null),
+                retry_id,
+                ver,
+            });
+        })
+        .is_some();
+    if !stored {
+        return;
+    }
+    if ver == 2 {
+        acp::send_result(stdout, &prompt_req, "{}");
+        send_v2_user_message(stdout, acp_sid, prompt_content);
+        acp::send_state(stdout, acp_sid, "running", None);
+    } else {
+        send_v1_user_message(stdout, acp_sid, prompt_content);
+    }
+}
+
+/// Settle a held `/recap` prompt with the host's outcome.
+fn settle_recap(
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    pending: &acp::PendingRecap,
+    text: Option<&str>,
+    stop: &str,
+) {
+    if let Some(text) = text.filter(|text| !text.is_empty()) {
+        send_agent_text(stdout, acp_sid, pending.ver, text);
+    }
+    if pending.ver == 2 {
+        // The recap is done, not the session: a turn that is still running
+        // keeps it running.
+        let busy = sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(acp_sid)
+            .is_some_and(|s| s.active_turn.is_some() || !s.in_flight.is_empty());
+        if busy {
+            acp::send_state(stdout, acp_sid, "running", None);
+        } else {
+            acp::send_state(stdout, acp_sid, "idle", Some(stop));
+        }
+    } else {
+        acp::send_result(
+            stdout,
+            &Some(pending.prompt_req.clone()),
+            &format!("{{\"stopReason\":\"{stop}\"}}"),
+        );
+    }
+}
+
+/// Fail a held `/recap` prompt. Failed turns settle as an error response on
+/// v1 and as visible agent text plus `idle` with `_failed` on v2, so a recap
+/// failure is reported the same way.
+fn fail_recap(
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    pending: &acp::PendingRecap,
+    message: &str,
+) {
+    if pending.ver == 2 {
+        send_agent_text(stdout, acp_sid, 2, message);
+        let busy = sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(acp_sid)
+            .is_some_and(|s| s.active_turn.is_some() || !s.in_flight.is_empty());
+        if busy {
+            acp::send_state(stdout, acp_sid, "running", None);
+        } else {
+            acp::send_state(stdout, acp_sid, "idle", Some("_failed"));
+        }
+    } else {
+        acp::send_error(stdout, &Some(pending.prompt_req.clone()), -32603, message);
     }
 }
 

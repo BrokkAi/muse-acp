@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add `/recap`: ask Muse for a while-you-were-away summary. The prompt stays
+  open until the host's `recap/completed` settles it, the summary (with its
+  optional title) arrives as agent text, and one recap is allowed per session
+  at a time. Stop sends `recap/cancel` and settles the prompt immediately
+  rather than waiting out the host's 45-second timeout; failed and timed-out
+  recaps are reported as failures, never as success.
 - Label hook runs and expose the session's hook inventory. `hookRun` items
   now render as `Hook <label>` cards carrying the hook key, event, durable
   outcome, and terminal reason, and the opt-in `_session/hooks` extension

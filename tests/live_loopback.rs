@@ -1391,6 +1391,37 @@ fn session_hook_reads_reach_a_real_host_when_negotiated() {
     adapter.finish();
 }
 
+/// `/recap` asks the host for a while-you-were-away summary; the held prompt
+/// settles when `recap/completed` arrives. `recap/request` arrived in Muse
+/// 1.4.6, so older CI pins skip.
+#[test]
+fn recap_settles_the_held_prompt_with_a_real_host() {
+    let test = "recap_settles_the_held_prompt_with_a_real_host";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 6), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let turn = adapter.prompt(&session, "say hello [[script:hello]]");
+    assert_eq!(adapter.result(turn)["stopReason"], "end_turn");
+    let recap = adapter.prompt(&session, "/recap");
+    // The host answers the recap's own model call through the loopback
+    // provider; the summary arrives as agent text and then the prompt
+    // settles, never as a hung request.
+    adapter.wait("the recap summary", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+    });
+    let result = adapter.result(recap);
+    assert_eq!(result["stopReason"], "end_turn", "{result}");
+    adapter.finish();
+}
+
 /// Pausing a live workflow folds the pause fact onto its card, and resuming
 /// it launches a new run whose item names the paused one. `workflow/pause`
 /// arrived in Muse 1.4.4; `workflow/resume` in 1.4.6, so the resume half

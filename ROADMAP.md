@@ -590,8 +590,8 @@ continues.
 | `plugin/marketplaceAdd` | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
 | `plugin/marketplaceRemove` | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
 | `plugin/marketplaceUpdate` | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
-| `recap/request` | Unsupported pending protocol decision | [#215](https://github.com/BrokkAi/muse-acp/issues/215) |
-| `recap/cancel` | Unsupported pending protocol decision | [#215](https://github.com/BrokkAi/muse-acp/issues/215) |
+| `recap/request` | Mapped to ACP | The adapter-local `/recap` slash command sends the request and holds the ACP prompt open (one recap per session) until `recap/completed` settles it with the host's summary. |
+| `recap/cancel` | Mapped to ACP | `session/cancel` while a recap is in flight sends `recap/cancel` and settles the held prompt `cancelled`, so the host's 45-second timeout is never waited on. |
 | `computerUseSettings/read` | Unsupported pending protocol decision | [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
 | `computerUseSettings/update` | Unsupported pending protocol decision | [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
 | `computerUseSetup/read` | Unsupported pending protocol decision | [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
