@@ -5169,8 +5169,16 @@ fn handle_acp(
                         .map(|s| s.fold.workflow_children())
                         .unwrap_or_default()
                 };
+                let workflow_runs = || {
+                    sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&sid)
+                        .map(|s| s.fold.workflow_runs())
+                        .unwrap_or_default()
+                };
                 let parsed = line.and_then(|line| {
-                    parse_protocol_command(&line, &workflow_children)
+                    parse_protocol_command(&line, &workflow_children, &workflow_runs)
                         .unwrap_or_else(|| Err(format!("unrecognized command: {line}")))
                 });
                 let (method, fields) = match parsed {
@@ -7239,8 +7247,77 @@ fn parse_workflow_child_command(
 /// A host method plus its params besides `commandId` and `sessionId`.
 type ProtocolCommand = (String, Vec<(&'static str, J)>);
 
+/// Parse `/workflow pause|resume [<runId>]` against the session's live
+/// workflow runs (read lazily, only for this command). A single live run may
+/// be implied; with more than one the run id is required, because the ids are
+/// the host's opaque values and are never guessed. Usage errors list the
+/// runs with their pause state so an editor user can pick one.
+fn parse_workflow_command(
+    text: &str,
+    runs: &dyn Fn() -> Vec<fold::WorkflowRun>,
+) -> Option<Result<ProtocolCommand, String>> {
+    let body = text.strip_prefix('/')?;
+    let mut words = body.split_whitespace();
+    if words.next()? != "workflow" {
+        return None;
+    }
+    let runs = runs();
+    let listing = || {
+        runs.iter()
+            .map(|run| {
+                let state = if run.paused { "paused" } else { "running" };
+                let children = if run.child_count == 1 {
+                    "1 child".to_string()
+                } else {
+                    format!("{} children", run.child_count)
+                };
+                format!("{} ({state}, {children})", run.workflow_run_id)
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let usage = || {
+        if runs.is_empty() {
+            "usage: /workflow pause|resume; no workflow runs are running".to_string()
+        } else {
+            format!(
+                "usage: /workflow pause|resume [<runId>]; live runs: {}",
+                listing()
+            )
+        }
+    };
+    let action = match words.next() {
+        Some(action @ ("pause" | "resume")) => action,
+        _ => return Some(Err(usage())),
+    };
+    let explicit_run = words.next();
+    if words.next().is_some() {
+        return Some(Err(usage()));
+    }
+    let run_id = match explicit_run {
+        Some(run_id) => run_id,
+        None => match runs.as_slice() {
+            [] => {
+                return Some(Err(format!("no workflow runs are running to {action}")));
+            }
+            [run] => &run.workflow_run_id,
+            _ => return Some(Err(usage())),
+        },
+    };
+    if !runs.iter().any(|run| run.workflow_run_id == run_id) {
+        return Some(Err(format!(
+            "unknown workflow run {run_id}; live runs: {}",
+            listing()
+        )));
+    }
+    Some(Ok((
+        format!("workflow/{action}"),
+        vec![("workflowRunId", J::Str(run_id.to_string()))],
+    )))
+}
+
 /// Adapter-local slash commands that map onto one host method.
-const PROTOCOL_COMMANDS: [&str; 4] = ["feedback", "goal", "rename", "workflow-child"];
+const PROTOCOL_COMMANDS: [&str; 5] = ["feedback", "goal", "rename", "workflow", "workflow-child"];
 
 /// The command line of a protocol-command prompt, or `None` when the prompt
 /// is not one. The first block decides: it must be text naming a protocol
@@ -7298,6 +7375,7 @@ fn protocol_command_text(blocks: &[J], feedback: bool) -> Option<Result<String, 
 fn parse_protocol_command(
     text: &str,
     workflow_children: &dyn Fn() -> Vec<fold::WorkflowChild>,
+    workflow_runs: &dyn Fn() -> Vec<fold::WorkflowRun>,
 ) -> Option<Result<ProtocolCommand, String>> {
     if let Some(parsed) = parse_goal_command(text) {
         return Some(parsed.map(|(method, objective)| {
@@ -7312,6 +7390,9 @@ fn parse_protocol_command(
         return Some(
             parsed.map(|name| ("session/rename".to_string(), vec![("name", J::Str(name))])),
         );
+    }
+    if let Some(parsed) = parse_workflow_command(text, workflow_runs) {
+        return Some(parsed);
     }
     parse_workflow_child_command(text, workflow_children)
 }

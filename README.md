@@ -361,6 +361,12 @@ error the editor shows if Muse then refuses the profile says why.
   `/workflow-child skip <childId>` or `/workflow-child retry <childId>` controls
   one child of a running workflow through the host's `workflow/childControl`.
   A bare `/workflow-child` lists the children you can control.
+- **Workflow runs** — `/workflow pause [<runId>]` and
+  `/workflow resume [<runId>]` pause and resume a live run through the host's
+  `workflow/pause` and `workflow/resume`. A single live run may be implied; a
+  bare `/workflow` lists the live runs with their pause state. A paused card
+  is titled `(paused)`, and a resumed launch arrives as a new item naming the
+  run it continued.
 - **Content** — text, inline and local-file images, `resource_link` text
   expansion, and embedded context. Audio is rejected, because Muse's input type
   is closed to `text` and `image`.

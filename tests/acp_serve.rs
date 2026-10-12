@@ -7430,6 +7430,109 @@ fn workflow_items_render_children_state() {
     c.finish();
 }
 
+/// `/workflow pause|resume [<runId>]` maps onto `workflow/pause` and
+/// `workflow/resume`. A single live run may be implied, the ids are never
+/// guessed, and the pause folds as the workflow card's `paused` member while
+/// the resumed launch arrives as a new item naming the run it superseded.
+#[test]
+fn workflow_pause_and_resume_map_to_host_methods() {
+    let mut c = Client::spawn("workflow_control", &[]);
+    let sid = c.new_session(2, "");
+    let commands = c.wait_for("available_commands_update", Duration::from_secs(15));
+    assert!(
+        commands.contains("\"name\":\"workflow\"") && commands.contains("pause|resume [<runId>]"),
+        "workflow must be advertised: {commands}"
+    );
+
+    // Without a running workflow there is nothing to pause.
+    let pid = c.prompt(&sid, "/workflow pause");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32602") && frame.contains("no workflow runs are running"),
+        "pause without a workflow must fail closed: {frame}"
+    );
+
+    let _run = c.prompt(&sid, "run workflow");
+    c.wait_for("triage issue #1 [c1]: started", Duration::from_secs(15));
+
+    // A bare command lists the live runs with their state.
+    let pid = c.prompt(&sid, "/workflow");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32602") && frame.contains("wfr-control (running, 1 child)"),
+        "bare /workflow must list live runs: {frame}"
+    );
+    // An unknown run is a usage error, never a host call.
+    let pid = c.prompt(&sid, "/workflow pause nope");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32602") && frame.contains("unknown workflow run nope"),
+        "unknown run must fail closed: {frame}"
+    );
+
+    // A single live run may be implied; the pause folds onto the card.
+    let pid = c.prompt(&sid, "/workflow pause");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"result\""),
+        "pause must settle on the admission ack: {frame}"
+    );
+    c.wait_input(
+        "\"workflowRunId\": \"wfr-control\"",
+        Duration::from_secs(10),
+    );
+    let paused = c.wait_for("(paused)", Duration::from_secs(15));
+    assert!(
+        paused.contains("\"paused\":true"),
+        "pause folds into the card meta: {paused}"
+    );
+
+    // Resume names the paused run; the reply drives the session's busy turn
+    // and the resumed launch is a new item naming its predecessor.
+    let pid = c.prompt(&sid, "/workflow resume wfr-control");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"result\""),
+        "resume must settle on the admission ack: {frame}"
+    );
+    let resumed = c.wait_for("it-wf-resumed", Duration::from_secs(15));
+    assert!(
+        resumed.contains("\"resumeFromRunId\":\"wfr-control\"")
+            && resumed.contains("\"workflowRunId\":\"wfr-control\""),
+        "the resumed launch names the paused run: {resumed}"
+    );
+
+    // The resumed generation is the only live state of that run: the listing
+    // shows it running again, and an implied pause targets it.
+    let pid = c.prompt(&sid, "/workflow");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("wfr-control (running, 1 child)") && !frame.contains("paused"),
+        "the resumed generation is running: {frame}"
+    );
+    let pid = c.prompt(&sid, "/workflow pause");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "{frame}");
+    c.wait_input(
+        "\"workflowRunId\": \"wfr-control\"",
+        Duration::from_secs(10),
+    );
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).expect("fake input");
+    let controls: Vec<&str> = input
+        .lines()
+        .filter(|line| line.contains("\"workflowRunId\""))
+        .collect();
+    assert_eq!(
+        controls.len(),
+        3,
+        "pause, resume, and the resumed pause reach the host: {input}"
+    );
+    assert!(controls[0].contains("\"wfr-control\""));
+    assert!(controls[1].contains("\"wfr-control\""));
+    assert!(controls[2].contains("\"wfr-control\""));
+    c.finish();
+}
+
 #[test]
 fn workflow_child_control_keys_the_current_attempt() {
     // `/workflow-child skip|retry <childId>` maps onto

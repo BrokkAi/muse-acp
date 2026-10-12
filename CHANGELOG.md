@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Pause and resume live Muse workflows from the editor. `/workflow pause
+  [<runId>]` and `/workflow resume [<runId>]` map onto the host's
+  `workflow/pause` and `workflow/resume`; a single live run may be implied,
+  a bare `/workflow` lists the live runs with their pause state, and the
+  workflow card shows `(paused)` while the host's pause fact is in force. A
+  resumed launch arrives as a new card whose `_meta` names the run it
+  continued, and its driven turn stays interruptible with Stop.
 - Keep the answers a user already confirmed when a pending Muse question is
   stopped or a later question is declined. ACP forms are atomic, so
   multi-question prompts are now asked one question per form and each

@@ -598,8 +598,8 @@ continues.
 | `computerUseSetup/start` | Unsupported pending protocol decision | [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
 | `skill/setActivation` | Unsupported pending protocol decision | [#217](https://github.com/BrokkAi/muse-acp/issues/217) |
 | `skill/import` | Unsupported pending protocol decision | [#217](https://github.com/BrokkAi/muse-acp/issues/217) |
-| `workflow/pause` | Unsupported pending protocol decision | [#218](https://github.com/BrokkAi/muse-acp/issues/218) |
-| `workflow/resume` | Unsupported pending protocol decision | [#218](https://github.com/BrokkAi/muse-acp/issues/218) |
+| `workflow/pause` | Mapped to ACP | The adapter-local `/workflow pause [<runId>]` slash command sends the run's pause and settles on the admission-only ack; the pause folds into the card's title and `_meta.muse.workflow.paused`. A single live run may be implied and a bare `/workflow` lists the live runs. |
+| `workflow/resume` | Mapped to ACP | The adapter-local `/workflow resume [<runId>]` slash command sends the paused run's resume and settles on the admission-only ack, whose driven turn stays unowned so Stop can interrupt it. The resumed launch folds as a new workflow item whose `resumeFromRunId` names the run; Muse 1.4.6 reuses the run id, which the fold treats as a generation boundary. |
 | `task/list` | Unsupported pending protocol decision | [#219](https://github.com/BrokkAi/muse-acp/issues/219) |
 | `hook/list` | Unsupported pending protocol decision | [#220](https://github.com/BrokkAi/muse-acp/issues/220) |
 | `media/upload` | Unsupported pending protocol decision | [#221](https://github.com/BrokkAi/muse-acp/issues/221) |
