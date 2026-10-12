@@ -1391,6 +1391,60 @@ fn session_hook_reads_reach_a_real_host_when_negotiated() {
     adapter.finish();
 }
 
+/// A local video resource link uploads to the real host's video store and
+/// reaches the turn as a `video` part. `media/upload` arrived in Muse 1.4.4,
+/// so older CI pins skip.
+#[test]
+fn video_resource_links_reach_a_real_host() {
+    let test = "video_resource_links_reach_a_real_host";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 4), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let clip = host.workspace().join("clip.mp4");
+    std::fs::write(&clip, vec![7u8; 300_000]).expect("write the video fixture");
+    let path = clip.display().to_string().replace('\\', "/");
+    let uri = if cfg!(windows) {
+        format!("file:///{path}")
+    } else {
+        format!("file://{path}")
+    };
+    let id = adapter.request(
+        "session/prompt",
+        json!({"sessionId": session, "prompt": [
+            {"type": "text", "text": "watch [[script:hello]]"},
+            {"type": "resource_link", "uri": uri, "name": "clip.mp4",
+             "mimeType": "video/mp4"},
+        ]}),
+    );
+    let response = adapter.response(id);
+    if response.get("result").is_some() {
+        assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+    } else {
+        // The loopback provider serves only the model endpoints, so the
+        // host's own attempt to ship the uploaded video to a Files API is
+        // the observable proof that the upload and the video part were
+        // accepted; a host-side upload failure would have failed earlier.
+        // Both failures happen after the host accepted the upload and built
+        // the video part: 1.4.6 tries to ship it to the model provider's
+        // Files API (which the loopback provider does not serve), and older
+        // builds gate video input behind TBH_VIDEO_INPUT_ENABLED. An
+        // upload-side failure would have failed earlier with the chunk text.
+        let message = response["error"]["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("Files API") || message.contains("video input is disabled"),
+            "the video reached the turn: {response}"
+        );
+    }
+    adapter.finish();
+}
+
 /// The opt-in computer-use extension reaches a real host: either it answers
 /// with the setup state and settings, or the CUA gate answers its typed
 /// `computerUseUnavailable`, never a generic failure. The capability and the
