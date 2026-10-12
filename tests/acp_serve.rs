@@ -5271,19 +5271,23 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 }
 
 #[test]
-fn sdk_manifest_fingerprint_is_tested() {
-    // The vendored SDK manifest (537cc8d) equals the live-validated 1.4.4
-    // host surface.
+fn sdk_manifest_fingerprint_degrades_until_live_validated() {
+    // The vendored SDK manifest (ea88c822) publishes the Muse 1.4.6 surface.
+    // No pinned live host has been validated against it, so the adapter warns
+    // without blocking.
     let mut c = Client::spawn(
         "quiet",
         &[(
             "FAKE_FINGERPRINT",
-            "sha256:7c94f153c41659cb3f1bd3c3e04438be254644cb2a97d65d48edc7449b74858a",
+            "sha256:eae467ab60cb9a5d5af4de616830f065e59375c987fd59269c8cc33ed2a1137f",
         )],
     );
     c.initialize(1, "");
-    c.wait_stderr("status=tested", Duration::from_secs(10));
-    c.wait_stderr("validated against live host 1.4.4", Duration::from_secs(10));
+    c.wait_stderr("status=degraded", Duration::from_secs(10));
+    c.wait_stderr(
+        "not yet validated against a live host",
+        Duration::from_secs(10),
+    );
     c.finish();
 }
 

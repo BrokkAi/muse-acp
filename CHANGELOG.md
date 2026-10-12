@@ -10,6 +10,28 @@
   The blocking agent ids are still logged on stderr with
   `turn/foregroundCompleted`. Set `MUSE_SHOW_REMINDERS=1` (`true`/`yes`/`on`)
   to render the per-agent cards again.
+- Re-pin the vendored Muse SDK conformance corpus to `ea88c822` (2026-10-11,
+  "remirror: 1.4.6"), which publishes the Muse 1.4.6 stable surface. Unlike
+  the previous `bb44be3` (1.4.2) and `537cc8d` (1.4.4) pins, this fingerprint
+  has no live-validated host yet: `--selftest` and startup now report
+  `kind=sdk-manifest ... status=degraded` (a visible warning, never fatal)
+  instead of `tested`, and it joins the tested table once a pinned 1.4.6 build
+  runs in the live-host matrix. The corpus grows to 39 notifications and 68
+  methods; the four new notifications (`computerUseSetup/changed`,
+  `plugin/changed`, `plugin/marketplaceChanged`, `recap/completed`) are
+  classified in the event matrix and take the unhandled-notification
+  diagnostic path.
+- Record explicit dispositions for the Muse 1.4.3–1.4.6 surface the adapter
+  does not drive — `plugin/list`, `plugin/install`, the `plugin/marketplace*`
+  methods, `recap/request`, `recap/cancel`, `computerUseSettings/read`,
+  `computerUseSettings/update`, `computerUseSetup/read`,
+  `computerUseSetup/start`, `skill/setActivation`, `skill/import`,
+  `workflow/pause`, `workflow/resume`, `task/list`, `hook/list`,
+  `media/upload`, `session/sideChat`, `userInput/interrupt`, the
+  `computerUseSetup` capability, and the four new plugin/marketplace error
+  kinds — in the ROADMAP section 9 matrix, each linked to a tracking issue
+  (#214–#224). Nothing is adopted in this release; the adapter keeps refusing
+  or ignoring them exactly as before, now with the gap recorded.
 
 ## 0.12.0
 
