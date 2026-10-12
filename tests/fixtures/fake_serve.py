@@ -48,6 +48,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   skill_not_found skill/list still lists `stale`; turn/start rejects it
   async_task_stop       background task then a targeted task/stop terminal
   async_task_stop_all   background tasks then task/stopAll terminals
+  hook_run     a hookRun item around the turn; hook/list serves the inventory
   load         session/resume serves inline history (for session/load replay)
   resume_active session/resume reports a running turn (for steering reattach)
   async_resume session/resume reports running background work
@@ -900,6 +901,19 @@ def on_turn_start(params):
             "triggerSource": "modelProposal",
             "children": [{"childId": "c1", "attempt": 1, "status": "started",
                           "phase": "triage", "label": "triage issue #1"}]}})
+    elif SCENARIO == "hook_run":
+        # A configured hook runs around the turn: the item opens, settles with
+        # its durable outcome, and the inventory (hook/list) names the handler.
+        notify("item/started", {**base, "item": {
+            "itemId": "it-hook", "kind": "hookRun", "status": "inProgress",
+            "revision": 1, "hookKey": "fmt-on-save", "event": "postToolUse",
+            "label": "Format on save"}})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-hook", "kind": "hookRun", "status": "completed",
+            "revision": 2, "hookKey": "fmt-on-save", "event": "postToolUse",
+            "label": "Format on save", "runStatus": "completed",
+            "reason": "formatted 2 files"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "async_task":
         # A backgrounded toolCall plus a user-shell item: both are async work.
         notify("item/updated", {**base, "item": {
@@ -1724,6 +1738,17 @@ def result_for(method, msg):
     if method == "userInput/answer":
         log_input(msg.get("params", {}))
         return {}
+    if method == "hook/list":
+        # One row per installed handler per event; non-enabled rows stay in
+        # the set as `false`.
+        params = msg.get("params", {})
+        log_input(params)
+        return {"hooks": [
+            {"key": "fmt-on-save", "event": "postToolUse",
+             "handlerKind": "project", "enabled": True},
+            {"key": "notify-slack", "event": "notification",
+             "handlerKind": "plugin", "enabled": False},
+        ]}
     if method == "userInput/interrupt":
         # The real host settles the open prompt with the confirmed partial
         # answers and stops its turn, all on the interrupt lane.

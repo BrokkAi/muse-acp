@@ -168,6 +168,10 @@ pub struct SessionFold {
     /// Runs superseded by a newer resumed launch (`resumeFromRunId`). A late
     /// or replayed observation of a superseded run never brings it back.
     superseded_workflows: std::collections::HashSet<String>,
+    /// The session's installed hook handlers, keyed by the durable hook key,
+    /// as the last `hook/list` read reported them. `hookRun` items use this
+    /// to name where their handler came from.
+    hook_handlers: HashMap<String, HookHandlerFact>,
     /// Last terminal state sent for each async task.
     /// AIR task id -> MSP item id, used when task control targets the host.
     async_task_msp_ids: HashMap<String, String>,
@@ -214,6 +218,13 @@ struct WorkflowObservation {
     children: Vec<WorkflowChild>,
 }
 
+/// One installed hook handler from `hook/list`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HookHandlerFact {
+    handler_kind: String,
+    enabled: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubagentObservation {
     pub item_status: String,
@@ -235,6 +246,7 @@ impl SessionFold {
             workflow_tasks: HashMap::new(),
             workflow_children: HashMap::new(),
             superseded_workflows: std::collections::HashSet::new(),
+            hook_handlers: HashMap::new(),
             async_task_msp_ids: HashMap::new(),
             async_task_states: HashMap::new(),
             reminder_cards: HashMap::new(),
@@ -384,6 +396,36 @@ impl SessionFold {
                 child_count: seen.children.len(),
             })
             .collect()
+    }
+
+    /// Replace the session's hook inventory from a `hook/list` result. The
+    /// host promises the set, not an order, and non-enabled rows are included
+    /// as `false` rather than dropped. Rows without a key are skipped.
+    pub fn note_hook_inventory(&mut self, result: &J) {
+        let mut handlers = HashMap::new();
+        if let Some(J::Arr(hooks)) = result.get("hooks") {
+            for hook in hooks {
+                let Some(key) = hook
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .filter(|key| !key.is_empty())
+                else {
+                    continue;
+                };
+                handlers.insert(
+                    key.to_string(),
+                    HookHandlerFact {
+                        handler_kind: hook
+                            .get("handlerKind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        enabled: matches!(hook.get("enabled"), Some(J::Bool(true))),
+                    },
+                );
+            }
+        }
+        self.hook_handlers = handlers;
     }
 
     /// Return the latest owner-side observation for a durable child.
@@ -631,7 +673,7 @@ impl SessionFold {
 
     /// Build (title, content, `_meta` JSON) for host-side item kinds that
     /// render as synthetic tool cards. `meta` is a complete JSON object.
-    fn host_card_parts(kind: &str, item: &J) -> (String, Option<String>, Option<String>) {
+    fn host_card_parts(&self, kind: &str, item: &J) -> (String, Option<String>, Option<String>) {
         let str_field = |key: &str| item.get(key).and_then(|v| v.as_str()).unwrap_or("");
         let meta_obj = |namespace: &str, fields: Vec<(&str, &J)>| {
             let parts: Vec<String> = fields
@@ -739,6 +781,36 @@ impl SessionFold {
                             "resumeFromRunId",
                             item.get("resumeFromRunId").unwrap_or(&J::Null),
                         ),
+                    ],
+                );
+                (title, content, meta)
+            }
+            "hookRun" => {
+                let key = str_field("hookKey");
+                let label = str_field("label");
+                let title = match (label.is_empty(), key.is_empty()) {
+                    (false, _) => format!("Hook {label}"),
+                    (true, false) => format!("Hook {key}"),
+                    (true, true) => "Hook".to_string(),
+                };
+                let reason = str_field("reason");
+                let content = (!reason.is_empty()).then(|| reason.to_string());
+                // The inventory names where the handler came from; a hook run
+                // whose row is not in the last read stays honesty-unknown.
+                let handler = self.hook_handlers.get(key).filter(|_| !key.is_empty());
+                let handler_kind = handler
+                    .map(|h| J::Str(h.handler_kind.clone()))
+                    .unwrap_or(J::Null);
+                let enabled = handler.map(|h| J::Bool(h.enabled)).unwrap_or(J::Null);
+                let meta = meta_obj(
+                    "hookRun",
+                    vec![
+                        ("hookKey", item.get("hookKey").unwrap_or(&J::Null)),
+                        ("event", item.get("event").unwrap_or(&J::Null)),
+                        ("runStatus", item.get("runStatus").unwrap_or(&J::Null)),
+                        ("reason", item.get("reason").unwrap_or(&J::Null)),
+                        ("handlerKind", &handler_kind),
+                        ("enabled", &enabled),
                     ],
                 );
                 (title, content, meta)
@@ -1140,7 +1212,7 @@ impl SessionFold {
         settle: bool,
         out: &mut Vec<String>,
     ) {
-        let (title, content, meta) = Self::host_card_parts("reminderChild", item);
+        let (title, content, meta) = self.host_card_parts("reminderChild", item);
         let announced_card = matches!(self.items.get(item_id), Some(ItemRole::Tool { .. }));
         if title.is_empty() && !announced_card {
             // Never announced and no title to settle with: there is nothing
@@ -1534,9 +1606,9 @@ impl SessionFold {
                     }
                 }
             }
-            "subagent" | "workflow" | "userShell" => {
+            "subagent" | "workflow" | "userShell" | "hookRun" => {
                 let (tc_id, announced) = self.host_item_role(&item_id, kind);
-                let (title, content, meta) = Self::host_card_parts(kind, item);
+                let (title, content, meta) = self.host_card_parts(kind, item);
                 let muse_fields = Self::merge_muse_fields(
                     meta.as_deref(),
                     Self::item_muse_fields(item).as_deref(),
@@ -1597,7 +1669,7 @@ impl SessionFold {
                 }
             }
             _ => {
-                let (title, content, meta) = Self::host_card_parts(kind, item);
+                let (title, content, meta) = self.host_card_parts(kind, item);
                 let muse_fields = Self::merge_muse_fields(
                     meta.as_deref(),
                     Self::item_muse_fields(item).as_deref(),
@@ -1844,9 +1916,9 @@ impl SessionFold {
                 }
                 self.items.remove(&item_id);
             }
-            "subagent" | "workflow" | "userShell" => {
+            "subagent" | "workflow" | "userShell" | "hookRun" => {
                 let (tc_id, announced) = self.host_item_role(&item_id, kind);
-                let (title, content, meta) = Self::host_card_parts(kind, item);
+                let (title, content, meta) = self.host_card_parts(kind, item);
                 let muse_fields = Self::merge_muse_fields(
                     meta.as_deref(),
                     Self::item_muse_fields(item).as_deref(),
@@ -1915,7 +1987,7 @@ impl SessionFold {
                 let announced_card =
                     matches!(self.items.get(&item_id), Some(ItemRole::Tool { .. }));
                 let (tc_id, announced) = self.host_item_role(&item_id, "item-");
-                let (title, content, meta) = Self::host_card_parts(kind, item);
+                let (title, content, meta) = self.host_card_parts(kind, item);
                 let muse_fields = Self::merge_muse_fields(
                     meta.as_deref(),
                     Self::item_muse_fields(item).as_deref(),
@@ -2121,6 +2193,38 @@ mod corpus_tests {
         .unwrap();
         fold.on_item_completed("sid", 2, &completed, &mut out);
         assert!(fold.workflow_children().is_empty());
+    }
+
+    #[test]
+    fn hook_run_cards_use_the_inventory_when_present() {
+        let item = parse_json(
+            r#"{"itemId":"h1","kind":"hookRun","status":"completed","revision":2,"hookKey":"fmt","event":"postToolUse","label":"Format on save","runStatus":"completed","reason":"formatted 2 files"}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        fold.note_hook_inventory(
+            &parse_json(
+                r#"{"hooks":[{"key":"fmt","event":"postToolUse","handlerKind":"project","enabled":true}]}"#,
+            )
+            .unwrap(),
+        );
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &item, &mut out);
+        let card = out.join("\n");
+        assert!(card.contains("Hook Format on save"), "{card}");
+        assert!(card.contains("\"handlerKind\":\"project\""), "{card}");
+        assert!(card.contains("\"enabled\":true"), "{card}");
+        assert!(card.contains("\"runStatus\":\"completed\""), "{card}");
+        assert!(card.contains("formatted 2 files"), "{card}");
+
+        // Without a matching inventory row the card still renders, without
+        // inventing a handler origin.
+        let mut bare = SessionFold::new();
+        let mut out = Vec::new();
+        bare.on_item_snapshot("sid", 2, &item, &mut out);
+        let card = out.join("\n");
+        assert!(card.contains("Hook Format on save"), "{card}");
+        assert!(!card.contains("handlerKind"), "{card}");
     }
 
     #[test]
