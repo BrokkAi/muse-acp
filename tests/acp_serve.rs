@@ -2306,7 +2306,9 @@ fn partial_user_input_interrupts_with_confirmed_answers() {
         "the held answer must not be submitted early: {held}"
     );
     c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
-    c.wait_log("userInput/interrupt", Duration::from_secs(15));
+    // The method log line lands before the fixture's handler writes the
+    // params, so wait for the written input itself rather than racing it.
+    c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
     let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
     let interrupt = inputs
         .lines()
@@ -2424,7 +2426,9 @@ fn declining_after_a_confirmed_answer_interrupts_with_it() {
     c.raw(&format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":\"{q1_id}\",\"result\":{{\"action\":\"decline\"}}}}"
     ));
-    c.wait_log("userInput/interrupt", Duration::from_secs(15));
+    // The method log line lands before the fixture's handler writes the
+    // params, so wait for the written input itself rather than racing it.
+    c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
     let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
     assert!(
         inputs.contains("\"selectedLabel\": \"Alpha\""),
