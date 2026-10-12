@@ -1391,6 +1391,47 @@ fn session_hook_reads_reach_a_real_host_when_negotiated() {
     adapter.finish();
 }
 
+/// `_session/plugins` reads the real host's installed-plugin inventory
+/// (`plugin/list`, Muse 1.4.4+); on 1.4.6 a refused marketplace removal keeps
+/// the host's typed error.
+#[test]
+fn plugin_inventory_and_typed_refusals_reach_a_real_host() {
+    let test = "plugin_inventory_and_typed_refusals_reach_a_real_host";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    let adapter = Adapter::launch_with(&host, json!({"_meta": {"muse": {"plugins": true}}}));
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 4), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let read = adapter.request("_session/plugins", json!({"sessionId": session}));
+    let result = adapter.result(read);
+    assert!(
+        result["plugins"].is_array(),
+        "the host's plugin rows come back: {result}"
+    );
+    if release >= (1, 4, 6) {
+        let id = adapter.request(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{
+                "type": "text",
+                "text": "/plugin marketplace remove no-such-marketplace-muse-acp",
+            }]}),
+        );
+        let response = adapter.response(id);
+        assert_eq!(response["error"]["code"], json!(-32034), "{response}");
+        assert_eq!(
+            response["error"]["data"]["kind"],
+            json!("marketplaceNotFound"),
+            "{response}"
+        );
+    }
+    adapter.finish();
+}
+
 /// Resuming with AIR async tasks negotiated asks the real host for its
 /// authoritative `task/list` inventory. `task/list` arrived in Muse 1.4.6,
 /// so older CI pins skip.
@@ -1485,6 +1526,7 @@ fn skill_activation_reaches_a_real_host() {
         "compact",
         "feedback",
         "goal",
+        "plugin",
         "recap",
         "rename",
         "skill-activation",

@@ -260,6 +260,9 @@ fn method_timeout_ms(method: &str) -> u64 {
         // Control-plane decisions should be fast but not flaky.
         "approval/decide" | "userInput/answer" | "userInput/cancel" | "userInput/clarify"
         | "task/background" | "task/stop" | "task/stopAll" => 30_000,
+        // Plugin installs and marketplace fetches hold the request open while
+        // the host talks to a store or local source.
+        "plugin/install" | "plugin/marketplaceAdd" | "plugin/marketplaceUpdate" => 180_000,
         _ => DEFAULT_TIMEOUT_MS,
     }
 }
@@ -475,22 +478,27 @@ pub fn turn_auth_diagnostic(
     auth_diagnostic(message, host)
 }
 
-/// ACP reserves -32000 for authentication required. The MSP skill lookup
-/// error is also stable across the two protocols, so preserve its registry
-/// code; other MSP errors retain the caller's existing ACP mapping.
+/// ACP reserves -32000 for authentication required. MSP's stable
+/// protocol-surface errors (a rejected skill lookup and the plugin and
+/// marketplace write refusals) keep their registry codes; other MSP errors
+/// retain the caller's existing ACP mapping.
 pub fn acp_error_code(error: &J, fallback: i64) -> i64 {
     if auth_failure(&err_message(error)).is_some() {
-        -32000
-    } else if err_code(error) == -32032
-        || error
-            .get("data")
-            .and_then(|data| data.get("kind"))
-            .and_then(|kind| kind.as_str())
-            == Some("skillNotFound")
-    {
-        -32032
-    } else {
-        fallback
+        return -32000;
+    }
+    let kind = error
+        .get("data")
+        .and_then(|data| data.get("kind"))
+        .and_then(|kind| kind.as_str())
+        .unwrap_or("");
+    match kind {
+        "skillNotFound" => -32032,
+        "marketplaceNotFound" => -32034,
+        "pluginNotFound" => -32035,
+        "marketplaceAlreadyExists" => -32036,
+        "pluginMutationsDisabled" => -32037,
+        _ if err_code(error) == -32032 => -32032,
+        _ => fallback,
     }
 }
 
@@ -724,12 +732,25 @@ fn classify_status(status: &ExitStatus, stderr_tail: String) -> ExitClassificati
     classify_exit_parts(exit_code, signal, stderr_tail)
 }
 
-/// Structured data for the only MSP request error that ACP clients need to
-/// branch on here. In particular, keep the rejected selector visible.
+/// Structured data for the MSP request errors ACP clients need to branch on:
+/// a rejected skill selector and the plugin/marketplace write refusals. The
+/// host payload stays visible so a client sees which selector, marketplace,
+/// or plugin was refused.
 pub fn skill_error_data(error: &J) -> Option<String> {
     let data = error.get("data")?;
-    (data.get("kind").and_then(|kind| kind.as_str()) == Some("skillNotFound"))
-        .then(|| j_to_string(data))
+    let kind = data
+        .get("kind")
+        .and_then(|kind| kind.as_str())
+        .unwrap_or("");
+    let typed = matches!(
+        kind,
+        "skillNotFound"
+            | "marketplaceNotFound"
+            | "pluginNotFound"
+            | "marketplaceAlreadyExists"
+            | "pluginMutationsDisabled"
+    );
+    typed.then(|| j_to_string(data))
 }
 
 pub struct MspHost {

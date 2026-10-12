@@ -1073,6 +1073,10 @@ fn available_commands_json(
             "{{\"name\":\"rename\",\"description\":\"Rename this session\",\"input\":{}}}",
             input("<name>")
         ),
+        format!(
+            "{{\"name\":\"plugin\",\"description\":\"Install plugins and manage marketplaces\",\"input\":{}}}",
+            input("install <marketplace> <name> | marketplace add|remove|update <name>")
+        ),
         "{\"name\":\"recap\",\"description\":\"Summarize what happened while you were away\"}"
             .to_string(),
         format!(
@@ -1099,6 +1103,7 @@ fn available_commands_json(
                 !matches!(
                     name.as_str(),
                     "goal"
+                        | "plugin"
                         | "recap"
                         | "rename"
                         | "skill-activation"
@@ -1389,7 +1394,7 @@ mod tests {
                 panic!("available commands must be an array");
             };
             // The host's `rename` row is shadowed by the local command.
-            assert_eq!(items.len(), 10);
+            assert_eq!(items.len(), 11);
             assert_eq!(
                 commands.matches("\"name\":\"feedback\"").count(),
                 1,

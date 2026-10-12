@@ -50,6 +50,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   side_chat    session/sideChat opens a side session with sideFrom provenance
   task_list_seed task/list seeds async tasks after a resume whose history is
                empty; the item terminal then settles the seeded task
+  plugin_control plugin/list rows and the install/marketplace write receipts
   async_task_stop       background task then a targeted task/stop terminal
   async_task_stop_all   background tasks then task/stopAll terminals
   hook_run     a hookRun item around the turn; hook/list serves the inventory
@@ -1780,6 +1781,43 @@ def result_for(method, msg):
             {"taskId": "cron-1", "kind": "cron.run",
              "status": "inProgress", "startedAt": "2026-10-12T09:00:00Z"},
         ]}
+    if method == "plugin/list":
+        log_input(msg.get("params", {}))
+        return {"plugins": [
+            {"id": "threejs", "version": "1.2.0", "enabled": True,
+             "source": "curated"},
+            {"id": "local-tools", "version": "0.1.0", "enabled": False,
+             "source": "nativeLocal"},
+        ]}
+    if method == "plugin/install":
+        params = msg.get("params", {})
+        log_input(params)
+        notify("plugin/changed", {
+            "sessionId": params.get("sessionId", MSP_SID),
+            "id": "threejs", "version": "1.2.0", "enabled": True,
+            "source": "curated"})
+        return {"commandId": params.get("commandId", ""), "status": "accepted",
+                "id": "threejs", "version": "1.2.0", "enabled": True,
+                "source": "curated", "warning": "restart the session to load it"}
+    if method in ("plugin/marketplaceAdd", "plugin/marketplaceUpdate"):
+        params = msg.get("params", {})
+        log_input(params)
+        notify("plugin/marketplaceChanged", {
+            "sessionId": params.get("sessionId", MSP_SID),
+            "name": params.get("name", ""), "change": "added",
+            "pluginCount": 2, "skippedCount": 0})
+        return {"commandId": params.get("commandId", ""), "status": "accepted",
+                "name": params.get("name", ""),
+                "source": {"kind": "ownerRepo", "path": "acme/plugins"},
+                "pluginCount": 2, "skipped": []}
+    if method == "plugin/marketplaceRemove":
+        params = msg.get("params", {})
+        log_input(params)
+        notify("plugin/marketplaceChanged", {
+            "sessionId": params.get("sessionId", MSP_SID),
+            "name": params.get("name", ""), "change": "removed"})
+        return {"commandId": params.get("commandId", ""), "status": "accepted",
+                "name": params.get("name", "")}
     if method == "task/stop" and SCENARIO == "task_list_seed":
         params = msg.get("params", {})
         log_input(params)
@@ -2324,6 +2362,32 @@ def main():
                                     "data": {"kind": "skillNotFound",
                                              "selector": "missing"}}})
                     continue
+                if SCENARIO == "plugin_control" and method.startswith("plugin/"):
+                    params = msg.get("params", {})
+                    name = params.get("name", "")
+                    serialized = json.dumps(params)
+                    error = None
+                    if "missing-plugin" in serialized:
+                        error = {"code": -32035, "message": "plugin not found",
+                                 "data": {"kind": "pluginNotFound",
+                                          "plugin": "missing-plugin"}}
+                    elif name == "missing":
+                        error = {"code": -32034, "message": "marketplace not found",
+                                 "data": {"kind": "marketplaceNotFound",
+                                          "name": "missing"}}
+                    elif name == "taken":
+                        error = {"code": -32036,
+                                 "message": "marketplace already exists",
+                                 "data": {"kind": "marketplaceAlreadyExists",
+                                          "name": "taken"}}
+                    elif name == "locked":
+                        error = {"code": -32037,
+                                 "message": "plugin mutations are disabled",
+                                 "data": {"kind": "pluginMutationsDisabled"}}
+                    if error:
+                        log_input(params)
+                        send({"jsonrpc": "2.0", "id": ident, "error": error})
+                        continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
                 if REVIEW_HOST and method == "turn/start":

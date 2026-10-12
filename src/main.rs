@@ -48,6 +48,7 @@ static USER_SHELL: AtomicU64 = AtomicU64::new(0); // explicit editor shell featu
 static READ_OUTPUT: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates stored-output reads
 static HOOKS: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates session hook reads
 static SIDE_CHAT: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates side-chat creation
+static PLUGINS: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates plugin reads
 static AIR_FILE_REPORT: AtomicU64 = AtomicU64::new(0); // 1 when per-turn file reports are negotiated
 static MUSE_NOT_INSTALLED: AtomicBool = AtomicBool::new(false); // host launch found no Muse executable
 
@@ -1409,7 +1410,7 @@ enum LoopMsg {
 /// MSP `session/delete` support (Muse 1.4.1 or 1.4.2, durable); clients
 /// must not call `session/delete` unless it is advertised.
 fn v2_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["hooks","readOutput","sideChat","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
+    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["hooks","plugins","readOutput","sideChat","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v2())
         .replace(
@@ -1427,7 +1428,7 @@ fn v2_init(session_mcp: bool, session_delete: bool) -> String {
 }
 
 fn v1_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["hooks","readOutput","sideChat","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true}}}"#
+    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["hooks","plugins","readOutput","sideChat","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v1())
         .replace("__MCP_HTTP__", if session_mcp { "true" } else { "false" })
@@ -3794,6 +3795,11 @@ fn negotiate_acp(msg: &J) -> bool {
     if side_chat {
         log("client negotiated side-chat creation");
     }
+    let plugins = client_supports_muse(capabilities, "plugins");
+    PLUGINS.store(u64::from(plugins), Ordering::SeqCst);
+    if plugins {
+        log("client negotiated plugin reads");
+    }
     let recommended = client_supports_air(capabilities, "recommendedValue");
     AIR_RECOMMENDED.store(u64::from(recommended), Ordering::SeqCst);
     if async_tasks {
@@ -5744,6 +5750,53 @@ fn handle_acp(
                 ),
             }
         }
+        "_session/plugins" => {
+            if PLUGINS.load(Ordering::SeqCst) == 0 {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32601,
+                    "plugin reads require the muse plugins capability",
+                );
+                return;
+            }
+            let acp_sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let Some(acp_sid) = acp_sid else {
+                acp::send_error(stdout, &id, -32602, "_session/plugins requires sessionId");
+                return;
+            };
+            let msp_sid = match sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&acp_sid)
+            {
+                Some(session) => session.msp_sid.clone(),
+                None => {
+                    acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                    return;
+                }
+            };
+            // A pull surface with no local cache: writes refresh through the
+            // host's plugin/changed and marketplaceChanged notifications.
+            match host.command(
+                "plugin/list",
+                &format!("{{\"sessionId\":{}}}", esc(&msp_sid)),
+            ) {
+                Ok(result) => acp::send_result(stdout, &id, &j_to_string(&result)),
+                Err(error) => send_host_error(
+                    stdout,
+                    &id,
+                    &error,
+                    -32603,
+                    &format!("plugin/list failed: {}", err_message(&error)),
+                ),
+            }
+        }
         "_session/sideChat" => {
             if SIDE_CHAT.load(Ordering::SeqCst) == 0 {
                 acp::send_error(
@@ -7626,6 +7679,78 @@ fn parse_skill_activation_command(text: &str) -> Option<Result<ProtocolCommand, 
     )))
 }
 
+/// Parse the `/plugin ...` command family into a host write:
+///
+/// - `/plugin install <marketplace> <name>` installs a named marketplace plugin;
+/// - `/plugin install <path> [default|user|project]` installs from a host path;
+/// - `/plugin marketplace add <name> <source>`, and
+///   `/plugin marketplace remove|update <name>` manage marketplaces.
+///
+/// The host owns marketplace and plugin existence; only the closed scope
+/// vocabulary and the argument shapes are validated here. Two arguments where
+/// the second is a scope word is the path form, otherwise it is the
+/// marketplace form.
+fn parse_plugin_command(text: &str) -> Option<Result<ProtocolCommand, String>> {
+    const USAGE: &str = "usage: /plugin install <marketplace> <name> | /plugin install <path> [default|user|project] | /plugin marketplace add <name> <source> | /plugin marketplace remove <name> | /plugin marketplace update <name>";
+    let body = text.strip_prefix('/')?;
+    let mut words = body.split_whitespace();
+    if words.next()? != "plugin" {
+        return None;
+    }
+    let rest: Vec<&str> = words.collect();
+    let install_target = match rest.as_slice() {
+        ["install", path] => J::Obj(vec![(
+            "localPath".to_string(),
+            J::Obj(vec![("path".to_string(), J::Str(path.to_string()))]),
+        )]),
+        ["install", path, scope] if matches!(*scope, "default" | "user" | "project") => {
+            J::Obj(vec![(
+                "localPath".to_string(),
+                J::Obj(vec![
+                    ("path".to_string(), J::Str(path.to_string())),
+                    ("scope".to_string(), J::Str(scope.to_string())),
+                ]),
+            )])
+        }
+        ["install", marketplace, name] => J::Obj(vec![(
+            "marketplace".to_string(),
+            J::Obj(vec![
+                ("marketplace".to_string(), J::Str(marketplace.to_string())),
+                ("name".to_string(), J::Str(name.to_string())),
+            ]),
+        )]),
+        ["marketplace", "add", name, source] => {
+            return Some(Ok((
+                "plugin/marketplaceAdd".to_string(),
+                vec![
+                    ("name", J::Str(name.to_string())),
+                    ("source", J::Str(source.to_string())),
+                ],
+            )));
+        }
+        ["marketplace", action @ ("remove" | "update"), name] => {
+            return Some(Ok((
+                format!("plugin/marketplace{}", titlecase(action)),
+                vec![("name", J::Str(name.to_string()))],
+            )));
+        }
+        _ => return Some(Err(USAGE.to_string())),
+    };
+    Some(Ok((
+        "plugin/install".to_string(),
+        vec![("target", install_target)],
+    )))
+}
+
+/// `remove`/`update` -> `Remove`/`Update` for the MSP method names.
+fn titlecase(word: &str) -> String {
+    let mut chars = word.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 /// Parse `/skill-import <claude|codex> [dry-run] [force]`. The source is
 /// closed on the wire; the host resolves its own foreign directory, so no
 /// client path is involved.
@@ -7723,9 +7848,10 @@ fn parse_workflow_command(
 }
 
 /// Adapter-local slash commands that map onto one host method.
-const PROTOCOL_COMMANDS: [&str; 8] = [
+const PROTOCOL_COMMANDS: [&str; 9] = [
     "feedback",
     "goal",
+    "plugin",
     "recap",
     "rename",
     "skill-activation",
@@ -7807,6 +7933,9 @@ fn parse_protocol_command(
         );
     }
     if let Some(parsed) = parse_skill_activation_command(text) {
+        return Some(parsed);
+    }
+    if let Some(parsed) = parse_plugin_command(text) {
         return Some(parsed);
     }
     if let Some(parsed) = parse_workflow_command(text, workflow_runs) {
@@ -9004,6 +9133,36 @@ fn handle_msp(
         }
     }
     match method {
+        "plugin/changed" | "plugin/marketplaceChanged" => {
+            // The adapter keeps no plugin or marketplace cache: the host's
+            // change notice is consumed as a diagnostic, and clients re-read
+            // the opt-in `_session/plugins` view when they care.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let detail = if method == "plugin/changed" {
+                format!(
+                    "installed plugin {} version {} ({}); re-read _session/plugins",
+                    params.get("id").and_then(|v| v.as_str()).unwrap_or("?"),
+                    params
+                        .get("version")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?"),
+                    params.get("source").and_then(|v| v.as_str()).unwrap_or("?"),
+                )
+            } else {
+                format!(
+                    "marketplace {} {}; re-read _session/plugins",
+                    params.get("name").and_then(|v| v.as_str()).unwrap_or("?"),
+                    params
+                        .get("change")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("changed"),
+                )
+            };
+            log(&format!("{method} session={msp_sid}: {detail}"));
+        }
         "recap/completed" => {
             // The single settlement of an in-flight `recap/request`,
             // delivered to this connection outside the view stream.
