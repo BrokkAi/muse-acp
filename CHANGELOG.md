@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Verify the Windows verbatim `\\?\C:\...` workspace-root form against real
+  Muse hosts and keep it covered. A Windows x64 run of the multi-root,
+  mode-change, and load/re-attach flows passed against every pinned build
+  (1.4.1, 1.4.2, 1.4.3, 1.4.4; each Windows binary checksum-verified against
+  Muse's published manifest), so 1.4.1 and 1.4.2 accept the form and no
+  version gating is needed. The `live-host` matrix now runs those flows on
+  Windows x64 for every pinned build. The same run recorded Windows
+  host-platform gaps outside the flows: `session/delete` answers
+  `UnsupportedPlatform` on 1.4.1/1.4.2, and the bash shell and 1.4.1 fork
+  tests do not pass on Windows.
 - Render Muse todo plans on ACP v2 connections. The adapter previously
   emitted only the v1 `plan` frame, which v2 clients drop, so plans silently
   never appeared on a v2 session. v2 now receives the todo snapshot as a
