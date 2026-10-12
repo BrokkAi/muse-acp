@@ -73,6 +73,7 @@ pub struct Hosts {
     launching: Mutex<()>,
     user_input_dialogs: bool,
     user_shell: bool,
+    computer_use_setup: bool,
     forward: Forward,
 }
 
@@ -83,10 +84,16 @@ impl Hosts {
     pub fn launch(
         user_input_dialogs: bool,
         user_shell: bool,
+        computer_use_setup: bool,
         forward: Forward,
     ) -> Result<Arc<Hosts>, LaunchError> {
-        let (host, generation) =
-            launch_process(HostKind::Main, user_input_dialogs, user_shell, &forward)?;
+        let (host, generation) = launch_process(
+            HostKind::Main,
+            user_input_dialogs,
+            user_shell,
+            computer_use_setup,
+            &forward,
+        )?;
         Ok(Arc::new(Hosts {
             main: Mutex::new(Current { host, generation }),
             read_only: Mutex::new(None),
@@ -95,6 +102,7 @@ impl Hosts {
             launching: Mutex::new(()),
             user_input_dialogs,
             user_shell,
+            computer_use_setup,
             forward,
         }))
     }
@@ -106,6 +114,7 @@ impl Hosts {
             kind,
             self.user_input_dialogs,
             self.user_shell,
+            self.computer_use_setup,
             &self.forward,
         )
     }
@@ -306,9 +315,15 @@ fn launch_process(
     kind: HostKind,
     user_input_dialogs: bool,
     user_shell: bool,
+    computer_use_setup: bool,
     forward: &Forward,
 ) -> Result<(Arc<MspHost>, u64), LaunchError> {
-    let (host, events) = MspHost::launch(user_input_dialogs, user_shell, kind.args())?;
+    let (host, events) = MspHost::launch(
+        user_input_dialogs,
+        user_shell,
+        computer_use_setup,
+        kind.args(),
+    )?;
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
     forward(HostTag { kind, generation }, events);
     Ok((host, generation))

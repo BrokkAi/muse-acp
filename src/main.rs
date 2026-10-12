@@ -49,6 +49,7 @@ static READ_OUTPUT: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiat
 static HOOKS: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates session hook reads
 static SIDE_CHAT: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates side-chat creation
 static PLUGINS: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates plugin reads
+static COMPUTER_USE: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates computer-use setup
 static AIR_FILE_REPORT: AtomicU64 = AtomicU64::new(0); // 1 when per-turn file reports are negotiated
 static MUSE_NOT_INSTALLED: AtomicBool = AtomicBool::new(false); // host launch found no Muse executable
 
@@ -1410,7 +1411,7 @@ enum LoopMsg {
 /// MSP `session/delete` support (Muse 1.4.1 or 1.4.2, durable); clients
 /// must not call `session/delete` unless it is advertised.
 fn v2_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["hooks","plugins","readOutput","sideChat","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
+    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v2())
         .replace(
@@ -1428,7 +1429,7 @@ fn v2_init(session_mcp: bool, session_delete: bool) -> String {
 }
 
 fn v1_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["hooks","plugins","readOutput","sideChat","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true}}}"#
+    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v1())
         .replace("__MCP_HTTP__", if session_mcp { "true" } else { "false" })
@@ -3136,6 +3137,7 @@ fn main() {
                             let new_host = match Hosts::launch(
                                 user_input_dialogs,
                                 USER_SHELL.load(Ordering::SeqCst) == 1,
+                                COMPUTER_USE.load(Ordering::SeqCst) == 1,
                                 forward,
                             ) {
                                 Ok(h) => h,
@@ -3799,6 +3801,11 @@ fn negotiate_acp(msg: &J) -> bool {
     PLUGINS.store(u64::from(plugins), Ordering::SeqCst);
     if plugins {
         log("client negotiated plugin reads");
+    }
+    let computer_use = client_supports_muse(capabilities, "computerUse");
+    COMPUTER_USE.store(u64::from(computer_use), Ordering::SeqCst);
+    if computer_use {
+        log("client negotiated computer-use setup");
     }
     let recommended = client_supports_air(capabilities, "recommendedValue");
     AIR_RECOMMENDED.store(u64::from(recommended), Ordering::SeqCst);
@@ -5271,6 +5278,26 @@ fn handle_acp(
                     }
                     return;
                 }
+                // `/cua` mirrors the host TUI: setup status/start and the
+                // settings patch, each settled with its rendered result.
+                if let Ok(text) = &line
+                    && let Some(parsed) = parse_cua_command(text)
+                {
+                    match parsed {
+                        Ok(action) => run_cua(
+                            host,
+                            stdout,
+                            sessions,
+                            &sid,
+                            ver,
+                            id.clone(),
+                            &acp_content,
+                            action,
+                        ),
+                        Err(message) => acp::send_error(stdout, &id, -32602, &message),
+                    }
+                    return;
+                }
                 let workflow_children = || {
                     sessions
                         .lock()
@@ -5749,6 +5776,90 @@ fn handle_acp(
                     &format!("item/readOutput failed: {}", err_message(&error)),
                 ),
             }
+        }
+        "_session/computerUse" => {
+            if COMPUTER_USE.load(Ordering::SeqCst) == 0 || !host.handshake().computer_use_setup {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32601,
+                    "computer use requires the muse computerUse opt-in and the host's computerUseSetup grant",
+                );
+                return;
+            }
+            let acp_sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let Some(acp_sid) = acp_sid else {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32602,
+                    "_session/computerUse requires sessionId",
+                );
+                return;
+            };
+            let msp_sid = match sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&acp_sid)
+            {
+                Some(session) => session.msp_sid.clone(),
+                None => {
+                    acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                    return;
+                }
+            };
+            let setup = match host.command(
+                "computerUseSetup/read",
+                &format!("{{\"sessionId\":{}}}", esc(&msp_sid)),
+            ) {
+                Ok(result) => result,
+                Err(error) => {
+                    send_host_error(
+                        stdout,
+                        &id,
+                        &error,
+                        -32603,
+                        &format!("computerUseSetup/read failed: {}", err_message(&error)),
+                    );
+                    return;
+                }
+            };
+            let show_built_ins = params
+                .as_ref()
+                .and_then(|p| p.get("showBuiltIns"))
+                .is_some_and(|v| matches!(v, J::Bool(true)));
+            let settings_params = if show_built_ins {
+                "{\"showBuiltIns\":true}"
+            } else {
+                "{}"
+            };
+            let settings = match host.command("computerUseSettings/read", settings_params) {
+                Ok(result) => result,
+                Err(error) => {
+                    send_host_error(
+                        stdout,
+                        &id,
+                        &error,
+                        -32603,
+                        &format!("computerUseSettings/read failed: {}", err_message(&error)),
+                    );
+                    return;
+                }
+            };
+            acp::send_result(
+                stdout,
+                &id,
+                &format!(
+                    "{{\"setup\":{},\"settings\":{}}}",
+                    j_to_string(&setup),
+                    j_to_string(&settings)
+                ),
+            );
         }
         "_session/plugins" => {
             if PLUGINS.load(Ordering::SeqCst) == 0 {
@@ -7679,6 +7790,56 @@ fn parse_skill_activation_command(text: &str) -> Option<Result<ProtocolCommand, 
     )))
 }
 
+/// One `/cua` action: read the setup, run setup, or patch the settings.
+#[derive(PartialEq, Eq)]
+enum CuaAction {
+    Status,
+    Start,
+    Set {
+        key: &'static str,
+        value: &'static str,
+    },
+    Block {
+        bundle: String,
+        block: bool,
+    },
+}
+
+/// Parse `/cua [status|on|set <capability> <choice>|block|unblock <bundleId>]`
+/// mirroring the host TUI's `/cua` command. Both dropdown vocabularies are
+/// closed, so an unknown value fails before any host call.
+fn parse_cua_command(text: &str) -> Option<Result<CuaAction, String>> {
+    const USAGE: &str = "usage: /cua [status|on|set computerControl|screenshots ask|alwaysAllow|block <bundleId>|unblock <bundleId>]";
+    let body = text.strip_prefix('/')?;
+    let mut words = body.split_whitespace();
+    if words.next()? != "cua" {
+        return None;
+    }
+    let rest: Vec<&str> = words.collect();
+    match rest.as_slice() {
+        [] | ["status"] => Some(Ok(CuaAction::Status)),
+        ["on"] => Some(Ok(CuaAction::Start)),
+        ["set", capability, choice] => {
+            let key = match *capability {
+                "computerControl" => "computerControl",
+                "screenshots" => "screenshots",
+                _ => return Some(Err(USAGE.to_string())),
+            };
+            let value = match *choice {
+                "ask" => "ask",
+                "alwaysAllow" => "alwaysAllow",
+                _ => return Some(Err(USAGE.to_string())),
+            };
+            Some(Ok(CuaAction::Set { key, value }))
+        }
+        [action @ ("block" | "unblock"), bundle] => Some(Ok(CuaAction::Block {
+            bundle: bundle.to_string(),
+            block: *action == "block",
+        })),
+        _ => Some(Err(USAGE.to_string())),
+    }
+}
+
 /// Parse the `/plugin ...` command family into a host write:
 ///
 /// - `/plugin install <marketplace> <name>` installs a named marketplace plugin;
@@ -7848,7 +8009,8 @@ fn parse_workflow_command(
 }
 
 /// Adapter-local slash commands that map onto one host method.
-const PROTOCOL_COMMANDS: [&str; 9] = [
+const PROTOCOL_COMMANDS: [&str; 10] = [
+    "cua",
     "feedback",
     "goal",
     "plugin",
@@ -12020,6 +12182,168 @@ fn start_recap(
     } else {
         send_v1_user_message(stdout, acp_sid, prompt_content);
     }
+}
+
+/// Run one `/cua` action against the host. The client's opt-in and the
+/// host's `computerUseSetup` grant are both required; the gate's
+/// `computerUseUnavailable` refusal stays typed.
+#[allow(clippy::too_many_arguments)]
+fn run_cua(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    ver: u8,
+    prompt_req: Option<J>,
+    prompt_content: &str,
+    action: CuaAction,
+) {
+    if COMPUTER_USE.load(Ordering::SeqCst) == 0 || !host.handshake().computer_use_setup {
+        acp::send_error(
+            stdout,
+            &prompt_req,
+            -32601,
+            "computer use requires the muse computerUse opt-in and the host's computerUseSetup grant",
+        );
+        return;
+    }
+    let msp_sid = match sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(acp_sid)
+    {
+        Some(s) => s.msp_sid.clone(),
+        None => return,
+    };
+    let call = |method: &str, params: String| match host.command(method, &params) {
+        Ok(result) => Ok(result),
+        Err(error) => {
+            send_host_error(
+                stdout,
+                &prompt_req,
+                &error,
+                -32603,
+                &format!("{method} failed: {}", err_message(&error)),
+            );
+            Err(())
+        }
+    };
+    let text = match &action {
+        CuaAction::Status => {
+            let Ok(setup) = call(
+                "computerUseSetup/read",
+                format!("{{\"sessionId\":{}}}", esc(&msp_sid)),
+            ) else {
+                return;
+            };
+            let Ok(settings) = call("computerUseSettings/read", "{}".to_string()) else {
+                return;
+            };
+            format!(
+                "{}\n{}",
+                cua_state_text(&setup),
+                cua_settings_text(&settings)
+            )
+        }
+        CuaAction::Start => {
+            let cmd = host.mint_cmd("cmd-");
+            let Ok(state) = call(
+                "computerUseSetup/start",
+                format!(
+                    "{{\"commandId\":{},\"sessionId\":{}}}",
+                    esc(&cmd),
+                    esc(&msp_sid)
+                ),
+            ) else {
+                return;
+            };
+            cua_state_text(&state)
+        }
+        CuaAction::Set { key, value } => {
+            let Ok(settings) = call(
+                "computerUseSettings/update",
+                format!("{{\"{key}\":{}}}", esc(value)),
+            ) else {
+                return;
+            };
+            cua_settings_text(&settings)
+        }
+        CuaAction::Block { bundle, block } => {
+            let field = if *block { "blockApps" } else { "unblockApps" };
+            let Ok(settings) = call(
+                "computerUseSettings/update",
+                format!("{{\"{field}\":[{}]}}", esc(bundle)),
+            ) else {
+                return;
+            };
+            cua_settings_text(&settings)
+        }
+    };
+    settle_command_with_text(
+        stdout,
+        sessions,
+        acp_sid,
+        ver,
+        &prompt_req.unwrap_or(J::Null),
+        prompt_content,
+        &text,
+    );
+}
+
+/// Human text for a computer-use setup state.
+fn cua_state_text(state: &J) -> String {
+    let field = |key: &str| state.get(key).and_then(J::as_str).unwrap_or("unknown");
+    let mut text = format!(
+        "Computer use setup: {} (screen recording {}, accessibility {}, input monitoring {})",
+        field("setup"),
+        field("screenRecording"),
+        field("accessibility"),
+        field("inputMonitoring"),
+    );
+    if let Some(message) = state
+        .get("message")
+        .and_then(J::as_str)
+        .filter(|message| !message.is_empty())
+    {
+        text.push('\n');
+        text.push_str(message);
+    }
+    if let Some(refused) = state
+        .get("refused")
+        .and_then(J::as_str)
+        .filter(|refused| !refused.is_empty())
+    {
+        text.push_str(&format!("\nRefused: {refused}"));
+    }
+    text
+}
+
+/// Human text for the computer-use settings.
+fn cua_settings_text(settings: &J) -> String {
+    let field = |key: &str| settings.get(key).and_then(J::as_str).unwrap_or("unknown");
+    let mut text = format!(
+        "Computer use settings: computer control {}, screenshots {}",
+        field("computerControl"),
+        field("screenshots"),
+    );
+    if let Some(J::Arr(apps)) = settings.get("blockedApps") {
+        let rows: Vec<String> = apps
+            .iter()
+            .filter_map(|app| {
+                let id = app.get("bundleId").and_then(J::as_str)?;
+                let locked = matches!(app.get("locked"), Some(J::Bool(true)));
+                Some(if locked {
+                    format!("{id} (built-in)")
+                } else {
+                    id.to_string()
+                })
+            })
+            .collect();
+        if !rows.is_empty() {
+            text.push_str(&format!("\nBlocked apps: {}", rows.join(", ")));
+        }
+    }
+    text
 }
 
 /// Start `/skill-import`: import foreign skills from one of the host's own

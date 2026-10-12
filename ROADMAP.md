@@ -592,10 +592,10 @@ continues.
 | `plugin/marketplaceUpdate` | Mapped to ACP | The adapter-local `/plugin marketplace update <name>` slash command refreshes a marketplace and settles on the host record ack. |
 | `recap/request` | Mapped to ACP | The adapter-local `/recap` slash command sends the request and holds the ACP prompt open (one recap per session) until `recap/completed` settles it with the host's summary. |
 | `recap/cancel` | Mapped to ACP | `session/cancel` while a recap is in flight sends `recap/cancel` and settles the held prompt `cancelled`, so the host's 45-second timeout is never waited on. |
-| `computerUseSettings/read` | Unsupported pending protocol decision | [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
-| `computerUseSettings/update` | Unsupported pending protocol decision | [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
-| `computerUseSetup/read` | Unsupported pending protocol decision | [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
-| `computerUseSetup/start` | Unsupported pending protocol decision | [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
+| `computerUseSettings/read` | Mapped to ACP | Read by the opt-in `_session/computerUse` extension (with `showBuiltIns`) and rendered by `/cua`; the settings object is returned verbatim. |
+| `computerUseSettings/update` | Mapped to ACP | `/cua set computerControl|screenshots ask|alwaysAllow` and `/cua block|unblock <bundleId>` apply one all-or-nothing patch and render the returned settings. |
+| `computerUseSetup/read` | Mapped to ACP | Read by `_session/computerUse` and `/cua [status]`, which render the setup phase, the three permissions, and any refusal message verbatim. |
+| `computerUseSetup/start` | Mapped to ACP | `/cua on` runs the setup between turns and renders the state it settles in, mirroring the TUI's `/cua on`. |
 | `skill/setActivation` | Mapped to ACP | The adapter-local `/skill-activation <selector> on\|userInvocableOnly\|off [scope]` slash command writes one skill's activation and settles on the host ack; the scope defaults to `user` and the closed vocabulary is validated locally. A refused selector keeps the host's typed `skillNotFound` data. |
 | `skill/import` | Mapped to ACP | The adapter-local `/skill-import <claude\|codex> [dry-run] [force]` slash command imports foreign skills and renders the host's receipt (counts plus installed/quarantined/skipped/failed ids) as command text. Imported skills reach the catalog through the host's `skill/changed`; the adapter keeps no local activation or import cache. |
 | `workflow/pause` | Mapped to ACP | The adapter-local `/workflow pause [<runId>]` slash command sends the run's pause and settles on the admission-only ack; the pause folds into the card's title and `_meta.muse.workflow.paused`. A single live run may be implied and a bare `/workflow` lists the live runs. |
@@ -608,8 +608,8 @@ continues.
 | `plugin/changed` | Consumed | Logged as an install-landed diagnostic; the adapter keeps no plugin cache, so clients re-read the opt-in `_session/plugins` view. |
 | `plugin/marketplaceChanged` | Consumed | Logged as a marketplace-change diagnostic; clients re-read `_session/plugins` rather than a local cache. |
 | `recap/completed` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#215](https://github.com/BrokkAi/muse-acp/issues/215) |
-| `computerUseSetup/changed` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
-| `computerUseSetup` capability | Unsupported pending protocol decision | Never requested; [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
+| `computerUseSetup/changed` | Consumed | Logged as a diagnostic; the adapter keeps no CUA state, so the next `_session/computerUse` read or `/cua` command re-reads the host's truth. |
+| `computerUseSetup` capability | Mapped to ACP | Requested in the MSP handshake only when the ACP client opts in with `_meta.muse.computerUse`; the adapter's computer-use surface stays dark unless the host grants it. |
 | `marketplaceNotFound` (-32034) | Mapped to ACP | Forwarded with its registry code and the host's typed data from the plugin commands and the `_session/plugins` read. |
 | `pluginNotFound` (-32035) | Mapped to ACP | Forwarded with its registry code and the host's typed data. |
 | `marketplaceAlreadyExists` (-32036) | Mapped to ACP | Forwarded with its registry code and the host's typed data. |

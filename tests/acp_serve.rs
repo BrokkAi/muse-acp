@@ -8383,6 +8383,169 @@ fn output_unavailable_is_forwarded_as_typed_error() {
 /// host's `hook/list` rows verbatim; the read also seeds the fold's hook
 /// inventory.
 #[test]
+fn computer_use_reads_require_the_opt_in_and_the_grant() {
+    const OPT_IN: &str =
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"computerUse\"]}}}";
+    // Without the client's opt-in the extension is refused.
+    let mut c = Client::spawn("computer_use", &[]);
+    let sid = c.new_session(2, "");
+    let id = c.req(
+        "_session/computerUse",
+        &format!("{{\"sessionId\":\"{sid}\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32601") && frame.contains("computerUse opt-in"),
+        "un-negotiated computer use must fail closed: {frame}"
+    );
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !calls.lines().any(|line| line.starts_with("computerUse")),
+        "the refused read never reaches the host: {calls}"
+    );
+    c.finish();
+
+    // Opting in is not enough: the host's grant is required too.
+    let mut c = Client::spawn("computer_use", &[("FAKE_NO_COMPUTER_USE", "1")]);
+    let sid = c.new_session(2, OPT_IN);
+    c.wait_stderr(
+        "client negotiated computer-use setup",
+        Duration::from_secs(10),
+    );
+    let id = c.req(
+        "_session/computerUse",
+        &format!("{{\"sessionId\":\"{sid}\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32601") && frame.contains("host's computerUseSetup grant"),
+        "a withheld grant must fail closed: {frame}"
+    );
+    c.finish();
+
+    // With both, the extension returns the setup state and settings; built-in
+    // blocks appear only when asked for.
+    let mut c = Client::spawn("computer_use", &[]);
+    let sid = c.new_session(2, OPT_IN);
+    let id = c.req(
+        "_session/computerUse",
+        &format!("{{\"sessionId\":\"{sid}\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"setup\":\"dormant\"")
+            && frame.contains("\"computerControl\":\"ask\"")
+            && frame.contains("\"bundleId\":\"com.acme.Secrets\"")
+            && !frame.contains("com.apple.finder"),
+        "the read returns setup and settings: {frame}"
+    );
+    let id = c.req(
+        "_session/computerUse",
+        &format!("{{\"sessionId\":\"{sid}\",\"showBuiltIns\":true}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("com.apple.finder") && frame.contains("\"locked\":true"),
+        "showBuiltIns adds the locked rows: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn cua_commands_drive_setup_and_settings() {
+    const OPT_IN: &str =
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"computerUse\"]}}}";
+    let mut c = Client::spawn("computer_use", &[]);
+    let sid = c.new_session(2, OPT_IN);
+    for (text, want) in [
+        ("/cua", "Computer use setup: dormant"),
+        ("/cua status", "Computer use settings: computer control ask"),
+        ("/cua on", "Computer use setup: readyForTarget"),
+    ] {
+        let pid = c.prompt(&sid, text);
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert_eq!(frame.matches("\"result\":{}").count(), 1, "{text}: {frame}");
+        let text_frame = c.wait_for(want, Duration::from_secs(15));
+        assert!(
+            text_frame.contains("agent_message_chunk"),
+            "{text}: {text_frame}"
+        );
+    }
+    c.wait_log("computerUseSetup/start", Duration::from_secs(10));
+    // The setup change notice is consumed (no unhandled-notification error).
+    c.wait_stderr("computerUseSetup/changed", Duration::from_secs(10));
+
+    let pid = c.prompt(&sid, "/cua set screenshots alwaysAllow");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    c.wait_input("\"screenshots\": \"alwaysAllow\"", Duration::from_secs(10));
+    let shown = c.wait_for(
+        "Computer use settings: computer control ask, screenshots alwaysAllow",
+        Duration::from_secs(15),
+    );
+    assert!(shown.contains("agent_message_chunk"), "{shown}");
+
+    let pid = c.prompt(&sid, "/cua block com.acme.Other");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    c.wait_input(
+        "\"blockApps\": [\"com.acme.Other\"]",
+        Duration::from_secs(10),
+    );
+    let pid = c.prompt(&sid, "/cua unblock com.acme.Secrets");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    c.wait_input(
+        "\"unblockApps\": [\"com.acme.Secrets\"]",
+        Duration::from_secs(10),
+    );
+
+    for text in ["/cua nonsense", "/cua set model alwaysAllow", "/cua block"] {
+        let pid = c.prompt(&sid, text);
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"code\":-32602") && frame.contains("usage: /cua"),
+            "{text} must fail closed: {frame}"
+        );
+    }
+    // A session without the opt-in cannot reach the host.
+    let mut bare = Client::spawn("computer_use", &[]);
+    let bare_sid = bare.new_session(2, "");
+    let pid = bare.prompt(&bare_sid, "/cua on");
+    let frame = bare.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32601") && frame.contains("computerUse opt-in"),
+        "the command respects the gate: {frame}"
+    );
+    bare.finish();
+    c.finish();
+}
+
+#[test]
+fn computer_use_unavailable_is_forwarded_as_a_typed_error() {
+    const OPT_IN: &str =
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"computerUse\"]}}}";
+    let mut c = Client::spawn("computer_use_unavailable", &[]);
+    let sid = c.new_session(2, OPT_IN);
+    let id = c.req(
+        "_session/computerUse",
+        &format!("{{\"sessionId\":\"{sid}\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32033") && frame.contains("\"kind\":\"computerUseUnavailable\""),
+        "the CUA gate's refusal stays typed: {frame}"
+    );
+    let pid = c.prompt(&sid, "/cua on");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32033") && frame.contains("computerUseUnavailable"),
+        "the command keeps the typed refusal: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
 fn plugin_reads_require_opt_in_and_return_the_inventory() {
     let mut c = Client::spawn("plugin_control", &[]);
     let sid = c.new_session(2, "");

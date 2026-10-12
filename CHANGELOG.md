@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Add the opt-in computer-use surface. A client that advertises
+  `_meta.muse.computerUse` makes the adapter request the host's
+  `computerUseSetup` capability, and the `_session/computerUse` extension then
+  reads the session's setup state plus the computer-use settings (built-in
+  blocks with `showBuiltIns`). `/cua [status]`, `/cua on`, `/cua set
+  computerControl|screenshots ask|alwaysAllow`, and `/cua block|unblock
+  <bundleId>` mirror the host TUI for setup and settings patches. The CUA
+  gate's `computerUseUnavailable` (-32033) keeps its typed data, and
+  `computerUseSetup/changed` is consumed as a diagnostic with no local state.
 - Add plugin and marketplace management. The opt-in `_session/plugins`
   extension (muse `plugins` capability) reads the session's installed plugin
   rows through the host's `plugin/list`; `/plugin install <marketplace>
