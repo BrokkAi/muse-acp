@@ -1060,6 +1060,10 @@ fn available_commands_json(
             input("<name>")
         ),
         format!(
+            "{{\"name\":\"workflow\",\"description\":\"Pause or resume a running workflow\",\"input\":{}}}",
+            input("pause|resume [<runId>]")
+        ),
+        format!(
             "{{\"name\":\"workflow-child\",\"description\":\"Skip or retry a running workflow child\",\"input\":{}}}",
             input("skip|retry <childId>")
         ),
@@ -1068,8 +1072,10 @@ fn available_commands_json(
         skills
             .iter()
             .filter(|(name, _, _)| {
-                !matches!(name.as_str(), "goal" | "rename" | "workflow-child")
-                    && !(feedback && name.as_str() == "feedback")
+                !matches!(
+                    name.as_str(),
+                    "goal" | "rename" | "workflow" | "workflow-child"
+                ) && !(feedback && name.as_str() == "feedback")
             })
             .map(|(name, description, hint)| {
                 let input = hint
@@ -1340,7 +1346,7 @@ mod tests {
                 panic!("available commands must be an array");
             };
             // The host's `rename` row is shadowed by the local command.
-            assert_eq!(items.len(), 6);
+            assert_eq!(items.len(), 7);
             assert_eq!(
                 commands.matches("\"name\":\"feedback\"").count(),
                 1,
@@ -1350,6 +1356,7 @@ mod tests {
             assert!(commands.contains("\"name\":\"goal\""));
             assert!(commands.contains("\"name\":\"compact\""));
             assert!(commands.contains("\"name\":\"rename\""));
+            assert!(commands.contains("\"name\":\"workflow\""));
             assert!(commands.contains("\"name\":\"workflow-child\""));
             assert!(!commands.contains("Host rename skill"));
         }

@@ -17,8 +17,8 @@ To see it working, run the per-issue test command named in each milestone below;
 ## Progress
 
 - [x] (2026-10-12) Surveyed the open issues #214 through #224, the vendored schema, `ROADMAP.md` section 9, and the existing extension and slash-command patterns.
-- [ ] (2026-10-12) Issue #223 `userInput/interrupt`: implemented on `issue-223/userinput-interrupt` (staged multi-question forms, interrupt with confirmed answers, fake-host and live-1.4.6 tests, docs), PR and merge pending.
-- [ ] Issue #218 `workflow/pause` and `workflow/resume`.
+- [x] (2026-10-12) Issue #223 `userInput/interrupt`: merged in PR #228 (staged multi-question forms, interrupt with confirmed answers, fake-host and live-1.4.6 tests, docs).
+- [ ] (2026-10-12) Issue #218 `workflow/pause` and `workflow/resume`: implemented on `issue-218/workflow-pause-resume` (fold pause state and resume generation, `/workflow pause|resume [<runId>]`, fake-host plus live-1.4.6 tests, docs), PR and merge pending.
 - [ ] Issue #220 `hook/list`.
 - [ ] Issue #215 `recap/request` and `recap/cancel`.
 - [ ] Issue #217 `skill/setActivation` and `skill/import`.
@@ -36,6 +36,9 @@ To see it working, run the per-issue test command named in each milestone below;
 - Observation: the ACP elicitation contract cannot carry partial answers. `elicitation/create` is answered exactly once, and only the `accept` action carries any content; `decline` and `cancel` carry none. Therefore the adapter can only hold "confirmed partial answers" if it collects answers one question at a time itself. This shapes the #223 milestone.
   Evidence: the ACP schema at `agentclientprotocol/agent-client-protocol` defines `ElicitationAction` as `Accept(ElicitationAcceptAction)`, `Decline`, `Cancel`, with the action flattened and content only on the accept arm.
 
+- Observation: Muse 1.4.6 reuses a workflow's run id for the resumed generation. A paused run named `workflow-run-model-tool-call_1` resumed as an item with both `workflowRunId` and `resumeFromRunId` equal to `workflow-run-model-tool-call_1`, a fresh item id, `triggerSource: "guidanceAuto"`, and a restarted revision sequence. The fold therefore treats a same-id `resumeFromRunId` as a generation boundary (bypassing the revision guard) instead of a supersession to a different run.
+  Evidence: a live 1.4.6 run paused via `/workflow pause`, resumed via `/workflow resume`, and the resumed card frame carried both ids equal; the host's session record shows the resumed launch as a new `workflow_run_launched` event under the same run id.
+
 
 ## Decision Log
 
@@ -50,6 +53,10 @@ To see it working, run the per-issue test command named in each milestone below;
 
 - Decision: each milestone updates the ROADMAP section 9 row for its surfaces from "Unsupported pending protocol decision" to the behavior actually implemented, adds a `CHANGELOG.md` Unreleased entry, and updates `docs/event-compatibility.md` when a notification's disposition changes.
   Rationale: the repository's contribution rules require documentation to match behavior, and existing tests enforce that the notification matrix classifies every published schema notification exactly once.
+  Date/Author: 2026-10-12, Codex.
+
+- Decision: name the run-control command `/workflow pause|resume [<runId>]`, following issue #218's suggested spelling.
+  Rationale: a host skill named `workflow` is shadowed, which is the same tradeoff already accepted for `/goal`, `/rename`, and `/compact`. The alternative `/workflow-child`-style hyphenated name would contradict the issue's explicit suggestion, and the adapter's help text lists the live runs so the command is discoverable.
   Date/Author: 2026-10-12, Codex.
 
 

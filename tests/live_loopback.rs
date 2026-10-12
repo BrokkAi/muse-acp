@@ -1367,6 +1367,87 @@ fn stopping_a_staged_question_interrupts_with_the_confirmed_answer() {
     adapter.finish();
 }
 
+/// Pausing a live workflow folds the pause fact onto its card, and resuming
+/// it launches a new run whose item names the paused one. `workflow/pause`
+/// arrived in Muse 1.4.4; `workflow/resume` in 1.4.6, so the resume half
+/// skips on the older CI pins.
+#[test]
+fn workflow_pause_and_resume_drive_a_real_run() {
+    let test = "workflow_pause_and_resume_drive_a_real_run";
+    if !enabled(test) {
+        return;
+    }
+    // The child's model call holds the workflow open long enough to pause it.
+    let host = Host::start(
+        json!({
+            "workflow": {"tool": {"name": "workflow", "arguments": {
+                "name": "Pausable run",
+                "script": "export default async function workflow(host) { return await host.agent({ input: \"child task [[script:hold]]\", label: \"helper\" }); }",
+            }}},
+            "hold": {"text": "working", "hold_ms": 60000},
+        }),
+        None,
+    );
+    let mut adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    if release < (1, 4, 4) {
+        eprintln!("skipped {test}: host release {release:?} predates workflow/pause");
+        adapter.finish();
+        return;
+    }
+    let session = adapter.new_session(&host, json!([]));
+    adapter.turn(&session, "delegate it [[script:workflow]]");
+    adapter.wait("the running workflow card", |frame| {
+        let update = &frame["params"]["update"];
+        frame["method"] == "session/update"
+            && update["title"] == "Workflow Pausable run"
+            && update["status"] == "in_progress"
+    });
+    let paused = adapter.prompt(&session, "/workflow pause");
+    let result = adapter.result(paused);
+    assert!(result.is_object(), "pause settles on the ack: {result}");
+    let paused_card = adapter.wait("the paused workflow card", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["update"]["title"] == "Workflow Pausable run (paused)"
+    });
+    assert_eq!(
+        paused_card["params"]["update"]["_meta"]["muse"]["workflow"]["paused"],
+        json!(true),
+        "{paused_card}"
+    );
+    let run_id = paused_card["params"]["update"]["_meta"]["muse"]["workflow"]["workflowRunId"]
+        .as_str()
+        .expect("the card names its run id")
+        .to_string();
+    if release < (1, 4, 6) {
+        eprintln!(
+            "skipped the resume half of {test}: host release {release:?} predates workflow/resume"
+        );
+        adapter.finish();
+        return;
+    }
+    let resumed = adapter.prompt(&session, &format!("/workflow resume {run_id}"));
+    let result = adapter.result(resumed);
+    assert!(result.is_object(), "resume settles on the ack: {result}");
+    let card = adapter.wait("the resumed workflow card", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["update"]["_meta"]["muse"]["workflow"]["resumeFromRunId"]
+                == json!(run_id)
+    });
+    // Muse 1.4.6 reuses the run id for the resumed generation, so the new
+    // item (a fresh card) is the observable boundary, not a new run id.
+    assert_ne!(
+        card["params"]["update"]["toolCallId"], paused_card["params"]["update"]["toolCallId"],
+        "the resumed launch is a new item: {card}"
+    );
+    assert_eq!(
+        card["params"]["update"]["_meta"]["muse"]["workflow"]["workflowRunId"],
+        json!(run_id),
+        "{card}"
+    );
+    adapter.finish();
+}
+
 #[test]
 fn a_workflow_child_runs_and_its_result_reaches_the_parent() {
     if !enabled("a_workflow_child_runs_and_its_result_reaches_the_parent") {

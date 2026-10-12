@@ -161,9 +161,13 @@ pub struct SessionFold {
     pub announced_tasks: std::collections::HashSet<String>,
     /// Workflow async task ids, keyed by the AIR task id (workflowRunId).
     workflow_tasks: HashMap<String, String>,
-    /// Latest `(revision, children)` of each running workflow, keyed by
-    /// `workflowRunId`. Child control reads the current attempt from here.
-    workflow_children: HashMap<String, (u64, Vec<WorkflowChild>)>,
+    /// Latest observation of each running workflow, keyed by
+    /// `workflowRunId`. Child and run control read the current attempt and
+    /// pause state from here.
+    workflow_children: HashMap<String, WorkflowObservation>,
+    /// Runs superseded by a newer resumed launch (`resumeFromRunId`). A late
+    /// or replayed observation of a superseded run never brings it back.
+    superseded_workflows: std::collections::HashSet<String>,
     /// Last terminal state sent for each async task.
     /// AIR task id -> MSP item id, used when task control targets the host.
     async_task_msp_ids: HashMap<String, String>,
@@ -193,6 +197,23 @@ pub struct WorkflowChild {
     pub label: String,
 }
 
+/// One live workflow run, as the latest workflow item reported it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkflowRun {
+    pub workflow_run_id: String,
+    /// `true` while the host's durable pause fact is in force.
+    pub paused: bool,
+    pub child_count: usize,
+}
+
+/// The adapter's latest view of one live workflow run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkflowObservation {
+    revision: u64,
+    paused: bool,
+    children: Vec<WorkflowChild>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SubagentObservation {
     pub item_status: String,
@@ -213,6 +234,7 @@ impl SessionFold {
             announced_tasks: std::collections::HashSet::new(),
             workflow_tasks: HashMap::new(),
             workflow_children: HashMap::new(),
+            superseded_workflows: std::collections::HashSet::new(),
             async_task_msp_ids: HashMap::new(),
             async_task_states: HashMap::new(),
             reminder_cards: HashMap::new(),
@@ -255,7 +277,8 @@ impl SessionFold {
     /// Track the children of a running workflow from its item snapshots. A
     /// terminal item (or a completed delivery) drops the run, and an older
     /// revision never replaces a newer one. Children without an id or a valid
-    /// attempt (integer >= 1) are not controllable and are skipped.
+    /// attempt (integer >= 1) are not controllable and are skipped. A
+    /// resumed launch (`resumeFromRunId`) supersedes the paused run it names.
     fn observe_workflow(&mut self, item: &J, completed: bool) {
         if item.get("kind").and_then(|v| v.as_str()) != Some("workflow") {
             return;
@@ -267,19 +290,44 @@ impl SessionFold {
         else {
             return;
         };
+        if self.superseded_workflows.contains(run_id) {
+            return;
+        }
         let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
         if completed || matches!(status, "completed" | "failed" | "cancelled") {
             self.workflow_children.remove(run_id);
             return;
         }
+        // A resumed launch is the successor generation: the paused run it
+        // names is no longer live (ADR 45437 D2/D3), so a late observation
+        // of it must never re-add it to the control listings. Muse 1.4.6
+        // reuses the run id for the resumed generation, so a same-id resume
+        // is a generation boundary of one run rather than a supersession.
+        let resumed_from = item
+            .get("resumeFromRunId")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty());
+        if let Some(predecessor) = resumed_from
+            && predecessor != run_id
+        {
+            self.workflow_children.remove(predecessor);
+            self.superseded_workflows.insert(predecessor.to_string());
+        }
         let revision = item.get("revision").and_then(|v| v.as_u64()).unwrap_or(0);
-        if self
-            .workflow_children
-            .get(run_id)
-            .is_some_and(|(seen, _)| *seen > revision)
+        // A resumed generation restarts the item's revision sequence under
+        // the same run id, so the resume fact itself is its ordering guard.
+        if resumed_from.is_none()
+            && self
+                .workflow_children
+                .get(run_id)
+                .is_some_and(|seen| seen.revision > revision)
         {
             return;
         }
+        let paused = item
+            .get("paused")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let children = match item.get("children") {
             Some(J::Arr(children)) => children
                 .iter()
@@ -305,8 +353,14 @@ impl SessionFold {
                 .collect(),
             _ => Vec::new(),
         };
-        self.workflow_children
-            .insert(run_id.to_string(), (revision, children));
+        self.workflow_children.insert(
+            run_id.to_string(),
+            WorkflowObservation {
+                revision,
+                paused,
+                children,
+            },
+        );
     }
 
     /// Children of every running workflow, ordered by run id and then by
@@ -315,7 +369,20 @@ impl SessionFold {
         let mut runs: Vec<_> = self.workflow_children.iter().collect();
         runs.sort_by(|a, b| a.0.cmp(b.0));
         runs.into_iter()
-            .flat_map(|(_, (_, children))| children.iter().cloned())
+            .flat_map(|(_, seen)| seen.children.iter().cloned())
+            .collect()
+    }
+
+    /// Every live workflow run, ordered by run id, with its pause state.
+    pub fn workflow_runs(&self) -> Vec<WorkflowRun> {
+        let mut runs: Vec<_> = self.workflow_children.iter().collect();
+        runs.sort_by(|a, b| a.0.cmp(b.0));
+        runs.into_iter()
+            .map(|(run_id, seen)| WorkflowRun {
+                workflow_run_id: run_id.clone(),
+                paused: seen.paused,
+                child_count: seen.children.len(),
+            })
             .collect()
     }
 
@@ -617,13 +684,16 @@ impl SessionFold {
             "workflow" => {
                 let entry = str_field("entryId");
                 let script = str_field("scriptId");
-                let title = if !entry.is_empty() {
+                let mut title = if !entry.is_empty() {
                     format!("Workflow {entry}")
                 } else if !script.is_empty() {
                     format!("Workflow {script}")
                 } else {
                     "Workflow".to_string()
                 };
+                if item.get("paused").and_then(|v| v.as_bool()) == Some(true) {
+                    title.push_str(" (paused)");
+                }
                 let content = match item.get("children") {
                     Some(J::Arr(children)) if !children.is_empty() => {
                         let lines: Vec<String> = children
@@ -663,6 +733,11 @@ impl SessionFold {
                         (
                             "triggerSource",
                             item.get("triggerSource").unwrap_or(&J::Null),
+                        ),
+                        ("paused", item.get("paused").unwrap_or(&J::Null)),
+                        (
+                            "resumeFromRunId",
+                            item.get("resumeFromRunId").unwrap_or(&J::Null),
                         ),
                     ],
                 );
@@ -2046,6 +2121,69 @@ mod corpus_tests {
         .unwrap();
         fold.on_item_completed("sid", 2, &completed, &mut out);
         assert!(fold.workflow_children().is_empty());
+    }
+
+    #[test]
+    fn workflow_runs_track_pause_and_resume_supersession() {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        let live = workflow_item(
+            2,
+            "inProgress",
+            r#"{"childId":"c1","attempt":1,"status":"started"}"#,
+        );
+        fold.on_item_snapshot("sid", 2, &live, &mut out);
+        let runs = fold.workflow_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].workflow_run_id, "wfr-1");
+        assert!(!runs[0].paused);
+        assert_eq!(runs[0].child_count, 1);
+
+        // A pause folds as the item's `paused` member.
+        let paused = parse_json(
+            r#"{"itemId":"it-wf","kind":"workflow","status":"inProgress","revision":3,"workflowRunId":"wfr-1","paused":true,"children":[{"childId":"c1","attempt":1,"status":"started"}]}"#,
+        )
+        .unwrap();
+        fold.on_item_snapshot("sid", 2, &paused, &mut out);
+        let runs = fold.workflow_runs();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].paused);
+
+        // A resumed launch supersedes the paused run it names.
+        let resumed = parse_json(
+            r#"{"itemId":"it-wf-2","kind":"workflow","status":"inProgress","revision":2,"workflowRunId":"wfr-2","resumeFromRunId":"wfr-1","children":[{"childId":"c1","attempt":1,"status":"started"}]}"#,
+        )
+        .unwrap();
+        fold.on_item_snapshot("sid", 2, &resumed, &mut out);
+        let runs = fold.workflow_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].workflow_run_id, "wfr-2");
+        assert!(!runs[0].paused);
+
+        // A late observation of the superseded run never brings it back.
+        fold.on_item_snapshot("sid", 2, &paused, &mut out);
+        let runs = fold.workflow_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].workflow_run_id, "wfr-2");
+
+        // Muse 1.4.6 reuses the run id for the resumed generation, restarting
+        // its revision sequence: the resume fact is the generation boundary.
+        let same_id_resume = parse_json(
+            r#"{"itemId":"it-wf-3","kind":"workflow","status":"inProgress","revision":1,"workflowRunId":"wfr-2","resumeFromRunId":"wfr-2","children":[{"childId":"c1","attempt":1,"status":"started"}]}"#,
+        )
+        .unwrap();
+        fold.on_item_snapshot("sid", 2, &same_id_resume, &mut out);
+        let runs = fold.workflow_runs();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].workflow_run_id, "wfr-2");
+        assert!(!runs[0].paused);
+        // The resumed generation's later snapshots still land.
+        let advanced = parse_json(
+            r#"{"itemId":"it-wf-3","kind":"workflow","status":"inProgress","revision":3,"workflowRunId":"wfr-2","children":[{"childId":"c1","attempt":2,"status":"started"}]}"#,
+        )
+        .unwrap();
+        fold.on_item_snapshot("sid", 2, &advanced, &mut out);
+        assert_eq!(fold.workflow_children()[0].attempt, 2);
     }
 
     #[test]

@@ -108,6 +108,30 @@ def reply_for(request):
     if ("You are judging one planned coding-agent action" in prompt_text
             and "review" in SCRIPT):
         return SCRIPT["review"]
+    # `workflow/resume` drives a turn that tells the model to call the
+    # workflow tool with the launch receipt's handoff (scriptPath +
+    # resumeFromRunId). Script that call back from the receipt so pause and
+    # resume flows reach the host's real resume path.
+    if "Resume the paused workflow run" in prompt_text:
+        handoff = {}
+        for item in items:
+            if item.get("type") != "function_call_output":
+                continue
+            try:
+                receipt = json.loads(item.get("output") or "{}")
+            except (TypeError, ValueError):
+                continue
+            message = receipt.get("message") if isinstance(receipt, dict) else ""
+            for key in ("name", "scriptPath", "resumeFromRunId"):
+                found = re.search(r'"%s": "([^"]+)"' % key, message or "")
+                if found:
+                    handoff[key] = found.group(1)
+        if "scriptPath" in handoff and "resumeFromRunId" in handoff:
+            return {"tool": {"name": "workflow", "arguments": {
+                "name": handoff.get("name", "resumed"),
+                "scriptPath": handoff["scriptPath"],
+                "resumeFromRunId": handoff["resumeFromRunId"],
+            }}}
     marker = re.search(r"\[\[script:([\w-]+)\]\]", prompt_text)
     if marker and marker.group(1) in SCRIPT:
         return SCRIPT[marker.group(1)]

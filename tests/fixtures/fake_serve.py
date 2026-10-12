@@ -40,7 +40,9 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   host_exit_relaunch_unavailable first exit is retryable, replacement exits 5
   host_crash_loop every generation crashes (exit 1) right after it is usable
   support_exit stdin-free serve probe writes stderr and exits with a code
-  workflow_control live workflow; workflow/cancel emits the later item/turn views
+  workflow_control live workflow; workflow/cancel emits the later item/turn
+               views, workflow/pause folds paused, workflow/resume launches
+               the resumed run
   skills_changed skill/list changes after a skill/changed notification
                (FAKE_SKILL_REFRESH_FAILS=1: the re-read has no skills array)
   skill_not_found skill/list still lists `stale`; turn/start rejects it
@@ -1782,6 +1784,45 @@ def result_for(method, msg):
                                       "status": "started", "phase": "triage",
                                       "label": "triage issue #1"}]}})
         return {"commandId": params.get("commandId", ""), "status": "accepted"}
+    if method == "workflow/pause":
+        params = msg.get("params", {})
+        log_input(params)
+        if SCENARIO == "workflow_control":
+            # The pause folds as the workflow item's `paused` member.
+            notify("item/updated", {
+                "sessionId": MSP_SID, "turnId": WORKFLOW_TURN[0], "item": {
+                    "itemId": "it-wf-control", "kind": "workflow",
+                    "status": "inProgress", "revision": 3,
+                    "workflowRunId": "wfr-control", "paused": True,
+                    "entryId": "triage-batch", "scriptId": "triage@sha256:aa10",
+                    "triggerSource": "modelProposal",
+                    "children": [{"childId": "c1",
+                                  "attempt": WORKFLOW_CHILD_ATTEMPT[0],
+                                  "status": "started", "phase": "triage",
+                                  "label": "triage issue #1"}]}})
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
+    if method == "workflow/resume":
+        params = msg.get("params", {})
+        log_input(params)
+        if SCENARIO == "workflow_control":
+            # A resumed launch is a new workflow item whose `resumeFromRunId`
+            # names the paused run it supersedes; like Muse 1.4.6, the
+            # resumed generation reuses the run id and restarts its revision
+            # sequence. The reply names the turn the host drove (here the
+            # session's busy turn).
+            notify("item/updated", {
+                "sessionId": MSP_SID, "turnId": WORKFLOW_TURN[0], "item": {
+                    "itemId": "it-wf-resumed", "kind": "workflow",
+                    "status": "inProgress", "revision": 1,
+                    "workflowRunId": "wfr-control",
+                    "resumeFromRunId": "wfr-control",
+                    "entryId": "triage-batch", "scriptId": "triage@sha256:aa10",
+                    "triggerSource": "guidanceAuto",
+                    "children": [{"childId": "c1", "attempt": 1,
+                                  "status": "started", "phase": "triage",
+                                  "label": "triage issue #1"}]}})
+        return {"commandId": params.get("commandId", ""), "status": "accepted",
+                "turnId": WORKFLOW_TURN[0]}
     if method == "workflow/cancel":
         params = msg.get("params", {})
         log_input(params)
