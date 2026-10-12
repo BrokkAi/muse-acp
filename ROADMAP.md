@@ -204,6 +204,16 @@ refuses it while keeping the session. Its `--disable-write` host also no
 longer offers write tools at all (through 1.4.2 it offered them and denied
 the call), so the read-only and Plan tests accept either refusal.
 
+Windows x64 legs pin the same builds and run the workspace-root flows only:
+multi-root `session/start`, and the sticky `turn/start` replacement after a
+mode change and a load/re-attach, which together carry the Win32 verbatim
+`\\?\C:\...` root form to the host. A live Windows run verified the form end
+to end against 1.4.1, 1.4.2, 1.4.3, and 1.4.4 (issue #199): the pre-1.4.3
+hosts accept it, so the adapter does not version-gate it. The same run met
+Windows host-platform gaps outside those flows: 1.4.1/1.4.2 answer
+`session/delete` with `UnsupportedPlatform`, the bash-based shell tests
+behave differently than on Linux, and 1.4.1 forks fail their boundary check.
+
 **Work items**
 
 - Pin the SDK revision (currently `ea88c822`, 2026-10-11) and vendor
@@ -419,7 +429,10 @@ repeated/nested roots, path traversal, hard links, and Windows paths. On Muse
 (`session/start`, and a one-shot sticky replacement on the first user
 `turn/start` after a load, resume, fork, or host re-attach), so Muse's own
 tools work in the extra folders; older hosts keep adapter-side confinement and
-log that Muse's own tools see only the primary root.
+log that Muse's own tools see only the primary root. Entries keep the
+canonical Win32 verbatim form (`\\?\C:\...`) that `std::fs::canonicalize`
+returns, because Muse 1.4.3 rejects the stripped form; live Windows runs
+confirmed 1.4.1 and 1.4.2 accept the same entries (#199).
 
 **Work items**
 
