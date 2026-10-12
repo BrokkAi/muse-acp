@@ -1391,6 +1391,51 @@ fn session_hook_reads_reach_a_real_host_when_negotiated() {
     adapter.finish();
 }
 
+/// The opt-in computer-use extension reaches a real host: either it answers
+/// with the setup state and settings, or the CUA gate answers its typed
+/// `computerUseUnavailable`, never a generic failure. The capability and the
+/// methods arrived in Muse 1.4.6, so older CI pins skip.
+#[test]
+fn computer_use_reads_reach_a_real_host_when_negotiated() {
+    let test = "computer_use_reads_reach_a_real_host_when_negotiated";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    let adapter = Adapter::launch_with(&host, json!({"_meta": {"muse": {"computerUse": true}}}));
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 6), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let log = std::fs::read_to_string(&adapter.log).unwrap();
+    assert!(
+        log.contains("client negotiated computer-use setup"),
+        "{log}"
+    );
+    let id = adapter.request("_session/computerUse", json!({"sessionId": session}));
+    let response = adapter.response(id);
+    if response.get("error").is_some() {
+        // Either the host withheld the grant on this platform (the adapter
+        // stays dark) or the CUA gate answered its typed refusal.
+        match response["error"]["code"].as_i64() {
+            Some(-32601) => {}
+            Some(-32033) => assert_eq!(
+                response["error"]["data"]["kind"],
+                json!("computerUseUnavailable"),
+                "{response}"
+            ),
+            _ => panic!("unexpected computer-use refusal: {response}"),
+        }
+    } else {
+        assert!(
+            response["result"]["setup"].is_object() && response["result"]["settings"].is_object(),
+            "{response}"
+        );
+    }
+    adapter.finish();
+}
+
 /// `_session/plugins` reads the real host's installed-plugin inventory
 /// (`plugin/list`, Muse 1.4.4+); on 1.4.6 a refused marketplace removal keeps
 /// the host's typed error.
@@ -1524,6 +1569,7 @@ fn skill_activation_reaches_a_real_host() {
     });
     let local = [
         "compact",
+        "cua",
         "feedback",
         "goal",
         "plugin",

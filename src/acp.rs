@@ -1074,6 +1074,10 @@ fn available_commands_json(
             input("<name>")
         ),
         format!(
+            "{{\"name\":\"cua\",\"description\":\"Computer-use setup and settings\",\"input\":{}}}",
+            input("[status|on|set <capability> <choice>|block|unblock <bundleId>]")
+        ),
+        format!(
             "{{\"name\":\"plugin\",\"description\":\"Install plugins and manage marketplaces\",\"input\":{}}}",
             input("install <marketplace> <name> | marketplace add|remove|update <name>")
         ),
@@ -1102,7 +1106,8 @@ fn available_commands_json(
             .filter(|(name, _, _)| {
                 !matches!(
                     name.as_str(),
-                    "goal"
+                    "cua"
+                        | "goal"
                         | "plugin"
                         | "recap"
                         | "rename"
@@ -1394,7 +1399,7 @@ mod tests {
                 panic!("available commands must be an array");
             };
             // The host's `rename` row is shadowed by the local command.
-            assert_eq!(items.len(), 11);
+            assert_eq!(items.len(), 12);
             assert_eq!(
                 commands.matches("\"name\":\"feedback\"").count(),
                 1,

@@ -43,6 +43,9 @@ pub struct HandshakeInfo {
     /// Whether `feedback/submit` is granted (Muse 1.4.2+). The adapter only
     /// advertises `/feedback` on such a host.
     pub feedback: bool,
+    /// Whether the `computerUseSetup` capability was requested and granted.
+    /// The adapter's computer-use surface stays dark without it.
+    pub computer_use_setup: bool,
 }
 
 impl HandshakeInfo {
@@ -497,6 +500,7 @@ pub fn acp_error_code(error: &J, fallback: i64) -> i64 {
         "pluginNotFound" => -32035,
         "marketplaceAlreadyExists" => -32036,
         "pluginMutationsDisabled" => -32037,
+        "computerUseUnavailable" => -32033,
         _ if err_code(error) == -32032 => -32032,
         _ => fallback,
     }
@@ -749,6 +753,7 @@ pub fn skill_error_data(error: &J) -> Option<String> {
             | "pluginNotFound"
             | "marketplaceAlreadyExists"
             | "pluginMutationsDisabled"
+            | "computerUseUnavailable"
     );
     typed.then(|| j_to_string(data))
 }
@@ -974,6 +979,7 @@ impl MspHost {
     pub fn launch(
         user_input_dialogs: bool,
         user_shell: bool,
+        computer_use_setup: bool,
         extra_args: &[&str],
     ) -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
         let bin = muse_cli();
@@ -1049,11 +1055,16 @@ impl MspHost {
         std::thread::spawn(move || reader_loop(reader_host, stdout, tx));
         // Handshake.
         let shell_capability = if user_shell { ",\"userShell\"" } else { "" };
+        let cua_capability = if computer_use_setup {
+            ",\"computerUseSetup\""
+        } else {
+            ""
+        };
         // `experimentalApi` is the only way to reach `account/read`, which
         // lets session/new report a logged-out host before the first turn
         // (see `MspHost::logged_out`). On Muse 1.4.0 it gates nothing else.
         let init_params = format!(
-            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"experimentalApi":true,"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream","sessionMcp","feedback"{shell_capability}]}}}}"#,
+            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"experimentalApi":true,"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream","sessionMcp","feedback"{shell_capability}{cua_capability}]}}}}"#,
             ver = crate::json::esc(env!("CARGO_PKG_VERSION")),
             user_input_dialogs = user_input_dialogs
         );
@@ -1115,6 +1126,8 @@ impl MspHost {
                 res.get("grantedCapabilities"),
                 Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("feedback"))
             ),
+            computer_use_setup: computer_use_setup
+                && matches!(res.get("grantedCapabilities"), Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("computerUseSetup"))),
         };
         if verdict.is_fatal() {
             host.shutdown();
@@ -1811,6 +1824,7 @@ mod durability_tests {
             user_shell: false,
             session_mcp: false,
             feedback: false,
+            computer_use_setup: false,
         }
     }
 

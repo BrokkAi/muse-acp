@@ -27,7 +27,7 @@ are emitted by the MSP host.
 | `approval/requested` | Mapped to ACP | Opens `session/request_permission`; duplicate approval IDs are suppressed and unusable requests fail closed. |
 | `approval/resolved` | Mapped to ACP | Withdraws an outstanding permission or feedback form with `$/cancel_request`, including child-stream approvals resolved elsewhere, and reasserts ACP v2 `running` when work remains. The permission response itself drives `approval/decide`. |
 | `approval/updated` | Mapped to ACP | Reasserts ACP v2 `running` state for an updated, still-active approval flow. |
-| `computerUseSetup/changed` | Intentionally ignored | Progress from the experimental computer-use setup flow, which the adapter never starts. No ACP mapping; an inbound copy takes the unhandled-notification diagnostic path. |
+| `computerUseSetup/changed` | Consumed | Logged as a diagnostic for the setup flow the opt-in `_session/computerUse` extension and `/cua` drive. The adapter keeps no CUA state, so the next read re-asks the host. |
 | `initialized` | Consumed | Sent by the adapter after the MSP `initialize` handshake. An unexpected inbound copy is harmlessly ignored. |
 | `item/completed` | Mapped to ACP | Folds the authoritative final item into message, tool-call, async-task, subagent, or other negotiated ACP updates. |
 | `item/delta` | Mapped to ACP | Streams supported item field appends as ACP message or tool-call updates. Unknown item fields and kinds are tolerated. |

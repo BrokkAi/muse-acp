@@ -178,6 +178,7 @@ CATALOG_READS = [0]
 # hosts that predate userInputDialogs or ignore it.
 USER_INPUT_DIALOGS = [True]
 EXPERIMENTAL_API = [False]
+CUA_GRANTED = [False]
 SESSION_MCP = [False]
 FEEDBACK = [False]
 MCP_CONFLICTED = [False]
@@ -1259,6 +1260,10 @@ def result_for(method, msg):
                        and os.environ.get("FAKE_NO_FEEDBACK") != "1")
         if FEEDBACK[0]:
             granted.append("feedback")
+        CUA_GRANTED[0] = ("computerUseSetup" in requested
+                          and os.environ.get("FAKE_NO_COMPUTER_USE") != "1")
+        if CUA_GRANTED[0]:
+            granted.append("computerUseSetup")
         USER_INPUT_DIALOGS[0] = msg.get("params", {}).get("capabilities", {}).get(
             "userInputDialogs", True) is not False
         EXPERIMENTAL_API[0] = msg.get("params", {}).get("capabilities", {}).get(
@@ -1781,6 +1786,42 @@ def result_for(method, msg):
             {"taskId": "cron-1", "kind": "cron.run",
              "status": "inProgress", "startedAt": "2026-10-12T09:00:00Z"},
         ]}
+    if method == "computerUseSetup/read":
+        params = msg.get("params", {})
+        log_input(params)
+        return {"setup": "dormant", "screenRecording": "missing",
+                "accessibility": "missing", "inputMonitoring": "unknown",
+                "message": "Run /cua on to set up computer use for this session."}
+    if method == "computerUseSetup/start":
+        params = msg.get("params", {})
+        log_input(params)
+        state = {"setup": "readyForTarget", "screenRecording": "granted",
+                 "accessibility": "granted", "inputMonitoring": "missing",
+                 "message": "Computer use is ready; some actions still need "
+                            "Input Monitoring."}
+        notify("computerUseSetup/changed", {
+            "sessionId": params.get("sessionId", MSP_SID), "state": state})
+        return state
+    if method == "computerUseSettings/read":
+        params = msg.get("params", {})
+        log_input(params)
+        apps = [{"bundleId": "com.acme.Secrets", "locked": False}]
+        if params.get("showBuiltIns") is True:
+            apps.append({"bundleId": "com.apple.finder", "locked": True,
+                         "prefix": False})
+        return {"computerControl": "ask", "screenshots": "ask",
+                "blockedApps": apps}
+    if method == "computerUseSettings/update":
+        params = msg.get("params", {})
+        log_input(params)
+        apps = [{"bundleId": "com.acme.Secrets", "locked": False}]
+        for bundle in params.get("blockApps", []):
+            apps.append({"bundleId": bundle, "locked": False})
+        for bundle in params.get("unblockApps", []):
+            apps = [a for a in apps if a["bundleId"] != bundle]
+        return {"computerControl": params.get("computerControl", "ask"),
+                "screenshots": params.get("screenshots", "ask"),
+                "blockedApps": apps}
     if method == "plugin/list":
         log_input(msg.get("params", {}))
         return {"plugins": [
@@ -2388,6 +2429,14 @@ def main():
                         log_input(params)
                         send({"jsonrpc": "2.0", "id": ident, "error": error})
                         continue
+                if (SCENARIO == "computer_use_unavailable"
+                        and method.startswith("computerUse")):
+                    log_input(msg.get("params", {}))
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32033,
+                                    "message": "computer use is unavailable",
+                                    "data": {"kind": "computerUseUnavailable"}}})
+                    continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
                 if REVIEW_HOST and method == "turn/start":
