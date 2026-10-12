@@ -1391,6 +1391,45 @@ fn session_hook_reads_reach_a_real_host_when_negotiated() {
     adapter.finish();
 }
 
+/// `_session/sideChat` opens a side chat from a loaded session; the side's
+/// provenance names its source, and it attaches as an ordinary session.
+/// `session/sideChat` arrived in Muse 1.4.4, so older CI pins skip.
+#[test]
+fn side_chat_reaches_a_real_host_and_attaches_with_provenance() {
+    let test = "side_chat_reaches_a_real_host_and_attaches_with_provenance";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    let adapter = Adapter::launch_with(&host, json!({"_meta": {"muse": {"sideChat": true}}}));
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 4), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.request("_session/sideChat", json!({"sessionId": session}));
+    let result = adapter.result(id);
+    let side = result["sessionId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("the extension names the side: {result}"))
+        .to_string();
+    assert_ne!(side, session, "{result}");
+    assert_eq!(result["sideFrom"]["sessionId"], json!(session), "{result}");
+    let announced = adapter.wait("the side's provenance", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["sessionId"] == json!(side)
+            && frame["params"]["update"]["_meta"]["muse"]["sideFrom"]["sessionId"] == json!(session)
+    });
+    assert!(announced["params"]["update"]["sessionUpdate"] == "session_info_update");
+    // The side attaches through the ordinary resume path and serves a turn.
+    let resume = adapter.request("session/resume", json!({"sessionId": side}));
+    let attached = adapter.result(resume);
+    assert_eq!(attached["sessionId"], json!(side), "{attached}");
+    let turn = adapter.prompt(&side, "say hello [[script:hello]]");
+    assert_eq!(adapter.result(turn)["stopReason"], "end_turn");
+    adapter.finish();
+}
+
 /// `/skill-activation` writes one skill's activation through
 /// `skill/setActivation`. Muse 1.4.4 added the method, so older CI pins skip.
 #[test]

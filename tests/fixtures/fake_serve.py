@@ -47,6 +47,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
                (FAKE_SKILL_REFRESH_FAILS=1: the re-read has no skills array)
   skill_not_found skill/list still lists `stale`; turn/start rejects it
   skill_control skill/setActivation writes and skill/import receipts
+  side_chat    session/sideChat opens a side session with sideFrom provenance
   async_task_stop       background task then a targeted task/stop terminal
   async_task_stop_all   background tasks then task/stopAll terminals
   hook_run     a hookRun item around the turn; hook/list serves the inventory
@@ -347,6 +348,9 @@ ACTIVE_SESSION = [MSP_SID]
 CRASH_AFTER_ACK = [False]
 WORKFLOW_TURN = [""]
 WORKFLOW_CHILD_ATTEMPT = [1]
+# The `session/sideChat` command that opened the scenario's side session, so
+# a later resume reports the same provenance.
+SIDE_CHAT_CMD = [""]
 # The goal turn currently running in the goal_* scenarios ("" when idle).
 GOAL_TURN = [""]
 GOAL_OBJECTIVE = [""]
@@ -1388,6 +1392,12 @@ def result_for(method, msg):
             session["name"] = "Renamed outside adapter"
         elif SCENARIO == "rename_clear":
             session["name"] = None
+        elif SCENARIO == "side_chat" and params.get("sessionId") == "msp-sess-side":
+            session["sideFrom"] = {
+                "sessionId": MSP_SID,
+                "commandId": SIDE_CHAT_CMD[0],
+                "cutCursor": "opaque-side-cut",
+            }
         return {"session": session,
                 "viewCursor": "cur-9",
                 "pendingRequests": pending,
@@ -1643,6 +1653,21 @@ def result_for(method, msg):
                 "sessionId": MSP_SID, "status": "idle",
                 "viewCursor": "cur-status-2"})
         return {"status": "accepted"}
+    if method == "session/sideChat":
+        params = msg.get("params", {})
+        log_input(params)
+        SIDE_CHAT_CMD[0] = params.get("commandId", "")
+        side = session_obj("msp-sess-side")
+        side["sideFrom"] = {
+            "sessionId": params.get("sessionId", MSP_SID),
+            "commandId": params.get("commandId", ""),
+            "cutCursor": "opaque-side-cut",
+        }
+        return {
+            "session": side,
+            "history": {"mode": "inline", "items": [], "snapshot": None},
+            "viewCursor": "cur-side-1", "pendingRequests": [],
+        }
     if method == "session/fork":
         params = msg.get("params", {})
         log_input(params)

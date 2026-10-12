@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Support Muse side chats. The opt-in `_session/sideChat` extension (muse
+  `sideChat` capability) opens a side chat from a loaded session through the
+  host's `session/sideChat` and returns the new session id with its
+  `sideFrom` provenance; the side is routed to the source's host, inherits
+  its mode, and attaches through the ordinary `session/resume`/`session/load`
+  paths. `sideFrom` (and a fork's `forkedFrom`) now rides
+  `session_info_update._meta.muse` when a session is attached, so the parent
+  link survives reloads.
 - Add skill activation and import commands. `/skill-activation <selector>
   on|userInvocableOnly|off [scope]` writes one skill's activation through the
   host's `skill/setActivation` (scope defaults to `user`; a refused selector

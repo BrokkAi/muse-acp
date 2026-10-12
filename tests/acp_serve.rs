@@ -10513,6 +10513,97 @@ fn fork_history_replays_only_the_forked_view_and_preserves_provenance() {
 }
 
 #[test]
+fn side_chat_reads_require_opt_in_and_open_a_side_session() {
+    // Without the client's opt-in the extension is refused before any host
+    // call.
+    let mut c = Client::spawn("side_chat", &[]);
+    let sid = c.new_session(2, "");
+    let id = c.req("_session/sideChat", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32601") && frame.contains("sideChat capability"),
+        "un-negotiated side chats must fail closed: {frame}"
+    );
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !calls.lines().any(|line| line == "session/sideChat"),
+        "the refused call never reaches the host: {calls}"
+    );
+    c.finish();
+}
+
+#[test]
+fn side_chat_returns_provenance_and_attaches_as_an_acp_session() {
+    let mut c = Client::spawn("side_chat", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"sideChat\"]}}}",
+    );
+    c.wait_stderr(
+        "client negotiated side-chat creation",
+        Duration::from_secs(10),
+    );
+    let id = c.req("_session/sideChat", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"sessionId\":\"msp-sess-side\"")
+            && frame.contains("\"viewCursor\":\"cur-side-1\""),
+        "the extension names the new session: {frame}"
+    );
+    assert!(
+        frame.contains("\"sideFrom\":{")
+            && frame.contains("\"sessionId\":\"msp-sess-1\"")
+            && frame.contains("\"cutCursor\":\"opaque-side-cut\""),
+        "the extension carries the provenance: {frame}"
+    );
+    c.wait_input("\"sessionId\": \"msp-sess-1\"", Duration::from_secs(15));
+    // The new side is announced with its parent link, and ordinary session
+    // methods attach it.
+    let provenance_frames = |c: &Client| -> Vec<String> {
+        c.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|f| {
+                f.contains("session_info_update")
+                    && f.contains("msp-sess-side")
+                    && f.contains("\"muse\":{\"sideFrom\"")
+            })
+            .cloned()
+            .collect()
+    };
+    let start = std::time::Instant::now();
+    while provenance_frames(&c).is_empty() {
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "the side was never announced with provenance"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let announced = provenance_frames(&c)[0].clone();
+    assert!(
+        announced.contains("\"sessionId\":\"msp-sess-side\"")
+            && announced.contains("opaque-side-cut"),
+        "the side is announced with provenance: {announced}"
+    );
+    let resume = c.req("session/resume", "{\"sessionId\":\"msp-sess-side\"}");
+    let resumed = c.wait_for(&format!("\"id\":{resume}"), Duration::from_secs(15));
+    assert!(
+        resumed.contains("\"mspSessionId\":\"msp-sess-side\""),
+        "the side attaches through session/resume: {resumed}"
+    );
+    let start = std::time::Instant::now();
+    while provenance_frames(&c).len() < 2 {
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "attach never published the parent link"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    c.finish();
+}
+
+#[test]
 fn fork_history_failure_does_not_register_a_partial_session() {
     let mut c = Client::spawn("fork_history_failure", &[]);
     let sid = c.new_session(1, "");
