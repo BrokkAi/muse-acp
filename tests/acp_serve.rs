@@ -3998,6 +3998,139 @@ fn skill_catalog_refreshes_after_host_notification() {
     c.finish();
 }
 
+fn wait_log_count(c: &Client, method: &str, count: usize) {
+    let start = std::time::Instant::now();
+    loop {
+        if let Ok(text) = std::fs::read_to_string(&c.fake_log)
+            && text.lines().filter(|line| *line == method).count() >= count
+        {
+            return;
+        }
+        if start.elapsed() > Duration::from_secs(15) {
+            panic!("fake host never logged {count} {method:?} calls");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn skill_activation_maps_to_the_host_and_refreshes_the_catalog() {
+    let mut c = Client::spawn("skill_control", &[]);
+    let sid = c.new_session(2, "");
+    // The session-scoped catalog read already happened once.
+    c.wait_log("skill/list", Duration::from_secs(15));
+    let pid = c.prompt(&sid, "/skill-activation plan off");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    c.wait_input("\"selector\": \"plan\"", Duration::from_secs(15));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert!(
+        input.contains("\"activation\": \"off\"") && input.contains("\"scope\": \"user\""),
+        "the write carries state and default scope: {input}"
+    );
+    // The host's skill/changed refreshes the catalog through the existing
+    // path; the adapter never keeps its own activation cache.
+    wait_log_count(&c, "skill/list", 2);
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        calls.lines().filter(|line| *line == "skill/list").count() >= 2,
+        "skill/changed re-reads the catalog: {calls}"
+    );
+
+    // Explicit scopes pass through; the wire vocabulary is closed.
+    let pid = c.prompt(&sid, "/skill-activation plan on project");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    c.wait_input("\"scope\": \"project\"", Duration::from_secs(15));
+
+    // Usage errors never reach the host.
+    for text in [
+        "/skill-activation",
+        "/skill-activation plan",
+        "/skill-activation plan always",
+        "/skill-activation plan on everywhere",
+    ] {
+        let pid = c.prompt(&sid, text);
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"code\":-32602") && frame.contains("usage: /skill-activation"),
+            "{text} must fail closed: {frame}"
+        );
+    }
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert_eq!(
+        input
+            .lines()
+            .filter(|line| line.contains("\"activation\""))
+            .count(),
+        2,
+        "only the two valid writes reach the host: {input}"
+    );
+    // The host's typed rejection is forwarded untouched.
+    let pid = c.prompt(&sid, "/skill-activation missing on");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32032") && frame.contains("\"kind\":\"skillNotFound\""),
+        "typed host error: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn skill_import_renders_the_host_receipt() {
+    let mut c = Client::spawn("skill_control", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "/skill-import claude dry-run");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    let receipt = c.wait_for("Skill import dry run", Duration::from_secs(15));
+    assert!(
+        receipt.contains("2 installed, 1 quarantined, 1 skipped, 1 failed"),
+        "counts in the receipt: {receipt}"
+    );
+    assert!(
+        receipt.contains("installed: imported-a, imported-b")
+            && receipt.contains("quarantined: imported-c (unsafe-tools)")
+            && receipt.contains("failed: (unnamed) (unreadable manifest)"),
+        "id lists in the receipt: {receipt}"
+    );
+    let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+    assert!(idle.contains("end_turn"), "the command settles: {idle}");
+    c.wait_input("\"dryRun\": true", Duration::from_secs(15));
+
+    // A real import carries force and refreshes through skill/changed.
+    let pid = c.prompt(&sid, "/skill-import codex force");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    c.wait_input("\"force\": true", Duration::from_secs(15));
+    wait_log_count(&c, "skill/list", 2);
+
+    for text in [
+        "/skill-import",
+        "/skill-import vscode",
+        "/skill-import claude now",
+    ] {
+        let pid = c.prompt(&sid, text);
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"code\":-32602") && frame.contains("usage: /skill-import"),
+            "{text} must fail closed: {frame}"
+        );
+    }
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert_eq!(
+        input
+            .lines()
+            .filter(|line| {
+                line.contains("\"source\": \"claude\"") || line.contains("\"source\": \"codex\"")
+            })
+            .count(),
+        2,
+        "only the two valid imports reach the host: {input}"
+    );
+    c.finish();
+}
+
 #[test]
 fn unknown_native_skill_preserves_typed_host_error() {
     let mut c = Client::spawn("skill_not_found", &[]);

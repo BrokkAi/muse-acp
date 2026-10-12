@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Add skill activation and import commands. `/skill-activation <selector>
+  on|userInvocableOnly|off [scope]` writes one skill's activation through the
+  host's `skill/setActivation` (scope defaults to `user`; a refused selector
+  keeps the host's typed error), and `/skill-import <claude|codex> [dry-run]
+  [force]` imports foreign skills through `skill/import` and renders the
+  host's receipt: the four counts plus the installed, quarantined, skipped,
+  and failed ids. The command catalog refreshes through the host's existing
+  `skill/changed` path; the adapter keeps no local activation cache.
 - Add `/recap`: ask Muse for a while-you-were-away summary. The prompt stays
   open until the host's `recap/completed` settles it, the summary (with its
   optional title) arrives as agent text, and one recap is allowed per session
