@@ -10401,3 +10401,54 @@ fn plan_mode_is_remembered_when_the_session_is_loaded_again() {
     c.wait_log("ro:session/resume", Duration::from_secs(15));
     c.finish();
 }
+
+#[test]
+fn last_reasoning_effort_is_applied_to_new_sessions() {
+    let state = fresh_state_dir();
+    let state = state.to_str().unwrap();
+    let mut c = Client::spawn("happy", &[("XDG_STATE_HOME", state)]);
+    let sid = c.new_session(2, "");
+    let set = c.req(
+        "session/set_config_option",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
+        ),
+    );
+    let done = c.wait_for(&format!("\"id\":{set}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"currentValue\":\"high\""),
+        "the chosen effort sticks: {done}"
+    );
+    c.finish();
+    let store = std::path::Path::new(state).join("muse-acp/reasoning-efforts.json");
+    let body = std::fs::read_to_string(&store).expect("remembered effort store");
+    assert!(
+        body.contains("fake-model") && body.contains("high"),
+        "the last effort is remembered per model: {body}"
+    );
+
+    let mut c = Client::spawn("happy", &[("XDG_STATE_HOME", state)]);
+    c.initialize(2, "");
+    let dir = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent")
+        .join("workspace");
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let cwd = dir.to_str().unwrap().replace('\\', "\\\\");
+    let id = c.req("session/new", &format!("{{\"cwd\":\"{cwd}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"configId\":\"reasoning_effort\"")
+            && frame.contains("\"currentValue\":\"high\""),
+        "a new session starts at the last effort: {frame}"
+    );
+    c.wait_log("session/setReasoningEffort", Duration::from_secs(15));
+    let frames = host_requests(&c, "session/setReasoningEffort");
+    assert!(
+        frames
+            .iter()
+            .any(|params| params["reasoningEffort"] == "high"),
+        "the remembered tier reaches the host: {frames:?}"
+    );
+    c.finish();
+}

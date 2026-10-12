@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Remember the last reasoning effort picked per model in
+  `$XDG_STATE_HOME/muse-acp/reasoning-efforts.json` (Windows:
+  `%LOCALAPPDATA%\muse-acp\reasoning-efforts.json`) and apply it to new
+  sessions, so a new session starts at the last effort the way it already
+  starts at the last model. Picking `Muse default` forgets the remembered
+  tier; a tier the new session's model does not serve is left at the Muse
+  default.
+
 ## 0.12.1
 
 - Silence background reminder checks in the transcript. `reminderChild` items
