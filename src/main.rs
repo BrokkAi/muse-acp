@@ -6,6 +6,7 @@
 
 mod acp;
 mod compat;
+mod efforts;
 mod fold;
 mod host_config;
 mod hosts;
@@ -734,6 +735,71 @@ fn reset_unsupported_reasoning_tier(
         s.reasoning_effort = acp::REASONING_DEFAULT.to_string();
     }
     unsupported
+}
+
+/// Applies the last tier remembered for `model` to a freshly started session,
+/// so `session/new` inherits effort the way it already inherits the host's
+/// last-used model. A tier the model does not serve is left alone; without a
+/// remembered tier the session keeps the Muse default.
+fn apply_remembered_effort(
+    host: &Arc<Hosts>,
+    sessions: &Sessions,
+    acp_sid: &str,
+    msp_sid: &str,
+    model: &str,
+    models: &[acp::CatalogModel],
+) {
+    let Some(effort) = efforts::load(model) else {
+        return;
+    };
+    let served = models
+        .iter()
+        .find(|row| row.id == model)
+        .and_then(|row| row.variants.as_ref())
+        .is_none_or(|variants| variants.iter().any(|tier| tier == &effort));
+    if !served {
+        log(&format!(
+            "model {model} does not serve the remembered reasoning tier; keeping the Muse default"
+        ));
+        return;
+    }
+    let cmd = host.mint_cmd("cmd-");
+    match host.command(
+        "session/setReasoningEffort",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{},\"reasoningEffort\":{}}}",
+            esc(&cmd),
+            esc(msp_sid),
+            esc(&effort)
+        ),
+    ) {
+        Ok(_) => {
+            if let Some(s) = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(acp_sid)
+            {
+                s.reasoning_effort = effort;
+                s.reasoning_effort_source = Some("user".to_string());
+            }
+        }
+        Err(e) if msp::is_method_not_found(&e) => {
+            // Hosts before MSP 1.3.0 keep the tier as a per-turn override.
+            if let Some(s) = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(acp_sid)
+            {
+                s.reasoning_effort = effort;
+            }
+        }
+        Err(e) => {
+            log(&format!(
+                "remembered reasoning effort not applied: {}",
+                err_message(&e)
+            ));
+        }
+    }
 }
 
 fn reasoning_effort_param(effort: Option<&str>) -> String {
@@ -1732,7 +1798,7 @@ fn restart_unsaved_session(
     msp_sid: &str,
     mcp_servers: Option<&str>,
 ) -> Result<J, J> {
-    let (cwd, roots, approval, model, reasoning) = sessions
+    let (cwd, roots, approval, model, standing) = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(acp_sid)
@@ -1748,6 +1814,9 @@ fn restart_unsaved_session(
             )
         })
         .ok_or_else(|| msp::mk_err(-32602, "unknown sessionId"))?;
+    // A session that never ran a turn keeps its standing default; otherwise
+    // it falls back to the last tier remembered for its model.
+    let reasoning = standing.or_else(|| efforts::load(&model));
     let start_roots = if hosts.handshake().supports_workspace_roots() && roots.len() > 1 {
         host_workspace_roots(&cwd, &roots[1..]).map_err(|message| msp::mk_err(-32602, &message))?
     } else {
@@ -3950,6 +4019,21 @@ fn handle_acp(
                     // read is not free on the host and advances read-counted
                     // fixtures/scenarios.
                     let models = catalog(host);
+                    // A new session inherits the host's last-used model
+                    // through `session/start`; inherit the last-used effort
+                    // the same way.
+                    apply_remembered_effort(host, sessions, &sid, &msp_sid, &cur_model, &models);
+                    let (reasoning_new, offer_default_new) = sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&sid)
+                        .map(|s| {
+                            (
+                                s.reasoning_effort.clone(),
+                                s.reasoning_effort_source.is_none(),
+                            )
+                        })
+                        .unwrap_or((acp::REASONING_DEFAULT.to_string(), true));
                     let result = if ver == 2 {
                         format!(
                             "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
@@ -3961,8 +4045,8 @@ fn handle_acp(
                                     session_mode: acp::DEFAULT_MODE,
                                     approval_mode: acp::mode_from_msp(&cur_mode),
                                     model: &cur_model,
-                                    reasoning_effort: acp::REASONING_DEFAULT,
-                                    offer_muse_default: true,
+                                    reasoning_effort: &reasoning_new,
+                                    offer_muse_default: offer_default_new,
                                     auto_review: false,
                                     recommendations: (
                                         recommended_model(&models).as_deref(),
@@ -3984,8 +4068,8 @@ fn handle_acp(
                                     session_mode: acp::DEFAULT_MODE,
                                     approval_mode: acp::mode_from_msp(&cur_mode),
                                     model: &cur_model,
-                                    reasoning_effort: acp::REASONING_DEFAULT,
-                                    offer_muse_default: true,
+                                    reasoning_effort: &reasoning_new,
+                                    offer_muse_default: offer_default_new,
                                     auto_review: false,
                                     recommendations: (
                                         recommended_model(&models).as_deref(),
@@ -6333,6 +6417,9 @@ fn handle_acp(
                         .and_then(|e| e.get("mode"))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
+                    // An explicit effort choice is remembered for new
+                    // sessions; picking the Muse default forgets it.
+                    let mut remembered: Option<(String, String)> = None;
                     if let Some(s) = sessions
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -6355,8 +6442,16 @@ fn handle_acp(
                                 s.reasoning_effort_source = (!reasoning_fallback
                                     && value != acp::REASONING_DEFAULT)
                                     .then(|| "user".to_string());
+                                remembered = Some((s.model_value.clone(), value.clone()));
                             }
                             _ => unreachable!(),
+                        }
+                    }
+                    if let Some((model, tier)) = remembered {
+                        if tier == acp::REASONING_DEFAULT {
+                            efforts::clear(&model);
+                        } else {
+                            efforts::save(&model, &tier);
                         }
                     }
                     let models = catalog(host);
@@ -9040,17 +9135,23 @@ fn handle_msp(
                 .unwrap_or("unknown")
                 .to_string();
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
-                if let Some(s) = sessions
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .get_mut(&acp_sid)
-                {
-                    if matches!(source.as_str(), "default" | "policy") {
-                        s.reasoning_recommendation = Some(effort.to_string());
+                // A tier that lands from elsewhere (for example the Muse TUI)
+                // is still the latest choice, so new sessions inherit it too.
+                let model = {
+                    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                    match map.get_mut(&acp_sid) {
+                        Some(s) => {
+                            if matches!(source.as_str(), "default" | "policy") {
+                                s.reasoning_recommendation = Some(effort.to_string());
+                            }
+                            s.reasoning_effort = effort.to_string();
+                            s.reasoning_effort_source = Some(source);
+                            s.model_value.clone()
+                        }
+                        None => String::new(),
                     }
-                    s.reasoning_effort = effort.to_string();
-                    s.reasoning_effort_source = Some(source);
-                }
+                };
+                efforts::save(&model, effort);
                 publish_config_options(stdout, sessions, &acp_sid);
             }
         }

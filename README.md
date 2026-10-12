@@ -332,7 +332,12 @@ error the editor shows if Muse then refuses the profile says why.
   create, load, resume, and config change. The reasoning selector starts at
   `Muse default` and sends no override until you pick a tier; on Muse 1.4.1+
   it offers exactly the tiers the selected model serves, with Muse's own
-  descriptions, and follows a model change.
+  descriptions, and follows a model change. The adapter remembers the last
+  tier picked per model in
+  `$XDG_STATE_HOME/muse-acp/reasoning-efforts.json` (Windows:
+  `%LOCALAPPDATA%\muse-acp\reasoning-efforts.json`), so a new session starts
+  at the last effort the way it already starts at the last model. Picking
+  `Muse default` forgets the remembered tier.
 - **Skills** — Muse's skill catalog drives ACP `available_commands_update`.
   Slash prompts such as `/plan` use native skill turn parts; `/compact` invokes
   Muse's native compaction.
