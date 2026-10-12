@@ -508,12 +508,6 @@ fn recap_holds_the_prompt_until_the_host_summary_settles_it() {
         let mut c = Client::spawn("recap", &[]);
         let sid = c.new_session(ver, "");
         let pid = c.prompt(&sid, "/recap");
-        c.wait_log("recap/request", Duration::from_secs(15));
-        let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
-        assert!(
-            input.contains("\"sessionId\": \"msp-sess-1\"") && input.contains("\"commandId\": \""),
-            "the request carries the session and a retry id: {input}"
-        );
         // The summary arrives as ordinary agent text, title first.
         let summary = c.wait_for("While you were away", Duration::from_secs(15));
         assert!(
@@ -594,6 +588,42 @@ fn failed_and_timed_out_recaps_are_reported_as_failures() {
             c.finish();
         }
     }
+}
+
+#[test]
+fn recap_frames_conform_to_the_vendored_schema() {
+    let mut c = Client::spawn("recap", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "/recap");
+    c.wait_for("While you were away", Duration::from_secs(15));
+    let frames_path = format!("{}.frames", c.fake_log);
+    c.finish();
+    let frames = std::fs::read_to_string(&frames_path).expect("adapter frame log");
+    let schema_text = std::fs::read_to_string(format!(
+        "{}/tests/protocol/stable/msp.schema.json",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("vendored schema bundle");
+    let schema: serde_json::Value = serde_json::from_str(&schema_text).expect("schema JSON");
+    let frame: serde_json::Value = frames
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|frame| frame["method"] == "recap/request")
+        .expect("recap/request frame");
+    let params_def = &schema["$defs"]["RecapRequestParams"];
+    for required in params_def["required"].as_array().expect("required") {
+        let name = required.as_str().expect("field name");
+        assert!(
+            frame["params"].get(name).is_some(),
+            "recap/request is missing required {name}: {}",
+            frame["params"]
+        );
+    }
+    assert_eq!(
+        frame["params"]["sessionId"],
+        serde_json::json!("msp-sess-1"),
+        "{frame}"
+    );
 }
 
 #[test]
