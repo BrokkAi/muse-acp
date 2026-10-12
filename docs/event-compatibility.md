@@ -61,7 +61,7 @@ are emitted by the MSP host.
 | `usage/changed` | Mapped to ACP | Broadcasts the host's subscription observation to attached sessions as `_meta.museSubscriptionUsage`, separately from cost estimates. |
 | `userInput/engaged` | Intentionally ignored | A client-to-server engagement note: the user started interacting with a timed prompt, so the host disarms its auto-resolution countdown. The adapter sends no engagement notes itself; no ACP mapping, and an inbound copy would take the unhandled-notification path, which logs a diagnostic. |
 | `userInput/requested` | Mapped to ACP | Opens ACP `elicitation/create` when form elicitation was negotiated; otherwise sends `userInput/cancel` so the turn cannot hang. |
-| `userInput/settled` | Mapped to ACP | A question this adapter answered or cancelled is already cleared locally. A form still open for a question settled elsewhere (another client, an interrupt, auto-resolution) is withdrawn with `$/cancel_request`. |
+| `userInput/settled` | Mapped to ACP | A question this adapter answered, cancelled, or interrupted is already cleared locally. A form still open for a question settled elsewhere (another client, an interrupt, auto-resolution) is withdrawn with `$/cancel_request`. |
 | `view/gap` | Consumed | Pages forward from the bracket's `after` cursor until the walk meets `next` and recursively processes the missing events. When `next` is ephemeral (never paged) the walk runs to the end of the durable view, and live twins of the events it delivered are refused once. |
 <!-- schema-notifications:end -->
 
@@ -92,9 +92,13 @@ to them as well as bridge their payloads. Any other server-initiated request is
 
 ## Client commands related to events
 
-`turn/interrupt`, `turn/unqueue`, `approval/decide`, `userInput/answer`, `userInput/cancel`, and
-`userInput/clarify` are adapter-to-host commands. They are not event rows and
-are covered by request-schema conformance tests. The same holds for the
+`turn/interrupt`, `turn/unqueue`, `approval/decide`, `userInput/answer`, `userInput/cancel`,
+`userInput/clarify`, and `userInput/interrupt` are adapter-to-host commands.
+`userInput/interrupt` settles a pending question the user already partly
+answered: the adapter stages multi-question prompts one question per form and
+holds each confirmed answer, so a stop or a decline of a later question
+carries the answers to the host and stops the turn. They are not event rows
+and are covered by request-schema conformance tests. The same holds for the
 `goal/set`, `goal/edit`, `goal/pause`, `goal/resume`, and `goal/clear`
 commands, which editors reach through the adapter's `/goal` slash command
 rather than as raw ACP methods (a command that wakes a goal turn keeps its

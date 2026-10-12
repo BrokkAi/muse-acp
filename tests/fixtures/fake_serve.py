@@ -21,6 +21,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   questions    userInput/requested with options, then completed
   questions_multiple userInput/requested with multiple-selection options
   questions_resume reissue a pending question after both attach and usage backfill
+  questions_partial two-question ask whose turn waits for userInput/interrupt
+               (FAKE_QUESTION_SHAPE=pair)
   queued       1st turn/start: silence; 2nd: completed(TURN_1), completed(TURN_2)
   cancel_request 1st turn runs; later turns queue until one is reclaimed
   unqueued     turn/unqueued for the turn (never runs)
@@ -155,6 +157,9 @@ REVIEW_SID = "msp-reviewer"
 FOLDED_MODE = os.environ.get("FAKE_FOLDED_MODE", "")
 LOG = os.environ.get("FAKE_LOG", "")
 TURNS = [0]
+# The turn a `questions_partial` prompt belongs to, so `userInput/interrupt`
+# can report its terminal.
+QUESTION_TURN = [""]
 CATALOG_READS = [0]
 # The adapter's MSP initialize posture determines whether the host should
 # create a user-input request. An explicit override exercises the backstop for
@@ -560,8 +565,15 @@ def question_params(user_input_id="ui-1"):
             {"id": "q2", "header": "Explain", "question": "Why?",
              "selection": {"mode": "single"}},
         ])
+    if os.environ.get("FAKE_QUESTION_SHAPE", "") == "pair":
+        questions.append({
+            "id": "q1", "header": "Second", "question": "Which second?",
+            "selection": {"mode": "single"},
+            "options": [{"label": "Gamma"}, {"label": "Delta"}],
+        })
     return {"sessionId": MSP_SID, "userInputId": user_input_id,
-            "turnId": "turn-question", "itemId": f"item-{user_input_id}",
+            "turnId": QUESTION_TURN[0] or "turn-question",
+            "itemId": f"item-{user_input_id}",
             "toolCallId": f"call-{user_input_id}", "toolName": "request_user_input",
             "viewCursor": "cur-8", "questions": questions}
 
@@ -717,6 +729,11 @@ def on_turn_start(params):
                 send({"jsonrpc": "2.0", "id": 9200, "method": "userInput/request",
                       "params": question_params(qid)})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "questions_partial":
+        # A two-question ask whose turn stays open until the client answers
+        # every question or settles the prompt through userInput/interrupt.
+        QUESTION_TURN[0] = tid
+        notify("userInput/requested", question_params("ui-pair"))
     elif SCENARIO == "tool_huge_output":
         notify("item/completed", {**base, "item": {
             "itemId": "it-big", "kind": "toolCall", "callId": "call-big",
@@ -1705,6 +1722,30 @@ def result_for(method, msg):
     if method == "userInput/answer":
         log_input(msg.get("params", {}))
         return {}
+    if method == "userInput/interrupt":
+        # The real host settles the open prompt with the confirmed partial
+        # answers and stops its turn, all on the interrupt lane.
+        params = msg.get("params", {})
+        log_input(params)
+        notify("userInput/settled", {
+            "sessionId": params.get("sessionId", MSP_SID),
+            "userInputId": params.get("userInputId", ""),
+            "outcome": "interrupted",
+            "answers": params.get("answers", []),
+            "clarification": None,
+            "decidedAt": None,
+            "decidedByCommandId": params.get("commandId"),
+            "reason": "interrupted by the client",
+            "sourceRange": {"start": 0, "end": 1},
+            "viewCursor": "cur-ui-interrupt",
+        })
+        if QUESTION_TURN[0]:
+            notify("turn/completed", {
+                "sessionId": params.get("sessionId", MSP_SID),
+                "turnId": QUESTION_TURN[0], "terminal": "cancelled"})
+            QUESTION_TURN[0] = ""
+        return {"commandId": params.get("commandId", ""), "status": "accepted",
+                "userInputId": params.get("userInputId", "")}
     if method in ("approval/decide", "userInput/clarify"):
         log_input(msg.get("params", {}))
         return {}
@@ -1767,6 +1808,7 @@ def result_for(method, msg):
         # the exact turn and interrupt posture.
         params = msg.get("params", {})
         log_input(params)
+        QUESTION_TURN[0] = ""
         if GOAL_TURN[0] and params.get("turnId") == GOAL_TURN[0]:
             # Interrupting a goal turn pauses the goal (host safety rule).
             GOAL_TURN[0] = ""

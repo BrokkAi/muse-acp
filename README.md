@@ -324,7 +324,13 @@ error the editor shows if Muse then refuses the profile says why.
   [Client-provided MCP servers](#client-provided-mcp-servers).
 - **Questions** — Muse `userInput/requested` bridged to ACP
   `elicitation/create` forms when the client advertises form support; otherwise
-  the host falls back to auto-cancel.
+  the host falls back to auto-cancel. Multi-question prompts are asked one
+  question per form so each confirmed answer is held by the adapter: stopping
+  mid-way (or declining a later question) sends `userInput/interrupt` with the
+  answers already given, which settles the prompt and stops the turn instead
+  of losing them. A question with no confirmed answer stops through the
+  ordinary turn interrupt and is declined through `userInput/cancel` as
+  before.
 - **Modes** — Default, Read-only, and Plan, where Muse itself refuses file
   writes and shell commands; see [Read-only and plan modes](#read-only-and-plan-modes).
 - **Configuration** — mode, approval mode, auto-review, model, and reasoning

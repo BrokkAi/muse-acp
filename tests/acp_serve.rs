@@ -2205,16 +2205,236 @@ fn structured_question_shapes_keep_the_existing_answer_mapping() {
     c.raw(&format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
     ));
+    // Multi-question prompts are staged one question per form so a stop can
+    // carry the answers already confirmed (see
+    // `partial_user_input_interrupts_with_confirmed_answers`). Each form
+    // keeps its question's original index in the property key.
     let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
-    assert!(forms[1].contains("q1") && forms[1].contains("q2"));
-    let answer_id = extract_str(&forms[1], "id").unwrap();
+    assert!(
+        forms[1].contains("\"q0\"")
+            && forms[1].contains("Alpha")
+            && forms[1].contains("Question 1 of 3"),
+        "first staged question: {}",
+        forms[1]
+    );
+    let q0_id = extract_str(&forms[1], "id").unwrap();
     c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{answer_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\",\"q1\":[\"Red\",\"Blue\"],\"q2\":\"because\"}}}}}}"
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{q0_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
+    assert!(
+        forms[2].contains("\"q1\"")
+            && forms[2].contains("Red")
+            && forms[2].contains("Question 2 of 3"),
+        "multiple-selection question staged second: {}",
+        forms[2]
+    );
+    let q1_id = extract_str(&forms[2], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{q1_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q1\":[\"Red\",\"Blue\"]}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(4, Duration::from_secs(15));
+    assert!(
+        forms[3].contains("\"q2\"")
+            && forms[3].contains("Why?")
+            && forms[3].contains("Question 3 of 3"),
+        "free-text question staged last: {}",
+        forms[3]
+    );
+    let q2_id = extract_str(&forms[3], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{q2_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q2\":\"because\"}}}}}}"
     ));
     c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
     let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
     assert!(inputs.contains("\"selectedLabels\": [\"Red\", \"Blue\"]"));
     assert!(inputs.contains("\"freeText\": \"because\""));
+    assert_eq!(
+        inputs
+            .lines()
+            .filter(|line| line.contains("\"answers\""))
+            .count(),
+        1,
+        "one answer command carries every staged answer: {inputs}"
+    );
+    c.finish();
+}
+
+/// Answers the first of a two-question staged ask and leaves the second form
+/// open, so callers can drive the stop gesture.
+fn staged_question_pair_at_second_form() -> (Client, String) {
+    let mut c = Client::spawn("questions_partial", &[("FAKE_QUESTION_SHAPE", "pair")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let route_id = extract_str(&forms[0], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    assert!(
+        forms[1].contains("Alpha") && !forms[1].contains("Gamma"),
+        "only the first question is asked: {}",
+        forms[1]
+    );
+    let q0_id = extract_str(&forms[1], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{q0_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
+    assert!(
+        forms[2].contains("Gamma") && forms[2].contains("Question 2 of 2"),
+        "second question staged after the first answer: {}",
+        forms[2]
+    );
+    (c, sid)
+}
+
+/// ACP forms are atomic: a reply either carries a full answer set or none.
+/// The adapter therefore stages multi-question prompts and holds each
+/// confirmed answer, so stopping after the first answer settles the prompt
+/// through `userInput/interrupt` carrying it, which stops the turn without
+/// losing what the user already confirmed.
+#[test]
+fn partial_user_input_interrupts_with_confirmed_answers() {
+    let (mut c, sid) = staged_question_pair_at_second_form();
+    // Nothing reached the host yet: the confirmed answer is held until the
+    // whole set is ready or the user stops.
+    let held = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert!(
+        !held.contains("\"answers\""),
+        "the held answer must not be submitted early: {held}"
+    );
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_log("userInput/interrupt", Duration::from_secs(15));
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    let interrupt = inputs
+        .lines()
+        .find(|line| line.contains("selectedLabel"))
+        .expect("interrupt with the confirmed answer");
+    assert!(
+        interrupt.contains("\"userInputId\": \"ui-pair\"")
+            && interrupt.contains("\"selectedLabel\": \"Alpha\""),
+        "interrupt carries the confirmed answer: {interrupt}"
+    );
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !calls.lines().any(|line| line == "turn/interrupt"),
+        "userInput/interrupt already stops the turn: {calls}"
+    );
+    c.wait_for("$/cancel_request", Duration::from_secs(15));
+    let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+    assert!(
+        idle.contains("cancelled"),
+        "the interrupted prompt settles cancelled: {idle}"
+    );
+    c.finish();
+}
+
+/// The interrupt frame must match the vendored `userInput/interrupt` schema:
+/// required commandId/sessionId/userInputId, and answers that are valid
+/// `UserInputAnswer` objects.
+#[test]
+fn user_input_interrupt_frame_conforms_to_the_vendored_schema() {
+    let (mut c, sid) = staged_question_pair_at_second_form();
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_log("userInput/interrupt", Duration::from_secs(15));
+    let frames_path = format!("{}.frames", c.fake_log);
+    c.finish();
+    let frames = std::fs::read_to_string(&frames_path).expect("adapter frame log");
+    let frame: serde_json::Value = frames
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|frame| frame["method"] == "userInput/interrupt")
+        .expect("userInput/interrupt frame");
+    let schema_text = std::fs::read_to_string(format!(
+        "{}/tests/protocol/stable/msp.schema.json",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("vendored schema bundle");
+    let schema: serde_json::Value = serde_json::from_str(&schema_text).expect("schema JSON");
+    let params_def = &schema["$defs"]["UserInputInterruptParams"];
+    for required in params_def["required"].as_array().expect("required") {
+        let name = required.as_str().expect("field name");
+        assert!(
+            frame["params"].get(name).is_some(),
+            "userInput/interrupt is missing required {name}: {}",
+            frame["params"]
+        );
+    }
+    let answer_def = &schema["$defs"]["UserInputAnswer"];
+    let answers = frame["params"]["answers"]
+        .as_array()
+        .expect("answers array");
+    assert_eq!(answers.len(), 1, "one confirmed answer: {answers:?}");
+    for required in answer_def["required"].as_array().expect("required") {
+        let name = required.as_str().expect("field name");
+        assert!(
+            answers[0].get(name).is_some(),
+            "UserInputAnswer is missing required {name}: {}",
+            answers[0]
+        );
+    }
+    assert_eq!(answers[0]["questionId"], "q0");
+    assert_eq!(answers[0]["selectedLabel"], "Alpha");
+}
+
+/// A stop with no confirmed answer keeps the ordinary `turn/interrupt`
+/// path; there is nothing for `userInput/interrupt` to carry.
+#[test]
+fn unanswered_user_input_stop_keeps_the_turn_interrupt() {
+    let mut c = Client::spawn("questions_partial", &[("FAKE_QUESTION_SHAPE", "pair")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_log("turn/interrupt", Duration::from_secs(15));
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !calls.lines().any(|line| line == "userInput/interrupt"),
+        "an unanswered prompt stops through turn/interrupt: {calls}"
+    );
+    assert!(
+        !calls.lines().any(|line| line == "userInput/cancel"),
+        "the stop gesture is not a decline: {calls}"
+    );
+    c.finish();
+}
+
+/// Declining a later staged question after confirming an earlier one uses
+/// the interrupt lane too: the alternative would discard the confirmed
+/// answer, which the host cannot accept on its own.
+#[test]
+fn declining_after_a_confirmed_answer_interrupts_with_it() {
+    let mut c = Client::spawn("questions_partial", &[("FAKE_QUESTION_SHAPE", "pair")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let route_id = extract_str(&forms[0], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    let q0_id = extract_str(&forms[1], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{q0_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
+    let q1_id = extract_str(&forms[2], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{q1_id}\",\"result\":{{\"action\":\"decline\"}}}}"
+    ));
+    c.wait_log("userInput/interrupt", Duration::from_secs(15));
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert!(
+        inputs.contains("\"selectedLabel\": \"Alpha\""),
+        "the confirmed answer rides the interrupt: {inputs}"
+    );
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !calls.lines().any(|line| line == "userInput/cancel"),
+        "an answered prompt is not cancelled without its answers: {calls}"
+    );
     c.finish();
 }
 

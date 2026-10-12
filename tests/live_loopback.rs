@@ -1283,6 +1283,91 @@ fn a_user_input_question_becomes_an_editor_form_and_the_answer_reaches_muse() {
 }
 
 #[test]
+fn stopping_a_staged_question_interrupts_with_the_confirmed_answer() {
+    let test = "stopping_a_staged_question_interrupts_with_the_confirmed_answer";
+    if !enabled(test) {
+        return;
+    }
+    // userInput/interrupt arrived in Muse 1.4.3 (ADR 45450 D1): it settles
+    // the open prompt with the confirmed partial answers and stops the turn.
+    // ACP forms are atomic, so the two questions arrive as two staged forms
+    // and the first answer is held until the stop carries it.
+    let host = Host::start(
+        json!({"ask": {"tool": {"name": "request_user_input", "arguments": {"questions": [
+            {"id": "color", "header": "Color",
+             "question": "Which color should the notes use?",
+             "options": [{"label": "Blue (Recommended)"}, {"label": "Red"}]},
+            {"id": "size", "header": "Size", "question": "Which size?",
+             "options": [{"label": "Small"}, {"label": "Large"}]},
+        ]}}}}),
+        None,
+    );
+    let adapter = Adapter::launch_with(&host, json!({"elicitation": {"form": {}}}));
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 3), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let prompt = adapter.prompt(&session, "ask me [[script:ask]]");
+    let route = form(&adapter, "route");
+    adapter.send(json!({
+        "jsonrpc": "2.0",
+        "id": route["id"],
+        "result": {"action": "accept", "content": {"route": "Answer questions"}},
+    }));
+    let first = form(&adapter, "q0");
+    assert!(
+        first["params"]["requestedSchema"]["properties"]
+            .get("q1")
+            .is_none(),
+        "questions are staged one at a time: {first}"
+    );
+    let red = first["params"]["requestedSchema"]["properties"]["q0"]["enum"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|choice| choice.as_str().is_some_and(|label| label.contains("Red")))
+        .unwrap_or_else(|| panic!("no Red choice in {first}"))
+        .clone();
+    adapter.send(json!({
+        "jsonrpc": "2.0",
+        "id": first["id"],
+        "result": {"action": "accept", "content": {"q0": red}},
+    }));
+    let second = form(&adapter, "q1");
+    assert!(
+        second["params"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("Question 2 of 2")),
+        "the staged walk reports its position: {second}"
+    );
+    // Stop while the second question waits: the held answer rides the
+    // interrupt, and the host stops the turn with it.
+    adapter.send(json!({
+        "jsonrpc": "2.0",
+        "method": "session/cancel",
+        "params": {"sessionId": session},
+    }));
+    let result = adapter.result(prompt);
+    assert_eq!(result["stopReason"], "cancelled", "{result}");
+    // The turn stops before the model is called again, so the confirmed
+    // answer lives on the interrupted tool result in the stored session
+    // rather than in a later provider request.
+    let read = probe_host(
+        &host,
+        "session/read",
+        json!({"sessionId": session, "excludeItems": false}),
+    );
+    assert!(read.get("error").is_none(), "session/read: {read}");
+    let read = read.to_string();
+    assert!(
+        read.contains("selected_label") && read.contains("Red"),
+        "Muse records the confirmed partial answer on the interrupted result: {read}"
+    );
+    adapter.finish();
+}
+
+#[test]
 fn a_workflow_child_runs_and_its_result_reaches_the_parent() {
     if !enabled("a_workflow_child_runs_and_its_result_reaches_the_parent") {
         return;
