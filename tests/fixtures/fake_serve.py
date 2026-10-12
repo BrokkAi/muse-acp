@@ -341,9 +341,6 @@ ACTIVE_SESSION = [MSP_SID]
 CRASH_AFTER_ACK = [False]
 WORKFLOW_TURN = [""]
 WORKFLOW_CHILD_ATTEMPT = [1]
-# Whether the scenario's live workflow run is paused (workflow/pause and
-# workflow/resume set it; the item events carry the truth to the adapter).
-WORKFLOW_PAUSED = [False]
 # The goal turn currently running in the goal_* scenarios ("" when idle).
 GOAL_TURN = [""]
 GOAL_OBJECTIVE = [""]
@@ -1790,7 +1787,6 @@ def result_for(method, msg):
     if method == "workflow/pause":
         params = msg.get("params", {})
         log_input(params)
-        WORKFLOW_PAUSED[0] = True
         if SCENARIO == "workflow_control":
             # The pause folds as the workflow item's `paused` member.
             notify("item/updated", {
@@ -1808,7 +1804,6 @@ def result_for(method, msg):
     if method == "workflow/resume":
         params = msg.get("params", {})
         log_input(params)
-        WORKFLOW_PAUSED[0] = False
         if SCENARIO == "workflow_control":
             # A resumed launch is a new workflow item whose `resumeFromRunId`
             # names the paused run it supersedes; like Muse 1.4.6, the
