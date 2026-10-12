@@ -1409,7 +1409,12 @@ fn video_resource_links_reach_a_real_host() {
     let session = adapter.new_session(&host, json!([]));
     let clip = host.workspace().join("clip.mp4");
     std::fs::write(&clip, vec![7u8; 300_000]).expect("write the video fixture");
-    let uri = format!("file://{}", clip.display());
+    let path = clip.display().to_string().replace('\\', "/");
+    let uri = if cfg!(windows) {
+        format!("file:///{path}")
+    } else {
+        format!("file://{path}")
+    };
     let id = adapter.request(
         "session/prompt",
         json!({"sessionId": session, "prompt": [
@@ -1426,12 +1431,14 @@ fn video_resource_links_reach_a_real_host() {
         // host's own attempt to ship the uploaded video to a Files API is
         // the observable proof that the upload and the video part were
         // accepted; a host-side upload failure would have failed earlier.
-        let message = response["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
+        // Both failures happen after the host accepted the upload and built
+        // the video part: 1.4.6 tries to ship it to the model provider's
+        // Files API (which the loopback provider does not serve), and older
+        // builds gate video input behind TBH_VIDEO_INPUT_ENABLED. An
+        // upload-side failure would have failed earlier with the chunk text.
+        let message = response["error"]["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("Files API"),
+            message.contains("Files API") || message.contains("video input is disabled"),
             "the video reached the turn: {response}"
         );
     }

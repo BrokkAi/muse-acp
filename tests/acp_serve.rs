@@ -8394,7 +8394,12 @@ fn video_resource_links_upload_in_chunks_and_become_video_parts() {
     let clip = workspace.join("clip.mp4");
     let bytes: Vec<u8> = (0..1_600_000u32).map(|i| (i % 251) as u8).collect();
     std::fs::write(&clip, &bytes).expect("write the video fixture");
-    let uri = format!("file://{}", clip.display());
+    let path = clip.display().to_string().replace('\\', "/");
+    let uri = if cfg!(windows) {
+        format!("file:///{path}")
+    } else {
+        format!("file://{path}")
+    };
     let pid = c.req(
         "session/prompt",
         &serde_json::json!({
