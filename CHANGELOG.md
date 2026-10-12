@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Support chunked video uploads. A `resource_link` (or embedded resource
+  blob) whose media type is `video/mp4` or `video/quicktime` is read inside
+  the approved roots (up to 64 MiB), uploaded to the session's video store
+  through Muse's `media/upload` in 1 MiB raw chunks, and submitted to the
+  turn as a `{"type":"video","uploadId":...}` part. Chunks stay within the
+  host's frame budget, each carries a fresh command id so a retry is
+  idempotent, and a failed chunk fails the prompt before any turn is
+  submitted.
 - Add the opt-in computer-use surface. A client that advertises
   `_meta.muse.computerUse` makes the adapter request the host's
   `computerUseSetup` capability, and the `_session/computerUse` extension then

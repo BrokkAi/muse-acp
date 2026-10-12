@@ -8383,6 +8383,91 @@ fn output_unavailable_is_forwarded_as_typed_error() {
 /// host's `hook/list` rows verbatim; the read also seeds the fold's hook
 /// inventory.
 #[test]
+fn video_resource_links_upload_in_chunks_and_become_video_parts() {
+    let mut c = Client::spawn("media_upload", &[]);
+    let sid = c.new_session(2, "");
+    // The workspace is the session cwd; a >1 MiB file forces two chunks.
+    let workspace = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent")
+        .join("workspace");
+    let clip = workspace.join("clip.mp4");
+    let bytes: Vec<u8> = (0..1_600_000u32).map(|i| (i % 251) as u8).collect();
+    std::fs::write(&clip, &bytes).expect("write the video fixture");
+    let uri = format!("file://{}", clip.display());
+    let pid = c.req(
+        "session/prompt",
+        &serde_json::json!({
+            "sessionId": sid,
+            "prompt": [
+                {"type": "text", "text": "watch this"},
+                {"type": "resource_link", "uri": uri, "name": "clip.mp4",
+                 "mimeType": "video/mp4"},
+            ],
+        })
+        .to_string(),
+    );
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(30));
+    assert!(frame.contains("\"result\""), "prompt settles: {frame}");
+    // Two bounded chunks carrying the real bytes, then the receipt reaches
+    // the turn as a video part.
+    let uploaded = std::fs::read(format!("{}.upload", c.fake_log)).expect("assembled upload");
+    assert_eq!(uploaded, bytes, "the host store receives the file bytes");
+    c.wait_input("\"chunkCount\": 2", Duration::from_secs(15));
+    c.wait_input("\"chunkIndex\": 1", Duration::from_secs(15));
+    c.wait_input(
+        &format!("\"totalBytes\": {}", bytes.len()),
+        Duration::from_secs(15),
+    );
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert_eq!(
+        calls.lines().filter(|line| *line == "media/upload").count(),
+        2,
+        "one call per chunk: {calls}"
+    );
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    let turn = input
+        .lines()
+        .find(|line| line.contains("\"type\": \"video\""))
+        .unwrap_or_else(|| panic!("turn/start carries the video part: {input}"));
+    assert!(
+        turn.contains("\"uploadId\": \"") && !turn.contains("\"uploadId\": \"\""),
+        "{turn}"
+    );
+    c.finish();
+}
+
+#[test]
+fn embedded_video_blobs_upload_as_a_single_chunk() {
+    let mut c = Client::spawn("media_upload", &[]);
+    let sid = c.new_session(2, "");
+    // "hello video" in base64, small enough for one chunk.
+    let pid = c.req(
+        "session/prompt",
+        &serde_json::json!({
+            "sessionId": sid,
+            "prompt": [
+                {"type": "resource", "resource": {
+                    "uri": "file:///clip.mov", "mimeType": "video/quicktime",
+                    "blob": "aGVsbG8gdmlkZW8=",
+                }},
+            ],
+        })
+        .to_string(),
+    );
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(30));
+    assert!(frame.contains("\"result\""), "prompt settles: {frame}");
+    c.wait_input(
+        "\"mediaType\": \"video/quicktime\"",
+        Duration::from_secs(15),
+    );
+    c.wait_input("\"chunkCount\": 1", Duration::from_secs(15));
+    let uploaded = std::fs::read(format!("{}.upload", c.fake_log)).expect("assembled upload");
+    assert_eq!(uploaded, b"hello video");
+    c.finish();
+}
+
+#[test]
 fn computer_use_reads_require_the_opt_in_and_the_grant() {
     const OPT_IN: &str =
         ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"computerUse\"]}}}";

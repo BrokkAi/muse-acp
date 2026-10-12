@@ -395,8 +395,11 @@ error the editor shows if Muse then refuses the profile says why.
   <bundleId>` drive setup and the settings patch. A gate that is off answers
   the typed `computerUseUnavailable`, never a generic failure.
 - **Content** — text, inline and local-file images, `resource_link` text
-  expansion, and embedded context. Audio is rejected, because Muse's input type
-  is closed to `text` and `image`.
+  expansion, and embedded context. A `resource_link` (or embedded blob) whose
+  media type is `video/mp4` or `video/quicktime` is uploaded to the session's
+  video store through Muse's chunked `media/upload` and submitted as a `video`
+  turn part; the receipt is threaded into the turn. Audio is rejected, because
+  Muse's input type is closed to `text`, `image`, `skill`, and `video`.
 - **Usage** — context occupancy as `usage_update`, cumulative session totals,
   subscription observations under `_meta.museSubscriptionUsage`, and a
   session cost that on Muse 1.4.2+ is Muse's own figure (with its partial

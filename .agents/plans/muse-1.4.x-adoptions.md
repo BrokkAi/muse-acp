@@ -25,8 +25,8 @@ To see it working, run the per-issue test command named in each milestone below;
 - [x] (2026-10-12) Issue #222 `session/sideChat` and `SideProvenance`: merged in PR #233 (opt-in `_session/sideChat`, client-side attach through resume/load, provenance in `session_info_update`, fake-host plus live 1.4.4/1.4.6 tests, docs).
 - [x] (2026-10-12) Issue #219 `task/list`: merged in PR #234 (resume/re-attach seeding of AIR async tasks, seeded-id reuse for later item events, fake-host plus live-1.4.6 tests, docs).
 - [x] (2026-10-12) Issue #214 plugin and marketplace management: merged in PR #235 (opt-in `_session/plugins`, `/plugin install|marketplace` commands, typed refusals, consumed change notices, fake-host plus live 1.4.4/1.4.6 tests, docs).
-- [ ] (2026-10-12) Issue #216 computer-use settings and setup: implemented on `issue-216/computer-use` (opt-in `_session/computerUse`, `/cua` command family, capability request/grant plumbing, typed `computerUseUnavailable`, consumed setup notices, fake-host plus live-1.4.6 tests, docs), PR and merge pending.
-- [ ] Issue #221 `media/upload`.
+- [x] (2026-10-12) Issue #216 computer-use settings and setup: merged in PR #236 (opt-in `_session/computerUse`, `/cua` command family, capability request/grant plumbing, typed `computerUseUnavailable`, consumed setup notices, fake-host plus live-1.4.6 tests, docs).
+- [ ] (2026-10-12) Issue #221 `media/upload`: implemented on `issue-221/media-upload` (resource-link/embedded-blob video entry, 1 MiB aligned chunks with retries and UUIDv7 uploadId, injected uploader callback, video turn part, fake-host plus live-1.4.6 tests, docs), PR and merge pending.
 - [ ] Issue #224 remaining 1.4.x field-level and vocabulary additions.
 
 
@@ -98,7 +98,7 @@ For #214, decide the plugin surface, then implement `plugin/list` reads and `plu
 
 For #216, request the `computerUseSetup` capability only when a client asks for it, expose setup and settings through the adapter's ACP surface, and keep the CUA gate's refusals typed (`computerUseUnavailable`).
 
-For #221, add the chunked `media/upload` path: accept media references from ACP clients, upload in bounded chunks with resumable `uploadId`s, and thread the receipt into the turn part that consumes it.
+For #221, add the chunked `media/upload` path. Muse's video store takes one `media/upload` call per chunk (`chunkIndex`/`chunkCount`/`totalBytes`/`chunkBase64`/`mediaType`/`uploadId`), and a turn consumes the upload with a `{"type":"video","uploadId":...}` input part. Design decided here: ACP clients supply video as a `resource_link` to a local file whose `mimeType` (or extension) is a supported video type (`video/mp4`, `video/quicktime`), or as an embedded `resource` blob with a `video/*` mime type; both are currently rejected or degraded to a text reference. The prompt path reads the bytes (resource links go through the existing approved-roots local-file reader), mints one UUIDv7 `uploadId`, and uploads in fixed-size chunks (1 MiB raw, so each base64 frame stays well under the host's 10 MiB frame budget) with a fresh `commandId` per call and bounded per-chunk retries; a replayed chunk answers the recorded receipt. The receipt becomes the `video` turn part, and the upload happens before `turn/start` so a failure surfaces as a prompt error instead of a half-submitted turn. `extract_prompt_parts` gains an injected uploader callback so the prompt and steering paths can upload while pure callers pass a refusing stub that keeps the current error text.
 
 For #224, close the remaining field-level gaps: map or explicitly ignore `webSearch` items, `mcpLinkError`, `TurnError.quota`, the new `turn/retryScheduled` and `turn/retracted` detail fields, `SessionStartParams.permissionProfile`, `TurnStartParams.userShell`, `Session.sideFrom`, and the newly required nullable fields, recording each decision in `docs/event-compatibility.md` and ROADMAP section 9.
 

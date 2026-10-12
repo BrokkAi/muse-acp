@@ -5187,18 +5187,24 @@ fn handle_acp(
                     return;
                 }
             };
-            let (parts, acp_content) =
-                match extract_prompt_parts(params.as_ref(), &roots, skills.as_ref()) {
-                    Ok((p, c)) if !p.is_empty() => (p, c),
-                    Ok(_) => {
-                        acp::send_error(stdout, &id, -32602, "session/prompt requires content");
-                        return;
-                    }
-                    Err(e) => {
-                        acp::send_error(stdout, &id, -32602, &e);
-                        return;
-                    }
-                };
+            let mut media_upload =
+                |base64: &str, media_type: &str| upload_video(host, &msp_sid, base64, media_type);
+            let (parts, acp_content) = match extract_prompt_parts(
+                params.as_ref(),
+                &roots,
+                skills.as_ref(),
+                &mut media_upload,
+            ) {
+                Ok((p, c)) if !p.is_empty() => (p, c),
+                Ok(_) => {
+                    acp::send_error(stdout, &id, -32602, "session/prompt requires content");
+                    return;
+                }
+                Err(e) => {
+                    acp::send_error(stdout, &id, -32602, &e);
+                    return;
+                }
+            };
             {
                 let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                 if let Some(s) = map.get_mut(&sid) {
@@ -6117,18 +6123,24 @@ fn handle_acp(
                 );
                 return;
             }
-            let (parts, acp_content) =
-                match extract_prompt_parts(params.as_ref(), &roots, skills.as_ref()) {
-                    Ok((parts, content)) if !parts.is_empty() => (parts, content),
-                    Ok(_) => {
-                        acp::send_error(stdout, &id, -32602, "steering requires content");
-                        return;
-                    }
-                    Err(message) => {
-                        acp::send_error(stdout, &id, -32602, &message);
-                        return;
-                    }
-                };
+            let mut media_upload =
+                |base64: &str, media_type: &str| upload_video(host, &msp_sid, base64, media_type);
+            let (parts, acp_content) = match extract_prompt_parts(
+                params.as_ref(),
+                &roots,
+                skills.as_ref(),
+                &mut media_upload,
+            ) {
+                Ok((parts, content)) if !parts.is_empty() => (parts, content),
+                Ok(_) => {
+                    acp::send_error(stdout, &id, -32602, "steering requires content");
+                    return;
+                }
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
             if active_turn.is_none() && prompt_required {
                 acp::send_result(
                     stdout,
@@ -7481,6 +7493,161 @@ fn image_part(data_b64: &str, mime: &str) -> String {
     )
 }
 
+/// Standard-alphabet base64 with padding. Chosen so the encoder is trivial
+/// and dependency-free; the adapter only ever encodes at this one boundary.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[(triple >> 18) as usize & 0x3f] as char);
+        out.push(ALPHABET[(triple >> 12) as usize & 0x3f] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(triple >> 6) as usize & 0x3f] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[triple as usize & 0x3f] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// One raw byte chunk per `media/upload` call. A multiple of three keeps
+/// every chunk's base64 independently decodable, so an existing base64
+/// payload can be sliced without decoding it; ~1 MiB raw stays far inside
+/// the host's 10 MiB frame budget after base64 and JSON overhead.
+const MEDIA_CHUNK_RAW_BYTES: usize = 1_048_575;
+
+/// Largest local video file the adapter will read for one upload.
+const MEDIA_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Upload one video to the session's video store in chunks and return the
+/// receipt `uploadId`. Each call carries a fresh command id; a replayed call
+/// answers the host's recorded receipt, so a retry after a transient failure
+/// is safe. The frame stays bounded because `base64` is chunked at
+/// three-byte-aligned boundaries.
+fn upload_video(
+    host: &Arc<Hosts>,
+    msp_sid: &str,
+    base64: &str,
+    media_type: &str,
+) -> Result<String, String> {
+    if base64.is_empty() {
+        return Err("video payload is empty".to_string());
+    }
+    if !base64
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'\n' | b'\r'))
+    {
+        return Err("video payload is not base64".to_string());
+    }
+    let compact: String = base64
+        .chars()
+        .filter(|c| !matches!(c, '\n' | '\r'))
+        .collect();
+    let padding = compact.chars().rev().take_while(|c| *c == '=').count();
+    if !compact.len().is_multiple_of(4) || padding > 2 {
+        return Err("video payload is not valid base64".to_string());
+    }
+    let total_bytes = (compact.len() / 4) * 3 - padding;
+    let chunk_chars = MEDIA_CHUNK_RAW_BYTES / 3 * 4;
+    let chunks: Vec<&str> = compact
+        .as_bytes()
+        .chunks(chunk_chars)
+        .map(|chunk| std::str::from_utf8(chunk).expect("base64 is ASCII"))
+        .collect();
+    let chunk_count = chunks.len();
+    let upload_id = host.mint_cmd("upl-");
+    for (index, chunk) in chunks.iter().enumerate() {
+        let mut last_error = String::new();
+        let mut delivered = false;
+        for _ in 0..3 {
+            let command_id = host.mint_cmd("cmd-");
+            let params = format!(
+                "{{\"commandId\":{},\"sessionId\":{},\"uploadId\":{},\"mediaType\":{},\"chunkIndex\":{index},\"chunkCount\":{chunk_count},\"totalBytes\":{total_bytes},\"chunkBase64\":{}}}",
+                esc(&command_id),
+                esc(msp_sid),
+                esc(&upload_id),
+                esc(media_type),
+                esc(chunk)
+            );
+            match host.command("media/upload", &params) {
+                Ok(receipt)
+                    if receipt.get("uploadId").and_then(J::as_str) == Some(upload_id.as_str()) =>
+                {
+                    delivered = true;
+                    break;
+                }
+                Ok(receipt) => {
+                    last_error = format!(
+                        "media/upload echoed an unexpected receipt: {}",
+                        j_to_string(&receipt)
+                    );
+                }
+                Err(error) => last_error = err_message(&error),
+            }
+        }
+        if !delivered {
+            return Err(format!(
+                "video chunk {} of {} failed: {last_error}",
+                index + 1,
+                chunk_count
+            ));
+        }
+    }
+    Ok(upload_id)
+}
+
+/// Read one local file through the approved roots for a media reference.
+/// Returns `None` when the file does not exist, is outside the roots, or is
+/// larger than `cap` so the caller keeps its existing fallback.
+fn local_file_bytes(uri: &str, roots: &[String], cap: u64) -> Result<Option<Vec<u8>>, String> {
+    if uri.contains("://") && !uri.starts_with("file://") {
+        return Ok(None);
+    }
+    let cwd = roots.first().map(String::as_str).unwrap_or("/");
+    let requested = file_uri_path(uri, cwd)?;
+    let path = match confined_path(&requested, roots) {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    let meta = match std::fs::metadata(&path) {
+        Ok(meta) => meta,
+        Err(_) => return Ok(None),
+    };
+    if meta.len() > cap {
+        return Ok(None);
+    }
+    std::fs::read(&path).map(Some).map_err(|e| e.to_string())
+}
+
+/// The video media types the host's video store accepts, plus the file
+/// extensions an editor typically sends without a mime type.
+fn video_media_type(mime: &str, uri: &str) -> Option<&'static str> {
+    match mime {
+        "video/mp4" => return Some("video/mp4"),
+        "video/quicktime" => return Some("video/quicktime"),
+        _ => {}
+    }
+    let path = uri.split(['?', '#']).next().unwrap_or(uri).to_lowercase();
+    if mime.is_empty() {
+        if path.ends_with(".mp4") || path.ends_with(".m4v") {
+            return Some("video/mp4");
+        }
+        if path.ends_with(".mov") {
+            return Some("video/quicktime");
+        }
+    }
+    None
+}
+
 /// Build MSP turn input parts: text, native skill invocations, and images.
 /// Image sources: inline base64 `data`, or a local `file://`/`/` path which
 /// is read and encoded here (same machine). Audio has no host surface
@@ -7492,6 +7659,7 @@ fn extract_prompt_parts(
     params: Option<&J>,
     roots: &[String],
     skills: Option<&std::collections::HashSet<String>>,
+    media: &mut dyn FnMut(&str, &str) -> Result<String, String>,
 ) -> Result<(Vec<String>, String), String> {
     let p = params.ok_or("session/prompt requires params")?;
     let prompt = p.get("prompt").unwrap_or(p);
@@ -7550,6 +7718,19 @@ fn extract_prompt_parts(
                                     parts.push(image_part(blob, mime));
                                     content.push(j_to_string(b));
                                 }
+                                Some(blob) if video_media_type(mime, uri).is_some() => {
+                                    // Upload the inline video to the session's
+                                    // video store and consume the receipt.
+                                    flush_text(&mut texts, &mut parts);
+                                    let media_type = video_media_type(mime, uri)
+                                        .expect("checked video media type");
+                                    let upload_id = media(blob, media_type)?;
+                                    parts.push(format!(
+                                        "{{\"type\":\"video\",\"uploadId\":{}}}",
+                                        esc(&upload_id)
+                                    ));
+                                    content.push(j_to_string(b));
+                                }
                                 Some(_) => return Err("embedded non-image resource blobs are not supported; send text".to_string()),
                                 None if !uri.is_empty() => {
                                     texts.push(format!("[resource: {uri}]"));
@@ -7566,6 +7747,26 @@ fn extract_prompt_parts(
                         let mime = b.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
                         if uri.is_empty() {
                             return Err("resource_link block needs uri".to_string());
+                        }
+                        if video_media_type(mime, uri).is_some() {
+                            // A video reference is uploaded to the session's
+                            // video store and consumed as a `video` part; the
+                            // file must be readable inside the approved roots.
+                            flush_text(&mut texts, &mut parts);
+                            let media_type =
+                                video_media_type(mime, uri).expect("checked video media type");
+                            let Some(bytes) = local_file_bytes(uri, roots, MEDIA_MAX_BYTES)? else {
+                                return Err(format!(
+                                    "video resource {uri} is not a readable local file within the approved roots"
+                                ));
+                            };
+                            let upload_id = media(&base64_encode(&bytes), media_type)?;
+                            parts.push(format!(
+                                "{{\"type\":\"video\",\"uploadId\":{}}}",
+                                esc(&upload_id)
+                            ));
+                            content.push(j_to_string(b));
+                            continue;
                         }
                         let textual = mime.starts_with("text/") || mime.is_empty() || looks_textual(uri);
                         let local_text = if textual {

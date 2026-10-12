@@ -51,6 +51,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   task_list_seed task/list seeds async tasks after a resume whose history is
                empty; the item terminal then settles the seeded task
   plugin_control plugin/list rows and the install/marketplace write receipts
+  media_upload media/upload chunks reassemble into the video store
   async_task_stop       background task then a targeted task/stop terminal
   async_task_stop_all   background tasks then task/stopAll terminals
   hook_run     a hookRun item around the turn; hook/list serves the inventory
@@ -150,6 +151,7 @@ With FAKE_FLOOD_SYNC_EVERY=K it prints `sync` and waits for another stdin
 line every K lines, so the test can restart all writers together and recreate
 the t=0 contention the Windows seek-then-write race needs.
 """
+import base64
 import json
 import os
 import sys
@@ -184,6 +186,9 @@ FEEDBACK = [False]
 MCP_CONFLICTED = [False]
 USAGE_READS = [0]
 SKILL_READS = [0]
+# media/upload chunks received per uploadId, with the assembled bytes appended
+# to <FAKE_LOG>.upload for the test to compare.
+UPLOADS = {}
 FORK_ITEMS = []
 # Durable session ids a successful `session/delete` removed.
 DELETED_SESSIONS = []
@@ -926,6 +931,8 @@ def on_turn_start(params):
             "revision": 2, "hookKey": "fmt-on-save", "event": "postToolUse",
             "label": "Format on save", "runStatus": "completed",
             "reason": "formatted 2 files"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "media_upload":
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "task_list_seed":
         # A turn after the resume settles the seeded item-backed task; its
@@ -1822,6 +1829,25 @@ def result_for(method, msg):
         return {"computerControl": params.get("computerControl", "ask"),
                 "screenshots": params.get("screenshots", "ask"),
                 "blockedApps": apps}
+    if method == "media/upload":
+        params = msg.get("params", {})
+        # The base64 chunks stay out of the text log; the assembled bytes are
+        # appended to <FAKE_LOG>.upload so tests can compare them to the file.
+        log_input({key: params.get(key) for key in (
+            "commandId", "sessionId", "uploadId", "mediaType",
+            "chunkIndex", "chunkCount", "totalBytes")})
+        upload_id = params.get("uploadId", "")
+        UPLOADS.setdefault(upload_id, []).append(params)
+        assembled = params.get("chunkBase64", "")
+        try:
+            raw = base64.b64decode(assembled)
+        except Exception:
+            raw = b""
+        path = os.environ.get("FAKE_LOG", "") + ".upload"
+        if path != ".upload":
+            with open(path, "ab") as handle:
+                handle.write(raw)
+        return {"uploadId": upload_id}
     if method == "plugin/list":
         log_input(msg.get("params", {}))
         return {"plugins": [
