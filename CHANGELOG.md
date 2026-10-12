@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Label hook runs and expose the session's hook inventory. `hookRun` items
+  now render as `Hook <label>` cards carrying the hook key, event, durable
+  outcome, and terminal reason, and the opt-in `_session/hooks` extension
+  (muse `hooks` capability) returns the host's `hook/list` rows verbatim and
+  names each card's handler origin and enabled switch.
 - Pause and resume live Muse workflows from the editor. `/workflow pause
   [<runId>]` and `/workflow resume [<runId>]` map onto the host's
   `workflow/pause` and `workflow/resume`; a single live run may be implied,

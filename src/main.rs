@@ -46,6 +46,7 @@ static AIR_ASYNC_TASKS: AtomicU64 = AtomicU64::new(0); // 1 when the client want
 static AIR_RECOMMENDED: AtomicU64 = AtomicU64::new(0); // 1 when the client wants recommendedValue metadata
 static USER_SHELL: AtomicU64 = AtomicU64::new(0); // explicit editor shell feature
 static READ_OUTPUT: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates stored-output reads
+static HOOKS: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates session hook reads
 static AIR_FILE_REPORT: AtomicU64 = AtomicU64::new(0); // 1 when per-turn file reports are negotiated
 static MUSE_NOT_INSTALLED: AtomicBool = AtomicBool::new(false); // host launch found no Muse executable
 
@@ -1389,7 +1390,7 @@ enum LoopMsg {
 /// MSP `session/delete` support (Muse 1.4.1 or 1.4.2, durable); clients
 /// must not call `session/delete` unless it is advertised.
 fn v2_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
+    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["hooks","readOutput","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v2())
         .replace(
@@ -1407,7 +1408,7 @@ fn v2_init(session_mcp: bool, session_delete: bool) -> String {
 }
 
 fn v1_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["readOutput","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true}}}"#
+    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["hooks","readOutput","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v1())
         .replace("__MCP_HTTP__", if session_mcp { "true" } else { "false" })
@@ -3742,6 +3743,11 @@ fn negotiate_acp(msg: &J) -> bool {
     if read_output {
         log("client negotiated stored-output reads");
     }
+    let hooks = client_supports_muse(capabilities, "hooks");
+    HOOKS.store(u64::from(hooks), Ordering::SeqCst);
+    if hooks {
+        log("client negotiated session hook reads");
+    }
     let recommended = client_supports_air(capabilities, "recommendedValue");
     AIR_RECOMMENDED.store(u64::from(recommended), Ordering::SeqCst);
     if async_tasks {
@@ -5634,6 +5640,58 @@ fn handle_acp(
                     &id,
                     msp::acp_error_code(&error, -32603),
                     &format!("item/readOutput failed: {}", err_message(&error)),
+                ),
+            }
+        }
+        "_session/hooks" => {
+            if HOOKS.load(Ordering::SeqCst) == 0 {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32601,
+                    "session hook reads require the muse hooks capability",
+                );
+                return;
+            }
+            let acp_sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let Some(acp_sid) = acp_sid else {
+                acp::send_error(stdout, &id, -32602, "_session/hooks requires sessionId");
+                return;
+            };
+            let msp_sid = match sessions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .get(&acp_sid)
+            {
+                Some(session) => session.msp_sid.clone(),
+                None => {
+                    acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                    return;
+                }
+            };
+            match host.command("hook/list", &format!("{{\"sessionId\":{}}}", esc(&msp_sid))) {
+                Ok(result) => {
+                    // The inventory labels later `hookRun` items with where
+                    // each handler came from; the host promises the set.
+                    if let Some(session) = sessions
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .get_mut(&acp_sid)
+                    {
+                        session.fold.note_hook_inventory(&result);
+                    }
+                    acp::send_result(stdout, &id, &j_to_string(&result));
+                }
+                Err(error) => acp::send_error(
+                    stdout,
+                    &id,
+                    msp::acp_error_code(&error, -32603),
+                    &format!("hook/list failed: {}", err_message(&error)),
                 ),
             }
         }

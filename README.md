@@ -387,6 +387,10 @@ error the editor shows if Muse then refuses the profile says why.
   native file tools when the client negotiates the AIR extension.
 - **Stored output** — bounded tool output with head and tail retained, plus
   opt-in `_session/readOutput` access to the host's stored bytes.
+- **Hooks** — `hookRun` items render as hook cards with their event, durable
+  outcome, and terminal reason; opt-in `_session/hooks` reads the session's
+  installed handler rows (`hook/list`) and labels those cards with each
+  handler's origin and enabled switch.
 
 ### Protocol extensions
 
@@ -398,6 +402,7 @@ only when the client opts in too, with the documented fallback otherwise:
   standards-track `session/inject` proposal is still unmerged — adopting it is
   future work.
 - `_session/readOutput` — opt-in reads of host-stored tool output.
+- `_session/hooks` — opt-in reads of the session's installed hook handlers.
 - `_session/userShell` — shell commands outside any turn; needs editor
   opt-in, AIR `asyncTasks`, and a host grant all together.
 - `_session/async_task/stop` — stop one background task; `session/cancel`

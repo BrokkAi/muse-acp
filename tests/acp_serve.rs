@@ -8094,6 +8094,61 @@ fn output_unavailable_is_forwarded_as_typed_error() {
     );
 }
 
+/// `_session/hooks` is opt-in (like `_session/readOutput`) and returns the
+/// host's `hook/list` rows verbatim; the read also seeds the fold's hook
+/// inventory.
+#[test]
+fn session_hook_reads_require_opt_in_and_return_the_inventory() {
+    let mut c = Client::spawn("hook_run", &[]);
+    let sid = c.new_session(2, "");
+    let read_id = c.req("_session/hooks", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let response = c.wait_for(&format!("\"id\":{read_id}"), Duration::from_secs(15));
+    assert!(
+        response.contains("\"code\":-32601") && response.contains("hooks capability"),
+        "un-negotiated hook reads must fail closed: {response}"
+    );
+    c.finish();
+}
+
+#[test]
+fn hook_inventory_labels_hook_run_items() {
+    let mut c = Client::spawn("hook_run", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"hooks\"]}}}",
+    );
+    c.wait_stderr(
+        "client negotiated session hook reads",
+        Duration::from_secs(10),
+    );
+    let read_id = c.req("_session/hooks", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let response = c.wait_for(&format!("\"id\":{read_id}"), Duration::from_secs(15));
+    assert!(
+        response.contains("\"key\":\"fmt-on-save\"")
+            && response.contains("\"handlerKind\":\"project\"")
+            && response.contains("\"enabled\":false"),
+        "the host inventory is returned verbatim: {response}"
+    );
+    c.wait_log("hook/list", Duration::from_secs(10));
+
+    // A later hookRun item is labeled from the item and the inventory.
+    let _pid = c.prompt(&sid, "run the hook");
+    let card = c.wait_for("Hook Format on save", Duration::from_secs(15));
+    assert!(
+        card.contains("\"hookKey\":\"fmt-on-save\"")
+            && card.contains("\"event\":\"postToolUse\"")
+            && card.contains("\"handlerKind\":\"project\"")
+            && card.contains("\"enabled\":true"),
+        "the card carries the hook facts: {card}"
+    );
+    let done = c.wait_for("formatted 2 files", Duration::from_secs(15));
+    assert!(
+        done.contains("\"runStatus\":\"completed\""),
+        "the terminal outcome is on the card: {done}"
+    );
+    c.finish();
+}
+
 #[test]
 fn native_subagent_sessions_spawn_state_and_replay_the_child() {
     let mut c = Client::spawn("subagent_native", &[("FAKE_CAPS", "subagents")]);

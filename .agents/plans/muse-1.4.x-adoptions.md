@@ -18,8 +18,8 @@ To see it working, run the per-issue test command named in each milestone below;
 
 - [x] (2026-10-12) Surveyed the open issues #214 through #224, the vendored schema, `ROADMAP.md` section 9, and the existing extension and slash-command patterns.
 - [x] (2026-10-12) Issue #223 `userInput/interrupt`: merged in PR #228 (staged multi-question forms, interrupt with confirmed answers, fake-host and live-1.4.6 tests, docs).
-- [ ] (2026-10-12) Issue #218 `workflow/pause` and `workflow/resume`: implemented on `issue-218/workflow-pause-resume` (fold pause state and resume generation, `/workflow pause|resume [<runId>]`, fake-host plus live-1.4.6 tests, docs), PR and merge pending.
-- [ ] Issue #220 `hook/list`.
+- [x] (2026-10-12) Issue #218 `workflow/pause` and `workflow/resume`: merged in PR #229 (fold pause state and resume generation, `/workflow pause|resume [<runId>]`, fake-host plus live 1.4.4/1.4.6 tests, docs).
+- [ ] (2026-10-12) Issue #220 `hook/list`: implemented on `issue-220/hook-list` (opt-in `_session/hooks`, hook inventory in the fold, `hookRun` cards, fake-host plus live 1.4.4/1.4.6 tests, docs), PR and merge pending.
 - [ ] Issue #215 `recap/request` and `recap/cancel`.
 - [ ] Issue #217 `skill/setActivation` and `skill/import`.
 - [ ] Issue #222 `session/sideChat` and `SideProvenance`.

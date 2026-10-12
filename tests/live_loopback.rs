@@ -1367,6 +1367,30 @@ fn stopping_a_staged_question_interrupts_with_the_confirmed_answer() {
     adapter.finish();
 }
 
+/// `_session/hooks` returns the host's `hook/list` rows once the client
+/// negotiates the `hooks` extension. `hook/list` arrived in Muse 1.4.4.
+#[test]
+fn session_hook_reads_reach_a_real_host_when_negotiated() {
+    let test = "session_hook_reads_reach_a_real_host_when_negotiated";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    let adapter = Adapter::launch_with(&host, json!({"_meta": {"muse": {"hooks": true}}}));
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 4), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let read = adapter.request("_session/hooks", json!({"sessionId": session}));
+    let result = adapter.result(read);
+    assert!(
+        result["hooks"].is_array(),
+        "the host's hook rows come back: {result}"
+    );
+    adapter.finish();
+}
+
 /// Pausing a live workflow folds the pause fact onto its card, and resuming
 /// it launches a new run whose item names the paused one. `workflow/pause`
 /// arrived in Muse 1.4.4; `workflow/resume` in 1.4.6, so the resume half
