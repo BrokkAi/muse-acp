@@ -4,15 +4,15 @@ This is a living roadmap for `muse-acp`. It records the direction that keeps the
 adapter close to Muse Session Protocol (MSP), safe around approvals and file
 access, and useful in real editor workflows.
 
-- **Last revised:** 2026-10-08
+- **Last revised:** 2026-10-12
 - **Original planning baseline:** `v0.2.5`; current release history is in
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
-- **Reference snapshots used for this revision:** Muse SDK `537cc8d`
-  (2026-10-08; stable schema version 1, manifest fingerprint
-  `sha256:7c94f153c41659cb3f1bd3c3e04438be254644cb2a97d65d48edc7449b74858a`,
-  identical to the live-validated 1.4.4 host surface)
+- **Reference snapshots used for this revision:** Muse SDK `ea88c822`
+  (2026-10-11; stable schema version 1, manifest fingerprint
+  `sha256:eae467ab60cb9a5d5af4de616830f065e59375c987fd59269c8cc33ed2a1137f`,
+  the Muse 1.4.6 stable surface, not yet validated against a live host)
   and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
@@ -85,8 +85,9 @@ the verdict into richer support bundles.
   `sha256:cfd31ee77d78fdada9febc4edccd29b0434ff8f6bf157c7c03fd0ecfcbc29f5a`
   (schema version 1, never live-validated; now unknown); the `a7c10c5` pin
   after it published the 1.3.0-R3401.1 fingerprint below, the `bb44be3`
-  pin after that published the 1.4.2 fingerprint, and the current `537cc8d`
-  pin publishes the 1.4.4 fingerprint. Host 1.2.1 reports
+  pin after that published the 1.4.2 fingerprint, the `537cc8d` pin after
+  that published the live-validated 1.4.4 fingerprint, and the current
+  `ea88c822` pin publishes the 1.4.6 fingerprint. Host 1.2.1 reports
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
   bundle via the binary's own `muse schema` export, plus a live 1.2.1
@@ -123,7 +124,11 @@ the verdict into richer support bundles.
   own schema export, which is identical to the vendored bundle). The SDK's
   `537cc8d` revision publishes exactly this 1.4.4 surface in both its
   top-level schema and its Python tree, with its packages at 1.4.4, and the
-  adapter vendors it. Before it, the Python
+  adapter vendored it. The current `ea88c822` pin publishes the 1.4.6 surface
+  (`sha256:eae467ab60cb9a5d5af4de616830f065e59375c987fd59269c8cc33ed2a1137f`,
+  schema version 1); no live 1.4.6 host has been validated by this project
+  yet, so it classifies as degraded rather than tested until a pinned 1.4.6
+  build joins the live-host matrix. Before it, the Python
   tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
   `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
   surface while the top-level schema stayed on 1.3.0-R3401.1. Transcript
@@ -159,7 +164,7 @@ The SDK publishes generated MSP types, a schema bundle, and recorded transcripts
 The Rust adapter should consume those artifacts as conformance inputs.
 
 Status: **emissions validated and permission paths replayed.**
-`tests/protocol/` pins SDK revision `537cc8d` (stable manifest, JSON schema
+`tests/protocol/` pins SDK revision `ea88c822` (stable manifest, JSON schema
 bundle, 51 golden transcripts) with provenance and license. CI now replays
 every server-side item event through the notification fold (unknown kinds must
 tolerate), validates every emitted ACP frame with the adapter's own parser,
@@ -201,7 +206,7 @@ the call), so the read-only and Plan tests accept either refusal.
 
 **Work items**
 
-- Pin the SDK revision (currently `537cc8d`, 2026-10-08) and vendor
+- Pin the SDK revision (currently `ea88c822`, 2026-10-11) and vendor
   `schema/msp/stable/manifest.json`, `schema/msp/stable/msp.schema.json`, and
   the `schema/msp/transcripts/` corpus under `tests/protocol/`, or fetch that
   locked revision in CI. The corpus already covers approvals, cancellation,
@@ -500,7 +505,7 @@ usable cursor for the unload fold-failure arm.
 
 **Muse Code 1.3.0 stable-surface additions**
 
-The pinned schema bundle (`537cc8d`) includes the Muse 1.3.0 additions, and
+The pinned schema bundle (`ea88c822`) includes the Muse 1.3.0 additions, and
 its notifications are classified in
 [`docs/event-compatibility.md`](docs/event-compatibility.md). This inventory also
 covers the added methods, error kinds, and requests, which that matrix does not
@@ -551,6 +556,58 @@ object already used by the adapter:
 The request index has no additional unhandled entries. Unknown future request
 methods still receive the typed MSP `methodNotFound` response in the reader
 path, preserving the fail-closed policy from §4.
+
+**Muse 1.4.x stable-surface additions**
+
+Muse 1.4.1 through 1.4.6 grew the stable surface well past 1.3.0. The adapter
+adopts the parts that fit its ACP mapping (workspace roots, reasoning tiers,
+session delete on the hosts that serve it, `feedback/submit`, and
+`session/list` filters) and records an explicit disposition below for the
+rest, with a tracking issue. The pinned `ea88c822` bundle is the authority.
+The rows below record a disposition for the 1.4.x additions the adapter does
+not drive, plus `feedback/submit`, which it does; incoming notifications with
+no adapter arm stay safe because the unknown-method path in the fold logs and
+continues.
+
+| MSP addition | Disposition | Adapter behavior or tracking |
+| --- | --- | --- |
+| `feedback/submit` | Mapped to ACP | Backs the `/feedback` command on hosts that grant the `feedback` capability. |
+| `plugin/list` | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+| `plugin/install` | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+| `plugin/marketplaceAdd` | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+| `plugin/marketplaceRemove` | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+| `plugin/marketplaceUpdate` | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+| `recap/request` | Unsupported pending protocol decision | [#215](https://github.com/BrokkAi/muse-acp/issues/215) |
+| `recap/cancel` | Unsupported pending protocol decision | [#215](https://github.com/BrokkAi/muse-acp/issues/215) |
+| `computerUseSettings/read` | Unsupported pending protocol decision | [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
+| `computerUseSettings/update` | Unsupported pending protocol decision | [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
+| `computerUseSetup/read` | Unsupported pending protocol decision | [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
+| `computerUseSetup/start` | Unsupported pending protocol decision | [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
+| `skill/setActivation` | Unsupported pending protocol decision | [#217](https://github.com/BrokkAi/muse-acp/issues/217) |
+| `skill/import` | Unsupported pending protocol decision | [#217](https://github.com/BrokkAi/muse-acp/issues/217) |
+| `workflow/pause` | Unsupported pending protocol decision | [#218](https://github.com/BrokkAi/muse-acp/issues/218) |
+| `workflow/resume` | Unsupported pending protocol decision | [#218](https://github.com/BrokkAi/muse-acp/issues/218) |
+| `task/list` | Unsupported pending protocol decision | [#219](https://github.com/BrokkAi/muse-acp/issues/219) |
+| `hook/list` | Unsupported pending protocol decision | [#220](https://github.com/BrokkAi/muse-acp/issues/220) |
+| `media/upload` | Unsupported pending protocol decision | [#221](https://github.com/BrokkAi/muse-acp/issues/221) |
+| `session/sideChat` | Unsupported pending protocol decision | [#222](https://github.com/BrokkAi/muse-acp/issues/222) |
+| `userInput/interrupt` | Unsupported pending protocol decision | [#223](https://github.com/BrokkAi/muse-acp/issues/223) |
+| `plugin/changed` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+| `plugin/marketplaceChanged` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+| `recap/completed` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#215](https://github.com/BrokkAi/muse-acp/issues/215) |
+| `computerUseSetup/changed` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
+| `computerUseSetup` capability | Unsupported pending protocol decision | Never requested; [#216](https://github.com/BrokkAi/muse-acp/issues/216) |
+| `marketplaceNotFound` (-32034) | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+| `pluginNotFound` (-32035) | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+| `marketplaceAlreadyExists` (-32036) | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+| `pluginMutationsDisabled` (-32037) | Unsupported pending protocol decision | [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
+
+The remaining 1.4.x field-level and vocabulary additions — the `webSearch`
+item kind, `mcpLinkError`, `TurnError.quota`, the retry/retraction detail
+fields, the per-session `permissionProfile`, the per-turn `userShell`,
+`SideProvenance`, and the newly required-but-nullable params — are tolerated
+by the fold and tracked in
+[#224](https://github.com/BrokkAi/muse-acp/issues/224).
 
 **Acceptance criteria**
 

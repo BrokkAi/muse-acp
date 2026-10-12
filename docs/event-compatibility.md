@@ -27,11 +27,15 @@ are emitted by the MSP host.
 | `approval/requested` | Mapped to ACP | Opens `session/request_permission`; duplicate approval IDs are suppressed and unusable requests fail closed. |
 | `approval/resolved` | Mapped to ACP | Withdraws an outstanding permission or feedback form with `$/cancel_request`, including child-stream approvals resolved elsewhere, and reasserts ACP v2 `running` when work remains. The permission response itself drives `approval/decide`. |
 | `approval/updated` | Mapped to ACP | Reasserts ACP v2 `running` state for an updated, still-active approval flow. |
+| `computerUseSetup/changed` | Intentionally ignored | Progress from the experimental computer-use setup flow, which the adapter never starts. No ACP mapping; an inbound copy takes the unhandled-notification diagnostic path. |
 | `initialized` | Consumed | Sent by the adapter after the MSP `initialize` handshake. An unexpected inbound copy is harmlessly ignored. |
 | `item/completed` | Mapped to ACP | Folds the authoritative final item into message, tool-call, async-task, subagent, or other negotiated ACP updates. |
 | `item/delta` | Mapped to ACP | Streams supported item field appends as ACP message or tool-call updates. Unknown item fields and kinds are tolerated. |
 | `item/started` | Mapped to ACP | Opens or upserts the corresponding ACP item and starts negotiated async-task or subagent presentation where applicable. |
 | `item/updated` | Mapped to ACP | Upserts the corresponding ACP item from its higher-revision snapshot. |
+| `plugin/changed` | Intentionally ignored | Announces a change to the host's installed-plugin inventory. The adapter exposes no plugin catalog, so there is no ACP mapping; an inbound copy takes the unhandled-notification diagnostic path. |
+| `plugin/marketplaceChanged` | Intentionally ignored | Announces a change to a plugin marketplace the host knows. The adapter exposes no marketplace surface, so there is no ACP mapping; an inbound copy takes the unhandled-notification diagnostic path. |
+| `recap/completed` | Intentionally ignored | Reports that an away recap the adapter never requested has finished. No ACP mapping; an inbound copy takes the unhandled-notification diagnostic path. |
 | `session/approvalModeChanged` | Internally tracked | Updates the selected approval-mode value used in later ACP configuration snapshots. |
 | `session/branchChanged` | Mapped to ACP | Stores the latest branch fact and emits it in `session/update` metadata together with the current goal. |
 | `session/closed` | Consumed | Logs the unload and its reason. An unload is not a deletion: the session is `notLoaded`, its log stays on disk, and `session/resume` reloads it, so it stays in ACP `session/list`. |

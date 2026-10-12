@@ -84,10 +84,14 @@ pub const HOST_144_FINGERPRINT: &str =
     "sha256:7c94f153c41659cb3f1bd3c3e04438be254644cb2a97d65d48edc7449b74858a";
 
 /// Fingerprint published by the vendored Muse SDK manifest at revision
-/// `537cc8d` (schema version 1). It is the same stable surface the Muse 1.4.4
-/// host reports, so it classifies through that live-validated entry rather
-/// than a separate table arm.
-pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_144_FINGERPRINT;
+/// `ea88c822` (schema version 1), which describes the Muse 1.4.6 stable
+/// surface. Unlike the `bb44be3` (1.4.2) and `537cc8d` (1.4.4) pins, no live
+/// 1.4.6 host has been validated by this project yet, so the surface
+/// classifies as [`Status::Degraded`]: a visible warning that is not fatal.
+/// It joins the tested table only once a pinned 1.4.6 build runs in the
+/// live-host matrix.
+pub const SDK_MANIFEST_FINGERPRINT: &str =
+    "sha256:eae467ab60cb9a5d5af4de616830f065e59375c987fd59269c8cc33ed2a1137f";
 
 /// Fingerprint embedded in the SDK conformance-transcript fixtures. It is
 /// deliberately distinct from every host fingerprint and must never be
@@ -161,6 +165,10 @@ fn table_entry(fingerprint: &str) -> Option<(Status, &'static str)> {
         HOST_142_FINGERPRINT => (Status::Tested, "validated against live host 1.4.2"),
         HOST_143_FINGERPRINT => (Status::Tested, "validated against live host 1.4.3"),
         HOST_144_FINGERPRINT => (Status::Tested, "validated against live host 1.4.4"),
+        SDK_MANIFEST_FINGERPRINT => (
+            Status::Degraded,
+            "vendored SDK manifest 1.4.6 surface; not yet validated against a live host",
+        ),
         TRANSCRIPT_FIXTURE_FINGERPRINT => (
             Status::Fixture,
             "transcript fixture fingerprint; never a live-host result",
@@ -248,13 +256,17 @@ mod tests {
     }
 
     #[test]
-    fn sdk_manifest_matches_live_validated_144() {
-        // The vendored SDK manifest (537cc8d) publishes the exact surface the
-        // live 1.4.4 host was validated against, so it is tested, not merely
-        // a known shape.
-        assert_eq!(SDK_MANIFEST_FINGERPRINT, HOST_144_FINGERPRINT);
+    fn sdk_manifest_degrades_until_live_validated() {
+        // The vendored SDK manifest (ea88c822) publishes the Muse 1.4.6
+        // surface, which no pinned live host has been validated against yet,
+        // so it is a known shape that warns rather than a tested surface.
+        assert_eq!(
+            SDK_MANIFEST_FINGERPRINT,
+            "sha256:eae467ab60cb9a5d5af4de616830f065e59375c987fd59269c8cc33ed2a1137f"
+        );
+        assert_ne!(SDK_MANIFEST_FINGERPRINT, HOST_144_FINGERPRINT);
         let c = classify(Some(1), SDK_MANIFEST_FINGERPRINT);
-        assert_eq!(c.status, Status::Tested);
+        assert_eq!(c.status, Status::Degraded);
         assert!(!c.is_fatal());
     }
 
