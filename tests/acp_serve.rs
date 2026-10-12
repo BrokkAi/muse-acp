@@ -10452,3 +10452,64 @@ fn last_reasoning_effort_is_applied_to_new_sessions() {
     );
     c.finish();
 }
+
+#[test]
+fn picking_the_muse_default_forgets_the_remembered_effort() {
+    let state = fresh_state_dir();
+    let state = state.to_str().unwrap();
+    // Legacy host: no standing default, so `default` clears the per-turn tier.
+    let mut c = Client::spawn("reasoning_legacy", &[("XDG_STATE_HOME", state)]);
+    let sid = c.new_session(2, "");
+    let set = c.req(
+        "session/set_config_option",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"high\"}}"
+        ),
+    );
+    let done = c.wait_for(&format!("\"id\":{set}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"currentValue\":\"high\""),
+        "the chosen effort sticks: {done}"
+    );
+    let reset = c.req(
+        "session/set_config_option",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"configId\":\"reasoning_effort\",\"value\":\"default\"}}"
+        ),
+    );
+    let back = c.wait_for(&format!("\"id\":{reset}"), Duration::from_secs(15));
+    assert!(
+        back.contains("\"currentValue\":\"default\""),
+        "back to the Muse default: {back}"
+    );
+    c.finish();
+    let store = std::path::Path::new(state).join("muse-acp/reasoning-efforts.json");
+    if let Ok(body) = std::fs::read_to_string(&store) {
+        assert!(
+            !body.contains("high"),
+            "the forgotten tier is gone from the store: {body}"
+        );
+    }
+
+    let mut c = Client::spawn("reasoning_legacy", &[("XDG_STATE_HOME", state)]);
+    c.initialize(2, "");
+    let dir = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent")
+        .join("workspace");
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    let cwd = dir.to_str().unwrap().replace('\\', "\\\\");
+    let id = c.req("session/new", &format!("{{\"cwd\":\"{cwd}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"configId\":\"reasoning_effort\"")
+            && frame.contains("\"currentValue\":\"default\""),
+        "a new session starts at the Muse default again: {frame}"
+    );
+    let frames = host_requests(&c, "session/setReasoningEffort");
+    assert!(
+        frames.is_empty(),
+        "nothing remembered, nothing applied: {frames:?}"
+    );
+    c.finish();
+}
