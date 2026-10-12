@@ -729,10 +729,11 @@ list. Map it to ACP `plan`/`plan_update`, matching `codex-acp`'s plan
 presentation.
 
 Status: **implemented.** `session/todoListChanged` and the resume snapshot's
-`state.todoList` map to ACP `plan` updates (whole-list replacement, empty list
-clears the plan, `cancelled` and unknown statuses stay `pending`). Remaining
-work: none for the v1 wire shape; revisit if ACP adopts a distinct todo
-surface.
+`state.todoList` map to ACP plan updates (whole-list replacement, empty list
+clears the plan, `cancelled` and unknown statuses stay `pending`). v1 clients
+receive `plan` with the full `entries` array; v2 clients receive `plan_update`
+with an `items` plan and `plan_removed` when the list clears. Remaining work:
+none for either wire shape.
 
 **Work items**
 

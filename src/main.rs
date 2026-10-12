@@ -4439,7 +4439,7 @@ fn handle_acp(
                             if let Some(todo) = state.get("todoList")
                                 && matches!(todo, J::Obj(_))
                             {
-                                acp::send_plan(stdout, &sid, todo.get("items"));
+                                acp::send_plan(stdout, &sid, entry.ver, todo.get("items"));
                             }
                             // Goal and branch are folded snapshot facts too:
                             // adopt them so session metadata survives attach.
@@ -8259,7 +8259,9 @@ fn owned_session_rows(
         .collect()
 }
 
-fn find_acp_sid(sessions: &Sessions, msp_sid: &str) -> Option<String> {
+/// Version-tagged session lookup for emitters whose frame shape depends on the
+/// negotiated ACP version.
+fn find_acp_session(sessions: &Sessions, msp_sid: &str) -> Option<(String, u8)> {
     // Tolerate a poisoned lock like every other site: a panic while another
     // thread held this mutex must not take down the routing thread, which also
     // delivers the session/prompt result.
@@ -8268,7 +8270,11 @@ fn find_acp_sid(sessions: &Sessions, msp_sid: &str) -> Option<String> {
         .unwrap_or_else(|p| p.into_inner())
         .iter()
         .find(|(_, s)| s.msp_sid == msp_sid)
-        .map(|(k, _)| k.clone())
+        .map(|(k, s)| (k.clone(), s.ver))
+}
+
+fn find_acp_sid(sessions: &Sessions, msp_sid: &str) -> Option<String> {
+    find_acp_session(sessions, msp_sid).map(|(acp_sid, _)| acp_sid)
 }
 
 /// Map a view event back to its owning session. Child view streams are
@@ -9220,8 +9226,8 @@ fn handle_msp(
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
-                acp::send_plan(stdout, &acp_sid, params.get("items"));
+            if let Some((acp_sid, ver)) = find_acp_session(sessions, msp_sid) {
+                acp::send_plan(stdout, &acp_sid, ver, params.get("items"));
             }
         }
         "session/nameChanged" => {

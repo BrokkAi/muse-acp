@@ -48,7 +48,7 @@ are emitted by the MSP host.
 | `session/reasoningEffortChanged` | Mapped to ACP | Updates the standing reasoning default and emits `config_option_update`; negotiated recommendations require a host `default` or `policy` source. |
 | `session/started` | Internally tracked | Caches the new session's list row when Muse grants `sessionListStream`. The row may arrive before or after the `session/start` result. Clients still request `session/list` to discover membership changes. |
 | `session/statusChanged` | Mapped to ACP | Publishes host status and attention metadata and ACP v2 state; directs pending-request reconciliation without inventing unknown status values. |
-| `session/todoListChanged` | Mapped to ACP | Replaces the ACP plan with the reported todo list; an empty list clears the plan. |
+| `session/todoListChanged` | Mapped to ACP | Replaces the session plan with the reported todo list (plan id `muse-todo`); an empty list clears it. ACP v1 gets `plan` with an empty `entries` array, v2 gets `plan_update` / `plan_removed`. |
 | `session/tokenUsage` | Mapped to ACP | Deduplicates completion usage, tracks cumulative, cache, and per-turn totals, prefers the host's own session `cost` (with its partial flag) over the catalog estimate on hosts that report it, and emits ACP `usage_update` once context occupancy is known. |
 | `session/viewHealthChanged` | Consumed | Logs the view health and reason with guidance to reattach through resume. |
 | `skill/changed` | Mapped to ACP | Refreshes `skill/list` and the ACP available-command catalog. |

@@ -1110,26 +1110,46 @@ fn todo_entry(item: &J) -> Option<String> {
     ))
 }
 
-/// Emit an ACP `plan` update from an MSP todo list. The whole list is
-/// replaced on every event (and an empty list is a cleared plan, not a
-/// no-op), matching both protocols' replace-wholesale semantics.
-pub fn send_plan(stdout: &StdoutShared, acp_sid: &str, items: Option<&J>) {
+/// ACP v2 identifies plans by id; MSP keeps exactly one todo list per session
+/// and replaces it wholesale, so every v2 plan update for a session names the
+/// same plan.
+const TODO_PLAN_ID: &str = "muse-todo";
+
+/// Emit an ACP plan update from an MSP todo list. The whole list is replaced
+/// on every event (and an empty list is a cleared plan, not a no-op), matching
+/// both protocols' replace-wholesale semantics.
+///
+/// ACP v1 has one implicit plan per session and clears it with an empty
+/// `entries` array. ACP v2 names plans and splits the shapes: a snapshot
+/// becomes `plan_update` whose `plan` is an `items` checklist, and an empty
+/// list becomes `plan_removed` for the known plan id.
+pub fn send_plan(stdout: &StdoutShared, acp_sid: &str, ver: u8, items: Option<&J>) {
     let entries = match items {
-        Some(J::Arr(values)) => values
-            .iter()
-            .filter_map(todo_entry)
-            .collect::<Vec<_>>()
-            .join(","),
+        Some(J::Arr(values)) => values.iter().filter_map(todo_entry).collect::<Vec<_>>(),
         // A missing or malformed list carries no authoritative fact; keep the
         // last plan rather than clearing on garbage.
         _ => return,
     };
+    let update = if ver == 2 {
+        if entries.is_empty() {
+            format!("{{\"sessionUpdate\":\"plan_removed\",\"planId\":\"{TODO_PLAN_ID}\"}}")
+        } else {
+            format!(
+                "{{\"sessionUpdate\":\"plan_update\",\"plan\":{{\"type\":\"items\",\"planId\":\"{TODO_PLAN_ID}\",\"entries\":[{}]}}}}",
+                entries.join(",")
+            )
+        }
+    } else {
+        format!(
+            "{{\"sessionUpdate\":\"plan\",\"entries\":[{}]}}",
+            entries.join(",")
+        )
+    };
     send_raw(
         stdout,
         &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"plan\",\"entries\":[{}]}}}}}}",
-            esc(acp_sid),
-            entries
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{update}}}}}",
+            esc(acp_sid)
         ),
     );
 }
