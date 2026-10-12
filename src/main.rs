@@ -1596,6 +1596,9 @@ fn same_workspace_root(left: &str, right: &str) -> bool {
 /// verbatim `\\?\C:\...` path. Muse 1.4.3 validates `turn/start workspaceRoots`
 /// entries against that verbatim canonical form and rejects the stripped
 /// `C:\...` form ("expected a canonical path"), so keep the path as-is.
+/// Live Windows runs of the multi-root, mode-change, and load/re-attach flows
+/// confirmed 1.4.1 and 1.4.2 accept it too (issue #199), so no host-version
+/// gating is needed; the Windows live-host legs keep those flows covered.
 fn host_path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
 }
@@ -11853,7 +11856,8 @@ mod tests {
         // Muse 1.4.3+ rejects workspaceRoots entries that lack the verbatim
         // Win32 `\\?\` prefix that std::fs::canonicalize returns, so the
         // host-facing text must keep it. POSIX canonical paths never carry the
-        // prefix, so this only asserts while running on Windows.
+        // prefix, so this only asserts while running on Windows. The Windows
+        // live-host legs verify real 1.4.1-1.4.4 hosts accept the form (#199).
         if !cfg!(windows) {
             return;
         }
