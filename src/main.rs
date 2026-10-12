@@ -5960,6 +5960,56 @@ fn handle_acp(
             // `session/cancel` is the ACP all-work gesture. MSP separates
             // background task admission from foreground turn cancellation.
             stop_all_background_tasks(host, sessions, &sid);
+            // An open question the user has already partly answered settles
+            // on the interrupt lane: userInput/interrupt carries the
+            // confirmed answers and stops its turn, so the model still sees
+            // what the user told it. Prompts with no confirmed answer stay
+            // on the ordinary turn interrupt below.
+            let answered: Vec<(String, String, String, Vec<String>)> = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&sid)
+                .map(|s| {
+                    s.pending_ui
+                        .iter()
+                        .filter(|p| !p.confirmed.is_empty() && !p.turn_id.is_empty())
+                        .map(|p| {
+                            (
+                                p.owner_msp_sid.clone(),
+                                p.turn_id.clone(),
+                                p.user_input_id.clone(),
+                                p.confirmed.clone(),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let mut interrupted: Vec<(String, String)> = Vec::new();
+            for (msp_sid, turn_id, user_input_id, answers) in answered {
+                let cmd = host.mint_cmd("cmd-");
+                match host.command(
+                    "userInput/interrupt",
+                    &format!(
+                        "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{},\"answers\":[{}]}}",
+                        esc(&cmd),
+                        esc(&msp_sid),
+                        esc(&user_input_id),
+                        answers.join(",")
+                    ),
+                ) {
+                    Ok(_) => {
+                        log(&format!(
+                            "userInput/interrupt settled {user_input_id} with {} confirmed answer(s)",
+                            answers.len()
+                        ));
+                        interrupted.push((msp_sid, turn_id));
+                    }
+                    Err(e) => log(&format!(
+                        "userInput/interrupt failed for {user_input_id}: {}",
+                        err_message(&e)
+                    )),
+                }
+            }
             let turns = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -5973,6 +6023,12 @@ fn handle_acp(
             // it has produced no assistant output yet; an unowned turn has
             // no prompt text to restore.
             for (msp_sid, turn_id, owned) in turns {
+                if interrupted
+                    .iter()
+                    .any(|(sid, turn)| sid == &msp_sid && turn == &turn_id)
+                {
+                    continue;
+                }
                 let cmd = host.mint_cmd("cmd-");
                 let retract = if owned { ",\"retract\":true" } else { "" };
                 match host.command(
@@ -10630,15 +10686,24 @@ fn send_elicitation_form(
     );
 }
 
-/// Reissue a pending form after a correctable client or host-side error.
-fn reissue_pending_ui(
+/// One pending form to show the client, with the staged-answer state that
+/// must be stored alongside it.
+struct PendingUiForm {
+    stage: acp::UiStage,
+    message: String,
+    schema: String,
+    confirmed: Vec<String>,
+    question_index: usize,
+}
+
+/// Show a pending user-input form, replacing the stored ACP request id so a
+/// late reply to an older copy is never treated as the current one.
+fn show_pending_ui(
     stdout: &StdoutShared,
     sessions: &Sessions,
     acp_sid: &str,
     idx: usize,
-    stage: acp::UiStage,
-    message: String,
-    schema: &str,
+    form: PendingUiForm,
 ) -> bool {
     let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
     let tool_call_id = {
@@ -10650,11 +10715,87 @@ fn reissue_pending_ui(
             return false;
         };
         p.req_id = req_id.clone();
-        p.stage = stage;
+        p.stage = form.stage;
+        p.answer_schema = form.schema.clone();
+        p.answer_message = form.message.clone();
+        p.confirmed = form.confirmed;
+        p.question_index = form.question_index;
         p.tool_call_id.clone()
     };
-    send_elicitation_form(stdout, acp_sid, &req_id, &tool_call_id, &message, schema);
+    send_elicitation_form(
+        stdout,
+        acp_sid,
+        &req_id,
+        &tool_call_id,
+        &form.message,
+        &form.schema,
+    );
     true
+}
+
+/// Reissue a pending form after a correctable client or host-side error,
+/// keeping the staged answers and question position.
+fn reissue_pending_ui(
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    idx: usize,
+    stage: acp::UiStage,
+    message: String,
+    schema: &str,
+) -> bool {
+    let (confirmed, question_index) = {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get_mut(acp_sid) else {
+            return false;
+        };
+        let Some(p) = s.pending_ui.get_mut(idx) else {
+            return false;
+        };
+        (p.confirmed.clone(), p.question_index)
+    };
+    show_pending_ui(
+        stdout,
+        sessions,
+        acp_sid,
+        idx,
+        PendingUiForm {
+            stage,
+            message,
+            schema: schema.to_string(),
+            confirmed,
+            question_index,
+        },
+    )
+}
+
+/// Advance the staged answer walk: hold the confirmed answer for the
+/// question just completed and ask the next one.
+fn ask_next_ui_question(
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    idx: usize,
+    questions: &[acp::UiQuestion],
+    next: usize,
+    confirmed: Vec<String>,
+) -> bool {
+    let Some(question) = questions.get(next) else {
+        return false;
+    };
+    show_pending_ui(
+        stdout,
+        sessions,
+        acp_sid,
+        idx,
+        PendingUiForm {
+            stage: acp::UiStage::Answers,
+            message: ui_answer_message(next, questions),
+            schema: ui_answer_schema(next, question),
+            confirmed,
+            question_index: next,
+        },
+    )
 }
 
 fn remove_pending_ui(sessions: &Sessions, acp_sid: &str, req_id: &J) -> Option<acp::PendingUi> {
@@ -10715,11 +10856,13 @@ fn bridge_user_input(
         .unwrap_or_else(|p| p.into_inner())
         .get_mut(acp_sid)
         .map(|s| s.ui_seen.insert(user_input_id.clone()));
-    let mut props = Vec::new();
-    let mut required = Vec::new();
-    let mut msg = Vec::new();
+    let turn_id = params
+        .get("turnId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     let mut ui_qs = Vec::new();
-    for (i, q) in questions.iter().enumerate() {
+    for q in &questions {
         let qid = q
             .get("id")
             .and_then(|v| v.as_str())
@@ -10763,53 +10906,27 @@ fn bridge_user_input(
             .get("selection")
             .and_then(|s| s.get("maxSelections"))
             .and_then(|v| v.as_u64());
-        let key = format!("q{i}");
-        let en: Vec<String> = display.iter().map(|l| esc(l)).collect();
-        if labels.is_empty() {
-            // Free-text question: no options, plain string answer.
-            props.push(format!("{}: {{\"type\":\"string\"}}", esc(&key)));
-        } else if single {
-            props.push(format!(
-                "{}: {{\"type\":\"string\",\"enum\":[{}]}}",
-                esc(&key),
-                en.join(",")
-            ));
-        } else {
-            let mut sch = format!(
-                "{}: {{\"type\":\"array\",\"items\":{{\"type\":\"string\",\"enum\":[{}]}}",
-                esc(&key),
-                en.join(",")
-            );
-            sch.push_str(&format!(",\"minItems\":{min}"));
-            if let Some(m) = max {
-                sch.push_str(&format!(",\"maxItems\":{m}"));
-            }
-            sch.push('}');
-            props.push(sch);
-        }
-        if single || min > 0 {
-            required.push(key.to_string());
-        }
-        msg.push(format!("{header}: {text}"));
         ui_qs.push(acp::UiQuestion {
             qid,
             labels,
             display,
+            message: format!("{header}: {text}"),
+            multiple: !single,
+            min,
+            max,
         });
     }
     if ui_qs.is_empty() {
         return false;
     }
-    let answer_schema = format!(
-        "{{\"type\":\"object\",\"properties\":{{{}}},\"required\":[{}]}}",
-        props.join(","),
-        required
-            .iter()
-            .map(|k| esc(k))
-            .collect::<Vec<_>>()
-            .join(",")
-    );
-    let answer_message = msg.join("\n");
+    let answer_message = ui_qs
+        .iter()
+        .map(|q| q.message.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    // The stored Answers-stage schema always describes the first staged
+    // question; later questions overwrite it as the walk advances.
+    let answer_schema = ui_answer_schema(0, &ui_qs[0]);
     let has_options = ui_qs.iter().any(|q| !q.labels.is_empty());
     let (stage, schema, form_message) = if has_options {
         let route_schema = format!(
@@ -10825,8 +10942,8 @@ fn bridge_user_input(
     } else {
         (
             acp::UiStage::Answers,
-            answer_schema.clone(),
-            answer_message.clone(),
+            ui_answer_schema(0, &ui_qs[0]),
+            ui_answer_message(0, &ui_qs),
         )
     };
     let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
@@ -10839,11 +10956,14 @@ fn bridge_user_input(
             req_id: req_id.clone(),
             user_input_id: user_input_id.clone(),
             owner_msp_sid: owner_msp_sid.to_string(),
+            turn_id,
             questions: ui_qs,
             stage,
             answer_schema,
             answer_message,
             tool_call_id: tool_call.clone(),
+            question_index: 0,
+            confirmed: Vec::new(),
         });
         log(&format!(
             "bridging userInput {user_input_id} to elicitation {}",
@@ -10868,49 +10988,113 @@ fn ui_original(q: &acp::UiQuestion, shown: &str) -> Option<String> {
         .cloned()
 }
 
-fn ui_answers(questions: &[acp::UiQuestion], content: &J) -> String {
-    let mut parts = Vec::new();
-    for (i, q) in questions.iter().enumerate() {
-        let key = format!("q{i}");
-        match content.get(key.as_str()) {
-            Some(J::Str(v)) => match ui_original(q, v) {
-                Some(orig) => parts.push(format!(
-                    "{{\"questionId\":{},\"selectedLabel\":{}}}",
-                    esc(&q.qid),
-                    esc(&orig)
-                )),
-                None => parts.push(format!(
-                    "{{\"questionId\":{},\"freeText\":{}}}",
-                    esc(&q.qid),
-                    esc(v)
-                )),
-            },
-            Some(J::Arr(vs)) => {
-                let mut matched = Vec::new();
-                let mut free = Vec::new();
-                for v in vs {
-                    match v.as_str().and_then(|s| ui_original(q, s)) {
-                        Some(orig) => matched.push(esc(&orig)),
-                        None => {
-                            if let Some(s) = v.as_str() {
-                                free.push(s.to_string());
-                            }
+/// The JSON Schema property for one question, keyed `q<index>` for the
+/// client. ACP forms present one property per question.
+fn ui_question_property(index: usize, q: &acp::UiQuestion) -> String {
+    let key = format!("q{index}");
+    if q.labels.is_empty() {
+        // Free-text question: no options, plain string answer.
+        return format!("{}: {{\"type\":\"string\"}}", esc(&key));
+    }
+    let en: Vec<String> = q.display.iter().map(|l| esc(l)).collect();
+    if !q.multiple {
+        return format!(
+            "{}: {{\"type\":\"string\",\"enum\":[{}]}}",
+            esc(&key),
+            en.join(",")
+        );
+    }
+    let mut sch = format!(
+        "{}: {{\"type\":\"array\",\"items\":{{\"type\":\"string\",\"enum\":[{}]}}",
+        esc(&key),
+        en.join(",")
+    );
+    sch.push_str(&format!(",\"minItems\":{}", q.min));
+    if let Some(m) = q.max {
+        sch.push_str(&format!(",\"maxItems\":{m}"));
+    }
+    sch.push('}');
+    sch
+}
+
+/// Whether the client must answer a question (single-mode, free text, and
+/// multiple-mode with a positive minimum are required).
+fn ui_question_required(q: &acp::UiQuestion) -> bool {
+    !q.multiple || q.min > 0
+}
+
+/// The one-question form schema for the staged answer walk.
+fn ui_answer_schema(index: usize, q: &acp::UiQuestion) -> String {
+    let required = if ui_question_required(q) {
+        format!("[{}]", esc(&format!("q{index}")))
+    } else {
+        "[]".to_string()
+    };
+    format!(
+        "{{\"type\":\"object\",\"properties\":{{{}}},\"required\":{}}}",
+        ui_question_property(index, q),
+        required
+    )
+}
+
+/// The form message for one staged question. A single-question prompt keeps
+/// the original plain `header: question` form; a staged prompt numbers the
+/// questions so the user knows how many remain.
+fn ui_answer_message(index: usize, questions: &[acp::UiQuestion]) -> String {
+    let message = questions
+        .get(index)
+        .map(|q| q.message.clone())
+        .unwrap_or_default();
+    if questions.len() == 1 {
+        message
+    } else {
+        format!("Question {} of {}:\n{message}", index + 1, questions.len())
+    }
+}
+
+/// Convert one client form answer into an MSP `UserInputAnswer` object, or
+/// `None` when the client omitted the question's key. Selections map back to
+/// the host's original labels; unmatched strings become free text.
+fn ui_answer_json(q: &acp::UiQuestion, index: usize, content: &J) -> Option<String> {
+    let key = format!("q{index}");
+    match content.get(key.as_str()) {
+        Some(J::Str(v)) => Some(match ui_original(q, v) {
+            Some(orig) => format!(
+                "{{\"questionId\":{},\"selectedLabel\":{}}}",
+                esc(&q.qid),
+                esc(&orig)
+            ),
+            None => format!("{{\"questionId\":{},\"freeText\":{}}}", esc(&q.qid), esc(v)),
+        }),
+        Some(J::Arr(vs)) => {
+            let mut matched = Vec::new();
+            let mut free = Vec::new();
+            for v in vs {
+                match v.as_str().and_then(|s| ui_original(q, s)) {
+                    Some(orig) => matched.push(esc(&orig)),
+                    None => {
+                        if let Some(s) = v.as_str() {
+                            free.push(s.to_string());
                         }
                     }
                 }
-                let mut f = vec![format!("\"questionId\":{}", esc(&q.qid))];
-                if !matched.is_empty() {
-                    f.push(format!("\"selectedLabels\":[{}]", matched.join(",")));
-                }
-                if !free.is_empty() {
-                    f.push(format!("\"freeText\":{}", esc(&free.join(", "))));
-                }
-                parts.push(format!("{{{}}}", f.join(",")));
             }
-            _ => {}
+            let mut f = vec![format!("\"questionId\":{}", esc(&q.qid))];
+            if !matched.is_empty() {
+                f.push(format!("\"selectedLabels\":[{}]", matched.join(",")));
+            }
+            if !free.is_empty() {
+                f.push(format!("\"freeText\":{}", esc(&free.join(", "))));
+            }
+            if matched.is_empty() && free.is_empty() {
+                // An empty selection is a valid answer for a zero-minimum
+                // multiple-selection question; a bare questionId is not.
+                f.push("\"selectedLabels\":[]".to_string());
+            }
+            Some(format!("{{{}}}", f.join(",")))
         }
+        _ => None,
     }
-    format!("[{}]", parts.join(","))
 }
 
 fn clarification_schema() -> &'static str {
@@ -11388,23 +11572,43 @@ fn complete_elicitation(
             .and_then(|v| v.as_str())
             == Some("accept");
     if !accepted {
-        let p = remove_pending_ui(sessions, &acp_sid, &idv);
-        if p.is_none() {
+        let Some(p) = remove_pending_ui(sessions, &acp_sid, &idv) else {
             return;
-        }
+        };
         let cmd = host.mint_cmd("cmd-");
-        if let Err(e) = host.command(
-            "userInput/cancel",
-            &format!(
-                "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{}}}",
-                esc(&cmd),
-                esc(&msp_sid),
-                esc(&pending.user_input_id)
-            ),
-        ) {
-            log(&format!("userInput/cancel failed: {}", err_message(&e)));
+        // A form the user already partly answered settles on the interrupt
+        // lane: userInput/interrupt carries the confirmed answers and stops
+        // the turn, so the model still sees them. A prompt with no confirmed
+        // answer keeps the decline semantics of userInput/cancel, which
+        // resolves the tool call as cancelled and lets the turn continue.
+        let (method, params, outcome) = if p.confirmed.is_empty() {
+            (
+                "userInput/cancel",
+                format!(
+                    "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{}}}",
+                    esc(&cmd),
+                    esc(&msp_sid),
+                    esc(&pending.user_input_id)
+                ),
+                "elicitation declined/cancelled/failed; question cancelled",
+            )
         } else {
-            log("elicitation declined/cancelled/failed; question cancelled");
+            (
+                "userInput/interrupt",
+                format!(
+                    "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{},\"answers\":[{}]}}",
+                    esc(&cmd),
+                    esc(&msp_sid),
+                    esc(&pending.user_input_id),
+                    p.confirmed.join(",")
+                ),
+                "elicitation cancelled with confirmed answers; prompt interrupted",
+            )
+        };
+        if let Err(e) = host.command(method, &params) {
+            log(&format!("{method} failed: {}", err_message(&e)));
+        } else {
+            log(outcome);
         }
         return;
     }
@@ -11418,14 +11622,17 @@ fn complete_elicitation(
             let route = content.get("route").and_then(|v| v.as_str());
             match route {
                 Some(UI_ROUTE_ANSWER) => {
+                    // The answer walk now asks one question at a time and
+                    // holds each confirmed answer, so a stop can settle the
+                    // prompt with what the user already confirmed.
                     reissue_pending_ui(
                         stdout,
                         sessions,
                         &acp_sid,
                         idx,
                         acp::UiStage::Answers,
-                        pending.answer_message.clone(),
-                        &pending.answer_schema,
+                        ui_answer_message(0, &pending.questions),
+                        &ui_answer_schema(0, &pending.questions[0]),
                     );
                 }
                 Some(UI_ROUTE_EXPLAIN) => {
@@ -11456,8 +11663,55 @@ fn complete_elicitation(
             }
         }
         acp::UiStage::Answers => {
-            let answers = ui_answers(&pending.questions, &content);
+            let index = pending.question_index;
+            let Some(question) = pending.questions.get(index) else {
+                log(&format!(
+                    "pending userInput {} has no question {index}",
+                    pending.user_input_id
+                ));
+                return;
+            };
+            let answer = ui_answer_json(question, index, &content).or_else(|| {
+                // An optional multiple-selection question may be left empty;
+                // that is a valid answer for a zero minimum.
+                (!ui_question_required(question)).then(|| {
+                    format!(
+                        "{{\"questionId\":{},\"selectedLabels\":[]}}",
+                        esc(&question.qid)
+                    )
+                })
+            });
+            let Some(answer) = answer else {
+                reissue_pending_ui(
+                    stdout,
+                    sessions,
+                    &acp_sid,
+                    idx,
+                    acp::UiStage::Answers,
+                    format!(
+                        "{}\n\nAnswer this question to continue.",
+                        ui_answer_message(index, &pending.questions)
+                    ),
+                    &ui_answer_schema(index, &pending.questions[index]),
+                );
+                return;
+            };
+            let mut confirmed = pending.confirmed.clone();
+            confirmed.push(answer);
+            if index + 1 < pending.questions.len() {
+                ask_next_ui_question(
+                    stdout,
+                    sessions,
+                    &acp_sid,
+                    idx,
+                    &pending.questions,
+                    index + 1,
+                    confirmed,
+                );
+                return;
+            }
             let cmd = host.mint_cmd("cmd-");
+            let answers = format!("[{}]", confirmed.join(","));
             match host.command(
                 "userInput/answer",
                 &format!(
@@ -11481,7 +11735,13 @@ fn complete_elicitation(
                     }
                 }
                 Err(e) => {
-                    let message = format!("Muse rejected the answer: {}", err_message(&e));
+                    // The rejected answer is not held: the same question is
+                    // asked again with the error text.
+                    let message = format!(
+                        "{}\n\nMuse rejected the answer: {}",
+                        ui_answer_message(index, &pending.questions),
+                        err_message(&e)
+                    );
                     reissue_pending_ui(
                         stdout,
                         sessions,
@@ -11489,7 +11749,7 @@ fn complete_elicitation(
                         idx,
                         acp::UiStage::Answers,
                         message,
-                        &pending.answer_schema,
+                        &ui_answer_schema(index, &pending.questions[index]),
                     );
                 }
             }

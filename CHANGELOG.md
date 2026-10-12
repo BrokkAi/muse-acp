@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Keep the answers a user already confirmed when a pending Muse question is
+  stopped or a later question is declined. ACP forms are atomic, so
+  multi-question prompts are now asked one question per form and each
+  confirmed answer is held until the last one is ready; a stop (or a decline
+  after answering) then settles the prompt through MSP `userInput/interrupt`
+  carrying those answers, which stops the turn instead of discarding them. A
+  question with no confirmed answer still stops through the ordinary turn
+  interrupt and still declines through `userInput/cancel`.
 - Render Muse todo plans on ACP v2 connections. The adapter previously
   emitted only the v1 `plan` frame, which v2 clients drop, so plans silently
   never appeared on a v2 session. v2 now receives the todo snapshot as a

@@ -75,6 +75,15 @@ pub struct UiQuestion {
     pub labels: Vec<String>,
     /// Display labels (deduped; shown to the client).
     pub display: Vec<String>,
+    /// The `header: question` line the client sees for this question.
+    pub message: String,
+    /// True for a multiple-selection question (`selection.mode` is
+    /// `multiple`). Free-text questions are single.
+    pub multiple: bool,
+    /// Minimum selections for a multiple-selection question.
+    pub min: u64,
+    /// Maximum selections for a multiple-selection question.
+    pub max: Option<u64>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -91,12 +100,23 @@ pub struct PendingUi {
     pub user_input_id: String,
     /// MSP session that owns the question's child target.
     pub owner_msp_sid: String,
+    /// The MSP turn the question belongs to. A stop settles the prompt with
+    /// `userInput/interrupt`, which also stops this turn.
+    pub turn_id: String,
     pub questions: Vec<UiQuestion>,
     pub stage: UiStage,
     /// The form shown after choosing structured answers.
     pub answer_schema: String,
     pub answer_message: String,
     pub tool_call_id: String,
+    /// The question the staged answer form is asking, as an index into
+    /// `questions`. Single-question prompts ask `0` directly.
+    pub question_index: usize,
+    /// Answers the user has already confirmed, as MSP `UserInputAnswer`
+    /// JSON objects in question order. ACP forms are atomic, so each staged
+    /// question holds its answer here until the last one is ready to send,
+    /// or until a stop settles the prompt through `userInput/interrupt`.
+    pub confirmed: Vec<String>,
 }
 
 /// One in-flight `/feedback` form. The command's ACP prompt request stays

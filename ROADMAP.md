@@ -591,7 +591,7 @@ continues.
 | `hook/list` | Unsupported pending protocol decision | [#220](https://github.com/BrokkAi/muse-acp/issues/220) |
 | `media/upload` | Unsupported pending protocol decision | [#221](https://github.com/BrokkAi/muse-acp/issues/221) |
 | `session/sideChat` | Unsupported pending protocol decision | [#222](https://github.com/BrokkAi/muse-acp/issues/222) |
-| `userInput/interrupt` | Unsupported pending protocol decision | [#223](https://github.com/BrokkAi/muse-acp/issues/223) |
+| `userInput/interrupt` | Mapped to ACP | A stop (`session/cancel`) or a decline of a staged question carrying confirmed answers settles the open prompt through `userInput/interrupt`, which hands the answers to the model and stops the turn; an unanswered prompt keeps the ordinary turn interrupt, and an unanswered decline keeps `userInput/cancel`. |
 | `plugin/changed` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
 | `plugin/marketplaceChanged` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#214](https://github.com/BrokkAi/muse-acp/issues/214) |
 | `recap/completed` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#215](https://github.com/BrokkAi/muse-acp/issues/215) |
