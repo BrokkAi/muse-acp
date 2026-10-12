@@ -35,7 +35,7 @@ are emitted by the MSP host.
 | `item/updated` | Mapped to ACP | Upserts the corresponding ACP item from its higher-revision snapshot. |
 | `plugin/changed` | Intentionally ignored | Announces a change to the host's installed-plugin inventory. The adapter exposes no plugin catalog, so there is no ACP mapping; an inbound copy takes the unhandled-notification diagnostic path. |
 | `plugin/marketplaceChanged` | Intentionally ignored | Announces a change to a plugin marketplace the host knows. The adapter exposes no marketplace surface, so there is no ACP mapping; an inbound copy takes the unhandled-notification diagnostic path. |
-| `recap/completed` | Intentionally ignored | Reports that an away recap the adapter never requested has finished. No ACP mapping; an inbound copy takes the unhandled-notification diagnostic path. |
+| `recap/completed` | Mapped to ACP | The single settlement of each `recap/request` the adapter made: `completed` publishes the (title-prefixed) summary as agent text and settles the held prompt `end_turn`, `cancelled` settles it `cancelled`, and `failed`/`timedOut`/unknown outcomes surface as failures. A settlement whose correlation id matches no in-flight request is logged and ignored. |
 | `session/approvalModeChanged` | Internally tracked | Updates the selected approval-mode value used in later ACP configuration snapshots. |
 | `session/branchChanged` | Mapped to ACP | Stores the latest branch fact and emits it in `session/update` metadata together with the current goal. |
 | `session/closed` | Consumed | Logs the unload and its reason. An unload is not a deletion: the session is `notLoaded`, its log stays on disk, and `session/resume` reloads it, so it stays in ACP `session/list`. |

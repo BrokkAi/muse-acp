@@ -132,6 +132,18 @@ pub struct PendingFeedbackForm {
     pub ver: u8,
 }
 
+/// One in-flight `/recap`. The command's ACP prompt request stays pending
+/// until `recap/completed` settles it (the host enforces the 45-second
+/// timeout), or until the user stops the session.
+#[derive(Clone)]
+pub struct PendingRecap {
+    /// The `session/prompt` request that ran `/recap`.
+    pub prompt_req: J,
+    /// The MSP `recap/request` retry id: the settlement's correlation key.
+    pub retry_id: String,
+    pub ver: u8,
+}
+
 /// Host-authored title candidates. The adapter never derives a title from
 /// transcript items; it only chooses among facts the host explicitly sends.
 #[derive(Clone, Default)]
@@ -179,6 +191,8 @@ pub struct AcpSession {
     pub ui_seen: std::collections::HashSet<String>,
     /// The `/feedback` form awaiting its answer, if one is open.
     pub pending_feedback: Option<PendingFeedbackForm>,
+    /// The `/recap` request awaiting `recap/completed`, if one is in flight.
+    pub pending_recap: Option<PendingRecap>,
     /// The approval mode selector's value.
     pub mode_value: String,
     /// Adapter-side auto-review policy for this session. Off by default,
@@ -1059,6 +1073,8 @@ fn available_commands_json(
             "{{\"name\":\"rename\",\"description\":\"Rename this session\",\"input\":{}}}",
             input("<name>")
         ),
+        "{\"name\":\"recap\",\"description\":\"Summarize what happened while you were away\"}"
+            .to_string(),
         format!(
             "{{\"name\":\"workflow\",\"description\":\"Pause or resume a running workflow\",\"input\":{}}}",
             input("pause|resume [<runId>]")
@@ -1074,7 +1090,7 @@ fn available_commands_json(
             .filter(|(name, _, _)| {
                 !matches!(
                     name.as_str(),
-                    "goal" | "rename" | "workflow" | "workflow-child"
+                    "goal" | "recap" | "rename" | "workflow" | "workflow-child"
                 ) && !(feedback && name.as_str() == "feedback")
             })
             .map(|(name, description, hint)| {
@@ -1346,7 +1362,7 @@ mod tests {
                 panic!("available commands must be an array");
             };
             // The host's `rename` row is shadowed by the local command.
-            assert_eq!(items.len(), 7);
+            assert_eq!(items.len(), 8);
             assert_eq!(
                 commands.matches("\"name\":\"feedback\"").count(),
                 1,
@@ -1356,6 +1372,7 @@ mod tests {
             assert!(commands.contains("\"name\":\"goal\""));
             assert!(commands.contains("\"name\":\"compact\""));
             assert!(commands.contains("\"name\":\"rename\""));
+            assert!(commands.contains("\"name\":\"recap\""));
             assert!(commands.contains("\"name\":\"workflow\""));
             assert!(commands.contains("\"name\":\"workflow-child\""));
             assert!(!commands.contains("Host rename skill"));

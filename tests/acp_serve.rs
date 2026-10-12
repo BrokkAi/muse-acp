@@ -503,6 +503,128 @@ fn extract_str(frame: &str, key: &str) -> Option<String> {
 }
 
 #[test]
+fn recap_holds_the_prompt_until_the_host_summary_settles_it() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("recap", &[]);
+        let sid = c.new_session(ver, "");
+        let pid = c.prompt(&sid, "/recap");
+        c.wait_log("recap/request", Duration::from_secs(15));
+        let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        assert!(
+            input.contains("\"sessionId\": \"msp-sess-1\"") && input.contains("\"commandId\": \""),
+            "the request carries the session and a retry id: {input}"
+        );
+        // The summary arrives as ordinary agent text, title first.
+        let summary = c.wait_for("While you were away", Duration::from_secs(15));
+        assert!(
+            summary.contains("Away recap") && summary.contains("agent_message_chunk"),
+            "v{ver} recap text: {summary}"
+        );
+        if ver == 2 {
+            let result = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+            assert_eq!(result.matches("\"result\":{}").count(), 1, "{result}");
+            let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+            assert!(
+                idle.contains("end_turn"),
+                "v2 ids after the summary: {idle}"
+            );
+        } else {
+            let result = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+            assert!(
+                result.contains("\"stopReason\":\"end_turn\""),
+                "v1 result settles with the summary: {result}"
+            );
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn stopping_a_session_cancels_an_in_flight_recap() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("recap_pending", &[]);
+        let sid = c.new_session(ver, "");
+        let pid = c.prompt(&sid, "/recap");
+        if ver == 2 {
+            let running = c.wait_for("\"running\"", Duration::from_secs(15));
+            assert!(running.contains(&sid), "v2 running: {running}");
+        }
+        c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+        c.wait_log("recap/cancel", Duration::from_secs(15));
+        let result = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        if ver == 2 {
+            assert_eq!(result.matches("\"result\":{}").count(), 1, "{result}");
+            let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+            assert!(idle.contains("cancelled"), "v2 idle: {idle}");
+        } else {
+            assert!(
+                result.contains("\"stopReason\":\"cancelled\""),
+                "v1 result: {result}"
+            );
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn failed_and_timed_out_recaps_are_reported_as_failures() {
+    for scenario in ["recap_failed", "recap_timeout"] {
+        for ver in [1, 2] {
+            let mut c = Client::spawn(scenario, &[]);
+            let sid = c.new_session(ver, "");
+            let pid = c.prompt(&sid, "/recap");
+            if ver == 2 {
+                let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
+                assert!(
+                    idle.contains("_failed"),
+                    "{scenario} v2 settles failed: {idle}"
+                );
+                let text = c.wait_for("Recap", Duration::from_secs(15));
+                assert!(
+                    text.contains("agent_message_chunk"),
+                    "{scenario} v2 explains the failure: {text}"
+                );
+            } else {
+                let result = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+                assert!(
+                    result.contains("\"error\"") && result.contains("Recap"),
+                    "{scenario} v1 fails the prompt: {result}"
+                );
+            }
+            c.finish();
+        }
+    }
+}
+
+#[test]
+fn recap_rejects_arguments_and_a_second_in_flight_request() {
+    let mut c = Client::spawn("recap_pending", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "/recap now");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32602") && frame.contains("usage: /recap"),
+        "arguments are a usage error: {frame}"
+    );
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !calls.lines().any(|line| line == "recap/request"),
+        "a usage error never reaches the host: {calls}"
+    );
+
+    let first = c.prompt(&sid, "/recap");
+    let frame = c.wait_for(&format!("\"id\":{first}"), Duration::from_secs(15));
+    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    let second = c.prompt(&sid, "/recap");
+    let frame = c.wait_for(&format!("\"id\":{second}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32602") && frame.contains("already in flight"),
+        "one recap at a time: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
 fn usage_events_forward_msp_usage_as_acp_usage_update() {
     for ver in [1, 2] {
         let mut c = Client::spawn("usage", &[]);

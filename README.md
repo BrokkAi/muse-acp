@@ -367,6 +367,10 @@ error the editor shows if Muse then refuses the profile says why.
   bare `/workflow` lists the live runs with their pause state. A paused card
   is titled `(paused)`, and a resumed launch arrives as a new item naming the
   run it continued.
+- **Away recap** — `/recap` asks Muse for a while-you-were-away summary. The
+  prompt stays open until the host's `recap/completed` settles it (the host
+  enforces a 45-second timeout, reported as a failure), the summary arrives
+  as agent text, and Stop sends `recap/cancel` instead of waiting it out.
 - **Content** — text, inline and local-file images, `resource_link` text
   expansion, and embedded context. Audio is rejected, because Muse's input type
   is closed to `text` and `image`.
