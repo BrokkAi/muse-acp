@@ -1076,6 +1076,14 @@ fn available_commands_json(
         "{\"name\":\"recap\",\"description\":\"Summarize what happened while you were away\"}"
             .to_string(),
         format!(
+            "{{\"name\":\"skill-activation\",\"description\":\"Turn one skill on or off\",\"input\":{}}}",
+            input("<selector> on|userInvocableOnly|off [scope]")
+        ),
+        format!(
+            "{{\"name\":\"skill-import\",\"description\":\"Import skills from Claude Code or Codex\",\"input\":{}}}",
+            input("<claude|codex> [dry-run] [force]")
+        ),
+        format!(
             "{{\"name\":\"workflow\",\"description\":\"Pause or resume a running workflow\",\"input\":{}}}",
             input("pause|resume [<runId>]")
         ),
@@ -1090,7 +1098,13 @@ fn available_commands_json(
             .filter(|(name, _, _)| {
                 !matches!(
                     name.as_str(),
-                    "goal" | "recap" | "rename" | "workflow" | "workflow-child"
+                    "goal"
+                        | "recap"
+                        | "rename"
+                        | "skill-activation"
+                        | "skill-import"
+                        | "workflow"
+                        | "workflow-child"
                 ) && !(feedback && name.as_str() == "feedback")
             })
             .map(|(name, description, hint)| {
@@ -1362,7 +1376,7 @@ mod tests {
                 panic!("available commands must be an array");
             };
             // The host's `rename` row is shadowed by the local command.
-            assert_eq!(items.len(), 8);
+            assert_eq!(items.len(), 10);
             assert_eq!(
                 commands.matches("\"name\":\"feedback\"").count(),
                 1,
@@ -1373,6 +1387,8 @@ mod tests {
             assert!(commands.contains("\"name\":\"compact\""));
             assert!(commands.contains("\"name\":\"rename\""));
             assert!(commands.contains("\"name\":\"recap\""));
+            assert!(commands.contains("\"name\":\"skill-activation\""));
+            assert!(commands.contains("\"name\":\"skill-import\""));
             assert!(commands.contains("\"name\":\"workflow\""));
             assert!(commands.contains("\"name\":\"workflow-child\""));
             assert!(!commands.contains("Host rename skill"));

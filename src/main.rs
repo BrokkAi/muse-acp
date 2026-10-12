@@ -5202,6 +5202,28 @@ fn handle_acp(
                     );
                     return;
                 }
+                // `/skill-import` reports the host's import receipt, so it
+                // runs with its own settlement instead of the generic ack.
+                if let Ok(text) = &line
+                    && let Some(parsed) = parse_skill_import_command(text)
+                {
+                    match parsed {
+                        Ok((source, dry_run, force)) => import_skills(
+                            host,
+                            stdout,
+                            sessions,
+                            &sid,
+                            ver,
+                            id.clone(),
+                            &acp_content,
+                            &source,
+                            dry_run,
+                            force,
+                        ),
+                        Err(message) => acp::send_error(stdout, &id, -32602, &message),
+                    }
+                    return;
+                }
                 let workflow_children = || {
                     sessions
                         .lock()
@@ -5300,10 +5322,13 @@ fn handle_acp(
                             acp::send_result(stdout, &id, "{\"stopReason\":\"end_turn\"}");
                         }
                     }
-                    Err(e) => acp::send_error(
+                    // Typed host data (for example a rejected skill selector)
+                    // stays visible on the error.
+                    Err(e) => send_host_error(
                         stdout,
                         &id,
-                        msp::acp_error_code(&e, -32603),
+                        &e,
+                        -32603,
                         &format!("{method} failed: {}", err_message(&e)),
                     ),
                 }
@@ -7365,6 +7390,75 @@ fn parse_workflow_child_command(
 /// A host method plus its params besides `commandId` and `sessionId`.
 type ProtocolCommand = (String, Vec<(&'static str, J)>);
 
+/// Parse `/skill-activation <selector> <on|userInvocableOnly|off> [scope]`
+/// into a `skill/setActivation` write. The scope defaults to `user`, the
+/// user's own activation setting. The host owns selector and scope
+/// validation (a write must fail a target it does not serve rather than
+/// record against an unknown one), so nothing is guessed here.
+fn parse_skill_activation_command(text: &str) -> Option<Result<ProtocolCommand, String>> {
+    const USAGE: &str = "usage: /skill-activation <selector> on|userInvocableOnly|off [user|project|bundled|plugin]";
+    let body = text.strip_prefix('/')?;
+    let mut words = body.split_whitespace();
+    if words.next()? != "skill-activation" {
+        return None;
+    }
+    let Some(selector) = words.next() else {
+        return Some(Err(USAGE.to_string()));
+    };
+    let activation = match words.next() {
+        Some(state @ ("on" | "userInvocableOnly" | "off")) => state,
+        _ => {
+            return Some(Err(format!(
+                "activation must be on, userInvocableOnly, or off; {USAGE}"
+            )));
+        }
+    };
+    let scope = words.next().unwrap_or("user");
+    if !matches!(scope, "user" | "project" | "bundled" | "plugin") {
+        return Some(Err(format!(
+            "scope must be user, project, bundled, or plugin; {USAGE}"
+        )));
+    }
+    if words.next().is_some() {
+        return Some(Err(USAGE.to_string()));
+    }
+    Some(Ok((
+        "skill/setActivation".to_string(),
+        vec![
+            ("selector", J::Str(selector.to_string())),
+            ("activation", J::Str(activation.to_string())),
+            ("scope", J::Str(scope.to_string())),
+        ],
+    )))
+}
+
+/// Parse `/skill-import <claude|codex> [dry-run] [force]`. The source is
+/// closed on the wire; the host resolves its own foreign directory, so no
+/// client path is involved.
+fn parse_skill_import_command(text: &str) -> Option<Result<(String, bool, bool), String>> {
+    const USAGE: &str = "usage: /skill-import <claude|codex> [dry-run] [force]";
+    let body = text.strip_prefix('/')?;
+    let mut words = body.split_whitespace();
+    if words.next()? != "skill-import" {
+        return None;
+    }
+    let Some(source) = words.next() else {
+        return Some(Err(USAGE.to_string()));
+    };
+    if !matches!(source, "claude" | "codex") {
+        return Some(Err(format!("source must be claude or codex; {USAGE}")));
+    }
+    let (mut dry_run, mut force) = (false, false);
+    for word in words {
+        match word {
+            "dry-run" if !dry_run => dry_run = true,
+            "force" if !force => force = true,
+            _ => return Some(Err(USAGE.to_string())),
+        }
+    }
+    Some(Ok((source.to_string(), dry_run, force)))
+}
+
 /// Parse `/workflow pause|resume [<runId>]` against the session's live
 /// workflow runs (read lazily, only for this command). A single live run may
 /// be implied; with more than one the run id is required, because the ids are
@@ -7435,11 +7529,13 @@ fn parse_workflow_command(
 }
 
 /// Adapter-local slash commands that map onto one host method.
-const PROTOCOL_COMMANDS: [&str; 6] = [
+const PROTOCOL_COMMANDS: [&str; 8] = [
     "feedback",
     "goal",
     "recap",
     "rename",
+    "skill-activation",
+    "skill-import",
     "workflow",
     "workflow-child",
 ];
@@ -7515,6 +7611,9 @@ fn parse_protocol_command(
         return Some(
             parsed.map(|name| ("session/rename".to_string(), vec![("name", J::Str(name))])),
         );
+    }
+    if let Some(parsed) = parse_skill_activation_command(text) {
+        return Some(parsed);
     }
     if let Some(parsed) = parse_workflow_command(text, workflow_runs) {
         return Some(parsed);
@@ -11448,8 +11547,8 @@ fn feedback_form_schema(classification: Option<&str>, note: &str) -> String {
     )
 }
 
-/// End the `/feedback` turn with the receipt or refusal text.
-fn settle_feedback_turn(
+/// End a synchronous text command's turn with its receipt or refusal text.
+fn settle_command_with_text(
     stdout: &StdoutShared,
     sessions: &Sessions,
     acp_sid: &str,
@@ -11568,6 +11667,138 @@ fn start_recap(
     } else {
         send_v1_user_message(stdout, acp_sid, prompt_content);
     }
+}
+
+/// Start `/skill-import`: import foreign skills from one of the host's own
+/// ecosystem directories. The receipt is rendered as command text; the
+/// imported skills reach the catalog through the host's `skill/changed`.
+#[allow(clippy::too_many_arguments)]
+fn import_skills(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    ver: u8,
+    prompt_req: Option<J>,
+    prompt_content: &str,
+    source: &str,
+    dry_run: bool,
+    force: bool,
+) {
+    let msp_sid = match sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(acp_sid)
+    {
+        Some(s) => s.msp_sid.clone(),
+        None => return,
+    };
+    let cmd = host.mint_cmd("cmd-");
+    let mut params = format!(
+        "{{\"commandId\":{},\"sessionId\":{},\"source\":{}",
+        esc(&cmd),
+        esc(&msp_sid),
+        esc(source)
+    );
+    if dry_run {
+        params.push_str(",\"dryRun\":true");
+    }
+    if force {
+        params.push_str(",\"force\":true");
+    }
+    params.push('}');
+    match host.command("skill/import", &params) {
+        Ok(result) => settle_command_with_text(
+            stdout,
+            sessions,
+            acp_sid,
+            ver,
+            &prompt_req.unwrap_or(J::Null),
+            prompt_content,
+            &skill_import_text(&result),
+        ),
+        Err(error) => acp::send_error(
+            stdout,
+            &prompt_req,
+            msp::acp_error_code(&error, -32603),
+            &format!("skill/import failed: {}", err_message(&error)),
+        ),
+    }
+}
+
+/// Human text for a `skill/import` receipt: the four counts first (a client
+/// renders counts without walking lists), then the non-empty id lists.
+fn skill_import_text(result: &J) -> String {
+    let source = result
+        .get("source")
+        .and_then(J::as_str)
+        .unwrap_or("foreign");
+    let dry = matches!(result.get("dryRun"), Some(J::Bool(true)));
+    let count = |key: &str| {
+        result
+            .get("counts")
+            .and_then(|counts| counts.get(key))
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+    };
+    let mut lines = vec![format!(
+        "{} from {source}: {} installed, {} quarantined, {} skipped, {} failed.",
+        if dry {
+            "Skill import dry run"
+        } else {
+            "Skill import"
+        },
+        count("installed"),
+        count("quarantined"),
+        count("skipped"),
+        count("failed"),
+    )];
+    for key in ["installed", "skipped"] {
+        if let Some(J::Arr(items)) = result.get(key) {
+            let ids: Vec<&str> = items.iter().filter_map(|item| item.as_str()).collect();
+            if !ids.is_empty() {
+                lines.push(format!("{key}: {}", ids.join(", ")));
+            }
+        }
+    }
+    if let Some(J::Arr(items)) = result.get("quarantined") {
+        let entries: Vec<String> = items
+            .iter()
+            .filter_map(|item| {
+                let id = item.get("id").and_then(J::as_str)?;
+                let reasons = match item.get("reasons") {
+                    Some(J::Arr(reasons)) => reasons
+                        .iter()
+                        .filter_map(|reason| reason.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    _ => String::new(),
+                };
+                Some(if reasons.is_empty() {
+                    id.to_string()
+                } else {
+                    format!("{id} ({reasons})")
+                })
+            })
+            .collect();
+        if !entries.is_empty() {
+            lines.push(format!("quarantined: {}", entries.join("; ")));
+        }
+    }
+    if let Some(J::Arr(items)) = result.get("failed") {
+        let entries: Vec<String> = items
+            .iter()
+            .map(|item| {
+                let id = item.get("id").and_then(J::as_str).unwrap_or("(unnamed)");
+                let reason = item.get("reason").and_then(J::as_str).unwrap_or("unknown");
+                format!("{id} ({reason})")
+            })
+            .collect();
+        if !entries.is_empty() {
+            lines.push(format!("failed: {}", entries.join("; ")));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Settle a held `/recap` prompt with the host's outcome.
@@ -11733,7 +11964,7 @@ fn submit_feedback(
         Ok(result) => feedback_result_text(&result),
         Err(error) => format!("Feedback was not sent: {}.", err_message(&error)),
     };
-    settle_feedback_turn(
+    settle_command_with_text(
         stdout,
         sessions,
         acp_sid,
@@ -11822,7 +12053,7 @@ fn start_feedback(
             false,
             false,
         ),
-        _ => settle_feedback_turn(
+        _ => settle_command_with_text(
             stdout,
             sessions,
             acp_sid,
@@ -11895,7 +12126,7 @@ fn complete_feedback(
         {
             s.pending_feedback = None;
         }
-        settle_feedback_turn(
+        settle_command_with_text(
             stdout,
             sessions,
             &acp_sid,

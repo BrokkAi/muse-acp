@@ -46,6 +46,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   skills_changed skill/list changes after a skill/changed notification
                (FAKE_SKILL_REFRESH_FAILS=1: the re-read has no skills array)
   skill_not_found skill/list still lists `stale`; turn/start rejects it
+  skill_control skill/setActivation writes and skill/import receipts
   async_task_stop       background task then a targeted task/stop terminal
   async_task_stop_all   background tasks then task/stopAll terminals
   hook_run     a hookRun item around the turn; hook/list serves the inventory
@@ -1813,6 +1814,34 @@ def result_for(method, msg):
     if method in ("approval/decide", "userInput/clarify"):
         log_input(msg.get("params", {}))
         return {}
+    if method == "skill/setActivation":
+        params = msg.get("params", {})
+        log_input(params)
+        selector = params.get("selector", "")
+        previous = "userInvocableOnly"
+        notify("skill/changed", {"sessionId": params.get("sessionId", MSP_SID)})
+        return {
+            "commandId": params.get("commandId", ""), "status": "accepted",
+            "selector": selector, "scope": params.get("scope", "user"),
+            "activation": params.get("activation", "on"),
+            "previous": previous,
+        }
+    if method == "skill/import":
+        params = msg.get("params", {})
+        log_input(params)
+        dry = params.get("dryRun") is True
+        if not dry:
+            notify("skill/changed", {"sessionId": params.get("sessionId", MSP_SID)})
+        return {
+            "commandId": params.get("commandId", ""), "status": "accepted",
+            "source": params.get("source", "claude"), "dryRun": dry,
+            "installed": ["imported-a", "imported-b"],
+            "quarantined": [{"id": "imported-c", "reasons": ["unsafe-tools"]}],
+            "skipped": ["already-here"],
+            "failed": [{"id": None, "reason": "unreadable manifest"}],
+            "counts": {"installed": 2, "quarantined": 1,
+                       "skipped": 1, "failed": 1},
+        }
     if method == "turn/steer":
         params = msg.get("params", {})
         log_input(params)
@@ -2225,6 +2254,18 @@ def main():
                                     "message": "skill selector was not found",
                                     "data": {"kind": "skillNotFound",
                                              "selector": "stale"}}})
+                    continue
+                if (SCENARIO == "skill_control"
+                        and method == "skill/setActivation"
+                        and msg.get("params", {}).get("selector") == "missing"):
+                    # The host rejects a selector it does not serve; the
+                    # adapter forwards the typed error untouched.
+                    log_input(msg.get("params", {}))
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32032,
+                                    "message": "skill not found",
+                                    "data": {"kind": "skillNotFound",
+                                             "selector": "missing"}}})
                     continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})

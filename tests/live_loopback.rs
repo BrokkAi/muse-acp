@@ -1391,6 +1391,113 @@ fn session_hook_reads_reach_a_real_host_when_negotiated() {
     adapter.finish();
 }
 
+/// `/skill-activation` writes one skill's activation through
+/// `skill/setActivation`. Muse 1.4.4 added the method, so older CI pins skip.
+#[test]
+fn skill_activation_reaches_a_real_host() {
+    let test = "skill_activation_reaches_a_real_host";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 4), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let commands = adapter.wait("the command catalog", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["update"]["sessionUpdate"] == "available_commands_update"
+    });
+    let local = [
+        "compact",
+        "feedback",
+        "goal",
+        "recap",
+        "rename",
+        "skill-activation",
+        "skill-import",
+        "workflow",
+        "workflow-child",
+    ];
+    let skill = commands["params"]["update"]["availableCommands"]
+        .as_array()
+        .expect("commands")
+        .iter()
+        .filter_map(|command| command["name"].as_str())
+        .find(|name| !local.contains(name))
+        .unwrap_or_else(|| panic!("a host skill in {commands}"))
+        .to_string();
+    // The write must carry the row's own scope: a throwaway host's skills are
+    // bundled, and the host refuses to record one against another scope. Try
+    // the closed vocabulary and require at least one accepted write.
+    let mut accepted = None;
+    let mut refusals = Vec::new();
+    for scope in ["bundled", "user", "plugin", "project"] {
+        let id = adapter.request(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{
+                "type": "text",
+                "text": format!("/skill-activation {skill} userInvocableOnly {scope}"),
+            }]}),
+        );
+        let response = adapter.response(id);
+        if response.get("result").is_some() {
+            accepted = Some(scope);
+            break;
+        }
+        refusals.push(response);
+    }
+    assert!(
+        accepted.is_some(),
+        "no scope accepted the activation write: {refusals:?}"
+    );
+    adapter.finish();
+}
+
+/// `/skill-import` dry-runs a foreign-ecosystem import through the host's own
+/// directories. `skill/import` arrived in Muse 1.4.6, so older pins skip.
+#[test]
+fn skill_import_dry_run_reaches_a_real_host() {
+    let test = "skill_import_dry_run_reaches_a_real_host";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 6), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.request(
+        "session/prompt",
+        json!({"sessionId": session, "prompt": [{
+            "type": "text",
+            "text": "/skill-import claude dry-run",
+        }]}),
+    );
+    let result = adapter.result(id);
+    assert_eq!(result["stopReason"], "end_turn", "{result}");
+    // The throwaway home has no Claude skills, so the dry run reports zero
+    // writes; the point is that the receipt settles the prompt.
+    let receipt = adapter.wait("the import receipt", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+            && frame["params"]["update"]["content"]["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("Skill import dry run from claude"))
+    });
+    assert!(
+        receipt["params"]["update"]["content"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("installed")),
+        "{receipt}"
+    );
+    adapter.finish();
+}
+
 /// `/recap` asks the host for a while-you-were-away summary; the held prompt
 /// settles when `recap/completed` arrives. `recap/request` arrived in Muse
 /// 1.4.6, so older CI pins skip.

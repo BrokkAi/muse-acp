@@ -371,6 +371,12 @@ error the editor shows if Muse then refuses the profile says why.
   prompt stays open until the host's `recap/completed` settles it (the host
   enforces a 45-second timeout, reported as a failure), the summary arrives
   as agent text, and Stop sends `recap/cancel` instead of waiting it out.
+- **Skills** — `/skill-activation <selector> on|userInvocableOnly|off
+  [user|project|bundled|plugin]` writes one skill's activation through the
+  host's `skill/setActivation` (the scope defaults to `user`), and
+  `/skill-import <claude|codex> [dry-run] [force]` imports foreign skills
+  through `skill/import` and reports the host's receipt. The command catalog
+  refreshes through `skill/changed` after either write.
 - **Content** — text, inline and local-file images, `resource_link` text
   expansion, and embedded context. Audio is rejected, because Muse's input type
   is closed to `text` and `image`.
