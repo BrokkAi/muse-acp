@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Render Muse todo plans on ACP v2 connections. The adapter previously
+  emitted only the v1 `plan` frame, which v2 clients drop, so plans silently
+  never appeared on a v2 session. v2 now receives the todo snapshot as a
+  `plan_update` items checklist (plan id `muse-todo`) and a `plan_removed`
+  when the list is cleared; v1 keeps the existing `plan` frame.
 - Remember the last reasoning effort picked per model in
   `$XDG_STATE_HOME/muse-acp/reasoning-efforts.json` (Windows:
   `%LOCALAPPDATA%\muse-acp\reasoning-efforts.json`) and apply it to new

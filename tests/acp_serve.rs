@@ -6827,6 +6827,76 @@ fn resume_restores_the_plan_from_the_snapshot() {
 }
 
 #[test]
+fn v2_todo_list_changed_maps_to_a_plan_update() {
+    let mut c = Client::spawn("todo", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "do the thing");
+    let plan = c.wait_for("\"sessionUpdate\":\"plan_update\"", Duration::from_secs(15));
+    assert!(plan.contains(&sid), "plan must target our session: {plan}");
+    assert!(
+        plan.contains("\"plan\":{\"type\":\"items\",\"planId\":\"muse-todo\""),
+        "v2 items plan missing: {plan}"
+    );
+    assert!(
+        plan.contains("Read the schema"),
+        "completed entry missing: {plan}"
+    );
+    assert!(
+        plan.contains(
+            "\"content\":\"Map todo lists\",\"priority\":\"medium\",\"status\":\"in_progress\""
+        ),
+        "in-progress entry missing: {plan}"
+    );
+    assert!(
+        plan.contains(
+            "\"content\":\"Dropped task\",\"priority\":\"medium\",\"status\":\"pending\""
+        ),
+        "cancelled entry must stay pending: {plan}"
+    );
+    assert!(
+        !plan.contains("\"sessionUpdate\":\"plan\""),
+        "v1 plan frame leaked into v2: {plan}"
+    );
+    c.finish();
+}
+
+#[test]
+fn v2_empty_todo_list_removes_the_plan() {
+    let mut c = Client::spawn("todo_cleared", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "clear the plan");
+    c.wait_for("\"sessionUpdate\":\"plan_update\"", Duration::from_secs(15));
+    let removed = c.wait_for(
+        "\"sessionUpdate\":\"plan_removed\"",
+        Duration::from_secs(15),
+    );
+    assert!(
+        removed.contains(&sid),
+        "removal must target our session: {removed}"
+    );
+    assert!(
+        removed.contains("\"planId\":\"muse-todo\""),
+        "removal must name the plan: {removed}"
+    );
+    c.finish();
+}
+
+#[test]
+fn v2_resume_restores_the_plan_from_the_snapshot() {
+    let mut c = Client::spawn("todo_resume", &[]);
+    let sid = c.new_session(2, "");
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "resume failed: {frame}");
+    let plan = c.wait_for("\"sessionUpdate\":\"plan_update\"", Duration::from_secs(15));
+    assert!(
+        plan.contains("\"planId\":\"muse-todo\"") && plan.contains("Read the schema"),
+        "snapshot plan missing: {plan}"
+    );
+    c.finish();
+}
+
+#[test]
 fn reasoning_summary_parts_stream_as_thought_chunks() {
     let mut c = Client::spawn("reasoning_stream", &[]);
     let sid = c.new_session(2, "");
