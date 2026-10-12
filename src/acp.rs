@@ -1259,6 +1259,19 @@ pub fn send_session_info(
     );
 }
 
+/// Publish the host's session provenance (`sideFrom` or `forkedFrom`) as the
+/// `muse` object of a `session_info_update` `_meta`. The caller passes the
+/// already-serialized host fact, e.g. `{"sideFrom":{...}}`.
+pub fn send_session_provenance(stdout: &StdoutShared, acp_sid: &str, muse: &str) {
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"muse\":{muse}}}}}}}}}",
+            esc(acp_sid)
+        ),
+    );
+}
+
 /// Publish the loaded session's status and known attention flags through the
 /// provider namespace of ACP's session-info update. The caller also emits the
 /// standard ACP state when the status or attention projection has one.

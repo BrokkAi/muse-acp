@@ -47,6 +47,7 @@ static AIR_RECOMMENDED: AtomicU64 = AtomicU64::new(0); // 1 when the client want
 static USER_SHELL: AtomicU64 = AtomicU64::new(0); // explicit editor shell feature
 static READ_OUTPUT: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates stored-output reads
 static HOOKS: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates session hook reads
+static SIDE_CHAT: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates side-chat creation
 static AIR_FILE_REPORT: AtomicU64 = AtomicU64::new(0); // 1 when per-turn file reports are negotiated
 static MUSE_NOT_INSTALLED: AtomicBool = AtomicBool::new(false); // host launch found no Muse executable
 
@@ -825,6 +826,24 @@ fn session_name_from_result(res: &J) -> Option<Option<String>> {
     }
 }
 
+/// The host's session provenance, if any: a session carries at most one of
+/// `sideFrom` (side chats) and `forkedFrom` (forks).
+fn session_provenance(session: Option<&J>) -> Option<(&'static str, &J)> {
+    let session = session?;
+    ["sideFrom", "forkedFrom"].into_iter().find_map(|key| {
+        session
+            .get(key)
+            .filter(|value| !matches!(value, J::Null))
+            .map(|value| (key, value))
+    })
+}
+
+/// The `_meta.muse` object naming the session's provenance, e.g.
+/// `{"sideFrom":{...}}`.
+fn session_provenance_meta(session: Option<&J>) -> Option<String> {
+    session_provenance(session).map(|(key, value)| format!("{{\"{key}\":{}}}", j_to_string(value)))
+}
+
 /// Adopt a `(usedTokens, windowTokens, pressure)` occupancy triple, replacing
 /// wholesale: an absent `windowTokens` means the basis has no limit, so the
 /// stale size is dropped rather than re-emitted. Returns the pressure to ride
@@ -1390,7 +1409,7 @@ enum LoopMsg {
 /// MSP `session/delete` support (Muse 1.4.1 or 1.4.2, durable); clients
 /// must not call `session/delete` unless it is advertised.
 fn v2_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["hooks","readOutput","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
+    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["hooks","readOutput","sideChat","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v2())
         .replace(
@@ -1408,7 +1427,7 @@ fn v2_init(session_mcp: bool, session_delete: bool) -> String {
 }
 
 fn v1_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["hooks","readOutput","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true}}}"#
+    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["hooks","readOutput","sideChat","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v1())
         .replace("__MCP_HTTP__", if session_mcp { "true" } else { "false" })
@@ -2760,7 +2779,14 @@ fn adopt_reattached(
                 adopt_session_projection(s, session);
             }
             let projection = (s.ver, s.session_status.clone(), s.attention.clone());
+            let provenance = session_provenance(r.get("session"))
+                .map(|(key, value)| format!("{{\"{key}\":{}}}", j_to_string(value)));
             drop(map);
+            if let Some(muse) = provenance {
+                // A side chat names the session it was opened from; a fork
+                // names its cut point. Both ride the attach's info update.
+                acp::send_session_provenance(stdout, acp_sid, &muse);
+            }
             send_session_projection(
                 stdout,
                 acp_sid,
@@ -3761,6 +3787,11 @@ fn negotiate_acp(msg: &J) -> bool {
     if hooks {
         log("client negotiated session hook reads");
     }
+    let side_chat = client_supports_muse(capabilities, "sideChat");
+    SIDE_CHAT.store(u64::from(side_chat), Ordering::SeqCst);
+    if side_chat {
+        log("client negotiated side-chat creation");
+    }
     let recommended = client_supports_air(capabilities, "recommendedValue");
     AIR_RECOMMENDED.store(u64::from(recommended), Ordering::SeqCst);
     if async_tasks {
@@ -4429,6 +4460,12 @@ fn handle_acp(
                             entry.title_facts.name = name.clone();
                             title_update = Some(entry.title_facts.selected().map(str::to_string));
                         }
+                        // A side chat names the session it was opened from; a
+                        // fork names its cut point. Publish the provenance on
+                        // attach so the parent link survives a reload.
+                        if let Some(muse) = session_provenance_meta(r.get("session")) {
+                            acp::send_session_provenance(stdout, &sid, &muse);
+                        }
                         // Usage the host already knows, restored from the
                         // snapshot rather than from message replay: Muse
                         // subscribes after the returned view head, so the
@@ -4879,9 +4916,8 @@ fn handle_acp(
                     for item in &history_items {
                         fork_fold.replay_item(&new_msp, ver, item, &mut replay_lines);
                     }
-                    let provenance = new_session
-                        .get("forkedFrom")
-                        .map(|p| format!(",\"muse\":{{\"forkedFrom\":{}}}", j_to_string(p)))
+                    let provenance = session_provenance_meta(Some(&new_session))
+                        .map(|muse| format!(",\"muse\":{muse}"))
                         .unwrap_or_default();
                     let fork_title_facts = title_facts(Some(&new_session));
                     let fork_branch_meta = raw_host_fact(Some(&new_session), "branch");
@@ -5700,6 +5736,106 @@ fn handle_acp(
                     &id,
                     msp::acp_error_code(&error, -32603),
                     &format!("item/readOutput failed: {}", err_message(&error)),
+                ),
+            }
+        }
+        "_session/sideChat" => {
+            if SIDE_CHAT.load(Ordering::SeqCst) == 0 {
+                acp::send_error(
+                    stdout,
+                    &id,
+                    -32601,
+                    "side chats require the muse sideChat capability",
+                );
+                return;
+            }
+            let acp_sid = params
+                .as_ref()
+                .and_then(|p| p.get("sessionId"))
+                .and_then(|v| v.as_str())
+                .filter(|v| !v.is_empty())
+                .map(str::to_string);
+            let Some(acp_sid) = acp_sid else {
+                acp::send_error(stdout, &id, -32602, "_session/sideChat requires sessionId");
+                return;
+            };
+            let (parent_msp, parent_mode) = {
+                let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                match map.get(&acp_sid) {
+                    Some(s) => (s.msp_sid.clone(), s.session_mode.clone()),
+                    None => {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32602,
+                            "unknown sessionId; open a side chat from a loaded session",
+                        );
+                        return;
+                    }
+                }
+            };
+            // Muse creates the side on the host holding its source, so the
+            // side is routed there and inherits the source's mode.
+            let parent_host = host.owner(&parent_msp);
+            let cmd = host.mint_cmd("cmd-");
+            match host.command(
+                "session/sideChat",
+                &format!(
+                    "{{\"commandId\":{},\"sessionId\":{}}}",
+                    esc(&cmd),
+                    esc(&parent_msp)
+                ),
+            ) {
+                Ok(result) => {
+                    let session = result.get("session").cloned().unwrap_or(J::Null);
+                    let new_msp = session
+                        .get("sessionId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    if new_msp.is_empty() {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32603,
+                            "session/sideChat returned no sessionId",
+                        );
+                        return;
+                    }
+                    host.note_owner(&new_msp, parent_host);
+                    modes::save(&new_msp, &parent_mode);
+                    let view_cursor = result
+                        .get("viewCursor")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let side_from = session_provenance(Some(&session))
+                        .filter(|(key, _)| *key == "sideFrom")
+                        .map(|(_, value)| format!(",\"sideFrom\":{}", j_to_string(value)))
+                        .unwrap_or_default();
+                    acp::send_result(
+                        stdout,
+                        &id,
+                        &format!(
+                            "{{\"sessionId\":{},\"viewCursor\":{}{side_from}}}",
+                            esc(&new_msp),
+                            esc(view_cursor)
+                        ),
+                    );
+                    // The side names the session it was opened from; the
+                    // client attaches it with its ordinary session methods.
+                    if let Some(muse) = session_provenance_meta(Some(&session)) {
+                        acp::send_session_provenance(stdout, &new_msp, &muse);
+                    }
+                    log(&format!(
+                        "opened side chat {new_msp} from session {parent_msp}"
+                    ));
+                }
+                Err(error) => send_host_error(
+                    stdout,
+                    &id,
+                    &error,
+                    -32603,
+                    &format!("session/sideChat failed: {}", err_message(&error)),
                 ),
             }
         }

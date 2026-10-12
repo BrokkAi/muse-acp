@@ -21,8 +21,8 @@ To see it working, run the per-issue test command named in each milestone below;
 - [x] (2026-10-12) Issue #218 `workflow/pause` and `workflow/resume`: merged in PR #229 (fold pause state and resume generation, `/workflow pause|resume [<runId>]`, fake-host plus live 1.4.4/1.4.6 tests, docs).
 - [x] (2026-10-12) Issue #220 `hook/list`: merged in PR #230 (opt-in `_session/hooks`, hook inventory in the fold, `hookRun` cards, fake-host plus live 1.4.4/1.4.6 tests, docs).
 - [x] (2026-10-12) Issue #215 `recap/request` and `recap/cancel`: merged in PR #231 (`/recap` holding the prompt until `recap/completed`, `recap/cancel` on stop, failure reporting, fake-host plus live-1.4.6 tests, docs).
-- [ ] (2026-10-12) Issue #217 `skill/setActivation` and `skill/import`: implemented on `issue-217/skill-activation-import` (`/skill-activation`, `/skill-import`, typed error passthrough on protocol commands, fake-host plus live 1.4.4/1.4.6 tests, docs), PR and merge pending.
-- [ ] Issue #222 `session/sideChat` and `SideProvenance`.
+- [x] (2026-10-12) Issue #217 `skill/setActivation` and `skill/import`: merged in PR #232 (`/skill-activation`, `/skill-import`, typed error passthrough on protocol commands, fake-host plus live 1.4.4/1.4.6 tests, docs).
+- [ ] (2026-10-12) Issue #222 `session/sideChat` and `SideProvenance`: implemented on `issue-222/side-chats` (opt-in `_session/sideChat`, client-side attach through resume/load, provenance in `session_info_update`, fake-host plus live 1.4.4/1.4.6 tests, docs), PR and merge pending.
 - [ ] Issue #219 `task/list`.
 - [ ] Issue #214 plugin and marketplace management.
 - [ ] Issue #216 computer-use settings and setup.
