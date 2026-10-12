@@ -178,6 +178,9 @@ pub struct SessionFold {
     /// Last terminal state emitted for each AIR task, suppressing duplicate
     /// item/updated + item/completed deliveries.
     async_task_states: HashMap<String, String>,
+    /// Tool-call cards already marked backgrounded in AIR, keyed by the card
+    /// id (the item's call id).
+    backgrounded_cards: std::collections::HashSet<String>,
     /// Card ids for `reminderChild` items, keyed by reminder agent (or by host
     /// item id when the item carries no agent). Only used when reminder cards
     /// are opted in with `MUSE_SHOW_REMINDERS`: the host mints a new item for
@@ -249,6 +252,7 @@ impl SessionFold {
             hook_handlers: HashMap::new(),
             async_task_msp_ids: HashMap::new(),
             async_task_states: HashMap::new(),
+            backgrounded_cards: std::collections::HashSet::new(),
             reminder_cards: HashMap::new(),
             show_reminders: false,
         }
@@ -447,6 +451,65 @@ impl SessionFold {
         self.air_async_tasks
             .then_some(())
             .and_then(|_| self.workflow_tasks.get(task_id).cloned())
+    }
+
+    /// Seed one AIR async task from a `task/list` row. A row whose host task
+    /// id is already known (announced from item events or an earlier seed) is
+    /// left to those events. The host task id becomes both the AIR task id
+    /// and the MSP task id, so a stop and a later item terminal resolve to the
+    /// same task. Returns true when the row was announced.
+    pub fn seed_async_task(&mut self, acp_sid: &str, row: &J, out: &mut Vec<String>) -> bool {
+        if !self.air_async_tasks {
+            return false;
+        }
+        let Some(task_id) = row
+            .get("taskId")
+            .and_then(|v| v.as_str())
+            .filter(|id| !id.is_empty())
+        else {
+            return false;
+        };
+        if self.announced_tasks.contains(task_id)
+            || self.async_task_states.contains_key(task_id)
+            || self.async_task_msp_ids.values().any(|msp| msp == task_id)
+        {
+            return false;
+        }
+        let tool = row.get("tool").and_then(|v| v.as_str()).unwrap_or("");
+        let kind = row.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+        let name = if !tool.is_empty() {
+            tool.to_string()
+        } else if !kind.is_empty() {
+            kind.to_string()
+        } else {
+            "task".to_string()
+        };
+        // Item-visible tool rows are shell-family work; registry-only rows
+        // carry the host's own kind string.
+        let task_type = if kind == "tool" || kind.starts_with("tool.") || kind.is_empty() {
+            "shell"
+        } else {
+            kind
+        };
+        self.async_task_msp_ids
+            .insert(task_id.to_string(), task_id.to_string());
+        self.announced_tasks.insert(task_id.to_string());
+        out.push(Self::async_task_spawned_line(
+            acp_sid, task_id, &name, task_type, true, None,
+        ));
+        true
+    }
+
+    /// The AIR async-task id already announced for a host item id (from a
+    /// `task/list` seed), or `fallback` when none exists. Reusing the seeded
+    /// id keeps one AIR task per host task when the item's own events arrive
+    /// later.
+    fn async_task_id_for(&self, msp_task_id: &str, fallback: &str) -> String {
+        self.async_task_msp_ids
+            .iter()
+            .find(|(_, msp)| msp.as_str() == msp_task_id)
+            .map(|(air, _)| air.clone())
+            .unwrap_or_else(|| fallback.to_string())
     }
 
     /// Resolve the adapter-facing AIR task id to MSP's durable item id.
@@ -1517,16 +1580,25 @@ impl SessionFold {
                         host_truncated: false,
                     },
                 ));
+                let task_id = self.async_task_id_for(&item_id, &tc_id);
                 let backgrounded = item
                     .get("background")
                     .is_some_and(|v| matches!(v, J::Bool(true)))
-                    || self.announced_tasks.contains(&tc_id);
+                    || self.announced_tasks.contains(&tc_id)
+                    || self.backgrounded_cards.contains(&tc_id);
                 if backgrounded && self.air_async_tasks {
-                    if !self.announced_tasks.contains(&tc_id) {
+                    if self.backgrounded_cards.insert(tc_id.clone()) {
                         out.push(Self::backgrounded_tool_line(acp_sid, ver, &tc_id));
                     }
-                    self.announce_async_task(acp_sid, &item_id, &tc_id, &title, Some(&tc_id), out);
-                    self.emit_async_task_state(acp_sid, &tc_id, item, out);
+                    self.announce_async_task(
+                        acp_sid,
+                        &item_id,
+                        &task_id,
+                        &title,
+                        Some(&tc_id),
+                        out,
+                    );
+                    self.emit_async_task_state(acp_sid, &task_id, item, out);
                 }
                 if let Some(ItemRole::Tool { announced, .. }) = self.items.get_mut(&item_id) {
                     *announced = true;
@@ -1629,8 +1701,16 @@ impl SessionFold {
                     ));
                 }
                 if kind == "userShell" && self.air_async_tasks {
-                    self.announce_async_task(acp_sid, &item_id, &tc_id, &title, Some(&tc_id), out);
-                    self.emit_async_task_state(acp_sid, &tc_id, item, out);
+                    let task_id = self.async_task_id_for(&item_id, &tc_id);
+                    self.announce_async_task(
+                        acp_sid,
+                        &item_id,
+                        &task_id,
+                        &title,
+                        Some(&tc_id),
+                        out,
+                    );
+                    self.emit_async_task_state(acp_sid, &task_id, item, out);
                 } else if kind == "workflow"
                     && self.air_async_tasks
                     && let Some(run_id) = item
@@ -1815,13 +1895,22 @@ impl SessionFold {
                 let backgrounded = item
                     .get("background")
                     .is_some_and(|v| matches!(v, J::Bool(true)))
-                    || self.announced_tasks.contains(&tc_id);
+                    || self.announced_tasks.contains(&tc_id)
+                    || self.backgrounded_cards.contains(&tc_id);
                 if backgrounded && self.air_async_tasks {
-                    if !self.announced_tasks.contains(&tc_id) {
+                    let task_id = self.async_task_id_for(&item_id, &tc_id);
+                    if self.backgrounded_cards.insert(tc_id.clone()) {
                         out.push(Self::backgrounded_tool_line(acp_sid, ver, &tc_id));
                     }
-                    self.announce_async_task(acp_sid, &item_id, &tc_id, &title, Some(&tc_id), out);
-                    self.emit_async_task_state(acp_sid, &tc_id, item, out);
+                    self.announce_async_task(
+                        acp_sid,
+                        &item_id,
+                        &task_id,
+                        &title,
+                        Some(&tc_id),
+                        out,
+                    );
+                    self.emit_async_task_state(acp_sid, &task_id, item, out);
                 }
                 self.items.remove(&item_id);
             }
@@ -1939,8 +2028,16 @@ impl SessionFold {
                     ));
                 }
                 if kind == "userShell" && self.air_async_tasks {
-                    self.announce_async_task(acp_sid, &item_id, &tc_id, &title, Some(&tc_id), out);
-                    self.emit_async_task_state(acp_sid, &tc_id, item, out);
+                    let task_id = self.async_task_id_for(&item_id, &tc_id);
+                    self.announce_async_task(
+                        acp_sid,
+                        &item_id,
+                        &task_id,
+                        &title,
+                        Some(&tc_id),
+                        out,
+                    );
+                    self.emit_async_task_state(acp_sid, &task_id, item, out);
                 }
                 if kind == "workflow"
                     && self.air_async_tasks
@@ -2193,6 +2290,49 @@ mod corpus_tests {
         .unwrap();
         fold.on_item_completed("sid", 2, &completed, &mut out);
         assert!(fold.workflow_children().is_empty());
+    }
+
+    #[test]
+    fn seeded_async_tasks_keep_their_id_when_the_item_arrives() {
+        let mut fold = SessionFold::new();
+        fold.air_async_tasks = true;
+        let mut out = Vec::new();
+        let row = parse_json(
+            r#"{"taskId":"it-bg","kind":"tool.workspace-shell","status":"inProgress","tool":"workspace-shell"}"#,
+        )
+        .unwrap();
+        assert!(fold.seed_async_task("sid", &row, &mut out));
+        assert!(
+            !fold.seed_async_task("sid", &row, &mut out),
+            "a known row is never announced twice"
+        );
+        let spawned = out.join("\n");
+        assert!(
+            spawned.contains("\"asyncTaskId\":\"it-bg\"")
+                && spawned.contains("\"name\":\"workspace-shell\"")
+                && spawned.contains("\"taskType\":\"shell\""),
+            "{spawned}"
+        );
+        assert_eq!(fold.msp_task_id("it-bg"), Some("it-bg"));
+
+        // The item's own terminal reuses the seeded id, not the call id.
+        let mut out = Vec::new();
+        let wrapped = parse_json(
+            r#"{"item":{"itemId":"it-bg","kind":"toolCall","callId":"call-bg","status":"completed","revision":2,"tool":"workspace-shell","args":"{}","background":true}}"#,
+        )
+        .unwrap();
+        fold.on_item_completed("sid", 2, &wrapped, &mut out);
+        let settled = out.join("\n");
+        assert!(
+            settled.contains("async_task_state_update")
+                && settled.contains("\"asyncTaskId\":\"it-bg\"")
+                && settled.contains("\"state\":\"completed\""),
+            "{settled}"
+        );
+        assert!(
+            !settled.contains("\"asyncTaskId\":\"call-bg\""),
+            "{settled}"
+        );
     }
 
     #[test]

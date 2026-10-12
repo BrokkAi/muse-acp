@@ -22,8 +22,8 @@ To see it working, run the per-issue test command named in each milestone below;
 - [x] (2026-10-12) Issue #220 `hook/list`: merged in PR #230 (opt-in `_session/hooks`, hook inventory in the fold, `hookRun` cards, fake-host plus live 1.4.4/1.4.6 tests, docs).
 - [x] (2026-10-12) Issue #215 `recap/request` and `recap/cancel`: merged in PR #231 (`/recap` holding the prompt until `recap/completed`, `recap/cancel` on stop, failure reporting, fake-host plus live-1.4.6 tests, docs).
 - [x] (2026-10-12) Issue #217 `skill/setActivation` and `skill/import`: merged in PR #232 (`/skill-activation`, `/skill-import`, typed error passthrough on protocol commands, fake-host plus live 1.4.4/1.4.6 tests, docs).
-- [ ] (2026-10-12) Issue #222 `session/sideChat` and `SideProvenance`: implemented on `issue-222/side-chats` (opt-in `_session/sideChat`, client-side attach through resume/load, provenance in `session_info_update`, fake-host plus live 1.4.4/1.4.6 tests, docs), PR and merge pending.
-- [ ] Issue #219 `task/list`.
+- [x] (2026-10-12) Issue #222 `session/sideChat` and `SideProvenance`: merged in PR #233 (opt-in `_session/sideChat`, client-side attach through resume/load, provenance in `session_info_update`, fake-host plus live 1.4.4/1.4.6 tests, docs).
+- [ ] (2026-10-12) Issue #219 `task/list`: implemented on `issue-219/task-list` (resume/re-attach seeding of AIR async tasks, seeded-id reuse for later item events, fake-host plus live-1.4.6 tests, docs), PR and merge pending.
 - [ ] Issue #214 plugin and marketplace management.
 - [ ] Issue #216 computer-use settings and setup.
 - [ ] Issue #221 `media/upload`.

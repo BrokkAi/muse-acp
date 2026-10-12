@@ -2802,6 +2802,8 @@ fn adopt_reattached(
     // Prompts whose turns no longer exist in the reattached fold must settle,
     // not hang forever.
     reconcile_in_flight(stdout, sessions, acp_sid, r);
+    // A restarted adapter never saw the running tasks' announcements.
+    seed_task_inventory(hosts, stdout, sessions, acp_sid);
 }
 
 /// The session's full selector set as raw `configOptions` JSON.
@@ -4556,6 +4558,9 @@ fn handle_acp(
                     // One-to-one with the folded active/queued turns, or an
                     // explicit cancelled settlement for anything orphaned.
                     reconcile_in_flight(stdout, sessions, &sid, &r);
+                    // The host's task inventory is authoritative for work
+                    // the replayed history did not carry.
+                    seed_task_inventory(host, stdout, sessions, &sid);
                     // Outside the lock: this reads back from the host.
                     backfill_usage(host, stdout, sessions, &sid);
                     refresh_subscription_usage(host, stdout, sessions, &sid);
@@ -7233,6 +7238,59 @@ fn reconcile_active_tasks(
     }
     for line in out {
         acp::send_raw(stdout, &line);
+    }
+}
+
+/// Seed the AIR async-task inventory from the host's authoritative
+/// `task/list` (Muse 1.4.6+) after a resume or re-attach. A restarted adapter
+/// never saw the announcements for work still running, and the replayed
+/// history can omit registry-only rows; rows the fold already knows are left
+/// to the item events that follow.
+fn seed_task_inventory(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+) {
+    let (negotiated, msp_sid) = {
+        let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        match map.get(acp_sid) {
+            Some(s) => (s.fold.air_async_tasks, s.msp_sid.clone()),
+            None => return,
+        }
+    };
+    if !negotiated || !host.handshake().at_least(1, 4, 6) {
+        return;
+    }
+    match host.command("task/list", &format!("{{\"sessionId\":{}}}", esc(&msp_sid))) {
+        Ok(result) => {
+            let mut out = Vec::new();
+            let mut seeded = 0usize;
+            {
+                let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                let Some(s) = map.get_mut(acp_sid) else {
+                    return;
+                };
+                let acp_sid = s.acp_sid.clone();
+                if let Some(J::Arr(tasks)) = result.get("tasks") {
+                    for row in tasks {
+                        if s.fold.seed_async_task(&acp_sid, row, &mut out) {
+                            seeded += 1;
+                        }
+                    }
+                }
+            }
+            for line in out {
+                acp::send_raw(stdout, &line);
+            }
+            log(&format!(
+                "task/list seeded {seeded} async task(s) for session {msp_sid}"
+            ));
+        }
+        Err(error) => log(&format!(
+            "task/list failed: {}; keeping the observed async-task set",
+            err_message(&error)
+        )),
     }
 }
 

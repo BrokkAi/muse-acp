@@ -1391,6 +1391,38 @@ fn session_hook_reads_reach_a_real_host_when_negotiated() {
     adapter.finish();
 }
 
+/// Resuming with AIR async tasks negotiated asks the real host for its
+/// authoritative `task/list` inventory. `task/list` arrived in Muse 1.4.6,
+/// so older CI pins skip.
+#[test]
+fn task_list_seeds_the_async_task_inventory_after_resume() {
+    let test = "task_list_seeds_the_async_task_inventory_after_resume";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    let adapter = Adapter::launch_with(
+        &host,
+        json!({"_meta": {"jetbrains": {"air": {"version": 1, "capabilities": ["asyncTasks"]}}}}),
+    );
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 6), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let resume = adapter.request("session/resume", json!({"sessionId": session}));
+    let _ = adapter.result(resume);
+    // A fresh session has no running work, so the host's answer is the empty
+    // inventory; the point is that the authoritative read happens and
+    // settles the resume.
+    let log = std::fs::read_to_string(&adapter.log).unwrap();
+    assert!(
+        log.contains("task/list seeded 0 async task(s)"),
+        "the resume seeds from task/list:\n{log}"
+    );
+    adapter.finish();
+}
+
 /// `_session/sideChat` opens a side chat from a loaded session; the side's
 /// provenance names its source, and it attaches as an ordinary session.
 /// `session/sideChat` arrived in Muse 1.4.4, so older CI pins skip.
