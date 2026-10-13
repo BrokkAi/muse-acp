@@ -27,7 +27,7 @@ To see it working, run the per-issue test command named in each milestone below;
 - [x] (2026-10-12) Issue #214 plugin and marketplace management: merged in PR #235 (opt-in `_session/plugins`, `/plugin install|marketplace` commands, typed refusals, consumed change notices, fake-host plus live 1.4.4/1.4.6 tests, docs).
 - [x] (2026-10-12) Issue #216 computer-use settings and setup: merged in PR #236 (opt-in `_session/computerUse`, `/cua` command family, capability request/grant plumbing, typed `computerUseUnavailable`, consumed setup notices, fake-host plus live-1.4.6 tests, docs).
 - [ ] (2026-10-12) Issue #221 `media/upload`: implemented on `issue-221/media-upload` (resource-link/embedded-blob video entry, 1 MiB aligned chunks with retries and UUIDv7 uploadId, injected uploader callback, video turn part, fake-host plus live-1.4.6 tests, docs), PR and merge pending.
-- [x] (2026-10-13) Re-pinned the vendored corpus to SDK `a0c8611` (Muse 1.4.7): stable manifest and schema bundle, 51 transcripts, `src/compat.rs` compatibility table, `tests/protocol/PROVENANCE.md`, `ROADMAP.md`, and `CHANGELOG.md` (working tree; not yet merged). The new surface is tracked in #240–#243.
+- [x] (2026-10-13) Re-pinned the vendored corpus to SDK `a0c8611` (Muse 1.4.7): stable manifest and schema bundle, 51 transcripts, `src/compat.rs` compatibility table, `tests/protocol/PROVENANCE.md`, `ROADMAP.md`, and `CHANGELOG.md` (PR #244). The new surface is tracked in #240–#243.
 - [ ] Issue #224 remaining 1.4.x field-level and vocabulary additions.
 
 
