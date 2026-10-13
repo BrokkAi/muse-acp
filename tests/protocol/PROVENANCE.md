@@ -1,14 +1,13 @@
 # Vendored Muse MSP conformance corpus
 
 - **Source:** <https://github.com/meta-models/muse-code-sdk>
-- **Upstream revision:** `ea88c8221d381de7cb28281be8bc6b8b1507ba72`
-  ("remirror: 1.4.6 from the internal source tree (tracked internally)",
-  2026-10-11).
-  This revision publishes the Muse 1.4.6 stable surface. Unlike the `bb44be3`
-  (1.4.2) and `537cc8d` (1.4.4) pins, its manifest fingerprint has not been
-  compared against a live `muse serve` binary from this project yet, so the
-  adapter classifies it as degraded rather than tested until a pinned 1.4.6
-  build joins the live-host matrix. Only `schema/msp/` was copied, without
+- **Upstream revision:** `a0c8611b382584eb5091942b477f30e92e1c8d18`
+  ("remirror: 1.4.7 from the internal source tree (tracked internally)",
+  2026-10-13).
+  This revision publishes the Muse 1.4.7 stable surface. Like the `ea88c822`
+  (1.4.6) pin before it, no pinned 1.4.7 build has joined the live-host
+  matrix yet, so the adapter classifies this fingerprint as degraded rather
+  than tested until one does. Only `schema/msp/` was copied, without
   `schema/msp/msp.d.ts`; the revision's `python/`, `clients/`, and `scripts/`
   trees are not vendored.
 - **License:** MIT — see `LICENSE.muse-code-sdk`
