@@ -4,15 +4,15 @@ This is a living roadmap for `muse-acp`. It records the direction that keeps the
 adapter close to Muse Session Protocol (MSP), safe around approvals and file
 access, and useful in real editor workflows.
 
-- **Last revised:** 2026-10-12
+- **Last revised:** 2026-10-13
 - **Original planning baseline:** `v0.2.5`; current release history is in
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
-- **Reference snapshots used for this revision:** Muse SDK `ea88c822`
-  (2026-10-11; stable schema version 1, manifest fingerprint
-  `sha256:eae467ab60cb9a5d5af4de616830f065e59375c987fd59269c8cc33ed2a1137f`,
-  the Muse 1.4.6 stable surface, not yet validated against a live host)
+- **Reference snapshots used for this revision:** Muse SDK `a0c8611`
+  (2026-10-13; stable schema version 1, manifest fingerprint
+  `sha256:6de32db08bbbe0deb478d2bfcaba001e9fb490986bc80db3aceb4d996abf7df9`,
+  the Muse 1.4.7 stable surface, not yet validated against a live host)
   and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
@@ -86,8 +86,9 @@ the verdict into richer support bundles.
   (schema version 1, never live-validated; now unknown); the `a7c10c5` pin
   after it published the 1.3.0-R3401.1 fingerprint below, the `bb44be3`
   pin after that published the 1.4.2 fingerprint, the `537cc8d` pin after
-  that published the live-validated 1.4.4 fingerprint, and the current
-  `ea88c822` pin publishes the 1.4.6 fingerprint. Host 1.2.1 reports
+  that published the live-validated 1.4.4 fingerprint, the `ea88c822` pin
+  after that published the 1.4.6 fingerprint, and the current `a0c8611`
+  pin publishes the 1.4.7 fingerprint. Host 1.2.1 reports
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
   bundle via the binary's own `muse schema` export, plus a live 1.2.1
@@ -124,11 +125,23 @@ the verdict into richer support bundles.
   own schema export, which is identical to the vendored bundle). The SDK's
   `537cc8d` revision publishes exactly this 1.4.4 surface in both its
   top-level schema and its Python tree, with its packages at 1.4.4, and the
-  adapter vendored it. The current `ea88c822` pin publishes the 1.4.6 surface
+  adapter vendored it. The `ea88c822` pin publishes the 1.4.6 surface
   (`sha256:eae467ab60cb9a5d5af4de616830f065e59375c987fd59269c8cc33ed2a1137f`,
-  schema version 1); no live 1.4.6 host has been validated by this project
-  yet, so it classifies as degraded rather than tested until a pinned 1.4.6
-  build joins the live-host matrix. Before it, the Python
+  schema version 1); no live 1.4.6 host has been validated by this project,
+  so it stays degraded. The current `a0c8611` pin publishes the 1.4.7 surface
+  (`sha256:6de32db08bbbe0deb478d2bfcaba001e9fb490986bc80db3aceb4d996abf7df9`,
+  schema version 1): `computerUseSetup/check`, the `computerUseHostSetup`
+  grant with host-level setup reads, the handshake's optional
+  `sandboxAvailability`/`sandboxUnavailableReason` facts, `SessionNameOrigin`
+  on the session snapshot and name-change notification, and `Item.cutOff`
+  for a partial agent message. No pinned 1.4.7 build has joined the live-host
+  matrix yet, so it classifies as degraded rather than tested until one does.
+  A local live run against Muse 1.4.7-R6101.1 (2026-10-13) negotiated this
+  fingerprint, the binary's own `muse schema generate-json-schema` export is
+  byte-identical to the vendored bundle and manifest, and the loopback suite
+  passed 36 of 37 tests; the remaining failure is the open MCP approval-title
+  bug [#239](https://github.com/BrokkAi/muse-acp/issues/239), so the matrix
+  cannot pass until that is fixed. Before 1.4.6, the Python
   tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
   `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
   surface while the top-level schema stayed on 1.3.0-R3401.1. Transcript
@@ -164,7 +177,7 @@ The SDK publishes generated MSP types, a schema bundle, and recorded transcripts
 The Rust adapter should consume those artifacts as conformance inputs.
 
 Status: **emissions validated and permission paths replayed.**
-`tests/protocol/` pins SDK revision `ea88c822` (stable manifest, JSON schema
+`tests/protocol/` pins SDK revision `a0c8611` (stable manifest, JSON schema
 bundle, 51 golden transcripts) with provenance and license. CI now replays
 every server-side item event through the notification fold (unknown kinds must
 tolerate), validates every emitted ACP frame with the adapter's own parser,
@@ -216,7 +229,7 @@ behave differently than on Linux, and 1.4.1 forks fail their boundary check.
 
 **Work items**
 
-- Pin the SDK revision (currently `ea88c822`, 2026-10-11) and vendor
+- Pin the SDK revision (currently `a0c8611`, 2026-10-13) and vendor
   `schema/msp/stable/manifest.json`, `schema/msp/stable/msp.schema.json`, and
   the `schema/msp/transcripts/` corpus under `tests/protocol/`, or fetch that
   locked revision in CI. The corpus already covers approvals, cancellation,
@@ -518,7 +531,7 @@ usable cursor for the unload fold-failure arm.
 
 **Muse Code 1.3.0 stable-surface additions**
 
-The pinned schema bundle (`ea88c822`) includes the Muse 1.3.0 additions, and
+The pinned schema bundle (`a0c8611`) includes the Muse 1.3.0 additions, and
 its notifications are classified in
 [`docs/event-compatibility.md`](docs/event-compatibility.md). This inventory also
 covers the added methods, error kinds, and requests, which that matrix does not
@@ -572,11 +585,11 @@ path, preserving the fail-closed policy from §4.
 
 **Muse 1.4.x stable-surface additions**
 
-Muse 1.4.1 through 1.4.6 grew the stable surface well past 1.3.0. The adapter
+Muse 1.4.1 through 1.4.7 grew the stable surface well past 1.3.0. The adapter
 adopts the parts that fit its ACP mapping (workspace roots, reasoning tiers,
 session delete on the hosts that serve it, `feedback/submit`, and
 `session/list` filters) and records an explicit disposition below for the
-rest, with a tracking issue. The pinned `ea88c822` bundle is the authority.
+rest, with a tracking issue. The pinned `a0c8611` bundle is the authority.
 The rows below record a disposition for the 1.4.x additions the adapter does
 not drive, plus `feedback/submit`, which it does; incoming notifications with
 no adapter arm stay safe because the unknown-method path in the fold logs and
@@ -596,6 +609,7 @@ continues.
 | `computerUseSettings/update` | Mapped to ACP | `/cua set computerControl|screenshots ask|alwaysAllow` and `/cua block|unblock <bundleId>` apply one all-or-nothing patch and render the returned settings. |
 | `computerUseSetup/read` | Mapped to ACP | Read by `_session/computerUse` and `/cua [status]`, which render the setup phase, the three permissions, and any refusal message verbatim. |
 | `computerUseSetup/start` | Mapped to ACP | `/cua on` runs the setup between turns and renders the state it settles in, mirroring the TUI's `/cua on`. |
+| `computerUseSetup/check` | Unsupported pending protocol decision | The host-own setup check reads the three macOS grants and needs the new `computerUseHostSetup` grant, which the adapter does not request yet; tracked in [#240](https://github.com/BrokkAi/muse-acp/issues/240). |
 | `skill/setActivation` | Mapped to ACP | The adapter-local `/skill-activation <selector> on\|userInvocableOnly\|off [scope]` slash command writes one skill's activation and settles on the host ack; the scope defaults to `user` and the closed vocabulary is validated locally. A refused selector keeps the host's typed `skillNotFound` data. |
 | `skill/import` | Mapped to ACP | The adapter-local `/skill-import <claude\|codex> [dry-run] [force]` slash command imports foreign skills and renders the host's receipt (counts plus installed/quarantined/skipped/failed ids) as command text. Imported skills reach the catalog through the host's `skill/changed`; the adapter keeps no local activation or import cache. |
 | `workflow/pause` | Mapped to ACP | The adapter-local `/workflow pause [<runId>]` slash command sends the run's pause and settles on the admission-only ack; the pause folds into the card's title and `_meta.muse.workflow.paused`. A single live run may be implied and a bare `/workflow` lists the live runs. |
@@ -620,7 +634,14 @@ item kind, `mcpLinkError`, `TurnError.quota`, the retry/retraction detail
 fields, the per-session `permissionProfile`, the per-turn `userShell`,
 `SideProvenance`, and the newly required-but-nullable params — are tolerated
 by the fold and tracked in
-[#224](https://github.com/BrokkAi/muse-acp/issues/224).
+[#224](https://github.com/BrokkAi/muse-acp/issues/224). The 1.4.7 additions
+have their own issues: the `InitializeResult` sandbox facts
+(`sandboxAvailability`, `sandboxUnavailableReason`) in
+[#241](https://github.com/BrokkAi/muse-acp/issues/241), `SessionNameOrigin`
+(`Session.nameOrigin`, `SessionNameChangedParams.nameOrigin`) in
+[#242](https://github.com/BrokkAi/muse-acp/issues/242), and the `Item.cutOff`
+partial-message mark in
+[#243](https://github.com/BrokkAi/muse-acp/issues/243).
 
 **Acceptance criteria**
 

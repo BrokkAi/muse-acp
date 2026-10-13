@@ -1,7 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.13.0
 
+- Re-pin the vendored Muse SDK conformance corpus to `a0c8611` (2026-10-13,
+  "remirror: 1.4.7"), which publishes the Muse 1.4.7 stable surface. The
+  corpus keeps its 51 golden transcripts and their recorded frames; 45
+  manifests re-pin only their authoring `fingerprint` field, and the schema
+  grows to 69 methods with 39 notifications unchanged. The schema adds
+  `computerUseSetup/check`, the `computerUseHostSetup` grant with host-level
+  `computerUseSetup/read` and `/start` (an omitted `sessionId` reads or
+  starts the host's own setup), the handshake's optional `sandboxAvailability`
+  and `sandboxUnavailableReason` facts, `SessionNameOrigin` on the session
+  snapshot and name-change notification, and `Item.cutOff` for a partial
+  agent message. No pinned 1.4.7 build has joined the live-host matrix yet,
+  so the new manifest fingerprint still reports `kind=sdk-manifest ...
+  status=degraded` in `--selftest` and startup (a visible warning, never
+  fatal) until one does. A local live run against Muse 1.4.7-R6101.1
+  negotiated the same fingerprint and passed 36 of 37 loopback tests; the
+  remaining failure is the open MCP approval-title bug
+  [#239](https://github.com/BrokkAi/muse-acp/issues/239). The new fields are
+  tolerated by the fold with their own tracking issues
+  ([#241](https://github.com/BrokkAi/muse-acp/issues/241)–[#243](https://github.com/BrokkAi/muse-acp/issues/243)),
+  and the undispositioned `computerUseSetup/check` method is tracked in
+  [#240](https://github.com/BrokkAi/muse-acp/issues/240).
 - Support chunked video uploads. A `resource_link` (or embedded resource
   blob) whose media type is `video/mp4` or `video/quicktime` is read inside
   the approved roots (up to 64 MiB), uploaded to the session's video store
