@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.0
 
 - Re-pin the vendored Muse SDK conformance corpus to `a0c8611` (2026-10-13,
   "remirror: 1.4.7"), which publishes the Muse 1.4.7 stable surface. The
