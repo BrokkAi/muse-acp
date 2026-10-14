@@ -2306,6 +2306,21 @@ fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
                     }
                 }
                 sess.in_flight = kept;
+                // The host lost these turns, so their background checks will
+                // never reach a terminal: close the card and hint with them.
+                let mut checks = Vec::new();
+                for f in &settled {
+                    sess.fold.settle_background_checks(
+                        acp_sid,
+                        Some(&f.msp_turn),
+                        "failed",
+                        true,
+                        &mut checks,
+                    );
+                }
+                for line in checks {
+                    acp::send_raw(stdout, &line);
+                }
                 let rest = sess.in_flight.len();
                 (settled, rest, sess.ver)
             }
@@ -10272,6 +10287,20 @@ fn handle_msp(
                 .map(|s| {
                     if s.active_turn.as_deref() == Some(turn_id) {
                         s.active_turn = None;
+                    }
+                    // The prompt settles here, so its background checks must
+                    // too. Like a superseded reminder, a retract is not a
+                    // failure: settle the card as completed.
+                    let mut checks = Vec::new();
+                    s.fold.settle_background_checks(
+                        &acp_sid,
+                        Some(turn_id),
+                        "completed",
+                        true,
+                        &mut checks,
+                    );
+                    for line in checks {
+                        acp::send_raw(stdout, &line);
                     }
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id)?;
                     let ver = s.ver;

@@ -2881,6 +2881,36 @@ fn turn_foreground_completed_is_consumed_and_the_turn_still_settles() {
 }
 
 #[test]
+fn a_retracted_turn_closes_its_background_checks_before_settling() {
+    let mut c = Client::spawn("foreground_then_retracted", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"cancelled\""),
+        "the retract settles the prompt: {done}"
+    );
+    let log = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    let at = |needle: &str| {
+        log.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {log}"))
+    };
+    let card = at("\"title\":\"Background checks: agent-1\"");
+    let settled = at("\"status\":\"completed\"}");
+    let cleared = at("\"foregroundCompleted\":null");
+    let result = log.rfind(&format!("\"id\":{pid}")).unwrap();
+    assert!(
+        card < settled && settled < cleared && cleared < result,
+        "no open card or hint outlives the prompt: {log}"
+    );
+    c.finish();
+}
+
+#[test]
 fn queued_turns_share_running_until_drained() {
     let mut c = Client::spawn("queued", &[]);
     let sid = c.new_session(2, "");
