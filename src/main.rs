@@ -8469,8 +8469,12 @@ struct ReviewJob {
 
 #[derive(Default)]
 struct ReviewState {
-    /// The memory-only reviewer session, once started.
+    /// The memory-only reviewer session of the active review. Every review
+    /// starts a fresh one, so no review inherits an earlier review's history.
     session: Option<String>,
+    /// Review sessions started on the current reviewer host; the host is
+    /// recycled once this reaches `reviewer::SESSIONS_PER_HOST`.
+    host_sessions: usize,
     /// The job whose reviewer turn is running.
     active: Option<ReviewJob>,
     /// Jobs waiting for the reviewer to finish the current turn.
@@ -8599,7 +8603,7 @@ fn child_of(params: &J) -> Option<String> {
 /// failure to start or describe the review denies that approval: an
 /// unanswered prompt is worse than a visible refusal.
 fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions) {
-    let (job, session, cwd) = {
+    let (job, session, cwd, recycle) = {
         let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
         if st.active.is_some() {
             return;
@@ -8613,8 +8617,17 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
             .get(&job.acp_sid)
             .map(|s| s.cwd.clone())
             .unwrap_or_default();
-        (job, st.session.clone(), cwd)
+        (
+            job,
+            st.session.clone(),
+            cwd,
+            st.host_sessions >= reviewer::SESSIONS_PER_HOST,
+        )
     };
+    if recycle {
+        log("auto-review recycling the reviewer host");
+        reset_reviewer_host(host);
+    }
     let reviewer = match host.reviewer_host() {
         Ok(host) => host,
         Err(error) => {
@@ -8641,10 +8654,9 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
                     Some(sid) => {
                         host.note_owner(sid, HostKind::Reviewer);
                         let sid = sid.to_string();
-                        REVIEW_STATE
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .session = Some(sid.clone());
+                        let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+                        st.session = Some(sid.clone());
+                        st.host_sessions += 1;
                         sid
                     }
                     None => {
@@ -8716,10 +8728,9 @@ fn reset_reviewer_host(host: &Arc<Hosts>) {
         reviewer.shutdown();
     }
     host.clear_reviewer();
-    REVIEW_STATE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .session = None;
+    let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+    st.session = None;
+    st.host_sessions = 0;
 }
 
 /// Deny one job with the host's own reject choice, carrying the reviewer's
@@ -8813,14 +8824,39 @@ fn finish_review(
                 deny_review_job(host, stdout, sessions, job, &assessment.rationale)
             }
         },
-        None => deny_review_job(
-            host,
-            stdout,
-            sessions,
-            job,
-            "auto-review returned no usable decision",
-        ),
+        None => {
+            log(&format!(
+                "auto-review reply for {} was unusable: {:?}",
+                job.approval_id,
+                reviewer::excerpt(text)
+            ));
+            deny_review_job(
+                host,
+                stdout,
+                sessions,
+                job,
+                reviewer::unusable_reply_rationale(text),
+            );
+            reset_reviewer_host(host);
+        }
     }
+    start_next_review(host, stdout, sessions);
+}
+
+/// Deny a review whose reviewer turn ended `failed` or `cancelled`, naming the
+/// host's failure instead of reporting the empty reply as unusable, and reset
+/// the reviewer host before the next review.
+fn fail_review_turn(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    job: ReviewJob,
+    terminal: &str,
+    params: &J,
+) {
+    let rationale = reviewer::failed_turn_rationale(terminal, params);
+    deny_review_job(host, stdout, sessions, job, &rationale);
+    reset_reviewer_host(host);
     start_next_review(host, stdout, sessions);
 }
 
@@ -8869,7 +8905,9 @@ fn handle_review_event(
     {
         let st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
         if st.session.as_deref() != Some(sid) {
-            return false;
+            // A finished review's session: drop its late events rather than
+            // letting them reach the user-session handlers.
+            return host.known_owner(sid) == Some(HostKind::Reviewer);
         }
     }
     match method {
@@ -8900,16 +8938,25 @@ fn handle_review_event(
         }
         "turn/completed" => {
             let turn = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+            let terminal = params
+                .get("terminal")
+                .and_then(|v| v.as_str())
+                .unwrap_or("completed");
             let (job, text) = {
                 let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
                 if !st.turn.is_empty() && !turn.is_empty() && st.turn != turn {
                     return true;
                 }
                 st.deadline = None;
+                st.session = None;
                 (st.active.take(), std::mem::take(&mut st.text))
             };
             if let Some(job) = job {
-                finish_review(host, stdout, sessions, job, &text);
+                if terminal == "completed" {
+                    finish_review(host, stdout, sessions, job, &text);
+                } else {
+                    fail_review_turn(host, stdout, sessions, job, terminal, params);
+                }
             }
         }
         "approval/requested" | "approval/request" | "approval/updated" => {

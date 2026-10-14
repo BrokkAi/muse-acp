@@ -12,6 +12,11 @@ use std::time::Duration;
 /// Codex allows each review `REVIEW_TIMEOUT` before timing out the approval.
 pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(90);
 
+/// Recycle the reviewer host after this many review sessions. Each review runs
+/// in a fresh session so no review inherits an earlier review's history, and
+/// MSP has no call that drops a session from a memory-only host.
+pub const SESSIONS_PER_HOST: usize = 32;
+
 /// Resolve a review timeout from an optional environment override
 /// (`MUSE_REVIEW_TIMEOUT_MS`, milliseconds) and the Codex default.
 pub fn resolve_review_timeout(env_override: Option<&str>) -> Duration {
@@ -183,6 +188,57 @@ pub fn parse_assessment(text: &str) -> Option<Assessment> {
     })
 }
 
+/// Describe a reviewer turn that ended without completing, from the
+/// `turn/completed` params: the typed `error` when present, else the host's
+/// free-text `reason` (a synthesized host-death terminal carries only that).
+pub fn failed_turn_rationale(terminal: &str, params: &crate::json::J) -> String {
+    let error = params.get("error");
+    let kind = error
+        .and_then(|e| e.get("kind"))
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty());
+    let message = error
+        .and_then(|e| e.get("message"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            params
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+        });
+    let detail = match (kind, message) {
+        (Some(kind), Some(message)) => format!("{kind}: {message}"),
+        (Some(kind), None) => kind.to_string(),
+        (None, Some(message)) => message.to_string(),
+        (None, None) => "no reason given".to_string(),
+    };
+    format!("reviewer turn {terminal}: {}", excerpt(&detail))
+}
+
+/// Explain an unusable reviewer reply without echoing it as feedback.
+pub fn unusable_reply_rationale(text: &str) -> &'static str {
+    if text.trim().is_empty() {
+        "auto-review returned no usable decision: the reviewer reply was empty"
+    } else {
+        "auto-review returned no usable decision: the reviewer reply was not a JSON decision"
+    }
+}
+
+/// A short, single-line excerpt of reviewer text for the stderr log.
+pub fn excerpt(text: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= MAX_CHARS {
+        return flat;
+    }
+    let mut cut: String = flat.chars().take(MAX_CHARS).collect();
+    cut.push('…');
+    cut
+}
+
 /// Re-derive the outcome from the risk and authorization thresholds so a
 /// model that says "allow" for a critical action cannot override the policy.
 pub fn effective_outcome(assessment: &Assessment) -> Outcome {
@@ -236,6 +292,40 @@ mod tests {
 
         assert!(parse_assessment("no json here").is_none());
         assert!(parse_assessment("{\"outcome\":\"maybe\"}").is_none());
+    }
+
+    #[test]
+    fn failed_turns_name_the_host_failure() {
+        let parse = |raw: &str| crate::json::parse_json(raw).expect("params");
+        assert_eq!(
+            failed_turn_rationale(
+                "failed",
+                &parse(
+                    r#"{"terminal":"failed","error":{"kind":"contextWindowExceeded","message":"prompt is too long","retryable":false}}"#
+                )
+            ),
+            "reviewer turn failed: contextWindowExceeded: prompt is too long"
+        );
+        assert_eq!(
+            failed_turn_rationale(
+                "failed",
+                &parse(r#"{"terminal":"failed","reason":"host exited"}"#)
+            ),
+            "reviewer turn failed: host exited"
+        );
+        assert_eq!(
+            failed_turn_rationale("cancelled", &parse(r#"{"terminal":"cancelled"}"#)),
+            "reviewer turn cancelled: no reason given"
+        );
+    }
+
+    #[test]
+    fn unusable_replies_say_whether_the_reviewer_answered() {
+        assert!(unusable_reply_rationale("  \n").ends_with("the reviewer reply was empty"));
+        assert!(unusable_reply_rationale("I need approval").ends_with("not a JSON decision"));
+        assert_eq!(excerpt("a\n  b\tc"), "a b c");
+        let long = "x".repeat(500);
+        assert_eq!(excerpt(&long).chars().count(), 241);
     }
 
     #[test]

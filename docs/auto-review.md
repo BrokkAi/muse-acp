@@ -45,7 +45,14 @@ medium or high authorization; low and medium allow.
 - Deny: the adapter answers with the host's reject choice and passes the
   rationale as feedback when the host accepts feedback.
 - Reviewer failure or unusable output: deny. The action does not run, and the
-  reason is logged.
+  reason is logged. A reviewer turn that fails denies with the host's error,
+  for example `reviewer turn failed: contextWindowExceeded: prompt is too
+  long`. An unusable reply says whether the reply was empty and logs a short
+  excerpt. Either way the adapter resets the reviewer host before the next
+  review.
+- Each review runs in a fresh reviewer session, so no review inherits an
+  earlier review's history. The adapter restarts the reviewer host every 32
+  reviews.
 - Reviewer timeout: a review whose turn never ends is denied after 90 seconds
   (Codex's guardian review timeout, overridable with `MUSE_REVIEW_TIMEOUT_MS`).
   The adapter logs the timeout, denies with a
