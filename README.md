@@ -231,7 +231,7 @@ variable. See [Auto-review](#auto-review-keep-the-boundary-lose-the-busywork).
 | `MUSE_SHUTDOWN_TIMEOUT_MS` | `8000` | Shutdown deadline, 100–60000 ms. |
 | `MUSE_TOOL_OUTPUT_LIMIT` | `8000` | Editor-facing tool output bound, in characters (minimum 200). |
 | `MUSE_LOG` | `normal` | Set to `debug` for per-method protocol tracing (no payloads). |
-| `MUSE_SHOW_REMINDERS` | off | Set to `1`, `true`, `yes`, or `on` to render background reminder checks as transcript cards. |
+| `MUSE_SHOW_REMINDERS` | off | Set to `1`, `true`, `yes`, or `on` to render each background reminder check as its own transcript card instead of one `Background checks` card. |
 | `MUSE_ALLOW_UNSCOPED_READS` | off | **Dangerous.** Set to `1`, `true`, `yes`, or `on` to allow local reads outside the approved workspace roots. |
 
 Without `MUSE_COMMAND_TIMEOUT_MS`, admission deadlines are 30 seconds for the
@@ -407,6 +407,12 @@ error the editor shows if Muse then refuses the profile says why.
   session cost that on Muse 1.4.2+ is Muse's own figure (with its partial
   flag) and otherwise is a client-local list-price estimate explicitly
   labeled as not a billing figure.
+- **Background checks** — when the answer is done but Muse's reminder agents
+  still hold the turn open (`turn/foregroundCompleted`), the prompt stays
+  pending until `turn/completed`, as the Muse SDK requires. Meanwhile the
+  editor gets `session_info_update._meta.muse.foregroundCompleted` (`turnId`,
+  `blockingAgents`) and an in-progress `Background checks: <agents>` card.
+  Both clear before the prompt result.
 - **Feedback** — `/feedback [bug|bad|good|other] <note>` sends feedback about
   Muse through the host's `feedback/submit` when Muse grants the capability.
   With form elicitation, one form collects the classification, the note, and

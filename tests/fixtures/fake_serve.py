@@ -31,6 +31,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   retry_then_completed turn/retryScheduled, then a normal completion
   foreground_then_completed turn/foregroundCompleted (background checks hold
                         the turn open), then a normal completion
+  foreground_then_retracted turn/foregroundCompleted, then turn/retracted
   deferred_launch_error queued admission followed by a launchError terminal
   quiet        turn/start answers only; nothing follows (for close/cancel)
   subagent_control live native child; FAKE_SUBAGENT_CONTROL_STATUS selects its state
@@ -1074,6 +1075,13 @@ def on_turn_start(params):
                                             "viewCursor": "cur-fg",
                                             "sourceRange": {"start": 0, "end": 1}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "foreground_then_retracted":
+        # A retract settles the prompt while background checks hold the turn.
+        notify("turn/foregroundCompleted", {**base,
+                                            "blockingAgents": ["agent-1"],
+                                            "viewCursor": "cur-fg",
+                                            "sourceRange": {"start": 0, "end": 1}})
+        notify("turn/retracted", {**base, "commandId": params.get("commandId", "")})
     elif SCENARIO == "usage":
         # A tokenUsage before any contextUsage has no used/size pair and
         # must be held back, not emitted with nulls.
