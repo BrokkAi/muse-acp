@@ -4,12 +4,11 @@
 - **Upstream revision:** `a0c8611b382584eb5091942b477f30e92e1c8d18`
   ("remirror: 1.4.7 from the internal source tree (tracked internally)",
   2026-10-13).
-  This revision publishes the Muse 1.4.7 stable surface. Like the `ea88c822`
-  (1.4.6) pin before it, no pinned 1.4.7 build has joined the live-host
-  matrix yet, so the adapter classifies this fingerprint as degraded rather
-  than tested until one does. Only `schema/msp/` was copied, without
-  `schema/msp/msp.d.ts`; the revision's `python/`, `clients/`, and `scripts/`
-  trees are not vendored.
+  This revision publishes the Muse 1.4.7 stable surface. The pinned 1.4.7
+  build in the live-host matrix reports the same fingerprint byte-for-byte,
+  so the adapter classifies this surface as tested. Only `schema/msp/` was
+  copied, without `schema/msp/msp.d.ts`; the revision's `python/`,
+  `clients/`, and `scripts/` trees are not vendored.
 - **License:** MIT — see `LICENSE.muse-code-sdk`
 - **Contents:**
   - `stable/manifest.json` — schema version + stable-surface fingerprint

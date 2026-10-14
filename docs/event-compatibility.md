@@ -77,6 +77,7 @@ errors, and deliberate omissions.
 | MSP notification | Disposition | ACP behavior |
 | --- | --- | --- |
 | `mcpServer/oauthLoginCompleted` | Intentionally ignored | The terminal of an MCP OAuth login, sent to every experimental connection. The adapter never starts such a login, so it logs the server name and outcome (never the free-text message) and sends nothing to the editor. |
+| `turn/modelRetryScheduled` | Intentionally ignored | Muse 1.4.8's model-retry notice, distinct from the `turn/retryScheduled` attempt/backoff notice the adapter consumes. No ACP mapping; it takes the unhandled-notification path, which logs a diagnostic. |
 
 ## Server-initiated requests
 

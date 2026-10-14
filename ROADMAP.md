@@ -127,22 +127,26 @@ the verdict into richer support bundles.
   top-level schema and its Python tree, with its packages at 1.4.4, and the
   adapter vendored it. The `ea88c822` pin publishes the 1.4.6 surface
   (`sha256:eae467ab60cb9a5d5af4de616830f065e59375c987fd59269c8cc33ed2a1137f`,
-  schema version 1); no live 1.4.6 host has been validated by this project,
-  so it stays degraded. The current `a0c8611` pin publishes the 1.4.7 surface
+  schema version 1), and Muse 1.4.6-R6000.1 reports the same digest in its own
+  published download manifest. The `a0c8611` pin publishes the 1.4.7 surface
   (`sha256:6de32db08bbbe0deb478d2bfcaba001e9fb490986bc80db3aceb4d996abf7df9`,
   schema version 1): `computerUseSetup/check`, the `computerUseHostSetup`
   grant with host-level setup reads, the handshake's optional
   `sandboxAvailability`/`sandboxUnavailableReason` facts, `SessionNameOrigin`
   on the session snapshot and name-change notification, and `Item.cutOff`
-  for a partial agent message. No pinned 1.4.7 build has joined the live-host
-  matrix yet, so it classifies as degraded rather than tested until one does.
-  A local live run against Muse 1.4.7-R6101.1 (2026-10-13) negotiated this
-  fingerprint, the binary's own `muse schema generate-json-schema` export is
-  byte-identical to the vendored bundle and manifest, and the loopback suite
-  passed 36 of 37 tests; the remaining failure is the open MCP approval-title
-  bug [#239](https://github.com/BrokkAi/muse-acp/issues/239), so the matrix
-  cannot pass until that is fixed. Before 1.4.6, the Python
-  tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
+  for a partial agent message. Muse 1.4.7-R6101.1 reports that fingerprint
+  byte-for-byte, and the pin's own `muse schema generate-json-schema` export
+  is identical to the vendored bundle and manifest, so the vendored corpus is
+  live-validated rather than degraded. Muse 1.4.8-R6256.1 reports
+  `sha256:4e3200c3c9dc0cd7919d11022630d43f9bc1c5cdda375381e90b0183b5665069`
+  (schema version 1), a surface newer than the vendored corpus: its
+  `muse schema generate-json-schema` export is purely additive over the 1.4.7
+  bundle (`turn/modelRetryScheduled`, the computer-use app and app-patch
+  vocabulary, `Item.messagePhase` and the monitor fields,
+  `Session.generatedName`, `permissionProfile` on resume, and a skill-catalog
+  title), with nothing removed or newly required. All three builds are pinned
+  in the live-host matrix, so their fingerprints classify as tested. Before
+  1.4.6, the Python tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
   `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
   surface while the top-level schema stayed on 1.3.0-R3401.1. Transcript
   fixtures intentionally carry their own
@@ -200,7 +204,8 @@ session, fork with its source history, `/compact` (declined on a short
 session), `/goal`, `write_todos` as an editor plan, the AIR file-change
 report, editor MCP forwarding, the `userInput` form, and a saved
 `:auto-review` profile. Still to come (#176): subagent spawn, since Muse
-offers no subagent tool to a model it does not know.
+offers no subagent tool to a model it does not know. The pinned builds now
+span 1.3.0, 1.4.1 through 1.4.4, and 1.4.6 through 1.4.8.
 
 The 1.4.2 re-pin is adopted: the live suite now also covers ACP
 `session/delete` against a session this run created, the ownership refusal
@@ -217,6 +222,21 @@ refuses it while keeping the session. Its `--disable-write` host also no
 longer offers write tools at all (through 1.4.2 it offered them and denied
 the call), so the read-only and Plan tests accept either refusal.
 
+Muse 1.4.6, 1.4.7, and 1.4.8 join the matrix too: 1.4.6-R6000.1,
+1.4.7-R6101.1, and 1.4.8-R6256.1 each run on Linux x86-64 and on Windows x64
+for the workspace-root flows, and 1.4.8 takes over from 1.4.4 as the newest
+build that also runs on macOS arm64. Every checksum is the value in the
+release's own published download manifest. The newer surfaces also added two
+host details the suite had to absorb: Muse omits the top-level `toolName` for
+MCP tool approvals and carries it only as `subject.toolName`, which is the
+approval-title fix for
+[#239](https://github.com/BrokkAi/muse-acp/issues/239), and Muse 1.4.8
+refuses a `workflow/resume` whose `name` differs from the recorded run
+(`workflow_name_conflict`), so the loopback provider resumes a run without
+inventing a name instead of renaming it. Local runs against the installed
+1.4.8 and the cached 1.4.7 binary exercised the full suite; with those two
+fixes in place the tests that failed on the new surfaces pass against both.
+
 Windows x64 legs pin the same builds and run the workspace-root flows only:
 multi-root `session/start`, and the sticky `turn/start` replacement after a
 mode change and a load/re-attach, which together carry the Win32 verbatim
@@ -226,6 +246,8 @@ hosts accept it, so the adapter does not version-gate it. The same run met
 Windows host-platform gaps outside those flows: 1.4.1/1.4.2 answer
 `session/delete` with `UnsupportedPlatform`, the bash-based shell tests
 behave differently than on Linux, and 1.4.1 forks fail their boundary check.
+The 1.4.6, 1.4.7, and 1.4.8 legs have not run on a Windows host yet, so CI is
+their first Windows evidence.
 
 **Work items**
 
@@ -585,11 +607,19 @@ path, preserving the fail-closed policy from §4.
 
 **Muse 1.4.x stable-surface additions**
 
-Muse 1.4.1 through 1.4.7 grew the stable surface well past 1.3.0. The adapter
+Muse 1.4.1 through 1.4.8 grew the stable surface well past 1.3.0. The adapter
 adopts the parts that fit its ACP mapping (workspace roots, reasoning tiers,
 session delete on the hosts that serve it, `feedback/submit`, and
 `session/list` filters) and records an explicit disposition below for the
-rest, with a tracking issue. The pinned `a0c8611` bundle is the authority.
+rest, with a tracking issue. The pinned `a0c8611` bundle is the authority
+through 1.4.7. The additions a live 1.4.8 reports beyond it
+(`turn/modelRetryScheduled`, the computer-use app and app-patch vocabulary,
+`Item.messagePhase` and the monitor fields, `Session.generatedName`, and
+`permissionProfile` on resume) have no disposition rows yet: they ride the
+tolerant paths (unknown fields and notifications are ignored or passed
+through verbatim, and the computer-use views return the host's settings
+unchanged). `turn/modelRetryScheduled` is recorded in the
+[event matrix](docs/event-compatibility.md#host-emitted-extensions).
 The rows below record a disposition for the 1.4.x additions the adapter does
 not drive, plus `feedback/submit`, which it does; incoming notifications with
 no adapter arm stay safe because the unknown-method path in the fold logs and

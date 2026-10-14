@@ -127,11 +127,17 @@ def reply_for(request):
                 if found:
                     handoff[key] = found.group(1)
         if "scriptPath" in handoff and "resumeFromRunId" in handoff:
-            return {"tool": {"name": "workflow", "arguments": {
-                "name": handoff.get("name", "resumed"),
+            # Muse 1.4.8 refuses a resume whose `name` differs from the
+            # recorded run (`workflow_name_conflict`), and its receipt does
+            # not repeat the name, so send one only when the handoff carried
+            # it: the host keeps the recorded name otherwise.
+            arguments = {
                 "scriptPath": handoff["scriptPath"],
                 "resumeFromRunId": handoff["resumeFromRunId"],
-            }}}
+            }
+            if "name" in handoff:
+                arguments["name"] = handoff["name"]
+            return {"tool": {"name": "workflow", "arguments": arguments}}
     marker = re.search(r"\[\[script:([\w-]+)\]\]", prompt_text)
     if marker and marker.group(1) in SCRIPT:
         return SCRIPT[marker.group(1)]
