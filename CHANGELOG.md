@@ -15,10 +15,10 @@
   resume permission-profile pick (`SessionResumeParams.permissionProfile`),
   the skill's declared `title` (`SkillCatalogEntry.title`), the
   `turn/modelRetryScheduled` notification, and the `sessionRename` capability.
-  No pinned 1.4.8 build has joined the live-host matrix yet, so the
-  fingerprint classifies as degraded (a visible warning that is not fatal)
-  until one does; an installed Muse 1.4.8 exports a schema bundle and
-  manifest byte-identical to the vendored copy. The event matrix files the new
+  The 1.4.8 build pinned below joins the live-host matrix in the same release,
+  so the fingerprint classifies as tested rather than degraded; an installed
+  Muse 1.4.8 exports a schema bundle and manifest byte-identical to the
+  vendored copy. The event matrix files the new
   `turn/modelRetryScheduled` notification as `Intentionally ignored` (it takes
   the unknown-notification diagnostic path and never settles a prompt). Each
   new surface the adapter does not drive has a tracking issue, #253 through
@@ -53,6 +53,24 @@
   selected option, and RPC error for every fallback deny. Previously these
   fail-closed paths left only Muse's generic "approval aborted" tool result
   visible in the editor.
+
+- Pin the Muse 1.4.6, 1.4.7, and 1.4.8 builds in the live-host matrix. The
+  matrix had stopped at 1.4.4, so three published releases were never run
+  against the adapter: 1.4.6-R6000.1, 1.4.7-R6101.1, and 1.4.8-R6256.1 each
+  now run the loopback suite on Linux x86-64 and the workspace-root flows on
+  Windows x64, and 1.4.8 replaces 1.4.4 as the newest pin that also runs on
+  macOS arm64. Every checksum, and every recorded fingerprint, is the value
+  in that release's own published download manifest. The compatibility table
+  moves all three surfaces to tested: 1.4.6's is the surface the `ea88c822`
+  SDK pin published, 1.4.7's is the retired `a0c8611` pin's surface, and
+  1.4.8's is byte-for-byte the vendored `838d36a` corpus, so the corpus is
+  live-validated instead of degraded. Two host details only the newer pins
+  meet:
+  Muse omits the top-level `toolName` for MCP tool approvals and carries it
+  only as `subject.toolName` (#239), and Muse 1.4.8 refuses a
+  `workflow/resume` that renames the run (`workflow_name_conflict`), so the
+  loopback provider now resumes without inventing a name. Local runs of the
+  full suite pass 37 of 37 tests against all three builds.
 
 - Tell the editor when a turn's answer is done but Muse's background reminder
   checks still hold it open (#247). Muse 1.4.6+ sends

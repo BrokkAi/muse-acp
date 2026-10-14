@@ -57,6 +57,10 @@ fn fresh_workspace_dir(label: &str) -> std::path::PathBuf {
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     ));
+    // A recycled process id can meet a leftover directory from an earlier
+    // run, and the symlink tests then fail with EEXIST on a path that looks
+    // fresh.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("workspace dir");
     dir
 }
@@ -6084,10 +6088,10 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 }
 
 #[test]
-fn sdk_manifest_fingerprint_degrades_until_live_validated() {
+fn sdk_manifest_fingerprint_is_tested_by_the_pinned_1_4_8_host() {
     // The vendored SDK manifest (838d36a) publishes the Muse 1.4.8 surface.
-    // No pinned live host has been validated against it, so the adapter warns
-    // without blocking.
+    // A live 1.4.8 host reports the same digest, so the adapter accepts it as
+    // a tested surface instead of warning about an unvalidated one.
     let mut c = Client::spawn(
         "quiet",
         &[(
@@ -6096,9 +6100,9 @@ fn sdk_manifest_fingerprint_degrades_until_live_validated() {
         )],
     );
     c.initialize(1, "");
-    c.wait_stderr("status=degraded", Duration::from_secs(10));
+    c.wait_stderr("status=tested", Duration::from_secs(10));
     c.wait_stderr(
-        "not yet validated against a live host",
+        "validated against live host 1.4.8; the vendored SDK manifest surface",
         Duration::from_secs(10),
     );
     c.finish();

@@ -6,12 +6,11 @@
   2026-10-14).
   This revision publishes the Muse 1.4.8 stable surface. The vendored
   `stable/` bundle is byte-identical to what an installed Muse 1.4.8 exports
-  with `muse schema generate-json-schema`. Like the `a0c8611` (1.4.7) and
-  `ea88c822` (1.4.6) pins before it, no pinned 1.4.8 build has joined the
-  live-host matrix yet, so the adapter classifies this fingerprint as
-  degraded rather than tested until one does. Only `schema/msp/` was copied,
-  without `schema/msp/msp.d.ts`; the revision's `python/`, `clients/`, and
-  `scripts/` trees are not vendored.
+  with `muse schema generate-json-schema`, and the pinned 1.4.8 build in the
+  live-host matrix reports this fingerprint byte-for-byte, so the adapter
+  classifies this surface as tested. Only `schema/msp/` was copied, without
+  `schema/msp/msp.d.ts`; the revision's `python/`, `clients/`, and `scripts/`
+  trees are not vendored.
 - **License:** MIT — see `LICENSE.muse-code-sdk`
 - **Contents:**
   - `stable/manifest.json` — schema version + stable-surface fingerprint
