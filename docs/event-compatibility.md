@@ -54,6 +54,7 @@ are emitted by the MSP host.
 | `skill/changed` | Mapped to ACP | Refreshes `skill/list` and the ACP available-command catalog. |
 | `turn/completed` | Mapped to ACP | Settles the matching ACP prompt, reports its stop reason and per-turn usage, and moves ACP v2 to idle when no work remains. Failures also receive host detail. |
 | `turn/foregroundCompleted` | Mapped to ACP | Explicitly non-terminal: foreground work is done while background reminder checks hold the turn open, so the ACP prompt stays open until `turn/completed` / `turn/unqueued`. The adapter sends the SDK fold's renderer hint as `session_info_update._meta.muse.foregroundCompleted` (`turnId`, `blockingAgents`) plus one in-progress `Background checks: <agents>` card (per-agent cards instead with `MUSE_SHOW_REMINDERS`); both clear at the turn's terminal, before the prompt settles. A notice for a turn that already ended is ignored. Agent ids, never display names, are also logged. |
+| `turn/modelRetryScheduled` | Intentionally ignored | A durable, non-terminal mid-turn model-retry observation (attempt/next/max, scheduled backoff, failing kind) the adapter does not surface yet; an inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt. Its sibling `turn/retryScheduled` is consumed; adopting this one is tracked in [#259](https://github.com/BrokkAi/muse-acp/issues/259). |
 | `turn/retracted` | Mapped to ACP | Removes the retracted turn from tracked work and settles its ACP prompt as cancelled. |
 | `turn/retryScheduled` | Consumed | Records attempt and backoff facts in diagnostics. It remains non-terminal and never settles the ACP prompt. |
 | `turn/started` | Internally tracked | Marks the active MSP turn so steering, cancellation, and reconciliation target the running work. |
@@ -77,7 +78,6 @@ errors, and deliberate omissions.
 | MSP notification | Disposition | ACP behavior |
 | --- | --- | --- |
 | `mcpServer/oauthLoginCompleted` | Intentionally ignored | The terminal of an MCP OAuth login, sent to every experimental connection. The adapter never starts such a login, so it logs the server name and outcome (never the free-text message) and sends nothing to the editor. |
-| `turn/modelRetryScheduled` | Intentionally ignored | Muse 1.4.8's model-retry notice, distinct from the `turn/retryScheduled` attempt/backoff notice the adapter consumes. No ACP mapping; it takes the unhandled-notification path, which logs a diagnostic. |
 
 ## Server-initiated requests
 
