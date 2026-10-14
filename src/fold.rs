@@ -48,7 +48,7 @@ fn trunc(s: &str) -> (String, Option<String>) {
     (format!("{}{MARKER}{}", &s[..head], &s[tail..]), Some(meta))
 }
 
-fn tool_kind(tool: &str) -> &'static str {
+pub(crate) fn tool_kind(tool: &str) -> &'static str {
     let t = tool.to_lowercase();
     if t.contains("read") || t.contains("list") || t.contains("cat") {
         "read"
@@ -521,6 +521,15 @@ impl SessionFold {
 
     pub fn has_active_item(&self, item_id: &str) -> bool {
         self.items.contains_key(item_id)
+    }
+
+    /// The ACP tool-call id already assigned to a toolCall item, so an
+    /// approval for it can point at the same card.
+    pub fn tool_call_id(&self, item_id: &str) -> Option<&str> {
+        match self.items.get(item_id) {
+            Some(ItemRole::Tool { tc_id, .. }) => Some(tc_id),
+            _ => None,
+        }
     }
 
     /// Whether work this session started may still run on its host after the

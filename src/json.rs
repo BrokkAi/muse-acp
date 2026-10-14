@@ -24,6 +24,12 @@ impl J {
     pub fn as_str(&self) -> Option<&str> {
         if let J::Str(s) = self { Some(s) } else { None }
     }
+    /// The string field `key`, treating an empty string as absent.
+    pub fn non_empty_str(&self, key: &str) -> Option<&str> {
+        self.get(key)
+            .and_then(J::as_str)
+            .filter(|value| !value.is_empty())
+    }
     pub fn as_u64(&self) -> Option<u64> {
         if let J::Num(n) = self {
             n.parse().ok()
