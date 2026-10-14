@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Stop a resumed session from reopening approvals that were already decided
+  (#238). Muse's pending list can still include approvals that durable history
+  resolved; the adapter showed them again, deciding them failed with
+  `approval <id> is already resolved`, and the stale prompt blocked every
+  follow-up prompt. A reattached session now reads its history once, when its
+  first approval arrives, and drops any approval history already resolved,
+  whether it comes from the pending list, a reissued request, or a live event.
+  An approval resolved elsewhere while queued for Auto-review is no longer
+  reviewed.
+
 - Fix MCP tool approvals from Muse 1.4.6+ showing as `Muse action` with a
   stray pending tool card (#239). These approvals carry no top-level
   `toolName` or `toolCallId`; the tool name is only on the subject. The

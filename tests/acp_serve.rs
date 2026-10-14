@@ -1751,6 +1751,46 @@ fn auto_review_names_a_failed_reviewer_turn() {
 }
 
 #[test]
+fn auto_review_skips_a_queued_approval_resolved_elsewhere() {
+    // The second approval waits behind a hung review and is resolved by
+    // policy meanwhile; the reviewer must never decide it.
+    let mut c = Client::spawn(
+        "approval_queue",
+        &[
+            ("FAKE_RESOLVE_SECOND", "1"),
+            ("FAKE_REVIEW_HANG", "1"),
+            ("MUSE_REVIEW_TIMEOUT_MS", "1000"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "do the thing");
+    c.wait_stderr(
+        "auto-review dropped queued approval-second: resolved elsewhere",
+        Duration::from_secs(15),
+    );
+    c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
+    std::thread::sleep(Duration::from_millis(500));
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    let reviews = input
+        .lines()
+        .filter(|line| line.contains("You are judging one planned coding-agent action"))
+        .count();
+    assert_eq!(reviews, 1, "only the first approval is reviewed: {input}");
+    assert!(
+        !input
+            .lines()
+            .any(|line| line.contains("\"approvalId\": \"approval-second\"")),
+        "a resolved approval is never decided: {input}"
+    );
+    c.finish();
+}
+
+#[test]
 fn auto_review_starts_a_fresh_reviewer_session_per_review() {
     // A reused reviewer session accumulates every earlier review prompt until
     // the provider rejects it, after which every approval is denied.
@@ -7485,6 +7525,127 @@ fn resume_reconciliation_does_not_duplicate_displayed_approval() {
         frames.matches("session/request_permission").count(),
         1,
         "duplicate permission presentation: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn resume_does_not_reopen_resolved_approvals() {
+    // Issue #238: the host's pending projection includes an approval that
+    // durable history already resolved. Reattach must present only the
+    // distinct genuine approval, never the terminal ghost.
+    let mut c = Client::spawn("resolved_ghost", &[]);
+    let sid = c.new_session(1, "");
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "resume failed: {frame}");
+
+    let perm = c.wait_for("session/request_permission", Duration::from_secs(15));
+    assert!(
+        perm.contains("call-live"),
+        "genuine approval missing: {perm}"
+    );
+    c.wait_stderr(
+        "pending reconciliation: 1 approval(s), 0 user input(s) presented",
+        Duration::from_secs(10),
+    );
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("call-stale"),
+        "resolved approval was reopened: {frames}"
+    );
+    assert_eq!(
+        frames.matches("session/request_permission").count(),
+        1,
+        "expected exactly one permission presentation: {frames}"
+    );
+    // Reading history is a log-fold query: it must not mint admission
+    // records in the log it reads. (The resume usage fallback makes its own
+    // single backward read, with a commandId.)
+    c.wait_stderr(
+        "resolved-approval history: 1 resolved approval(s) in 2 page(s)",
+        Duration::from_secs(10),
+    );
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    let continued = input
+        .lines()
+        .find(|line| line.contains("\"cursor\": \"cur-ghost-1\""))
+        .unwrap_or_else(|| panic!("second history page requested: {input}"));
+    assert!(
+        !continued.contains("commandId"),
+        "history reads carry no commandId: {continued}"
+    );
+    c.finish();
+}
+
+#[test]
+fn resume_finds_a_resolved_approval_deep_in_history() {
+    // The terminal record sits past 100 backward pages; a page cap would
+    // miss it and reopen the ghost.
+    let mut c = Client::spawn("resolved_ghost", &[("FAKE_GHOST_PAGES", "150")]);
+    let sid = c.new_session(1, "");
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "resume failed: {frame}");
+    let perm = c.wait_for("session/request_permission", Duration::from_secs(15));
+    assert!(
+        perm.contains("call-live"),
+        "genuine approval missing: {perm}"
+    );
+    c.wait_stderr(
+        "resolved-approval history: 1 resolved approval(s) in 151 page(s)",
+        Duration::from_secs(10),
+    );
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("call-stale"),
+        "resolved approval was reopened: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn a_reissued_resolved_approval_after_resume_stays_closed() {
+    // Nothing is pending at reattach, so no history is read then. The host
+    // later reissues the resolved approval; history is read on that first
+    // approval and the ghost is dropped.
+    let mut c = Client::spawn("resolved_ghost", &[("FAKE_GHOST_REISSUE", "1")]);
+    let sid = c.new_session(1, "");
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "resume failed: {frame}");
+    std::thread::sleep(Duration::from_millis(300));
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        !stderr.contains("resolved-approval history"),
+        "no history read while nothing is pending: {stderr}"
+    );
+    let _pid = c.prompt(&sid, "do it");
+    let perm = c.wait_for("session/request_permission", Duration::from_secs(15));
+    assert!(
+        perm.contains("call-live"),
+        "genuine approval missing: {perm}"
+    );
+    c.wait_stderr(
+        "approval ap-stale dropped: already resolved",
+        Duration::from_secs(10),
+    );
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("call-stale"),
+        "resolved approval was reopened: {frames}"
     );
     c.finish();
 }
