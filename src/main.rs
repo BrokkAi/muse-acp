@@ -8472,9 +8472,10 @@ struct ReviewState {
     /// The memory-only reviewer session of the active review. Every review
     /// starts a fresh one, so no review inherits an earlier review's history.
     session: Option<String>,
-    /// Review sessions started on the current reviewer host; the host is
-    /// recycled once this reaches `reviewer::SESSIONS_PER_HOST`.
-    host_sessions: usize,
+    /// Review sessions started on the current reviewer host. The host is
+    /// recycled once there are `reviewer::SESSIONS_PER_HOST`, and a reset
+    /// forgets their owner entries.
+    host_sessions: Vec<String>,
     /// The job whose reviewer turn is running.
     active: Option<ReviewJob>,
     /// Jobs waiting for the reviewer to finish the current turn.
@@ -8621,7 +8622,7 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
             job,
             st.session.clone(),
             cwd,
-            st.host_sessions >= reviewer::SESSIONS_PER_HOST,
+            st.host_sessions.len() >= reviewer::SESSIONS_PER_HOST,
         )
     };
     if recycle {
@@ -8656,7 +8657,7 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
                         let sid = sid.to_string();
                         let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
                         st.session = Some(sid.clone());
-                        st.host_sessions += 1;
+                        st.host_sessions.push(sid.clone());
                         sid
                     }
                     None => {
@@ -8728,9 +8729,17 @@ fn reset_reviewer_host(host: &Arc<Hosts>) {
         reviewer.shutdown();
     }
     host.clear_reviewer();
-    let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
-    st.session = None;
-    st.host_sessions = 0;
+    let retired = {
+        let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+        st.session = None;
+        std::mem::take(&mut st.host_sessions)
+    };
+    // Events from the replaced host fail the generation check, so its
+    // sessions no longer need an owner entry to keep them out of the
+    // user-session handlers.
+    for sid in retired {
+        host.forget_owner(&sid);
+    }
 }
 
 /// Deny one job with the host's own reject choice, carrying the reviewer's
