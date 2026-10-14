@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+- Fix MCP tool approvals from Muse 1.4.6+ showing as `Muse action` with a
+  stray pending tool card (#239). These approvals carry no top-level
+  `toolName` or `toolCallId`; the tool name is only on the subject. The
+  permission is now titled from `subject.toolName` (or the subject's
+  description when it has no name) and points at the tool card already open
+  for the approval's item, or a unique id when there is none, instead of a
+  shared `?` card that never settled.
+
+- Surface the reason when a permission is denied without an explicit editor
+  rejection. Auto-review denials, reviewer failures, unusable replies, and
+  review timeouts now add a short transcript message such as `Permission
+  denied: reviewer timed out after 90s.`; the reviewer's rationale is still
+  what Muse receives as decision feedback. A failed, missing, or unusable
+  editor permission reply is explained the same way, without sending the
+  notice to the model as feedback. A `cancelled` reply follows the user's own
+  stop, so it adds no message. The adapter log records the client outcome,
+  selected option, and RPC error for every fallback deny. Previously these
+  fail-closed paths left only Muse's generic "approval aborted" tool result
+  visible in the editor.
+
+- Tell the editor when a turn's answer is done but Muse's background reminder
+  checks still hold it open (#247). Muse 1.4.6+ sends
+  `turn/foregroundCompleted` right after the final content, then keeps the turn
+  running while reminder agents (`verify-reminder`, `goal-reminder`, …) run,
+  which can take a minute. The Muse SDK treats that notice as explicitly
+  non-terminal, so the ACP prompt still settles at `turn/completed`. The
+  adapter previously only logged it to stderr, so editors saw no frames at all
+  during the wait. It now sends a `session_info_update` with
+  `_meta.muse.foregroundCompleted` (`turnId`, `blockingAgents`) and one
+  in-progress `Background checks: <agents>` card. The card settles and the hint
+  clears (`foregroundCompleted: null`) just before the prompt result. A
+  reminder that resumes work and fires again settles the old card and opens a
+  new one. With `MUSE_SHOW_REMINDERS`, the per-agent cards replace the single
+  card, and the hint is still sent.
+
 ## 0.13.1
 
 - Fix Auto-review denying every approval with "auto-review returned no usable
