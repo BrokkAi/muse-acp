@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Re-pin the vendored Muse SDK conformance corpus to `838d36a` (2026-10-14,
+  "remirror: 1.4.8"), which publishes the Muse 1.4.8 stable surface. The new
+  surface is additive over 1.4.7: Computer Use app-level choices and the
+  installed-app picker (`ComputerUseSettings.apps`/`.installedApps`,
+  `ComputerUseSettingsReadParams.installed`,
+  `ComputerUseSettingsUpdateParams.apps`), the agent-message phase
+  (`Item.messagePhase` with the `MessagePhase` enum), the `monitorFeed` item
+  kind (`Item.monitorId`/`Item.monitorDescription`, with `Item.truncated` and
+  `Item.turnId` widened to cover it), the generated short title
+  (`Session.generatedName`, `SessionNameChangedParams.generatedName`), the
+  resume permission-profile pick (`SessionResumeParams.permissionProfile`),
+  the skill's declared `title` (`SkillCatalogEntry.title`), the
+  `turn/modelRetryScheduled` notification, and the `sessionRename` capability.
+  No pinned 1.4.8 build has joined the live-host matrix yet, so the
+  fingerprint classifies as degraded (a visible warning that is not fatal)
+  until one does; an installed Muse 1.4.8 exports a schema bundle and
+  manifest byte-identical to the vendored copy. The event matrix files the new
+  `turn/modelRetryScheduled` notification as `Intentionally ignored` (it takes
+  the unknown-notification diagnostic path and never settles a prompt). Each
+  new surface the adapter does not drive has a tracking issue, #253 through
+  #260.
+
 - Stop a resumed session from reopening approvals that were already decided
   (#238). Muse's pending list can still include approvals that durable history
   resolved; the adapter showed them again, deciding them failed with
