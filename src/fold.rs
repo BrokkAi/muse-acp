@@ -192,6 +192,10 @@ pub struct SessionFold {
     /// but carry no editor-facing content, so they stay out of the transcript
     /// and only their agent ids reach the stderr diagnostics.
     pub show_reminders: bool,
+    /// The open "background checks" card of a turn whose foreground work is
+    /// done while reminder agents hold it open (`turn/foregroundCompleted`),
+    /// as `(turn id, card id)`. Settled at the turn's terminal.
+    background_checks: Option<(String, String)>,
 }
 
 /// One child of a running workflow, as the latest workflow item reported it.
@@ -255,6 +259,7 @@ impl SessionFold {
             backgrounded_cards: std::collections::HashSet::new(),
             reminder_cards: HashMap::new(),
             show_reminders: false,
+            background_checks: None,
         }
     }
 
@@ -1321,6 +1326,97 @@ impl SessionFold {
         ));
         if settle {
             self.items.remove(item_id);
+        }
+    }
+
+    /// `turn/foregroundCompleted`: the answer is done, but the named reminder
+    /// agents hold the turn open until `turn/completed` (tdd SS4.5.12). The
+    /// prompt stays pending, so tell the editor why: a `_meta.muse` hint
+    /// (the SDK fold's `foregroundCompleted`) and, unless per-agent reminder
+    /// cards are opted in, one card naming the checks. A later firing in the
+    /// same turn settles the previous card and opens a new one after any
+    /// work the reminder resumed.
+    pub fn on_foreground_completed(
+        &mut self,
+        acp_sid: &str,
+        ver: u8,
+        turn_id: &str,
+        agents: &[&str],
+        out: &mut Vec<String>,
+    ) {
+        self.settle_background_checks(acp_sid, None, "completed", false, out);
+        let agents_json = agents.iter().map(|a| esc(a)).collect::<Vec<_>>().join(",");
+        out.push(Self::update_line(
+            acp_sid,
+            &format!(
+                "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"muse\":{{\"foregroundCompleted\":{{\"turnId\":{},\"blockingAgents\":[{agents_json}]}}}}}}}}",
+                esc(turn_id)
+            ),
+        ));
+        if self.show_reminders {
+            self.background_checks = Some((turn_id.to_string(), String::new()));
+            return;
+        }
+        let tc_id = mint_id("checks-", &self.idc);
+        let title = if agents.is_empty() {
+            "Background checks".to_string()
+        } else {
+            format!("Background checks: {}", agents.join(", "))
+        };
+        out.push(Self::card_line(
+            acp_sid,
+            ver,
+            true,
+            &tc_id,
+            &title,
+            "other",
+            "in_progress",
+            None,
+            Some(&format!(
+                "\"turnId\":{},\"blockingAgents\":[{agents_json}]",
+                esc(turn_id)
+            )),
+            false,
+        ));
+        self.background_checks = Some((turn_id.to_string(), tc_id));
+    }
+
+    /// Settle the background-checks card and clear the hint. `turn` limits
+    /// this to one turn's terminal; `None` settles whatever is open. `clear`
+    /// also withdraws the `_meta.muse.foregroundCompleted` hint.
+    pub fn settle_background_checks(
+        &mut self,
+        acp_sid: &str,
+        turn: Option<&str>,
+        status: &str,
+        clear: bool,
+        out: &mut Vec<String>,
+    ) {
+        if turn.is_some_and(|t| {
+            self.background_checks
+                .as_ref()
+                .is_some_and(|(open, _)| open != t)
+        }) {
+            return;
+        }
+        let Some((_, tc_id)) = self.background_checks.take() else {
+            return;
+        };
+        if !tc_id.is_empty() {
+            out.push(Self::update_line(
+                acp_sid,
+                &format!(
+                    "{{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":{},\"status\":{}}}",
+                    esc(&tc_id),
+                    esc(status)
+                ),
+            ));
+        }
+        if clear {
+            out.push(Self::update_line(
+                acp_sid,
+                "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"muse\":{\"foregroundCompleted\":null}}}",
+            ));
         }
     }
 
@@ -2729,6 +2825,70 @@ mod corpus_tests {
                 .any(|line| line.contains("Reminder from skill-reminder")),
             "opted-in card names the agent: {out:?}"
         );
+    }
+
+    #[test]
+    fn foreground_completed_opens_one_checks_card_until_the_terminal() {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_foreground_completed("sid", 1, "t1", &["verify-reminder"], &mut out);
+        assert_eq!(out.len(), 2, "hint plus card: {out:?}");
+        assert!(out[0].contains(
+            r#""foregroundCompleted":{"turnId":"t1","blockingAgents":["verify-reminder"]}"#
+        ));
+        assert!(out[1].contains(r#""sessionUpdate":"tool_call""#));
+        assert!(out[1].contains("Background checks: verify-reminder"));
+        assert!(out[1].contains(r#""status":"in_progress""#));
+
+        // Another turn's terminal leaves this turn's card alone.
+        out.clear();
+        fold.settle_background_checks("sid", Some("t0"), "completed", true, &mut out);
+        assert!(out.is_empty(), "other turn: {out:?}");
+
+        fold.settle_background_checks("sid", Some("t1"), "completed", true, &mut out);
+        assert_eq!(out.len(), 2, "settle plus clear: {out:?}");
+        assert!(out[0].contains(r#""status":"completed""#));
+        assert!(out[1].contains(r#""foregroundCompleted":null"#));
+
+        out.clear();
+        fold.settle_background_checks("sid", Some("t1"), "completed", true, &mut out);
+        assert!(out.is_empty(), "settles once: {out:?}");
+    }
+
+    #[test]
+    fn a_second_firing_settles_the_previous_checks_card() {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_foreground_completed("sid", 2, "t1", &["goal-reminder"], &mut out);
+        let first = parse_json(&out[1]).unwrap();
+        let first_id = first
+            .get("params")
+            .and_then(|p| p.get("update"))
+            .and_then(|u| u.get("toolCallId"))
+            .and_then(J::as_str)
+            .unwrap()
+            .to_string();
+        out.clear();
+        fold.on_foreground_completed("sid", 2, "t1", &["verify-reminder"], &mut out);
+        assert_eq!(out.len(), 3, "settle, hint, new card: {out:?}");
+        assert!(out[0].contains(&first_id) && out[0].contains(r#""status":"completed""#));
+        assert!(
+            !out[2].contains(&first_id),
+            "a new card follows resumed work"
+        );
+    }
+
+    #[test]
+    fn opted_in_reminder_cards_replace_the_aggregate_checks_card() {
+        let mut fold = SessionFold::new();
+        fold.show_reminders = true;
+        let mut out = Vec::new();
+        fold.on_foreground_completed("sid", 1, "t1", &["todo-reminder"], &mut out);
+        assert_eq!(out.len(), 1, "hint only: {out:?}");
+        out.clear();
+        fold.settle_background_checks("sid", Some("t1"), "completed", true, &mut out);
+        assert_eq!(out.len(), 1, "clear only: {out:?}");
+        assert!(out[0].contains(r#""foregroundCompleted":null"#));
     }
 
     #[test]

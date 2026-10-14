@@ -1705,6 +1705,14 @@ fn auto_review_denies_on_unusable_reviewer_output() {
         Duration::from_secs(15),
     );
     c.wait_stderr("was unusable: \"not json\"", Duration::from_secs(15));
+    let notice = c.wait_for(
+        "Permission denied: reviewer failed: auto-review returned no usable decision: the reviewer reply was not a JSON decision.",
+        Duration::from_secs(15),
+    );
+    assert!(
+        notice.contains("\"sessionUpdate\":\"agent_message_chunk\""),
+        "an unusable reviewer reply must be explained in the transcript: {notice}"
+    );
     c.finish();
 }
 
@@ -1730,6 +1738,14 @@ fn auto_review_names_a_failed_reviewer_turn() {
     assert!(
         !stderr.contains("no usable decision"),
         "a failed turn is not an unusable reply: {stderr}"
+    );
+    let notice = c.wait_for(
+        "Permission denied: reviewer turn failed: contextWindowExceeded: prompt is too long.",
+        Duration::from_secs(15),
+    );
+    assert!(
+        notice.contains("\"sessionUpdate\":\"agent_message_chunk\""),
+        "a failed reviewer turn must be explained in the transcript: {notice}"
     );
     c.finish();
 }
@@ -1779,6 +1795,7 @@ fn auto_review_denies_when_the_reviewer_hangs() {
         "approval_hang",
         &[
             ("FAKE_REVIEW_HANG", "1"),
+            ("FAKE_APPROVAL_FEEDBACK", "deny"),
             ("MUSE_REVIEW_TIMEOUT_MS", "1000"),
         ],
     );
@@ -1791,6 +1808,18 @@ fn auto_review_denies_when_the_reviewer_hangs() {
     let _pid = c.prompt(&sid, "do the thing");
     c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
     c.wait_stderr("auto-review timed out", Duration::from_secs(15));
+    let notice = c.wait_for(
+        "Permission denied: reviewer timed out after 1s.",
+        Duration::from_secs(15),
+    );
+    assert!(
+        notice.contains("\"sessionUpdate\":\"agent_message_chunk\""),
+        "timeout must be explained in the transcript: {notice}"
+    );
+    c.wait_input(
+        "\"feedback\": \"reviewer timed out after 1s\"",
+        Duration::from_secs(15),
+    );
     let frames = c
         .frames
         .lock()
@@ -2892,12 +2921,65 @@ fn turn_foreground_completed_is_consumed_and_the_turn_still_settles() {
         (count, frames.join("\n"))
     };
     assert_eq!(count, 1, "exactly one settle for the prompt: {log}");
+    // The answer-done hint and its card reach the editor while the prompt is
+    // still open, and both are withdrawn before it settles (#247).
+    let at = |needle: &str| {
+        log.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {log}"))
+    };
+    let hint = at("\"foregroundCompleted\":{\"turnId\":");
+    assert!(
+        log.contains("\"blockingAgents\":[\"agent-1\",\"agent-2\"]"),
+        "hint names the blocking agents: {log}"
+    );
+    let card = at("\"title\":\"Background checks: agent-1, agent-2\"");
+    let settled = at("\"status\":\"completed\"}");
+    let cleared = at("\"foregroundCompleted\":null");
+    let result = log.rfind(&format!("\"id\":{pid}")).unwrap();
+    assert!(
+        at("foreground done") < hint && hint < card && card < settled,
+        "hint and card follow the answer: {log}"
+    );
+    assert!(
+        settled < cleared && cleared < result,
+        "checks settle before the prompt result: {log}"
+    );
     c.wait_stderr("turn foreground completed", Duration::from_secs(15));
     c.wait_stderr("agents=agent-1,agent-2", Duration::from_secs(15));
     let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
     assert!(
         !stderr.contains("unhandled MSP notification: turn/foregroundCompleted"),
         "the event is handled, not unhandled: {stderr}"
+    );
+    c.finish();
+}
+
+#[test]
+fn a_retracted_turn_closes_its_background_checks_before_settling() {
+    let mut c = Client::spawn("foreground_then_retracted", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"cancelled\""),
+        "the retract settles the prompt: {done}"
+    );
+    let log = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    let at = |needle: &str| {
+        log.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {log}"))
+    };
+    let card = at("\"title\":\"Background checks: agent-1\"");
+    let settled = at("\"status\":\"completed\"}");
+    let cleared = at("\"foregroundCompleted\":null");
+    let result = log.rfind(&format!("\"id\":{pid}")).unwrap();
+    assert!(
+        card < settled && settled < cleared && cleared < result,
+        "no open card or hint outlives the prompt: {log}"
     );
     c.finish();
 }
@@ -5308,6 +5390,74 @@ fn all_approve_cancellation_fails_closed() {
         "no approving decide was sent; host saw:\n{seen}"
     );
     c.finish();
+}
+
+#[test]
+fn fallback_permission_denies_report_the_client_outcome() {
+    // A `cancelled` reply follows the user's own stop, so it is logged but
+    // not explained in the transcript. Neither deny sends adapter text as
+    // decision feedback: feedback is reserved for the user's guidance.
+    for (respond_with_error, notice_text, log_text) in [
+        (
+            false,
+            None,
+            "session/request_permission outcome=cancelled option=none",
+        ),
+        (
+            true,
+            Some("Permission denied: the permission request failed in the editor."),
+            "session/request_permission failed at client; outcome=error option=none error=-32800: cancelled",
+        ),
+    ] {
+        let mut c = Client::spawn("approval_hang", &[("FAKE_APPROVAL_FEEDBACK", "deny")]);
+        let sid = c.new_session(1, "");
+        let _pid = c.prompt(&sid, "do it");
+        let permission = c.wait_for("request_permission", Duration::from_secs(15));
+        let permission_id = extract_str(&permission, "id").expect("permission request id");
+        if respond_with_error {
+            c.respond_error(&permission_id);
+        } else {
+            c.raw(&format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":\"{permission_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"cancelled\"}}}}}}"
+            ));
+        }
+        c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
+        c.wait_stderr(log_text, Duration::from_secs(15));
+        match notice_text {
+            Some(notice_text) => {
+                let notice = c.wait_for(notice_text, Duration::from_secs(15));
+                assert!(
+                    notice.contains("\"sessionUpdate\":\"agent_message_chunk\""),
+                    "fallback deny must be explained in the transcript: {notice}"
+                );
+            }
+            None => {
+                std::thread::sleep(Duration::from_millis(500));
+                let frames = c
+                    .frames
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .join("\n");
+                assert!(
+                    !frames.contains("Permission denied"),
+                    "a cancelled reply needs no deny notice: {frames}"
+                );
+            }
+        }
+        let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        let decisions: Vec<&str> = input
+            .lines()
+            .filter(|line| line.contains("\"approvalId\""))
+            .collect();
+        assert_eq!(decisions.len(), 1, "one fallback decision: {input}");
+        assert!(decisions[0].contains("\"choiceId\": \"c-deny\""));
+        assert!(
+            !decisions[0].contains("\"feedback\""),
+            "a fallback deny carries no feedback: {}",
+            decisions[0]
+        );
+        c.finish();
+    }
 }
 
 #[test]

@@ -2306,6 +2306,21 @@ fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
                     }
                 }
                 sess.in_flight = kept;
+                // The host lost these turns, so their background checks will
+                // never reach a terminal: close the card and hint with them.
+                let mut checks = Vec::new();
+                for f in &settled {
+                    sess.fold.settle_background_checks(
+                        acp_sid,
+                        Some(&f.msp_turn),
+                        "failed",
+                        true,
+                        &mut checks,
+                    );
+                }
+                for line in checks {
+                    acp::send_raw(stdout, &line);
+                }
                 let rest = sess.in_flight.len();
                 (settled, rest, sess.ver)
             }
@@ -3266,6 +3281,7 @@ fn main() {
                             &stdout,
                             &sessions,
                             job,
+                            ReviewDeny::ReviewerFailed,
                             "the reviewer host exited before deciding",
                         );
                         start_next_review(&hosts, &stdout, &sessions);
@@ -8487,6 +8503,9 @@ struct ReviewState {
     /// When the active review expires: a reviewer turn that never ends must
     /// not stall approvals indefinitely.
     deadline: Option<std::time::Instant>,
+    /// The timeout that set `deadline`, so the timeout notice names the
+    /// duration that was enforced.
+    timeout: std::time::Duration,
 }
 
 static REVIEW_STATE: LazyLock<Mutex<ReviewState>> =
@@ -8632,7 +8651,14 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
     let reviewer = match host.reviewer_host() {
         Ok(host) => host,
         Err(error) => {
-            deny_review_job(host, stdout, sessions, job, &error);
+            deny_review_job(
+                host,
+                stdout,
+                sessions,
+                job,
+                ReviewDeny::ReviewerFailed,
+                &error,
+            );
             start_next_review(host, stdout, sessions);
             return;
         }
@@ -8666,6 +8692,7 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
                             stdout,
                             sessions,
                             job,
+                            ReviewDeny::ReviewerFailed,
                             "reviewer session started without an id",
                         );
                         start_next_review(host, stdout, sessions);
@@ -8673,13 +8700,8 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
                     }
                 },
                 Err(error) => {
-                    deny_review_job(
-                        host,
-                        stdout,
-                        sessions,
-                        job,
-                        &format!("reviewer session failed: {}", err_message(&error)),
-                    );
+                    let rationale = format!("reviewer session failed: {}", err_message(&error));
+                    deny_review_job(host, stdout, sessions, job, ReviewDeny::Plain, &rationale);
                     start_next_review(host, stdout, sessions);
                     return;
                 }
@@ -8708,16 +8730,13 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
             st.active = Some(job);
             st.text.clear();
             st.turn = turn;
-            st.deadline = Some(std::time::Instant::now() + reviewer::review_timeout());
+            let timeout = reviewer::review_timeout();
+            st.deadline = Some(std::time::Instant::now() + timeout);
+            st.timeout = timeout;
         }
         Err(error) => {
-            deny_review_job(
-                host,
-                stdout,
-                sessions,
-                job,
-                &format!("reviewer turn failed: {}", err_message(&error)),
-            );
+            let rationale = format!("reviewer turn failed: {}", err_message(&error));
+            deny_review_job(host, stdout, sessions, job, ReviewDeny::Plain, &rationale);
             reset_reviewer_host(host);
             start_next_review(host, stdout, sessions);
         }
@@ -8742,20 +8761,63 @@ fn reset_reviewer_host(host: &Arc<Hosts>) {
     }
 }
 
-/// Deny one job with the host's own reject choice, carrying the reviewer's
-/// rationale as feedback when the host accepts it.
+fn finished_sentence(mut text: String) -> String {
+    if !text.ends_with(['.', '!', '?', '…']) {
+        text.push('.');
+    }
+    text
+}
+
+/// A whole number of seconds as `90s`, anything else as `1500ms`.
+fn short_duration(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms.is_multiple_of(1000) {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+/// Why a review job was denied, which sets the transcript notice's prefix.
+#[derive(Clone, Copy)]
+enum ReviewDeny {
+    /// The reviewer assessed the action and denied it.
+    Assessment,
+    /// The reviewer could not produce a decision.
+    ReviewerFailed,
+    /// The rationale already names what went wrong.
+    Plain,
+}
+
+impl ReviewDeny {
+    fn notice(self, rationale: &str) -> String {
+        let prefix = match self {
+            ReviewDeny::Assessment => "Permission denied by Auto-review",
+            ReviewDeny::ReviewerFailed => "Permission denied: reviewer failed",
+            ReviewDeny::Plain => "Permission denied",
+        };
+        finished_sentence(format!("{prefix}: {rationale}"))
+    }
+}
+
+/// Deny one job with the host's own reject choice. The rationale goes to the
+/// host as feedback when the reject choice accepts it; the transcript notice
+/// tells the editor user why.
 fn deny_review_job(
     host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     job: ReviewJob,
+    kind: ReviewDeny,
     rationale: &str,
 ) {
+    let notice = kind.notice(rationale);
     let Some(choice) = reviewer::deny_choice(&job.choices) else {
         log(&format!(
-            "auto-review deny {}: no reject choice; failing closed",
+            "auto-review deny {}: {rationale}; no reject choice; failing closed",
             job.approval_id
         ));
+        send_agent_text(stdout, &job.acp_sid, job.ver, &notice);
         fail_closed_owner_work(
             host,
             sessions,
@@ -8787,6 +8849,7 @@ fn deny_review_job(
             requirement: job.requirement,
             choice,
             feedback,
+            deny_notice: Some(notice),
         },
     );
 }
@@ -8818,6 +8881,7 @@ fn finish_review(
                             requirement: job.requirement,
                             choice,
                             feedback: None,
+                            deny_notice: None,
                         },
                     );
                 }
@@ -8826,12 +8890,18 @@ fn finish_review(
                     stdout,
                     sessions,
                     job,
+                    ReviewDeny::Plain,
                     "auto-review allowed the action but the host offered no approving choice",
                 ),
             },
-            reviewer::Outcome::Deny => {
-                deny_review_job(host, stdout, sessions, job, &assessment.rationale)
-            }
+            reviewer::Outcome::Deny => deny_review_job(
+                host,
+                stdout,
+                sessions,
+                job,
+                ReviewDeny::Assessment,
+                &assessment.rationale,
+            ),
         },
         None => {
             log(&format!(
@@ -8839,12 +8909,14 @@ fn finish_review(
                 job.approval_id,
                 reviewer::excerpt(text)
             ));
+            let rationale = reviewer::unusable_reply_rationale(text);
             deny_review_job(
                 host,
                 stdout,
                 sessions,
                 job,
-                reviewer::unusable_reply_rationale(text),
+                ReviewDeny::ReviewerFailed,
+                rationale,
             );
             reset_reviewer_host(host);
         }
@@ -8864,7 +8936,7 @@ fn fail_review_turn(
     params: &J,
 ) {
     let rationale = reviewer::failed_turn_rationale(terminal, params);
-    deny_review_job(host, stdout, sessions, job, &rationale);
+    deny_review_job(host, stdout, sessions, job, ReviewDeny::Plain, &rationale);
     reset_reviewer_host(host);
     start_next_review(host, stdout, sessions);
 }
@@ -8875,24 +8947,26 @@ fn fail_review_turn(
 /// next queued review. A turn that completed first already took the active
 /// review, leaving nothing to expire.
 fn expire_review_deadline(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions) {
-    let job = {
+    let expired = {
         let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
         match st.deadline {
             Some(deadline) if std::time::Instant::now() >= deadline && st.active.is_some() => {
                 st.deadline = None;
-                st.active.take()
+                let timeout = st.timeout;
+                st.active.take().map(|job| (job, timeout))
             }
             _ => None,
         }
     };
-    if let Some(job) = job {
+    if let Some((job, timeout)) = expired {
         log(&format!("auto-review timed out for {}", job.approval_id));
         deny_review_job(
             host,
             stdout,
             sessions,
             job,
-            "reviewer unavailable: permission approval review timed out",
+            ReviewDeny::Plain,
+            &format!("reviewer timed out after {}", short_duration(timeout)),
         );
         reset_reviewer_host(host);
         start_next_review(host, stdout, sessions);
@@ -9963,6 +10037,24 @@ fn handle_msp(
                     if s.active_turn.as_deref() == Some(turn_id) {
                         s.active_turn = None;
                     }
+                    // The background checks end with the turn; settle their
+                    // card and withdraw the hint before the prompt settles.
+                    let mut checks = Vec::new();
+                    let status = if terminal == "failed" {
+                        "failed"
+                    } else {
+                        "completed"
+                    };
+                    s.fold.settle_background_checks(
+                        &acp_sid,
+                        Some(turn_id),
+                        status,
+                        true,
+                        &mut checks,
+                    );
+                    for line in checks {
+                        acp::send_raw(stdout, &line);
+                    }
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id);
                     let ver = s.ver;
                     let finished = pos.map(|p| s.in_flight.remove(p));
@@ -10255,6 +10347,20 @@ fn handle_msp(
                     if s.active_turn.as_deref() == Some(turn_id) {
                         s.active_turn = None;
                     }
+                    // The prompt settles here, so its background checks must
+                    // too. Like a superseded reminder, a retract is not a
+                    // failure: settle the card as completed.
+                    let mut checks = Vec::new();
+                    s.fold.settle_background_checks(
+                        &acp_sid,
+                        Some(turn_id),
+                        "completed",
+                        true,
+                        &mut checks,
+                    );
+                    for line in checks {
+                        acp::send_raw(stdout, &line);
+                    }
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id)?;
                     let ver = s.ver;
                     Some((s.in_flight.remove(pos).req_id, ver, s.in_flight.len()))
@@ -10276,27 +10382,46 @@ fn handle_msp(
             // at turn/completed / turn/unqueued. ACP has no matching state, so
             // record the blocking reminder agents for diagnostics and leave the
             // pending prompt alone.
-            let agents = match params.get("blockingAgents") {
-                Some(J::Arr(items)) => items
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                _ => String::new(),
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+            let agents: Vec<&str> = match params.get("blockingAgents") {
+                Some(J::Arr(items)) => items.iter().filter_map(|v| v.as_str()).collect(),
+                _ => Vec::new(),
             };
             log(&format!(
                 "turn foreground completed; background reminder checks hold it open turn={} sess={} agents={}",
-                params.get("turnId").and_then(|v| v.as_str()).unwrap_or("?"),
-                params
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?"),
+                if turn_id.is_empty() { "?" } else { turn_id },
+                if msp_sid.is_empty() { "?" } else { msp_sid },
                 if agents.is_empty() {
-                    "?"
+                    "?".to_string()
                 } else {
-                    agents.as_str()
+                    agents.join(",")
                 }
             ));
+            let Some(acp_sid) = find_acp_sid(sessions, msp_sid) else {
+                return;
+            };
+            // The SDK fold keeps this as a renderer hint on a running turn:
+            // "the answer is done while `blockingAgents` hold the turn". A
+            // replayed notice for a turn that already ended is stale.
+            let mut out = Vec::new();
+            if let Some(s) = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&acp_sid)
+                && !turn_id.is_empty()
+                && (s.active_turn.as_deref() == Some(turn_id)
+                    || s.in_flight.iter().any(|f| f.msp_turn == turn_id))
+            {
+                s.fold
+                    .on_foreground_completed(&acp_sid, s.ver, turn_id, &agents, &mut out);
+            }
+            for line in out {
+                acp::send_raw(stdout, &line);
+            }
         }
         "turn/retryScheduled" => {
             // Non-terminal by schema: it never resolves a turn-wait, so never
@@ -11162,6 +11287,7 @@ fn offer_permission_feedback(
 fn report_approval_failure(
     stdout: &StdoutShared,
     acp_sid: &str,
+    ver: u8,
     approval_id: &str,
     included_feedback: bool,
 ) {
@@ -11172,16 +11298,7 @@ fn report_approval_failure(
     } else {
         format!("Muse rejected the permission decision for {approval_id}.")
     };
-    let msg_id = mint_id("msg-", &ID_COUNTER);
-    acp::send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}}}",
-            esc(acp_sid),
-            esc(&msg_id),
-            esc(&text),
-        ),
-    );
+    send_agent_text(stdout, acp_sid, ver, &text);
 }
 
 struct PermissionDecision {
@@ -11191,6 +11308,7 @@ struct PermissionDecision {
     requirement: J,
     choice: String,
     feedback: Option<String>,
+    deny_notice: Option<String>,
 }
 
 /// Send the one MSP decision associated with a completed permission flow.
@@ -11240,6 +11358,9 @@ fn send_permission_decision(
                     acp::send_state(stdout, acp_sid, "running", None);
                 }
             }
+            if let Some(notice) = &decision.deny_notice {
+                send_agent_text(stdout, acp_sid, decision.ver, notice);
+            }
         }
         Err(e) => {
             log(&format!(
@@ -11247,9 +11368,13 @@ fn send_permission_decision(
                 decision.approval_id,
                 err_message(&e)
             ));
+            if let Some(notice) = &decision.deny_notice {
+                send_agent_text(stdout, acp_sid, decision.ver, notice);
+            }
             report_approval_failure(
                 stdout,
                 acp_sid,
+                decision.ver,
                 &decision.approval_id,
                 included_feedback,
             );
@@ -11335,39 +11460,66 @@ fn complete_permission(
             .map(|choice| choice.decision.to_lowercase().starts_with("approv"))
             .unwrap_or(false)
     };
-    let mut explicit_choice = false;
-    let verdict = if msg.get("error").is_some() {
-        log("session/request_permission failed at client; failing closed");
-        match acp::fallback_deny(&choices) {
-            Some(c) => Verdict::Deny(c),
-            None => Verdict::FailClosed,
-        }
+    // Ok is an explicit selection of an offered choice. Err is any other
+    // reply: the log line, and the transcript notice for the fallback deny.
+    let selected: Result<String, (String, Option<&str>)> = if let Some(error) = msg.get("error") {
+        let code = match error.get("code") {
+            Some(J::Num(code)) => code.as_str(),
+            _ => "unknown",
+        };
+        Err((
+            format!(
+                "session/request_permission failed at client; outcome=error option=none error={code}: {}",
+                err_message(error)
+            ),
+            Some("Permission denied: the permission request failed in the editor."),
+        ))
     } else {
-        match msg.get("result").and_then(|r| r.get("outcome")) {
-            Some(o) => match o.get("outcome").and_then(|v| v.as_str()).unwrap_or("") {
-                "selected" => match o.get("optionId").and_then(|v| v.as_str()) {
-                    Some(cid) if is_approving(cid) => {
-                        explicit_choice = true;
-                        Verdict::Approve(cid.to_string())
-                    }
-                    Some(cid) if choices.iter().any(|choice| choice.id == cid) => {
-                        explicit_choice = true;
-                        Verdict::Deny(cid.to_string())
-                    }
-                    _ => match acp::fallback_deny(&choices) {
-                        Some(c) => Verdict::Deny(c),
-                        None => Verdict::FailClosed,
-                    },
-                },
-                _ => match acp::fallback_deny(&choices) {
-                    Some(c) => Verdict::Deny(c),
-                    None => Verdict::FailClosed,
-                },
+        let outcome = msg.get("result").and_then(|r| r.get("outcome"));
+        let outcome_name = outcome
+            .and_then(|o| o.get("outcome"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let option_id = outcome
+            .and_then(|o| o.get("optionId"))
+            .and_then(|v| v.as_str());
+        let reply = format!(
+            "session/request_permission outcome={} option={}",
+            if outcome_name.is_empty() {
+                "missing"
+            } else {
+                outcome_name
             },
-            None => match acp::fallback_deny(&choices) {
+            option_id.unwrap_or("none")
+        );
+        match (outcome_name, option_id) {
+            ("selected", Some(cid)) if choices.iter().any(|choice| choice.id == cid) => {
+                Ok(cid.to_string())
+            }
+            ("selected", _) => Err((
+                reply,
+                Some("Permission denied: the editor returned no usable permission option."),
+            )),
+            // ACP clients answer `cancelled` after `session/cancel`: the user
+            // stopped the turn, so the deny needs no explanation.
+            ("cancelled", _) => Err((reply, None)),
+            _ => Err((
+                reply,
+                Some("Permission denied: the editor did not approve the permission request."),
+            )),
+        }
+    };
+    let explicit_choice = selected.is_ok();
+    let (verdict, deny_notice) = match selected {
+        Ok(cid) if is_approving(&cid) => (Verdict::Approve(cid), None),
+        Ok(cid) => (Verdict::Deny(cid), None),
+        Err((reply, notice)) => {
+            log(&format!("{reply}; failing closed"));
+            let verdict = match acp::fallback_deny(&choices) {
                 Some(c) => Verdict::Deny(c),
                 None => Verdict::FailClosed,
-            },
+            };
+            (verdict, notice)
         }
     };
     if let Verdict::Deny(ref choice) = verdict
@@ -11384,6 +11536,9 @@ fn complete_permission(
         Verdict::Approve(c) | Verdict::Deny(c) => c,
         Verdict::FailClosed => {
             log("permission: no deny choice available; cancelling the turn instead of approving");
+            if let Some(notice) = deny_notice {
+                send_agent_text(stdout, &acp_sid, ver, notice);
+            }
             sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -11419,6 +11574,7 @@ fn complete_permission(
             requirement,
             choice,
             feedback: None,
+            deny_notice: deny_notice.map(str::to_string),
         },
     );
 }
@@ -11495,6 +11651,7 @@ fn complete_permission_feedback(
             requirement,
             choice: choice_id,
             feedback,
+            deny_notice: None,
         },
     );
 }
@@ -11841,6 +11998,12 @@ fn fail_all_with_message(stdout: &StdoutShared, sessions: &Sessions, message: &s
 /// Settle every in-flight prompt of one session with an explanation: an error
 /// response in v1, and a transcript message plus a cancelled idle in v2.
 fn fail_in_flight(stdout: &StdoutShared, s: &mut AcpSession, message: &str) {
+    let mut checks = Vec::new();
+    s.fold
+        .settle_background_checks(&s.acp_sid, None, "failed", true, &mut checks);
+    for line in checks {
+        acp::send_raw(stdout, &line);
+    }
     if s.in_flight.is_empty() {
         return;
     }
@@ -13494,6 +13657,28 @@ fn complete_elicitation(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn review_deny_notices_end_once_and_name_the_enforced_duration() {
+        use super::{ReviewDeny, short_duration};
+        assert_eq!(
+            ReviewDeny::Assessment.notice("touches prod credentials"),
+            "Permission denied by Auto-review: touches prod credentials."
+        );
+        assert_eq!(
+            ReviewDeny::ReviewerFailed.notice("reply was cut…"),
+            "Permission denied: reviewer failed: reply was cut…"
+        );
+        assert_eq!(
+            ReviewDeny::Plain.notice("reviewer turn failed: boom."),
+            "Permission denied: reviewer turn failed: boom."
+        );
+        assert_eq!(short_duration(std::time::Duration::from_secs(90)), "90s");
+        assert_eq!(
+            short_duration(std::time::Duration::from_millis(1500)),
+            "1500ms"
+        );
+    }
 
     #[test]
     fn host_path_string_keeps_the_verbatim_windows_prefix() {
