@@ -982,18 +982,31 @@ fn refresh_all_subscription_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sess
     }
 }
 
-/// Read durable history back from the head and remember every approval it
-/// already resolved, so a stale pending projection cannot reopen one
-/// (issue #238). History that cannot be read proves nothing: approvals it
-/// never reached keep the ordinary permission decision, never an implicit
-/// approval. Paging is bounded for the same reason.
-fn seed_resolved_approvals(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str, msp_sid: &str) {
-    const MAX_PAGES: usize = 100;
-    let mut resolved: Vec<String> = Vec::new();
+/// Read a reattached session's durable history back from the head, once, and
+/// remember every approval it already resolved, so a stale pending projection
+/// or reissued request cannot reopen one (issue #238). The walk stops at the
+/// end of the view, on an error, or on a cursor it already asked for; never
+/// on a page count, which would silently miss an old terminal record. History
+/// that cannot be read proves nothing: approvals it never reached keep the
+/// ordinary permission decision, never an implicit approval.
+fn learn_resolved_approvals(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) {
+    let msp_sid = {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get_mut(acp_sid) else {
+            return;
+        };
+        if !std::mem::take(&mut s.resolved_history_unread) {
+            return;
+        }
+        s.msp_sid.clone()
+    };
+    let mut resolved: Vec<(String, String)> = Vec::new();
     let mut cursor: Option<String> = None;
     let mut requested = std::collections::HashSet::new();
-    for _ in 0..MAX_PAGES {
-        let cmd = host.mint_cmd("cmd-");
+    let mut pages = 0usize;
+    loop {
+        // A read of the durable view, like the replay pager: no commandId,
+        // so it leaves no admission record in the log it reads.
         let cursor_json = cursor
             .as_deref()
             .map(|c| format!(",\"cursor\":{}", esc(c)))
@@ -1001,51 +1014,45 @@ fn seed_resolved_approvals(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str
         let page = match host.command(
             "view/page",
             &format!(
-                "{{\"commandId\":{},\"sessionId\":{},\"direction\":\"backward\",\"limit\":100{cursor_json}}}",
-                esc(&cmd),
-                esc(msp_sid),
+                "{{\"sessionId\":{},\"direction\":\"backward\",\"limit\":100{cursor_json}}}",
+                esc(&msp_sid),
             ),
         ) {
             Ok(r) => r,
             Err(e) => {
                 log(&format!(
-                    "resolved-approval history read failed: {}",
+                    "resolved-approval history read failed after {pages} page(s): {}",
                     err_message(&e)
                 ));
                 break;
             }
         };
+        pages += 1;
         let Some(J::Arr(events)) = page.get("events") else {
             log("resolved-approval history read returned no events");
             break;
         };
         for event in events {
-            if event.get("method").and_then(|v| v.as_str()) != Some("approval/resolved") {
+            if event.get("method").and_then(J::as_str) != Some("approval/resolved") {
                 continue;
             }
             let Some(params) = event.get("params") else {
                 continue;
             };
-            if let Some(owner) = params.get("sessionId").and_then(|v| v.as_str())
-                && owner != msp_sid
-            {
-                continue;
-            }
-            if let Some(id) = params.get("approvalId").and_then(|v| v.as_str())
-                && !id.is_empty()
-            {
-                resolved.push(id.to_string());
+            // Child approvals projected onto this view keep their own
+            // session id; the key carries it, so they cannot shadow a
+            // parent approval with the same id.
+            let owner = params.non_empty_str("sessionId").unwrap_or(&msp_sid);
+            if let Some(id) = params.non_empty_str("approvalId") {
+                resolved.push((owner.to_string(), id.to_string()));
             }
         }
-        match page.get("nextCursor").and_then(|v| v.as_str()) {
-            Some(next) if !next.is_empty() && requested.insert(next.to_string()) => {
+        match page.non_empty_str("nextCursor") {
+            Some(next) if requested.insert(next.to_string()) => {
                 cursor = Some(next.to_string());
             }
             _ => break,
         }
-    }
-    if resolved.is_empty() {
-        return;
     }
     let count = resolved.len();
     if let Some(s) = sessions
@@ -1056,7 +1063,7 @@ fn seed_resolved_approvals(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str
         s.approval_resolved.extend(resolved);
     }
     log(&format!(
-        "pending reconciliation: remembered {count} resolved approval(s) from durable history"
+        "resolved-approval history: {count} resolved approval(s) in {pages} page(s)"
     ));
 }
 
@@ -1088,12 +1095,6 @@ fn reconcile_pending(
         ));
         return;
     }
-    // The pending projection can include approvals durable history already
-    // resolved (issue #238). Learn the terminal ids first so neither this
-    // pull nor a reissued request reopens them.
-    if approvals_targeted {
-        seed_resolved_approvals(host, sessions, acp_sid, &msp_sid);
-    }
     // This is a log-fold query: no commandId, no admission record.
     let params = format!("{{\"sessionId\":{}}}", esc(&msp_sid));
     let r = match host.command("approval/listPending", &params) {
@@ -1107,40 +1108,32 @@ fn reconcile_pending(
         }
     };
     let (mut n_approvals, mut n_inputs) = (0usize, 0usize);
-    if approvals_targeted && let Some(J::Arr(approvals)) = r.get("approvals") {
+    if approvals_targeted
+        && let Some(J::Arr(approvals)) = r.get("approvals")
+        && !approvals.is_empty()
+    {
+        // The pending projection can include approvals durable history
+        // already resolved (issue #238).
+        learn_resolved_approvals(host, sessions, acp_sid);
         for a in approvals.clone() {
-            let approval_id = a
-                .get("approvalId")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let resolved = !approval_id.is_empty()
-                && sessions
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .get(acp_sid)
-                    .is_some_and(|s| s.approval_resolved.contains(&approval_id));
-            if resolved {
-                continue;
-            }
-            let known = sessions
+            // Resolved, displayed, or already queued: nothing to present.
+            let skip = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .get(acp_sid)
                 .is_some_and(|s| {
-                    let displayed = s
-                        .pending_perm
-                        .as_ref()
-                        .map(|p| p.approval_id.as_str())
-                        .unwrap_or("");
-                    let id = a.get("approvalId").and_then(|v| v.as_str()).unwrap_or("");
-                    displayed == id && !id.is_empty()
-                        || s.perm_queue.iter().any(|q| {
-                            q.get("approvalId").and_then(|v| v.as_str()) == Some(id)
-                                && !id.is_empty()
-                        })
+                    let Some(id) = a.non_empty_str("approvalId") else {
+                        return false;
+                    };
+                    let owner = a.non_empty_str("sessionId").unwrap_or(&msp_sid);
+                    s.approval_resolved
+                        .contains(&(owner.to_string(), id.to_string()))
+                        || s.pending_perm.as_ref().is_some_and(|p| p.approval_id == id)
+                        || s.perm_queue
+                            .iter()
+                            .any(|q| q.non_empty_str("approvalId") == Some(id))
                 });
-            if !known {
+            if !skip {
                 n_approvals += 1;
                 open_approval(host, stdout, sessions, &a);
             }
@@ -4130,6 +4123,7 @@ fn handle_acp(
                             pending_perm: None,
                             approval_seen: std::collections::HashSet::new(),
                             approval_resolved: std::collections::HashSet::new(),
+                            resolved_history_unread: false,
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
@@ -4488,6 +4482,7 @@ fn handle_acp(
                             pending_perm: None,
                             approval_seen: std::collections::HashSet::new(),
                             approval_resolved: std::collections::HashSet::new(),
+                            resolved_history_unread: true,
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
@@ -4531,6 +4526,9 @@ fn handle_acp(
                         });
                         entry.msp_sid = real_msp.clone();
                         entry.ver = ver;
+                        // Approvals may have resolved while this view was
+                        // detached; read history again before the next one.
+                        entry.resolved_history_unread = true;
                         // The next user turn replaces the host's sticky root
                         // set, even when the request activated no extras.
                         entry.host_roots_pending = supports_host_roots;
@@ -5053,6 +5051,7 @@ fn handle_acp(
                             pending_perm: None,
                             approval_seen: std::collections::HashSet::new(),
                             approval_resolved: std::collections::HashSet::new(),
+                            resolved_history_unread: true,
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
@@ -8568,6 +8567,23 @@ struct ReviewJob {
     prompt: String,
 }
 
+/// Drop a queued (not yet running) review for an approval that resolved
+/// elsewhere, so the reviewer never decides a terminal approval.
+fn drop_queued_review(acp_sid: &str, child_subagent_id: &Option<String>, approval_id: &str) {
+    let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+    let before = st.queue.len();
+    st.queue.retain(|job| {
+        job.acp_sid != acp_sid
+            || job.approval_id != approval_id
+            || &job.child_subagent_id != child_subagent_id
+    });
+    if st.queue.len() != before {
+        log(&format!(
+            "auto-review dropped queued {approval_id}: resolved elsewhere"
+        ));
+    }
+}
+
 #[derive(Default)]
 struct ReviewState {
     /// The memory-only reviewer session of the active review. Every review
@@ -10189,17 +10205,24 @@ fn handle_msp(
                 .unwrap_or("");
             // Child-stream approvals open on their owner session, so resolve
             // them through the same routing or the prompt is never withdrawn.
-            if let Some((acp_sid, _, _)) = owner_for_msp_session(sessions, msp_sid) {
+            if let Some((acp_sid, _, child_subagent_id)) = owner_for_msp_session(sessions, msp_sid)
+            {
                 // Terminal is terminal: remember it and drop any queued
-                // twin so a stale reissue can never reopen it (#238).
+                // twin, displayed or awaiting auto-review, so a stale
+                // reissue can never reopen it (#238).
                 if !approval_id.is_empty() {
-                    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-                    if let Some(s) = map.get_mut(&acp_sid) {
-                        s.approval_resolved.insert(approval_id.to_string());
-                        s.perm_queue.retain(|q| {
-                            q.get("approvalId").and_then(|v| v.as_str()) != Some(approval_id)
-                        });
+                    {
+                        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                        if let Some(s) = map.get_mut(&acp_sid) {
+                            s.approval_resolved
+                                .insert((msp_sid.to_string(), approval_id.to_string()));
+                            s.perm_queue.retain(|q| {
+                                q.non_empty_str("approvalId") != Some(approval_id)
+                                    || q.non_empty_str("sessionId") != Some(msp_sid)
+                            });
+                        }
                     }
+                    drop_queued_review(&acp_sid, &child_subagent_id, approval_id);
                 }
                 if invalidate_pending_approval(stdout, sessions, &acp_sid, Some(approval_id), false)
                 {
@@ -11015,12 +11038,17 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
     }
     // A terminal approval never reopens, however stale the projection that
     // reissues it (issue #238). This precedes adapter policy so auto-review
-    // cannot decide a ghost either.
+    // cannot decide a ghost either. A reattached session reads its history
+    // here on its first approval, whichever path delivered it.
+    learn_resolved_approvals(host, sessions, &acp_sid);
     let already_resolved = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(&acp_sid)
-        .is_some_and(|s| s.approval_resolved.contains(&approval_id));
+        .is_some_and(|s| {
+            s.approval_resolved
+                .contains(&(msp_sid.to_string(), approval_id.clone()))
+        });
     if already_resolved {
         log(&format!("approval {approval_id} dropped: already resolved"));
         return;

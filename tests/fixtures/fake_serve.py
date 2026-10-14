@@ -18,7 +18,10 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   approval_resolved_elsewhere approval/requested, then approval/resolved by policy
   child_approval_resolved a child-stream approval, then approval/resolved on the child
   resolved_ghost listPending returns a resolved approval plus a genuine one;
-               view/page carries the durable approval/resolved for the ghost
+               view/page carries the durable approval/resolved for the ghost.
+               FAKE_GHOST_PAGES=N puts it on the Nth backward page;
+               FAKE_GHOST_REISSUE=1 keeps listPending empty and has the next
+               prompt reissue both approvals instead
   question_settled_elsewhere userInput/requested, then userInput/settled by another actor
   questions    userInput/requested with options, then completed
   questions_multiple userInput/requested with multiple-selection options
@@ -706,6 +709,20 @@ def on_turn_start(params):
         notify("approval/requested", approval_params())
         if SCENARIO == "approval_queue":
             notify("approval/requested", approval_params(approvalId="approval-second"))
+            if os.environ.get("FAKE_RESOLVE_SECOND") == "1":
+                # Decided elsewhere while it waits behind the first review.
+                notify("approval/resolved", {
+                    "sessionId": MSP_SID, "approvalId": "approval-second",
+                    "itemId": "it-ap", "turnId": tid, "decision": "denied",
+                    "resolvedBy": "policy", "policyResult": "denied",
+                    "stageEvidence": [], "sourceRange": {"start": 0, "end": 1},
+                    "viewCursor": "cur-second"})
+    elif SCENARIO == "resolved_ghost":
+        # A stale reissue of the resolved approval, then a genuine one.
+        notify("approval/requested", approval_params(
+            approvalId="ap-stale", toolCallId="call-stale"))
+        notify("approval/requested", approval_params(
+            approvalId="ap-live", toolCallId="call-live"))
     elif SCENARIO == "approval_resolved_elsewhere":
         # Another actor (policy, reviewer, or a second client) decides the
         # approval while the editor still shows the permission prompt.
@@ -1299,7 +1316,8 @@ def result_for(method, msg):
         if SCENARIO == "pending_reconcile_dup":
             # The same approval the adapter is already displaying.
             return {"approvals": [dict(APPROVAL_PARAMS)], "userInputs": []}
-        if SCENARIO == "resolved_ghost":
+        if (SCENARIO == "resolved_ghost"
+                and os.environ.get("FAKE_GHOST_REISSUE") != "1"):
             # The host wrongly reports a terminal approval as pending,
             # alongside a distinct genuine one (issue #238).
             return {"approvals": [
@@ -1524,17 +1542,23 @@ def result_for(method, msg):
                  "params": token_usage("cur-8", 300, 60, 300, 60)}],
                 "nextCursor": None}
         if SCENARIO == "resolved_ghost":
-            # Two-page durable history: the terminal record for ap-stale is
-            # on the first backward page; the second page ends the view.
-            if page.get("cursor") == "cur-ghost-1":
+            # Paged durable history: the terminal record for ap-stale is on
+            # backward page FAKE_GHOST_PAGES (default 1); the page after it
+            # ends the view.
+            pages = int(os.environ.get("FAKE_GHOST_PAGES", "1"))
+            cursor = page.get("cursor") or "cur-ghost-0"
+            n = int(cursor.rsplit("-", 1)[1]) + 1
+            if n > pages:
                 return {"events": [], "nextCursor": None}
-            return {"events": [{
-                        "method": "approval/resolved",
-                        "params": {"sessionId": MSP_SID,
-                                   "approvalId": "ap-stale",
-                                   "viewCursor": "cur-ghost-1",
-                                   "decision": "approved"}}],
-                    "nextCursor": "cur-ghost-1"}
+            events = []
+            if n == pages:
+                events.append({
+                    "method": "approval/resolved",
+                    "params": {"sessionId": MSP_SID,
+                               "approvalId": "ap-stale",
+                               "viewCursor": f"cur-ghost-{n}",
+                               "decision": "approved"}})
+            return {"events": events, "nextCursor": f"cur-ghost-{n}"}
         # Every other session pages back to nothing usable.
         return {"events": [], "nextCursor": None}
     if method == "session/list":
