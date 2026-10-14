@@ -1705,6 +1705,14 @@ fn auto_review_denies_on_unusable_reviewer_output() {
         Duration::from_secs(15),
     );
     c.wait_stderr("was unusable: \"not json\"", Duration::from_secs(15));
+    let notice = c.wait_for(
+        "Permission denied: reviewer failed: auto-review returned no usable decision: the reviewer reply was not a JSON decision.",
+        Duration::from_secs(15),
+    );
+    assert!(
+        notice.contains("\"sessionUpdate\":\"agent_message_chunk\""),
+        "an unusable reviewer reply must be explained in the transcript: {notice}"
+    );
     c.finish();
 }
 
@@ -1730,6 +1738,14 @@ fn auto_review_names_a_failed_reviewer_turn() {
     assert!(
         !stderr.contains("no usable decision"),
         "a failed turn is not an unusable reply: {stderr}"
+    );
+    let notice = c.wait_for(
+        "Permission denied: reviewer turn failed: contextWindowExceeded: prompt is too long.",
+        Duration::from_secs(15),
+    );
+    assert!(
+        notice.contains("\"sessionUpdate\":\"agent_message_chunk\""),
+        "a failed reviewer turn must be explained in the transcript: {notice}"
     );
     c.finish();
 }
@@ -1779,6 +1795,7 @@ fn auto_review_denies_when_the_reviewer_hangs() {
         "approval_hang",
         &[
             ("FAKE_REVIEW_HANG", "1"),
+            ("FAKE_APPROVAL_FEEDBACK", "deny"),
             ("MUSE_REVIEW_TIMEOUT_MS", "1000"),
         ],
     );
@@ -1791,6 +1808,18 @@ fn auto_review_denies_when_the_reviewer_hangs() {
     let _pid = c.prompt(&sid, "do the thing");
     c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
     c.wait_stderr("auto-review timed out", Duration::from_secs(15));
+    let notice = c.wait_for(
+        "Permission denied: reviewer timed out after 1s.",
+        Duration::from_secs(15),
+    );
+    assert!(
+        notice.contains("\"sessionUpdate\":\"agent_message_chunk\""),
+        "timeout must be explained in the transcript: {notice}"
+    );
+    c.wait_input(
+        "\"feedback\": \"Permission denied: reviewer timed out after 1s.\"",
+        Duration::from_secs(15),
+    );
     let frames = c
         .frames
         .lock()
@@ -5263,6 +5292,53 @@ fn all_approve_cancellation_fails_closed() {
         "no approving decide was sent; host saw:\n{seen}"
     );
     c.finish();
+}
+
+#[test]
+fn fallback_permission_denies_report_the_client_outcome() {
+    for (respond_with_error, notice_text, log_text) in [
+        (
+            false,
+            "Permission denied: cancelled in the editor.",
+            "session/request_permission outcome=cancelled option=none",
+        ),
+        (
+            true,
+            "Permission denied: the permission request failed in the editor.",
+            "session/request_permission failed at client; outcome=error option=none error=-32800: cancelled",
+        ),
+    ] {
+        let mut c = Client::spawn("approval_hang", &[("FAKE_APPROVAL_FEEDBACK", "deny")]);
+        let sid = c.new_session(1, "");
+        let _pid = c.prompt(&sid, "do it");
+        let permission = c.wait_for("request_permission", Duration::from_secs(15));
+        let permission_id = extract_str(&permission, "id").expect("permission request id");
+        if respond_with_error {
+            c.respond_error(&permission_id);
+        } else {
+            c.raw(&format!(
+                "{{\"jsonrpc\":\"2.0\",\"id\":\"{permission_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"cancelled\"}}}}}}"
+            ));
+        }
+        let notice = c.wait_for(notice_text, Duration::from_secs(15));
+        assert!(
+            notice.contains("\"sessionUpdate\":\"agent_message_chunk\""),
+            "fallback deny must be explained in the transcript: {notice}"
+        );
+        c.wait_input(
+            &format!("\"feedback\": \"{notice_text}\""),
+            Duration::from_secs(15),
+        );
+        c.wait_stderr(log_text, Duration::from_secs(15));
+        let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+        let decisions: Vec<&str> = input
+            .lines()
+            .filter(|line| line.contains("\"approvalId\""))
+            .collect();
+        assert_eq!(decisions.len(), 1, "one fallback decision: {input}");
+        assert!(decisions[0].contains("\"choiceId\": \"c-deny\""));
+        c.finish();
+    }
 }
 
 #[test]

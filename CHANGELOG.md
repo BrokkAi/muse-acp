@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Surface the reason when a permission is denied without an explicit editor
+  rejection. Auto-review denials, reviewer failures, unusable replies, and
+  review timeouts now add a short transcript message such as `Permission
+  denied: reviewer timed out after 90s.`, and the same text is sent as
+  decision feedback when Muse accepts it. A cancelled, failed, missing, or
+  unusable editor permission reply is explained the same way, and the adapter
+  log records the client outcome, selected option, and RPC error. Previously
+  these fail-closed paths left only Muse's generic "approval aborted" tool
+  result visible in the editor.
+
 ## 0.13.1
 
 - Fix Auto-review denying every approval with "auto-review returned no usable

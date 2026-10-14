@@ -42,12 +42,14 @@ medium or high authorization; low and medium allow.
 
 - Allow: the adapter answers with a once-scoped allowing choice when the host
   offers one, otherwise the first allowing choice.
-- Deny: the adapter answers with the host's reject choice and passes the
-  rationale as feedback when the host accepts feedback.
-- Reviewer failure or unusable output: deny. The action does not run, and the
-  reason is logged. A reviewer turn that fails denies with the host's error,
-  for example `reviewer turn failed: contextWindowExceeded: prompt is too
-  long`. An unusable reply says whether the reply was empty and logs a short
+- Deny: the adapter answers with the host's reject choice, shows
+  `Permission denied by Auto-review: <rationale>` in the editor transcript,
+  and passes that same text as feedback when the host accepts feedback.
+- Reviewer failure or unusable output: deny. The action does not run, the
+  transcript identifies the reviewer failure, and the detailed reason is
+  logged. A reviewer turn that fails denies with the host's error, for
+  example `reviewer turn failed: contextWindowExceeded: prompt is too long`.
+  An unusable reply says whether the reply was empty and logs a short
   excerpt. Either way the adapter resets the reviewer host before the next
   review.
 - Each review runs in a fresh reviewer session, so no review inherits an
@@ -55,9 +57,9 @@ medium or high authorization; low and medium allow.
   reviews.
 - Reviewer timeout: a review whose turn never ends is denied after 90 seconds
   (Codex's guardian review timeout, overridable with `MUSE_REVIEW_TIMEOUT_MS`).
-  The adapter logs the timeout, denies with a
-  reviewer-unavailable rationale, resets the reviewer session, and starts the
-  next queued review.
+  The adapter logs the timeout, shows the timeout duration in the editor
+  transcript, denies with a reviewer-unavailable rationale, resets the
+  reviewer session, and starts the next queued review.
 
 Every decision is logged to the adapter's stderr:
 
