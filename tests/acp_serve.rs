@@ -1817,7 +1817,7 @@ fn auto_review_denies_when_the_reviewer_hangs() {
         "timeout must be explained in the transcript: {notice}"
     );
     c.wait_input(
-        "\"feedback\": \"Permission denied: reviewer timed out after 1s.\"",
+        "\"feedback\": \"reviewer timed out after 1s\"",
         Duration::from_secs(15),
     );
     let frames = c
@@ -5296,15 +5296,18 @@ fn all_approve_cancellation_fails_closed() {
 
 #[test]
 fn fallback_permission_denies_report_the_client_outcome() {
+    // A `cancelled` reply follows the user's own stop, so it is logged but
+    // not explained in the transcript. Neither deny sends adapter text as
+    // decision feedback: feedback is reserved for the user's guidance.
     for (respond_with_error, notice_text, log_text) in [
         (
             false,
-            "Permission denied: cancelled in the editor.",
+            None,
             "session/request_permission outcome=cancelled option=none",
         ),
         (
             true,
-            "Permission denied: the permission request failed in the editor.",
+            Some("Permission denied: the permission request failed in the editor."),
             "session/request_permission failed at client; outcome=error option=none error=-32800: cancelled",
         ),
     ] {
@@ -5320,16 +5323,29 @@ fn fallback_permission_denies_report_the_client_outcome() {
                 "{{\"jsonrpc\":\"2.0\",\"id\":\"{permission_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"cancelled\"}}}}}}"
             ));
         }
-        let notice = c.wait_for(notice_text, Duration::from_secs(15));
-        assert!(
-            notice.contains("\"sessionUpdate\":\"agent_message_chunk\""),
-            "fallback deny must be explained in the transcript: {notice}"
-        );
-        c.wait_input(
-            &format!("\"feedback\": \"{notice_text}\""),
-            Duration::from_secs(15),
-        );
+        c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
         c.wait_stderr(log_text, Duration::from_secs(15));
+        match notice_text {
+            Some(notice_text) => {
+                let notice = c.wait_for(notice_text, Duration::from_secs(15));
+                assert!(
+                    notice.contains("\"sessionUpdate\":\"agent_message_chunk\""),
+                    "fallback deny must be explained in the transcript: {notice}"
+                );
+            }
+            None => {
+                std::thread::sleep(Duration::from_millis(500));
+                let frames = c
+                    .frames
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .join("\n");
+                assert!(
+                    !frames.contains("Permission denied"),
+                    "a cancelled reply needs no deny notice: {frames}"
+                );
+            }
+        }
         let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
         let decisions: Vec<&str> = input
             .lines()
@@ -5337,6 +5353,11 @@ fn fallback_permission_denies_report_the_client_outcome() {
             .collect();
         assert_eq!(decisions.len(), 1, "one fallback decision: {input}");
         assert!(decisions[0].contains("\"choiceId\": \"c-deny\""));
+        assert!(
+            !decisions[0].contains("\"feedback\""),
+            "a fallback deny carries no feedback: {}",
+            decisions[0]
+        );
         c.finish();
     }
 }

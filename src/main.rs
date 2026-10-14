@@ -3266,9 +3266,8 @@ fn main() {
                             &stdout,
                             &sessions,
                             job,
+                            ReviewDeny::ReviewerFailed,
                             "the reviewer host exited before deciding",
-                            "Permission denied: reviewer failed: the reviewer host exited before deciding"
-                                .to_string(),
                         );
                         start_next_review(&hosts, &stdout, &sessions);
                     }
@@ -8489,6 +8488,9 @@ struct ReviewState {
     /// When the active review expires: a reviewer turn that never ends must
     /// not stall approvals indefinitely.
     deadline: Option<std::time::Instant>,
+    /// The timeout that set `deadline`, so the timeout notice names the
+    /// duration that was enforced.
+    timeout: std::time::Duration,
 }
 
 static REVIEW_STATE: LazyLock<Mutex<ReviewState>> =
@@ -8639,8 +8641,8 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
                 stdout,
                 sessions,
                 job,
+                ReviewDeny::ReviewerFailed,
                 &error,
-                format!("Permission denied: reviewer failed: {error}"),
             );
             start_next_review(host, stdout, sessions);
             return;
@@ -8675,9 +8677,8 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
                             stdout,
                             sessions,
                             job,
+                            ReviewDeny::ReviewerFailed,
                             "reviewer session started without an id",
-                            "Permission denied: reviewer failed: reviewer session started without an id"
-                                .to_string(),
                         );
                         start_next_review(host, stdout, sessions);
                         return;
@@ -8685,14 +8686,7 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
                 },
                 Err(error) => {
                     let rationale = format!("reviewer session failed: {}", err_message(&error));
-                    deny_review_job(
-                        host,
-                        stdout,
-                        sessions,
-                        job,
-                        &rationale,
-                        format!("Permission denied: {rationale}"),
-                    );
+                    deny_review_job(host, stdout, sessions, job, ReviewDeny::Plain, &rationale);
                     start_next_review(host, stdout, sessions);
                     return;
                 }
@@ -8721,18 +8715,13 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
             st.active = Some(job);
             st.text.clear();
             st.turn = turn;
-            st.deadline = Some(std::time::Instant::now() + reviewer::review_timeout());
+            let timeout = reviewer::review_timeout();
+            st.deadline = Some(std::time::Instant::now() + timeout);
+            st.timeout = timeout;
         }
         Err(error) => {
             let rationale = format!("reviewer turn failed: {}", err_message(&error));
-            deny_review_job(
-                host,
-                stdout,
-                sessions,
-                job,
-                &rationale,
-                format!("Permission denied: {rationale}"),
-            );
+            deny_review_job(host, stdout, sessions, job, ReviewDeny::Plain, &rationale);
             reset_reviewer_host(host);
             start_next_review(host, stdout, sessions);
         }
@@ -8758,30 +8747,56 @@ fn reset_reviewer_host(host: &Arc<Hosts>) {
 }
 
 fn finished_sentence(mut text: String) -> String {
-    if !text.ends_with(['.', '!', '?']) {
+    if !text.ends_with(['.', '!', '?', '…']) {
         text.push('.');
     }
     text
 }
 
-fn review_timeout_notice() -> String {
-    format!(
-        "Permission denied: reviewer timed out after {:?}",
-        reviewer::review_timeout()
-    )
+/// A whole number of seconds as `90s`, anything else as `1500ms`.
+fn short_duration(d: std::time::Duration) -> String {
+    let ms = d.as_millis();
+    if ms.is_multiple_of(1000) {
+        format!("{}s", ms / 1000)
+    } else {
+        format!("{ms}ms")
+    }
 }
 
-/// Deny one job with the host's own reject choice, carrying the user-visible
-/// reason as feedback when the host accepts it.
+/// Why a review job was denied, which sets the transcript notice's prefix.
+#[derive(Clone, Copy)]
+enum ReviewDeny {
+    /// The reviewer assessed the action and denied it.
+    Assessment,
+    /// The reviewer could not produce a decision.
+    ReviewerFailed,
+    /// The rationale already names what went wrong.
+    Plain,
+}
+
+impl ReviewDeny {
+    fn notice(self, rationale: &str) -> String {
+        let prefix = match self {
+            ReviewDeny::Assessment => "Permission denied by Auto-review",
+            ReviewDeny::ReviewerFailed => "Permission denied: reviewer failed",
+            ReviewDeny::Plain => "Permission denied",
+        };
+        finished_sentence(format!("{prefix}: {rationale}"))
+    }
+}
+
+/// Deny one job with the host's own reject choice. The rationale goes to the
+/// host as feedback when the reject choice accepts it; the transcript notice
+/// tells the editor user why.
 fn deny_review_job(
     host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     job: ReviewJob,
+    kind: ReviewDeny,
     rationale: &str,
-    notice: String,
 ) {
-    let notice = finished_sentence(notice);
+    let notice = kind.notice(rationale);
     let Some(choice) = reviewer::deny_choice(&job.choices) else {
         log(&format!(
             "auto-review deny {}: {rationale}; no reject choice; failing closed",
@@ -8802,7 +8817,7 @@ fn deny_review_job(
         .iter()
         .find(|c| c.id == choice)
         .filter(|c| c.accepts_feedback)
-        .map(|_| notice.clone());
+        .map(|_| rationale.to_string());
     log(&format!(
         "auto-review deny {}: {rationale}",
         job.approval_id
@@ -8860,9 +8875,8 @@ fn finish_review(
                     stdout,
                     sessions,
                     job,
+                    ReviewDeny::Plain,
                     "auto-review allowed the action but the host offered no approving choice",
-                    "Permission denied: auto-review allowed the action but the host offered no approving choice"
-                        .to_string(),
                 ),
             },
             reviewer::Outcome::Deny => deny_review_job(
@@ -8870,8 +8884,8 @@ fn finish_review(
                 stdout,
                 sessions,
                 job,
+                ReviewDeny::Assessment,
                 &assessment.rationale,
-                format!("Permission denied by Auto-review: {}", assessment.rationale),
             ),
         },
         None => {
@@ -8886,8 +8900,8 @@ fn finish_review(
                 stdout,
                 sessions,
                 job,
+                ReviewDeny::ReviewerFailed,
                 rationale,
-                format!("Permission denied: reviewer failed: {rationale}"),
             );
             reset_reviewer_host(host);
         }
@@ -8907,14 +8921,7 @@ fn fail_review_turn(
     params: &J,
 ) {
     let rationale = reviewer::failed_turn_rationale(terminal, params);
-    deny_review_job(
-        host,
-        stdout,
-        sessions,
-        job,
-        &rationale,
-        format!("Permission denied: {rationale}"),
-    );
+    deny_review_job(host, stdout, sessions, job, ReviewDeny::Plain, &rationale);
     reset_reviewer_host(host);
     start_next_review(host, stdout, sessions);
 }
@@ -8925,25 +8932,26 @@ fn fail_review_turn(
 /// next queued review. A turn that completed first already took the active
 /// review, leaving nothing to expire.
 fn expire_review_deadline(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions) {
-    let job = {
+    let expired = {
         let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
         match st.deadline {
             Some(deadline) if std::time::Instant::now() >= deadline && st.active.is_some() => {
                 st.deadline = None;
-                st.active.take()
+                let timeout = st.timeout;
+                st.active.take().map(|job| (job, timeout))
             }
             _ => None,
         }
     };
-    if let Some(job) = job {
+    if let Some((job, timeout)) = expired {
         log(&format!("auto-review timed out for {}", job.approval_id));
         deny_review_job(
             host,
             stdout,
             sessions,
             job,
-            "reviewer unavailable: permission approval review timed out",
-            review_timeout_notice(),
+            ReviewDeny::Plain,
+            &format!("reviewer timed out after {}", short_duration(timeout)),
         );
         reset_reviewer_host(host);
         start_next_review(host, stdout, sessions);
@@ -11265,6 +11273,9 @@ fn send_permission_decision(
                 decision.approval_id,
                 err_message(&e)
             ));
+            if let Some(notice) = &decision.deny_notice {
+                send_agent_text(stdout, acp_sid, decision.ver, notice);
+            }
             report_approval_failure(
                 stdout,
                 acp_sid,
@@ -11354,89 +11365,66 @@ fn complete_permission(
             .map(|choice| choice.decision.to_lowercase().starts_with("approv"))
             .unwrap_or(false)
     };
-    let mut explicit_choice = false;
-    let mut deny_notice: Option<String> = None;
-    let verdict = if let Some(error) = msg.get("error") {
+    // Ok is an explicit selection of an offered choice. Err is any other
+    // reply: the log line, and the transcript notice for the fallback deny.
+    let selected: Result<String, (String, Option<&str>)> = if let Some(error) = msg.get("error") {
         let code = match error.get("code") {
             Some(J::Num(code)) => code.as_str(),
             _ => "unknown",
         };
-        log(&format!(
-            "session/request_permission failed at client; outcome=error option=none error={code}: {}; failing closed",
-            err_message(error)
-        ));
-        deny_notice =
-            Some("Permission denied: the permission request failed in the editor.".to_string());
-        match acp::fallback_deny(&choices) {
-            Some(c) => Verdict::Deny(c),
-            None => Verdict::FailClosed,
-        }
+        Err((
+            format!(
+                "session/request_permission failed at client; outcome=error option=none error={code}: {}",
+                err_message(error)
+            ),
+            Some("Permission denied: the permission request failed in the editor."),
+        ))
     } else {
-        match msg.get("result").and_then(|r| r.get("outcome")) {
-            Some(o) => {
-                let outcome_name = o.get("outcome").and_then(|v| v.as_str()).unwrap_or("");
-                let option_id = o.get("optionId").and_then(|v| v.as_str());
-                match outcome_name {
-                    "selected" => match option_id {
-                        Some(cid) if is_approving(cid) => {
-                            explicit_choice = true;
-                            Verdict::Approve(cid.to_string())
-                        }
-                        Some(cid) if choices.iter().any(|choice| choice.id == cid) => {
-                            explicit_choice = true;
-                            Verdict::Deny(cid.to_string())
-                        }
-                        _ => {
-                            log(&format!(
-                                "session/request_permission outcome=selected option={}; failing closed",
-                                option_id.unwrap_or("none")
-                            ));
-                            deny_notice = Some(
-                                "Permission denied: the editor returned no usable permission option."
-                                    .to_string(),
-                            );
-                            match acp::fallback_deny(&choices) {
-                                Some(c) => Verdict::Deny(c),
-                                None => Verdict::FailClosed,
-                            }
-                        }
-                    },
-                    _ => {
-                        let shown_outcome = if outcome_name.is_empty() {
-                            "missing"
-                        } else {
-                            outcome_name
-                        };
-                        log(&format!(
-                            "session/request_permission outcome={shown_outcome} option={}; failing closed",
-                            option_id.unwrap_or("none")
-                        ));
-                        deny_notice = Some(
-                            if outcome_name == "cancelled" {
-                                "Permission denied: cancelled in the editor."
-                            } else {
-                                "Permission denied: the editor did not approve the permission request."
-                            }
-                            .to_string(),
-                        );
-                        match acp::fallback_deny(&choices) {
-                            Some(c) => Verdict::Deny(c),
-                            None => Verdict::FailClosed,
-                        }
-                    }
-                }
+        let outcome = msg.get("result").and_then(|r| r.get("outcome"));
+        let outcome_name = outcome
+            .and_then(|o| o.get("outcome"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        let option_id = outcome
+            .and_then(|o| o.get("optionId"))
+            .and_then(|v| v.as_str());
+        let reply = format!(
+            "session/request_permission outcome={} option={}",
+            if outcome_name.is_empty() {
+                "missing"
+            } else {
+                outcome_name
+            },
+            option_id.unwrap_or("none")
+        );
+        match (outcome_name, option_id) {
+            ("selected", Some(cid)) if choices.iter().any(|choice| choice.id == cid) => {
+                Ok(cid.to_string())
             }
-            None => {
-                log("session/request_permission outcome=missing option=none; failing closed");
-                deny_notice = Some(
-                    "Permission denied: the editor did not approve the permission request."
-                        .to_string(),
-                );
-                match acp::fallback_deny(&choices) {
-                    Some(c) => Verdict::Deny(c),
-                    None => Verdict::FailClosed,
-                }
-            }
+            ("selected", _) => Err((
+                reply,
+                Some("Permission denied: the editor returned no usable permission option."),
+            )),
+            // ACP clients answer `cancelled` after `session/cancel`: the user
+            // stopped the turn, so the deny needs no explanation.
+            ("cancelled", _) => Err((reply, None)),
+            _ => Err((
+                reply,
+                Some("Permission denied: the editor did not approve the permission request."),
+            )),
+        }
+    };
+    let explicit_choice = selected.is_ok();
+    let (verdict, deny_notice) = match selected {
+        Ok(cid) if is_approving(&cid) => (Verdict::Approve(cid), None),
+        Ok(cid) => (Verdict::Deny(cid), None),
+        Err((reply, notice)) => {
+            log(&format!("{reply}; failing closed"));
+            let verdict = match acp::fallback_deny(&choices) {
+                Some(c) => Verdict::Deny(c),
+                None => Verdict::FailClosed,
+            };
+            (verdict, notice)
         }
     };
     if let Verdict::Deny(ref choice) = verdict
@@ -11453,7 +11441,7 @@ fn complete_permission(
         Verdict::Approve(c) | Verdict::Deny(c) => c,
         Verdict::FailClosed => {
             log("permission: no deny choice available; cancelling the turn instead of approving");
-            if let Some(notice) = &deny_notice {
+            if let Some(notice) = deny_notice {
                 send_agent_text(stdout, &acp_sid, ver, notice);
             }
             sessions
@@ -11479,9 +11467,6 @@ fn complete_permission(
     if pending.is_none() {
         return;
     }
-    let feedback = deny_notice
-        .clone()
-        .filter(|_| choices.iter().any(|c| c.id == choice && c.accepts_feedback));
     send_permission_decision(
         host,
         stdout,
@@ -11493,8 +11478,8 @@ fn complete_permission(
             approval_id,
             requirement,
             choice,
-            feedback,
-            deny_notice,
+            feedback: None,
+            deny_notice: deny_notice.map(str::to_string),
         },
     );
 }
@@ -13571,6 +13556,28 @@ fn complete_elicitation(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn review_deny_notices_end_once_and_name_the_enforced_duration() {
+        use super::{ReviewDeny, short_duration};
+        assert_eq!(
+            ReviewDeny::Assessment.notice("touches prod credentials"),
+            "Permission denied by Auto-review: touches prod credentials."
+        );
+        assert_eq!(
+            ReviewDeny::ReviewerFailed.notice("reply was cut…"),
+            "Permission denied: reviewer failed: reply was cut…"
+        );
+        assert_eq!(
+            ReviewDeny::Plain.notice("reviewer turn failed: boom."),
+            "Permission denied: reviewer turn failed: boom."
+        );
+        assert_eq!(short_duration(std::time::Duration::from_secs(90)), "90s");
+        assert_eq!(
+            short_duration(std::time::Duration::from_millis(1500)),
+            "1500ms"
+        );
+    }
 
     #[test]
     fn host_path_string_keeps_the_verbatim_windows_prefix() {

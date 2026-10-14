@@ -318,7 +318,7 @@ error the editor shows if Muse then refuses the profile says why.
   `_session/steering` extension (ACP v1 and v2).
 - **Approvals** — Muse approval requests surfaced as
   `session/request_permission`, with a deny-safe fallback that explains
-  cancelled or failed editor replies in the transcript, plus optional
+  failed or unusable editor replies in the transcript, plus optional
   [Auto-review](#auto-review-keep-the-boundary-lose-the-busywork) for
   workspace-local file access.
 - **MCP servers** — stdio and HTTP MCP servers attached by the editor load
