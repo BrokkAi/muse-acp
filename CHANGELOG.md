@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.13.1
 
 - Fix Auto-review denying every approval with "auto-review returned no usable
   decision" after a session has run many reviews. The adapter ran every
