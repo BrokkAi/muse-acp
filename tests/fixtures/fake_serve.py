@@ -227,6 +227,18 @@ if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "mcp-tool":
     APPROVAL_PARAMS["subject"] = {
         "kind": "tool", "toolName": "mcp__probe__secret_word",
     }
+if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "tool-described":
+    # A tool subject with no tool name anywhere, only a description.
+    APPROVAL_PARAMS.pop("toolName", None)
+    APPROVAL_PARAMS["subject"] = {
+        "kind": "tool", "description": "Query the probe server",
+    }
+if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "tool-wrapped":
+    # A generic top-level name must not hide the subject's specific tool.
+    APPROVAL_PARAMS["toolName"] = "mcp"
+    APPROVAL_PARAMS["subject"] = {
+        "kind": "tool", "toolName": "mcp__probe__secret_word",
+    }
 if os.environ.get("FAKE_APPROVAL", "") == "all-approve":
     APPROVAL_PARAMS["availableChoices"] = [
         {"choiceId": "c-yes", "label": "Yes",
