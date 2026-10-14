@@ -9963,6 +9963,24 @@ fn handle_msp(
                     if s.active_turn.as_deref() == Some(turn_id) {
                         s.active_turn = None;
                     }
+                    // The background checks end with the turn; settle their
+                    // card and withdraw the hint before the prompt settles.
+                    let mut checks = Vec::new();
+                    let status = if terminal == "failed" {
+                        "failed"
+                    } else {
+                        "completed"
+                    };
+                    s.fold.settle_background_checks(
+                        &acp_sid,
+                        Some(turn_id),
+                        status,
+                        true,
+                        &mut checks,
+                    );
+                    for line in checks {
+                        acp::send_raw(stdout, &line);
+                    }
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id);
                     let ver = s.ver;
                     let finished = pos.map(|p| s.in_flight.remove(p));
@@ -10276,27 +10294,46 @@ fn handle_msp(
             // at turn/completed / turn/unqueued. ACP has no matching state, so
             // record the blocking reminder agents for diagnostics and leave the
             // pending prompt alone.
-            let agents = match params.get("blockingAgents") {
-                Some(J::Arr(items)) => items
-                    .iter()
-                    .filter_map(|v| v.as_str())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                _ => String::new(),
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+            let agents: Vec<&str> = match params.get("blockingAgents") {
+                Some(J::Arr(items)) => items.iter().filter_map(|v| v.as_str()).collect(),
+                _ => Vec::new(),
             };
             log(&format!(
                 "turn foreground completed; background reminder checks hold it open turn={} sess={} agents={}",
-                params.get("turnId").and_then(|v| v.as_str()).unwrap_or("?"),
-                params
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?"),
+                if turn_id.is_empty() { "?" } else { turn_id },
+                if msp_sid.is_empty() { "?" } else { msp_sid },
                 if agents.is_empty() {
-                    "?"
+                    "?".to_string()
                 } else {
-                    agents.as_str()
+                    agents.join(",")
                 }
             ));
+            let Some(acp_sid) = find_acp_sid(sessions, msp_sid) else {
+                return;
+            };
+            // The SDK fold keeps this as a renderer hint on a running turn:
+            // "the answer is done while `blockingAgents` hold the turn". A
+            // replayed notice for a turn that already ended is stale.
+            let mut out = Vec::new();
+            if let Some(s) = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&acp_sid)
+                && !turn_id.is_empty()
+                && (s.active_turn.as_deref() == Some(turn_id)
+                    || s.in_flight.iter().any(|f| f.msp_turn == turn_id))
+            {
+                s.fold
+                    .on_foreground_completed(&acp_sid, s.ver, turn_id, &agents, &mut out);
+            }
+            for line in out {
+                acp::send_raw(stdout, &line);
+            }
         }
         "turn/retryScheduled" => {
             // Non-terminal by schema: it never resolves a turn-wait, so never
@@ -11812,6 +11849,12 @@ fn fail_all_with_message(stdout: &StdoutShared, sessions: &Sessions, message: &s
 /// Settle every in-flight prompt of one session with an explanation: an error
 /// response in v1, and a transcript message plus a cancelled idle in v2.
 fn fail_in_flight(stdout: &StdoutShared, s: &mut AcpSession, message: &str) {
+    let mut checks = Vec::new();
+    s.fold
+        .settle_background_checks(&s.acp_sid, None, "failed", true, &mut checks);
+    for line in checks {
+        acp::send_raw(stdout, &line);
+    }
     if s.in_flight.is_empty() {
         return;
     }

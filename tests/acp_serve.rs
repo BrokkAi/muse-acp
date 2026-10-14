@@ -2847,6 +2847,29 @@ fn turn_foreground_completed_is_consumed_and_the_turn_still_settles() {
         (count, frames.join("\n"))
     };
     assert_eq!(count, 1, "exactly one settle for the prompt: {log}");
+    // The answer-done hint and its card reach the editor while the prompt is
+    // still open, and both are withdrawn before it settles (#247).
+    let at = |needle: &str| {
+        log.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {log}"))
+    };
+    let hint = at("\"foregroundCompleted\":{\"turnId\":");
+    assert!(
+        log.contains("\"blockingAgents\":[\"agent-1\",\"agent-2\"]"),
+        "hint names the blocking agents: {log}"
+    );
+    let card = at("\"title\":\"Background checks: agent-1, agent-2\"");
+    let settled = at("\"status\":\"completed\"}");
+    let cleared = at("\"foregroundCompleted\":null");
+    let result = log.rfind(&format!("\"id\":{pid}")).unwrap();
+    assert!(
+        at("foreground done") < hint && hint < card && card < settled,
+        "hint and card follow the answer: {log}"
+    );
+    assert!(
+        settled < cleared && cleared < result,
+        "checks settle before the prompt result: {log}"
+    );
     c.wait_stderr("turn foreground completed", Duration::from_secs(15));
     c.wait_stderr("agents=agent-1,agent-2", Duration::from_secs(15));
     let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();

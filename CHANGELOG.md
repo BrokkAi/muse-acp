@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Tell the editor when a turn's answer is done but Muse's background reminder
+  checks still hold it open (#247). Muse 1.4.6+ sends
+  `turn/foregroundCompleted` right after the final content, then keeps the turn
+  running while reminder agents (`verify-reminder`, `goal-reminder`, …) run,
+  which can take a minute. The Muse SDK treats that notice as explicitly
+  non-terminal, so the ACP prompt still settles at `turn/completed`. The
+  adapter previously only logged it to stderr, so editors saw no frames at all
+  during the wait. It now sends a `session_info_update` with
+  `_meta.muse.foregroundCompleted` (`turnId`, `blockingAgents`) and one
+  in-progress `Background checks: <agents>` card. The card settles and the hint
+  clears (`foregroundCompleted: null`) just before the prompt result. A
+  reminder that resumes work and fires again settles the old card and opens a
+  new one. With `MUSE_SHOW_REMINDERS`, the per-agent cards replace the single
+  card, and the hint is still sent.
+
 ## 0.13.1
 
 - Fix Auto-review denying every approval with "auto-review returned no usable
