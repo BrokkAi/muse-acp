@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fix MCP tool approvals from Muse 1.4.6+ showing as `Muse action` with a
+  stray pending tool card (#239). These approvals carry no top-level
+  `toolName` or `toolCallId`; the tool name is only on the subject. The
+  permission is now titled from `subject.toolName` (or the subject's
+  description when it has no name) and points at the tool card already open
+  for the approval's item, or a unique id when there is none, instead of a
+  shared `?` card that never settled.
+
 - Surface the reason when a permission is denied without an explicit editor
   rejection. Auto-review denials, reviewer failures, unusable replies, and
   review timeouts now add a short transcript message such as `Permission

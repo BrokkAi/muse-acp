@@ -219,6 +219,27 @@ if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "file-write":
     APPROVAL_PARAMS["subject"] = {
         "kind": "fileAccess", "access": "write", "path": "/tmp/output.txt",
     }
+if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "mcp-tool":
+    # Muse 1.4.6 MCP shape (#239): no top-level toolName/toolCallId; the
+    # tool name lives only on the subject.
+    APPROVAL_PARAMS.pop("toolName", None)
+    APPROVAL_PARAMS.pop("toolCallId", None)
+    APPROVAL_PARAMS["itemId"] = "it-mcp"
+    APPROVAL_PARAMS["subject"] = {
+        "kind": "tool", "toolName": "mcp__probe__secret_word",
+    }
+if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "tool-described":
+    # A tool subject with no tool name anywhere, only a description.
+    APPROVAL_PARAMS.pop("toolName", None)
+    APPROVAL_PARAMS["subject"] = {
+        "kind": "tool", "description": "Query the probe server",
+    }
+if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "tool-wrapped":
+    # A generic top-level name must not hide the subject's specific tool.
+    APPROVAL_PARAMS["toolName"] = "mcp"
+    APPROVAL_PARAMS["subject"] = {
+        "kind": "tool", "toolName": "mcp__probe__secret_word",
+    }
 if os.environ.get("FAKE_APPROVAL", "") == "all-approve":
     APPROVAL_PARAMS["availableChoices"] = [
         {"choiceId": "c-yes", "label": "Yes",
@@ -698,6 +719,13 @@ def on_turn_start(params):
             "args": json.dumps({"command": "printf data > inferred.txt"})}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO in ("approval", "pending_reconcile_dup"):
+        if os.environ.get("FAKE_MCP_TOOL_ITEM", "") == "1":
+            # The tool card Muse opens before asking; the approval names
+            # only its itemId.
+            notify("item/started", {**base, "item": {
+                "itemId": "it-mcp", "kind": "toolCall", "callId": "call-mcp-7",
+                "turnId": tid, "status": "pending",
+                "tool": "mcp__probe__secret_word", "args": "{}"}})
         notify("approval/requested", approval_params())
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO in ("approval_hang", "approval_queue"):

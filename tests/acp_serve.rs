@@ -2091,6 +2091,51 @@ fn file_write_permission_is_not_presented_as_a_read() {
 }
 
 #[test]
+fn mcp_tool_permission_title_comes_from_the_subject() {
+    // #239: Muse 1.4.6 omits top-level toolName/toolCallId for MCP tools;
+    // the name is only subject.toolName, and the card is found by itemId.
+    for (item_started, tool_call_id) in [("1", "call-mcp-7"), ("", "approval-ap-1")] {
+        let mut c = Client::spawn(
+            "approval",
+            &[
+                ("FAKE_APPROVAL_SUBJECT", "mcp-tool"),
+                ("FAKE_MCP_TOOL_ITEM", item_started),
+            ],
+        );
+        let sid = c.new_session(2, "");
+        let _pid = c.prompt(&sid, "use the probe");
+        let perm = c.wait_for("request_permission", Duration::from_secs(15));
+        assert!(
+            perm.contains("\"title\":\"mcp__probe__secret_word\""),
+            "MCP tool approval must be titled from subject.toolName: {perm}"
+        );
+        assert!(
+            perm.contains(&format!("\"toolCallId\":\"{tool_call_id}\"")),
+            "MCP tool approval must point at {tool_call_id}: {perm}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn tool_permission_title_prefers_the_subject_then_its_description() {
+    for (subject, title) in [
+        ("tool-described", "Query the probe server"),
+        ("tool-wrapped", "mcp__probe__secret_word"),
+    ] {
+        let mut c = Client::spawn("approval", &[("FAKE_APPROVAL_SUBJECT", subject)]);
+        let sid = c.new_session(2, "");
+        let _pid = c.prompt(&sid, "use the probe");
+        let perm = c.wait_for("request_permission", Duration::from_secs(15));
+        assert!(
+            perm.contains(&format!("\"title\":\"{title}\"")),
+            "{subject} approval must be titled {title}: {perm}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn user_input_options_reach_the_client() {
     let mut c = Client::spawn("questions", &[]);
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");

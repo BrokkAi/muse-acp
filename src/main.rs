@@ -11098,17 +11098,37 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
         }
         return;
     }
+    // Muse 1.4.6 MCP approvals omit the top-level toolCallId and toolName
+    // (#239). Point the permission at the card the fold already opened for
+    // the approval's item, or at least at a card no other approval shares.
     let tool_call_id = params
-        .get("toolCallId")
-        .and_then(|v| v.as_str())
-        .unwrap_or("?")
-        .to_string();
+        .non_empty_str("toolCallId")
+        .map(str::to_string)
+        .or_else(|| {
+            let item_id = params.non_empty_str("itemId")?;
+            sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&acp_sid)?
+                .fold
+                .tool_call_id(item_id)
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("approval-{approval_id}"));
     let subject = params.get("subject").cloned().unwrap_or(J::Null);
-    let tool_name = params
-        .get("toolName")
-        .and_then(|v| v.as_str())
-        .unwrap_or("Muse action");
     let subject_kind = subject.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    // A tool subject names the specific tool; a top-level name may only be
+    // its wrapper.
+    let named_tool = if subject_kind == "tool" {
+        subject
+            .non_empty_str("toolName")
+            .or_else(|| params.non_empty_str("toolName"))
+    } else {
+        params
+            .non_empty_str("toolName")
+            .or_else(|| subject.non_empty_str("toolName"))
+    };
+    let tool_name = named_tool.unwrap_or("Muse action");
     let command = subject.get("command").and_then(|v| v.as_str());
     let path = subject.get("path").and_then(|v| v.as_str());
     let target = subject.get("target").and_then(|v| v.as_str());
@@ -11123,6 +11143,13 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
             (None, None) => description.unwrap_or(tool_name).to_string(),
         },
         "network" => target.or(description).unwrap_or(tool_name).to_string(),
+        "tool" => named_tool
+            .or(description)
+            .or(command)
+            .or(path)
+            .or(target)
+            .unwrap_or(tool_name)
+            .to_string(),
         _ => command
             .or(path)
             .or(target)
@@ -11142,6 +11169,8 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
             _ => "other",
         },
         "network" => "fetch",
+        // Match the kind the tool's own card gets from its name.
+        "tool" => fold::tool_kind(tool_name),
         _ => "other",
     };
     let raw_input = match &subject {
