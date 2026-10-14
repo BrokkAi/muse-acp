@@ -218,6 +218,14 @@ if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "file-write":
     APPROVAL_PARAMS["subject"] = {
         "kind": "fileAccess", "access": "write", "path": "/tmp/output.txt",
     }
+if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "mcp-tool":
+    # Muse 1.4.6 MCP shape (#239): no top-level toolName/toolCallId; the
+    # tool name lives only on the subject.
+    APPROVAL_PARAMS.pop("toolName", None)
+    APPROVAL_PARAMS.pop("toolCallId", None)
+    APPROVAL_PARAMS["subject"] = {
+        "kind": "tool", "toolName": "mcp__probe__secret_word",
+    }
 if os.environ.get("FAKE_APPROVAL", "") == "all-approve":
     APPROVAL_PARAMS["availableChoices"] = [
         {"choiceId": "c-yes", "label": "Yes",

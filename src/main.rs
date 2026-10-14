@@ -10979,9 +10979,18 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
         .unwrap_or("?")
         .to_string();
     let subject = params.get("subject").cloned().unwrap_or(J::Null);
+    // Muse 1.4.6 MCP approvals omit the top-level toolName and carry it
+    // only as subject.toolName (#239).
     let tool_name = params
         .get("toolName")
         .and_then(|v| v.as_str())
+        .filter(|name| !name.is_empty())
+        .or_else(|| {
+            subject
+                .get("toolName")
+                .and_then(|v| v.as_str())
+                .filter(|name| !name.is_empty())
+        })
         .unwrap_or("Muse action");
     let subject_kind = subject.get("kind").and_then(|v| v.as_str()).unwrap_or("");
     let command = subject.get("command").and_then(|v| v.as_str());
@@ -10998,6 +11007,7 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
             (None, None) => description.unwrap_or(tool_name).to_string(),
         },
         "network" => target.or(description).unwrap_or(tool_name).to_string(),
+        "tool" => tool_name.to_string(),
         _ => command
             .or(path)
             .or(target)
