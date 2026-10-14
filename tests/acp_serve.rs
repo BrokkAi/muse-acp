@@ -2847,12 +2847,65 @@ fn turn_foreground_completed_is_consumed_and_the_turn_still_settles() {
         (count, frames.join("\n"))
     };
     assert_eq!(count, 1, "exactly one settle for the prompt: {log}");
+    // The answer-done hint and its card reach the editor while the prompt is
+    // still open, and both are withdrawn before it settles (#247).
+    let at = |needle: &str| {
+        log.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {log}"))
+    };
+    let hint = at("\"foregroundCompleted\":{\"turnId\":");
+    assert!(
+        log.contains("\"blockingAgents\":[\"agent-1\",\"agent-2\"]"),
+        "hint names the blocking agents: {log}"
+    );
+    let card = at("\"title\":\"Background checks: agent-1, agent-2\"");
+    let settled = at("\"status\":\"completed\"}");
+    let cleared = at("\"foregroundCompleted\":null");
+    let result = log.rfind(&format!("\"id\":{pid}")).unwrap();
+    assert!(
+        at("foreground done") < hint && hint < card && card < settled,
+        "hint and card follow the answer: {log}"
+    );
+    assert!(
+        settled < cleared && cleared < result,
+        "checks settle before the prompt result: {log}"
+    );
     c.wait_stderr("turn foreground completed", Duration::from_secs(15));
     c.wait_stderr("agents=agent-1,agent-2", Duration::from_secs(15));
     let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
     assert!(
         !stderr.contains("unhandled MSP notification: turn/foregroundCompleted"),
         "the event is handled, not unhandled: {stderr}"
+    );
+    c.finish();
+}
+
+#[test]
+fn a_retracted_turn_closes_its_background_checks_before_settling() {
+    let mut c = Client::spawn("foreground_then_retracted", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"cancelled\""),
+        "the retract settles the prompt: {done}"
+    );
+    let log = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    let at = |needle: &str| {
+        log.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {log}"))
+    };
+    let card = at("\"title\":\"Background checks: agent-1\"");
+    let settled = at("\"status\":\"completed\"}");
+    let cleared = at("\"foregroundCompleted\":null");
+    let result = log.rfind(&format!("\"id\":{pid}")).unwrap();
+    assert!(
+        card < settled && settled < cleared && cleared < result,
+        "no open card or hint outlives the prompt: {log}"
     );
     c.finish();
 }
