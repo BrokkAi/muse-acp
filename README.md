@@ -39,7 +39,8 @@ request. It answers with strict JSON - `risk_level`, `user_authorization`,
 `outcome`, and a rationale. Low and medium risk actions proceed; critical
 risk is denied; high risk proceeds only when your instructions authorize it.
 A reviewer failure or an unusable answer denies the action rather than
-letting it run. Every decision is logged to stderr with its rationale.
+letting it run. Denials are shown in the editor transcript with the specific
+reason, and every decision is logged to stderr with its rationale.
 
 ```mermaid
 flowchart TD
@@ -316,7 +317,8 @@ error the editor shows if Muse then refuses the profile says why.
   cancellation with a terminal event, and exact-turn steering over the
   `_session/steering` extension (ACP v1 and v2).
 - **Approvals** — Muse approval requests surfaced as
-  `session/request_permission`, with a deny-safe fallback, plus optional
+  `session/request_permission`, with a deny-safe fallback that explains
+  failed or unusable editor replies in the transcript, plus optional
   [Auto-review](#auto-review-keep-the-boundary-lose-the-busywork) for
   workspace-local file access.
 - **MCP servers** — stdio and HTTP MCP servers attached by the editor load

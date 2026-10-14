@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Surface the reason when a permission is denied without an explicit editor
+  rejection. Auto-review denials, reviewer failures, unusable replies, and
+  review timeouts now add a short transcript message such as `Permission
+  denied: reviewer timed out after 90s.`; the reviewer's rationale is still
+  what Muse receives as decision feedback. A failed, missing, or unusable
+  editor permission reply is explained the same way, without sending the
+  notice to the model as feedback. A `cancelled` reply follows the user's own
+  stop, so it adds no message. The adapter log records the client outcome,
+  selected option, and RPC error for every fallback deny. Previously these
+  fail-closed paths left only Muse's generic "approval aborted" tool result
+  visible in the editor.
+
 - Tell the editor when a turn's answer is done but Muse's background reminder
   checks still hold it open (#247). Muse 1.4.6+ sends
   `turn/foregroundCompleted` right after the final content, then keeps the turn
