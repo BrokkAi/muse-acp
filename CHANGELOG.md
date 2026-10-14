@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Fix Auto-review denying every approval with "auto-review returned no usable
+  decision" after a session has run many reviews. The adapter ran every
+  review as a new turn in one long-lived reviewer session, so the session's
+  history grew with each review prompt. Once the reviewer turn failed (for
+  example, the provider rejected the oversized history), the adapter ignored
+  the `failed` terminal, parsed the empty reply, and denied with the generic
+  unusable-decision message. The reviewer session was never reset on that
+  path, so every later approval failed the same way, and Muse reported each
+  one as "approval aborted". Each review now starts a fresh reviewer session,
+  and the reviewer host is recycled every 32 reviews. A `failed` or
+  `cancelled` reviewer turn now denies with the host's error (for example,
+  `reviewer turn failed: contextWindowExceeded: prompt is too long`) and
+  resets the reviewer host. An unparseable reply says whether it was empty,
+  logs a short excerpt to stderr, and also resets the reviewer host.
+
 ## 0.13.0
 
 - Re-pin the vendored Muse SDK conformance corpus to `a0c8611` (2026-10-13,

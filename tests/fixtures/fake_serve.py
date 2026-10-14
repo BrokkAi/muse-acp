@@ -162,10 +162,11 @@ SCHEMA = {"fingerprint": FP, "version": 1}
 MSP_SID = os.environ.get("FAKE_SESSION_ID", "msp-sess-1")
 SCENARIO = os.environ.get("FAKE_SCENARIO", "happy")
 MODE = os.environ.get("FAKE_MODE", "promptUnmatched")
-# The adapter launches a third, memory-only host for auto-review. It serves
-# one reviewer session and answers each review turn with scripted JSON.
+# The adapter launches a third, memory-only host for auto-review. It mints a
+# distinct reviewer session per session/start and answers each review turn
+# with scripted JSON.
 REVIEW_HOST = "--no-session-log" in sys.argv
-REVIEW_SID = "msp-reviewer"
+REVIEW_SESSIONS = [0]
 # When set, session/setApprovalMode folds to this mode instead of echoing the
 # request, modelling a host that downgrades or pins the effective mode.
 FOLDED_MODE = os.environ.get("FAKE_FOLDED_MODE", "")
@@ -1246,7 +1247,10 @@ def on_turn_start(params):
 def result_for(method, msg):
     if REVIEW_HOST:
         if method == "session/start":
-            return {"session": session_obj(session_id=REVIEW_SID),
+            REVIEW_SESSIONS[0] += 1
+            log_method(f"review-session-{REVIEW_SESSIONS[0]}")
+            return {"session": session_obj(
+                        session_id=f"msp-reviewer-{REVIEW_SESSIONS[0]}"),
                     "viewCursor": "cur-review"}
         if method == "turn/start":
             log_input(msg.get("params", {}))
@@ -2471,18 +2475,29 @@ def main():
                         # no turn/completed, so the adapter must time out
                         # the review and deny the approval.
                         continue
+                    review_sid = msg.get("params", {}).get("sessionId", "")
+                    if os.environ.get("FAKE_REVIEW_TERMINAL") == "failed":
+                        # The provider rejects the review turn: no reply
+                        # text, only a failed terminal with a typed error.
+                        notify("turn/completed", {
+                            "sessionId": review_sid, "turnId": "review-turn-1",
+                            "terminal": "failed",
+                            "error": {"kind": "contextWindowExceeded",
+                                      "message": "prompt is too long",
+                                      "retryable": False}})
+                        continue
                     text = os.environ.get(
                         "FAKE_REVIEW_TEXT",
                         '{"outcome":"allow","rationale":"routine action"}')
                     notify("item/delta", {
-                        "sessionId": REVIEW_SID, "itemId": "review-msg",
+                        "sessionId": review_sid, "itemId": "review-msg",
                         "field": "text", "delta": text})
                     notify("item/completed", {
-                        "sessionId": REVIEW_SID,
+                        "sessionId": review_sid,
                         "item": {"itemId": "review-msg", "kind": "agentMessage",
                                  "status": "completed", "text": text}})
                     notify("turn/completed", {
-                        "sessionId": REVIEW_SID, "turnId": "review-turn-1",
+                        "sessionId": review_sid, "turnId": "review-turn-1",
                         "terminal": "completed"})
                     continue
                 if SCENARIO in ("session_list_stream", "session_list_stream_denied") \

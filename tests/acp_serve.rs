@@ -1700,7 +1700,76 @@ fn auto_review_denies_on_unusable_reviewer_output() {
     let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
     let _pid = c.prompt(&sid, "do the thing");
     c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
-    c.wait_stderr("auto-review deny", Duration::from_secs(15));
+    c.wait_stderr(
+        "auto-review deny ap-1: auto-review returned no usable decision: the reviewer reply was not a JSON decision",
+        Duration::from_secs(15),
+    );
+    c.wait_stderr("was unusable: \"not json\"", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn auto_review_names_a_failed_reviewer_turn() {
+    // A provider that rejects the review prompt ends the reviewer turn
+    // `failed` with no reply text. The denial must carry the host's error,
+    // not report the missing reply as an unusable decision.
+    let mut c = Client::spawn("approval_hang", &[("FAKE_REVIEW_TERMINAL", "failed")]);
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "open an issue");
+    c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
+    c.wait_stderr(
+        "auto-review deny ap-1: reviewer turn failed: contextWindowExceeded: prompt is too long",
+        Duration::from_secs(15),
+    );
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap();
+    assert!(
+        !stderr.contains("no usable decision"),
+        "a failed turn is not an unusable reply: {stderr}"
+    );
+    c.finish();
+}
+
+#[test]
+fn auto_review_starts_a_fresh_reviewer_session_per_review() {
+    // A reused reviewer session accumulates every earlier review prompt until
+    // the provider rejects it, after which every approval is denied.
+    let mut c = Client::spawn("approval_queue", &[]);
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "do the thing");
+    c.wait_input(
+        "\"approvalId\": \"approval-second\"",
+        Duration::from_secs(20),
+    );
+    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    for approval in ["ap-1", "approval-second"] {
+        let decision = input
+            .lines()
+            .find(|line| line.contains(&format!("\"approvalId\": \"{approval}\"")))
+            .unwrap_or_else(|| panic!("{approval} decided: {input}"));
+        assert!(
+            decision.contains("\"choiceId\": \"c-allow\""),
+            "{approval} is allowed: {decision}"
+        );
+    }
+    let reviews: Vec<&str> = input
+        .lines()
+        .filter(|line| line.contains("You are judging one planned coding-agent action"))
+        .collect();
+    assert_eq!(reviews.len(), 2, "one review turn per approval: {input}");
+    assert!(
+        reviews[0].contains("msp-reviewer-1") && reviews[1].contains("msp-reviewer-2"),
+        "each review runs in its own reviewer session: {input}"
+    );
     c.finish();
 }
 
