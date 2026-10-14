@@ -181,6 +181,10 @@ pub struct AcpSession {
     /// connection. This suppresses duplicate delivery after a decision while
     /// still allowing a later requirement stage to open.
     pub approval_seen: std::collections::HashSet<String>,
+    /// Approval ids with a durable terminal decision (`approval/resolved`),
+    /// learned live or read back from history on reattach. A stale pending
+    /// projection must never reopen one; genuine approvals are unaffected.
+    pub approval_resolved: std::collections::HashSet<String>,
     /// Approvals awaiting display while another permission is shown. Raw MSP
     /// `approval/request` params; drained one at a time because the adapter
     /// shows one ACP permission request per session at a time.

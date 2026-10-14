@@ -982,16 +982,84 @@ fn refresh_all_subscription_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sess
     }
 }
 
-/// Latest usage for a resumed session whose history carried none.
-///
-/// Two reads, because the host exposes the two halves in different places.
-/// `session/contextUsage` is never durable-sourced -- it does not appear in a
-/// `view/page` at all -- and the default `auto` history rung resolves to
-/// `inline` in practice, which carries no snapshot. Occupancy therefore only
-/// comes from a snapshot rung, asked for explicitly; the durable page can
-/// still recover the cumulative block, which is worth having so the first
-/// frame after a reattach reports real totals instead of nulls.
-///
+/// Read durable history back from the head and remember every approval it
+/// already resolved, so a stale pending projection cannot reopen one
+/// (issue #238). History that cannot be read proves nothing: approvals it
+/// never reached keep the ordinary permission decision, never an implicit
+/// approval. Paging is bounded for the same reason.
+fn seed_resolved_approvals(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str, msp_sid: &str) {
+    const MAX_PAGES: usize = 100;
+    let mut resolved: Vec<String> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut requested = std::collections::HashSet::new();
+    for _ in 0..MAX_PAGES {
+        let cmd = host.mint_cmd("cmd-");
+        let cursor_json = cursor
+            .as_deref()
+            .map(|c| format!(",\"cursor\":{}", esc(c)))
+            .unwrap_or_default();
+        let page = match host.command(
+            "view/page",
+            &format!(
+                "{{\"commandId\":{},\"sessionId\":{},\"direction\":\"backward\",\"limit\":100{cursor_json}}}",
+                esc(&cmd),
+                esc(msp_sid),
+            ),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                log(&format!(
+                    "resolved-approval history read failed: {}",
+                    err_message(&e)
+                ));
+                break;
+            }
+        };
+        let Some(J::Arr(events)) = page.get("events") else {
+            log("resolved-approval history read returned no events");
+            break;
+        };
+        for event in events {
+            if event.get("method").and_then(|v| v.as_str()) != Some("approval/resolved") {
+                continue;
+            }
+            let Some(params) = event.get("params") else {
+                continue;
+            };
+            if let Some(owner) = params.get("sessionId").and_then(|v| v.as_str())
+                && owner != msp_sid
+            {
+                continue;
+            }
+            if let Some(id) = params.get("approvalId").and_then(|v| v.as_str())
+                && !id.is_empty()
+            {
+                resolved.push(id.to_string());
+            }
+        }
+        match page.get("nextCursor").and_then(|v| v.as_str()) {
+            Some(next) if !next.is_empty() && requested.insert(next.to_string()) => {
+                cursor = Some(next.to_string());
+            }
+            _ => break,
+        }
+    }
+    if resolved.is_empty() {
+        return;
+    }
+    let count = resolved.len();
+    if let Some(s) = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(acp_sid)
+    {
+        s.approval_resolved.extend(resolved);
+    }
+    log(&format!(
+        "pending reconciliation: remembered {count} resolved approval(s) from durable history"
+    ));
+}
+
 /// Pull `approval/listPending` after attach and reconcile both halves of the
 /// pending set (approvals and user input) with what is already displayed.
 /// Deduplication is by approval/user-input id, so pull-versus-reissue races
@@ -1020,6 +1088,12 @@ fn reconcile_pending(
         ));
         return;
     }
+    // The pending projection can include approvals durable history already
+    // resolved (issue #238). Learn the terminal ids first so neither this
+    // pull nor a reissued request reopens them.
+    if approvals_targeted {
+        seed_resolved_approvals(host, sessions, acp_sid, &msp_sid);
+    }
     // This is a log-fold query: no commandId, no admission record.
     let params = format!("{{\"sessionId\":{}}}", esc(&msp_sid));
     let r = match host.command("approval/listPending", &params) {
@@ -1035,6 +1109,20 @@ fn reconcile_pending(
     let (mut n_approvals, mut n_inputs) = (0usize, 0usize);
     if approvals_targeted && let Some(J::Arr(approvals)) = r.get("approvals") {
         for a in approvals.clone() {
+            let approval_id = a
+                .get("approvalId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let resolved = !approval_id.is_empty()
+                && sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(acp_sid)
+                    .is_some_and(|s| s.approval_resolved.contains(&approval_id));
+            if resolved {
+                continue;
+            }
             let known = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -1081,6 +1169,16 @@ fn reconcile_pending(
     ));
 }
 
+/// Latest usage for a resumed session whose history carried none.
+///
+/// Two reads, because the host exposes the two halves in different places.
+/// `session/contextUsage` is never durable-sourced -- it does not appear in a
+/// `view/page` at all -- and the default `auto` history rung resolves to
+/// `inline` in practice, which carries no snapshot. Occupancy therefore only
+/// comes from a snapshot rung, asked for explicitly; the durable page can
+/// still recover the cumulative block, which is worth having so the first
+/// frame after a reattach reports real totals instead of nulls.
+///
 /// Restores facts, not cost: historic completions stay unpriced.
 fn backfill_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
     let (msp_sid, want_context, want_totals, want_reasoning) = match sessions
@@ -4031,6 +4129,7 @@ fn handle_acp(
                             in_flight: Vec::new(),
                             pending_perm: None,
                             approval_seen: std::collections::HashSet::new(),
+                            approval_resolved: std::collections::HashSet::new(),
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
@@ -4388,6 +4487,7 @@ fn handle_acp(
                             in_flight: Vec::new(),
                             pending_perm: None,
                             approval_seen: std::collections::HashSet::new(),
+                            approval_resolved: std::collections::HashSet::new(),
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
@@ -4952,6 +5052,7 @@ fn handle_acp(
                             in_flight: Vec::new(),
                             pending_perm: None,
                             approval_seen: std::collections::HashSet::new(),
+                            approval_resolved: std::collections::HashSet::new(),
                             perm_queue: Vec::new(),
                             pending_ui: Vec::new(),
                             ui_seen: std::collections::HashSet::new(),
@@ -10089,6 +10190,17 @@ fn handle_msp(
             // Child-stream approvals open on their owner session, so resolve
             // them through the same routing or the prompt is never withdrawn.
             if let Some((acp_sid, _, _)) = owner_for_msp_session(sessions, msp_sid) {
+                // Terminal is terminal: remember it and drop any queued
+                // twin so a stale reissue can never reopen it (#238).
+                if !approval_id.is_empty() {
+                    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                    if let Some(s) = map.get_mut(&acp_sid) {
+                        s.approval_resolved.insert(approval_id.to_string());
+                        s.perm_queue.retain(|q| {
+                            q.get("approvalId").and_then(|v| v.as_str()) != Some(approval_id)
+                        });
+                    }
+                }
                 if invalidate_pending_approval(stdout, sessions, &acp_sid, Some(approval_id), false)
                 {
                     pop_queued_approval(host, stdout, sessions, &acp_sid);
@@ -10899,6 +11011,18 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
         .to_string();
     if approval_id.is_empty() {
         log("approval dropped: missing approvalId");
+        return;
+    }
+    // A terminal approval never reopens, however stale the projection that
+    // reissues it (issue #238). This precedes adapter policy so auto-review
+    // cannot decide a ghost either.
+    let already_resolved = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&acp_sid)
+        .is_some_and(|s| s.approval_resolved.contains(&approval_id));
+    if already_resolved {
+        log(&format!("approval {approval_id} dropped: already resolved"));
         return;
     }
     let requirement = params

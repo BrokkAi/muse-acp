@@ -17,6 +17,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   approval_hang stays pending after the approval so client decisions can be tested
   approval_resolved_elsewhere approval/requested, then approval/resolved by policy
   child_approval_resolved a child-stream approval, then approval/resolved on the child
+  resolved_ghost listPending returns a resolved approval plus a genuine one;
+               view/page carries the durable approval/resolved for the ghost
   question_settled_elsewhere userInput/requested, then userInput/settled by another actor
   questions    userInput/requested with options, then completed
   questions_multiple userInput/requested with multiple-selection options
@@ -1297,6 +1299,15 @@ def result_for(method, msg):
         if SCENARIO == "pending_reconcile_dup":
             # The same approval the adapter is already displaying.
             return {"approvals": [dict(APPROVAL_PARAMS)], "userInputs": []}
+        if SCENARIO == "resolved_ghost":
+            # The host wrongly reports a terminal approval as pending,
+            # alongside a distinct genuine one (issue #238).
+            return {"approvals": [
+                        approval_params(approvalId="ap-stale",
+                                        toolCallId="call-stale"),
+                        approval_params(approvalId="ap-live",
+                                        toolCallId="call-live")],
+                    "userInputs": []}
         if SCENARIO == "status_flags":
             return {"approvals": [dict(APPROVAL_PARAMS, approvalId="ap-status")],
                     "userInputs": [question_params("ui-status")]}
@@ -1512,6 +1523,18 @@ def result_for(method, msg):
                 {"method": "session/tokenUsage",
                  "params": token_usage("cur-8", 300, 60, 300, 60)}],
                 "nextCursor": None}
+        if SCENARIO == "resolved_ghost":
+            # Two-page durable history: the terminal record for ap-stale is
+            # on the first backward page; the second page ends the view.
+            if page.get("cursor") == "cur-ghost-1":
+                return {"events": [], "nextCursor": None}
+            return {"events": [{
+                        "method": "approval/resolved",
+                        "params": {"sessionId": MSP_SID,
+                                   "approvalId": "ap-stale",
+                                   "viewCursor": "cur-ghost-1",
+                                   "decision": "approved"}}],
+                    "nextCursor": "cur-ghost-1"}
         # Every other session pages back to nothing usable.
         return {"events": [], "nextCursor": None}
     if method == "session/list":

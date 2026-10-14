@@ -7295,6 +7295,43 @@ fn resume_reconciliation_does_not_duplicate_displayed_approval() {
 }
 
 #[test]
+fn resume_does_not_reopen_resolved_approvals() {
+    // Issue #238: the host's pending projection includes an approval that
+    // durable history already resolved. Reattach must present only the
+    // distinct genuine approval, never the terminal ghost.
+    let mut c = Client::spawn("resolved_ghost", &[]);
+    let sid = c.new_session(1, "");
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "resume failed: {frame}");
+
+    let perm = c.wait_for("session/request_permission", Duration::from_secs(15));
+    assert!(
+        perm.contains("call-live"),
+        "genuine approval missing: {perm}"
+    );
+    c.wait_stderr(
+        "pending reconciliation: 1 approval(s), 0 user input(s) presented",
+        Duration::from_secs(10),
+    );
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("call-stale"),
+        "resolved approval was reopened: {frames}"
+    );
+    assert_eq!(
+        frames.matches("session/request_permission").count(),
+        1,
+        "expected exactly one permission presentation: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
 fn status_changed_seeds_and_targets_session_attention() {
     let mut c = Client::spawn("status_flags", &[]);
     let sid = c.new_session(2, "");
