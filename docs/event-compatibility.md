@@ -104,7 +104,11 @@ and are covered by request-schema conformance tests. The same holds for the
 commands, which editors reach through the adapter's `/goal` slash command
 rather than as raw ACP methods (a command that wakes a goal turn keeps its
 prompt open until that turn's `turn/completed`), for `session/rename`, which editors reach
-through `/rename <name>`, and for `workflow/childControl`, which editors reach
+through `/rename <name>` (the adapter requests the 1.4.8 `sessionRename`
+capability and answers `/rename` with the typed `capabilityRequired` when a
+host that knows the name withholds it; hosts that predate the registry entry
+keep serving the method without the grant), and for `workflow/childControl`,
+which editors reach
 through `/workflow-child skip|retry <childId>`. `workflow/pause` and
 `workflow/resume` are reached through `/workflow pause|resume [<runId>]`: a
 single live run may be implied, the ids come from the folded workflow items

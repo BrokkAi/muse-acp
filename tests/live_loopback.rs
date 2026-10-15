@@ -551,6 +551,54 @@ fn host_feature_gates_read_the_installed_muse_version() {
     adapter.finish();
 }
 
+/// `/rename` against a real host, across the `sessionRename` registry entry.
+///
+/// The adapter requests `sessionRename` at `initialize` unconditionally
+/// (Muse 1.4.8 added it to the grantable registry) and records the grant on
+/// its handshake. A host that predates the entry ignores the unknown name and
+/// withholds it, yet still serves `session/rename`, so `/rename` must keep
+/// working on every pinned build; the 1.4.8 pin proves the granted path. The
+/// startup log names both facts, so each pin asserts what it actually saw
+/// rather than what the test assumes.
+#[test]
+fn rename_drives_a_real_host_across_the_capability_registry() {
+    let test = "rename_drives_a_real_host_across_the_capability_registry";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    let mut adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let want = if release >= (1, 4, 8) {
+        "session rename: granted=true available=true"
+    } else {
+        "session rename: granted=false available=true"
+    };
+    let log = std::fs::read_to_string(&adapter.log).unwrap();
+    assert!(log.contains(want), "expected {want:?} in:\n{log}");
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.prompt(&session, "/rename Live rename probe");
+    let result = adapter.result(id);
+    assert_eq!(result["stopReason"], "end_turn", "{result}");
+    // The host normalizes the requested name (a live 1.4.7 lower-cases it),
+    // so the title is compared case-insensitively against the probe.
+    let renamed = adapter.wait("the rename to reach ACP", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["sessionId"] == json!(session)
+            && frame["params"]["update"]["sessionUpdate"] == "session_info_update"
+            && frame["params"]["update"]["title"]
+                .as_str()
+                .is_some_and(|title| title.eq_ignore_ascii_case("Live rename probe"))
+    });
+    assert!(
+        renamed["params"]["update"]["title"]
+            .as_str()
+            .is_some_and(|title| title.eq_ignore_ascii_case("Live rename probe")),
+        "{renamed}"
+    );
+    adapter.finish();
+}
+
 /// The Muse release and full label the adapter reported for its host, read
 /// from its own `host-ready` line.
 fn adapter_host_release(adapter: &Adapter) -> ((u64, u64, u64), String) {

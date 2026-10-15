@@ -148,6 +148,15 @@ FAKE_FEEDBACK_OUTCOME selects the result outcome (default uploaded);
 FAKE_FEEDBACK_NOTES=1 adds sessionNote and localTracingNote;
 FAKE_FEEDBACK_HOST_ERROR=1 fails the method with an internal error.
 
+Session rename: `sessionRename` is granted when requested unless
+FAKE_NO_SESSION_RENAME=1. Unlike the enforced grants above, the withheld
+grant still answers `session/rename` (status accepted), matching the live
+1.4.8 host, which registers the capability but does not enforce it; that
+leaves the adapter's own gate as the only thing between a withheld grant and
+a silent rename. FAKE_SERVER_VERSION decides whether that gate applies: a
+1.4.8+ version withholds the capability, while an older version merely
+ignores the unknown name and the adapter keeps driving `session/rename`.
+
 Session MCP (every scenario): `sessionMcp` is granted when requested unless
 FAKE_NO_SESSION_MCP=1. As on the live host, a non-empty config.mcpServers
 without the grant fails with capabilityRequired. FAKE_MCP_CONFLICT=1 rejects
@@ -194,6 +203,7 @@ EXPERIMENTAL_API = [False]
 CUA_GRANTED = [False]
 SESSION_MCP = [False]
 FEEDBACK = [False]
+SESSION_RENAME = [False]
 MCP_CONFLICTED = [False]
 USAGE_READS = [0]
 SKILL_READS = [0]
@@ -1373,6 +1383,10 @@ def result_for(method, msg):
                           and os.environ.get("FAKE_NO_COMPUTER_USE") != "1")
         if CUA_GRANTED[0]:
             granted.append("computerUseSetup")
+        SESSION_RENAME[0] = ("sessionRename" in requested
+                             and os.environ.get("FAKE_NO_SESSION_RENAME") != "1")
+        if SESSION_RENAME[0]:
+            granted.append("sessionRename")
         USER_INPUT_DIALOGS[0] = msg.get("params", {}).get("capabilities", {}).get(
             "userInputDialogs", True) is not False
         EXPERIMENTAL_API[0] = msg.get("params", {}).get("capabilities", {}).get(
