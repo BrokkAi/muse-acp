@@ -2752,6 +2752,33 @@ mod corpus_tests {
     }
 
     #[test]
+    fn web_search_items_render_through_the_generic_card_path() {
+        // `webSearch` is a Muse 1.4.6 item kind with no dedicated ACP
+        // presentation. The unknown-kind path renders its `fallbackText` as a
+        // generic card and tags the item kind, so the new kind is tolerated
+        // and never dropped.
+        for ver in [1, 2] {
+            let mut fold = SessionFold::new();
+            let started = parse_json(
+                r#"{"itemId":"ws1","kind":"webSearch","status":"in_progress","fallbackText":"Searching the web for: muse-acp"}"#,
+            )
+            .unwrap();
+            let mut out = Vec::new();
+            fold.on_item_snapshot("sid", ver, &started, &mut out);
+            assert_eq!(
+                out.len(),
+                1,
+                "webSearch start emits one card for v{ver}: {out:?}"
+            );
+            assert!(
+                out[0].contains("\"title\":\"Searching the web for: muse-acp\"")
+                    && out[0].contains("\"itemKind\":\"webSearch\""),
+                "generic card titles from fallbackText and names the kind for v{ver}: {out:?}"
+            );
+        }
+    }
+
+    #[test]
     fn reminder_child_start_emits_nothing() {
         // Background reminder checks hold the turn open but carry no
         // editor-facing content: the host shows nothing per agent, so the

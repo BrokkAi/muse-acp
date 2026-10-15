@@ -517,6 +517,20 @@ fn friendly_terminal_error(terminal: &str, params: &J) -> String {
     } else if non_retryable {
         out.push_str(". The host marks this non-retryable");
     }
+    if kind == "mcpLinkError" {
+        out.push_str(
+            ". An MCP server failed to link for this turn: check the server's configuration and credentials, then retry",
+        );
+    }
+    // `TurnError.quota` is the quota-class detail the schema tells clients to
+    // branch on by presence, never by parsing `message`; surface it as the
+    // trailing sentence so an exhausted window is actionable in the editor.
+    if let Some(quota) = err
+        .and_then(|e| e.get("quota"))
+        .filter(|value| !matches!(value, J::Null))
+    {
+        out.push_str(&format!(". {}", quota_reset_phrase(quota, now_ms())));
+    }
     let combined = format!("{kind} {message} {reason}");
     if is_network_error(&combined) {
         out.push_str(
@@ -524,6 +538,72 @@ fn friendly_terminal_error(terminal: &str, params: &J) -> String {
         );
     }
     out
+}
+
+/// Render the typed `QuotaDetail` MSP attaches to a quota-classified turn
+/// failure. The schema tells clients to branch on the detail's presence and
+/// never on the free-text message, so the failure text names the exhausted
+/// limit kind and, from the provider's reset instant, a coarse wait. There is
+/// no calendar in the adapter, so the reset is a relative duration; `now_ms`
+/// is injected so the wording stays deterministic under test.
+fn quota_reset_phrase(quota: &J, now_ms: u64) -> String {
+    let limit = quota
+        .get("limitKind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    match quota.get("resetsAtMs").and_then(|v| v.as_u64()) {
+        Some(reset) if reset <= now_ms => format!(
+            "the {limit} quota is exhausted; the provider's reset instant has passed, so retry the prompt"
+        ),
+        Some(reset) => {
+            let minutes = (reset - now_ms).div_ceil(60_000);
+            let wait = if minutes <= 1 {
+                "in under a minute".to_string()
+            } else if minutes < 120 {
+                format!("in about {minutes} minutes")
+            } else {
+                format!("in about {:.1} hours", minutes as f64 / 60.0)
+            };
+            format!("the {limit} quota is exhausted; the provider resets it {wait}")
+        }
+        None => format!("the {limit} quota is exhausted"),
+    }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// One machine-readable diagnostic line for a durable `turn/retryScheduled`
+/// fact. The event is non-terminal, so the adapter never settles a prompt on
+/// it; this is the only place the attempt's backoff and — since Muse 1.4.6 —
+/// the failing attempt's `errorKind`, `httpStatus`, and provider `system` are
+/// recorded. A missing member reads as `?` rather than a fabricated value.
+fn retry_scheduled_log_line(params: &J) -> String {
+    let num = |key: &str| {
+        params
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| "?".to_string())
+    };
+    let text = |key: &str| params.get(key).and_then(|v| v.as_str()).unwrap_or("?");
+    format!(
+        "turn/retryScheduled turn={} sess={} attempt={} next={} max={} delayMs={} reason={} errorKind={} httpStatus={} system={}",
+        text("turnId"),
+        text("sessionId"),
+        num("attempt"),
+        num("nextAttempt"),
+        num("maxAttempts"),
+        num("retryDelayMs"),
+        text("reason"),
+        text("errorKind"),
+        num("httpStatus"),
+        text("system"),
+    )
 }
 
 /// Translate backend decision-stage rejection jargon into an actionable
@@ -10470,17 +10550,29 @@ fn handle_msp(
             // terminal: settle the tracked prompt now as cancelled (like
             // turn/unqueued) so it cannot hang or falsely succeed. A late
             // turn/completed then finds no tracked prompt left to settle.
+            //
+            // The 1.4.6 `outcome` rides this settlement: `accepted` means the
+            // submitted user message is rolled back, `declined` means the
+            // rollback was refused. Either way the interrupt that produced the
+            // retract already cancelled the turn, so both arms settle the
+            // prompt the same way and the outcome only needs a diagnostic.
             let msp_sid = params
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
             log(&format!(
-                "turn/retracted turn={turn_id} sess={msp_sid} command={}",
+                "turn/retracted turn={turn_id} sess={msp_sid} command={} outcome={}",
                 params
                     .get("commandId")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("?")
+                    .unwrap_or("?"),
+                // Absent reads as `accepted` per the schema's additive-optional
+                // rule; an unrecognized value is the open enum's fallback.
+                params
+                    .get("outcome")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("accepted")
             ));
             let acp_sid = match find_acp_sid(sessions, msp_sid) {
                 Some(s) => s,
@@ -10575,26 +10667,7 @@ fn handle_msp(
             // Non-terminal by schema: it never resolves a turn-wait, so never
             // settle here. Record the attempt facts for diagnostics; the
             // turn's own turn/completed still settles it exactly once.
-            let num = |key: &str| {
-                params
-                    .get(key)
-                    .and_then(|v| v.as_u64())
-                    .map(|n| n.to_string())
-                    .unwrap_or_else(|| "?".to_string())
-            };
-            log(&format!(
-                "turn/retryScheduled turn={} sess={} attempt={} next={} max={} delayMs={} reason={}",
-                params.get("turnId").and_then(|v| v.as_str()).unwrap_or("?"),
-                params
-                    .get("sessionId")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?"),
-                num("attempt"),
-                num("nextAttempt"),
-                num("maxAttempts"),
-                num("retryDelayMs"),
-                params.get("reason").and_then(|v| v.as_str()).unwrap_or("?")
-            ));
+            log(&retry_scheduled_log_line(params));
         }
         "session/approvalModeChanged" => {
             // Audit fact of an accepted mode change: refresh the selector.
@@ -13999,7 +14072,7 @@ mod tests {
     }
     use super::{
         CostRate, env_flag_enabled, friendly_terminal_error, friendly_turn_error, is_network_error,
-        parse_rates, v1_init, v2_init,
+        parse_rates, quota_reset_phrase, retry_scheduled_log_line, v1_init, v2_init,
     };
     use crate::acp;
     use crate::json::{J, parse_json};
@@ -14238,6 +14311,90 @@ mod tests {
         let params = parse_json("{\"terminal\":\"failed\"}").unwrap();
         let out = friendly_terminal_error("failed", &params);
         assert_eq!(out, "turn ended with terminal 'failed'");
+    }
+
+    #[test]
+    fn terminal_failure_surfaces_the_typed_quota_detail() {
+        // The schema tells clients to branch on `error.quota` presence, never
+        // on the free-text message. An exhausted tier limit names the kind and
+        // the provider's reset instant.
+        let params = parse_json(
+            r#"{"terminal":"failed","error":{"kind":"modelError","message":"usage limit reached","retryable":false,"quota":{"limitKind":"tierLimit","resetsAtMs":4102444800000}}}"#,
+        )
+        .unwrap();
+        let out = friendly_terminal_error("failed", &params);
+        assert!(
+            out.contains("tierLimit quota is exhausted"),
+            "quota kind survives: {out}"
+        );
+        assert!(out.contains("resets"), "reset instant survives: {out}");
+    }
+
+    #[test]
+    fn quota_reset_phrase_renders_the_wait_bucket() {
+        let past = parse_json(r#"{"limitKind":"tierLimit","resetsAtMs":1000}"#).unwrap();
+        assert!(
+            quota_reset_phrase(&past, 5000).contains("reset instant has passed"),
+            "an elapsed reset says so"
+        );
+        let soon = parse_json(r#"{"limitKind":"tierLimit","resetsAtMs":31000}"#).unwrap();
+        assert_eq!(
+            quota_reset_phrase(&soon, 1000),
+            "the tierLimit quota is exhausted; the provider resets it in under a minute"
+        );
+        let minutes = parse_json(r#"{"limitKind":"tierLimit","resetsAtMs":121000}"#).unwrap();
+        assert_eq!(
+            quota_reset_phrase(&minutes, 1000),
+            "the tierLimit quota is exhausted; the provider resets it in about 2 minutes"
+        );
+        let hours = parse_json(r#"{"limitKind":"tierLimit","resetsAtMs":7201000}"#).unwrap();
+        assert_eq!(
+            quota_reset_phrase(&hours, 1000),
+            "the tierLimit quota is exhausted; the provider resets it in about 2.0 hours"
+        );
+    }
+
+    #[test]
+    fn terminal_mcp_link_failure_names_the_remedy() {
+        let params = parse_json(
+            r#"{"terminal":"failed","error":{"kind":"mcpLinkError","message":"server refused handshake","retryable":true}}"#,
+        )
+        .unwrap();
+        let out = friendly_terminal_error("failed", &params);
+        assert!(out.contains("mcpLinkError"), "kind survives: {out}");
+        assert!(
+            out.contains("MCP server failed to link"),
+            "the failure names its remedy: {out}"
+        );
+    }
+
+    #[test]
+    fn retry_scheduled_diagnostic_carries_the_attempt_detail() {
+        let params = parse_json(
+            r#"{"turnId":"t1","sessionId":"s1","attempt":1,"nextAttempt":2,"maxAttempts":3,"retryDelayMs":2000,"reason":"provider stream disconnected","errorKind":"overloaded","httpStatus":529,"system":"meta"}"#,
+        )
+        .unwrap();
+        let line = retry_scheduled_log_line(&params);
+        for token in [
+            "turn/retryScheduled",
+            "errorKind=overloaded",
+            "httpStatus=529",
+            "system=meta",
+            "delayMs=2000",
+        ] {
+            assert!(line.contains(token), "missing {token} in {line}");
+        }
+        // An old host omits the new members; they read as unknown, never
+        // fabricated.
+        let legacy = parse_json(
+            r#"{"turnId":"t1","sessionId":"s1","attempt":1,"nextAttempt":2,"maxAttempts":3,"retryDelayMs":2000,"reason":"boom"}"#,
+        )
+        .unwrap();
+        let legacy_line = retry_scheduled_log_line(&legacy);
+        assert!(
+            legacy_line.contains("errorKind=? httpStatus=? system=?"),
+            "absent members stay unknown: {legacy_line}"
+        );
     }
 
     fn rates(input: &str, output: &str, currency: &str) -> Option<CostRate> {

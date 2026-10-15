@@ -671,10 +671,11 @@ continues.
 The remaining 1.4.x field-level and vocabulary additions — the `webSearch`
 item kind, `mcpLinkError`, `TurnError.quota`, the retry/retraction detail
 fields, the per-session `permissionProfile`, the per-turn `userShell`,
-`SideProvenance`, and the newly required-but-nullable params — are tolerated
-by the fold and tracked in
-[#224](https://github.com/BrokkAi/muse-acp/issues/224). The 1.4.7 additions
-have their own issues: the `InitializeResult` sandbox facts
+`SideProvenance`, and the newly required-but-nullable params — each carries an
+explicit disposition in the field matrix below;
+[#224](https://github.com/BrokkAi/muse-acp/issues/224) is resolved by that
+matrix. The 1.4.7 additions have their own issues: the `InitializeResult`
+sandbox facts
 (`sandboxAvailability`, `sandboxUnavailableReason`) in
 [#241](https://github.com/BrokkAi/muse-acp/issues/241), `SessionNameOrigin`
 (`Session.nameOrigin`, `SessionNameChangedParams.nameOrigin`) in
@@ -703,6 +704,39 @@ permission-profile pick (`SessionResumeParams.permissionProfile`) in
 [#259](https://github.com/BrokkAi/muse-acp/issues/259). The new
 `sessionRename` capability is tracked in
 [#260](https://github.com/BrokkAi/muse-acp/issues/260).
+
+**Muse 1.4.x field-level and vocabulary additions**
+
+Muse 1.4.6 grew fields and open vocabularies the adapter's tolerant fold had to
+carry without an explicit decision. This matrix records one per addition — an
+ACP mapping where the value earns one, or an explicit disposition where it does
+not. `webSearch` items render through the unknown-kind generic card path,
+`TurnError.quota` is branched on by presence (never by parsing `message`), the
+`turn/retryScheduled` detail fields extend the diagnostic, and the matrix is
+the closed list of what this issue tracked; the rest of the surface is
+unchanged. `tests/msp_140_field_matrix.rs` enforces one row per addition and
+checks each against the vendored bundle, so a schema advance cannot drop a
+member without failing CI.
+
+<!-- msp-1.4.x-field-matrix:start -->
+| MSP addition | Disposition | Adapter behavior or tracking |
+| --- | --- | --- |
+| `ItemKind.webSearch` | Mapped to ACP | Rendered through the unknown-kind generic card path from the item's `fallbackText`, carrying `_meta.muse.itemKind`; a frame without a summary is tolerated and emits nothing. |
+| `TurnErrorKind.mcpLinkError` | Mapped to ACP | The turn-failure projection names the kind verbatim and adds an MCP-link remedy ("check the server's configuration and credentials"); the host message and retryable judgment are preserved. |
+| `TurnError.quota` | Mapped to ACP | The failure text appends the typed `QuotaDetail` (`limitKind` plus the reset wait); the adapter branches on the detail's presence, never on the message text. |
+| `TurnRetryScheduledParams.errorKind` | Consumed | Recorded in the `turn/retryScheduled` diagnostic; the event stays non-terminal and never settles the ACP prompt. |
+| `TurnRetryScheduledParams.httpStatus` | Consumed | Recorded in the `turn/retryScheduled` diagnostic; the event stays non-terminal and never settles the ACP prompt. |
+| `TurnRetryScheduledParams.system` | Consumed | Recorded in the `turn/retryScheduled` diagnostic; the event stays non-terminal and never settles the ACP prompt. |
+| `TurnRetractedParams.outcome` | Consumed | Recorded in the `turn/retracted` diagnostic; `accepted` and `declined` both settle the interrupt-paired prompt as cancelled, so the outcome needs no ACP branch. |
+| `SessionStartParams.permissionProfile` | Intentionally ignored | The adapter selects approval policy with `approvalMode`; the host's permission-profile catalog is not read or pinned here, and the 1.4.8 resume-time pick has its own issue in [#257](https://github.com/BrokkAi/muse-acp/issues/257). |
+| `TurnStartParams.userShell` | Intentionally ignored | A `!cmd` queued behind a running turn is the app's own submit; the adapter drives shells through the `session/userShell` command instead. |
+| `Session.sideFrom` | Mapped to ACP | Published as `session_info_update._meta.muse.sideFrom` when present; the nullable spelling tolerates `null` as "no side provenance". |
+| `SessionBranchChangedParams.branch` | Mapped to ACP | Emitted in `session/update` metadata together with the goal; a null `branch` is preserved as null rather than dropped. |
+| `SessionModelChangedParams.providerId` | Intentionally ignored | The adapter keys the model selector on `modelId`; the provider split is a host catalog detail with no ACP representation. |
+| `SessionModelRouteUnservedParams.providerId` | Intentionally ignored | The whole `session/modelRouteUnserved` notification is intentionally ignored, so its provider field is never read. |
+| `SessionTokenUsageParams.modelId` | Mapped to ACP | Keys the per-model cost legs under the prompt result's `_meta.muse.modelUsage`; a leg without a `modelId` is counted in the totals and left out rather than given an invented name. |
+| `SessionGoalChangedParams.goal` | Mapped to ACP | An explicit null clears the goal metadata (clear is kept distinct from never-seen); a non-null goal is stored and emitted. |
+<!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**
 

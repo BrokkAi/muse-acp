@@ -1422,6 +1422,35 @@ fn v2_failed_terminal_emits_detail_before_idle() {
 }
 
 #[test]
+fn v2_quota_failure_surfaces_the_typed_limit_detail() {
+    // A quota-classified failure carries a typed `QuotaDetail`. MSP tells
+    // clients to branch on its presence rather than parsing the message, so
+    // the v2 transcript must name the exhausted limit, not just the host text.
+    let mut c = Client::spawn(
+        "failed",
+        &[
+            ("FAKE_TURN_ERROR_KIND", "modelError"),
+            ("FAKE_TURN_ERROR_MESSAGE", "usage limit reached"),
+            ("FAKE_TURN_ERROR_RETRYABLE", "false"),
+            ("FAKE_TURN_ERROR_QUOTA", "tierLimit"),
+            ("FAKE_TURN_ERROR_QUOTA_RESET_MS", "4102444800000"),
+        ],
+    );
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "hi");
+    let msg = c.wait_for("agent_message_chunk", Duration::from_secs(15));
+    assert!(
+        msg.contains("usage limit reached"),
+        "host message survives: {msg}"
+    );
+    assert!(
+        msg.contains("tierLimit quota is exhausted"),
+        "typed quota detail survives: {msg}"
+    );
+    c.finish();
+}
+
+#[test]
 fn v2_prompt_accepts_then_echoes_and_idles() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(2, "");
@@ -2883,6 +2912,25 @@ fn turn_retracted_settles_prompt_cancelled() {
         done.contains("\"stopReason\":\"cancelled\""),
         "retracted turn settles: {done}"
     );
+    // An absent outcome reads as accepted in the diagnostic.
+    c.wait_stderr("outcome=accepted", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn declined_retract_still_settles_the_prompt_cancelled() {
+    // A declined retract refuses the user-message rollback, but the interrupt
+    // that produced it already cancelled the turn, so the ACP settlement is
+    // the same as the accepted arm and only the diagnostic differs.
+    let mut c = Client::spawn("retracted", &[("FAKE_RETRACT_OUTCOME", "declined")]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"cancelled\""),
+        "declined retract still settles: {done}"
+    );
+    c.wait_stderr("outcome=declined", Duration::from_secs(15));
     c.finish();
 }
 
@@ -2941,6 +2989,11 @@ fn turn_retry_then_completed_settles_once_as_end_turn() {
         (count, frames.join("\n"))
     };
     assert_eq!(count, 1, "exactly one settle for the prompt: {log}");
+    // The 1.4.6 retry detail rides the diagnostic; the event stays
+    // non-terminal and never settles a prompt by itself.
+    c.wait_stderr("errorKind=overloaded", Duration::from_secs(15));
+    c.wait_stderr("httpStatus=529", Duration::from_secs(15));
+    c.wait_stderr("system=meta", Duration::from_secs(15));
     c.finish();
 }
 
@@ -7894,6 +7947,9 @@ fn reasoning_summary_parts_stream_as_thought_chunks() {
         section.contains("\\n\\nThen testing"),
         "part boundary must be a section break: {section}"
     );
+    // The final answer is the frame after the thought stream; wait for it so
+    // the snapshot below cannot race the host's completion.
+    c.wait_for("agent_message_chunk", Duration::from_secs(15));
     // The completed frame must not duplicate what already streamed.
     let frames = c
         .frames

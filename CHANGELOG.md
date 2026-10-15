@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- Adopt the remaining Muse 1.4.x field-level and vocabulary additions (#224).
+  A turn failure that carries the typed `TurnError.quota` detail now names the
+  exhausted limit and the provider's reset wait in the transcript, a
+  `mcpLinkError` failure names the MCP-link remedy, and the
+  `turn/retryScheduled` and `turn/retracted` diagnostics record the 1.4.6
+  `errorKind`/`httpStatus`/`system` and `outcome` fields. The `webSearch` item
+  kind renders through the unknown-kind generic card path. Every remaining
+  addition (`SessionStartParams.permissionProfile`, `TurnStartParams.userShell`,
+  the `providerId` fields, and the newly required-but-nullable params) has an
+  explicit disposition in the ROADMAP section 9 field matrix, which
+  `tests/msp_140_field_matrix.rs` enforces against the vendored bundle.
+
 ## 0.14.0
 
 - Re-pin the vendored Muse SDK conformance corpus to `838d36a` (2026-10-14,
