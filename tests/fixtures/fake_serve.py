@@ -1132,7 +1132,12 @@ def on_turn_start(params):
         notify("turn/unqueued", dict(base))
     elif SCENARIO == "retracted":
         # The submission is durably retracted: no turn/completed follows.
-        notify("turn/retracted", {**base, "commandId": params.get("commandId", "")})
+        # An absent outcome reads as accepted; the env var exercises declined.
+        retract = {**base, "commandId": params.get("commandId", "")}
+        outcome = os.environ.get("FAKE_RETRACT_OUTCOME", "")
+        if outcome:
+            retract["outcome"] = outcome
+        notify("turn/retracted", retract)
     elif SCENARIO == "retract_then_completed":
         # A terminal still arrives after the retract: settle exactly once.
         notify("turn/retracted", {**base, "commandId": params.get("commandId", "")})

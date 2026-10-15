@@ -2912,6 +2912,25 @@ fn turn_retracted_settles_prompt_cancelled() {
         done.contains("\"stopReason\":\"cancelled\""),
         "retracted turn settles: {done}"
     );
+    // An absent outcome reads as accepted in the diagnostic.
+    c.wait_stderr("outcome=accepted", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn declined_retract_still_settles_the_prompt_cancelled() {
+    // A declined retract refuses the user-message rollback, but the interrupt
+    // that produced it already cancelled the turn, so the ACP settlement is
+    // the same as the accepted arm and only the diagnostic differs.
+    let mut c = Client::spawn("retracted", &[("FAKE_RETRACT_OUTCOME", "declined")]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"cancelled\""),
+        "declined retract still settles: {done}"
+    );
+    c.wait_stderr("outcome=declined", Duration::from_secs(15));
     c.finish();
 }
 
