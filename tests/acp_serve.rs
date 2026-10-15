@@ -7947,6 +7947,9 @@ fn reasoning_summary_parts_stream_as_thought_chunks() {
         section.contains("\\n\\nThen testing"),
         "part boundary must be a section break: {section}"
     );
+    // The final answer is the frame after the thought stream; wait for it so
+    // the snapshot below cannot race the host's completion.
+    c.wait_for("agent_message_chunk", Duration::from_secs(15));
     // The completed frame must not duplicate what already streamed.
     let frames = c
         .frames
