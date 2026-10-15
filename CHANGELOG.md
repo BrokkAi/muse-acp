@@ -23,6 +23,19 @@
   answered with the typed `capabilityRequired` (`-32010`, naming
   `sessionRename`) instead of a generic failure or an ungranted call.
 
+- Mark agent replies that Muse cut off mid-stream (#243). When the provider
+  stream dies mid-reply and Muse 1.4.7+ commits the partial text with
+  `Item.cutOff`, the adapter marks that message once with
+  `_meta.muse.cutOff: true` and the host `itemId`, so editors can show the
+  reply as incomplete instead of finished. A streamed reply gets the mark on
+  an empty `agent_message_chunk` (naming its `messageId` on ACP v2); a resent
+  or replayed reply carries it on its own text update, so a reload never
+  reopens a delivered `agent_message`. The mark comes from whichever of
+  `item/updated`, `item/completed`, a gap refill, or history replay first
+  carries the flag; it is never inferred, repeated, or cleared. The field
+  joins the ROADMAP section 9 field matrix, and a live loopback test covers it
+  on Muse 1.4.7 and later.
+
 ## 0.14.0
 
 - Re-pin the vendored Muse SDK conformance corpus to `838d36a` (2026-10-14,

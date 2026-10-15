@@ -1451,6 +1451,57 @@ fn v2_quota_failure_surfaces_the_typed_limit_detail() {
 }
 
 #[test]
+fn cut_off_reply_is_marked_truncated() {
+    for (ver, late) in [(1, "0"), (2, "0"), (1, "1"), (2, "1")] {
+        let mut c = Client::spawn("cut_off", &[("FAKE_CUT_OFF_LATE", late)]);
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "hi");
+        let mark = c.wait_for("\"cutOff\":true", Duration::from_secs(15));
+        assert!(
+            mark.contains("agent_message_chunk") && mark.contains("\"itemId\":\"it-cut\""),
+            "v{ver} (late={late}) marks the partial reply: {mark}"
+        );
+        let partial = c.wait_for("the answer is fo", Duration::from_secs(15));
+        if ver == 2 {
+            let id = |frame: &str| {
+                frame
+                    .split("\"messageId\":")
+                    .nth(1)
+                    .map(|rest| rest[..rest.find(',').unwrap()].to_string())
+            };
+            assert_eq!(
+                id(&mark),
+                id(&partial),
+                "the mark names the streamed message"
+            );
+            c.wait_for("\"idle\"", Duration::from_secs(15));
+        } else {
+            c.wait_for("provider stream ended mid-reply", Duration::from_secs(15));
+        }
+        let marks = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|f| f.contains("\"cutOff\""))
+            .count();
+        assert_eq!(marks, 1, "v{ver} (late={late}): sent exactly once");
+        c.finish();
+    }
+}
+
+#[test]
+fn a_complete_reply_carries_no_cut_off_mark() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "hi");
+    let msg = c.wait_for("hello from fake host", Duration::from_secs(15));
+    c.wait_for("\"idle\"", Duration::from_secs(15));
+    assert!(!msg.contains("cutOff"), "complete reply unmarked: {msg}");
+    c.finish();
+}
+
+#[test]
 fn v2_prompt_accepts_then_echoes_and_idles() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(2, "");

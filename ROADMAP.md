@@ -677,11 +677,12 @@ explicit disposition in the field matrix below;
 matrix. The 1.4.7 additions have their own issues: the `InitializeResult`
 sandbox facts
 (`sandboxAvailability`, `sandboxUnavailableReason`) in
-[#241](https://github.com/BrokkAi/muse-acp/issues/241), `SessionNameOrigin`
+[#241](https://github.com/BrokkAi/muse-acp/issues/241) and `SessionNameOrigin`
 (`Session.nameOrigin`, `SessionNameChangedParams.nameOrigin`) in
-[#242](https://github.com/BrokkAi/muse-acp/issues/242), and the `Item.cutOff`
-partial-message mark in
-[#243](https://github.com/BrokkAi/muse-acp/issues/243).
+[#242](https://github.com/BrokkAi/muse-acp/issues/242). The `Item.cutOff`
+partial-message mark is adopted
+([#243](https://github.com/BrokkAi/muse-acp/issues/243)); its row is in the
+field matrix below.
 
 The 1.4.8 additions have their own issues. The Computer Use app-level list,
 installed-app picker, and `apps` writer (`ComputerUseSettings.apps`,
@@ -714,11 +715,13 @@ carry without an explicit decision. This matrix records one per addition — an
 ACP mapping where the value earns one, or an explicit disposition where it does
 not. `webSearch` items render through the unknown-kind generic card path,
 `TurnError.quota` is branched on by presence (never by parsing `message`), the
-`turn/retryScheduled` detail fields extend the diagnostic, and the matrix is
-the closed list of what this issue tracked; the rest of the surface is
-unchanged. `tests/msp_140_field_matrix.rs` enforces one row per addition and
-checks each against the vendored bundle, so a schema advance cannot drop a
-member without failing CI.
+`turn/retryScheduled` detail fields extend the diagnostic, and the 1.4.7
+`Item.cutOff` partial-reply mark reaches the client as `_meta.muse.cutOff`
+([#243](https://github.com/BrokkAi/muse-acp/issues/243)). The matrix is the
+closed list of field additions with a recorded decision; the rest of the
+surface is unchanged. `tests/msp_140_field_matrix.rs` enforces one row per
+addition and checks each against the vendored bundle, so a schema advance
+cannot drop a member without failing CI.
 
 <!-- msp-1.4.x-field-matrix:start -->
 | MSP addition | Disposition | Adapter behavior or tracking |
@@ -738,6 +741,7 @@ member without failing CI.
 | `SessionModelRouteUnservedParams.providerId` | Intentionally ignored | The whole `session/modelRouteUnserved` notification is intentionally ignored, so its provider field is never read. |
 | `SessionTokenUsageParams.modelId` | Mapped to ACP | Keys the per-model cost legs under the prompt result's `_meta.muse.modelUsage`; a leg without a `modelId` is counted in the totals and left out rather than given an invented name. |
 | `SessionGoalChangedParams.goal` | Mapped to ACP | An explicit null clears the goal metadata (clear is kept distinct from never-seen); a non-null goal is stored and emitted. |
+| `Item.cutOff` | Mapped to ACP | A partial agent reply the host committed when the provider stream died is marked once with `_meta.muse.cutOff: true` and the host `itemId`, from whichever of `item/updated`, `item/completed`, a gap refill, or a history replay first carries the flag. A streamed reply gets an empty `agent_message_chunk` naming its `messageId` on ACP v2; a resent or replayed reply carries the mark on its own text update. A late mark only names the latest settled reply, and on ACP v1 (chunks attach by position) waits out a newer streaming reply. Never inferred, repeated, or cleared. [#243](https://github.com/BrokkAi/muse-acp/issues/243) |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**

@@ -406,6 +406,13 @@ error the editor shows if Muse then refuses the profile says why.
   video store through Muse's chunked `media/upload` and submitted as a `video`
   turn part; the receipt is threaded into the turn. Audio is rejected, because
   Muse's input type is closed to `text`, `image`, `skill`, and `video`.
+- **Cut-off replies** — when the provider stream dies mid-reply and Muse
+  commits the partial text (`Item.cutOff`, Muse 1.4.7+), that agent message
+  is marked once with `_meta.muse.cutOff: true` and the host `itemId`, so an
+  editor can show the reply as incomplete. A streamed reply gets the mark on
+  an empty `agent_message_chunk` (naming its `messageId` on ACP v2); a resent
+  or replayed reply carries it on its own text update. The mark is sent only
+  when the host sets the flag, and never cleared.
 - **Usage** — context occupancy as `usage_update`, cumulative session totals,
   subscription observations under `_meta.museSubscriptionUsage`, and a
   session cost that on Muse 1.4.2+ is Muse's own figure (with its partial
