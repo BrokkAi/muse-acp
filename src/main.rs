@@ -1128,10 +1128,13 @@ fn reconcile_pending(
                     let owner = a.non_empty_str("sessionId").unwrap_or(&msp_sid);
                     s.approval_resolved
                         .contains(&(owner.to_string(), id.to_string()))
-                        || s.pending_perm.as_ref().is_some_and(|p| p.approval_id == id)
-                        || s.perm_queue
-                            .iter()
-                            .any(|q| q.non_empty_str("approvalId") == Some(id))
+                        || s.pending_perm
+                            .as_ref()
+                            .is_some_and(|p| p.approval_sid == owner && p.approval_id == id)
+                        || s.perm_queue.iter().any(|q| {
+                            q.non_empty_str("approvalId") == Some(id)
+                                && q.non_empty_str("sessionId").unwrap_or(&msp_sid) == owner
+                        })
                 });
             if !skip {
                 n_approvals += 1;
@@ -8694,7 +8697,12 @@ fn enqueue_review(
     if choices.is_empty() {
         return false;
     }
-    let key = format!("{approval_id}:{requirement_json}");
+    let approval_sid = params.non_empty_str("sessionId").unwrap_or("");
+    let key = (
+        approval_sid.to_string(),
+        approval_id.to_string(),
+        requirement_json.to_string(),
+    );
     {
         let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
         let Some(s) = map.get_mut(acp_sid) else {
@@ -10316,8 +10324,13 @@ fn handle_msp(
                     }
                     drop_queued_review(&acp_sid, &child_subagent_id, approval_id);
                 }
-                if invalidate_pending_approval(stdout, sessions, &acp_sid, Some(approval_id), false)
-                {
+                if invalidate_pending_approval(
+                    stdout,
+                    sessions,
+                    &acp_sid,
+                    Some((msp_sid, approval_id)),
+                    false,
+                ) {
                     pop_queued_approval(host, stdout, sessions, &acp_sid);
                 }
                 let (ver, busy) = sessions
@@ -11106,7 +11119,7 @@ fn invalidate_pending_approval(
     stdout: &StdoutShared,
     sessions: &Sessions,
     acp_sid: &str,
-    approval_id: Option<&str>,
+    approval: Option<(&str, &str)>,
     feedback_only: bool,
 ) -> bool {
     let request_id = {
@@ -11115,7 +11128,7 @@ fn invalidate_pending_approval(
             return false;
         };
         let matches = s.pending_perm.as_ref().is_some_and(|p| {
-            approval_id.is_none_or(|wanted| p.approval_id == wanted)
+            approval.is_none_or(|(sid, id)| p.approval_sid == sid && p.approval_id == id)
                 && (!feedback_only || p.feedback.is_some())
         });
         if !matches {
@@ -11134,7 +11147,8 @@ fn invalidate_pending_approval(
 
 /// Open an ACP permission request for MSP approval params (from either the
 /// `approval/requested` event or a reissued `approval/request`). Dedupes by
-/// approval id so multi-stage/resumed flows bridge exactly once. Never leaves
+/// MSP session and approval id so multi-stage/resumed flows bridge exactly
+/// once, without a child stream's approval masking its parent's (#252). Never leaves
 /// an approval silently unresolved: without displayable choices there is
 /// nothing the client could answer, so fail closed by cancelling the turn.
 fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, params: &J) {
@@ -11183,7 +11197,11 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
         .cloned()
         .unwrap_or(J::Null);
     let requirement_json = j_to_string(&requirement);
-    let approval_key = format!("{}:{requirement_json}", approval_id);
+    let approval_key = (
+        msp_sid.to_string(),
+        approval_id.clone(),
+        requirement_json.clone(),
+    );
     // Adapter policy answers eligible approvals before the editor sees them.
     // Ineligible or ambiguous requests fall through to the ordinary prompt.
     if enqueue_review(host, stdout, sessions, &acp_sid, &owner_msp_sid, params) {
@@ -11200,6 +11218,7 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
             if s.approval_seen.contains(&approval_key) {
                 duplicate = true;
             } else if let Some(p) = s.pending_perm.as_ref()
+                && p.approval_sid == msp_sid
                 && p.approval_id == approval_id
             {
                 if j_to_string(&p.requirement) == requirement_json {
@@ -11216,7 +11235,8 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
             }
             if !duplicate
                 && let Some(index) = s.perm_queue.iter().position(|queued| {
-                    queued.get("approvalId").and_then(|v| v.as_str()) == Some(&approval_id)
+                    queued.non_empty_str("approvalId") == Some(&approval_id)
+                        && queued.non_empty_str("sessionId") == Some(msp_sid)
                 })
             {
                 let queued_requirement = s.perm_queue[index]
@@ -11351,6 +11371,7 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
         if let Some(s) = map.get_mut(&acp_sid) {
             s.pending_perm = Some(PendingPerm {
                 req_id: req_id.clone(),
+                approval_sid: msp_sid.to_string(),
                 approval_id,
                 requirement,
                 choices,

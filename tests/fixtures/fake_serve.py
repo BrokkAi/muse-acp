@@ -17,6 +17,10 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   approval_hang stays pending after the approval so client decisions can be tested
   approval_resolved_elsewhere approval/requested, then approval/resolved by policy
   child_approval_resolved a child-stream approval, then approval/resolved on the child
+  child_then_parent_approval a child ap-1 is resolved, then the parent asks
+               for its own ap-1 with the same requirement
+  parent_resolved_beside_child a child ap-1 is displayed, then the parent's
+               ap-1 resolves
   resolved_ghost listPending returns a resolved approval plus a genuine one;
                view/page carries the durable approval/resolved for the ghost.
                FAKE_GHOST_PAGES=N puts it on the Nth backward page;
@@ -776,6 +780,31 @@ def on_turn_start(params):
             "resolvedBy": "policy", "policyResult": "allowed",
             "stageEvidence": [], "sourceRange": {"start": 0, "end": 1},
             "viewCursor": "cur-child-ap"})
+    elif SCENARIO in ("child_then_parent_approval",
+                      "parent_resolved_beside_child"):
+        # Approval ids are only unique within one MSP session: the child
+        # stream and its parent both use ap-1 (#252).
+        notify("item/started", {**base, "item": {
+            "itemId": "it-sub-control", "kind": "subagent",
+            "status": "inProgress", "revision": 1, "subagentId": "sub-control",
+            "agentPath": "researcher", "depth": 1,
+            "objective": "hold the approval test open",
+            "childSessionId": "child-sess-control", "controlStatus": "running"}})
+        notify("approval/requested", dict(
+            APPROVAL_PARAMS, sessionId="child-sess-control",
+            toolCallId="call-child"))
+        resolved_sid = MSP_SID
+        if SCENARIO == "child_then_parent_approval":
+            resolved_sid = "child-sess-control"
+        notify("approval/resolved", {
+            "sessionId": resolved_sid, "approvalId": "ap-1",
+            "itemId": "it-ap", "turnId": tid, "decision": "approved",
+            "resolvedBy": "policy", "policyResult": "allowed",
+            "stageEvidence": [], "sourceRange": {"start": 0, "end": 1},
+            "viewCursor": "cur-ap-resolved"})
+        if SCENARIO == "child_then_parent_approval":
+            notify("approval/requested", dict(
+                APPROVAL_PARAMS, toolCallId="call-parent"))
     elif SCENARIO == "question_settled_elsewhere":
         notify("userInput/requested", question_params("ui-1"))
         notify("userInput/settled", {

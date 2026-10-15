@@ -3194,6 +3194,50 @@ fn a_child_approval_resolved_elsewhere_is_withdrawn() {
 }
 
 #[test]
+fn a_parent_approval_reusing_a_resolved_child_id_still_opens() {
+    let mut c = Client::spawn("child_then_parent_approval", &[("FAKE_CAPS", "subagents")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let _pid = c.prompt(&sid, "child and parent need permission");
+    let parent = c.wait_for("\"toolCallId\":\"call-parent\"", Duration::from_secs(15));
+    assert!(
+        parent.contains("request_permission"),
+        "the parent's ap-1 is not a duplicate of the child's: {parent}"
+    );
+    let permission_id = extract_str(&parent, "id").expect("permission request id");
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{permission_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":\"c-allow\"}}}}}}"
+    ));
+    c.wait_log("approval/decide", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn a_parent_resolution_keeps_a_child_prompt_with_the_same_id() {
+    let mut c = Client::spawn(
+        "parent_resolved_beside_child",
+        &[("FAKE_CAPS", "subagents")],
+    );
+    let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let _pid = c.prompt(&sid, "child needs permission");
+    let permission = c.wait_for("\"toolCallId\":\"call-child\"", Duration::from_secs(15));
+    let permission_id = extract_str(&permission, "id").expect("permission request id");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !c.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|f| f.contains(&format!("\"requestId\":\"{permission_id}\""))),
+        "the parent's ap-1 resolution must not withdraw the child's prompt"
+    );
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{permission_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":\"c-allow\"}}}}}}"
+    ));
+    c.wait_log("approval/decide", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
 fn a_question_settled_elsewhere_withdraws_its_form() {
     for ver in [1u64, 2] {
         let mut c = Client::spawn("question_settled_elsewhere", &[]);
