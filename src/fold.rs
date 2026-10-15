@@ -196,12 +196,13 @@ pub struct SessionFold {
     /// done while reminder agents hold it open (`turn/foregroundCompleted`),
     /// as `(turn id, card id)`. Settled at the turn's terminal.
     background_checks: Option<(String, String)>,
-    /// ACP message id of each settled agent message, keyed by MSP item id,
-    /// so a late `item/updated` carrying `cutOff` still names its message.
-    message_ids: HashMap<String, String>,
-    /// Agent messages the host marked cut off, and whether the client has
-    /// been sent the mark. The host never clears it, so it is sent once.
-    cut_off: HashMap<String, bool>,
+    /// The latest settled agent message as (MSP item id, ACP message id). A
+    /// cut-off reply is the last one of its failed run, so a late
+    /// `item/updated` carrying `cutOff` can only name this message.
+    last_message: Option<(String, String)>,
+    /// Agent messages already marked cut off. The host never clears the
+    /// flag, so the mark is sent once.
+    cut_off: std::collections::HashSet<String>,
 }
 
 /// One child of a running workflow, as the latest workflow item reported it.
@@ -266,8 +267,8 @@ impl SessionFold {
             reminder_cards: HashMap::new(),
             show_reminders: false,
             background_checks: None,
-            message_ids: HashMap::new(),
-            cut_off: HashMap::new(),
+            last_message: None,
+            cut_off: std::collections::HashSet::new(),
         }
     }
 
@@ -597,61 +598,60 @@ impl SessionFold {
             && matches!(item.get("cutOff"), Some(J::Bool(true)))
     }
 
+    /// The `_meta` member that marks a reply cut off, ready to append to an
+    /// update object.
+    fn cut_off_meta(item_id: &str) -> String {
+        format!(
+            ",\"_meta\":{{\"muse\":{{\"cutOff\":true,\"itemId\":{}}}}}",
+            esc(item_id)
+        )
+    }
+
     /// An agent-message chunk carrying `_meta.muse.cutOff`, so an editor can
     /// mark the reply as truncated rather than complete. `text` is whatever
     /// the completion still has to show; empty when the deltas carried it.
     fn cut_off_chunk(acp_sid: &str, ver: u8, msg_id: &str, item_id: &str, text: &str) -> String {
-        let content = format!("{{\"type\":\"text\",\"text\":{}}}", esc(text));
-        let message_id = if ver == 2 {
-            format!("\"messageId\":{},", esc(msg_id))
-        } else {
-            String::new()
-        };
-        Self::update_line(
-            acp_sid,
-            &format!(
-                "{{\"sessionUpdate\":\"agent_message_chunk\",{message_id}\"content\":{content},\"_meta\":{{\"muse\":{{\"cutOff\":true,\"itemId\":{}}}}}}}",
-                esc(item_id)
-            ),
-        )
+        let mut line = Self::chunk(acp_sid, ver, msg_id, text);
+        // The chunk is the update object followed by the two closing braces
+        // of `params` and the envelope.
+        line.insert_str(line.len() - 3, &Self::cut_off_meta(item_id));
+        line
     }
 
-    /// Record the host's cut-off mark and send it, once, for a message the
-    /// client already shows. Before any text is shown the mark waits for the
-    /// text that carries it.
+    /// Claim the one-time mark for a cut-off reply about to be shown.
+    fn claim_cut_off(&mut self, item: &J, item_id: &str) -> bool {
+        Self::is_cut_off(item) && self.cut_off.insert(item_id.to_string())
+    }
+
+    /// Mark a reply the client already shows as cut off, once. A reply with
+    /// no text shown yet gets the mark with the text that shows it. A settled
+    /// reply can only be the latest one; on ACP v1, whose chunks attach by
+    /// position, only while no newer message is streaming.
     fn mark_cut_off(&mut self, acp_sid: &str, ver: u8, item: &J, out: &mut Vec<String>) {
         let Some(item_id) = item.get("itemId").and_then(|v| v.as_str()) else {
             return;
         };
-        let shown = match self.items.get(item_id) {
-            Some(ItemRole::Message { msg_id, streamed }) if *streamed > 0 => Some(msg_id),
-            Some(_) => None,
-            None => self.message_ids.get(item_id),
-        };
-        let Some(msg_id) = shown.cloned() else {
-            if Self::is_cut_off(item) {
-                self.cut_off.entry(item_id.to_string()).or_insert(false);
-            }
+        if !Self::is_cut_off(item) || self.cut_off.contains(item_id) {
             return;
-        };
-        if self.take_cut_off(item, item_id) {
-            out.push(Self::cut_off_chunk(acp_sid, ver, &msg_id, item_id, ""));
         }
+        let msg_id = match self.items.get(item_id) {
+            Some(ItemRole::Message { msg_id, streamed }) if *streamed > 0 => msg_id.clone(),
+            Some(_) => return,
+            None => match &self.last_message {
+                Some((id, msg_id)) if id == item_id && (ver == 2 || !self.message_streaming()) => {
+                    msg_id.clone()
+                }
+                _ => return,
+            },
+        };
+        self.cut_off.insert(item_id.to_string());
+        out.push(Self::cut_off_chunk(acp_sid, ver, &msg_id, item_id, ""));
     }
 
-    /// Whether the host marked this message cut off and the client has not
-    /// been sent the mark yet; claims the send.
-    fn take_cut_off(&mut self, item: &J, item_id: &str) -> bool {
-        if Self::is_cut_off(item) {
-            self.cut_off.entry(item_id.to_string()).or_insert(false);
-        }
-        match self.cut_off.get_mut(item_id) {
-            Some(sent) if !*sent => {
-                *sent = true;
-                true
-            }
-            _ => false,
-        }
+    fn message_streaming(&self) -> bool {
+        self.items
+            .values()
+            .any(|role| matches!(role, ItemRole::Message { streamed, .. } if *streamed > 0))
     }
 
     fn thought_chunk(acp_sid: &str, ver: u8, msg_id: &str, text: &str) -> String {
@@ -1611,9 +1611,18 @@ impl SessionFold {
             .unwrap_or("")
     }
 
-    fn replay_message_line(acp_sid: &str, ver: u8, kind: &str, msg_id: &str, text: &str) -> String {
+    /// `cut_off` names the item when the replayed reply carries the cut-off
+    /// mark, which then rides the message itself.
+    fn replay_message_line(
+        acp_sid: &str,
+        ver: u8,
+        kind: &str,
+        msg_id: &str,
+        text: &str,
+        cut_off: Option<&str>,
+    ) -> String {
         let content = format!("[{{\"type\":\"text\",\"text\":{}}}]", esc(text));
-        let update = match (kind, ver) {
+        let mut update = match (kind, ver) {
             ("userMessage", 2) => format!(
                 "{{\"sessionUpdate\":\"user_message\",\"messageId\":{},\"content\":{}}}",
                 esc(msg_id),
@@ -1636,6 +1645,9 @@ impl SessionFold {
             ),
             _ => unreachable!("replay_message_line called for {kind}"),
         };
+        if let Some(item_id) = cut_off {
+            update.insert_str(update.len() - 1, &Self::cut_off_meta(item_id));
+        }
         Self::update_line(acp_sid, &update)
     }
 
@@ -1669,14 +1681,25 @@ impl SessionFold {
                     if text.is_empty() {
                         return;
                     }
+                    let unshown = matches!(
+                        self.items.get(&item_id),
+                        Some(ItemRole::Message { streamed: 0, .. })
+                    );
+                    let mark = unshown && self.claim_cut_off(item, &item_id);
                     if let Some(ItemRole::Message { msg_id, streamed }) =
                         self.items.get_mut(&item_id)
                         && *streamed == 0
                     {
                         *streamed = text.len();
-                        out.push(Self::replay_message_line(acp_sid, ver, kind, msg_id, text));
+                        out.push(Self::replay_message_line(
+                            acp_sid,
+                            ver,
+                            kind,
+                            msg_id,
+                            text,
+                            mark.then_some(item_id.as_str()),
+                        ));
                     }
-                    self.mark_cut_off(acp_sid, ver, item, out);
                 }
                 _ => {}
             }
@@ -1693,12 +1716,17 @@ impl SessionFold {
                 let text = Self::message_text(item);
                 if !text.is_empty() {
                     let msg_id = mint_id("msg-", &self.idc);
-                    out.push(Self::replay_message_line(acp_sid, ver, kind, &msg_id, text));
+                    let mark = self.claim_cut_off(item, &item_id);
+                    out.push(Self::replay_message_line(
+                        acp_sid,
+                        ver,
+                        kind,
+                        &msg_id,
+                        text,
+                        mark.then_some(item_id.as_str()),
+                    ));
                     if kind == "agentMessage" {
-                        if self.take_cut_off(item, &item_id) {
-                            out.push(Self::cut_off_chunk(acp_sid, ver, &msg_id, &item_id, ""));
-                        }
-                        self.message_ids.insert(item_id, msg_id);
+                        self.last_message = Some((item_id, msg_id));
                     }
                 }
             }
@@ -2108,24 +2136,25 @@ impl SessionFold {
             }
             "agentMessage" => {
                 let text = item.get("text").and_then(|v| v.as_str()).unwrap_or("");
-                let (msg_id, streamed) = match self.items.get(&item_id) {
-                    Some(ItemRole::Message { msg_id, streamed }) => (msg_id.clone(), *streamed),
-                    _ => (mint_id("msg-", &self.idc), 0),
+                let (msg_id, streamed) = match self.items.remove(&item_id) {
+                    Some(ItemRole::Message { msg_id, streamed }) => (Some(msg_id), streamed),
+                    _ => (None, 0),
                 };
                 // Deltas are authoritative-in-motion; the completed frame is the
                 // truth. Resend only if nothing streamed (missed deltas).
-                let resend = streamed == 0 && !text.is_empty();
-                let shown = resend || streamed > 0;
-                if shown {
-                    self.message_ids.insert(item_id.clone(), msg_id.clone());
+                let shown = if streamed == 0 && !text.is_empty() {
+                    Some((msg_id.unwrap_or_else(|| mint_id("msg-", &self.idc)), text))
+                } else {
+                    msg_id.filter(|_| streamed > 0).map(|id| (id, ""))
+                };
+                if let Some((msg_id, text)) = shown {
+                    if self.claim_cut_off(item, &item_id) {
+                        out.push(Self::cut_off_chunk(acp_sid, ver, &msg_id, &item_id, text));
+                    } else if !text.is_empty() {
+                        out.push(Self::chunk(acp_sid, ver, &msg_id, text));
+                    }
+                    self.last_message = Some((item_id.clone(), msg_id));
                 }
-                if shown && self.take_cut_off(item, &item_id) {
-                    let text = if resend { text } else { "" };
-                    out.push(Self::cut_off_chunk(acp_sid, ver, &msg_id, &item_id, text));
-                } else if resend {
-                    out.push(Self::chunk(acp_sid, ver, &msg_id, text));
-                }
-                self.items.remove(&item_id);
             }
             "reasoning" => {
                 // The committed summary (or raw text when no summary exists)
@@ -2864,6 +2893,57 @@ mod corpus_tests {
     }
 
     #[test]
+    fn a_late_v1_mark_waits_out_a_newer_streaming_reply() {
+        let mut fold = SessionFold::new();
+        let settled = parse_json(
+            r#"{"item":{"itemId":"it-old","kind":"agentMessage","status":"completed","text":"partial"}}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_completed("sid", 1, &settled, &mut out);
+        let started =
+            parse_json(r#"{"itemId":"it-new","kind":"agentMessage","status":"inProgress"}"#)
+                .unwrap();
+        fold.on_item_snapshot("sid", 1, &started, &mut out);
+        let delta = parse_json(r#"{"itemId":"it-new","field":"text","delta":"fresh"}"#).unwrap();
+        fold.on_item_delta("sid", 1, &delta, &mut out);
+
+        let late = parse_json(
+            r#"{"itemId":"it-old","kind":"agentMessage","status":"completed","text":"partial","cutOff":true}"#,
+        )
+        .unwrap();
+        let mut marks = Vec::new();
+        fold.on_item_snapshot("sid", 1, &late, &mut marks);
+        assert!(
+            marks.is_empty(),
+            "a v1 chunk would attach to the streaming reply: {marks:?}"
+        );
+    }
+
+    #[test]
+    fn a_late_mark_names_only_the_latest_settled_reply() {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        for id in ["it-a", "it-b"] {
+            let settled = parse_json(&format!(
+                r#"{{"item":{{"itemId":"{id}","kind":"agentMessage","status":"completed","text":"text"}}}}"#
+            ))
+            .unwrap();
+            fold.on_item_completed("sid", 2, &settled, &mut out);
+        }
+        let stale = parse_json(
+            r#"{"itemId":"it-a","kind":"agentMessage","status":"completed","text":"text","cutOff":true}"#,
+        )
+        .unwrap();
+        let mut marks = Vec::new();
+        fold.on_item_snapshot("sid", 2, &stale, &mut marks);
+        assert!(
+            marks.is_empty(),
+            "an older reply is not the cut-off one: {marks:?}"
+        );
+    }
+
+    #[test]
     fn cut_off_is_only_an_explicit_true() {
         for flag in [r#""cutOff":false,"#, r#""cutOff":"true","#, ""] {
             let mut fold = SessionFold::new();
@@ -2889,11 +2969,29 @@ mod corpus_tests {
             r#"{"itemId":"it-cut","kind":"agentMessage","status":"completed","text":"partial","cutOff":true}"#,
         )
         .unwrap();
+        for ver in [1, 2] {
+            let mut fold = SessionFold::new();
+            let mut replay = Vec::new();
+            fold.replay_item("sid", ver, &item, &mut replay);
+            assert_eq!(replay.len(), 1, "the mark rides the message: {replay:?}");
+            let parsed = parse_json(&replay[0]).unwrap();
+            let update = parsed.get("params").and_then(|p| p.get("update")).unwrap();
+            assert!(
+                update.get("messageId").is_some()
+                    && update
+                        .get("content")
+                        .is_some_and(|c| j_to_string(c).contains("partial"))
+                    && update
+                        .get("_meta")
+                        .and_then(|m| m.get("muse"))
+                        .and_then(|m| m.get("cutOff"))
+                        .is_some_and(|v| matches!(v, J::Bool(true))),
+                "v{ver} replay carries text, id, and mark together: {}",
+                replay[0]
+            );
+        }
         let mut replay = Vec::new();
         fold.replay_item("sid", 2, &item, &mut replay);
-        assert_eq!(replay.len(), 2, "message then mark: {replay:?}");
-        assert!(replay[0].contains("\"agent_message\"") && !replay[0].contains("cutOff"));
-        assert!(replay[1].contains("\"cutOff\":true"));
 
         let refill = parse_json(&format!(r#"{{"item":{}}}"#, j_to_string(&item))).unwrap();
         let mut duplicate = Vec::new();

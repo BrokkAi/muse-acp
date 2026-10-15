@@ -694,16 +694,18 @@ def on_turn_start(params):
         notify("turn/completed", failed_params)
     elif SCENARIO == "cut_off":
         # The provider stream dies mid-reply: the partial text is committed
-        # with `cutOff` (Muse 1.4.7) and the run fails.
+        # with `cutOff` (Muse 1.4.7) and the run fails. FAKE_CUT_OFF_LATE=1
+        # leaves the flag to the later item/updated revision.
         item = {"itemId": "it-cut", "kind": "agentMessage",
                 "status": "inProgress", "text": ""}
         notify("item/started", {**base, "item": item})
         notify("item/delta", {**base, "itemId": "it-cut", "field": "text",
                               "delta": "the answer is fo"})
-        done = {**item, "status": "completed", "text": "the answer is fo",
-                "cutOff": True}
-        notify("item/completed", {**base, "item": done})
-        notify("item/updated", {**base, "item": done})
+        done = {**item, "status": "completed", "text": "the answer is fo"}
+        late = os.environ.get("FAKE_CUT_OFF_LATE") == "1"
+        notify("item/completed", {**base, "item": done if late else {
+            **done, "cutOff": True}})
+        notify("item/updated", {**base, "item": {**done, "cutOff": True}})
         notify("turn/completed", {**base, "terminal": "failed", "error": {
             "kind": "modelError", "message": "provider stream ended mid-reply",
             "retryable": True}})

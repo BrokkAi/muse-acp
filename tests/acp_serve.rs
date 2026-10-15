@@ -1452,14 +1452,14 @@ fn v2_quota_failure_surfaces_the_typed_limit_detail() {
 
 #[test]
 fn cut_off_reply_is_marked_truncated() {
-    for ver in [1, 2] {
-        let mut c = Client::spawn("cut_off", &[]);
+    for (ver, late) in [(1, "0"), (2, "0"), (1, "1"), (2, "1")] {
+        let mut c = Client::spawn("cut_off", &[("FAKE_CUT_OFF_LATE", late)]);
         let sid = c.new_session(ver, "");
         let _pid = c.prompt(&sid, "hi");
         let mark = c.wait_for("\"cutOff\":true", Duration::from_secs(15));
         assert!(
             mark.contains("agent_message_chunk") && mark.contains("\"itemId\":\"it-cut\""),
-            "v{ver} marks the partial reply: {mark}"
+            "v{ver} (late={late}) marks the partial reply: {mark}"
         );
         let partial = c.wait_for("the answer is fo", Duration::from_secs(15));
         if ver == 2 {
@@ -1485,7 +1485,7 @@ fn cut_off_reply_is_marked_truncated() {
             .iter()
             .filter(|f| f.contains("\"cutOff\""))
             .count();
-        assert_eq!(marks, 1, "v{ver}: item/updated never repeats the mark");
+        assert_eq!(marks, 1, "v{ver} (late={late}): sent exactly once");
         c.finish();
     }
 }

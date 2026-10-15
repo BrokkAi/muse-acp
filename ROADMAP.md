@@ -656,7 +656,6 @@ continues.
 | `media/upload` | Mapped to ACP | A `resource_link` to a local `video/mp4`/`video/quicktime` file, or an embedded `video/*` blob, is uploaded in 1 MiB raw chunks (three-byte-aligned, so each base64 frame stays inside the host frame budget) with a client-minted `uploadId`, fresh `commandId` per chunk, and bounded per-chunk retries; the receipt becomes the turn's `video` part. Files are read only inside the approved roots and capped at 64 MiB. |
 | `session/sideChat` | Mapped to ACP | Backs the opt-in `_session/sideChat` extension (muse `sideChat` capability): the call opens a side chat from a loaded session and returns the new session id with its `sideFrom` provenance, which the client attaches with its ordinary session methods (`session/resume`/`session/load`). The side is routed to the source's host and inherits its mode. `sideFrom` — and `forkedFrom` — also ride `session_info_update._meta.muse` when the session is attached. |
 | `userInput/interrupt` | Mapped to ACP | A stop (`session/cancel`) or a decline of a staged question carrying confirmed answers settles the open prompt through `userInput/interrupt`, which hands the answers to the model and stops the turn; an unanswered prompt keeps the ordinary turn interrupt, and an unanswered decline keeps `userInput/cancel`. |
-| `Item.cutOff` | Mapped to ACP | A partial agent reply the host committed when the provider stream died gets one `agent_message_chunk` with `_meta.muse.cutOff: true` and the host `itemId` (plus the streamed `messageId` on ACP v2), from whichever of `item/updated`, `item/completed`, or a history replay first carries the flag; it is never inferred, cleared, or repeated. [#243](https://github.com/BrokkAi/muse-acp/issues/243) |
 | `plugin/changed` | Consumed | Logged as an install-landed diagnostic; the adapter keeps no plugin cache, so clients re-read the opt-in `_session/plugins` view. |
 | `plugin/marketplaceChanged` | Consumed | Logged as a marketplace-change diagnostic; clients re-read `_session/plugins` rather than a local cache. |
 | `recap/completed` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#215](https://github.com/BrokkAi/muse-acp/issues/215) |
@@ -682,7 +681,8 @@ sandbox facts
 (`Session.nameOrigin`, `SessionNameChangedParams.nameOrigin`) in
 [#242](https://github.com/BrokkAi/muse-acp/issues/242). The `Item.cutOff`
 partial-message mark is adopted
-([#243](https://github.com/BrokkAi/muse-acp/issues/243)): see its row above.
+([#243](https://github.com/BrokkAi/muse-acp/issues/243)); its row is in the
+field matrix below.
 
 The 1.4.8 additions have their own issues. The Computer Use app-level list,
 installed-app picker, and `apps` writer (`ComputerUseSettings.apps`,
@@ -715,11 +715,13 @@ carry without an explicit decision. This matrix records one per addition — an
 ACP mapping where the value earns one, or an explicit disposition where it does
 not. `webSearch` items render through the unknown-kind generic card path,
 `TurnError.quota` is branched on by presence (never by parsing `message`), the
-`turn/retryScheduled` detail fields extend the diagnostic, and the matrix is
-the closed list of what this issue tracked; the rest of the surface is
-unchanged. `tests/msp_140_field_matrix.rs` enforces one row per addition and
-checks each against the vendored bundle, so a schema advance cannot drop a
-member without failing CI.
+`turn/retryScheduled` detail fields extend the diagnostic, and the 1.4.7
+`Item.cutOff` partial-reply mark reaches the client as `_meta.muse.cutOff`
+([#243](https://github.com/BrokkAi/muse-acp/issues/243)). The matrix is the
+closed list of field additions with a recorded decision; the rest of the
+surface is unchanged. `tests/msp_140_field_matrix.rs` enforces one row per
+addition and checks each against the vendored bundle, so a schema advance
+cannot drop a member without failing CI.
 
 <!-- msp-1.4.x-field-matrix:start -->
 | MSP addition | Disposition | Adapter behavior or tracking |
@@ -739,6 +741,7 @@ member without failing CI.
 | `SessionModelRouteUnservedParams.providerId` | Intentionally ignored | The whole `session/modelRouteUnserved` notification is intentionally ignored, so its provider field is never read. |
 | `SessionTokenUsageParams.modelId` | Mapped to ACP | Keys the per-model cost legs under the prompt result's `_meta.muse.modelUsage`; a leg without a `modelId` is counted in the totals and left out rather than given an invented name. |
 | `SessionGoalChangedParams.goal` | Mapped to ACP | An explicit null clears the goal metadata (clear is kept distinct from never-seen); a non-null goal is stored and emitted. |
+| `Item.cutOff` | Mapped to ACP | A partial agent reply the host committed when the provider stream died is marked once with `_meta.muse.cutOff: true` and the host `itemId`, from whichever of `item/updated`, `item/completed`, a gap refill, or a history replay first carries the flag. A streamed reply gets an empty `agent_message_chunk` naming its `messageId` on ACP v2; a resent or replayed reply carries the mark on its own text update. A late mark only names the latest settled reply, and on ACP v1 (chunks attach by position) waits out a newer streaming reply. Never inferred, repeated, or cleared. [#243](https://github.com/BrokkAi/muse-acp/issues/243) |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**
