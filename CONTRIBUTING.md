@@ -33,6 +33,11 @@ sh -n install.sh
 node scripts/smoke_npm.cjs target/debug/muse-acp
 ```
 
+The script tests check that the npm launcher, `install.ps1`, `scripts/release.py`,
+and the release workflow list the same targets. When `pwsh` or `powershell` is
+installed, they also run the installer's architecture selection against a stubbed
+registry.
+
 CI also parses `install.ps1` with PowerShell, tests the minimum Rust version,
 runs clippy, the Rust tests, and the selftest on macOS and Windows x64 and arm64,
 and runs the npm launcher tests on Linux, macOS, and both Windows architectures.

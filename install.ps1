@@ -37,6 +37,31 @@ function Download([string]$Uri, [string]$Path) {
     }
 }
 
+# scripts/test_targets.py runs this function against a stubbed registry.
+function Resolve-Target {
+    # Prefer the OS architecture from the registry: an x64 PowerShell emulated
+    # on Arm64 Windows reports AMD64 in its environment, with no W6432 hint.
+    try {
+        $architecture = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE).PROCESSOR_ARCHITECTURE
+    }
+    catch {
+        $architecture = $null
+    }
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = $env:PROCESSOR_ARCHITEW6432
+    }
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = $env:PROCESSOR_ARCHITECTURE
+    }
+    if ($architecture -match '^(?i:AMD64|X86_64)$') {
+        return 'x86_64-pc-windows-msvc'
+    }
+    if ($architecture -match '^(?i:ARM64|AARCH64)$') {
+        return 'aarch64-pc-windows-msvc'
+    }
+    Fail "unsupported architecture: $architecture (the Windows release supports x86_64 and arm64)"
+}
+
 $tempDir = $null
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -61,29 +86,7 @@ try {
         Fail "invalid release version: $tag"
     }
 
-    # Prefer the OS architecture from the registry: an x64 PowerShell emulated
-    # on Arm64 Windows reports AMD64 in its environment, with no W6432 hint.
-    try {
-        $architecture = (Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' -Name PROCESSOR_ARCHITECTURE).PROCESSOR_ARCHITECTURE
-    }
-    catch {
-        $architecture = $null
-    }
-    if ([string]::IsNullOrWhiteSpace($architecture)) {
-        $architecture = $env:PROCESSOR_ARCHITEW6432
-    }
-    if ([string]::IsNullOrWhiteSpace($architecture)) {
-        $architecture = $env:PROCESSOR_ARCHITECTURE
-    }
-    if ($architecture -match '^(?i:AMD64|X86_64)$') {
-        $target = 'x86_64-pc-windows-msvc'
-    }
-    elseif ($architecture -match '^(?i:ARM64|AARCH64)$') {
-        $target = 'aarch64-pc-windows-msvc'
-    }
-    else {
-        Fail "unsupported architecture: $architecture (the Windows release supports x86_64 and arm64)"
-    }
+    $target = Resolve-Target
 
     $configuredDir = $InstallDir
     if ([string]::IsNullOrWhiteSpace($configuredDir)) {
