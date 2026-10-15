@@ -657,6 +657,7 @@ def on_turn_start(params):
         err_kind = os.environ.get("FAKE_TURN_ERROR_KIND", "")
         err_msg = os.environ.get("FAKE_TURN_ERROR_MESSAGE", "")
         err_retry = os.environ.get("FAKE_TURN_ERROR_RETRYABLE", "")
+        err_quota = os.environ.get("FAKE_TURN_ERROR_QUOTA", "")
         turn_reason = os.environ.get("FAKE_TURN_REASON", "")
         if err_kind or err_msg or err_retry:
             err_obj = {}
@@ -671,6 +672,12 @@ def on_turn_start(params):
                 err_obj["retryable"] = False
             else:
                 err_obj["retryable"] = False
+            if err_quota:
+                err_obj["quota"] = {
+                    "limitKind": err_quota,
+                    "resetsAtMs": int(
+                        os.environ.get("FAKE_TURN_ERROR_QUOTA_RESET_MS", "4102444800000")),
+                }
             failed_params["error"] = err_obj
         if turn_reason:
             failed_params["reason"] = turn_reason
@@ -1135,7 +1142,9 @@ def on_turn_start(params):
         notify("turn/retryScheduled", {**base,
                                       "attempt": 1, "nextAttempt": 2,
                                       "maxAttempts": 3, "retryDelayMs": 2000,
-                                      "reason": "provider stream disconnected"})
+                                      "reason": "provider stream disconnected",
+                                      "errorKind": "overloaded", "httpStatus": 529,
+                                      "system": "meta"})
         notify("item/completed", {**base, "item": {
             "itemId": "it-rt", "kind": "agentMessage",
             "status": "completed", "text": "recovered"}})

@@ -29,7 +29,7 @@ To see it working, run the per-issue test command named in each milestone below;
 - [ ] (2026-10-12) Issue #221 `media/upload`: implemented on `issue-221/media-upload` (resource-link/embedded-blob video entry, 1 MiB aligned chunks with retries and UUIDv7 uploadId, injected uploader callback, video turn part, fake-host plus live-1.4.6 tests, docs), PR and merge pending.
 - [x] (2026-10-13) Re-pinned the vendored corpus to SDK `a0c8611` (Muse 1.4.7): stable manifest and schema bundle, 51 transcripts, `src/compat.rs` compatibility table, `tests/protocol/PROVENANCE.md`, `ROADMAP.md`, and `CHANGELOG.md` (PR #244). The new surface is tracked in #240–#243.
 - [x] (2026-10-14) Re-pinned the vendored corpus to SDK `838d36a` (Muse 1.4.8): stable manifest and schema bundle, the 52 transcripts, `src/compat.rs`, `tests/protocol/PROVENANCE.md`, `ROADMAP.md` (reference snapshot, §1 compatibility facts, and §9 rows), `docs/event-compatibility.md`, and `CHANGELOG.md`. The new surface is tracked in #253–#260. Documentation-only, matching the 1.4.7 re-pin.
-- [ ] Issue #224 remaining 1.4.x field-level and vocabulary additions.
+- [ ] (2026-10-15) Issue #224 remaining 1.4.x field-level and vocabulary additions: implemented on `issue-224/msp-field-dispositions` (per-field disposition matrix in ROADMAP §9 enforced by `tests/msp_140_field_matrix.rs`, `TurnError.quota` and `mcpLinkError` folded into the turn-failure text, the `turn/retryScheduled`/`turn/retracted` 1.4.6 detail fields added to diagnostics, a `webSearch` generic-card fold test, and the fake-host quota/retry scenarios), PR and merge pending.
 
 
 ## Surprises & Discoveries
@@ -68,10 +68,19 @@ To see it working, run the per-issue test command named in each milestone below;
   Rationale: the re-pin is a maintenance step that keeps the vendored schema and the event matrices honest, and every new 1.4.8 surface is additive, so the adapter tolerates it unchanged. Filing issues rather than implementing keeps each adoption reviewable on its own, which is how the 1.4.3–1.4.7 additions were handled.
   Date/Author: 2026-10-14, Codex.
 
+- Decision: for #224, map the fields that earn an ACP representation and record an explicit disposition for the rest. `TurnError.quota` maps because the schema tells clients to branch on its presence and never on the message (the failure text now names the limit kind and the reset wait), `TurnErrorKind.mcpLinkError` maps to an added MCP-link remedy, the `webSearch` item kind maps through the existing unknown-kind generic card path, and the newly required-but-nullable params (`branch`, `providerId`, `modelId`, `goal`, `sideFrom`) map to the metadata/totals they already feed. The `turn/retryScheduled` (`errorKind`/`httpStatus`/`system`) and `turn/retracted` (`outcome`) fields are `Consumed` diagnostics, and `SessionStartParams.permissionProfile` plus `TurnStartParams.userShell` are `Intentionally ignored` because the adapter drives those surfaces through `approvalMode` and `session/userShell`.
+  Rationale: this satisfies the issue's suggested scope (a per-field decision recorded in ROADMAP §9 and `docs/event-compatibility.md`) without inventing ACP primitives. `tests/msp_140_field_matrix.rs` mirrors the §9 rows and asserts each addition is still present — and, where relevant, still null-tolerant — in the vendored bundle, so a future re-pin cannot drop one silently. `declined` retracts settle the prompt like `accepted` ones because the interrupt that produced the retract already cancelled the turn; the outcome only changes whether the user message rolls back, which ACP has no primitive for.
+  Date/Author: 2026-10-15, Codex.
+
 
 ## Outcomes & Retrospective
 
-To be written as milestones land.
+The 0.13.0 and 0.14.0 releases landed most of the 1.4.x surface; #224 is the
+last milestone and closes with a documented, test-enforced disposition for
+every remaining 1.4.6 field and vocabulary addition rather than new protocol
+primitives. The per-field matrix in ROADMAP §9 is now the single place to look
+when a re-pin adds a field: if it is not in the table, `tests/msp_140_field_matrix.rs`
+cannot see it, and a dropped member fails the same test.
 
 
 ## Context and Orientation

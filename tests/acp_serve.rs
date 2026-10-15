@@ -1422,6 +1422,35 @@ fn v2_failed_terminal_emits_detail_before_idle() {
 }
 
 #[test]
+fn v2_quota_failure_surfaces_the_typed_limit_detail() {
+    // A quota-classified failure carries a typed `QuotaDetail`. MSP tells
+    // clients to branch on its presence rather than parsing the message, so
+    // the v2 transcript must name the exhausted limit, not just the host text.
+    let mut c = Client::spawn(
+        "failed",
+        &[
+            ("FAKE_TURN_ERROR_KIND", "modelError"),
+            ("FAKE_TURN_ERROR_MESSAGE", "usage limit reached"),
+            ("FAKE_TURN_ERROR_RETRYABLE", "false"),
+            ("FAKE_TURN_ERROR_QUOTA", "tierLimit"),
+            ("FAKE_TURN_ERROR_QUOTA_RESET_MS", "4102444800000"),
+        ],
+    );
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "hi");
+    let msg = c.wait_for("agent_message_chunk", Duration::from_secs(15));
+    assert!(
+        msg.contains("usage limit reached"),
+        "host message survives: {msg}"
+    );
+    assert!(
+        msg.contains("tierLimit quota is exhausted"),
+        "typed quota detail survives: {msg}"
+    );
+    c.finish();
+}
+
+#[test]
 fn v2_prompt_accepts_then_echoes_and_idles() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(2, "");
@@ -2941,6 +2970,11 @@ fn turn_retry_then_completed_settles_once_as_end_turn() {
         (count, frames.join("\n"))
     };
     assert_eq!(count, 1, "exactly one settle for the prompt: {log}");
+    // The 1.4.6 retry detail rides the diagnostic; the event stays
+    // non-terminal and never settles a prompt by itself.
+    c.wait_stderr("errorKind=overloaded", Duration::from_secs(15));
+    c.wait_stderr("httpStatus=529", Duration::from_secs(15));
+    c.wait_stderr("system=meta", Duration::from_secs(15));
     c.finish();
 }
 
