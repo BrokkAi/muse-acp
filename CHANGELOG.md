@@ -34,6 +34,14 @@
   An approval resolved elsewhere while queued for Auto-review is no longer
   reviewed.
 
+- Stop a subagent's approval from hiding or withdrawing its parent's (#252).
+  Muse approval ids are only unique within one session, so a subagent and its
+  parent can both ask for `ap-1`. The adapter matched approvals by id alone:
+  once the subagent's `ap-1` was decided, the parent's `ap-1` with the same
+  requirement was dropped as a duplicate and its turn waited forever, and the
+  parent's `ap-1` resolving could withdraw the subagent's prompt. Approvals are
+  now matched by their Muse session and id together.
+
 - Fix MCP tool approvals from Muse 1.4.6+ showing as `Muse action` with a
   stray pending tool card (#239). These approvals carry no top-level
   `toolName` or `toolCallId`; the tool name is only on the subject. The

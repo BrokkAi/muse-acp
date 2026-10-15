@@ -36,6 +36,10 @@ pub struct FileChangeReport {
 pub struct PendingPerm {
     /// ACP `session/request_permission` request id awaiting the client reply.
     pub req_id: J,
+    /// MSP session the approval belongs to (`params.sessionId`). Approval ids
+    /// are only unique within one MSP session, and a child stream's approval
+    /// opens here beside its parent's, so the pair identifies the approval.
+    pub approval_sid: String,
     pub approval_id: String,
     pub requirement: J,
     /// Choices in host order; first reject-ish is the deny fallback.
@@ -177,10 +181,12 @@ pub struct AcpSession {
     pub ver: u8,
     pub in_flight: Vec<InFlight>,
     pub pending_perm: Option<PendingPerm>,
-    /// Approval ids and requirement snapshots already opened on this
-    /// connection. This suppresses duplicate delivery after a decision while
-    /// still allowing a later requirement stage to open.
-    pub approval_seen: std::collections::HashSet<String>,
+    /// Approvals and requirement snapshots already opened on this
+    /// connection, keyed by the approval's MSP session id, approval id, and
+    /// requirement JSON. This suppresses duplicate delivery after a decision
+    /// while still allowing a later requirement stage, or another session's
+    /// approval with the same id, to open.
+    pub approval_seen: std::collections::HashSet<(String, String, String)>,
     /// Approvals with a durable terminal decision (`approval/resolved`),
     /// keyed by the approval's MSP session id and approval id, since ids are
     /// only unique within one MSP session (a child stream reuses them).
