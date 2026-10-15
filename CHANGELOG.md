@@ -14,6 +14,15 @@
   explicit disposition in the ROADMAP section 9 field matrix, which
   `tests/msp_140_field_matrix.rs` enforces against the vendored bundle.
 
+- Request the Muse 1.4.8 `sessionRename` capability and stay in step with its
+  registry (#260). The adapter asks for `sessionRename` at `initialize` and
+  records the grant, so `/rename <name>` keeps driving `session/rename` on a
+  host that grants it. Muse 1.4.3 through 1.4.7 predate the registry entry:
+  they ignore the unknown name and still serve `session/rename`, so `/rename`
+  keeps working there. From 1.4.8 on, a host that withholds the grant is
+  answered with the typed `capabilityRequired` (`-32010`, naming
+  `sessionRename`) instead of a generic failure or an ungranted call.
+
 ## 0.14.0
 
 - Re-pin the vendored Muse SDK conformance corpus to `838d36a` (2026-10-14,

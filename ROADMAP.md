@@ -666,7 +666,7 @@ continues.
 | `marketplaceAlreadyExists` (-32036) | Mapped to ACP | Forwarded with its registry code and the host's typed data. |
 | `pluginMutationsDisabled` (-32037) | Mapped to ACP | Forwarded with its registry code; the host's refusal never degrades to a generic failure. |
 | `turn/modelRetryScheduled` | Intentionally ignored | A durable, non-terminal observation that a provider backoff behind one model attempt is waiting out its delay. The adapter has no arm for it, so an inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt; adopting it is tracked in [#259](https://github.com/BrokkAi/muse-acp/issues/259). |
-| `sessionRename` capability | Unsupported pending protocol decision | The 1.4.8 capability registry adds `sessionRename`, which the adapter does not request yet. `session/rename` still answers on a 1.4.8 host without it (the grant is registered but not enforced), so no behavior is lost today, but the adapter is out of step with the registry; tracked in [#260](https://github.com/BrokkAi/muse-acp/issues/260). |
+| `sessionRename` capability | Mapped to ACP | Requested unconditionally at `initialize`, like `sessionListStream` and `feedback`, and recorded on the handshake. Muse 1.4.3–1.4.7 predate the registry entry: they ignore the unknown name and still serve `session/rename`, so `/rename` keeps working there. From 1.4.8 on the name is registered, and a withheld grant answers `/rename` with the typed `capabilityRequired` (-32010, `data.capability` = `sessionRename`) instead of sending an ungranted call. |
 
 The remaining 1.4.x field-level and vocabulary additions — the `webSearch`
 item kind, `mcpLinkError`, `TurnError.quota`, the retry/retraction detail
@@ -702,8 +702,10 @@ permission-profile pick (`SessionResumeParams.permissionProfile`) in
 [#258](https://github.com/BrokkAi/muse-acp/issues/258); and the
 `turn/modelRetryScheduled` notification in
 [#259](https://github.com/BrokkAi/muse-acp/issues/259). The new
-`sessionRename` capability is tracked in
-[#260](https://github.com/BrokkAi/muse-acp/issues/260).
+`sessionRename` capability was adopted in
+[#260](https://github.com/BrokkAi/muse-acp/issues/260): the adapter requests
+it at `initialize`, records the grant, and keeps `/rename` typed on a host
+that withholds it (see the §9 row above).
 
 **Muse 1.4.x field-level and vocabulary additions**
 

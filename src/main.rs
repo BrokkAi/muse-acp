@@ -3368,6 +3368,11 @@ fn main() {
                             } else {
                                 "client MCP servers: dropped (this Muse host did not grant sessionMcp)"
                             });
+                            log(&format!(
+                                "session rename: granted={} available={}",
+                                hi.session_rename,
+                                hi.allows_session_rename()
+                            ));
                             host = Some(new_host);
                         }
                         handle_acp(
@@ -5530,6 +5535,18 @@ fn handle_acp(
                         return;
                     }
                 };
+                // `/rename` is capability-gated on the 1.4.8 registry. The
+                // adapter requests `sessionRename` unconditionally, so a host
+                // that withholds the grant is answered with the same typed
+                // `capabilityRequired` refusal the host itself uses, instead
+                // of sending a call it would reject or degrading to an
+                // unexplained failure. Hosts that predate the registry entry
+                // keep serving `session/rename` without the grant.
+                if method == "session/rename" && !host.handshake().allows_session_rename() {
+                    let error = msp::capability_required_error("session/rename", "sessionRename");
+                    send_host_error(stdout, &id, &error, -32010, &err_message(&error));
+                    return;
+                }
                 let cmd = host.mint_cmd("cmd-");
                 let mut params = format!(
                     "{{\"commandId\":{},\"sessionId\":{}",

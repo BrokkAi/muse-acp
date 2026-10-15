@@ -4875,6 +4875,86 @@ fn rename_slash_command_maps_to_host_method() {
 }
 
 #[test]
+fn rename_is_refused_with_the_typed_capability_error_when_the_grant_is_withheld() {
+    // The 1.4.8 host registers `sessionRename` as grantable but does not
+    // enforce it: a connection that never requests it still gets an accepted
+    // `session/rename`. The adapter therefore requests the grant at
+    // `initialize` and refuses `/rename` itself when the grant is withheld,
+    // so the user sees the typed `capabilityRequired` rather than a silent
+    // rename or an unexplained failure. The fixture models that host: it
+    // withholds the grant under FAKE_NO_SESSION_RENAME but still answers the
+    // method, so only the adapter's own gate can produce the refusal.
+    for ver in [1, 2] {
+        let mut c = Client::spawn(
+            "quiet",
+            &[
+                ("FAKE_NO_SESSION_RENAME", "1"),
+                ("FAKE_SERVER_VERSION", "1.4.8"),
+            ],
+        );
+        let sid = c.new_session(ver, "");
+        let initialize = host_requests(&c, "initialize");
+        assert!(
+            initialize[0]["capabilities"]["requestedCapabilities"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("sessionRename")),
+            "the adapter must request sessionRename: {initialize:?}"
+        );
+        // The command stays advertised: the refusal, not a missing palette
+        // entry, explains why it cannot run.
+        let commands = c.wait_for("available_commands_update", Duration::from_secs(15));
+        assert!(
+            commands.contains("\"name\":\"rename\""),
+            "rename must stay advertised: {commands}"
+        );
+        let pid = c.prompt(&sid, "/rename Renamed without the grant");
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"code\":-32010")
+                && frame.contains("\"kind\":\"capabilityRequired\"")
+                && frame.contains("\"capability\":\"sessionRename\""),
+            "v{ver} a withheld grant must yield the typed refusal: {frame}"
+        );
+        let methods = std::fs::read_to_string(&c.fake_log).expect("fake log");
+        assert!(
+            !methods.lines().any(|line| line == "session/rename"),
+            "v{ver} a withheld grant must not send session/rename: {methods}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn rename_still_works_on_a_host_that_predates_the_capability() {
+    // Muse 1.4.3 through 1.4.7 predate the `sessionRename` registry entry:
+    // they ignore the unknown requested name and withhold the grant, yet
+    // still serve `session/rename`. The adapter has driven `/rename` that way
+    // since before the entry existed, so a pre-1.4.8 host must keep working.
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_NO_SESSION_RENAME", "1"),
+            ("FAKE_SERVER_VERSION", "1.4.7"),
+        ],
+    );
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "/rename Pre-registry rename");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"result\""),
+        "a pre-1.4.8 host must still rename: {frame}"
+    );
+    c.wait_log("session/rename", Duration::from_secs(10));
+    let renamed = c.wait_for("\"title\":\"Pre-registry rename\"", Duration::from_secs(15));
+    assert!(
+        renamed.contains("\"sessionUpdate\":\"session_info_update\""),
+        "the pre-registry rename must retitle the ACP session: {renamed}"
+    );
+    c.finish();
+}
+
+#[test]
 fn a_forked_session_reads_its_skill_catalog() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");

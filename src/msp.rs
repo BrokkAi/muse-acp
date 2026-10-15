@@ -43,6 +43,11 @@ pub struct HandshakeInfo {
     /// Whether `feedback/submit` is granted (Muse 1.4.2+). The adapter only
     /// advertises `/feedback` on such a host.
     pub feedback: bool,
+    /// Whether the `sessionRename` capability was requested and granted
+    /// (Muse 1.4.8+). `session/rename` backs the editor's `/rename <name>`
+    /// command; a host that withholds the grant gets the typed
+    /// `capabilityRequired` refusal instead of the call.
+    pub session_rename: bool,
     /// Whether the `computerUseSetup` capability was requested and granted.
     /// The adapter's computer-use surface stays dark without it.
     pub computer_use_setup: bool,
@@ -116,6 +121,21 @@ impl HandshakeInfo {
             self.supports_workspace_roots(),
             self.reports_session_cost()
         )
+    }
+
+    /// Whether `/rename` may call `session/rename` on this connection.
+    ///
+    /// Muse 1.4.8 added the `sessionRename` capability to its grantable
+    /// registry. A host that predates it ignores the unknown name in
+    /// `requestedCapabilities` and withholds it from `grantedCapabilities`,
+    /// yet still serves the method: the adapter has driven `/rename` that way
+    /// since before the registry entry existed, so an absent grant there is
+    /// not a refusal. From 1.4.8 on the name is registered, so a withheld
+    /// grant is the host withholding the capability: the adapter answers
+    /// `/rename` with the typed `capabilityRequired` instead of sending a
+    /// call the host may reject.
+    pub fn allows_session_rename(&self) -> bool {
+        self.session_rename || !self.at_least(1, 4, 8)
     }
 }
 
@@ -501,6 +521,7 @@ pub fn acp_error_code(error: &J, fallback: i64) -> i64 {
         "marketplaceAlreadyExists" => -32036,
         "pluginMutationsDisabled" => -32037,
         "computerUseUnavailable" => -32033,
+        "capabilityRequired" => -32010,
         _ if err_code(error) == -32032 => -32032,
         _ => fallback,
     }
@@ -737,9 +758,10 @@ fn classify_status(status: &ExitStatus, stderr_tail: String) -> ExitClassificati
 }
 
 /// Structured data for the MSP request errors ACP clients need to branch on:
-/// a rejected skill selector and the plugin/marketplace write refusals. The
-/// host payload stays visible so a client sees which selector, marketplace,
-/// or plugin was refused.
+/// a rejected skill selector, the plugin/marketplace write refusals, and the
+/// capability-gated methods (`capabilityRequired`). The host payload stays
+/// visible so a client sees which selector, marketplace, plugin, or
+/// capability was refused.
 pub fn skill_error_data(error: &J) -> Option<String> {
     let data = error.get("data")?;
     let kind = data
@@ -754,8 +776,25 @@ pub fn skill_error_data(error: &J) -> Option<String> {
             | "marketplaceAlreadyExists"
             | "pluginMutationsDisabled"
             | "computerUseUnavailable"
+            | "capabilityRequired"
     );
     typed.then(|| j_to_string(data))
+}
+
+/// The host's error shape for one capability-gated method on a connection
+/// that was not granted the capability (MSP §1.6): code `-32010`, with
+/// `data.kind` `capabilityRequired` and the missing `capability` named. The
+/// adapter returns this same shape itself when it knows the grant was
+/// withheld, so an editor sees the typed refusal rather than an unexplained
+/// failure or a call the host would reject.
+pub fn capability_required_error(method: &str, capability: &str) -> J {
+    let message = format!("{method} requires the {capability} capability");
+    parse_json(&format!(
+        r#"{{"code":-32010,"message":{},"data":{{"capability":{},"kind":"capabilityRequired","retryable":false}}}}"#,
+        crate::json::esc(&message),
+        crate::json::esc(capability)
+    ))
+    .expect("capability_required_error builds valid JSON")
 }
 
 pub struct MspHost {
@@ -1060,11 +1099,16 @@ impl MspHost {
         } else {
             ""
         };
+        // `sessionRename` is requested unconditionally and last among the
+        // always-on registry names: `/rename` maps onto `session/rename`, and
+        // Muse 1.4.8 registers the capability as grantable. Requesting it on
+        // an older host is harmless (unknown names are ignored).
+        //
         // `experimentalApi` is the only way to reach `account/read`, which
         // lets session/new report a logged-out host before the first turn
         // (see `MspHost::logged_out`). On Muse 1.4.0 it gates nothing else.
         let init_params = format!(
-            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"experimentalApi":true,"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream","sessionMcp","feedback"{shell_capability}{cua_capability}]}}}}"#,
+            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"experimentalApi":true,"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream","sessionMcp","feedback","sessionRename"{shell_capability}{cua_capability}]}}}}"#,
             ver = crate::json::esc(env!("CARGO_PKG_VERSION")),
             user_input_dialogs = user_input_dialogs
         );
@@ -1125,6 +1169,10 @@ impl MspHost {
             feedback: matches!(
                 res.get("grantedCapabilities"),
                 Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("feedback"))
+            ),
+            session_rename: matches!(
+                res.get("grantedCapabilities"),
+                Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("sessionRename"))
             ),
             computer_use_setup: computer_use_setup
                 && matches!(res.get("grantedCapabilities"), Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("computerUseSetup"))),
@@ -1805,6 +1853,28 @@ mod tests {
             Some("out-1")
         );
     }
+
+    #[test]
+    fn capability_required_keeps_the_host_refusal_shape() {
+        let error = super::capability_required_error("session/rename", "sessionRename");
+        assert_eq!(super::err_code(&error), -32010);
+        assert_eq!(super::acp_error_code(&error, -32603), -32010);
+        assert_eq!(
+            error
+                .get("data")
+                .and_then(|data| data.get("capability"))
+                .and_then(|capability| capability.as_str()),
+            Some("sessionRename")
+        );
+        assert_eq!(
+            super::skill_error_data(&error).as_deref(),
+            Some(r#"{"capability":"sessionRename","kind":"capabilityRequired","retryable":false}"#)
+        );
+        assert_eq!(
+            super::err_message(&error),
+            "session/rename requires the sessionRename capability"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1824,6 +1894,7 @@ mod durability_tests {
             user_shell: false,
             session_mcp: false,
             feedback: false,
+            session_rename: false,
             computer_use_setup: false,
         }
     }
@@ -1843,6 +1914,26 @@ mod durability_tests {
             server_version: server_version.into(),
             ..info(durability)
         }
+    }
+
+    #[test]
+    fn session_rename_gate_ignores_pre_registry_hosts() {
+        // A host that predates the registry entry ignores the unknown
+        // requested name and withholds the grant, yet still serves
+        // `session/rename`: refusing there would regress `/rename`.
+        for older in ["1.3.0", "1.4.3", "1.4.6", "1.4.7", "0.0.0-fixture"] {
+            assert!(
+                version(older, None).allows_session_rename(),
+                "{older} must keep serving session/rename without the grant"
+            );
+        }
+        // From 1.4.8 on the name is registered, so a withheld grant is a
+        // refusal and a granted one is required.
+        assert!(!version("1.4.8", None).allows_session_rename());
+        assert!(!version("1.5.0", None).allows_session_rename());
+        let mut granted = version("1.4.8", None);
+        granted.session_rename = true;
+        assert!(granted.allows_session_rename());
     }
 
     #[test]
