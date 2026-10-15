@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.14.0
 
 - Re-pin the vendored Muse SDK conformance corpus to `838d36a` (2026-10-14,
   "remirror: 1.4.8"), which publishes the Muse 1.4.8 stable surface. The new
