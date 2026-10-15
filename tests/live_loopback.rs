@@ -527,6 +527,49 @@ fn cancel_stops_a_streaming_turn() {
 }
 
 #[test]
+fn a_reply_cut_off_mid_stream_is_marked_truncated() {
+    if !enabled("a_reply_cut_off_mid_stream_is_marked_truncated") {
+        return;
+    }
+    let host = Host::start(
+        json!({"cut": {"text": "the answer is fo", "cut": true}}),
+        None,
+    );
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(
+        adapter,
+        release,
+        (1, 4, 7),
+        "a_reply_cut_off_mid_stream_is_marked_truncated",
+    ) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.prompt(&session, "answer [[script:cut]]");
+    let mark = adapter.wait("the cut-off mark", |frame| {
+        frame["params"]["update"]["_meta"]["muse"]["cutOff"] == true
+    });
+    assert_eq!(
+        mark["params"]["update"]["sessionUpdate"], "agent_message_chunk",
+        "{mark}"
+    );
+    assert!(
+        adapter
+            .text("agent_message_chunk")
+            .contains("the answer is fo"),
+        "{:?}",
+        adapter.updates("agent_message_chunk")
+    );
+    let response = adapter.response(id);
+    assert!(
+        response.get("error").is_some(),
+        "a cut-off reply fails the turn: {response}"
+    );
+    adapter.finish();
+}
+
+#[test]
 fn host_feature_gates_read_the_installed_muse_version() {
     if !enabled("host_feature_gates_read_the_installed_muse_version") {
         return;

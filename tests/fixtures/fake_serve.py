@@ -692,6 +692,21 @@ def on_turn_start(params):
         if turn_reason:
             failed_params["reason"] = turn_reason
         notify("turn/completed", failed_params)
+    elif SCENARIO == "cut_off":
+        # The provider stream dies mid-reply: the partial text is committed
+        # with `cutOff` (Muse 1.4.7) and the run fails.
+        item = {"itemId": "it-cut", "kind": "agentMessage",
+                "status": "inProgress", "text": ""}
+        notify("item/started", {**base, "item": item})
+        notify("item/delta", {**base, "itemId": "it-cut", "field": "text",
+                              "delta": "the answer is fo"})
+        done = {**item, "status": "completed", "text": "the answer is fo",
+                "cutOff": True}
+        notify("item/completed", {**base, "item": done})
+        notify("item/updated", {**base, "item": done})
+        notify("turn/completed", {**base, "terminal": "failed", "error": {
+            "kind": "modelError", "message": "provider stream ended mid-reply",
+            "retryable": True}})
     elif SCENARIO == "deferred_launch_error":
         notify("turn/completed", {
             **base,

@@ -16,7 +16,10 @@ observers (offered only `submit_reminder_decision`) decide "none". A
 workflow child (offered `submit_result`) reports "child finished". Anything
 else gets the text "ok". A reply is {"text": "..."} or
 {"tool": {"name": "...", "arguments": {...}}}, optionally with "hold_ms" to
-hold the stream open before it completes.
+hold the stream open before it completes. A text reply with "cut": true
+drops the connection after the message item and before the response
+completes, as a provider stream that dies mid-reply; Muse 1.4.7+ fails the
+run with the partial text committed (`Item.cutOff`) rather than retrying.
 
 The adapter's auto-review turn asks a guardian-style reviewer instead of a
 user, so a request whose prompt carries the guardian policy gets the script's
@@ -241,6 +244,8 @@ class Handler(BaseHTTPRequestHandler):
                   "item_id": item["id"], "content_index": 0, "part": done_part})
             send({"type": "response.output_item.done", "output_index": 0,
                   "item": dict(item, status="completed", content=[done_part])})
+            if reply.get("cut"):
+                return
         send({"type": "response.completed", "response": response(rid, "completed", usage={
             "input_tokens": 1, "output_tokens": 1, "total_tokens": 2})})
 

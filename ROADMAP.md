@@ -656,6 +656,7 @@ continues.
 | `media/upload` | Mapped to ACP | A `resource_link` to a local `video/mp4`/`video/quicktime` file, or an embedded `video/*` blob, is uploaded in 1 MiB raw chunks (three-byte-aligned, so each base64 frame stays inside the host frame budget) with a client-minted `uploadId`, fresh `commandId` per chunk, and bounded per-chunk retries; the receipt becomes the turn's `video` part. Files are read only inside the approved roots and capped at 64 MiB. |
 | `session/sideChat` | Mapped to ACP | Backs the opt-in `_session/sideChat` extension (muse `sideChat` capability): the call opens a side chat from a loaded session and returns the new session id with its `sideFrom` provenance, which the client attaches with its ordinary session methods (`session/resume`/`session/load`). The side is routed to the source's host and inherits its mode. `sideFrom` — and `forkedFrom` — also ride `session_info_update._meta.muse` when the session is attached. |
 | `userInput/interrupt` | Mapped to ACP | A stop (`session/cancel`) or a decline of a staged question carrying confirmed answers settles the open prompt through `userInput/interrupt`, which hands the answers to the model and stops the turn; an unanswered prompt keeps the ordinary turn interrupt, and an unanswered decline keeps `userInput/cancel`. |
+| `Item.cutOff` | Mapped to ACP | A partial agent reply the host committed when the provider stream died gets one `agent_message_chunk` with `_meta.muse.cutOff: true` and the host `itemId` (plus the streamed `messageId` on ACP v2), from whichever of `item/updated`, `item/completed`, or a history replay first carries the flag; it is never inferred, cleared, or repeated. [#243](https://github.com/BrokkAi/muse-acp/issues/243) |
 | `plugin/changed` | Consumed | Logged as an install-landed diagnostic; the adapter keeps no plugin cache, so clients re-read the opt-in `_session/plugins` view. |
 | `plugin/marketplaceChanged` | Consumed | Logged as a marketplace-change diagnostic; clients re-read `_session/plugins` rather than a local cache. |
 | `recap/completed` | Intentionally ignored | An inbound copy takes the unhandled-notification path; [#215](https://github.com/BrokkAi/muse-acp/issues/215) |
@@ -677,11 +678,11 @@ explicit disposition in the field matrix below;
 matrix. The 1.4.7 additions have their own issues: the `InitializeResult`
 sandbox facts
 (`sandboxAvailability`, `sandboxUnavailableReason`) in
-[#241](https://github.com/BrokkAi/muse-acp/issues/241), `SessionNameOrigin`
+[#241](https://github.com/BrokkAi/muse-acp/issues/241) and `SessionNameOrigin`
 (`Session.nameOrigin`, `SessionNameChangedParams.nameOrigin`) in
-[#242](https://github.com/BrokkAi/muse-acp/issues/242), and the `Item.cutOff`
-partial-message mark in
-[#243](https://github.com/BrokkAi/muse-acp/issues/243).
+[#242](https://github.com/BrokkAi/muse-acp/issues/242). The `Item.cutOff`
+partial-message mark is adopted
+([#243](https://github.com/BrokkAi/muse-acp/issues/243)): see its row above.
 
 The 1.4.8 additions have their own issues. The Computer Use app-level list,
 installed-app picker, and `apps` writer (`ComputerUseSettings.apps`,

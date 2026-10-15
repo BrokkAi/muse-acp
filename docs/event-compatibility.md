@@ -29,10 +29,10 @@ are emitted by the MSP host.
 | `approval/updated` | Mapped to ACP | Reasserts ACP v2 `running` state for an updated, still-active approval flow. |
 | `computerUseSetup/changed` | Consumed | Logged as a diagnostic for the setup flow the opt-in `_session/computerUse` extension and `/cua` drive. The adapter keeps no CUA state, so the next read re-asks the host. A 1.4.7 copy without `sessionId` carries the host's own setup and is delivered only to `computerUseHostSetup` holders, which the adapter does not request. |
 | `initialized` | Consumed | Sent by the adapter after the MSP `initialize` handshake. An unexpected inbound copy is harmlessly ignored. |
-| `item/completed` | Mapped to ACP | Folds the authoritative final item into message, tool-call, async-task, subagent, or other negotiated ACP updates. |
+| `item/completed` | Mapped to ACP | Folds the authoritative final item into message, tool-call, async-task, subagent, or other negotiated ACP updates. An `agentMessage` with `cutOff: true` (Muse 1.4.7+) is marked once with `_meta.muse.cutOff` on an `agent_message_chunk` for that message. |
 | `item/delta` | Mapped to ACP | Streams supported item field appends as ACP message or tool-call updates. Unknown item fields and kinds are tolerated. |
 | `item/started` | Mapped to ACP | Opens or upserts the corresponding ACP item and starts negotiated async-task or subagent presentation where applicable. |
-| `item/updated` | Mapped to ACP | Upserts the corresponding ACP item from its higher-revision snapshot. |
+| `item/updated` | Mapped to ACP | Upserts the corresponding ACP item from its higher-revision snapshot. A revision that first marks a reply `cutOff`, including one after the reply settled, sends the same one-time `_meta.muse.cutOff` mark. |
 | `plugin/changed` | Consumed | Logs the installed row as a diagnostic. The adapter keeps no plugin cache, so a client re-reads the opt-in `_session/plugins` view after a change. |
 | `plugin/marketplaceChanged` | Consumed | Logs the marketplace and change as a diagnostic; clients re-read `_session/plugins` instead of a local cache. |
 | `recap/completed` | Mapped to ACP | The single settlement of each `recap/request` the adapter made: `completed` publishes the (title-prefixed) summary as agent text and settles the held prompt `end_turn`, `cancelled` settles it `cancelled`, and `failed`/`timedOut`/unknown outcomes surface as failures. A settlement whose correlation id matches no in-flight request is logged and ignored. |
