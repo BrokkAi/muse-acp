@@ -599,9 +599,8 @@ current behavior.
 Relative adoption, from the npm registry's last-30-day download counts
 (2026-09-19 through 2026-10-18), was about 4.0k for `@bex-co/muse-code-acp`,
 2.5k for `muse-spark-code-acp`, 2.2k for `@brokkai/muse-acp`, and 160 for
-`muse-acp`. The `muse-spark-code-acp` count covers only its ACP package, not
-its VS Code extension installs. Download counts include CI and mirrors, so
-treat them as an order-of-magnitude signal, not a usage measurement.
+`muse-acp`. Download counts include CI and mirrors, so treat them as an
+order-of-magnitude signal, not a usage measurement.
 
 The headless `muse exec --json` design is a good fit for one-shot automation and
 scripted workflows. This adapter chooses MSP so a single editor session keeps
