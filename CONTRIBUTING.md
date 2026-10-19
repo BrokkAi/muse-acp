@@ -19,7 +19,8 @@ MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loopback
 Set `MUSE_CLI` to test a specific Muse build. The nightly workflow
 (`.github/workflows/nightly.yml`) runs this suite against each pinned build it
 lists; run it on a branch with `gh workflow run nightly --ref <branch>` when a
-change needs live-host coverage before merge.
+change needs live-host coverage before merge. Each failed nightly job opens an issue
+labeled `nightly-failure`, or comments on the open one for that job.
 
 Before submitting a pull request, run:
 

@@ -207,3 +207,43 @@ jobs:
           node-version: '22'
           package-manager-cache: false
       - run: node --test npm/test/launcher.test.cjs
+
+  # Files one issue per failed job, so each failure gets tracked and fixed. A
+  # job that keeps failing gets a comment on its open issue rather than a new
+  # issue every night.
+  report-failures:
+    needs: [platform, live-host, npm-launcher]
+    if: failure()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      issues: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_ID: ${{ github.run_id }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Open or update an issue for each failed job
+        run: |
+          set -euo pipefail
+          gh label create nightly-failure --color B60205 \
+            --description 'A nightly workflow job failed' --force
+          gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/jobs" \
+            --jq '.jobs[] | select(.conclusion == "failure") | [.name, .html_url] | @tsv' |
+          while IFS=$'\t' read -r job url; do
+            title="Nightly failure: $job"
+            body="The nightly job \`$job\` failed on \`$GITHUB_SHA\`.
+
+          Job log: $url
+          Run: $RUN_URL"
+            existing=$(gh issue list --state open --label nightly-failure \
+              --search "\"$title\" in:title" --json number,title \
+              --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body "$body"
+            else
+              gh issue create --title "$title" --label nightly-failure --body "$body"
+            fi
+          done
