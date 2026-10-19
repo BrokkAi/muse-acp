@@ -38,6 +38,8 @@ const ADDITIONS: &[&str] = &[
     "InitializeResult.sandboxUnavailableReason",
     "Item.displayLabel",
     "SkillCatalogEntry.title",
+    "Session.nameOrigin",
+    "SessionNameChangedParams.nameOrigin",
 ];
 
 fn matrix() -> String {
@@ -202,6 +204,8 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("InitializeResult", "sandboxUnavailableReason"),
         ("Item", "displayLabel"),
         ("SkillCatalogEntry", "title"),
+        ("Session", "nameOrigin"),
+        ("SessionNameChangedParams", "nameOrigin"),
     ] {
         assert!(
             has_property(defs, def, member),

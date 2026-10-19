@@ -360,8 +360,10 @@ error the editor shows if Muse then refuses the profile says why.
   through `session/goalChanged` display metadata.
 - **Session names** — `/rename <name>` renames the session through the host's
   `session/rename`; the new title arrives through `session/nameChanged` as an
-  ACP `session_info_update`. The adapter requests the host's `sessionRename`
-  capability at startup. Muse 1.4.8 added it to the grantable registry; a host
+  ACP `session_info_update`. When the host proves how the name was set
+  (Muse 1.4.7+), the update's `_meta.muse.nameOrigin` says `automatic` or
+  `custom`; unknown provenance is omitted, never guessed. The adapter
+  requests the host's `sessionRename` capability at startup. Muse 1.4.8 added it to the grantable registry; a host
   that withholds the grant is answered with the typed `capabilityRequired`
   refusal, while hosts that predate the entry keep serving `session/rename`
   without it.

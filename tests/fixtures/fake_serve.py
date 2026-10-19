@@ -117,6 +117,9 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   rename_snapshot SnapshotState.name is the only name on resume
   rename_clear  resume reports a null name and must clear a stale title
   rename_list   session/list exposes the authoritative session name
+  name_origin  Session.nameOrigin is automatic at start and custom (with a
+               new name) on resume; one prompt folds custom, an unknown
+               future origin, no origin, then an origin-only re-fold
   tool_stored_output tool result with outputRef/patchRef metadata
   tool_output_unavailable outputRef exists but item/readOutput fails
   close_stdin  closes the host's stdin after initialization, then exits
@@ -668,6 +671,21 @@ def on_turn_start(params):
         notify("session/nameChanged", {
             "sessionId": ACTIVE_SESSION[0], "name": "Renamed by host",
         })
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "name_origin":
+        for cursor, name, origin in (
+            ("cur-origin-1", "Custom name", "custom"),
+            ("cur-origin-2", "Future name", "conversationGenerated"),
+            ("cur-origin-3", "Plain name", None),
+            # Same name again, now with provenance: an origin-only change.
+            ("cur-origin-4", "Plain name", "automatic"),
+        ):
+            change = {"sessionId": ACTIVE_SESSION[0], "name": name,
+                      "viewCursor": cursor,
+                      "sourceRange": {"start": 1, "end": 1}}
+            if origin is not None:
+                change["nameOrigin"] = origin
+            notify("session/nameChanged", change)
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "failed":
         failed_params = {**base, "terminal": "failed"}
@@ -1490,6 +1508,9 @@ def result_for(method, msg):
             result["session"]["name"] = "Before resume"
         elif SCENARIO == "rename_clear":
             result["session"]["name"] = "Before clear"
+        elif SCENARIO == "name_origin":
+            result["session"]["name"] = "Auto name"
+            result["session"]["nameOrigin"] = "automatic"
         return result
     if method == "skill/list":
         log_input(msg.get("params", {}))
@@ -1605,6 +1626,9 @@ def result_for(method, msg):
             session["activeTurnId"] = "turn-2"
         if SCENARIO == "rename_resume":
             session["name"] = "Renamed outside adapter"
+        elif SCENARIO == "name_origin":
+            session["name"] = "Resumed name"
+            session["nameOrigin"] = "custom"
         elif SCENARIO == "rename_clear":
             session["name"] = None
         elif SCENARIO == "side_chat" and params.get("sessionId") == "msp-sess-side":
