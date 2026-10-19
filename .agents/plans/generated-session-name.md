@@ -21,8 +21,9 @@ The behavior is observable with the fake MSP host and with a real Muse host whos
 - [x] Add unit and fake-host regression coverage.
 - [x] Add real-host coverage for the non-fabrication/compatibility half on Muse 1.4.8+.
 - [x] Update README, ROADMAP, event compatibility, CHANGELOG, and this plan.
-- [ ] Run all contribution gates and the focused live test.
-- [ ] Open a pull request, complete three review/fix passes, and merge only after final CI is green.
+- [x] Run all contribution gates and the focused live test.
+- [x] Open [PR #289](https://github.com/BrokkAi/muse-acp/pull/289).
+- [ ] Complete three review/fix passes and merge only after final CI is green.
 
 
 ## Surprises & Discoveries
@@ -65,7 +66,7 @@ The behavior is observable with the fake MSP host and with a real Muse host whos
 
 ## Outcomes & Retrospective
 
-Implementation is complete and focused tests pass. Fake-host coverage proves snapshot restoration, live replacement, withdrawal, list-row preservation, and no fabrication. The real-host test proves the compatibility half: a host that publishes no generated pair does not acquire metadata from its canonical title or a custom rename. All contribution gates and the three review/fix passes remain.
+Implementation is complete, all contribution gates pass, and PR #289 is open. Fake-host coverage proves snapshot restoration, live replacement, withdrawal, list-row preservation, and no fabrication. The real-host test proves the compatibility half: a host that publishes no generated pair does not acquire metadata from its canonical title or a custom rename. The three review/fix passes remain.
 
 
 ## Context and Orientation
@@ -89,7 +90,7 @@ Third, carry the metadata through every canonical-title emission: initial start,
 
 Fourth, extend the fake host with scenarios for a generated name in the initial snapshot, a live generated pair with replacement, a later authoritative omission, and a list-row update that omits generated metadata. Add unit tests proving no inference from `name` and proving list-row preservation. Add integration assertions that ACP receives `_meta.muse.generatedName`, that generated-only changes publish, that withdrawal emits null, and that list rows never contain the key.
 
-Add a live test using a real host path that produces an automatically generated name. The test must discover the host release and only assert `generatedName` where the host emits it, while verifying it accompanies the canonical title and is never equal to a fabricated fallback merely because the test expected it to exist.
+Probe the live host path and scope its assertion to what that path can prove. The native loopback host publishes canonical first-prompt and rename titles without a generated pair, so the live test must assert that neither path fabricates `generatedName`. The fake host supplies the positive snapshot, replacement, and withdrawal evidence because the host-native path does not expose a generated pair.
 
 Finally, update user and compatibility documentation, run every repository gate, open a pull request that closes #256, review the actual diff three times, fix real findings, and merge only after the final required checks pass.
 
@@ -108,7 +109,7 @@ Format and run focused tests while iterating:
 
 Run the focused real-host test:
 
-    MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loopback generated_name -- --nocapture
+    MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loopback real_host_without_generated_pair_keeps_it_unpublished -- --nocapture
 
 Run all contribution gates before opening or updating the pull request:
 
@@ -140,7 +141,7 @@ A live `session/nameChanged` carrying a new `generatedName` updates the metadata
 
 `session/list` rows and list-change frames never expose or infer `generatedName`, and a list-change omission does not erase a generated value already held for the session.
 
-All unit, integration, live, and repository gates are green. The pull request closes #256, receives three documented review/fix passes, and is merged only at a green final head.
+All unit, integration, live, and repository gates are green. The live host proves that canonical titles and custom renames remain unpublished when the host supplies no generated pair; the fake host proves positive adoption and withdrawal. The pull request closes #256, receives three documented review/fix passes, and is merged only at a green final head.
 
 
 ## Idempotence and Recovery
@@ -166,3 +167,5 @@ An initial update with no generated title omits `generatedName`. A withdrawal af
 At completion, `src/acp.rs` defines `HostTitleFacts` with a public `generated_name: Option<String>` member. `send_session_title` accepts enough information to distinguish omission, a string generated title, and explicit null, and emits at most one `_meta.muse` object containing the publishable name-origin and generated-name facts.
 
 At completion, `src/main.rs` provides a helper that snapshots the canonical title, name origin, and generated name for change detection; an authoritative generated-name replacement helper used by lifecycle snapshots and `SessionNameChangedParams`; and non-authoritative folding used by list rows. No new dependency is required.
+
+Change note (2026-10-19): review pass 1 corrected the live-test description and progress to match the implemented and locally validated behavior.
