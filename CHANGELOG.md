@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Adopt Muse 1.4.8 monitor feed items (#255). A `monitorFeed` item renders as
+  one stable ACP tool card per `monitorId`; streamed `text` deltas accumulate
+  into replacement card content and the completed item settles it. The
+  model-controlled arm-time description is stripped of control and bidi
+  formatting characters, collapsed and bounded for the card title, while
+  `_meta.muse.monitorId` links the card to the monitor tool call. Feed items
+  arriving outside a turn (`turnId: null`) are accepted, and host-truncated
+  text is reported with `_meta.muse.truncated.source = "host"`.
+
 - Adopt Muse 1.4.8 generated session short titles (#256). The adapter folds
   the optional `Session.generatedName` snapshot fact through start, resume,
   load, and fork, and accepts live replacements from

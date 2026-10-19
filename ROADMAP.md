@@ -713,8 +713,9 @@ phase (`Item.messagePhase`, `MessagePhase`) is adopted
 ([#254](https://github.com/BrokkAi/muse-acp/issues/254); see the field-matrix
 row below); the `monitorFeed`
 item kind with `Item.monitorId`/`Item.monitorDescription` and the widened
-`Item.truncated`/`Item.turnId` text in
-[#255](https://github.com/BrokkAi/muse-acp/issues/255); the generated short
+`Item.truncated`/`Item.turnId` handling is adopted
+([#255](https://github.com/BrokkAi/muse-acp/issues/255); see the
+field-matrix rows below); the generated short
 title (`Session.generatedName`,
 `SessionNameChangedParams.generatedName`) is adopted
 ([#256](https://github.com/BrokkAi/muse-acp/issues/256); see the field-matrix
@@ -760,6 +761,7 @@ cannot drop a member without failing CI.
 | MSP addition | Disposition | Adapter behavior or tracking |
 | --- | --- | --- |
 | `ItemKind.webSearch` | Mapped to ACP | Rendered through the unknown-kind generic card path from the item's `fallbackText`, carrying `_meta.muse.itemKind`; a frame without a summary is tolerated and emits nothing. |
+| `ItemKind.monitorFeed` | Mapped to ACP | Rendered as one stable `kind: "other"` tool card per monitor. `item/delta` on `text` accumulates and replaces the card content, the completed item settles it, and `Item.truncated` is forwarded from the host. `Item.turnId: null` is accepted because monitor events can arrive outside a turn. [#255](https://github.com/BrokkAi/muse-acp/issues/255) |
 | `TurnErrorKind.mcpLinkError` | Mapped to ACP | The turn-failure projection names the kind verbatim and adds an MCP-link remedy ("check the server's configuration and credentials"); the host message and retryable judgment are preserved. |
 | `TurnError.quota` | Mapped to ACP | The failure text appends the typed `QuotaDetail` (`limitKind` plus the reset wait); the adapter branches on the detail's presence, never on the message text. |
 | `TurnRetryScheduledParams.errorKind` | Consumed | Recorded in the `turn/retryScheduled` diagnostic; the event stays non-terminal and never settles the ACP prompt. |
@@ -775,6 +777,8 @@ cannot drop a member without failing CI.
 | `SessionTokenUsageParams.modelId` | Mapped to ACP | Keys the per-model cost legs under the prompt result's `_meta.muse.modelUsage`; a leg without a `modelId` is counted in the totals and left out rather than given an invented name. |
 | `SessionGoalChangedParams.goal` | Mapped to ACP | An explicit null clears the goal metadata (clear is kept distinct from never-seen); a non-null goal is stored and emitted. |
 | `Item.cutOff` | Mapped to ACP | A partial agent reply the host committed when the provider stream died is marked once with `_meta.muse.cutOff: true` and the host `itemId`, from whichever of `item/updated`, `item/completed`, a gap refill, or a history replay first carries the flag. A streamed reply gets an empty `agent_message_chunk` naming its `messageId` on ACP v2; a resent or replayed reply carries the mark on its own text update. A late mark only names the latest settled reply, and on ACP v1 (chunks attach by position) waits out a newer streaming reply. Never inferred, repeated, or cleared. [#243](https://github.com/BrokkAi/muse-acp/issues/243) |
+| `Item.monitorId` | Mapped to ACP | Selects the stable ACP card id `monitor-<monitorId>` and is carried verbatim as `_meta.muse.monitorId`; a client can match it to the monitor tool call's item id. Later feed items for one monitor update the same card. [#255](https://github.com/BrokkAi/muse-acp/issues/255) |
+| `Item.monitorDescription` | Mapped to ACP | The arm-time description labels the card as `Monitor: <description>` and is also carried as sanitized `_meta.muse.monitorDescription`. Control and bidi formatting characters are removed, whitespace is collapsed, and the label is bounded before rendering. [#255](https://github.com/BrokkAi/muse-acp/issues/255) |
 | `InitializeResult.sandboxAvailability` | Consumed | Recorded on the handshake and logged as `host-sandbox server=<host> availability=<posture> reason=<reason>` beside `host-features`, the posture being `available`, `unavailable`, or `unknown`; `--support` probes a live host for the same line and `--selftest`'s offline row reads `unknown`. An absent field (a host before 1.4.7) or an unrecognized value reads as `unknown`, never as a guess. `unavailable` adds a visible warning; nothing is gated on it. [#241](https://github.com/BrokkAi/muse-acp/issues/241) |
 | `InitializeResult.sandboxUnavailableReason` | Consumed | Reported as `reason=` on the `host-sandbox` line and in the warning only beside `unavailable`; a reason outside the published vocabulary reads as `unknown`, and an absent reason stays `none` — the adapter never infers one. [#241](https://github.com/BrokkAi/muse-acp/issues/241) |
 | `Item.displayLabel` | Mapped to ACP | Tool-card titles prefer the host's own words: `active` while `inProgress`, `done` on `completed`, and `neutral` beside every other status. The selected string must be non-empty; absent, null, malformed, or empty labels fall back to the existing synthesized `tool: detail` title. The same title is used by live updates, history replay, and AIR async-task announcements. [#272](https://github.com/BrokkAi/muse-acp/issues/272) |

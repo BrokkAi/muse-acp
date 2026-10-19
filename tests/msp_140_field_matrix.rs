@@ -19,6 +19,7 @@ const END: &str = "<!-- msp-1.4.x-field-matrix:end -->";
 /// the ROADMAP row (the second table cell). Kept in the issue's order.
 const ADDITIONS: &[&str] = &[
     "ItemKind.webSearch",
+    "ItemKind.monitorFeed",
     "TurnErrorKind.mcpLinkError",
     "TurnError.quota",
     "TurnRetryScheduledParams.errorKind",
@@ -34,6 +35,8 @@ const ADDITIONS: &[&str] = &[
     "SessionTokenUsageParams.modelId",
     "SessionGoalChangedParams.goal",
     "Item.cutOff",
+    "Item.monitorId",
+    "Item.monitorDescription",
     "InitializeResult.sandboxAvailability",
     "InitializeResult.sandboxUnavailableReason",
     "Item.displayLabel",
@@ -185,6 +188,10 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         "ItemKind.webSearch left the stable surface"
     );
     assert!(
+        enum_has("ItemKind", "monitorFeed"),
+        "ItemKind.monitorFeed left the stable surface"
+    );
+    assert!(
         enum_has("TurnErrorKind", "mcpLinkError"),
         "TurnErrorKind.mcpLinkError left the stable surface"
     );
@@ -203,6 +210,8 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("SessionTokenUsageParams", "modelId"),
         ("SessionGoalChangedParams", "goal"),
         ("Item", "cutOff"),
+        ("Item", "monitorId"),
+        ("Item", "monitorDescription"),
         ("InitializeResult", "sandboxAvailability"),
         ("InitializeResult", "sandboxUnavailableReason"),
         ("Item", "displayLabel"),

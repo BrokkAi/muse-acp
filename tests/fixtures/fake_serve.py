@@ -138,6 +138,9 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   generated_name Session.generatedName is restored from the start snapshot,
                then live nameChanged frames replace it and clear it; list
                rows carry only the canonical name
+  monitor_feed  monitorFeed items stream into one card keyed by monitorId,
+                sanitize the model-controlled description, and honor
+                host truncation
   tool_stored_output tool result with outputRef/patchRef metadata
   tool_output_unavailable outputRef exists but item/readOutput fails
   close_stdin  closes the host's stdin after initialization, then exits
@@ -733,6 +736,48 @@ def on_turn_start(params):
             if present:
                 change["generatedName"] = generated_name
             notify("session/nameChanged", change)
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "monitor_feed":
+        monitor_id = "monitor-task-1"
+        first = {
+            "itemId": "feed-item-1", "kind": "monitorFeed",
+            "monitorId": monitor_id,
+            "monitorDescription": "Build\twatcher \u001b[31m\u202e",
+            "status": "inProgress", "turnId": None, "revision": 1,
+            "text": "watching\n",
+        }
+        notify("item/started", {
+            "sessionId": ACTIVE_SESSION[0], "item": first,
+            "viewCursor": "cur-monitor-1",
+        })
+        notify("item/delta", {
+            "sessionId": ACTIVE_SESSION[0], "itemId": first["itemId"],
+            "field": "text", "delta": "event one\n",
+            "viewCursor": "cur-monitor-2",
+        })
+        first = {**first, "status": "completed", "revision": 3,
+                 "text": "watching\nevent one\n", "truncated": True}
+        notify("item/completed", {
+            "sessionId": ACTIVE_SESSION[0], "item": first,
+            "viewCursor": "cur-monitor-3",
+            "sourceRange": {"start": 1, "end": 1},
+        })
+        second = {
+            "itemId": "feed-item-2", "kind": "monitorFeed",
+            "monitorId": monitor_id, "monitorDescription": "Build watcher",
+            "status": "inProgress", "turnId": None, "revision": 1,
+            "text": "event two\n",
+        }
+        notify("item/started", {
+            "sessionId": ACTIVE_SESSION[0], "item": second,
+            "viewCursor": "cur-monitor-4",
+        })
+        second = {**second, "status": "completed", "revision": 2}
+        notify("item/completed", {
+            "sessionId": ACTIVE_SESSION[0], "item": second,
+            "viewCursor": "cur-monitor-5",
+            "sourceRange": {"start": 1, "end": 1},
+        })
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "failed":
         failed_params = {**base, "terminal": "failed"}
