@@ -36,6 +36,17 @@
   joins the ROADMAP section 9 field matrix, and a live loopback test covers it
   on Muse 1.4.7 and later.
 
+- Show Muse 1.4.8 mid-turn model retries (#259). A `turn/modelRetryScheduled`
+  notification no longer takes the unhandled-notification path: it leaves the
+  ACP prompt open, logs the attempt facts like `turn/retryScheduled`, and,
+  while the turn is running, sends
+  `session_info_update._meta.muse.modelRetry` with `turnId`, `attempt`,
+  `nextAttempt`, `maxAttempts`, `retryDelayMs`, and the optional `errorKind`,
+  `system`, and `httpStatus`, so an editor can render a retry countdown. An
+  unknown `errorKind` passes through verbatim. The turn's terminal withdraws
+  the hint with `modelRetry: null` before the prompt settles. A live loopback
+  test covers it on Muse 1.4.8 and later.
+
 ## 0.14.0
 
 - Re-pin the vendored Muse SDK conformance corpus to `838d36a` (2026-10-14,

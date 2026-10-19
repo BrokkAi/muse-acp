@@ -38,6 +38,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   retracted    turn/retracted for the turn (no completion follows)
   retract_then_completed retract, then a late turn/completed (settle once)
   retry_then_completed turn/retryScheduled, then a normal completion
+  model_retry_then_completed turn/modelRetryScheduled (unknown errorKind, no
+               httpStatus/system), then a normal completion
   foreground_then_completed turn/foregroundCompleted (background checks hold
                         the turn open), then a normal completion
   foreground_then_retracted turn/foregroundCompleted, then turn/retracted
@@ -1179,6 +1181,24 @@ def on_turn_start(params):
                                       "system": "meta"})
         notify("item/completed", {**base, "item": {
             "itemId": "it-rt", "kind": "agentMessage",
+            "status": "completed", "text": "recovered"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "model_retry_then_completed":
+        # The model-layer sibling (Muse 1.4.8) is equally non-terminal. The
+        # errorKind is open vocabulary and system/httpStatus are optional, so
+        # an unknown kind with both omitted must still fold.
+        record = {"id": "ev-mr", "sequence": 4}
+        notify("turn/modelRetryScheduled", {**base,
+                                           "attempt": 1, "nextAttempt": 2,
+                                           "maxAttempts": 4, "retryDelayMs": 1500,
+                                           "errorKind": "someFutureKind",
+                                           "viewCursor": "cur-mr",
+                                           "sourceRange": {"first": record,
+                                                           "last": record,
+                                                           "stream": {"id": "st-1",
+                                                                      "kind": "session"}}})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-mr", "kind": "agentMessage",
             "status": "completed", "text": "recovered"}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "foreground_then_completed":

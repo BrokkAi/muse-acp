@@ -3049,6 +3049,55 @@ fn turn_retry_then_completed_settles_once_as_end_turn() {
 }
 
 #[test]
+fn turn_model_retry_is_surfaced_and_the_turn_still_settles_once() {
+    // The 1.4.8 model-layer retry is non-terminal: the prompt stays open
+    // while the retry hint reaches the editor, the later completion settles
+    // it exactly once, and the hint is withdrawn before that result. An
+    // unknown errorKind with system/httpStatus omitted must not fail the
+    // frame.
+    let mut c = Client::spawn("model_retry_then_completed", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"end_turn\""),
+        "completion settles after the model retry: {done}"
+    );
+    let (count, log) = {
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+        let needle = format!("\"id\":{pid}");
+        let count = frames.iter().filter(|f| f.contains(&needle)).count();
+        (count, frames.join("\n"))
+    };
+    assert_eq!(count, 1, "exactly one settle for the prompt: {log}");
+    let at = |needle: &str| {
+        log.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {log}"))
+    };
+    let hint = at(
+        "\"modelRetry\":{\"turnId\":\"turn-1\",\"attempt\":1,\"nextAttempt\":2,\"maxAttempts\":4,\"retryDelayMs\":1500,\"errorKind\":\"someFutureKind\"}",
+    );
+    let reply = at("recovered");
+    let cleared = at("\"modelRetry\":null");
+    let result = log.rfind(&format!("\"id\":{pid}")).unwrap();
+    assert!(
+        hint < reply && reply < cleared && cleared < result,
+        "the hint shows while the turn runs and is withdrawn before it settles: {log}"
+    );
+    c.wait_stderr(
+        "turn/modelRetryScheduled turn=turn-1",
+        Duration::from_secs(15),
+    );
+    c.wait_stderr("errorKind=someFutureKind", Duration::from_secs(15));
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        !stderr.contains("unhandled MSP notification: turn/modelRetryScheduled"),
+        "the event is handled, not unhandled: {stderr}"
+    );
+    c.finish();
+}
+
+#[test]
 fn turn_foreground_completed_is_consumed_and_the_turn_still_settles() {
     // Foreground completion is explicitly non-terminal: background reminder
     // checks hold the turn open, so the prompt must settle only on the later

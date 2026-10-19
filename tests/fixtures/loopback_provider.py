@@ -20,6 +20,10 @@ hold the stream open before it completes. A text reply with "cut": true
 drops the connection after the message item and before the response
 completes, as a provider stream that dies mid-reply; Muse 1.4.7+ fails the
 run with the partial text committed (`Item.cutOff`) rather than retrying.
+A reply with "fail_first": N answers its first N calls with HTTP
+"fail_status" (default 503) before streaming, as a provider backing off;
+Muse retries the model attempt, and 1.4.8+ reports each scheduled retry
+as `turn/modelRetryScheduled`.
 
 The adapter's auto-review turn asks a guardian-style reviewer instead of a
 user, so a request whose prompt carries the guardian policy gets the script's
@@ -45,6 +49,8 @@ LOG = sys.argv[1]
 SCRIPT = json.load(open(sys.argv[2]))
 LOCK = threading.Lock()
 CALLS = [0]
+# Error answers already sent per scripted reply, for "fail_first".
+FAILURES = {}
 CHILD_RESULT = "child finished"
 OBSERVER_DECISION = {
     "advisory_text": None, "confidence": None, "decision": "none",
@@ -202,6 +208,20 @@ class Handler(BaseHTTPRequestHandler):
                              "output": last.get("output"),
                              "text": text_of(last)[:4000]},
                 }) + "\n")
+        with LOCK:
+            failed = FAILURES.get(id(reply), 0)
+            fail = failed < reply.get("fail_first", 0)
+            if fail:
+                FAILURES[id(reply)] = failed + 1
+        if fail:
+            body = json.dumps({"error": {"type": "server_error",
+                                         "message": "loopback overloaded"}}).encode()
+            self.send_response(reply.get("fail_status", 503))
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         rid = f"resp_{index}"
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")

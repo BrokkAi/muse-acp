@@ -196,6 +196,9 @@ pub struct SessionFold {
     /// done while reminder agents hold it open (`turn/foregroundCompleted`),
     /// as `(turn id, card id)`. Settled at the turn's terminal.
     background_checks: Option<(String, String)>,
+    /// The turn whose `_meta.muse.modelRetry` hint is showing
+    /// (`turn/modelRetryScheduled`). Withdrawn at the turn's terminal.
+    model_retry: Option<String>,
     /// The latest settled agent message as (MSP item id, ACP message id). A
     /// cut-off reply is the last one of its failed run, so a late
     /// `item/updated` carrying `cutOff` can only name this message.
@@ -267,6 +270,7 @@ impl SessionFold {
             reminder_cards: HashMap::new(),
             show_reminders: false,
             background_checks: None,
+            model_retry: None,
             last_message: None,
             cut_off: std::collections::HashSet::new(),
         }
@@ -1489,6 +1493,59 @@ impl SessionFold {
             out.push(Self::update_line(
                 acp_sid,
                 "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"muse\":{\"foregroundCompleted\":null}}}",
+            ));
+        }
+    }
+
+    /// `turn/modelRetryScheduled`: a provider backoff behind one model
+    /// attempt of a running turn (Muse 1.4.8). Non-terminal, so the prompt
+    /// stays pending; publish the attempt facts as a `_meta.muse.modelRetry`
+    /// hint so the editor can show "retrying in Ss, attempt N/M" instead of
+    /// dead air. `retryDelayMs` is the recorded backoff, not a fire time, so
+    /// any countdown is the client's. Absent optional members are omitted
+    /// rather than fabricated, and `errorKind` passes through verbatim: its
+    /// vocabulary is open.
+    pub fn on_model_retry_scheduled(
+        &mut self,
+        acp_sid: &str,
+        turn_id: &str,
+        params: &J,
+        out: &mut Vec<String>,
+    ) {
+        let mut fields = vec![format!("\"turnId\":{}", esc(turn_id))];
+        for key in ["attempt", "nextAttempt", "maxAttempts", "retryDelayMs"] {
+            if let Some(n) = params.get(key).and_then(J::as_u64) {
+                fields.push(format!("\"{key}\":{n}"));
+            }
+        }
+        for key in ["errorKind", "system"] {
+            if let Some(text) = params.get(key).and_then(J::as_str) {
+                fields.push(format!("\"{key}\":{}", esc(text)));
+            }
+        }
+        if let Some(status) = params.get("httpStatus").and_then(J::as_u64) {
+            fields.push(format!("\"httpStatus\":{status}"));
+        }
+        out.push(Self::update_line(
+            acp_sid,
+            &format!(
+                "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"muse\":{{\"modelRetry\":{{{}}}}}}}}}",
+                fields.join(",")
+            ),
+        ));
+        self.model_retry = Some(turn_id.to_string());
+    }
+
+    /// Withdraw the `_meta.muse.modelRetry` hint at a turn's terminal. `turn`
+    /// limits this to that turn; `None` clears whatever is showing.
+    pub fn clear_model_retry(&mut self, acp_sid: &str, turn: Option<&str>, out: &mut Vec<String>) {
+        if turn.is_some_and(|t| self.model_retry.as_deref().is_some_and(|open| open != t)) {
+            return;
+        }
+        if self.model_retry.take().is_some() {
+            out.push(Self::update_line(
+                acp_sid,
+                "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"muse\":{\"modelRetry\":null}}}",
             ));
         }
     }
@@ -3211,6 +3268,44 @@ mod corpus_tests {
         out.clear();
         fold.settle_background_checks("sid", Some("t1"), "completed", true, &mut out);
         assert!(out.is_empty(), "settles once: {out:?}");
+    }
+
+    #[test]
+    fn model_retry_hint_carries_the_attempt_facts_until_the_terminal() {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        let params = parse_json(
+            r#"{"turnId":"t1","sessionId":"s1","attempt":1,"nextAttempt":2,"maxAttempts":4,"retryDelayMs":1500,"errorKind":"someFutureKind","httpStatus":503,"system":"meta","viewCursor":"c1","sourceRange":{"first":3,"last":3}}"#,
+        )
+        .unwrap();
+        fold.on_model_retry_scheduled("sid", "t1", &params, &mut out);
+        assert_eq!(out.len(), 1, "one hint: {out:?}");
+        assert!(out[0].contains(
+            r#""modelRetry":{"turnId":"t1","attempt":1,"nextAttempt":2,"maxAttempts":4,"retryDelayMs":1500,"errorKind":"someFutureKind","system":"meta","httpStatus":503}"#
+        ), "{out:?}");
+
+        // The optional members are omitted, never fabricated.
+        out.clear();
+        let bare = parse_json(
+            r#"{"turnId":"t1","attempt":2,"nextAttempt":3,"maxAttempts":4,"retryDelayMs":3000}"#,
+        )
+        .unwrap();
+        fold.on_model_retry_scheduled("sid", "t1", &bare, &mut out);
+        assert!(out[0].contains(
+            r#""modelRetry":{"turnId":"t1","attempt":2,"nextAttempt":3,"maxAttempts":4,"retryDelayMs":3000}"#
+        ), "{out:?}");
+
+        // Another turn's terminal leaves the hint alone; this turn's clears
+        // it exactly once.
+        out.clear();
+        fold.clear_model_retry("sid", Some("t0"), &mut out);
+        assert!(out.is_empty(), "other turn: {out:?}");
+        fold.clear_model_retry("sid", Some("t1"), &mut out);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(out[0].contains(r#""modelRetry":null"#));
+        out.clear();
+        fold.clear_model_retry("sid", None, &mut out);
+        assert!(out.is_empty(), "clears once: {out:?}");
     }
 
     #[test]

@@ -569,6 +569,63 @@ fn a_reply_cut_off_mid_stream_is_marked_truncated() {
     adapter.finish();
 }
 
+/// A provider backoff behind one model attempt (Muse 1.4.8's
+/// `turn/modelRetryScheduled`). The loopback provider answers the first call
+/// with a 503, so the host schedules a model retry mid-turn: the editor sees
+/// the attempt facts as `_meta.muse.modelRetry` while the prompt stays open,
+/// the retried attempt's reply still streams, and the prompt settles once.
+#[test]
+fn a_model_retry_is_shown_while_the_turn_stays_open() {
+    let test = "a_model_retry_is_shown_while_the_turn_stays_open";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(
+        json!({"flaky": {"text": "after the retry", "fail_first": 1}}),
+        None,
+    );
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 8), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.prompt(&session, "answer [[script:flaky]]");
+    let hint = adapter.wait("the model-retry hint", |frame| {
+        frame["params"]["update"]["_meta"]["muse"]["modelRetry"].is_object()
+    });
+    let retry = &hint["params"]["update"]["_meta"]["muse"]["modelRetry"];
+    assert_eq!(retry["attempt"], 1, "{hint}");
+    assert_eq!(retry["nextAttempt"], 2, "{hint}");
+    assert!(
+        retry["maxAttempts"].as_u64().unwrap_or(0) >= 2,
+        "a retry chain bound: {hint}"
+    );
+    assert!(retry["retryDelayMs"].is_u64(), "{hint}");
+    assert!(retry["errorKind"].is_string(), "{hint}");
+    let result = adapter.result(id);
+    assert_eq!(result["stopReason"], "end_turn", "{result}");
+    assert!(
+        adapter
+            .text("agent_message_chunk")
+            .contains("after the retry"),
+        "{:?}",
+        adapter.updates("agent_message_chunk")
+    );
+    adapter.wait("the hint withdrawn", |frame| {
+        frame["params"]["update"]["_meta"]["muse"]["modelRetry"].is_null()
+            && frame["params"]["update"]["_meta"]["muse"]
+                .as_object()
+                .is_some_and(|muse| muse.contains_key("modelRetry"))
+    });
+    let log = std::fs::read_to_string(&adapter.log).unwrap();
+    assert!(
+        log.contains("turn/modelRetryScheduled turn="),
+        "the attempt facts reach the diagnostics:\n{log}"
+    );
+    adapter.finish();
+}
+
 #[test]
 fn host_feature_gates_read_the_installed_muse_version() {
     if !enabled("host_feature_gates_read_the_installed_muse_version") {
