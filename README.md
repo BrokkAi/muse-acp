@@ -322,7 +322,11 @@ error the editor shows if Muse then refuses the profile says why.
   `session/request_permission`, with a deny-safe fallback that explains
   failed or unusable editor replies in the transcript, plus optional
   [Auto-review](#auto-review-keep-the-boundary-lose-the-busywork) for
-  workspace-local file access.
+  workspace-local file access. On Muse 1.4.9+ an approval held by Muse's
+  native reviewer appears in reversible
+  `session_info_update._meta.muse.approvalReviewing` metadata, never as a
+  permission request. The hint clears when the host releases the approval,
+  resolves it, or ends the owning turn.
 - **MCP servers** — stdio and HTTP MCP servers attached by the editor load
   into the Muse session on Muse 1.3.0 and newer; see
   [Client-provided MCP servers](#client-provided-mcp-servers).

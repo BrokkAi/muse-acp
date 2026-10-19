@@ -15,6 +15,12 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   file_changes successful native file tools, including a replayed completion
   file_changes_ambiguous a shell tool whose writes cannot be inferred safely
   approval     approval/requested notification (two choices), then completed
+  approval_reviewing_then_requested native review activity, then the released
+               approval request and completed
+  approval_reviewing_then_resolved native review activity, then a terminal
+               resolution without a permission request
+  approval_reviewing_hold native review activity only; no decision request
+  approval_reviewing_child_identity parent and child reviews reuse ap-1
   approval_req approval/request server-initiated REQUEST (no notification)
   approval_hang stays pending after the approval so client decisions can be tested
   approval_resolved_elsewhere approval/requested, then approval/resolved by policy
@@ -828,6 +834,47 @@ def on_turn_start(params):
             "itemId": "it-shell", "kind": "toolCall", "callId": "call-shell",
             "turnId": tid, "status": "completed", "tool": "shell",
             "args": json.dumps({"command": "printf data > inferred.txt"})}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "approval_reviewing_then_requested":
+        review = approval_params(viewCursor="cur-review", turnId=tid)
+        notify("approval/reviewing", review)
+        if os.environ.get("FAKE_REVIEWING_TWICE") == "1":
+            notify("approval/reviewing", review)
+        notify("approval/requested", approval_params(
+            viewCursor="cur-requested", turnId=tid))
+        if os.environ.get("FAKE_REVIEWING_HANG") == "1":
+            return {"commandId": params.get("commandId", ""),
+                    "status": "accepted", "turnId": tid,
+                    "startedNewTurn": True}
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "approval_reviewing_hold":
+        review = approval_params(viewCursor="cur-review", turnId=tid)
+        notify("approval/reviewing", review)
+        if os.environ.get("FAKE_REVIEWING_TWICE") == "1":
+            notify("approval/reviewing", review)
+        if os.environ.get("FAKE_REVIEWING_THEN_COMPLETE") == "1":
+            notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "approval_reviewing_child_identity":
+        notify("item/started", {**base, "item": {
+            "itemId": "it-sub-review", "kind": "subagent",
+            "status": "inProgress", "revision": 1,
+            "subagentId": "sub-review", "agentPath": "researcher", "depth": 1,
+            "objective": "hold a child approval", "childSessionId": "child-sess-control",
+            "controlStatus": "running"}})
+        notify("approval/reviewing", approval_params(
+            viewCursor="cur-parent-review", turnId=tid))
+        notify("approval/reviewing", approval_params(
+            sessionId="child-sess-control", viewCursor="cur-child-review", turnId=tid,
+            subject={"kind": "tool", "toolName": "child-tool"}))
+    elif SCENARIO == "approval_reviewing_then_resolved":
+        notify("approval/reviewing",
+               approval_params(viewCursor="cur-review", turnId=tid))
+        notify("approval/resolved", {
+            "sessionId": MSP_SID, "approvalId": "ap-1", "itemId": "it-ap",
+            "turnId": tid, "decision": "approved", "resolvedBy": "policy",
+            "policyResult": "allowed", "stageEvidence": [],
+            "sourceRange": {"start": 0, "end": 1},
+            "viewCursor": "cur-resolved"})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO in ("approval", "pending_reconcile_dup"):
         if os.environ.get("FAKE_MCP_TOOL_ITEM", "") == "1":

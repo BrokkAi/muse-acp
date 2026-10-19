@@ -685,7 +685,7 @@ continues.
 | `pluginMutationsDisabled` (-32037) | Mapped to ACP | Forwarded with its registry code; the host's refusal never degrades to a generic failure. |
 | `turn/modelRetryScheduled` | Mapped to ACP | A durable, non-terminal observation that a provider backoff behind one model attempt is waiting out its delay. The prompt stays open; while the turn runs the attempt facts reach the editor as `session_info_update._meta.muse.modelRetry` (attempt, next, max, delay, and the optional failing `errorKind`/`system`/`httpStatus`), cleared at the turn's terminal, and are logged like `turn/retryScheduled`. An unknown `errorKind` passes through verbatim ([#259](https://github.com/BrokkAi/muse-acp/issues/259)). |
 | `sessionRename` capability | Mapped to ACP | Requested unconditionally at `initialize`, like `sessionListStream` and `feedback`, and recorded on the handshake. Muse 1.4.3–1.4.7 predate the registry entry: they ignore the unknown name and still serve `session/rename`, so `/rename` keeps working there. From 1.4.8 on the name is registered, and a withheld grant answers `/rename` with the typed `capabilityRequired` (-32010, `data.capability` = `sessionRename`) instead of sending an ungranted call. |
-| `approval/reviewing` | Intentionally ignored | A reviewer-held twin of `approval/requested` (Muse 1.4.9+): the host's native reviewer holds the approval, so no permission prompt opens and no decide is answered. An inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt; the release arrives as `approval/requested` (or `approval/resolved`) on the same id. Adopting it is tracked in [#271](https://github.com/BrokkAi/muse-acp/issues/271). |
+| `approval/reviewing` | Mapped to ACP | A reviewer-held activity notice, not a request. The adapter publishes reversible `session_info_update._meta.muse.approvalReviewing` rows keyed by source MSP session and approval id, with title and ACP tool kind. No permission prompt or decision is opened. `approval/requested` clears the row before normal approval handling; `approval/resolved` or the owning turn terminal also clears it. Adapter Auto-review remains independent and can handle the later release. [#271](https://github.com/BrokkAi/muse-acp/issues/271) |
 
 The remaining 1.4.x field-level and vocabulary additions — the `webSearch`
 item kind, `mcpLinkError`, `TurnError.quota`, the retry/retraction detail
@@ -730,10 +730,10 @@ above). The new
 it at `initialize`, records the grant, and keeps `/rename` typed on a host
 that withholds it (see the §9 row above).
 
-The 1.4.9 additions have their own issues. The tool-call display label
-(`Item.displayLabel`, `ToolDisplayLabel`) is adopted in
+The 1.4.9 additions are adopted. The tool-call display label
+(`Item.displayLabel`, `ToolDisplayLabel`) landed through
 [#272](https://github.com/BrokkAi/muse-acp/issues/272); the native-reviewer
-hold notice (`approval/reviewing`) remains in
+hold notice (`approval/reviewing`) lands through
 [#271](https://github.com/BrokkAi/muse-acp/issues/271). Muse 1.4.10 adds no
 stable-schema surface of its own; its SDK fold clarification for declined
 `turn/retracted` outcomes is re-examined against the adapter's
