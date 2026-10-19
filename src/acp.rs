@@ -916,7 +916,8 @@ pub fn reasoning_tier_name(tier: &str) -> &str {
 pub struct CatalogSkill {
     /// The shortcut token, advertised as the command name.
     pub selector: String,
-    /// The palette summary, advertised as the command description.
+    /// The palette summary, advertised as the command description; the
+    /// skill's name (else the selector) when the host sent an empty one.
     pub description: String,
     /// The skill's name for people to read: its declared `title` (Muse
     /// 1.4.8+), else the host's `displayName`. `None` when the row carries
