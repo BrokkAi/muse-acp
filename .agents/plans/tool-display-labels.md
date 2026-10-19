@@ -163,7 +163,7 @@ Local validation on 2026-10-19:
 Focused live test against Muse 1.4.10:
 
     tool_display_label_reaches_a_real_host: passed
-    observed active title: printf approved > approved.txt
+    observed active title on a real write_todos card: write_todos
 
 
 ## Interfaces and Dependencies

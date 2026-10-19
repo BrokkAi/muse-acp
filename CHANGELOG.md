@@ -8,7 +8,7 @@
   replay, and AIR async-task announcements all use the same selected label.
   Missing, null, malformed, or empty labels retain the existing synthesized
   `tool: detail` title, so pre-1.4.9 hosts keep their current presentation. A
-  live 1.4.10 shell call verifies the host-selected title reaches ACP.
+  live 1.4.10 `write_todos` call verifies the host-selected title reaches ACP.
 
 - Reconcile declined turn retractions with the Muse 1.4.10 fold (#273). When
   `turn/retracted` reports `outcome: "declined"`, the submission stood even
