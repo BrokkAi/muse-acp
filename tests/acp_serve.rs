@@ -3113,6 +3113,41 @@ fn turn_model_retry_is_surfaced_and_the_turn_still_settles_once() {
 }
 
 #[test]
+fn completed_agent_messages_declare_their_phase() {
+    // The 1.4.8 agent-message phase rides the completed item: a commentary
+    // reply is distinguishable from the final answer, and an unknown phase
+    // still renders its text as the final answer.
+    let mut c = Client::spawn("message_phase", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"end_turn\""),
+        "the turn still settles normally: {done}"
+    );
+    let log = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    let at = |needle: &str| {
+        log.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {log}"))
+    };
+    let commentary = at("\"messagePhase\":\"commentary\"");
+    let fallback = at("\"messagePhase\":\"finalAnswer\"");
+    assert!(
+        commentary < fallback,
+        "commentary stays distinguishable from the final answer: {log}"
+    );
+    assert!(
+        at("working through it") < at("\"text\":\"done\""),
+        "both replies render their text: {log}"
+    );
+    c.finish();
+}
+
+#[test]
 fn turn_foreground_completed_is_consumed_and_the_turn_still_settles() {
     // Foreground completion is explicitly non-terminal: background reminder
     // checks hold the turn open, so the prompt must settle only on the later

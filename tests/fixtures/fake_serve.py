@@ -42,6 +42,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
                httpStatus/system), then a normal completion
   foreground_then_completed turn/foregroundCompleted (background checks hold
                         the turn open), then a normal completion
+  message_phase commentary then unknown-phase agentMessage completions,
+                        then a normal completion
   foreground_then_retracted turn/foregroundCompleted, then turn/retracted
   deferred_launch_error queued admission followed by a launchError terminal
   quiet        turn/start answers only; nothing follows (for close/cancel)
@@ -1240,6 +1242,19 @@ def on_turn_start(params):
                                             "blockingAgents": ["agent-1", "agent-2"],
                                             "viewCursor": "cur-fg",
                                             "sourceRange": {"start": 0, "end": 1}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "message_phase":
+        # The 1.4.8 agent-message phase rides the completed item: commentary
+        # stays distinguishable from the final answer, and an unknown value
+        # still renders its text as the final answer.
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-commentary", "kind": "agentMessage",
+            "status": "completed", "text": "working through it",
+            "messagePhase": "commentary"}})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-final", "kind": "agentMessage",
+            "status": "completed", "text": "done",
+            "messagePhase": "someday"}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "foreground_then_retracted":
         # A retract settles the prompt while background checks hold the turn.

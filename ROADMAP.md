@@ -708,8 +708,9 @@ installed-app picker, and `apps` writer (`ComputerUseSettings.apps`,
 `ComputerUseSettings.installedApps`, `ComputerUseSettingsReadParams.installed`,
 `ComputerUseSettingsUpdateParams.apps`) are in
 [#253](https://github.com/BrokkAi/muse-acp/issues/253); the agent-message
-phase (`Item.messagePhase`, `MessagePhase`) in
-[#254](https://github.com/BrokkAi/muse-acp/issues/254); the `monitorFeed`
+phase (`Item.messagePhase`, `MessagePhase`) is adopted
+([#254](https://github.com/BrokkAi/muse-acp/issues/254); see the field-matrix
+row below); the `monitorFeed`
 item kind with `Item.monitorId`/`Item.monitorDescription` and the widened
 `Item.truncated`/`Item.turnId` text in
 [#255](https://github.com/BrokkAi/muse-acp/issues/255); the generated short
@@ -778,6 +779,7 @@ cannot drop a member without failing CI.
 | `SkillCatalogEntry.title` | Mapped to ACP | Each skill command in `available_commands_update` carries the skill's name as `_meta.muse.title`: the declared `title` (Muse 1.4.8+, from `SKILL.md` `metadata.display-name`), else the host's `displayName`. The command `name` stays the selector, and the `description` stays the palette summary unless the host sent an empty one, when it falls back to that name. Adapter-local commands carry no title. [#258](https://github.com/BrokkAi/muse-acp/issues/258) |
 | `Session.nameOrigin` | Mapped to ACP | The fold-only snapshot origin (`automatic` or `custom`, Muse 1.4.7+) is held with the name it describes and published as `session_info_update._meta.muse.nameOrigin` on attach. Absent and unrecognized future values read as unknown and stay unpublished; `session/list` rows never carry it and never erase a known origin for the same name. [#242](https://github.com/BrokkAi/muse-acp/issues/242) |
 | `SessionNameChangedParams.nameOrigin` | Mapped to ACP | The same origin on the live rename fold rides the title's `session_info_update` as `_meta.muse.nameOrigin`, including when only the origin changed. Omitted or unrecognized reads as unknown for the new name rather than inheriting the previous name's provenance. [#242](https://github.com/BrokkAi/muse-acp/issues/242) |
+| `Item.messagePhase` | Mapped to ACP | A completed agent reply declares the model-committed phase as `_meta.muse.messagePhase` (`commentary` or `finalAnswer`, Muse 1.4.8+). A streamed reply gets an empty `agent_message_chunk` naming its `messageId` on ACP v2; a resent, replayed, or cut-off reply carries the phase on its own marked update. An absent or unrecognized value reads as `finalAnswer`; the phase is never inferred from position and is never a turn-done signal. [#254](https://github.com/BrokkAi/muse-acp/issues/254) |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**

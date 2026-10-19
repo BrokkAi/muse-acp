@@ -631,6 +631,43 @@ fn a_model_retry_is_shown_while_the_turn_stays_open() {
     adapter.finish();
 }
 
+/// A completed agent reply declares its model-committed phase (Muse 1.4.8's
+/// `Item.messagePhase`). A plain loopback reply completes as the final
+/// answer: the completion update carries `_meta.muse.messagePhase` as
+/// `"finalAnswer"`, and the prompt still settles once.
+#[test]
+fn a_completed_reply_declares_its_message_phase() {
+    let test = "a_completed_reply_declares_its_message_phase";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"plain": {"text": "a plain final answer"}}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 8), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.prompt(&session, "answer [[script:plain]]");
+    let mark = adapter.wait("the message-phase mark", |frame| {
+        frame["params"]["update"]["_meta"]["muse"]["messagePhase"] == "finalAnswer"
+    });
+    assert_eq!(
+        mark["params"]["update"]["sessionUpdate"], "agent_message_chunk",
+        "{mark}"
+    );
+    assert!(
+        adapter
+            .text("agent_message_chunk")
+            .contains("a plain final answer"),
+        "{:?}",
+        adapter.updates("agent_message_chunk")
+    );
+    let result = adapter.result(id);
+    assert_eq!(result["stopReason"], "end_turn", "{result}");
+    adapter.finish();
+}
+
 #[test]
 fn host_feature_gates_read_the_installed_muse_version() {
     if !enabled("host_feature_gates_read_the_installed_muse_version") {
