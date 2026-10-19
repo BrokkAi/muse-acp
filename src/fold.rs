@@ -2934,6 +2934,12 @@ mod corpus_tests {
             "{}",
             j_to_string(&completed)
         );
+        let mut duplicate = Vec::new();
+        fold.on_item_completed("sid", 1, &completed, &mut duplicate);
+        assert!(
+            duplicate.is_empty(),
+            "a terminal refill must not settle the monitor twice: {duplicate:?}"
+        );
 
         // A later feed batch reuses the monitor card and is an update on v1.
         let second = parse_json(
