@@ -23,6 +23,7 @@ This does not change the adapter-side Auto-review setting. Native host review ha
 - [x] (2026-10-19) Added live Muse 1.4.10 coverage.
 - [x] (2026-10-19) Updated the README, ROADMAP, event matrix, CHANGELOG, and Auto-review documentation.
 - [x] (2026-10-19) Ran all contribution gates successfully.
+- [x] (2026-10-19) Follow-up review fix: terminal cleanup now matches the owning turn id and routes child terminals through their owner ACP session.
 - [x] (2026-10-19) Opened [PR #287](https://github.com/BrokkAi/muse-acp/pull/287) to close #271.
 - [x] (2026-10-19) Completed three review/fix passes: corrected the no-op diagnostic, removed a timing assumption from replay coverage and pinned Auto-review clear ordering, and documented the exact metadata/ignored-client behavior.
 - [ ] Merge only when the final head's required checks are green.
@@ -38,6 +39,9 @@ This does not change the adapter-side Auto-review setting. Native host review ha
 
 - Observation: approval IDs are only unique per MSP session; child streams can reuse a parent's id.
   Evidence: `AcpSession::approval_seen` and `approval_resolved` already key approvals by `(msp session id, approval id)`.
+
+- Observation: the first terminal cleanup implementation matched both source MSP session and turn id, while child reviewing rows keep the child source but can be ended by a parent or child terminal. This left a stale row if the host omitted the matching release/resolution frame.
+  Evidence: the follow-up review finding and new fake-host cases using parent and child `turn/completed` routes.
 
 
 ## Decision Log
@@ -55,7 +59,7 @@ This does not change the adapter-side Auto-review setting. Native host review ha
   Date/Author: 2026-10-19, Codex.
 
 - Decision: clear all held reviews for a turn when its `turn/completed` terminal arrives.
-  Rationale: a missing release/resolution frame must not leave a stale session hint after the work has ended.
+  Rationale: a missing release/resolution frame must not leave a stale session hint after the work has ended. Turn ids are globally unique host identities, so cleanup matches the turn id across parent/child source sessions. A terminal for a child MSP session is routed through `owner_for_msp_session` for cleanup because it has no root ACP session id of its own.
   Date/Author: 2026-10-19, Codex.
 
 - Decision: do not treat native reviewing as adapter Auto-review activity and do not add it to `approval_seen`.

@@ -1845,6 +1845,24 @@ fn approval_reviewing_keeps_child_and_parent_ids_distinct() {
 }
 
 #[test]
+fn child_approval_reviewing_clears_from_either_terminal_route() {
+    for route in [
+        "FAKE_CHILD_REVIEW_PARENT_TERMINAL",
+        "FAKE_CHILD_REVIEW_CHILD_TERMINAL",
+    ] {
+        let mut c = Client::spawn("approval_reviewing_child_identity", &[(route, "1")]);
+        let sid = c.new_session(2, "");
+        let _pid = c.prompt(&sid, "review both");
+        c.wait_for(
+            "\"sourceSessionId\":\"child-sess-control\"",
+            Duration::from_secs(15),
+        );
+        c.wait_for("\"approvalReviewing\":null", Duration::from_secs(15));
+        c.finish();
+    }
+}
+
+#[test]
 fn native_approval_reviewing_does_not_consume_adapter_auto_review() {
     let mut c = Client::spawn(
         "approval_reviewing_then_requested",
