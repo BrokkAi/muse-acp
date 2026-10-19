@@ -569,6 +569,68 @@ fn a_reply_cut_off_mid_stream_is_marked_truncated() {
     adapter.finish();
 }
 
+/// A provider backoff behind one model attempt (Muse 1.4.8's
+/// `turn/modelRetryScheduled`). The loopback provider answers the first call
+/// with a 503, so the host schedules a model retry mid-turn: the editor sees
+/// the attempt facts as `_meta.muse.modelRetry` while the prompt stays open,
+/// the retried attempt's reply still streams, and the prompt settles once.
+#[test]
+fn a_model_retry_is_shown_while_the_turn_stays_open() {
+    let test = "a_model_retry_is_shown_while_the_turn_stays_open";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(
+        json!({"flaky": {"text": "after the retry", "fail_first": 1}}),
+        None,
+    );
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 8), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.prompt(&session, "answer [[script:flaky]]");
+    let hint = adapter.wait("the model-retry hint", |frame| {
+        frame["params"]["update"]["_meta"]["muse"]["modelRetry"].is_object()
+    });
+    let retry = &hint["params"]["update"]["_meta"]["muse"]["modelRetry"];
+    assert_eq!(retry["attempt"], 1, "{hint}");
+    assert_eq!(retry["nextAttempt"], 2, "{hint}");
+    assert!(
+        retry["maxAttempts"].as_u64().unwrap_or(0) >= 2,
+        "a retry chain bound: {hint}"
+    );
+    assert!(retry["retryDelayMs"].is_u64(), "{hint}");
+    // The failing kind is optional on the wire and open vocabulary: only its
+    // shape is pinned.
+    assert!(
+        retry.get("errorKind").is_none_or(Value::is_string),
+        "{hint}"
+    );
+    let result = adapter.result(id);
+    assert_eq!(result["stopReason"], "end_turn", "{result}");
+    assert!(
+        adapter
+            .text("agent_message_chunk")
+            .contains("after the retry"),
+        "{:?}",
+        adapter.updates("agent_message_chunk")
+    );
+    adapter.wait("the hint withdrawn", |frame| {
+        frame["params"]["update"]["_meta"]["muse"]["modelRetry"].is_null()
+            && frame["params"]["update"]["_meta"]["muse"]
+                .as_object()
+                .is_some_and(|muse| muse.contains_key("modelRetry"))
+    });
+    let log = std::fs::read_to_string(&adapter.log).unwrap();
+    assert!(
+        log.contains("turn/modelRetryScheduled turn="),
+        "the attempt facts reach the diagnostics:\n{log}"
+    );
+    adapter.finish();
+}
+
 #[test]
 fn host_feature_gates_read_the_installed_muse_version() {
     if !enabled("host_feature_gates_read_the_installed_muse_version") {
@@ -591,6 +653,60 @@ fn host_feature_gates_read_the_installed_muse_version() {
     );
     let log = std::fs::read_to_string(&adapter.log).unwrap();
     assert!(log.contains(&want), "expected {want:?} in:\n{log}");
+    adapter.finish();
+}
+
+/// The real host's sandbox facts reach the adapter's startup log.
+///
+/// Muse 1.4.7 added `sandboxAvailability` (and, beside `unavailable`, a
+/// `sandboxUnavailableReason`) to the `initialize` reply. A host from that
+/// release on always sends a posture, so the adapter must record a real
+/// one; an older host sends nothing, which must read as unknown rather than
+/// a guess. Each pin asserts what it actually saw.
+#[test]
+fn the_host_sandbox_facts_are_recorded_from_a_real_handshake() {
+    let test = "the_host_sandbox_facts_are_recorded_from_a_real_handshake";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, label) = adapter_host_release(&adapter);
+    let log = std::fs::read_to_string(&adapter.log).unwrap();
+    let prefix = format!("host-sandbox server={label} ");
+    let line = log
+        .lines()
+        .find_map(|line| line.split(&prefix).nth(1))
+        .unwrap_or_else(|| panic!("no {prefix:?} line in:\n{log}"));
+    if release < (1, 4, 7) {
+        assert_eq!(line, "availability=unknown reason=none", "{log}");
+    } else {
+        let (availability, reason) = line
+            .strip_prefix("availability=")
+            .and_then(|rest| rest.split_once(" reason="))
+            .unwrap_or_else(|| panic!("malformed sandbox line {line:?}"));
+        match availability {
+            "available" => assert_eq!(reason, "none", "{line}"),
+            "unavailable" => {
+                assert!(
+                    [
+                        "userNamespacesDenied",
+                        "bubblewrapUnavailable",
+                        "unknown",
+                        "none"
+                    ]
+                    .contains(&reason),
+                    "{line}"
+                );
+                assert!(
+                    log.contains("cannot enforce its sandbox"),
+                    "an unavailable sandbox must warn:\n{log}"
+                );
+            }
+            other => panic!("a 1.4.7+ host always reports its sandbox, got {other:?}"),
+        }
+        eprintln!("{test}: {label} reports availability={availability} reason={reason}");
+    }
     adapter.finish();
 }
 

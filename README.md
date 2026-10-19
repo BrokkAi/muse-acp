@@ -428,6 +428,13 @@ error the editor shows if Muse then refuses the profile says why.
   editor gets `session_info_update._meta.muse.foregroundCompleted` (`turnId`,
   `blockingAgents`) and an in-progress `Background checks: <agents>` card.
   Both clear before the prompt result.
+- **Model retries** — when a provider backs off and Muse 1.4.8+ schedules a
+  retry of the model attempt (`turn/modelRetryScheduled`), the prompt stays
+  open and the editor gets `session_info_update._meta.muse.modelRetry`
+  (`turnId`, `attempt`, `nextAttempt`, `maxAttempts`, `retryDelayMs`, plus the
+  failing `errorKind`, `system`, and `httpStatus` when the host sends them),
+  so it can show "retrying in Ss, attempt N/M". The hint clears with
+  `modelRetry: null` before the prompt result.
 - **Feedback** — `/feedback [bug|bad|good|other] <note>` sends feedback about
   Muse through the host's `feedback/submit` when Muse grants the capability.
   With form elicitation, one form collects the classification, the note, and
@@ -671,6 +678,18 @@ muse-acp --support    # redacted support bundle, safe to paste into a report
 compatibility table, and reports whether the configured Muse CLI can be invoked
 (`cli-ready` or `cli-unready`). It exits `0` even when Muse is not installed, so
 you can collect output on a machine that is still being set up.
+
+At startup the adapter logs whether the host can enforce its sandbox, as
+reported by Muse 1.4.7+ on `initialize`:
+`host-sandbox server=<host> availability=available|unavailable|unknown
+reason=<reason>|none`. `unknown` means the host did not say (Muse before 1.4.7)
+or sent a value the adapter does not recognize. A reason appears only when the
+host reports `unavailable` and names one (`userNamespacesDenied` or
+`bubblewrapUnavailable`); the adapter never infers it. An `unavailable` host
+also logs a warning, but nothing is blocked. `--support` runs one
+`initialize` handshake with `muse serve` to report the same facts as
+`support-host-sandbox`, and `--selftest`, which never starts `muse serve`,
+reports them as `unknown`.
 
 Set `MUSE_LOG=debug` for per-method protocol tracing. Tracing records method
 names and outcomes, not payloads.

@@ -16,9 +16,11 @@ settings:
 MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loopback
 ```
 
-Set `MUSE_CLI` to test a specific Muse build. CI runs this suite against each
-pinned build listed in `.github/workflows/ci.yml`, and a pull request to master
-needs the `live-host` check, which passes only when every build passes.
+Set `MUSE_CLI` to test a specific Muse build. The nightly workflow
+(`.github/workflows/nightly.yml`) runs this suite against each pinned build it
+lists; run it on a branch with `gh workflow run nightly --ref <branch>` when a
+change needs live-host coverage before merge. Each failed nightly job opens an issue
+labeled `nightly-failure`, or comments on the open one for that job.
 
 Before submitting a pull request, run:
 
@@ -39,8 +41,9 @@ installed, they also run the installer's architecture selection against a stubbe
 registry.
 
 CI also parses `install.ps1` with PowerShell, tests the minimum Rust version,
-runs clippy, the Rust tests, and the selftest on macOS and Windows x64 and arm64,
-and runs the npm launcher tests on Linux, macOS, and both Windows architectures.
+and runs the npm launcher tests on Linux. The nightly workflow runs clippy, the
+Rust tests, and the selftest on macOS and Windows x64 and arm64, and the npm
+launcher tests on macOS and both Windows architectures.
 
 Keep protocol changes compatible with the ACP versions advertised by the
 adapter. Add regression coverage for behavior changes, especially permission,

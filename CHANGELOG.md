@@ -71,6 +71,28 @@
   described by its name instead. The field joins the ROADMAP section 9 field
   matrix, and a live loopback test covers it on Muse 1.4.8 and later.
 
+- Record the Muse 1.4.7 sandbox-availability facts from the `initialize`
+  handshake (#241). The adapter logs
+  `host-sandbox server=<host> availability=… reason=…` next to
+  `host-features`, plus a warning when the host reports it cannot enforce its
+  sandbox. An absent field (Muse before 1.4.7) or an unrecognized value reads
+  as `unknown`. A reason is shown only when the host reports `unavailable` and
+  sends one, and is never inferred. `--support` now runs one handshake with
+  `muse serve` to include the same facts (`support-host-sandbox`), and
+  `--selftest` prints an offline `unknown` row. No behavior is gated on the
+  facts. Both fields join the ROADMAP section 9 field matrix.
+
+- Show Muse 1.4.8 mid-turn model retries (#259). A `turn/modelRetryScheduled`
+  notification no longer takes the unhandled-notification path: it leaves the
+  ACP prompt open, logs the attempt facts like `turn/retryScheduled`, and,
+  while the turn is running, sends
+  `session_info_update._meta.muse.modelRetry` with `turnId`, `attempt`,
+  `nextAttempt`, `maxAttempts`, `retryDelayMs`, and the optional `errorKind`,
+  `system`, and `httpStatus`, so an editor can render a retry countdown. An
+  unknown `errorKind` passes through verbatim. The turn's terminal withdraws
+  the hint with `modelRetry: null` before the prompt settles. A live loopback
+  test covers it on Muse 1.4.8 and later.
+
 ## 0.14.0
 
 - Re-pin the vendored Muse SDK conformance corpus to `838d36a` (2026-10-14,

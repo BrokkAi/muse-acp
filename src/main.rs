@@ -583,6 +583,16 @@ fn now_ms() -> u64 {
 /// the failing attempt's `errorKind`, `httpStatus`, and provider `system` are
 /// recorded. A missing member reads as `?` rather than a fabricated value.
 fn retry_scheduled_log_line(params: &J) -> String {
+    retry_log_line("turn/retryScheduled", params, true)
+}
+
+/// The same diagnostic for `turn/modelRetryScheduled` (Muse 1.4.8), the
+/// model layer's sibling: identical members minus `reason`.
+fn model_retry_scheduled_log_line(params: &J) -> String {
+    retry_log_line("turn/modelRetryScheduled", params, false)
+}
+
+fn retry_log_line(method: &str, params: &J, with_reason: bool) -> String {
     let num = |key: &str| {
         params
             .get(key)
@@ -591,15 +601,19 @@ fn retry_scheduled_log_line(params: &J) -> String {
             .unwrap_or_else(|| "?".to_string())
     };
     let text = |key: &str| params.get(key).and_then(|v| v.as_str()).unwrap_or("?");
+    let reason = if with_reason {
+        format!(" reason={}", text("reason"))
+    } else {
+        String::new()
+    };
     format!(
-        "turn/retryScheduled turn={} sess={} attempt={} next={} max={} delayMs={} reason={} errorKind={} httpStatus={} system={}",
+        "{method} turn={} sess={} attempt={} next={} max={} delayMs={}{reason} errorKind={} httpStatus={} system={}",
         text("turnId"),
         text("sessionId"),
         num("attempt"),
         num("nextAttempt"),
         num("maxAttempts"),
         num("retryDelayMs"),
-        text("reason"),
         text("errorKind"),
         num("httpStatus"),
         text("system"),
@@ -2258,6 +2272,9 @@ fn selftest() -> i32 {
     for line in compat::selftest_lines(env!("CARGO_PKG_VERSION")) {
         println!("[muse-acp] {line}");
     }
+    // Sandbox availability is a fact only a live host reports, so the
+    // offline row says unknown rather than guessing (`--support` probes it).
+    println!("[muse-acp] host-sandbox server=offline availability=unknown reason=none");
     for line in cli_readiness_lines() {
         println!("[muse-acp] {line}");
     }
@@ -2430,6 +2447,7 @@ fn support_bundle() -> i32 {
         ),
         Err(error) => println!("[muse-acp] support-serve-exit status=unavailable error={error}"),
     }
+    println!("[muse-acp] {}", support_sandbox_line());
     // Adapter-relevant configuration, values shown only when they cannot be
     // credentials. Unknown MUSE_* variables are listed by name, redacted.
     let safe = [
@@ -2458,6 +2476,23 @@ fn support_bundle() -> i32 {
     }
     println!("[muse-acp] support note=no tokens, credentials, or workspace files are included");
     0
+}
+
+/// The host's sandbox facts for the support bundle, read from one
+/// `initialize` handshake with a short-lived `muse serve`. Only the
+/// classified facts are printed, never the host's raw strings.
+fn support_sandbox_line() -> String {
+    match msp::MspHost::launch(false, false, false, &[]) {
+        Ok((host, _events)) => {
+            let line = format!("support-{}", host.handshake().sandbox_line());
+            host.shutdown();
+            line
+        }
+        Err(error) => format!(
+            "support-host-sandbox status=unavailable error={}",
+            error.to_string().lines().next().unwrap_or("")
+        ),
+    }
 }
 
 /// Restart a dead durable host and re-attach every known session.
@@ -2528,6 +2563,8 @@ fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
                         true,
                         &mut checks,
                     );
+                    sess.fold
+                        .clear_model_retry(acp_sid, Some(&f.msp_turn), &mut checks);
                 }
                 for line in checks {
                     acp::send_raw(stdout, &line);
@@ -3400,6 +3437,10 @@ fn main() {
                                 hi.detail
                             ));
                             log(&hi.features_line());
+                            log(&hi.sandbox_line());
+                            if let Some(warning) = hi.sandbox_warning() {
+                                log(&warning);
+                            }
                             log(if hi.session_mcp {
                                 "client MCP servers: forwarded to Muse (sessionMcp granted)"
                             } else {
@@ -10359,6 +10400,8 @@ fn handle_msp(
                         true,
                         &mut checks,
                     );
+                    s.fold
+                        .clear_model_retry(&acp_sid, Some(turn_id), &mut checks);
                     for line in checks {
                         acp::send_raw(stdout, &line);
                     }
@@ -10700,6 +10743,8 @@ fn handle_msp(
                         true,
                         &mut checks,
                     );
+                    s.fold
+                        .clear_model_retry(&acp_sid, Some(turn_id), &mut checks);
                     for line in checks {
                         acp::send_raw(stdout, &line);
                     }
@@ -10770,6 +10815,38 @@ fn handle_msp(
             // settle here. Record the attempt facts for diagnostics; the
             // turn's own turn/completed still settles it exactly once.
             log(&retry_scheduled_log_line(params));
+        }
+        "turn/modelRetryScheduled" => {
+            // The model layer's sibling (Muse 1.4.8): a provider backoff
+            // behind one model attempt. Equally non-terminal, so never settle
+            // here. Record the facts, and while the turn is still running
+            // publish them as `_meta.muse.modelRetry` so the editor can show
+            // the retry instead of dead air; the terminal withdraws it.
+            log(&model_retry_scheduled_log_line(params));
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(acp_sid) = find_acp_sid(sessions, msp_sid) else {
+                return;
+            };
+            // A replayed retry for a turn that already ended is stale.
+            let mut out = Vec::new();
+            if let Some(s) = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&acp_sid)
+                && !turn_id.is_empty()
+                && (s.active_turn.as_deref() == Some(turn_id)
+                    || s.in_flight.iter().any(|f| f.msp_turn == turn_id))
+            {
+                s.fold
+                    .on_model_retry_scheduled(&acp_sid, turn_id, params, &mut out);
+            }
+            for line in out {
+                acp::send_raw(stdout, &line);
+            }
         }
         "session/approvalModeChanged" => {
             // Audit fact of an accepted mode change: refresh the selector.
@@ -12370,6 +12447,7 @@ fn fail_in_flight(stdout: &StdoutShared, s: &mut AcpSession, message: &str) {
     let mut checks = Vec::new();
     s.fold
         .settle_background_checks(&s.acp_sid, None, "failed", true, &mut checks);
+    s.fold.clear_model_retry(&s.acp_sid, None, &mut checks);
     for line in checks {
         acp::send_raw(stdout, &line);
     }
@@ -14266,7 +14344,8 @@ mod tests {
     }
     use super::{
         CostRate, env_flag_enabled, friendly_terminal_error, friendly_turn_error, is_network_error,
-        parse_rates, quota_reset_phrase, retry_scheduled_log_line, v1_init, v2_init,
+        model_retry_scheduled_log_line, parse_rates, quota_reset_phrase, retry_scheduled_log_line,
+        v1_init, v2_init,
     };
     use crate::acp;
     use crate::json::{J, parse_json};
@@ -14588,6 +14667,19 @@ mod tests {
         assert!(
             legacy_line.contains("errorKind=? httpStatus=? system=?"),
             "absent members stay unknown: {legacy_line}"
+        );
+    }
+
+    #[test]
+    fn model_retry_scheduled_diagnostic_carries_the_attempt_detail() {
+        let params = parse_json(
+            r#"{"turnId":"t1","sessionId":"s1","attempt":1,"nextAttempt":2,"maxAttempts":3,"retryDelayMs":2000,"errorKind":"someFutureKind","viewCursor":"c","sourceRange":{"first":{"id":"e1","sequence":1},"last":{"id":"e1","sequence":1},"stream":{"id":"s","kind":"session"}}}"#,
+        )
+        .unwrap();
+        let line = model_retry_scheduled_log_line(&params);
+        assert_eq!(
+            line,
+            "turn/modelRetryScheduled turn=t1 sess=s1 attempt=1 next=2 max=3 delayMs=2000 errorKind=someFutureKind httpStatus=? system=?"
         );
     }
 

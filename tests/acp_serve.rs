@@ -3049,6 +3049,70 @@ fn turn_retry_then_completed_settles_once_as_end_turn() {
 }
 
 #[test]
+fn turn_model_retry_is_surfaced_and_the_turn_still_settles_once() {
+    // The 1.4.8 model-layer retry is non-terminal: the prompt stays open
+    // while the retry hint reaches the editor, the later completion settles
+    // it exactly once, and the hint is withdrawn before that result. An
+    // unknown errorKind with system/httpStatus omitted must not fail the
+    // frame.
+    let mut c = Client::spawn("model_retry_then_completed", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"stopReason\":\"end_turn\""),
+        "completion settles after the model retry: {done}"
+    );
+    let (count, log) = {
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+        let needle = format!("\"id\":{pid}");
+        let count = frames.iter().filter(|f| f.contains(&needle)).count();
+        (count, frames.join("\n"))
+    };
+    assert_eq!(count, 1, "exactly one settle for the prompt: {log}");
+    let at = |needle: &str| {
+        log.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {log}"))
+    };
+    let hint = at(
+        "\"modelRetry\":{\"turnId\":\"turn-1\",\"attempt\":1,\"nextAttempt\":2,\"maxAttempts\":4,\"retryDelayMs\":1500,\"errorKind\":\"someFutureKind\"}",
+    );
+    let reply = at("recovered");
+    let cleared = at("\"modelRetry\":null");
+    let result = log.rfind(&format!("\"id\":{pid}")).unwrap();
+    assert!(
+        hint < reply && reply < cleared && cleared < result,
+        "the hint shows while the turn runs and is withdrawn before it settles: {log}"
+    );
+    c.wait_stderr(
+        "turn/modelRetryScheduled turn=turn-1",
+        Duration::from_secs(15),
+    );
+    c.wait_stderr("errorKind=someFutureKind", Duration::from_secs(15));
+    // A copy after the terminal is stale: logged, but it must not reopen the
+    // hint. The adapter handles host and editor messages on one loop, so the
+    // answer to a later request proves the stale copy was fully handled.
+    c.wait_stderr("attempt=2 next=3", Duration::from_secs(15));
+    let probe = c.req("_muse/noSuchMethod", "{}");
+    c.wait_for(&format!("\"id\":{probe}"), Duration::from_secs(15));
+    let after = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !after.contains("\"attempt\":2"),
+        "a retry for an ended turn emits no hint: {after}"
+    );
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        !stderr.contains("unhandled MSP notification: turn/modelRetryScheduled"),
+        "the event is handled, not unhandled: {stderr}"
+    );
+    c.finish();
+}
+
+#[test]
 fn turn_foreground_completed_is_consumed_and_the_turn_still_settles() {
     // Foreground completion is explicitly non-terminal: background reminder
     // checks hold the turn open, so the prompt must settle only on the later
@@ -6511,6 +6575,120 @@ fn host_feature_gates_follow_the_reported_muse_version() {
 }
 
 #[test]
+fn host_sandbox_facts_are_logged_without_inventing_a_reason() {
+    // Muse 1.4.7 reports whether it can enforce its sandbox on `initialize`.
+    // Absent and unrecognized values read as unknown, a reason is reported
+    // only beside `unavailable`, and only `unavailable` warns.
+    for (availability, reason, want, warns) in [
+        ("available", "", "availability=available reason=none", false),
+        (
+            "unavailable",
+            "userNamespacesDenied",
+            "availability=unavailable reason=userNamespacesDenied",
+            true,
+        ),
+        (
+            "unavailable",
+            "bubblewrapUnavailable",
+            "availability=unavailable reason=bubblewrapUnavailable",
+            true,
+        ),
+        (
+            "unavailable",
+            "",
+            "availability=unavailable reason=none",
+            true,
+        ),
+        (
+            "unavailable",
+            "seccompDenied",
+            "availability=unavailable reason=unknown",
+            true,
+        ),
+        ("", "", "availability=unknown reason=none", false),
+        (
+            "partial",
+            "userNamespacesDenied",
+            "availability=unknown reason=none",
+            false,
+        ),
+    ] {
+        let mut c = Client::spawn(
+            "quiet",
+            &[
+                ("FAKE_SERVER_VERSION", "1.4.7-R6101.1"),
+                ("FAKE_SANDBOX_AVAILABILITY", availability),
+                ("FAKE_SANDBOX_UNAVAILABLE_REASON", reason),
+            ],
+        );
+        c.initialize(1, "");
+        c.wait_stderr(
+            &format!("host-sandbox server=muse-session-server-fixture/1.4.7-R6101.1 {want}"),
+            Duration::from_secs(10),
+        );
+        // Logged after the sandbox lines, so any warning is already written.
+        c.wait_stderr("client MCP servers:", Duration::from_secs(10));
+        let stderr = std::fs::read_to_string(&c.stderr_log).unwrap();
+        let warning = stderr
+            .lines()
+            .find(|line| line.contains("cannot enforce its sandbox"));
+        assert_eq!(
+            warning.is_some(),
+            warns,
+            "{availability}/{reason}: {stderr}"
+        );
+        if let Some(warning) = warning {
+            match reason {
+                "" => assert!(!warning.contains("reason"), "{warning}"),
+                "seccompDenied" => assert!(warning.contains("(reason: unknown)"), "{warning}"),
+                known => assert!(warning.contains(&format!("(reason: {known})")), "{warning}"),
+            }
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn support_bundle_reports_the_host_sandbox_facts() {
+    let support = |env: &[(&str, &str)]| {
+        let mut cmd = std::process::Command::new(adapter_bin());
+        cmd.env("XDG_STATE_HOME", fresh_state_dir())
+            .arg("--support")
+            .env("MUSE_CLI", fixture())
+            .env("FAKE_SCENARIO", "quiet");
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        let out = cmd.output().expect("support bundle");
+        assert!(out.status.success(), "support must succeed: {out:?}");
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    let text = support(&[
+        ("FAKE_SANDBOX_AVAILABILITY", "unavailable"),
+        ("FAKE_SANDBOX_UNAVAILABLE_REASON", "bubblewrapUnavailable"),
+    ]);
+    assert!(
+        text.contains(
+            "support-host-sandbox server=muse-session-server-fixture/0.0.0-fixture availability=unavailable reason=bubblewrapUnavailable"
+        ),
+        "{text}"
+    );
+    let text = support(&[]);
+    assert!(
+        text.contains("availability=unknown reason=none"),
+        "an older host's silence must read as unknown: {text}"
+    );
+
+    // A host that cannot start leaves a diagnostic, not a guessed answer,
+    // and the bundle still succeeds.
+    let text = support(&[("FAKE_SCENARIO", "support_exit")]);
+    assert!(
+        text.contains("support-host-sandbox status=unavailable"),
+        "{text}"
+    );
+}
+
+#[test]
 fn session_delete_is_advertised_only_where_the_host_supports_it() {
     // ACP v1 advertises `session/delete` in agentCapabilities.
     // sessionCapabilities; v2 in capabilities.session. It needs Muse 1.4.1
@@ -7674,17 +7852,18 @@ fn auto_review_override_is_recreated_on_restart_and_used_by_support() {
         .output()
         .unwrap();
     assert!(output.status.success());
-    let config: serde_json::Value = serde_json::from_str(
-        std::fs::read_to_string(support_log.with_extension("config"))
-            .unwrap()
-            .trim(),
-    )
-    .unwrap();
-    assert_eq!(
-        config["settings"]["permissions"]["default_profile"],
-        ":ask-me"
-    );
-    assert!(!std::path::Path::new(config["root"].as_str().unwrap()).exists());
+    // The bundle starts serve twice: the exit probe and the sandbox-facts
+    // handshake. Both must see the same scratch settings.
+    let configs = std::fs::read_to_string(support_log.with_extension("config")).unwrap();
+    assert!(!configs.trim().is_empty());
+    for line in configs.lines() {
+        let config: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            config["settings"]["permissions"]["default_profile"],
+            ":ask-me"
+        );
+        assert!(!std::path::Path::new(config["root"].as_str().unwrap()).exists());
+    }
     assert_eq!(
         std::fs::read_to_string(source.join("muse/settings.json")).unwrap(),
         original
@@ -10377,6 +10556,10 @@ fn selftest_reports_cli_readiness_without_gating() {
     assert!(
         text.contains(&format!("cli-ready binary={}", adapter_bin())),
         "ready probe missing: {text}"
+    );
+    assert!(
+        text.contains("host-sandbox server=offline availability=unknown reason=none"),
+        "offline sandbox row missing: {text}"
     );
 
     let missing = std::process::Command::new(adapter_bin())

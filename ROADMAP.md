@@ -682,7 +682,7 @@ continues.
 | `pluginNotFound` (-32035) | Mapped to ACP | Forwarded with its registry code and the host's typed data. |
 | `marketplaceAlreadyExists` (-32036) | Mapped to ACP | Forwarded with its registry code and the host's typed data. |
 | `pluginMutationsDisabled` (-32037) | Mapped to ACP | Forwarded with its registry code; the host's refusal never degrades to a generic failure. |
-| `turn/modelRetryScheduled` | Intentionally ignored | A durable, non-terminal observation that a provider backoff behind one model attempt is waiting out its delay. The adapter has no arm for it, so an inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt; adopting it is tracked in [#259](https://github.com/BrokkAi/muse-acp/issues/259). |
+| `turn/modelRetryScheduled` | Mapped to ACP | A durable, non-terminal observation that a provider backoff behind one model attempt is waiting out its delay. The prompt stays open; while the turn runs the attempt facts reach the editor as `session_info_update._meta.muse.modelRetry` (attempt, next, max, delay, and the optional failing `errorKind`/`system`/`httpStatus`), cleared at the turn's terminal, and are logged like `turn/retryScheduled`. An unknown `errorKind` passes through verbatim ([#259](https://github.com/BrokkAi/muse-acp/issues/259)). |
 | `sessionRename` capability | Mapped to ACP | Requested unconditionally at `initialize`, like `sessionListStream` and `feedback`, and recorded on the handshake. Muse 1.4.3–1.4.7 predate the registry entry: they ignore the unknown name and still serve `session/rename`, so `/rename` keeps working there. From 1.4.8 on the name is registered, and a withheld grant answers `/rename` with the typed `capabilityRequired` (-32010, `data.capability` = `sessionRename`) instead of sending an ungranted call. |
 | `approval/reviewing` | Intentionally ignored | A reviewer-held twin of `approval/requested` (Muse 1.4.9+): the host's native reviewer holds the approval, so no permission prompt opens and no decide is answered. An inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt; the release arrives as `approval/requested` (or `approval/resolved`) on the same id. Adopting it is tracked in [#271](https://github.com/BrokkAi/muse-acp/issues/271). |
 
@@ -692,15 +692,15 @@ fields, the per-session `permissionProfile`, the per-turn `userShell`,
 `SideProvenance`, and the newly required-but-nullable params — each carries an
 explicit disposition in the field matrix below;
 [#224](https://github.com/BrokkAi/muse-acp/issues/224) is resolved by that
-matrix. The 1.4.7 additions have their own issues: the `InitializeResult`
-sandbox facts
-(`sandboxAvailability`, `sandboxUnavailableReason`) in
-[#241](https://github.com/BrokkAi/muse-acp/issues/241). `SessionNameOrigin`
+matrix. The 1.4.7 additions have their own issues. `SessionNameOrigin`
 (`Session.nameOrigin`, `SessionNameChangedParams.nameOrigin`) is adopted
 ([#242](https://github.com/BrokkAi/muse-acp/issues/242)); its rows are in
 the field matrix below. The `Item.cutOff`
 partial-message mark is adopted
-([#243](https://github.com/BrokkAi/muse-acp/issues/243)); its row is in the
+([#243](https://github.com/BrokkAi/muse-acp/issues/243)), and so are the
+`InitializeResult` sandbox facts (`sandboxAvailability`,
+`sandboxUnavailableReason`,
+[#241](https://github.com/BrokkAi/muse-acp/issues/241)); their rows are in the
 field matrix below.
 
 The 1.4.8 additions have their own issues. The Computer Use app-level list,
@@ -717,12 +717,12 @@ title (`Session.generatedName`,
 `SessionNameChangedParams.generatedName`) in
 [#256](https://github.com/BrokkAi/muse-acp/issues/256); the resume
 permission-profile pick (`SessionResumeParams.permissionProfile`) in
-[#257](https://github.com/BrokkAi/muse-acp/issues/257); and the
-`turn/modelRetryScheduled` notification in
-[#259](https://github.com/BrokkAi/muse-acp/issues/259). The skill's declared
+[#257](https://github.com/BrokkAi/muse-acp/issues/257). The skill's declared
 `title` (`SkillCatalogEntry.title`) is adopted
 ([#258](https://github.com/BrokkAi/muse-acp/issues/258)); its row is in the
-field matrix below. The new
+field matrix below. The `turn/modelRetryScheduled` notification is adopted
+([#259](https://github.com/BrokkAi/muse-acp/issues/259); see the §9 row
+above). The new
 `sessionRename` capability was adopted in
 [#260](https://github.com/BrokkAi/muse-acp/issues/260): the adapter requests
 it at `initialize`, records the grant, and keeps `/rename` typed on a host
@@ -772,6 +772,8 @@ cannot drop a member without failing CI.
 | `SessionTokenUsageParams.modelId` | Mapped to ACP | Keys the per-model cost legs under the prompt result's `_meta.muse.modelUsage`; a leg without a `modelId` is counted in the totals and left out rather than given an invented name. |
 | `SessionGoalChangedParams.goal` | Mapped to ACP | An explicit null clears the goal metadata (clear is kept distinct from never-seen); a non-null goal is stored and emitted. |
 | `Item.cutOff` | Mapped to ACP | A partial agent reply the host committed when the provider stream died is marked once with `_meta.muse.cutOff: true` and the host `itemId`, from whichever of `item/updated`, `item/completed`, a gap refill, or a history replay first carries the flag. A streamed reply gets an empty `agent_message_chunk` naming its `messageId` on ACP v2; a resent or replayed reply carries the mark on its own text update. A late mark only names the latest settled reply, and on ACP v1 (chunks attach by position) waits out a newer streaming reply. Never inferred, repeated, or cleared. [#243](https://github.com/BrokkAi/muse-acp/issues/243) |
+| `InitializeResult.sandboxAvailability` | Consumed | Recorded on the handshake and logged as `host-sandbox server=<host> availability=<posture> reason=<reason>` beside `host-features`, the posture being `available`, `unavailable`, or `unknown`; `--support` probes a live host for the same line and `--selftest`'s offline row reads `unknown`. An absent field (a host before 1.4.7) or an unrecognized value reads as `unknown`, never as a guess. `unavailable` adds a visible warning; nothing is gated on it. [#241](https://github.com/BrokkAi/muse-acp/issues/241) |
+| `InitializeResult.sandboxUnavailableReason` | Consumed | Reported as `reason=` on the `host-sandbox` line and in the warning only beside `unavailable`; a reason outside the published vocabulary reads as `unknown`, and an absent reason stays `none` — the adapter never infers one. [#241](https://github.com/BrokkAi/muse-acp/issues/241) |
 | `Item.displayLabel` | Unsupported pending protocol decision | The tool's own words for the call (`ToolDisplayLabel`: `active` while `inProgress`, `done` on `completed`, `neutral` beside any other status), which the adapter's synthesized tool-call titles do not read yet; adopting it is tracked in [#272](https://github.com/BrokkAi/muse-acp/issues/272). |
 | `SkillCatalogEntry.title` | Mapped to ACP | Each skill command in `available_commands_update` carries the skill's name as `_meta.muse.title`: the declared `title` (Muse 1.4.8+, from `SKILL.md` `metadata.display-name`), else the host's `displayName`. The command `name` stays the selector, and the `description` stays the palette summary unless the host sent an empty one, when it falls back to that name. Adapter-local commands carry no title. [#258](https://github.com/BrokkAi/muse-acp/issues/258) |
 | `Session.nameOrigin` | Mapped to ACP | The fold-only snapshot origin (`automatic` or `custom`, Muse 1.4.7+) is held with the name it describes and published as `session_info_update._meta.muse.nameOrigin` on attach. Absent and unrecognized future values read as unknown and stay unpublished; `session/list` rows never carry it and never erase a known origin for the same name. [#242](https://github.com/BrokkAi/muse-acp/issues/242) |
