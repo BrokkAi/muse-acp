@@ -43,7 +43,10 @@ current Muse metadata object and publish it on every session-info update.
 - [x] (2026-10-19) Complete four review passes. Passes 1-3 found and fixed
   compaction noop semantics, streamed-row metadata clearing, and duplicate
   lifecycle adoption. Pass 4 found no new problems, ending the review loop.
-- [ ] Merge after final CI is green.
+- [x] (2026-10-19) Merge PR #295 after final CI.
+- [x] (2026-10-19) Address post-merge review follow-up: ordinary
+  `session/list` pull rows again retain live metadata on omitted fields, and
+  the contract documents explicit nested-null clears accurately.
 
 
 ## Surprises & Discoveries
@@ -123,7 +126,7 @@ updates publish complete Muse metadata snapshots with explicit nested null
 clear markers. Canonical usage annotations now live under the `muse` namespace
 with the earlier flat keys retained for compatibility. The full Cargo suite,
 clippy, format, focused live-host tests, selftest, npm, Python, installer, and
-package smoke gates pass. Pull-request review is complete; final CI remains.
+package smoke gates pass. PR #295 merged after the reviewed CI run.
 
 PR #295 completed four review passes:
 
@@ -134,7 +137,15 @@ PR #295 completed four review passes:
   projection work;
 - pass 4 found no new problems and ended the review loop.
 
-Final CI and merge remain.
+The post-merge follow-up requires its own final CI and merge.
+
+Post-merge review found two real regressions in the first delivery. The pull
+path shared the streamed-row clear helper, so routine `session/list` requests
+could erase live status, attention, and branch facts. It now uses a separate
+additive row path; only `session/listChanged` rows retain replace-and-clear
+semantics. The extension contract also changed the reviewer/retry/foreground
+clear descriptions from omitted keys to the explicit nested `null` values the
+wire actually emits. A fake-host regression test pins the pull-row behavior.
 
 
 ## Context and Orientation

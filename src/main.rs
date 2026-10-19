@@ -755,6 +755,20 @@ fn adopt_streamed_session_row(s: &mut AcpSession, row: &J) {
     }
 }
 
+/// Pull rows are additive observations: an omitted status, branch, or
+/// attention field does not erase a fact learned from a live event.
+fn adopt_pulled_session_row(s: &mut AcpSession, row: &J) {
+    adopt_session_projection(s, row);
+    if let Some(branch) = row.get("branch") {
+        let branch = j_to_string(branch);
+        s.branch_meta = Some(branch.clone());
+        s.set_session_meta("branch", branch);
+    }
+    if let Some(attention) = row.get("attention") {
+        s.attention_meta = Some(j_to_string(attention));
+    }
+}
+
 /// The status event always carries a status. Its omitted attention member is
 /// the event's representation of an empty flag set, unlike an omitted field on
 /// an older Session object.
@@ -9774,7 +9788,7 @@ fn update_host_session_facts(
             session.attention_meta = Some(j_to_string(attention));
         }
     } else {
-        adopt_streamed_session_row(session, host_session);
+        adopt_pulled_session_row(session, host_session);
     }
     HostTitleUpdate::after(&before, &session.title_facts)
 }
