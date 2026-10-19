@@ -402,9 +402,11 @@ error the editor shows if Muse then refuses the profile says why.
   `computerUseHostSetup` grants. `/cua host` reads the host's setup state and
   its Screen Recording, Accessibility, and Input Monitoring grants;
   `/cua host check` asks the host to inspect those grants without prompting
-  or opening System Settings. These are ordinary prompt commands, so clients
-  do not need the `_session/computerUse` extension to use them. With the
-  per-session grant, `/cua [status]`, `/cua on`, `/cua set
+  or opening System Settings. Input Monitoring is reported separately because
+  basic computer use can be ready without it, while some actions still need
+  it. These are ordinary prompt commands, so clients do not need the
+  `_session/computerUse` extension to use them. With the per-session grant,
+  `/cua [status]`, `/cua on`, `/cua set
   computerControl|screenshots ask|alwaysAllow`, and `/cua block|unblock
   <bundleId>` drive the session setup and settings patch, while the extension
   returns structured session setup plus settings (built-in blocks on request).
