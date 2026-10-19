@@ -26,8 +26,9 @@ To see the change working, run the integration test named in Validation and Acce
 - [x] (2026-10-19 12:55Z) Extended the live 1.4.7+ loopback coverage; it passed against installed Muse 1.4.10.
 - [x] (2026-10-19 13:00Z) Updated README, command metadata, ROADMAP, event compatibility, and CHANGELOG.
 - [x] (2026-10-19 13:05Z) Ran formatting, lint, unit/integration, selftest, npm, script, smoke, and expanded live loopback checks successfully.
-- [ ] Open a pull request that closes #240.
-- [ ] Complete three review/fix passes and merge only when required checks are green.
+- [x] (2026-10-19 12:17Z) Opened [PR #282](https://github.com/BrokkAi/muse-acp/pull/282) to close #240.
+- [x] (2026-10-19 12:20Z) Completed three review/fix passes: clarified the client opt-in wire shape and tested `/cua host status`, renamed the launch opt-in from the per-session grant name to `computer_use`, and clarified that Input Monitoring is optional for basic use.
+- [ ] Merge only when the final head's required checks are green.
 
 
 ## Surprises & Discoveries
@@ -67,7 +68,9 @@ To see the change working, run the integration test named in Validation and Acce
 
 ## Outcomes & Retrospective
 
-Implementation is in progress. The completed outcome will be recorded here after the pull request is reviewed, fixed, and merged.
+Implementation and all three review passes are complete on PR #282. The adapter now requests both computer-use capabilities under the existing ACP opt-in, records them independently, exposes host status/check through ordinary prompt commands, and preserves typed command rejections. Review found and fixed an ambiguous client opt-in example, an untested advertised `/cua host status` alias, misleading internal opt-in naming, and an inaccurate implication that Input Monitoring is required for basic computer use.
+
+The final local gates passed on the reviewed head, and GitHub CI run [39251163241](https://github.com/BrokkAi/muse-acp/actions/runs/39251163241) passed all `check`, `msrv`, and `npm-launcher` jobs on `d638312`. The only remaining outcome is the merge itself.
 
 
 ## Context and Orientation
@@ -132,6 +135,18 @@ Before opening the pull request, run every contribution gate:
     python3 -m unittest discover -s scripts -p 'test_*.py'
     sh -n install.sh
     node scripts/smoke_npm.cjs target/debug/muse-acp
+
+Review/fix commits:
+
+    bfa20f2 Document computer-use opt-in shape
+    0653275 Clarify computer-use opt-in plumbing
+    d638312 Clarify optional input monitoring
+
+GitHub checks on d638312:
+
+    check         success
+    msrv          success
+    npm-launcher  success
 
 Push the branch and open a draft or ready pull request only after the local gates pass. Use a body that links `Fixes #240`, summarizes the user-visible commands and capability behavior, lists validation evidence, and records the platform limitation for the true macOS grant-success path.
 
