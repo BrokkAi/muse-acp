@@ -1212,18 +1212,22 @@ def on_turn_start(params):
         # The interrupt still stops the turn, but the submission stood, so
         # the adapter must wait for the ordinary terminal instead of settling
         # cancelled at the retract event.
-        notify("turn/retracted", {**base,
-                                  "commandId": params.get("commandId", ""),
-                                  "outcome": "declined"})
+        declined = {**base, "commandId": params.get("commandId", ""),
+                    "outcome": "declined"}
+        notify("turn/retracted", declined)
+        if os.environ.get("FAKE_DECLINED_RETRACT_TWICE") == "1":
+            notify("turn/retracted", declined)
         notify("item/completed", {**base, "item": {
             "itemId": "it-declined-retract", "kind": "agentMessage",
             "status": "completed", "revision": 1,
             "text": "continued after declined retract"}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "declined_retract_quiet":
-        notify("turn/retracted", {**base,
-                                  "commandId": params.get("commandId", ""),
-                                  "outcome": "declined"})
+        declined = {**base, "commandId": params.get("commandId", ""),
+                    "outcome": "declined"}
+        notify("turn/retracted", declined)
+        if os.environ.get("FAKE_DECLINED_RETRACT_TWICE") == "1":
+            notify("turn/retracted", declined)
     elif SCENARIO == "declined_retract_after_completed":
         notify("turn/completed", {**base, "terminal": "cancelled"})
         notify("turn/retracted", {**base,

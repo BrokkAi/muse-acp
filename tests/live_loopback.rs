@@ -534,7 +534,7 @@ fn declined_retract_after_a_committed_tool_call_keeps_the_terminal_settlement() 
     let host = Host::start(json!({"shell": shell_step()}), None);
     let adapter = Adapter::launch(&host);
     let (release, _) = adapter_host_release(&adapter);
-    let Some(mut adapter) = require_release(adapter, release, (1, 4, 6), test) else {
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 10), test) else {
         return;
     };
     let session = adapter.new_session(&host, json!([]));

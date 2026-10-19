@@ -3054,6 +3054,30 @@ fn declined_retract_preserves_steering_and_second_cancel() {
 }
 
 #[test]
+fn duplicate_declined_retract_emits_one_notice() {
+    let mut c = Client::spawn(
+        "declined_retract_quiet",
+        &[("FAKE_DECLINED_RETRACT_TWICE", "1")],
+    );
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "hi");
+    c.wait_for("Muse declined to retract", Duration::from_secs(15));
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_for_all(&["\"idle\"", "\"cancelled\""], Duration::from_secs(15));
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+    assert_eq!(
+        frames
+            .iter()
+            .filter(|frame| frame.contains("Muse declined to retract"))
+            .count(),
+        1,
+        "a replayed decline must not repeat the note: {frames:#?}"
+    );
+    drop(frames);
+    c.finish();
+}
+
+#[test]
 fn declined_retract_after_the_terminal_is_ignored() {
     let mut c = Client::spawn("declined_retract_after_completed", &[]);
     let sid = c.new_session(1, "");
