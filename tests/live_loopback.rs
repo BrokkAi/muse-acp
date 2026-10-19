@@ -627,6 +627,16 @@ fn the_host_sandbox_facts_are_recorded_from_a_real_handshake() {
             "available" => assert_eq!(reason, "none", "{line}"),
             "unavailable" => {
                 assert!(
+                    [
+                        "userNamespacesDenied",
+                        "bubblewrapUnavailable",
+                        "unknown",
+                        "none"
+                    ]
+                    .contains(&reason),
+                    "{line}"
+                );
+                assert!(
                     log.contains("cannot enforce its sandbox"),
                     "an unavailable sandbox must warn:\n{log}"
                 );

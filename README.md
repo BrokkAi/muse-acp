@@ -675,9 +675,10 @@ reason=<reason>|none`. `unknown` means the host did not say (Muse before 1.4.7)
 or sent a value the adapter does not recognize. A reason appears only when the
 host reports `unavailable` and names one (`userNamespacesDenied` or
 `bubblewrapUnavailable`); the adapter never infers it. An `unavailable` host
-also logs a warning, but nothing is blocked. `--support` starts Muse once to
-report the same facts as `support-host-sandbox`, and `--selftest`, which never
-starts Muse, reports them as `unknown`.
+also logs a warning, but nothing is blocked. `--support` runs one
+`initialize` handshake with `muse serve` to report the same facts as
+`support-host-sandbox`, and `--selftest`, which never starts `muse serve`,
+reports them as `unknown`.
 
 Set `MUSE_LOG=debug` for per-method protocol tracing. Tracing records method
 names and outcomes, not payloads.
