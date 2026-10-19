@@ -163,3 +163,5 @@ Change note (2026-10-19): review pass 1 corrected the live app-patch assertion s
 Change note (2026-10-19): review pass 2 added coverage for combining `installed` and `showBuiltIns` in one extended settings read.
 
 Change note (2026-10-19): review pass 3 added direct rendering coverage for the `file` lock reason alongside `builtIn`.
+
+Change note (2026-10-19): final CI caught a newer-clippy `chunks_exact` lint; the parser now consumes the even pair list with an iterator loop, preserving the workspace MSRV.

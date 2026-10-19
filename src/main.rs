@@ -8378,14 +8378,15 @@ fn parse_cua_command(text: &str) -> Option<Result<CuaAction, String>> {
         })),
         ["app", app_args @ ..] if !app_args.is_empty() && app_args.len() % 2 == 0 => {
             let mut patches = Vec::new();
-            for pair in app_args.chunks_exact(2) {
-                let choice = match pair[1] {
+            let mut pairs = app_args.iter();
+            while let (Some(bundle), Some(choice)) = (pairs.next(), pairs.next()) {
+                let choice = match *choice {
                     "ask" => "ask",
                     "alwaysAllow" => "alwaysAllow",
                     "blocked" => "blocked",
                     _ => return Some(Err(USAGE.to_string())),
                 };
-                patches.push((pair[0].to_string(), choice));
+                patches.push((bundle.to_string(), choice));
             }
             Some(Ok(CuaAction::Apps { patches }))
         }
