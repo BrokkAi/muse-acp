@@ -59,6 +59,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
                (FAKE_SKILL_REFRESH_FAILS=1: the re-read has no skills array)
   skill_not_found skill/list still lists `stale`; turn/start rejects it
   skill_control skill/setActivation writes and skill/import receipts
+  skill_titles skill/list rows with and without a declared 1.4.8 `title`,
+               plus one with an empty description
   side_chat    session/sideChat opens a side session with sideFrom provenance
   task_list_seed task/list seeds async tasks after a resume whose history is
                empty; the item terminal then settles the seeded task
@@ -1503,6 +1505,15 @@ def result_for(method, msg):
             "argumentHint": "what to plan",
             "source": "bundled",
         }]
+        if SCENARIO == "skill_titles":
+            # Muse 1.4.8: `title` is the skill's declared name and is absent
+            # when the skill declares none; `displayName` stays required.
+            skills[0]["title"] = "Grounded Planner"
+            skills.append({"selector": "lint", "description": "",
+                           "displayName": "Lint", "title": "Style Checker",
+                           "source": "user"})
+            skills.append({"selector": "tidy", "description": "Tidy imports",
+                           "displayName": "Tidy", "source": "project"})
         if SCENARIO == "skill_not_found":
             # The catalog read races the skill's removal: the adapter still
             # lists `stale`, but the host no longer resolves it.

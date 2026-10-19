@@ -1509,10 +1509,7 @@ fn catalog(host: &Arc<Hosts>) -> Vec<acp::CatalogModel> {
 /// Read the session-scoped skill palette. The host returns one row for each
 /// shortcut spelling that it can resolve, so this is also the source of truth
 /// for the ACP command catalog.
-fn skill_catalog(
-    host: &Arc<Hosts>,
-    msp_sid: &str,
-) -> Option<Vec<(String, String, Option<String>)>> {
+fn skill_catalog(host: &Arc<Hosts>, msp_sid: &str) -> Option<Vec<acp::CatalogSkill>> {
     let params = format!("{{\"sessionId\":{}}}", esc(msp_sid));
     let result = match host.command("skill/list", &params) {
         Ok(result) => result,
@@ -1538,18 +1535,26 @@ fn skill_catalog(
         if selector.is_empty() {
             continue;
         }
-        let description = row
-            .get("description")
-            .and_then(|v| v.as_str())
-            .or_else(|| row.get("displayName").and_then(|v| v.as_str()))
+        let text = |key: &str| {
+            row.get(key)
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+        };
+        // The skill's own declared name (Muse 1.4.8 `title`, from `SKILL.md`
+        // `metadata.display-name`) is what people should read; a skill that
+        // declares none keeps the host's `displayName`.
+        let title = text("title").or_else(|| text("displayName"));
+        let description = text("description")
+            .or(title)
             .unwrap_or(selector)
             .to_string();
-        let argument_hint = row
-            .get("argumentHint")
-            .and_then(|v| v.as_str())
-            .filter(|hint| !hint.is_empty())
-            .map(str::to_string);
-        skills.push((selector.to_string(), description, argument_hint));
+        skills.push(acp::CatalogSkill {
+            selector: selector.to_string(),
+            description,
+            title: title.map(str::to_string),
+            argument_hint: text("argumentHint").map(str::to_string),
+        });
     }
     Some(skills)
 }
@@ -1558,21 +1563,14 @@ fn skill_catalog(
 /// text is submitted as a native skill only when it names one of them.
 /// A failed read forgets the previous catalog: after `skill/changed` it is
 /// known to be stale, so the host decides again until a read succeeds.
-fn adopt_skill_catalog(
-    sessions: &Sessions,
-    acp_sid: &str,
-    skills: Option<&[(String, String, Option<String>)]>,
-) {
+fn adopt_skill_catalog(sessions: &Sessions, acp_sid: &str, skills: Option<&[acp::CatalogSkill]>) {
     if let Some(s) = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get_mut(acp_sid)
     {
-        s.skill_selectors = skills.map(|rows| {
-            rows.iter()
-                .map(|(selector, _, _)| selector.clone())
-                .collect()
-        });
+        s.skill_selectors =
+            skills.map(|rows| rows.iter().map(|skill| skill.selector.clone()).collect());
     }
 }
 

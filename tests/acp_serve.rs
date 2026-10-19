@@ -4450,6 +4450,47 @@ fn skill_catalog_refreshes_after_host_notification() {
     c.finish();
 }
 
+/// Muse 1.4.8 `SkillCatalogEntry.title` is the skill's declared name. The
+/// command catalog carries it as `_meta.muse.title`, falling back to
+/// `displayName` when the skill declares none; the description stays the
+/// palette summary unless the host sent an empty one.
+#[test]
+fn skill_commands_carry_the_declared_title() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("skill_titles", &[]);
+        c.new_session(ver, "");
+        let frame = c.wait_for("available_commands_update", Duration::from_secs(15));
+        let parsed: serde_json::Value = serde_json::from_str(&frame).expect("catalog frame");
+        let commands = parsed["params"]["update"]["availableCommands"]
+            .as_array()
+            .expect("availableCommands");
+        let command = |name: &str| {
+            commands
+                .iter()
+                .find(|command| command["name"] == name)
+                .unwrap_or_else(|| panic!("/{name} in {frame}"))
+        };
+        let plan = command("plan");
+        assert_eq!(plan["_meta"]["muse"]["title"], "Grounded Planner", "{plan}");
+        assert_eq!(plan["description"], "Create a grounded plan", "{plan}");
+        let tidy = command("tidy");
+        assert_eq!(
+            tidy["_meta"]["muse"]["title"], "Tidy",
+            "a row without a title falls back to displayName: {tidy}"
+        );
+        assert_eq!(tidy["description"], "Tidy imports", "{tidy}");
+        let lint = command("lint");
+        assert_eq!(lint["_meta"]["muse"]["title"], "Style Checker", "{lint}");
+        assert_eq!(
+            lint["description"], "Style Checker",
+            "an empty summary falls back to the skill's name: {lint}"
+        );
+        // Adapter-local commands are not skills and carry no title.
+        assert!(command("compact").get("_meta").is_none(), "{frame}");
+        c.finish();
+    }
+}
+
 fn wait_log_count(c: &Client, method: &str, count: usize) {
     let start = std::time::Instant::now();
     loop {
