@@ -7,8 +7,9 @@
   `.neutral` for every other status. Live snapshots, completed items, history
   replay, and AIR async-task announcements all use the same selected label.
   Missing, null, malformed, or empty labels retain the existing synthesized
-  `tool: detail` title, so pre-1.4.9 hosts keep their current presentation. A
-  live 1.4.10 `write_todos` call verifies the host-selected title reaches ACP.
+  `tool: detail` title, so pre-1.4.9 hosts keep their current presentation.
+  Fake-host tests pin the active/done/neutral selection; a live 1.4.10 probe
+  confirms tools without a label keep the synthesized title.
 
 - Reconcile declined turn retractions with the Muse 1.4.10 fold (#273). When
   `turn/retracted` reports `outcome: "declined"`, the submission stood even

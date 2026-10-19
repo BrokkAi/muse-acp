@@ -496,15 +496,13 @@ fn an_approved_shell_command_runs_and_a_rejected_one_does_not() {
 }
 
 #[test]
-fn tool_display_label_reaches_a_real_host() {
-    let test = "tool_display_label_reaches_a_real_host";
+fn unlabeled_real_tool_keeps_the_synthesized_title() {
+    let test = "unlabeled_real_tool_keeps_the_synthesized_title";
     if !enabled(test) {
         return;
     }
     let host = Host::start(
-        json!({"todos": {"tool": {"name": "write_todos", "arguments": {"todos": [
-            {"text": "Inspect the code", "status": "in_progress"},
-        ]}}}}),
+        json!({"pwd": {"tool": {"name": "bash", "arguments": {"command": "pwd"}}}}),
         None,
     );
     let adapter = Adapter::launch(&host);
@@ -513,8 +511,8 @@ fn tool_display_label_reaches_a_real_host() {
         return;
     };
     let session = adapter.new_session(&host, json!([]));
-    adapter.turn(&session, "plan it [[script:todos]]");
-    let tool = adapter.wait("the host-labelled tool card", |frame| {
+    adapter.turn(&session, "print the workspace [[script:pwd]]");
+    let tool = adapter.wait("the real tool card", |frame| {
         frame["method"] == "session/update"
             && frame["params"]["sessionId"] == json!(session)
             && matches!(
@@ -523,10 +521,10 @@ fn tool_display_label_reaches_a_real_host() {
             )
             && frame["params"]["update"]["status"] == json!("in_progress")
     });
-    let title = tool["params"]["update"]["title"].as_str().unwrap_or("");
     assert_eq!(
-        title, "write_todos",
-        "the ACP tool card must use the host's active label, not the synthesized `write_todos: args` fallback: {tool}"
+        tool["params"]["update"]["title"],
+        json!("bash: pwd"),
+        "an unlabeled real tool keeps the synthesized title: {tool}"
     );
     adapter.finish();
 }
