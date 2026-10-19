@@ -512,7 +512,7 @@ fn unlabeled_real_tool_keeps_the_synthesized_title() {
     };
     let session = adapter.new_session(&host, json!([]));
     adapter.turn(&session, "print the workspace [[script:pwd]]");
-    let tool = adapter.wait("the host-labelled tool card", |frame| {
+    let tool = adapter.wait("the real tool card", |frame| {
         frame["method"] == "session/update"
             && frame["params"]["sessionId"] == json!(session)
             && matches!(
