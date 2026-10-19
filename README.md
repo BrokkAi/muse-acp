@@ -289,8 +289,11 @@ On Muse 1.4.8+, an ACP `session/load` or `session/resume` request can select a
 launch profile with
 `{"_meta":{"muse":{"permissionProfile":"<profile-id>"}}}`. The adapter
 forwards it to the host's resume step; omitting it restores retained authority
-only. Unknown or unavailable ids keep the host's typed `commandRejected`
-refusal. `session/fork` never carries the member.
+only. The id must already be admitted by the host's permission-profile
+catalog; the request selects a profile and never creates one. The value must
+be a non-empty string, and malformed metadata fails locally with invalid
+params before the host is called. Unknown or unavailable ids keep the host's
+typed `commandRejected` refusal. `session/fork` never carries the member.
 
 The view links the rest of your configuration instead of copying it, so
 credentials are never copied. Files Muse creates while it runs, such as the
