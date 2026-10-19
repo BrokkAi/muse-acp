@@ -23,8 +23,9 @@ This does not change the adapter-side Auto-review setting. Native host review ha
 - [x] (2026-10-19) Added live Muse 1.4.10 coverage.
 - [x] (2026-10-19) Updated the README, ROADMAP, event matrix, CHANGELOG, and Auto-review documentation.
 - [x] (2026-10-19) Ran all contribution gates successfully.
-- [ ] Open a pull request that closes #271.
-- [ ] Complete three review/fix passes and merge only when the final head's required checks are green.
+- [x] (2026-10-19) Opened [PR #287](https://github.com/BrokkAi/muse-acp/pull/287) to close #271.
+- [x] (2026-10-19) Completed three review/fix passes: corrected the no-op diagnostic, removed a timing assumption from replay coverage and pinned Auto-review clear ordering, and documented the exact metadata/ignored-client behavior.
+- [ ] Merge only when the final head's required checks are green.
 
 
 ## Surprises & Discoveries
@@ -64,7 +65,7 @@ This does not change the adapter-side Auto-review setting. Native host review ha
 
 ## Outcomes & Retrospective
 
-Implementation and focused/live validation are complete. The reviewed outcome will be recorded after the three review passes and merge.
+Implementation and all three review passes are complete on PR #287. Native-review activity is reversible ACP session metadata, release/resolution/terminal paths clear it, and adapter Auto-review remains independent. The final remote-check result will be appended before merge.
 
 
 ## Context and Orientation
@@ -179,6 +180,12 @@ Local validation on 2026-10-19:
 Focused live test against Muse 1.4.10:
 
     native_approval_reviewing_reaches_a_real_host_and_clears: passed
+
+Review/fix commits:
+
+    a01e4f2 Clarify approval reviewing diagnostics
+    8ba9b88 Make approval review replay test deterministic
+    c6057cb Document native approval review metadata
 
 
 ## Interfaces and Dependencies
