@@ -584,6 +584,11 @@ fn unlabeled_real_tool_keeps_the_synthesized_title() {
         json!("bash: pwd"),
         "an unlabeled real tool keeps the synthesized title: {tool}"
     );
+    assert_eq!(
+        tool["params"]["update"]["name"],
+        json!("bash"),
+        "the real host's programmatic tool name reaches ACP: {tool}"
+    );
     adapter.finish();
 }
 

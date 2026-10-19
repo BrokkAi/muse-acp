@@ -44,6 +44,7 @@ static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the client advertis
 static NATIVE_SUBAGENTS: AtomicU64 = AtomicU64::new(0); // 1 when subagent sessions are negotiated
 static AIR_ASYNC_TASKS: AtomicU64 = AtomicU64::new(0); // 1 when the client wants async-task updates
 static AIR_RECOMMENDED: AtomicU64 = AtomicU64::new(0); // 1 when the client wants recommendedValue metadata
+static COMPACTION: AtomicU64 = AtomicU64::new(0); // 1 when standard ACP compaction is available
 static USER_SHELL: AtomicU64 = AtomicU64::new(0); // explicit editor shell feature
 static READ_OUTPUT: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates stored-output reads
 static HOOKS: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates session hook reads
@@ -146,6 +147,16 @@ fn client_supports_subagents(capabilities: Option<&J>) -> bool {
         return true;
     }
     client_supports_air(Some(caps), "nativeSubagentSessions")
+}
+
+/// ACP v2 has no compaction capability gate. ACP v1 requires
+/// `clientCapabilities.session.compaction: {}`.
+fn client_supports_compaction(capabilities: Option<&J>, ver: u64) -> bool {
+    ver >= 2
+        || capabilities
+            .and_then(|caps| caps.get("session"))
+            .and_then(|session| session.get("compaction"))
+            .is_some_and(|compaction| matches!(compaction, J::Obj(_)))
 }
 
 /// Adapter extensions require explicit `_meta.muse.capabilities` opt-in.
@@ -731,12 +742,19 @@ fn adopt_status_changed(s: &mut AcpSession, params: &J) {
 /// provider-neutral session-info metadata for both ACP versions.
 fn send_session_projection(
     stdout: &StdoutShared,
+    sessions: &Sessions,
     acp_sid: &str,
-    ver: u8,
     status: Option<&str>,
     attention: Option<&[String]>,
 ) {
-    acp::send_session_status(stdout, acp_sid, status, attention);
+    let ver = {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get_mut(acp_sid) else {
+            return;
+        };
+        acp::send_session_status(stdout, s, status, attention);
+        s.ver
+    };
     if ver == 2 {
         if attention.is_some_and(|flags| !flags.is_empty()) {
             acp::send_state(stdout, acp_sid, "requires_action", None);
@@ -748,6 +766,19 @@ fn send_session_projection(
             }
         }
     }
+}
+
+/// Send fold output through the session's complete Muse metadata snapshot.
+fn send_fold_output(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str, out: Vec<String>) {
+    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(s) = map.get_mut(acp_sid) else {
+        drop(map);
+        for line in out {
+            acp::send_raw(stdout, &line);
+        }
+        return;
+    };
+    acp::send_fold_lines(stdout, s, out);
 }
 
 /// Return the request classes worth asking `approval/listPending` for. A
@@ -1076,6 +1107,14 @@ fn adopt_subscription_usage(
     }
     let clear = s.subscription_usage.is_some() && next.is_none();
     s.subscription_usage = next;
+    if let Some(usage) = s.subscription_usage.as_deref() {
+        s.set_session_meta(
+            "subscriptionUsage",
+            format!("{{\"source\":\"msp-host-observation\",\"billing\":false,\"usage\":{usage}}}"),
+        );
+    } else {
+        s.remove_session_meta("subscriptionUsage");
+    }
     if s.usage_used.is_some() && s.usage_size.is_some() {
         if clear {
             acp::send_subscription_usage(stdout, s, true);
@@ -1433,7 +1472,7 @@ fn backfill_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions,
         s.title_facts.generated_name = generated_name;
     }
     if let Some(update) = HostTitleUpdate::after(&title_before, &s.title_facts) {
-        update.send(stdout, acp_sid);
+        update.send(stdout, s);
     }
     if adopted {
         acp::send_usage(
@@ -2604,9 +2643,7 @@ fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
                     sess.fold
                         .clear_model_retry(acp_sid, Some(&f.msp_turn), &mut checks);
                 }
-                for line in checks {
-                    acp::send_raw(stdout, &line);
-                }
+                acp::send_fold_lines(stdout, sess, checks);
                 let rest = sess.in_flight.len();
                 (settled, rest, sess.ver)
             }
@@ -3029,9 +3066,8 @@ fn abandon_session_work(stdout: &StdoutShared, s: &mut AcpSession, message: &str
     }
     s.perm_queue.clear();
     s.active_turn = None;
-    for line in s.fold.disconnect_tasks(&s.acp_sid) {
-        acp::send_raw(stdout, &line);
-    }
+    let lines = s.fold.disconnect_tasks(&s.acp_sid);
+    acp::send_fold_lines(stdout, s, lines);
 }
 
 /// Brings the editor's view of a re-attached session up to date with the
@@ -3084,16 +3120,16 @@ fn adopt_reattached(
             let projection = (s.ver, s.session_status.clone(), s.attention.clone());
             let provenance = session_provenance(r.get("session"))
                 .map(|(key, value)| format!("{{\"{key}\":{}}}", j_to_string(value)));
-            drop(map);
             if let Some(muse) = provenance {
                 // A side chat names the session it was opened from; a fork
                 // names its cut point. Both ride the attach's info update.
-                acp::send_session_provenance(stdout, acp_sid, &muse);
+                acp::send_session_provenance(stdout, s, &muse);
             }
+            drop(map);
             send_session_projection(
                 stdout,
+                sessions,
                 acp_sid,
-                projection.0,
                 projection.1.as_deref(),
                 projection.2.as_deref(),
             );
@@ -3759,6 +3795,7 @@ fn fresh_fold() -> SessionFold {
     let mut fold = SessionFold::new();
     fold.native_subagents = NATIVE_SUBAGENTS.load(Ordering::SeqCst) == 1;
     fold.air_async_tasks = AIR_ASYNC_TASKS.load(Ordering::SeqCst) == 1;
+    fold.compaction_supported = COMPACTION.load(Ordering::SeqCst) == 1;
     fold.show_reminders = show_reminders();
     fold
 }
@@ -4081,6 +4118,8 @@ fn negotiate_acp(msg: &J) -> bool {
     ELICIT_FORM.store(u64::from(form), Ordering::SeqCst);
     let subagents = client_supports_subagents(capabilities);
     NATIVE_SUBAGENTS.store(u64::from(subagents), Ordering::SeqCst);
+    let compaction = client_supports_compaction(capabilities, v);
+    COMPACTION.store(u64::from(compaction), Ordering::SeqCst);
     let async_tasks = client_supports_air(capabilities, "asyncTasks");
     AIR_ASYNC_TASKS.store(u64::from(async_tasks), Ordering::SeqCst);
     // A shell launch needs both explicit execution opt-in and task controls.
@@ -4128,6 +4167,9 @@ fn negotiate_acp(msg: &J) -> bool {
     }
     if subagents {
         log("client negotiated native subagent sessions");
+    }
+    if compaction {
+        log("client negotiated standard ACP compaction");
     }
     form
 }
@@ -4385,6 +4427,7 @@ fn handle_acp(
                             usage_seen: std::collections::HashSet::new(),
                             subscription_usage: None,
                             goal_meta: None,
+                            session_meta: acp::SessionMeta::default(),
                             branch_meta,
                             attention_meta,
                             title_facts: initial_title_facts.clone(),
@@ -4477,15 +4520,15 @@ fn handle_acp(
                         .unwrap_or_default();
                     send_session_projection(
                         stdout,
+                        sessions,
                         &sid,
-                        ver,
                         status.as_deref(),
                         attention.as_deref(),
                     );
                     if let Some(update) =
                         HostTitleUpdate::after(&HostTitleSnapshot::default(), &initial_title_facts)
                     {
-                        update.send(stdout, &sid);
+                        update.send_session(stdout, sessions, &sid);
                     }
                     acp::send_available_commands(
                         stdout,
@@ -4753,6 +4796,7 @@ fn handle_acp(
                             usage_seen: std::collections::HashSet::new(),
                             subscription_usage: None,
                             goal_meta: None,
+                            session_meta: acp::SessionMeta::default(),
                             branch_meta: None,
                             attention_meta: None,
                             title_facts: HostTitleFacts::default(),
@@ -4817,7 +4861,7 @@ fn handle_acp(
                         // fork names its cut point. Publish the provenance on
                         // attach so the parent link survives a reload.
                         if let Some(muse) = session_provenance_meta(r.get("session")) {
-                            acp::send_session_provenance(stdout, &sid, &muse);
+                            acp::send_session_provenance(stdout, entry, &muse);
                         }
                         // Usage the host already knows, restored from the
                         // snapshot rather than from message replay: Muse
@@ -4863,13 +4907,13 @@ fn handle_acp(
                             if let Some(branch) = state.get("branch") {
                                 entry.branch_meta = Some(j_to_string(branch));
                             }
-                            let (goal_meta, branch_meta) =
-                                (entry.goal_meta.clone(), entry.branch_meta.clone());
+                            let goal = entry.goal_meta.clone();
+                            let branch = entry.branch_meta.clone();
                             acp::send_session_meta(
                                 stdout,
-                                &sid,
-                                goal_meta.as_deref(),
-                                branch_meta.as_deref(),
+                                entry,
+                                goal.as_deref(),
+                                branch.as_deref(),
                             );
                         }
                         if replay {
@@ -4891,13 +4935,13 @@ fn handle_acp(
                         .unwrap_or_default();
                     send_session_projection(
                         stdout,
+                        sessions,
                         &sid,
-                        ver,
                         status.as_deref(),
                         attention.as_deref(),
                     );
                     if let Some(update) = title_update {
-                        update.send(stdout, &sid);
+                        update.send_session(stdout, sessions, &sid);
                     }
                     // session/load and an explicit v2 replay already deliver
                     // history to ACP. Replaying the same suffix again through
@@ -5334,6 +5378,7 @@ fn handle_acp(
                             usage_seen: std::collections::HashSet::new(),
                             subscription_usage: None,
                             goal_meta: None,
+                            session_meta: acp::SessionMeta::default(),
                             branch_meta: None,
                             attention_meta: None,
                             title_facts: HostTitleFacts::default(),
@@ -5446,9 +5491,7 @@ fn handle_acp(
                         )
                     };
                     if ver == 1 || params.as_ref().and_then(|p| p.get("replayFrom")).is_some() {
-                        for line in replay_lines {
-                            acp::send_raw(stdout, &line);
-                        }
+                        send_fold_output(stdout, sessions, &new_msp, replay_lines);
                     }
                     acp::send_result(stdout, &id, &result);
                     let (status, attention) = sessions
@@ -5459,8 +5502,8 @@ fn handle_acp(
                         .unwrap_or_default();
                     send_session_projection(
                         stdout,
+                        sessions,
                         &new_msp,
-                        ver,
                         status.as_deref(),
                         attention.as_deref(),
                     );
@@ -5468,7 +5511,7 @@ fn handle_acp(
                     if let Some(update) =
                         HostTitleUpdate::after(&HostTitleSnapshot::default(), &fork_title_facts)
                     {
-                        update.send(stdout, &new_msp);
+                        update.send_session(stdout, sessions, &new_msp);
                     }
                     let skills = skill_catalog(host, &new_msp);
                     adopt_skill_catalog(sessions, &new_msp, skills.as_deref());
@@ -6365,7 +6408,7 @@ fn handle_acp(
                     // The side names the session it was opened from; the
                     // client attaches it with its ordinary session methods.
                     if let Some(muse) = session_provenance_meta(Some(&session)) {
-                        acp::send_session_provenance(stdout, &new_msp, &muse);
+                        acp::send_session_provenance_only(stdout, &new_msp, &muse);
                     }
                     log(&format!(
                         "opened side chat {new_msp} from session {parent_msp}"
@@ -7072,7 +7115,7 @@ fn handle_acp(
                         ));
                     }
                     for (sid, update) in title_updates {
-                        update.send(stdout, &sid);
+                        update.send_session(stdout, sessions, &sid);
                     }
                     // Adapter-held sessions the host page did not mention are
                     // appended to the first page only, so a client paging
@@ -7704,15 +7747,13 @@ fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) 
     for it in &items {
         let kind = it.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         match kind {
-            "subagent" | "toolCall" | "userMessage" | "agentMessage" => {
+            "subagent" | "toolCall" | "userMessage" | "agentMessage" | "compaction" => {
                 sess.fold.replay_item(&sess.acp_sid, sess.ver, it, &mut out)
             }
             _ => {}
         }
     }
-    for line in out {
-        acp::send_raw(stdout, &line);
-    }
+    acp::send_fold_lines(stdout, sess, out);
 }
 
 /// Rebuild the observable AIR task set from the durable fold returned by
@@ -7778,9 +7819,7 @@ fn reconcile_active_tasks(
                 .on_item_snapshot(&sess.acp_sid, sess.ver, item, &mut out);
         }
     }
-    for line in out {
-        acp::send_raw(stdout, &line);
-    }
+    acp::send_fold_lines(stdout, sess, out);
 }
 
 /// Seed the AIR async-task inventory from the host's authoritative
@@ -7822,9 +7861,7 @@ fn seed_task_inventory(
                     }
                 }
             }
-            for line in out {
-                acp::send_raw(stdout, &line);
-            }
+            send_fold_output(stdout, sessions, acp_sid, out);
             log(&format!(
                 "task/list seeded {seeded} async task(s) for session {msp_sid}"
             ));
@@ -9590,7 +9627,7 @@ impl HostTitleUpdate {
         })
     }
 
-    fn send(&self, stdout: &StdoutShared, acp_sid: &str) {
+    fn send(&self, stdout: &StdoutShared, s: &mut AcpSession) {
         let generated_name = match &self.generated_name {
             None => acp::GeneratedName::Omit,
             Some(None) => acp::GeneratedName::Clear,
@@ -9598,11 +9635,21 @@ impl HostTitleUpdate {
         };
         acp::send_session_title(
             stdout,
-            acp_sid,
+            s,
             self.title.as_deref(),
             self.name_origin.as_deref(),
             generated_name,
         );
+    }
+
+    fn send_session(&self, stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
+        if let Some(s) = sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get_mut(acp_sid)
+        {
+            self.send(stdout, s);
+        }
     }
 }
 
@@ -10064,9 +10111,7 @@ fn drill_down_subagent_child(
                         }
                     }
                 }
-                for line in out {
-                    acp::send_raw(&stdout, &line);
-                }
+                send_fold_output(&stdout, &sessions, &child, out);
                 log(&format!("subagent child {child} transcript replayed"));
             }
             Err(e) => {
@@ -10413,9 +10458,7 @@ fn handle_msp(
                         {
                             s.fold.on_item_completed(&acp_sid, s.ver, &wrap, &mut out);
                         }
-                        for line in out {
-                            acp::send_raw(stdout, &line);
-                        }
+                        send_fold_output(stdout, sessions, &acp_sid, out);
                         n += 1;
                     }
                     break;
@@ -10462,9 +10505,7 @@ fn handle_msp(
                 {
                     s.fold.on_item_snapshot(&acp_sid, s.ver, &item, &mut out);
                 }
-                for line in out {
-                    acp::send_raw(stdout, &line);
-                }
+                send_fold_output(stdout, sessions, &acp_sid, out);
                 drill_down_subagent_child(host, stdout, sessions, &acp_sid, &item);
             }
         }
@@ -10482,9 +10523,7 @@ fn handle_msp(
                 {
                     s.fold.on_item_delta(&acp_sid, s.ver, params, &mut out);
                 }
-                for line in out {
-                    acp::send_raw(stdout, &line);
-                }
+                send_fold_output(stdout, sessions, &acp_sid, out);
             }
         }
         "item/completed" => {
@@ -10517,9 +10556,7 @@ fn handle_msp(
                         format!("{kind} {tool} {status}: {text}"),
                     );
                 }
-                for line in out {
-                    acp::send_raw(stdout, &line);
-                }
+                send_fold_output(stdout, sessions, &acp_sid, out);
                 drill_down_subagent_child(host, stdout, sessions, &acp_sid, &item);
             }
         }
@@ -10584,9 +10621,7 @@ fn handle_msp(
                     );
                     s.fold
                         .clear_model_retry(&acp_sid, Some(turn_id), &mut checks);
-                    for line in checks {
-                        acp::send_raw(stdout, &line);
-                    }
+                    acp::send_fold_lines(stdout, s, checks);
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id);
                     let ver = s.ver;
                     let finished = pos.map(|p| s.in_flight.remove(p));
@@ -10952,9 +10987,7 @@ fn handle_msp(
                     );
                     s.fold
                         .clear_model_retry(&acp_sid, Some(turn_id), &mut checks);
-                    for line in checks {
-                        acp::send_raw(stdout, &line);
-                    }
+                    acp::send_fold_lines(stdout, s, checks);
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id)?;
                     let ver = s.ver;
                     Some((s.in_flight.remove(pos).req_id, ver, s.in_flight.len()))
@@ -11013,9 +11046,7 @@ fn handle_msp(
                 s.fold
                     .on_foreground_completed(&acp_sid, s.ver, turn_id, &agents, &mut out);
             }
-            for line in out {
-                acp::send_raw(stdout, &line);
-            }
+            send_fold_output(stdout, sessions, &acp_sid, out);
         }
         "turn/retryScheduled" => {
             // Non-terminal by schema: it never resolves a turn-wait, so never
@@ -11051,9 +11082,7 @@ fn handle_msp(
                 s.fold
                     .on_model_retry_scheduled(&acp_sid, turn_id, params, &mut out);
             }
-            for line in out {
-                acp::send_raw(stdout, &line);
-            }
+            send_fold_output(stdout, sessions, &acp_sid, out);
         }
         "session/approvalModeChanged" => {
             // Audit fact of an accepted mode change: refresh the selector.
@@ -11170,8 +11199,8 @@ fn handle_msp(
                 };
                 send_session_projection(
                     stdout,
+                    sessions,
                     &acp_sid,
-                    projection.0,
                     projection.1.as_deref(),
                     projection.2.as_deref(),
                 );
@@ -11208,7 +11237,7 @@ fn handle_msp(
                     }
                 };
                 if let Some(update) = update {
-                    update.send(stdout, &acp_sid);
+                    update.send_session(stdout, sessions, &acp_sid);
                 }
             }
         }
@@ -11220,24 +11249,15 @@ fn handle_msp(
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid)
                 && let Some(goal) = params.get("goal")
             {
-                let (goal_meta, branch_meta) = {
-                    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-                    match map.get_mut(&acp_sid) {
-                        Some(s) => {
-                            // An explicit null clears; the raw encoding keeps
-                            // that distinct from "never seen".
-                            s.goal_meta = Some(j_to_string(goal));
-                            (s.goal_meta.clone(), s.branch_meta.clone())
-                        }
-                        None => (None, None),
-                    }
-                };
-                acp::send_session_meta(
-                    stdout,
-                    &acp_sid,
-                    goal_meta.as_deref(),
-                    branch_meta.as_deref(),
-                );
+                let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(s) = map.get_mut(&acp_sid) {
+                    // An explicit null clears; the raw encoding keeps
+                    // that distinct from "never seen".
+                    s.goal_meta = Some(j_to_string(goal));
+                    let goal = s.goal_meta.clone();
+                    let branch = s.branch_meta.clone();
+                    acp::send_session_meta(stdout, s, goal.as_deref(), branch.as_deref());
+                }
             }
         }
         "session/branchChanged" => {
@@ -11260,22 +11280,13 @@ fn handle_msp(
                         params.get("workspaceRoot").cloned().unwrap_or(J::Null),
                     ),
                 ]);
-                let (goal_meta, branch_meta) = {
-                    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-                    match map.get_mut(&acp_sid) {
-                        Some(s) => {
-                            s.branch_meta = Some(j_to_string(&branch));
-                            (s.goal_meta.clone(), s.branch_meta.clone())
-                        }
-                        None => (None, None),
-                    }
-                };
-                acp::send_session_meta(
-                    stdout,
-                    &acp_sid,
-                    goal_meta.as_deref(),
-                    branch_meta.as_deref(),
-                );
+                let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(s) = map.get_mut(&acp_sid) {
+                    s.branch_meta = Some(j_to_string(&branch));
+                    let goal = s.goal_meta.clone();
+                    let branch = s.branch_meta.clone();
+                    acp::send_session_meta(stdout, s, goal.as_deref(), branch.as_deref());
+                }
             }
         }
         "session/viewHealthChanged" => {
@@ -11460,7 +11471,7 @@ fn handle_msp(
                 session.attention_meta = raw_host_fact(Some(row), "attention");
                 adopt_session_projection(session, row);
                 if let Some(update) = HostTitleUpdate::after(&before, &session.title_facts) {
-                    update.send(stdout, &session.acp_sid);
+                    update.send(stdout, session);
                 }
             }
         }
@@ -11685,19 +11696,17 @@ fn clear_approval_reviewing(
     source_session_id: &str,
     approval_id: &str,
 ) {
-    let remaining = {
-        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(s) = map.get_mut(acp_sid) else {
-            return;
-        };
-        let before = s.approval_reviewing.len();
-        s.approval_reviewing.retain(|review| {
-            review.source_session_id != source_session_id || review.approval_id != approval_id
-        });
-        (before != s.approval_reviewing.len()).then(|| s.approval_reviewing.clone())
+    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(s) = map.get_mut(acp_sid) else {
+        return;
     };
-    if let Some(reviews) = remaining {
-        acp::send_approval_reviewing(stdout, acp_sid, &reviews);
+    let before = s.approval_reviewing.len();
+    s.approval_reviewing.retain(|review| {
+        review.source_session_id != source_session_id || review.approval_id != approval_id
+    });
+    if before != s.approval_reviewing.len() {
+        let reviews = s.approval_reviewing.clone();
+        acp::send_approval_reviewing(stdout, s, &reviews);
     }
 }
 
@@ -11708,18 +11717,16 @@ fn clear_turn_approval_reviewing(
     acp_sid: &str,
     turn_id: &str,
 ) {
-    let remaining = {
-        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(s) = map.get_mut(acp_sid) else {
-            return;
-        };
-        let before = s.approval_reviewing.len();
-        s.approval_reviewing
-            .retain(|review| review.turn_id.as_deref() != Some(turn_id));
-        (before != s.approval_reviewing.len()).then(|| s.approval_reviewing.clone())
+    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(s) = map.get_mut(acp_sid) else {
+        return;
     };
-    if let Some(reviews) = remaining {
-        acp::send_approval_reviewing(stdout, acp_sid, &reviews);
+    let before = s.approval_reviewing.len();
+    s.approval_reviewing
+        .retain(|review| review.turn_id.as_deref() != Some(turn_id));
+    if before != s.approval_reviewing.len() {
+        let reviews = s.approval_reviewing.clone();
+        acp::send_approval_reviewing(stdout, s, &reviews);
     }
 }
 
@@ -11795,11 +11802,15 @@ fn observe_approval_reviewing(
         }
     };
     match changed {
-        Some(reviews) => {
+        Some(_) => {
             log(&format!(
                 "approval {approval_id} under native review: session={msp_sid}"
             ));
-            acp::send_approval_reviewing(stdout, &acp_sid, &reviews);
+            let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(s) = map.get_mut(&acp_sid) {
+                let reviews = s.approval_reviewing.clone();
+                acp::send_approval_reviewing(stdout, s, &reviews);
+            }
         }
         None => log(&format!(
             "approval/reviewing {approval_id} produced no state change: resolved, actionable, or already current"
@@ -12782,9 +12793,7 @@ fn fail_in_flight(stdout: &StdoutShared, s: &mut AcpSession, message: &str) {
     s.fold
         .settle_background_checks(&s.acp_sid, None, "failed", true, &mut checks);
     s.fold.clear_model_retry(&s.acp_sid, None, &mut checks);
-    for line in checks {
-        acp::send_raw(stdout, &line);
-    }
+    acp::send_fold_lines(stdout, s, checks);
     if s.in_flight.is_empty() {
         return;
     }

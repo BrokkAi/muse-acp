@@ -562,8 +562,8 @@ events require an explicit documentation decision before CI passes.
 - `userInput/settled`
 - `session/contextUsage`
 - `session/tokenUsage`
-- `usage/read` (host query; mapped to `_meta.museSubscriptionUsage`)
-- `usage/changed` (host-global notification; mapped to `_meta.museSubscriptionUsage`)
+- `usage/read` (host query; mapped to `_meta.muse.subscriptionUsage`, with the legacy flat alias)
+- `usage/changed` (host-global notification; mapped to `_meta.muse.subscriptionUsage`, with the legacy flat alias)
 
 `approval/request` and `userInput/request` are server-initiated *requests*, not
 notifications; list them in a separate section with their response policy.
@@ -609,7 +609,7 @@ fold's unknown-method path logs and continues.
 | `task/background` | Unsupported pending protocol decision | The adapter observes backgrounded items but does not issue the host control command; tracked by [#38](https://github.com/BrokkAi/muse-acp/issues/38). |
 | `task/stop` | Mapped to ACP | Sent for `_session/async_task/stop` on a backgrounded tool task when AIR async tasks are negotiated; the terminal item event settles the task. |
 | `task/stopAll` | Mapped to ACP | Sent on `session/cancel` when AIR async tasks are negotiated, so cancellation also stops the session's background work. |
-| `usage/read` | Mapped to ACP | Reads the host-global subscription snapshot and publishes it as `_meta.museSubscriptionUsage`, separately from cost estimates; an unavailable host keeps existing state. |
+| `usage/read` | Mapped to ACP | Reads the host-global subscription snapshot and publishes it as `_meta.muse.subscriptionUsage` (with the legacy flat alias), separately from cost estimates; an unavailable host keeps existing state. |
 | `view/subscribe` | Mapped to ACP | Re-attaches at the last delivered cursor after resume or host restart so a durable suffix appended while detached is replayed; a failed subscribe keeps the resume attachment and logs a diagnostic. |
 | `workflow/cancel` | Mapped to ACP | Sent for `_session/async_task/stop` on a workflow async task (keyed by `workflowRunId`); the ack is admission-only and the workflow settles from subsequent view events. |
 | `workflow/childControl` | Mapped to ACP | The adapter-local `/workflow-child skip\|retry <childId>` slash command sends the child's current attempt from the latest folded workflow item and settles on the admission-only ack; a `stale_attempt` rejection is surfaced, never re-keyed. Workflow cards show each child's id. |
@@ -619,7 +619,7 @@ fold's unknown-method path logs and continues.
 | `session/statusChanged` | Mapped to ACP | Publishes host status and attention metadata and ACP v2 state; directs pending-request reconciliation without inventing unknown status values. |
 | `session/viewHealthChanged` | Consumed | Logs the view health and reason with guidance to reattach through resume. |
 | `skill/changed` | Mapped to ACP | Refreshes `skill/list` and the ACP available-command catalog. |
-| `usage/changed` | Mapped to ACP | Broadcasts the host's subscription observation to attached sessions as `_meta.museSubscriptionUsage`, separately from cost estimates. |
+| `usage/changed` | Mapped to ACP | Broadcasts the host's subscription observation to attached sessions as `_meta.muse.subscriptionUsage` (with the legacy flat alias), separately from cost estimates. |
 | `skillNotFound` | Mapped to ACP | Forwarded as ACP error `-32032` with the host's typed data, keeping the rejected selector visible; slash text naming no listed skill is sent as ordinary text instead. |
 | `outputUnavailable` | Mapped to ACP | Forwarded from `_session/readOutput` with the host's typed availability facts (`availability`, `itemId`, `outputRef`) intact. |
 
@@ -871,12 +871,13 @@ Muse 1.4.2's own session cost is **mapped to ACP**: when the host reports
 `partial` flag and the adapter's catalog estimate is not emitted at all; a
 cumulative object without `cost` clears it. The estimate's provenance moved
 into `_meta` because ACP's `Cost` has no root-level extension points, and the
-host's `cacheReadTokens`/`cacheWriteTokens` ride `_meta.museCumulative`.
+host's `cacheReadTokens`/`cacheWriteTokens` ride
+`_meta.muse.cumulative` (with a legacy flat alias).
 
 Muse 1.3.0 subscription usage is **mapped to ACP**. The adapter queries
 `usage/read` when a session is attached and adopts `usage/changed` as a
 host-global observation for every attached session. It carries the raw
-`SubscriptionUsage` object in `_meta.museSubscriptionUsage`, labeled
+`SubscriptionUsage` object in `_meta.muse.subscriptionUsage`, labeled
 `source: msp-host-observation` and `billing: false`, so the `observedAtMs`,
 tier, 5h-class window, and weekly block cannot be mistaken for the adapter's
 token estimate or for billing. The adapter preserves truthful absence, emits
@@ -1140,17 +1141,20 @@ MSP provides `session/compact` (with `CompactionOutcome`
 `tokensAfter`, `outcome`, `reason`, `strategyId`, `summarizedThrough`), and
 `ContextPressureLevel` (`normal|warning|blocked`) on context usage.
 
-Status: **items and command implemented.** Compaction items surface as
-think-kind tool calls with `contextCompaction` v1 provenance metadata and
-token facts; a bare `/compact` prompt maps to `session/compact` and settles
-the ACP prompt honestly for both `accepted` and `noop`, and the context pressure level rides
-`usage_update` as `_meta.musePressure`.
+Status: **items and command implemented with ACP-native presentation.**
+Compaction items surface as standard `compaction_update` entities on ACP v2
+and on ACP v1 clients that advertise `clientCapabilities.session.compaction`.
+The older v1 fallback remains a think-kind tool call with
+`contextCompaction` v1 provenance. Token and host outcome facts ride
+`_meta.muse.contextCompaction`; a bare `/compact` prompt maps to
+`session/compact` and settles the ACP prompt honestly for both `accepted` and
+`noop`, and the context pressure level rides `usage_update` as
+`_meta.muse.pressure`.
 
 **Work items**
 
-- Surface `compaction` items as a visible think-kind tool call with `_meta`
-  provenance (matching `codex-acp`'s compaction presentation) instead of
-  dropping them.
+- Surface `compaction` items through negotiated ACP `compaction_update`, with
+  the legacy think-kind tool card only as a v1 fallback.
 - Add a `/compact` slash command mapped to `session/compact`; report `noop`
   and failure outcomes honestly.
 - Carry the pressure level alongside `usage_update` where the client accepts
