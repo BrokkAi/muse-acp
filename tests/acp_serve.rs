@@ -9730,6 +9730,66 @@ fn stored_output_metadata_and_negotiated_fetch_are_available() {
 }
 
 #[test]
+fn monitor_feed_streams_into_one_stable_card() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("monitor_feed", &[]);
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "start the monitor feed");
+
+        let initial = c.wait_for_all(
+            &[
+                "\"toolCallId\":\"monitor-monitor-task-1\"",
+                "\"title\":\"Monitor: Build watcher [31m\"",
+                "\"monitorId\":\"monitor-task-1\"",
+                "\"monitorDescription\":\"Build watcher [31m\"",
+                "\"itemKind\":\"monitorFeed\"",
+            ],
+            Duration::from_secs(15),
+        );
+        assert!(
+            initial.contains(&sid) && initial.contains("\"status\":\"in_progress\""),
+            "v{ver} monitor opens one labeled card: {initial}"
+        );
+        assert!(
+            !initial.contains('\u{1b}') && !initial.contains('\u{202e}'),
+            "v{ver} model-controlled controls must not reach the title: {initial:?}"
+        );
+
+        let streamed = c.wait_for(
+            "\"text\":\"watching\\nevent one\\n\"",
+            Duration::from_secs(15),
+        );
+        assert!(
+            streamed.contains("\"toolCallId\":\"monitor-monitor-task-1\"")
+                && streamed.contains("\"sessionUpdate\":\"tool_call_update\""),
+            "v{ver} a delta replaces the card with accumulated text: {streamed}"
+        );
+
+        let completed = c.wait_for_all(
+            &[
+                "\"toolCallId\":\"monitor-monitor-task-1\"",
+                "\"status\":\"completed\"",
+                "\"truncated\":{\"source\":\"host\"}",
+                "\"text\":\"watching\\nevent one\\n\"",
+            ],
+            Duration::from_secs(15),
+        );
+        assert!(
+            completed.contains(&sid),
+            "v{ver} monitor terminal: {completed}"
+        );
+
+        let second = c.wait_for("\"text\":\"event two\\n\"", Duration::from_secs(15));
+        assert!(
+            second.contains("\"toolCallId\":\"monitor-monitor-task-1\"")
+                && second.contains("\"sessionUpdate\":\"tool_call_update\""),
+            "v{ver} a later feed batch reuses the monitor card: {second}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn stored_output_fetch_requires_capability_negotiation() {
     let mut c = Client::spawn("tool_stored_output", &[]);
     let sid = c.new_session(2, "");

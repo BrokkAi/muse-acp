@@ -201,6 +201,10 @@ impl Adapter {
     /// Launches and initializes the adapter with the given ACP v1 client
     /// capabilities.
     fn launch_with(host: &Host, capabilities: Value) -> Adapter {
+        Adapter::launch_with_env(host, capabilities, &[])
+    }
+
+    fn launch_with_env(host: &Host, capabilities: Value, extra_env: &[(&str, &str)]) -> Adapter {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let home = host.dir.join("home");
         let log = host.dir.join(format!(
@@ -213,6 +217,9 @@ impl Adapter {
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
             }
+        }
+        for (name, value) in extra_env {
+            command.env(name, value);
         }
         // On macOS Muse reads credentials from the Keychain, which waits for
         // an approval no headless run can give. Its file backend reads the
@@ -969,6 +976,88 @@ fn real_host_without_generated_pair_keeps_it_unpublished() {
         "a host that published no generated pair must not produce generatedName: {fabricated:#?}"
     );
     drop(output);
+    adapter.finish();
+}
+
+/// Muse 1.4.8's monitor task publishes outside-turn `monitorFeed` items when
+/// armed with visible lines. The loopback model starts a finite shell monitor,
+/// and the adapter must expose one stable, sanitized feed card whose identity
+/// matches the monitor tool call.
+#[test]
+fn monitor_feed_reaches_a_real_host() {
+    let test = "monitor_feed_reaches_a_real_host";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(
+        json!({"monitor": {"tool": {"name": "monitor", "arguments": {
+            "command": "printf 'tick-one\\ntick-two\\n'",
+            "description": "Watch the build",
+            "persistent": false,
+            "timeout_ms": 5000,
+            "show_lines": true,
+        }}}}),
+        None,
+    );
+    let adapter = Adapter::launch_with_env(&host, json!({}), &[("MUSE_EXPERIMENTAL_MONITOR", "1")]);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 8), test) else {
+        return;
+    };
+
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.prompt(&session, "watch the build [[script:monitor]]");
+    let result = adapter.result(id);
+    assert_eq!(result["stopReason"], "end_turn", "{result}");
+    let tool = adapter.wait("the monitor tool call", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["sessionId"] == json!(session)
+            && matches!(
+                frame["params"]["update"]["sessionUpdate"].as_str(),
+                Some("tool_call" | "tool_call_update")
+            )
+            && frame["params"]["update"]["title"]
+                .as_str()
+                .is_some_and(|title| title.starts_with("monitor:"))
+    });
+    let monitor_item_id = tool["params"]["update"]["_meta"]["muse"]["itemId"]
+        .as_str()
+        .expect("monitor tool item id")
+        .to_string();
+    let feed = adapter.wait("a real monitor feed card", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["sessionId"] == json!(session)
+            && matches!(
+                frame["params"]["update"]["sessionUpdate"].as_str(),
+                Some("tool_call" | "tool_call_update")
+            )
+            && frame["params"]["update"]["_meta"]["muse"]["monitorId"].is_string()
+    });
+    let update = &feed["params"]["update"];
+    assert_eq!(update["title"], json!("Monitor: Watch the build"), "{feed}");
+    assert!(
+        update["toolCallId"]
+            .as_str()
+            .is_some_and(|id| id.starts_with("monitor-")),
+        "{feed}"
+    );
+    let monitor_id = update["_meta"]["muse"]["monitorId"]
+        .as_str()
+        .expect("monitor id");
+    assert_eq!(monitor_id, monitor_item_id.as_str(), "{feed}");
+    let completed = adapter.wait("the real monitor terminal", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["sessionId"] == json!(session)
+            && frame["params"]["update"]["sessionUpdate"] == json!("tool_call_update")
+            && frame["params"]["update"]["_meta"]["muse"]["monitorId"] == json!(monitor_id)
+            && frame["params"]["update"]["status"] == json!("completed")
+    });
+    assert!(
+        completed["params"]["update"]["content"]
+            .to_string()
+            .contains("tick-"),
+        "the feed carries observed output: {completed}"
+    );
     adapter.finish();
 }
 

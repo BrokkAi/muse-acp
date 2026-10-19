@@ -109,6 +109,49 @@ fn fallback_card_title(kind: &str) -> String {
     }
 }
 
+/// The monitor description is model-controlled tool input. Keep a readable
+/// one-line label by replacing terminal/format controls and collapsing
+/// whitespace before it reaches a title or client metadata.
+fn sanitize_monitor_description(value: &str) -> String {
+    fn unsafe_format(c: char) -> bool {
+        c.is_control()
+            || matches!(
+                c,
+                '\u{061c}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            )
+    }
+
+    let mut out = String::new();
+    let mut pending_space = false;
+    for c in value.chars() {
+        if c.is_whitespace() || unsafe_format(c) {
+            pending_space = !out.is_empty();
+        } else {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn monitor_description(item: &J) -> String {
+    let raw = item
+        .get("monitorDescription")
+        .and_then(J::as_str)
+        .filter(|value| !value.is_empty())
+        .or_else(|| item.get("fallbackText").and_then(J::as_str))
+        .unwrap_or("");
+    let raw = raw.strip_prefix("Monitor event: ").unwrap_or(raw);
+    sanitize_monitor_description(raw)
+}
+
 enum ItemRole {
     Message {
         msg_id: String,
@@ -122,6 +165,13 @@ enum ItemRole {
     Tool {
         tc_id: String,
         announced: bool,
+    },
+    Monitor {
+        tc_id: String,
+        title: String,
+        muse_fields: Option<String>,
+        text: String,
+        host_truncated: bool,
     },
     Ignored,
 }
@@ -192,6 +242,10 @@ pub struct SessionFold {
     /// but carry no editor-facing content, so they stay out of the transcript
     /// and only their agent ids reach the stderr diagnostics.
     pub show_reminders: bool,
+    /// ACP monitor cards already announced for a durable monitor task id.
+    /// Later feed items update the same row instead of minting one per event
+    /// batch.
+    monitor_cards: std::collections::HashSet<String>,
     /// The open "background checks" card of a turn whose foreground work is
     /// done while reminder agents hold it open (`turn/foregroundCompleted`),
     /// as `(turn id, card id)`. Settled at the turn's terminal.
@@ -269,6 +323,7 @@ impl SessionFold {
             backgrounded_cards: std::collections::HashSet::new(),
             reminder_cards: HashMap::new(),
             show_reminders: false,
+            monitor_cards: std::collections::HashSet::new(),
             background_checks: None,
             model_retry: None,
             last_message: None,
@@ -1099,6 +1154,30 @@ impl SessionFold {
                 );
                 (title, content, meta)
             }
+            "monitorFeed" => {
+                let description = monitor_description(item);
+                let (description, _) = trunc(&description);
+                let title = if description.is_empty() {
+                    "Monitor event".to_string()
+                } else {
+                    format!("Monitor: {description}")
+                };
+                let (title, _) = trunc(&title);
+                let text = str_field("text");
+                let content = (!text.is_empty()).then(|| text.to_string());
+                let mut fields = vec!["\"itemKind\":\"monitorFeed\"".to_string()];
+                if let Some(monitor_id) = item
+                    .get("monitorId")
+                    .and_then(J::as_str)
+                    .filter(|value| !value.is_empty())
+                {
+                    fields.push(format!("\"monitorId\":{}", esc(monitor_id)));
+                }
+                if !description.is_empty() {
+                    fields.push(format!("\"monitorDescription\":{}", esc(&description)));
+                }
+                (title, content, Some(fields.join(",")))
+            }
             _ => {
                 // Unknown future kinds: the schema says a one-line summary
                 // SHOULD ride `fallbackText`; without it there is nothing
@@ -1781,7 +1860,9 @@ impl SessionFold {
         let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         if Self::replay_is_in_flight(item) {
             match kind {
-                "toolCall" | "subagent" => self.on_item_snapshot(acp_sid, ver, item, out),
+                "toolCall" | "subagent" | "monitorFeed" => {
+                    self.on_item_snapshot(acp_sid, ver, item, out)
+                }
                 "agentMessage" | "userMessage" => {
                     self.on_item_snapshot(acp_sid, ver, item, out);
                     let text = Self::message_text(item);
@@ -1815,7 +1896,7 @@ impl SessionFold {
         }
 
         match kind {
-            "toolCall" | "subagent" => {
+            "toolCall" | "subagent" | "monitorFeed" => {
                 let wrap = J::Obj(vec![("item".to_string(), item.clone())]);
                 self.on_item_completed(acp_sid, ver, &wrap, out);
             }
@@ -1842,6 +1923,75 @@ impl SessionFold {
             }
             _ => {}
         }
+    }
+
+    /// Upsert and emit the single stable card for one monitor task. The feed
+    /// item id remains in metadata, while `monitorId` selects the ACP row.
+    fn monitor_feed_card(
+        &mut self,
+        acp_sid: &str,
+        ver: u8,
+        item_id: &str,
+        item: &J,
+        status: &str,
+        out: &mut Vec<String>,
+    ) {
+        let (title, content, meta) = self.host_card_parts("monitorFeed", item);
+        let muse_fields =
+            Self::merge_muse_fields(meta.as_deref(), Self::item_muse_fields(item).as_deref());
+        let monitor_id = item
+            .get("monitorId")
+            .and_then(J::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(item_id);
+        let tc_id = format!("monitor-{monitor_id}");
+        let create = self.monitor_cards.insert(tc_id.clone());
+        let host_truncated = item
+            .get("truncated")
+            .is_some_and(|value| matches!(value, J::Bool(true)));
+        let (text, effective_truncated) = match self.items.get_mut(item_id) {
+            Some(ItemRole::Monitor {
+                title: seen_title,
+                muse_fields: seen_fields,
+                text: seen_text,
+                host_truncated: seen_truncated,
+                ..
+            }) => {
+                *seen_title = title.clone();
+                *seen_fields = muse_fields.clone();
+                if let Some(content) = content {
+                    *seen_text = content;
+                }
+                *seen_truncated |= host_truncated;
+                (seen_text.clone(), *seen_truncated)
+            }
+            _ => {
+                let text = content.unwrap_or_default();
+                self.items.insert(
+                    item_id.to_string(),
+                    ItemRole::Monitor {
+                        tc_id: tc_id.clone(),
+                        title: title.clone(),
+                        muse_fields: muse_fields.clone(),
+                        text: text.clone(),
+                        host_truncated,
+                    },
+                );
+                (text, host_truncated)
+            }
+        };
+        out.push(Self::card_line(
+            acp_sid,
+            ver,
+            create,
+            &tc_id,
+            &title,
+            "other",
+            msp_status(status),
+            (!text.is_empty()).then_some(text.as_str()),
+            muse_fields.as_deref(),
+            effective_truncated,
+        ));
     }
 
     /// item/started and item/updated share snapshotting.
@@ -2064,6 +2214,9 @@ impl SessionFold {
                     }
                 }
             }
+            "monitorFeed" => {
+                self.monitor_feed_card(acp_sid, ver, &item_id, item, status, out);
+            }
             "reminderChild" => {
                 if self.show_reminders {
                     self.reminder_child_card(acp_sid, ver, &item_id, item, status, false, out);
@@ -2119,9 +2272,33 @@ impl SessionFold {
             _ => return,
         };
         if field == "text" {
-            if let Some(ItemRole::Message { msg_id, streamed }) = self.items.get_mut(item_id) {
-                *streamed += delta.len();
-                out.push(Self::chunk(acp_sid, ver, msg_id, delta));
+            match self.items.get_mut(item_id) {
+                Some(ItemRole::Message { msg_id, streamed }) => {
+                    *streamed += delta.len();
+                    out.push(Self::chunk(acp_sid, ver, msg_id, delta));
+                }
+                Some(ItemRole::Monitor {
+                    tc_id,
+                    title,
+                    muse_fields,
+                    text,
+                    host_truncated,
+                }) => {
+                    text.push_str(delta);
+                    out.push(Self::card_line(
+                        acp_sid,
+                        ver,
+                        false,
+                        tc_id,
+                        title,
+                        "other",
+                        "in_progress",
+                        Some(text.as_str()),
+                        muse_fields.as_deref(),
+                        *host_truncated,
+                    ));
+                }
+                _ => {}
             }
             return;
         }
@@ -2410,6 +2587,10 @@ impl SessionFold {
                 }
                 self.items.remove(&item_id);
             }
+            "monitorFeed" => {
+                self.monitor_feed_card(acp_sid, ver, &item_id, item, status, out);
+                self.items.remove(&item_id);
+            }
             "reminderChild" => {
                 if self.show_reminders {
                     self.reminder_child_card(acp_sid, ver, &item_id, item, status, true, out);
@@ -2472,7 +2653,7 @@ pub fn stop_reason(terminal: &str) -> &'static str {
 
 #[cfg(test)]
 mod corpus_tests {
-    use super::{SessionFold, max_content, trunc};
+    use super::{SessionFold, max_content, sanitize_monitor_description, trunc};
     use crate::json::{J, j_to_string, parse_json};
     use std::path::{Path, PathBuf};
 
@@ -2634,6 +2815,185 @@ mod corpus_tests {
         .unwrap();
         fold.on_item_completed("sid", 2, &completed, &mut out);
         assert!(fold.workflow_children().is_empty());
+    }
+
+    #[test]
+    fn monitor_descriptions_are_sanitized_to_one_safe_line() {
+        let description = " Build\twatcher \n\u{1b}[31m\u{202e}ready \u{2066}now\u{2069} ";
+        let sanitized = sanitize_monitor_description(description);
+        assert_eq!(sanitized, "Build watcher [31m ready now");
+        assert!(!sanitized.chars().any(char::is_control));
+        assert!(!sanitized.contains('\u{202e}'));
+        assert!(!sanitized.contains('\u{2066}'));
+
+        let fold = SessionFold::new();
+        let fallback = J::Obj(vec![(
+            "fallbackText".to_string(),
+            J::Str("Monitor event: Fallback label".to_string()),
+        )]);
+        let (title, _, meta) = fold.host_card_parts("monitorFeed", &fallback);
+        assert_eq!(title, "Monitor: Fallback label");
+        assert!(
+            meta.as_deref()
+                .is_some_and(|meta| meta.contains("\"monitorDescription\":\"Fallback label\""))
+        );
+
+        let long = J::Obj(vec![(
+            "monitorDescription".to_string(),
+            J::Str("x".repeat(max_content() + 1000)),
+        )]);
+        let (title, _, _) = fold.host_card_parts("monitorFeed", &long);
+        assert!(title.contains("…[truncated]"), "{title}");
+        assert!(title.chars().count() <= max_content(), "{title}");
+    }
+
+    #[test]
+    fn monitor_feed_streams_into_one_stable_card() {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        let started = parse_json(
+            r#"{"itemId":"feed-1","kind":"monitorFeed","monitorId":"monitor-1","monitorDescription":"Build\twatcher\u001b[31m","status":"inProgress","turnId":null,"revision":1,"text":"watching\n"}"#,
+        )
+        .unwrap();
+        fold.on_item_snapshot("sid", 1, &started, &mut out);
+        let initial = parse_json(&out[0]).unwrap();
+        let update = initial.get("params").and_then(|p| p.get("update")).unwrap();
+        assert_eq!(
+            update.get("sessionUpdate").and_then(J::as_str),
+            Some("tool_call")
+        );
+        assert_eq!(
+            update.get("toolCallId").and_then(J::as_str),
+            Some("monitor-monitor-1")
+        );
+        assert!(
+            update
+                .get("title")
+                .and_then(J::as_str)
+                .is_some_and(|title| title == "Monitor: Build watcher [31m"),
+            "{}",
+            j_to_string(&initial)
+        );
+        let muse = update
+            .get("_meta")
+            .and_then(|meta| meta.get("muse"))
+            .unwrap();
+        assert_eq!(muse.get("monitorId").and_then(J::as_str), Some("monitor-1"));
+        assert_eq!(
+            muse.get("monitorDescription").and_then(J::as_str),
+            Some("Build watcher [31m")
+        );
+        assert_eq!(
+            muse.get("itemKind").and_then(J::as_str),
+            Some("monitorFeed")
+        );
+
+        let delta =
+            parse_json(r#"{"itemId":"feed-1","field":"text","delta":"event one\n"}"#).unwrap();
+        fold.on_item_delta("sid", 1, &delta, &mut out);
+        let streamed = parse_json(&out[1]).unwrap();
+        let update = streamed
+            .get("params")
+            .and_then(|p| p.get("update"))
+            .unwrap();
+        assert_eq!(
+            update.get("status").and_then(J::as_str),
+            Some("in_progress")
+        );
+        assert!(
+            update
+                .get("content")
+                .is_some_and(|content| j_to_string(content).contains("watching\\nevent one"))
+        );
+        assert!(
+            update
+                .get("toolCallId")
+                .and_then(J::as_str)
+                .is_some_and(|id| id == "monitor-monitor-1")
+        );
+
+        let updated = parse_json(
+            r#"{"itemId":"feed-1","kind":"monitorFeed","monitorId":"monitor-1","monitorDescription":"Build\twatcher\u001b[31m","status":"inProgress","turnId":null,"revision":2,"text":"watching\nevent one\n","truncated":true}"#,
+        )
+        .unwrap();
+        let mut revised = Vec::new();
+        fold.on_item_snapshot("sid", 1, &updated, &mut revised);
+        let revised = parse_json(&revised[0]).unwrap();
+        let update = revised.get("params").and_then(|p| p.get("update")).unwrap();
+        assert!(
+            update
+                .get("_meta")
+                .and_then(|meta| meta.get("muse"))
+                .and_then(|muse| muse.get("truncated"))
+                .and_then(|cut| cut.get("source"))
+                .and_then(J::as_str)
+                == Some("host")
+        );
+
+        let completed_item = parse_json(
+            r#"{"itemId":"feed-1","kind":"monitorFeed","monitorId":"monitor-1","monitorDescription":"Build\twatcher\u001b[31m","status":"completed","turnId":null,"revision":3,"text":"watching\nevent one\n","truncated":true}"#,
+        )
+        .unwrap();
+        let completed = J::Obj(vec![("item".to_string(), completed_item.clone())]);
+        let mut terminal = Vec::new();
+        fold.on_item_completed("sid", 1, &completed, &mut terminal);
+        let completed = parse_json(&terminal[0]).unwrap();
+        let update = completed
+            .get("params")
+            .and_then(|p| p.get("update"))
+            .unwrap();
+        assert_eq!(update.get("status").and_then(J::as_str), Some("completed"));
+        assert!(
+            update
+                .get("_meta")
+                .and_then(|meta| meta.get("muse"))
+                .and_then(|muse| muse.get("truncated"))
+                .and_then(|cut| cut.get("source"))
+                .and_then(J::as_str)
+                == Some("host"),
+            "{}",
+            j_to_string(&completed)
+        );
+        let mut duplicate = Vec::new();
+        fold.on_item_completed("sid", 1, &completed, &mut duplicate);
+        assert!(
+            duplicate.is_empty(),
+            "a terminal refill must not settle the monitor twice: {duplicate:?}"
+        );
+
+        // A later feed batch reuses the monitor card and is an update on v1.
+        let second = parse_json(
+            r#"{"itemId":"feed-2","kind":"monitorFeed","monitorId":"monitor-1","monitorDescription":"Build\twatcher","status":"inProgress","turnId":null,"revision":1,"text":"event two\n"}"#,
+        )
+        .unwrap();
+        let mut reused = Vec::new();
+        fold.on_item_snapshot("sid", 1, &second, &mut reused);
+        let reused = parse_json(&reused[0]).unwrap();
+        let update = reused.get("params").and_then(|p| p.get("update")).unwrap();
+        assert_eq!(
+            update.get("sessionUpdate").and_then(J::as_str),
+            Some("tool_call_update")
+        );
+        assert_eq!(
+            update.get("toolCallId").and_then(J::as_str),
+            Some("monitor-monitor-1")
+        );
+
+        // Replayed terminal history uses the same monitor identity and title.
+        let mut replayed = SessionFold::new();
+        let mut replay = Vec::new();
+        replayed.replay_item("sid", 1, &completed_item, &mut replay);
+        let replay = parse_json(&replay[0]).unwrap();
+        let update = replay.get("params").and_then(|p| p.get("update")).unwrap();
+        assert_eq!(update.get("status").and_then(J::as_str), Some("completed"));
+        assert_eq!(
+            update.get("toolCallId").and_then(J::as_str),
+            Some("monitor-monitor-1")
+        );
+        assert_eq!(
+            update.get("title").and_then(J::as_str),
+            Some("Monitor: Build watcher [31m")
+        );
     }
 
     #[test]

@@ -469,6 +469,12 @@ error the editor shows if Muse then refuses the profile says why.
   title. On Muse 1.4.6+ a resume or re-attach asks the host for its
   authoritative background-task inventory (`task/list`), so work the replayed
   history did not carry still appears with a stoppable row.
+- **Monitor feeds** — Muse 1.4.8+ `monitorFeed` observations render in one
+  stable tool card per monitor. The card title uses the monitor's sanitized
+  arm-time description, streamed text replaces the card content as events
+  arrive, and completion settles the card. `_meta.muse.monitorId` links it to
+  the monitor tool call, and host-truncated text is marked in
+  `_meta.muse.truncated`.
 - **File changes** — per-turn workspace file-change reports from the host's
   native file tools when the client negotiates the AIR extension.
 - **Stored output** — bounded tool output with head and tail retained, plus
