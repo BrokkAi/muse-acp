@@ -692,14 +692,14 @@ fields, the per-session `permissionProfile`, the per-turn `userShell`,
 `SideProvenance`, and the newly required-but-nullable params — each carries an
 explicit disposition in the field matrix below;
 [#224](https://github.com/BrokkAi/muse-acp/issues/224) is resolved by that
-matrix. The 1.4.7 additions have their own issues: the `InitializeResult`
-sandbox facts
-(`sandboxAvailability`, `sandboxUnavailableReason`) in
-[#241](https://github.com/BrokkAi/muse-acp/issues/241) and `SessionNameOrigin`
+matrix. The 1.4.7 additions have their own issues: `SessionNameOrigin`
 (`Session.nameOrigin`, `SessionNameChangedParams.nameOrigin`) in
 [#242](https://github.com/BrokkAi/muse-acp/issues/242). The `Item.cutOff`
 partial-message mark is adopted
-([#243](https://github.com/BrokkAi/muse-acp/issues/243)); its row is in the
+([#243](https://github.com/BrokkAi/muse-acp/issues/243)), and so are the
+`InitializeResult` sandbox facts (`sandboxAvailability`,
+`sandboxUnavailableReason`,
+[#241](https://github.com/BrokkAi/muse-acp/issues/241)); their rows are in the
 field matrix below.
 
 The 1.4.8 additions have their own issues. The Computer Use app-level list,
@@ -771,6 +771,8 @@ cannot drop a member without failing CI.
 | `SessionTokenUsageParams.modelId` | Mapped to ACP | Keys the per-model cost legs under the prompt result's `_meta.muse.modelUsage`; a leg without a `modelId` is counted in the totals and left out rather than given an invented name. |
 | `SessionGoalChangedParams.goal` | Mapped to ACP | An explicit null clears the goal metadata (clear is kept distinct from never-seen); a non-null goal is stored and emitted. |
 | `Item.cutOff` | Mapped to ACP | A partial agent reply the host committed when the provider stream died is marked once with `_meta.muse.cutOff: true` and the host `itemId`, from whichever of `item/updated`, `item/completed`, a gap refill, or a history replay first carries the flag. A streamed reply gets an empty `agent_message_chunk` naming its `messageId` on ACP v2; a resent or replayed reply carries the mark on its own text update. A late mark only names the latest settled reply, and on ACP v1 (chunks attach by position) waits out a newer streaming reply. Never inferred, repeated, or cleared. [#243](https://github.com/BrokkAi/muse-acp/issues/243) |
+| `InitializeResult.sandboxAvailability` | Consumed | Recorded on the handshake and logged as `host-sandbox server=<host> availability=<posture> reason=<reason>` beside `host-features`, the posture being `available`, `unavailable`, or `unknown`; `--support` probes a live host for the same line and `--selftest`'s offline row reads `unknown`. An absent field (a host before 1.4.7) or an unrecognized value reads as `unknown`, never as a guess. `unavailable` adds a visible warning; nothing is gated on it. [#241](https://github.com/BrokkAi/muse-acp/issues/241) |
+| `InitializeResult.sandboxUnavailableReason` | Consumed | Reported as `reason=` on the `host-sandbox` line and in the warning only beside `unavailable`; a reason outside the published vocabulary reads as `unknown`, and an absent reason stays `none` — the adapter never infers one. [#241](https://github.com/BrokkAi/muse-acp/issues/241) |
 | `Item.displayLabel` | Unsupported pending protocol decision | The tool's own words for the call (`ToolDisplayLabel`: `active` while `inProgress`, `done` on `completed`, `neutral` beside any other status), which the adapter's synthesized tool-call titles do not read yet; adopting it is tracked in [#272](https://github.com/BrokkAi/muse-acp/issues/272). |
 | `SkillCatalogEntry.title` | Mapped to ACP | Each skill command in `available_commands_update` carries the skill's name as `_meta.muse.title`: the declared `title` (Muse 1.4.8+, from `SKILL.md` `metadata.display-name`), else the host's `displayName`. The command `name` stays the selector, and the `description` stays the palette summary unless the host sent an empty one, when it falls back to that name. Adapter-local commands carry no title. [#258](https://github.com/BrokkAi/muse-acp/issues/258) |
 <!-- msp-1.4.x-field-matrix:end -->

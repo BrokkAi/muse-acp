@@ -34,6 +34,8 @@ const ADDITIONS: &[&str] = &[
     "SessionTokenUsageParams.modelId",
     "SessionGoalChangedParams.goal",
     "Item.cutOff",
+    "InitializeResult.sandboxAvailability",
+    "InitializeResult.sandboxUnavailableReason",
     "Item.displayLabel",
     "SkillCatalogEntry.title",
 ];
@@ -196,6 +198,8 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("SessionTokenUsageParams", "modelId"),
         ("SessionGoalChangedParams", "goal"),
         ("Item", "cutOff"),
+        ("InitializeResult", "sandboxAvailability"),
+        ("InitializeResult", "sandboxUnavailableReason"),
         ("Item", "displayLabel"),
         ("SkillCatalogEntry", "title"),
     ] {

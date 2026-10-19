@@ -656,6 +656,60 @@ fn host_feature_gates_read_the_installed_muse_version() {
     adapter.finish();
 }
 
+/// The real host's sandbox facts reach the adapter's startup log.
+///
+/// Muse 1.4.7 added `sandboxAvailability` (and, beside `unavailable`, a
+/// `sandboxUnavailableReason`) to the `initialize` reply. A host from that
+/// release on always sends a posture, so the adapter must record a real
+/// one; an older host sends nothing, which must read as unknown rather than
+/// a guess. Each pin asserts what it actually saw.
+#[test]
+fn the_host_sandbox_facts_are_recorded_from_a_real_handshake() {
+    let test = "the_host_sandbox_facts_are_recorded_from_a_real_handshake";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, label) = adapter_host_release(&adapter);
+    let log = std::fs::read_to_string(&adapter.log).unwrap();
+    let prefix = format!("host-sandbox server={label} ");
+    let line = log
+        .lines()
+        .find_map(|line| line.split(&prefix).nth(1))
+        .unwrap_or_else(|| panic!("no {prefix:?} line in:\n{log}"));
+    if release < (1, 4, 7) {
+        assert_eq!(line, "availability=unknown reason=none", "{log}");
+    } else {
+        let (availability, reason) = line
+            .strip_prefix("availability=")
+            .and_then(|rest| rest.split_once(" reason="))
+            .unwrap_or_else(|| panic!("malformed sandbox line {line:?}"));
+        match availability {
+            "available" => assert_eq!(reason, "none", "{line}"),
+            "unavailable" => {
+                assert!(
+                    [
+                        "userNamespacesDenied",
+                        "bubblewrapUnavailable",
+                        "unknown",
+                        "none"
+                    ]
+                    .contains(&reason),
+                    "{line}"
+                );
+                assert!(
+                    log.contains("cannot enforce its sandbox"),
+                    "an unavailable sandbox must warn:\n{log}"
+                );
+            }
+            other => panic!("a 1.4.7+ host always reports its sandbox, got {other:?}"),
+        }
+        eprintln!("{test}: {label} reports availability={availability} reason={reason}");
+    }
+    adapter.finish();
+}
+
 /// `/rename` against a real host, across the `sessionRename` registry entry.
 ///
 /// The adapter requests `sessionRename` at `initialize` unconditionally
