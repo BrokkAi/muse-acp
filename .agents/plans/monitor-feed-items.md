@@ -156,3 +156,5 @@ Update and completion frames use `tool_call_update` and the same card id.
 ## Interfaces and Dependencies
 
 `SessionFold::ItemRole` gains an internal monitor role. `SessionFold::new` initializes the set of monitor card ids. `host_card_parts` and a private description sanitizer produce the monitor title, content, and metadata. Public fold method signatures do not change. No dependency is added.
+
+Change note (2026-10-19): review pass 1 corrected the history-replay test so it replays a terminal monitor item rather than an in-progress snapshot.

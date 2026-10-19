@@ -2910,10 +2910,11 @@ mod corpus_tests {
                 == Some("host")
         );
 
-        let completed = parse_json(
-            r#"{"item":{"itemId":"feed-1","kind":"monitorFeed","monitorId":"monitor-1","monitorDescription":"Build\twatcher\u001b[31m","status":"completed","turnId":null,"revision":3,"text":"watching\nevent one\n","truncated":true}}"#,
+        let completed_item = parse_json(
+            r#"{"itemId":"feed-1","kind":"monitorFeed","monitorId":"monitor-1","monitorDescription":"Build\twatcher\u001b[31m","status":"completed","turnId":null,"revision":3,"text":"watching\nevent one\n","truncated":true}"#,
         )
         .unwrap();
+        let completed = J::Obj(vec![("item".to_string(), completed_item.clone())]);
         let mut terminal = Vec::new();
         fold.on_item_completed("sid", 1, &completed, &mut terminal);
         let completed = parse_json(&terminal[0]).unwrap();
@@ -2955,9 +2956,10 @@ mod corpus_tests {
         // Replayed terminal history uses the same monitor identity and title.
         let mut replayed = SessionFold::new();
         let mut replay = Vec::new();
-        replayed.replay_item("sid", 1, &updated, &mut replay);
+        replayed.replay_item("sid", 1, &completed_item, &mut replay);
         let replay = parse_json(&replay[0]).unwrap();
         let update = replay.get("params").and_then(|p| p.get("update")).unwrap();
+        assert_eq!(update.get("status").and_then(J::as_str), Some("completed"));
         assert_eq!(
             update.get("toolCallId").and_then(J::as_str),
             Some("monitor-monitor-1")
