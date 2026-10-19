@@ -21,7 +21,9 @@ Muse 1.4.8 lets `session/resume` apply a launch permission-profile pick after re
 - [x] (2026-10-19) Add fake-host, field-matrix, and live 1.4.8 coverage.
 - [x] (2026-10-19) Update README, ROADMAP, CHANGELOG, and this plan. No event-compatibility edit was needed because this is a lifecycle request member, not a notification disposition change.
 - [x] (2026-10-19) Run all contribution gates.
-- [ ] Open a pull request, complete three review/fix passes, and merge only after final CI is green.
+- [x] (2026-10-19) Open PR #292 with `Fixes #257`.
+- [x] (2026-10-19) Complete three review/fix passes.
+- [ ] Merge only after final CI is green.
 
 
 ## Surprises & Discoveries
@@ -70,7 +72,16 @@ profile is forwarded only through ACP load/resume, malformed metadata fails
 before any host call, typed host refusals retain their `commandRejected` data,
 and fork never carries the member. The full Cargo suite, focused fake-host and
 live tests, format, clippy, selftest, npm, Python, packaging, and shell gates
-pass. Pull-request review and CI remain.
+pass. PR #292 completed three review/fix passes:
+
+- The first pass added crash/reattach coverage proving adapter recovery does
+  not repeat a client's launch profile.
+- The second pass clarified that consumers must select an existing
+  host-catalog id and that malformed metadata fails before the host call.
+- The third pass extended typed-refusal coverage to the documented ephemeral
+  host reason.
+
+Final CI and merge remain.
 
 
 ## Context and Orientation
