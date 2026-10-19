@@ -282,7 +282,10 @@ Windows host-platform gaps outside those flows: 1.4.1/1.4.2 answer
 `session/delete` with `UnsupportedPlatform`, the bash-based shell tests
 behave differently than on Linux, and 1.4.1 forks fail their boundary check.
 The 1.4.6, 1.4.7, 1.4.8, and 1.4.10 legs have not run on a Windows host yet, so CI is
-their first Windows evidence.
+their first Windows evidence. On Linux, 1.4.10 fails `session/fork` outright:
+it resolves the branch creation time from file birth time, which the platform
+cannot provide, so the fork live test skips that host refusal there (macOS
+still covers the fork).
 
 **Work items**
 
