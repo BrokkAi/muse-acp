@@ -602,23 +602,48 @@ impl SessionFold {
             && matches!(item.get("cutOff"), Some(J::Bool(true)))
     }
 
-    /// The `_meta` member that marks a reply cut off, ready to append to an
-    /// update object.
-    fn cut_off_meta(item_id: &str) -> String {
-        format!(
-            ",\"_meta\":{{\"muse\":{{\"cutOff\":true,\"itemId\":{}}}}}",
-            esc(item_id)
-        )
+    /// `Item.messagePhase` (Muse 1.4.8): the phase the model declared on
+    /// the commit — running commentary or the final answer. Only an
+    /// explicit `"commentary"` counts; an absent or unknown value reads as
+    /// `"finalAnswer"`. Never inferred from position, and never a
+    /// turn-done signal.
+    fn message_phase(item: &J) -> &'static str {
+        if item.get("kind").and_then(|v| v.as_str()) == Some("agentMessage")
+            && item.get("messagePhase").and_then(|v| v.as_str()) == Some("commentary")
+        {
+            "commentary"
+        } else {
+            "finalAnswer"
+        }
     }
 
-    /// An agent-message chunk carrying `_meta.muse.cutOff`, so an editor can
-    /// mark the reply as truncated rather than complete. `text` is whatever
-    /// the completion still has to show; empty when the deltas carried it.
-    fn cut_off_chunk(acp_sid: &str, ver: u8, msg_id: &str, item_id: &str, text: &str) -> String {
+    /// The `_meta.muse` member marking a completed agent reply: its message
+    /// phase, plus the cut-off mark when the host committed a partial reply.
+    /// Ready to append to an update object. `None` on both sides means the
+    /// update carries no mark at all.
+    fn message_meta(phase: Option<&str>, cut_off: Option<&str>) -> Option<String> {
+        let mut fields = String::new();
+        if let Some(phase) = phase {
+            fields.push_str(&format!("\"messagePhase\":{}", esc(phase)));
+        }
+        if let Some(item_id) = cut_off {
+            if !fields.is_empty() {
+                fields.push(',');
+            }
+            fields.push_str(&format!("\"cutOff\":true,\"itemId\":{}", esc(item_id)));
+        }
+        (!fields.is_empty()).then(|| format!(",\"_meta\":{{\"muse\":{{{fields}}}}}"))
+    }
+
+    /// An agent-message chunk carrying the completed reply's `_meta.muse`
+    /// mark, so an editor can tell commentary from the final answer (and a
+    /// truncated reply from a complete one). `text` is whatever the
+    /// completion still has to show; empty when the deltas carried it.
+    fn marked_chunk(acp_sid: &str, ver: u8, msg_id: &str, text: &str, meta: &str) -> String {
         let mut line = Self::chunk(acp_sid, ver, msg_id, text);
         // The chunk is the update object followed by the two closing braces
         // of `params` and the envelope.
-        line.insert_str(line.len() - 3, &Self::cut_off_meta(item_id));
+        line.insert_str(line.len() - 3, meta);
         line
     }
 
@@ -649,7 +674,13 @@ impl SessionFold {
             },
         };
         self.cut_off.insert(item_id.to_string());
-        out.push(Self::cut_off_chunk(acp_sid, ver, &msg_id, item_id, ""));
+        // The mark never declares a phase: on a settled item the completion
+        // already emitted it, and on an in-flight item the model has not
+        // committed one yet — inferring `finalAnswer` here would contradict
+        // the completion's later declaration.
+        let meta = Self::message_meta(None, Some(item_id))
+            .expect("a cut-off mark always carries its cut-off");
+        out.push(Self::marked_chunk(acp_sid, ver, &msg_id, "", &meta));
     }
 
     fn message_streaming(&self) -> bool {
@@ -1685,7 +1716,9 @@ impl SessionFold {
     }
 
     /// `cut_off` names the item when the replayed reply carries the cut-off
-    /// mark, which then rides the message itself.
+    /// mark, and `phase` carries its declared message phase; both ride the
+    /// message itself. A settled agent-message replay carries its phase; an
+    /// in-flight prefix records none yet, and user messages carry neither.
     fn replay_message_line(
         acp_sid: &str,
         ver: u8,
@@ -1693,6 +1726,7 @@ impl SessionFold {
         msg_id: &str,
         text: &str,
         cut_off: Option<&str>,
+        phase: Option<&str>,
     ) -> String {
         let content = format!("[{{\"type\":\"text\",\"text\":{}}}]", esc(text));
         let mut update = match (kind, ver) {
@@ -1718,8 +1752,8 @@ impl SessionFold {
             ),
             _ => unreachable!("replay_message_line called for {kind}"),
         };
-        if let Some(item_id) = cut_off {
-            update.insert_str(update.len() - 1, &Self::cut_off_meta(item_id));
+        if let Some(meta) = Self::message_meta(phase, cut_off) {
+            update.insert_str(update.len() - 1, &meta);
         }
         Self::update_line(acp_sid, &update)
     }
@@ -1771,6 +1805,7 @@ impl SessionFold {
                             msg_id,
                             text,
                             mark.then_some(item_id.as_str()),
+                            None,
                         ));
                     }
                 }
@@ -1790,6 +1825,7 @@ impl SessionFold {
                 if !text.is_empty() {
                     let msg_id = mint_id("msg-", &self.idc);
                     let mark = self.claim_cut_off(item, &item_id);
+                    let phase = (kind == "agentMessage").then(|| Self::message_phase(item));
                     out.push(Self::replay_message_line(
                         acp_sid,
                         ver,
@@ -1797,6 +1833,7 @@ impl SessionFold {
                         &msg_id,
                         text,
                         mark.then_some(item_id.as_str()),
+                        phase,
                     ));
                     if kind == "agentMessage" {
                         self.last_message = Some((item_id, msg_id));
@@ -2221,11 +2258,17 @@ impl SessionFold {
                     msg_id.filter(|_| streamed > 0).map(|id| (id, ""))
                 };
                 if let Some((msg_id, text)) = shown {
-                    if self.claim_cut_off(item, &item_id) {
-                        out.push(Self::cut_off_chunk(acp_sid, ver, &msg_id, &item_id, text));
-                    } else if !text.is_empty() {
-                        out.push(Self::chunk(acp_sid, ver, &msg_id, text));
-                    }
+                    // The completion always declares the reply's phase — on
+                    // the resent text, or on an empty chunk after streamed
+                    // text — so commentary stays distinguishable from the
+                    // final answer even when the deltas carried the words.
+                    let phase = Self::message_phase(item);
+                    let cut = self
+                        .claim_cut_off(item, &item_id)
+                        .then_some(item_id.as_str());
+                    let meta = Self::message_meta(Some(phase), cut)
+                        .expect("a completion always declares its phase");
+                    out.push(Self::marked_chunk(acp_sid, ver, &msg_id, text, &meta));
                     self.last_message = Some((item_id.clone(), msg_id));
                 }
             }
@@ -2950,9 +2993,16 @@ mod corpus_tests {
         .unwrap();
         let mut terminal = Vec::new();
         fold.on_item_completed("sid", 2, &completed, &mut terminal);
+        assert_eq!(
+            terminal.len(),
+            1,
+            "completion declares the phase without resending the message: {terminal:?}"
+        );
         assert!(
-            terminal.is_empty(),
-            "completion does not resend the full message: {terminal:?}"
+            terminal[0].contains("\"messagePhase\":\"finalAnswer\"")
+                && terminal[0].contains("\"text\":\"\""),
+            "the streamed reply is marked final without repeating its text: {}",
+            terminal[0]
         );
     }
 
@@ -3009,8 +3059,9 @@ mod corpus_tests {
         fold.on_item_completed("sid", 2, &completed, &mut terminal);
         assert_eq!(terminal.len(), 1, "one mark: {terminal:?}");
         assert!(
-            terminal[0].contains("\"_meta\":{\"muse\":{\"cutOff\":true,\"itemId\":\"it-cut\"}}")
-                && terminal[0].contains(&format!("\"messageId\":\"{msg_id}\""))
+            terminal[0].contains(
+                "\"_meta\":{\"muse\":{\"messagePhase\":\"finalAnswer\",\"cutOff\":true,\"itemId\":\"it-cut\"}}"
+            ) && terminal[0].contains(&format!("\"messageId\":\"{msg_id}\""))
                 && terminal[0].contains("\"text\":\"\""),
             "the mark names the streamed message without repeating its text: {}",
             terminal[0]
@@ -3023,6 +3074,50 @@ mod corpus_tests {
         let mut late = Vec::new();
         fold.on_item_snapshot("sid", 2, &updated, &mut late);
         assert!(late.is_empty(), "the mark is never repeated: {late:?}");
+    }
+
+    #[test]
+    fn an_in_flight_cut_off_mark_claims_no_phase() {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        let started =
+            parse_json(r#"{"itemId":"it-cut","kind":"agentMessage","status":"inProgress"}"#)
+                .unwrap();
+        fold.on_item_snapshot("sid", 2, &started, &mut out);
+        let delta = parse_json(r#"{"itemId":"it-cut","field":"text","delta":"the answ"}"#).unwrap();
+        fold.on_item_delta("sid", 2, &delta, &mut out);
+        assert_eq!(out.len(), 1);
+
+        // A revision that first sets cutOff mid-stream marks the reply but
+        // invents no phase: the model has not committed one yet.
+        let updated = parse_json(
+            r#"{"itemId":"it-cut","kind":"agentMessage","status":"inProgress","text":"the answ","cutOff":true}"#,
+        )
+        .unwrap();
+        let mut marks = Vec::new();
+        fold.on_item_snapshot("sid", 2, &updated, &mut marks);
+        assert_eq!(marks.len(), 1, "one mark: {marks:?}");
+        assert!(
+            marks[0].contains("\"cutOff\":true") && !marks[0].contains("messagePhase"),
+            "the in-flight mark carries no phase: {}",
+            marks[0]
+        );
+
+        // The eventual completion declares commentary; it must not
+        // contradict the earlier mark.
+        let completed = parse_json(
+            r#"{"item":{"itemId":"it-cut","kind":"agentMessage","status":"completed","text":"the answ","cutOff":true,"messagePhase":"commentary"}}"#,
+        )
+        .unwrap();
+        let mut terminal = Vec::new();
+        fold.on_item_completed("sid", 2, &completed, &mut terminal);
+        assert_eq!(terminal.len(), 1, "one phase declaration: {terminal:?}");
+        assert!(
+            terminal[0].contains("\"messagePhase\":\"commentary\"")
+                && !terminal[0].contains("cutOff"),
+            "the completion declares its phase without repeating the mark: {}",
+            terminal[0]
+        );
     }
 
     #[test]
@@ -3145,6 +3240,115 @@ mod corpus_tests {
                 out[0]
             );
         }
+    }
+
+    #[test]
+    fn completed_agent_message_carries_its_declared_phase() {
+        for (phase_json, want) in [
+            (r#""messagePhase":"commentary","#, "commentary"),
+            (r#""messagePhase":"finalAnswer","#, "finalAnswer"),
+            ("", "finalAnswer"),
+        ] {
+            let mut fold = SessionFold::new();
+            let completed = parse_json(&format!(
+                r#"{{"item":{{"itemId":"it-msg","kind":"agentMessage","status":"completed",{phase_json}"text":"the answer"}}}}"#
+            ))
+            .unwrap();
+            let mut out = Vec::new();
+            fold.on_item_completed("sid", 2, &completed, &mut out);
+            assert_eq!(out.len(), 1, "one completion update: {out:?}");
+            assert!(
+                out[0].contains("\"text\":\"the answer\"")
+                    && out[0].contains(&format!("\"messagePhase\":\"{want}\"")),
+                "{phase_json:?} rides the completion as {want}: {}",
+                out[0]
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_message_phase_reads_as_final_answer() {
+        let mut fold = SessionFold::new();
+        let completed = parse_json(
+            r#"{"item":{"itemId":"it-msg","kind":"agentMessage","status":"completed","messagePhase":"someday","text":"the answer"}}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_completed("sid", 2, &completed, &mut out);
+        assert_eq!(out.len(), 1, "an unknown phase still renders: {out:?}");
+        assert!(
+            out[0].contains("\"text\":\"the answer\"")
+                && out[0].contains("\"messagePhase\":\"finalAnswer\""),
+            "an unknown phase falls back to the final answer: {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn streamed_completion_marks_the_phase_without_resending_text() {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        let started =
+            parse_json(r#"{"itemId":"it-msg","kind":"agentMessage","status":"inProgress"}"#)
+                .unwrap();
+        fold.on_item_snapshot("sid", 2, &started, &mut out);
+        let delta =
+            parse_json(r#"{"itemId":"it-msg","field":"text","delta":"the answer"}"#).unwrap();
+        fold.on_item_delta("sid", 2, &delta, &mut out);
+        assert_eq!(out.len(), 1);
+        let msg_id = out[0]
+            .split("\"messageId\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap()
+            .to_string();
+
+        let completed = parse_json(
+            r#"{"item":{"itemId":"it-msg","kind":"agentMessage","status":"completed","messagePhase":"commentary","text":"the answer"}}"#,
+        )
+        .unwrap();
+        let mut terminal = Vec::new();
+        fold.on_item_completed("sid", 2, &completed, &mut terminal);
+        assert_eq!(terminal.len(), 1, "one phase mark: {terminal:?}");
+        assert!(
+            terminal[0].contains("\"messagePhase\":\"commentary\"")
+                && terminal[0].contains(&format!("\"messageId\":\"{msg_id}\""))
+                && terminal[0].contains("\"text\":\"\""),
+            "the mark names the streamed message without repeating its text: {}",
+            terminal[0]
+        );
+    }
+
+    #[test]
+    fn replayed_settled_message_keeps_its_phase_but_a_prefix_claims_none() {
+        let mut fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"it-msg","kind":"agentMessage","status":"completed","text":"the answer","messagePhase":"commentary"}"#,
+        )
+        .unwrap();
+        let mut replay = Vec::new();
+        fold.replay_item("sid", 2, &item, &mut replay);
+        assert_eq!(replay.len(), 1);
+        assert!(
+            replay[0].contains("the answer")
+                && replay[0].contains("\"messagePhase\":\"commentary\""),
+            "a settled replay carries its phase: {}",
+            replay[0]
+        );
+
+        let mut fold = SessionFold::new();
+        let prefix = parse_json(
+            r#"{"itemId":"it-msg","kind":"agentMessage","status":"inProgress","text":"the ans"}"#,
+        )
+        .unwrap();
+        let mut replay = Vec::new();
+        fold.replay_item("sid", 2, &prefix, &mut replay);
+        assert_eq!(replay.len(), 1);
+        assert!(
+            !replay[0].contains("messagePhase"),
+            "an in-flight prefix records no phase yet: {}",
+            replay[0]
+        );
     }
 
     #[test]
