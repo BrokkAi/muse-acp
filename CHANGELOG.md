@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Adopt the Muse 1.4.8 resume permission-profile pick (#257). ACP
+  `session/load` and `session/resume` accept a non-empty
+  `_meta.muse.permissionProfile`; the adapter forwards it only to MSP
+  `session/resume`, including the MCP-configuration conflict retry. Omitting
+  it preserves retained-authority behavior, malformed values fail locally,
+  and unknown or unavailable ids keep the host's typed `commandRejected`
+  refusal. `session/fork` never carries the member.
+
 - Adopt Muse 1.4.8 Computer Use app-level choices (#253). The opt-in
   `_session/computerUse` settings now expose effective `apps` rows and can
   request `installedApps` with `installed: true`; `/cua status` renders each
