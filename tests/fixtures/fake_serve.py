@@ -823,6 +823,19 @@ def on_turn_start(params):
             **base, "blockingAgents": ["reviewer"],
             "viewCursor": "cur-patch-foreground"})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "pull_row_metadata":
+        notify("session/statusChanged", {
+            "sessionId": MSP_SID, "status": "running",
+            "attention": ["approvalPending"],
+            "viewCursor": "cur-pull-status"})
+        notify("session/branchChanged", {
+            "sessionId": MSP_SID, "viewCursor": "cur-pull-branch",
+            "branch": "keep/live", "vcs": "git",
+            "workspaceRoot": "/home/me/src/proj"})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-pull", "kind": "agentMessage",
+            "status": "completed", "text": "ready"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "session_metadata":
         notify("session/nameChanged", {
             "sessionId": ACTIVE_SESSION[0], "name": "Renamed by host",

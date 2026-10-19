@@ -96,9 +96,9 @@ the value from the latest frame.
 | `_meta.muse.generatedName` | string or `null` | Host-generated short title. `null` withdraws a previously published value. |
 | `_meta.muse.sideFrom` | object | Side-chat parent provenance. |
 | `_meta.muse.forkedFrom` | object | Fork provenance. |
-| `_meta.muse.approvalReviewing` | array or absent | Native reviewer activity rows. The key is removed when no rows remain. |
-| `_meta.muse.foregroundCompleted` | object or absent | `turnId` and `blockingAgents` while foreground work is done but background checks hold the prompt open. Removed at the terminal. |
-| `_meta.muse.modelRetry` | object or absent | Current model-attempt backoff details. Removed at the turn terminal. |
+| `_meta.muse.approvalReviewing` | array or `null` | Native reviewer activity rows. `null` clears the prior rows when none remain. |
+| `_meta.muse.foregroundCompleted` | object or `null` | `turnId` and `blockingAgents` while foreground work is done but background checks hold the prompt open. `null` clears the hint at the terminal. |
+| `_meta.muse.modelRetry` | object or `null` | Current model-attempt backoff details. `null` clears the hint at the turn terminal. |
 | `_meta.muse.subscriptionUsage` | object or `null` | Host subscription observation, separate from billing and ACP context usage. `null` clears a prior value. The legacy `_meta.museSubscriptionUsage` alias is also emitted. |
 
 The complete `muse` object can contain any combination of the keys above.

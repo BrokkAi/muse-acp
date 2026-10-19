@@ -8850,6 +8850,52 @@ fn v2_session_info_updates_patch_one_complete_muse_object() {
 }
 
 #[test]
+fn session_list_pull_rows_do_not_clear_live_session_metadata() {
+    let mut c = Client::spawn("pull_row_metadata", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "publish live metadata");
+    c.wait_for_all(
+        &[
+            "\"branch\":\"keep/live\"",
+            "\"status\":\"running\"",
+            "\"attention\":[\"approvalPending\"]",
+        ],
+        Duration::from_secs(15),
+    );
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("\"result\""), "{done}");
+    c.wait_for("\"state\":\"idle\"", Duration::from_secs(15));
+
+    let list = c.req("session/list", &format!("{{\"cwd\":{}}}", temp_cwd_json()));
+    c.wait_for(&format!("\"id\":{list}"), Duration::from_secs(15));
+    let mark = c.frames.lock().unwrap_or_else(|p| p.into_inner()).len();
+
+    let resume = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_for(&format!("\"id\":{resume}"), Duration::from_secs(15));
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let snapshot = frames[mark..]
+        .iter()
+        .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+        .find(|frame| {
+            frame["params"]["update"]["sessionUpdate"] == serde_json::json!("session_info_update")
+                && frame["params"]["update"]["_meta"]["muse"]["branch"]["branch"]
+                    == serde_json::json!("keep/live")
+        })
+        .unwrap_or_else(|| panic!("no preserved metadata snapshot: {frames:#?}"));
+    assert_eq!(
+        snapshot["params"]["update"]["_meta"]["muse"]["status"],
+        serde_json::json!("running"),
+        "{snapshot}"
+    );
+    assert_eq!(
+        snapshot["params"]["update"]["_meta"]["muse"]["attention"],
+        serde_json::json!(["approvalPending"]),
+        "{snapshot}"
+    );
+    c.finish();
+}
+
+#[test]
 fn todo_list_changed_maps_to_an_acp_plan() {
     let mut c = Client::spawn("todo", &[]);
     let sid = c.new_session(1, "");
