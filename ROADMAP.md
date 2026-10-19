@@ -659,8 +659,8 @@ continues.
 | `plugin/marketplaceUpdate` | Mapped to ACP | The adapter-local `/plugin marketplace update <name>` slash command refreshes a marketplace and settles on the host record ack. |
 | `recap/request` | Mapped to ACP | The adapter-local `/recap` slash command sends the request and holds the ACP prompt open (one recap per session) until `recap/completed` settles it with the host's summary. |
 | `recap/cancel` | Mapped to ACP | `session/cancel` while a recap is in flight sends `recap/cancel` and settles the held prompt `cancelled`, so the host's 45-second timeout is never waited on. |
-| `computerUseSettings/read` | Mapped to ACP | Read by the opt-in `_session/computerUse` extension (with `showBuiltIns`) and rendered by `/cua`; the settings object is returned verbatim. |
-| `computerUseSettings/update` | Mapped to ACP | `/cua set computerControl|screenshots ask|alwaysAllow` and `/cua block|unblock <bundleId>` apply one all-or-nothing patch and render the returned settings. |
+| `computerUseSettings/read` | Mapped to ACP | Read by the opt-in `_session/computerUse` extension (with optional `showBuiltIns`/`installed`) and rendered by `/cua status` and `/cua apps`; the settings object, including effective `apps`, is returned verbatim. |
+| `computerUseSettings/update` | Mapped to ACP | `/cua set computerControl|screenshots ask|alwaysAllow`, `/cua block|unblock <bundleId>`, and `/cua app <bundleId> ask|alwaysAllow|blocked [...]` apply one all-or-nothing patch and render the returned settings. |
 | `computerUseSetup/read` | Mapped to ACP | Read by `_session/computerUse` and `/cua [status]` for a session, and by `/cua host` with no `sessionId` for the host's own setup. Each renders the setup phase, the three permissions, and any refusal message verbatim. |
 | `computerUseSetup/start` | Mapped to ACP | `/cua on` runs the setup between turns and renders the state it settles in, mirroring the TUI's `/cua on`. |
 | `computerUseSetup/check` | Mapped to ACP | `/cua host check` reads the host's three macOS grants without prompting, opening System Settings, or starting a model turn. It needs `computerUseHostSetup`; a busy helper keeps the host's typed `commandRejected` `runtime_busy` data. |
@@ -707,8 +707,9 @@ field matrix below.
 The 1.4.8 additions have their own issues. The Computer Use app-level list,
 installed-app picker, and `apps` writer (`ComputerUseSettings.apps`,
 `ComputerUseSettings.installedApps`, `ComputerUseSettingsReadParams.installed`,
-`ComputerUseSettingsUpdateParams.apps`) are in
-[#253](https://github.com/BrokkAi/muse-acp/issues/253); the agent-message
+`ComputerUseSettingsUpdateParams.apps`) are adopted
+([#253](https://github.com/BrokkAi/muse-acp/issues/253); see the field-matrix
+rows below); the agent-message
 phase (`Item.messagePhase`, `MessagePhase`) is adopted
 ([#254](https://github.com/BrokkAi/muse-acp/issues/254); see the field-matrix
 row below); the `monitorFeed`
@@ -762,6 +763,10 @@ cannot drop a member without failing CI.
 | --- | --- | --- |
 | `ItemKind.webSearch` | Mapped to ACP | Rendered through the unknown-kind generic card path from the item's `fallbackText`, carrying `_meta.muse.itemKind`; a frame without a summary is tolerated and emits nothing. |
 | `ItemKind.monitorFeed` | Mapped to ACP | Rendered as one stable `kind: "other"` tool card per monitor. `item/delta` on `text` accumulates and replaces the card content, the completed item settles it, and `Item.truncated` is forwarded from the host. `Item.turnId: null` is accepted because monitor events can arrive outside a turn. [#255](https://github.com/BrokkAi/muse-acp/issues/255) |
+| `ComputerUseSettings.apps` | Mapped to ACP | Returned verbatim by the opt-in `_session/computerUse` extension and rendered by `/cua status` in host order with effective choice, host name, last-asked time, and lock reason. Absence means an older host; no rows are inferred. [#253](https://github.com/BrokkAi/muse-acp/issues/253) |
+| `ComputerUseSettings.installedApps` | Mapped to ACP | Returned verbatim when the host answers an installed-app read and rendered by `/cua apps` as the human picker source. Missing rows are never synthesized. [#253](https://github.com/BrokkAi/muse-acp/issues/253) |
+| `ComputerUseSettingsReadParams.installed` | Mapped to ACP | Forwarded from `_session/computerUse`'s optional `installed` request member and set by `/cua apps`; ordinary status reads omit it. [#253](https://github.com/BrokkAi/muse-acp/issues/253) |
+| `ComputerUseSettingsUpdateParams.apps` | Mapped to ACP | `/cua app <bundleId> <choice> [<bundleId> <choice> ...]` sends one ordered all-or-nothing app patch, validates only the closed choice vocabulary, and renders the returned settings. Locked, duplicate, and overlapping host refusals stay typed. [#253](https://github.com/BrokkAi/muse-acp/issues/253) |
 | `TurnErrorKind.mcpLinkError` | Mapped to ACP | The turn-failure projection names the kind verbatim and adds an MCP-link remedy ("check the server's configuration and credentials"); the host message and retryable judgment are preserved. |
 | `TurnError.quota` | Mapped to ACP | The failure text appends the typed `QuotaDetail` (`limitKind` plus the reset wait); the adapter branches on the detail's presence, never on the message text. |
 | `TurnRetryScheduledParams.errorKind` | Consumed | Recorded in the `turn/retryScheduled` diagnostic; the event stays non-terminal and never settles the ACP prompt. |

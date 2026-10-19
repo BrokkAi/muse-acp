@@ -1997,6 +1997,59 @@ fn computer_use_reads_reach_a_real_host_when_negotiated() {
             response["result"]["setup"].is_object() && response["result"]["settings"].is_object(),
             "{response}"
         );
+        if release >= (1, 4, 8) {
+            let id = adapter.request(
+                "_session/computerUse",
+                json!({"sessionId": session, "installed": true}),
+            );
+            let response = adapter.response(id);
+            assert!(
+                response.get("error").is_none(),
+                "the granted host serves the installed-app read: {response}"
+            );
+            assert!(
+                response["result"]["settings"]["apps"].is_array()
+                    && response["result"]["settings"]["installedApps"].is_array(),
+                "1.4.8 computer-use settings expose app and installed-app rows: {response}"
+            );
+            let id = adapter.prompt(&session, "/cua apps");
+            let response = adapter.response(id);
+            assert!(
+                response.get("error").is_none(),
+                "the installed-app picker command succeeds after the same read: {response}"
+            );
+            assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+
+            // A harmless isolated-profile grant must appear in the returned
+            // settings, proving this frame came from the app patch.
+            let probe = "com.brokkai.muse-acp.live-probe";
+            let id = adapter.prompt(&session, &format!("/cua app {probe} alwaysAllow"));
+            let response = adapter.response(id);
+            if let Some(error) = response.get("error") {
+                assert!(
+                    matches!(error["code"].as_i64(), Some(-32030 | -32033)),
+                    "unexpected app patch refusal: {response}"
+                );
+            } else {
+                assert_eq!(response["result"]["stopReason"], "end_turn", "{response}");
+                let patched = adapter.wait("computer-use app patch text", |frame| {
+                    frame["method"] == "session/update"
+                        && frame["params"]["sessionId"] == json!(session)
+                        && frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                        && frame["params"]["update"]["content"]["text"]
+                            .as_str()
+                            .is_some_and(|text| {
+                                text.contains(probe) && text.contains("alwaysAllow")
+                            })
+                });
+                assert!(
+                    patched["params"]["update"]["content"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("Computer use settings:")),
+                    "{patched}"
+                );
+            }
+        }
     }
     if release >= (1, 4, 7) {
         let id = adapter.prompt(&session, "/cua host");

@@ -420,8 +420,12 @@ error the editor shows if Muse then refuses the profile says why.
   `_session/computerUse` extension to use them. With the per-session grant,
   `/cua [status]`, `/cua on`, `/cua set
   computerControl|screenshots ask|alwaysAllow`, and `/cua block|unblock
-  <bundleId>` drive the session setup and settings patch, while the extension
-  returns structured session setup plus settings (built-in blocks on request).
+  <bundleId>` drive the session setup and settings patch. Muse 1.4.8 adds
+  effective per-app rows with their last-asked and lock facts; `/cua apps`
+  requests the installed/running picker source, and `/cua app <bundleId>
+  ask|alwaysAllow|blocked [...]` patches one or more apps atomically. The
+  extension returns structured session setup plus settings, can request
+  `installedApps`, and includes built-in blocks on request.
   A withheld grant or disabled gate fails closed with a typed refusal; a busy
   host check keeps the host's `commandRejected` `runtime_busy` data.
 - **Content** — text, inline and local-file images, `resource_link` text
@@ -498,7 +502,8 @@ only when the client opts in too, with the documented fallback otherwise:
 - `_session/sideChat` — opt-in creation of a side chat from a loaded session.
 - `_session/plugins` — opt-in reads of the session's installed plugin rows.
 - `_session/computerUse` — opt-in reads of the session's computer-use setup
-  and settings. The host's `computerUseSetup` and `computerUseHostSetup`
+  and settings, including effective app choices and the optional installed-app
+  picker source. The host's `computerUseSetup` and `computerUseHostSetup`
   capabilities are requested only for clients that opt in; the standard
   `/cua host` and `/cua host check` commands do not require extension support.
 - `_session/userShell` — shell commands outside any turn; needs editor

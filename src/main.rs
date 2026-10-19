@@ -6160,12 +6160,19 @@ fn handle_acp(
                 .as_ref()
                 .and_then(|p| p.get("showBuiltIns"))
                 .is_some_and(|v| matches!(v, J::Bool(true)));
-            let settings_params = if show_built_ins {
-                "{\"showBuiltIns\":true}"
-            } else {
-                "{}"
-            };
-            let settings = match host.command("computerUseSettings/read", settings_params) {
+            let installed = params
+                .as_ref()
+                .and_then(|p| p.get("installed"))
+                .is_some_and(|v| matches!(v, J::Bool(true)));
+            let mut settings_fields = Vec::new();
+            if show_built_ins {
+                settings_fields.push("\"showBuiltIns\":true");
+            }
+            if installed {
+                settings_fields.push("\"installed\":true");
+            }
+            let settings_params = format!("{{{}}}", settings_fields.join(","));
+            let settings = match host.command("computerUseSettings/read", &settings_params) {
                 Ok(result) => result,
                 Err(error) => {
                     send_host_error(
@@ -8317,6 +8324,7 @@ fn parse_skill_activation_command(text: &str) -> Option<Result<ProtocolCommand, 
 #[derive(PartialEq, Eq)]
 enum CuaAction {
     SessionStatus,
+    InstalledApps,
     SessionStart,
     HostStatus,
     HostCheck,
@@ -8328,14 +8336,17 @@ enum CuaAction {
         bundle: String,
         block: bool,
     },
+    Apps {
+        patches: Vec<(String, &'static str)>,
+    },
 }
 
-/// Parse `/cua [status|host [status|check]|on|set <capability> <choice>|block|unblock <bundleId>]`.
+/// Parse `/cua [status|apps|host [status|check]|on|set <capability> <choice>|app <bundleId> <choice> ...|block|unblock <bundleId>]`.
 /// The host target is separate from `/cua on`, which starts the current
 /// session's setup. Both dropdown vocabularies are closed, so an unknown
 /// value fails before any host call.
 fn parse_cua_command(text: &str) -> Option<Result<CuaAction, String>> {
-    const USAGE: &str = "usage: /cua [status|host [status|check]|on|set computerControl|screenshots ask|alwaysAllow|block <bundleId>|unblock <bundleId>]";
+    const USAGE: &str = "usage: /cua [status|apps|host [status|check]|on|set computerControl|screenshots ask|alwaysAllow|app <bundleId> ask|alwaysAllow|blocked [...]|block|unblock <bundleId>]";
     let body = text.strip_prefix('/')?;
     let mut words = body.split_whitespace();
     if words.next()? != "cua" {
@@ -8344,6 +8355,7 @@ fn parse_cua_command(text: &str) -> Option<Result<CuaAction, String>> {
     let rest: Vec<&str> = words.collect();
     match rest.as_slice() {
         [] | ["status"] => Some(Ok(CuaAction::SessionStatus)),
+        ["apps"] => Some(Ok(CuaAction::InstalledApps)),
         ["host"] | ["host", "status"] => Some(Ok(CuaAction::HostStatus)),
         ["host", "check"] => Some(Ok(CuaAction::HostCheck)),
         ["on"] => Some(Ok(CuaAction::SessionStart)),
@@ -8364,6 +8376,20 @@ fn parse_cua_command(text: &str) -> Option<Result<CuaAction, String>> {
             bundle: bundle.to_string(),
             block: *action == "block",
         })),
+        ["app", app_args @ ..] if !app_args.is_empty() && app_args.len() % 2 == 0 => {
+            let mut patches = Vec::new();
+            let mut pairs = app_args.iter();
+            while let (Some(bundle), Some(choice)) = (pairs.next(), pairs.next()) {
+                let choice = match *choice {
+                    "ask" => "ask",
+                    "alwaysAllow" => "alwaysAllow",
+                    "blocked" => "blocked",
+                    _ => return Some(Err(USAGE.to_string())),
+                };
+                patches.push((bundle.to_string(), choice));
+            }
+            Some(Ok(CuaAction::Apps { patches }))
+        }
         _ => Some(Err(USAGE.to_string())),
     }
 }
@@ -13434,6 +13460,16 @@ fn run_cua(
                 None => return,
             };
             match &action {
+                CuaAction::InstalledApps => {
+                    let Ok(settings) = call(
+                        None,
+                        "computerUseSettings/read",
+                        "{\"installed\":true}".to_string(),
+                    ) else {
+                        return;
+                    };
+                    cua_settings_text(&settings)
+                }
                 CuaAction::SessionStatus => {
                     let Ok(setup) = call(
                         None,
@@ -13488,6 +13524,27 @@ fn run_cua(
                     };
                     cua_settings_text(&settings)
                 }
+                CuaAction::Apps { patches } => {
+                    let apps = patches
+                        .iter()
+                        .map(|(bundle, choice)| {
+                            format!(
+                                "{{\"bundleId\":{},\"choice\":{}}}",
+                                esc(bundle),
+                                esc(choice)
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let Ok(settings) = call(
+                        None,
+                        "computerUseSettings/update",
+                        format!("{{\"apps\":[{apps}]}}"),
+                    ) else {
+                        return;
+                    };
+                    cua_settings_text(&settings)
+                }
                 CuaAction::HostStatus | CuaAction::HostCheck => unreachable!(),
             }
         }
@@ -13533,17 +13590,94 @@ fn cua_state_text(state: &J, label: &str) -> String {
 
 /// Human text for the computer-use settings.
 fn cua_settings_text(settings: &J) -> String {
+    fn safe(value: &str) -> String {
+        value
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
     let field = |key: &str| settings.get(key).and_then(J::as_str).unwrap_or("unknown");
     let mut text = format!(
         "Computer use settings: computer control {}, screenshots {}",
         field("computerControl"),
         field("screenshots"),
     );
-    if let Some(J::Arr(apps)) = settings.get("blockedApps") {
+    if let Some(J::Arr(apps)) = settings.get("apps") {
         let rows: Vec<String> = apps
             .iter()
             .filter_map(|app| {
                 let id = app.get("bundleId").and_then(J::as_str)?;
+                let id = safe(id);
+                let name = app
+                    .get("name")
+                    .and_then(J::as_str)
+                    .map(safe)
+                    .filter(|name| !name.is_empty() && name != &id);
+                let label = match name {
+                    Some(name) => format!("{name} [{id}]"),
+                    None => id,
+                };
+                let choice = safe(app.get("choice").and_then(J::as_str).unwrap_or("unknown"));
+                let mut details = Vec::new();
+                if let Some(last_asked) = app
+                    .get("lastAskedAt")
+                    .and_then(J::as_str)
+                    .filter(|last_asked| !last_asked.is_empty())
+                {
+                    details.push(format!("last asked {}", safe(last_asked)));
+                }
+                if matches!(app.get("locked"), Some(J::Bool(true))) {
+                    let locked = app
+                        .get("lockedBy")
+                        .and_then(J::as_str)
+                        .filter(|locked| !locked.is_empty())
+                        .map(|locked| format!("locked by {}", safe(locked)))
+                        .unwrap_or_else(|| "locked".to_string());
+                    details.push(locked);
+                }
+                let detail = if details.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", details.join("; "))
+                };
+                Some(format!("- {label}: {choice}{detail}"))
+            })
+            .collect();
+        if !rows.is_empty() {
+            text.push_str("\nApps:\n");
+            text.push_str(&rows.join("\n"));
+        }
+    }
+    if let Some(J::Arr(apps)) = settings.get("installedApps") {
+        let rows: Vec<String> = apps
+            .iter()
+            .filter_map(|app| {
+                let id = app.get("bundleId").and_then(J::as_str)?;
+                let id = safe(id);
+                let name = app
+                    .get("name")
+                    .and_then(J::as_str)
+                    .map(safe)
+                    .filter(|name| !name.is_empty() && name != &id);
+                Some(match name {
+                    Some(name) => format!("- {name} [{id}]"),
+                    None => format!("- {id}"),
+                })
+            })
+            .collect();
+        if !rows.is_empty() {
+            text.push_str("\nInstalled apps:\n");
+            text.push_str(&rows.join("\n"));
+        }
+    }
+    if let Some(J::Arr(apps)) = settings.get("blockedApps") {
+        let rows: Vec<String> = apps
+            .iter()
+            .filter_map(|app| {
+                let id = safe(app.get("bundleId").and_then(J::as_str)?);
                 let locked = matches!(app.get("locked"), Some(J::Bool(true)));
                 Some(if locked {
                     format!("{id} (built-in)")
