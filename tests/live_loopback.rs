@@ -496,6 +496,34 @@ fn an_approved_shell_command_runs_and_a_rejected_one_does_not() {
 }
 
 #[test]
+fn tool_display_label_reaches_a_real_host() {
+    let test = "tool_display_label_reaches_a_real_host";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"shell": shell_step()}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 9), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.prompt(&session, "write it [[script:shell]]");
+    let permission = adapter.permission();
+    let title = permission["params"]["toolCall"]["title"]
+        .as_str()
+        .unwrap_or_default();
+    assert_eq!(
+        title, "printf approved > approved.txt",
+        "the ACP card must use the host's active label, not the synthesized `bash: args` fallback: {permission}"
+    );
+    adapter.choose(&permission, "reject_once");
+    let result = adapter.result(id);
+    assert_eq!(result["stopReason"], "end_turn", "{result}");
+    adapter.finish();
+}
+
+#[test]
 fn cancel_stops_a_streaming_turn() {
     if !enabled("cancel_stops_a_streaming_turn") {
         return;
