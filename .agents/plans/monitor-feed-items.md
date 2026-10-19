@@ -160,3 +160,5 @@ Update and completion frames use `tool_call_update` and the same card id.
 Change note (2026-10-19): review pass 1 corrected the history-replay test so it replays a terminal monitor item rather than an in-progress snapshot.
 
 Change note (2026-10-19): review pass 2 added an explicit duplicate-terminal assertion for gap-refill idempotence.
+
+Change note (2026-10-19): review pass 3 added direct coverage for fallback description stripping and the bounded long-description title.

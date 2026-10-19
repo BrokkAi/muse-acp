@@ -2825,6 +2825,26 @@ mod corpus_tests {
         assert!(!sanitized.chars().any(char::is_control));
         assert!(!sanitized.contains('\u{202e}'));
         assert!(!sanitized.contains('\u{2066}'));
+
+        let fold = SessionFold::new();
+        let fallback = J::Obj(vec![(
+            "fallbackText".to_string(),
+            J::Str("Monitor event: Fallback label".to_string()),
+        )]);
+        let (title, _, meta) = fold.host_card_parts("monitorFeed", &fallback);
+        assert_eq!(title, "Monitor: Fallback label");
+        assert!(
+            meta.as_deref()
+                .is_some_and(|meta| meta.contains("\"monitorDescription\":\"Fallback label\""))
+        );
+
+        let long = J::Obj(vec![(
+            "monitorDescription".to_string(),
+            J::Str("x".repeat(max_content() + 1000)),
+        )]);
+        let (title, _, _) = fold.host_card_parts("monitorFeed", &long);
+        assert!(title.contains("…[truncated]"), "{title}");
+        assert!(title.chars().count() <= max_content(), "{title}");
     }
 
     #[test]
