@@ -397,13 +397,19 @@ error the editor shows if Muse then refuses the profile says why.
   <name>` (or `/plugin install <path> [scope]`) plus `/plugin marketplace
   add|remove|update` drive the host's install and marketplace writes. Change
   notices are diagnostics; clients re-read the extension instead of a cache.
-- **Computer use** — with the client's opt-in and the host's
-  `computerUseSetup` grant, the `_session/computerUse` extension reads the
-  session's setup state and the computer-use settings (built-in blocks on
-  request), and `/cua [status]`, `/cua on`, `/cua set
+- **Computer use** — with the client's `_meta.muse.computerUse` opt-in, the
+  adapter requests both the per-session `computerUseSetup` and host-wide
+  `computerUseHostSetup` grants. `/cua host` reads the host's setup state and
+  its Screen Recording, Accessibility, and Input Monitoring grants;
+  `/cua host check` asks the host to inspect those grants without prompting
+  or opening System Settings. These are ordinary prompt commands, so clients
+  do not need the `_session/computerUse` extension to use them. With the
+  per-session grant, `/cua [status]`, `/cua on`, `/cua set
   computerControl|screenshots ask|alwaysAllow`, and `/cua block|unblock
-  <bundleId>` drive setup and the settings patch. A gate that is off answers
-  the typed `computerUseUnavailable`, never a generic failure.
+  <bundleId>` drive the session setup and settings patch, while the extension
+  returns structured session setup plus settings (built-in blocks on request).
+  A withheld grant or disabled gate fails closed with a typed refusal; a busy
+  host check keeps the host's `commandRejected` `runtime_busy` data.
 - **Content** — text, inline and local-file images, `resource_link` text
   expansion, and embedded context. A `resource_link` (or embedded blob) whose
   media type is `video/mp4` or `video/quicktime` is uploaded to the session's
@@ -469,8 +475,9 @@ only when the client opts in too, with the documented fallback otherwise:
 - `_session/sideChat` — opt-in creation of a side chat from a loaded session.
 - `_session/plugins` — opt-in reads of the session's installed plugin rows.
 - `_session/computerUse` — opt-in reads of the session's computer-use setup
-  and settings; the host's `computerUseSetup` capability is requested only
-  for clients that opt in.
+  and settings. The host's `computerUseSetup` and `computerUseHostSetup`
+  capabilities are requested only for clients that opt in; the standard
+  `/cua host` and `/cua host check` commands do not require extension support.
 - `_session/userShell` — shell commands outside any turn; needs editor
   opt-in, AIR `asyncTasks`, and a host grant all together.
 - `_session/async_task/stop` — stop one background task; `session/cancel`

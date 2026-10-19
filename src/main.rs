@@ -1615,7 +1615,7 @@ fn adopt_skill_catalog(sessions: &Sessions, acp_sid: &str, skills: Option<&[acp:
 
 fn send_host_error(stdout: &StdoutShared, id: &Option<J>, error: &J, fallback: i64, message: &str) {
     let code = msp::acp_error_code(error, fallback);
-    if let Some(data) = msp::skill_error_data(error) {
+    if let Some(data) = msp::typed_error_data(error) {
         acp::send_error_with_data(stdout, id, code, message, &data);
     } else {
         acp::send_error(stdout, id, code, message);
@@ -8307,11 +8307,14 @@ fn parse_skill_activation_command(text: &str) -> Option<Result<ProtocolCommand, 
     )))
 }
 
-/// One `/cua` action: read the setup, run setup, or patch the settings.
+/// One `/cua` action: read or run session setup, read or check host setup, or
+/// patch the host-global settings.
 #[derive(PartialEq, Eq)]
 enum CuaAction {
-    Status,
-    Start,
+    SessionStatus,
+    SessionStart,
+    HostStatus,
+    HostCheck,
     Set {
         key: &'static str,
         value: &'static str,
@@ -8322,11 +8325,12 @@ enum CuaAction {
     },
 }
 
-/// Parse `/cua [status|on|set <capability> <choice>|block|unblock <bundleId>]`
-/// mirroring the host TUI's `/cua` command. Both dropdown vocabularies are
-/// closed, so an unknown value fails before any host call.
+/// Parse `/cua [status|host [status|check]|on|set <capability> <choice>|block|unblock <bundleId>]`.
+/// The host target is separate from `/cua on`, which starts the current
+/// session's setup. Both dropdown vocabularies are closed, so an unknown
+/// value fails before any host call.
 fn parse_cua_command(text: &str) -> Option<Result<CuaAction, String>> {
-    const USAGE: &str = "usage: /cua [status|on|set computerControl|screenshots ask|alwaysAllow|block <bundleId>|unblock <bundleId>]";
+    const USAGE: &str = "usage: /cua [status|host [status|check]|on|set computerControl|screenshots ask|alwaysAllow|block <bundleId>|unblock <bundleId>]";
     let body = text.strip_prefix('/')?;
     let mut words = body.split_whitespace();
     if words.next()? != "cua" {
@@ -8334,8 +8338,10 @@ fn parse_cua_command(text: &str) -> Option<Result<CuaAction, String>> {
     }
     let rest: Vec<&str> = words.collect();
     match rest.as_slice() {
-        [] | ["status"] => Some(Ok(CuaAction::Status)),
-        ["on"] => Some(Ok(CuaAction::Start)),
+        [] | ["status"] => Some(Ok(CuaAction::SessionStatus)),
+        ["host"] | ["host", "status"] => Some(Ok(CuaAction::HostStatus)),
+        ["host", "check"] => Some(Ok(CuaAction::HostCheck)),
+        ["on"] => Some(Ok(CuaAction::SessionStart)),
         ["set", capability, choice] => {
             let key = match *capability {
                 "computerControl" => "computerControl",
@@ -9974,6 +9980,28 @@ fn handle_msp(
         }
     }
     match method {
+        "computerUseSetup/changed" => {
+            // The adapter keeps no CUA state. A session id names a session's
+            // setup; an absent one names the host's own setup, which reaches
+            // this connection only when computerUseHostSetup was granted.
+            let state = params
+                .get("state")
+                .and_then(|state| state.get("setup"))
+                .and_then(J::as_str)
+                .unwrap_or("unknown");
+            match params.get("sessionId").and_then(J::as_str) {
+                Some(msp_sid) => {
+                    let acp_sid =
+                        find_acp_sid(sessions, msp_sid).unwrap_or_else(|| "?".to_string());
+                    log(&format!(
+                        "computer use session setup changed: session={msp_sid} acp_session={acp_sid} setup={state}"
+                    ));
+                }
+                None => log(&format!(
+                    "computer use host setup changed: setup={state}; re-read with /cua host"
+                )),
+            }
+        }
         "plugin/changed" | "plugin/marketplaceChanged" => {
             // The adapter keeps no plugin or marketplace cache: the host's
             // change notice is consumed as a diagnostic, and clients re-read
@@ -13080,9 +13108,10 @@ fn start_recap(
     }
 }
 
-/// Run one `/cua` action against the host. The client's opt-in and the
-/// host's `computerUseSetup` grant are both required; the gate's
-/// `computerUseUnavailable` refusal stays typed.
+/// Run one `/cua` action against the host. The client's opt-in is always
+/// required; host actions need `computerUseHostSetup`, while session actions
+/// need `computerUseSetup`. The gate's `computerUseUnavailable` refusal stays
+/// typed.
 #[allow(clippy::too_many_arguments)]
 fn run_cua(
     host: &Arc<Hosts>,
@@ -13094,85 +13123,131 @@ fn run_cua(
     prompt_content: &str,
     action: CuaAction,
 ) {
-    if COMPUTER_USE.load(Ordering::SeqCst) == 0 || !host.handshake().computer_use_setup {
+    if COMPUTER_USE.load(Ordering::SeqCst) == 0 {
         acp::send_error(
             stdout,
             &prompt_req,
             -32601,
-            "computer use requires the muse computerUse opt-in and the host's computerUseSetup grant",
+            "computer use requires the muse computerUse opt-in",
         );
         return;
     }
-    let msp_sid = match sessions
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .get(acp_sid)
-    {
-        Some(s) => s.msp_sid.clone(),
-        None => return,
-    };
-    let call = |method: &str, params: String| match host.command(method, &params) {
-        Ok(result) => Ok(result),
-        Err(error) => {
-            send_host_error(
-                stdout,
-                &prompt_req,
-                &error,
-                -32603,
-                &format!("{method} failed: {}", err_message(&error)),
-            );
-            Err(())
+    let call = |target: Option<&msp::MspHost>, method: &str, params: String| {
+        let result = match target {
+            Some(target) => target.command(method, &params),
+            None => host.command(method, &params),
+        };
+        match result {
+            Ok(result) => Ok(result),
+            Err(error) => {
+                send_host_error(
+                    stdout,
+                    &prompt_req,
+                    &error,
+                    -32603,
+                    &format!("{method} failed: {}", err_message(&error)),
+                );
+                Err(())
+            }
         }
     };
     let text = match &action {
-        CuaAction::Status => {
-            let Ok(setup) = call(
-                "computerUseSetup/read",
-                format!("{{\"sessionId\":{}}}", esc(&msp_sid)),
-            ) else {
+        CuaAction::HostStatus | CuaAction::HostCheck => {
+            let target = host.main_host();
+            if !target.handshake().computer_use_host_setup {
+                acp::send_error(
+                    stdout,
+                    &prompt_req,
+                    -32601,
+                    "computer use host setup requires the muse computerUse opt-in and the host's computerUseHostSetup grant",
+                );
+                return;
+            }
+            let (method, label) = match &action {
+                CuaAction::HostStatus => ("computerUseSetup/read", "Host computer use setup"),
+                CuaAction::HostCheck => ("computerUseSetup/check", "Host computer use check"),
+                _ => unreachable!(),
+            };
+            let Ok(state) = call(Some(target.as_ref()), method, "{}".to_string()) else {
                 return;
             };
-            let Ok(settings) = call("computerUseSettings/read", "{}".to_string()) else {
-                return;
-            };
-            format!(
-                "{}\n{}",
-                cua_state_text(&setup),
-                cua_settings_text(&settings)
-            )
+            cua_state_text(&state, label)
         }
-        CuaAction::Start => {
-            let cmd = host.mint_cmd("cmd-");
-            let Ok(state) = call(
-                "computerUseSetup/start",
-                format!(
-                    "{{\"commandId\":{},\"sessionId\":{}}}",
-                    esc(&cmd),
-                    esc(&msp_sid)
-                ),
-            ) else {
+        _ => {
+            if !host.handshake().computer_use_setup {
+                acp::send_error(
+                    stdout,
+                    &prompt_req,
+                    -32601,
+                    "computer use requires the muse computerUse opt-in and the host's computerUseSetup grant",
+                );
                 return;
+            }
+            let msp_sid = match sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(acp_sid)
+            {
+                Some(s) => s.msp_sid.clone(),
+                None => return,
             };
-            cua_state_text(&state)
-        }
-        CuaAction::Set { key, value } => {
-            let Ok(settings) = call(
-                "computerUseSettings/update",
-                format!("{{\"{key}\":{}}}", esc(value)),
-            ) else {
-                return;
-            };
-            cua_settings_text(&settings)
-        }
-        CuaAction::Block { bundle, block } => {
-            let field = if *block { "blockApps" } else { "unblockApps" };
-            let Ok(settings) = call(
-                "computerUseSettings/update",
-                format!("{{\"{field}\":[{}]}}", esc(bundle)),
-            ) else {
-                return;
-            };
-            cua_settings_text(&settings)
+            match &action {
+                CuaAction::SessionStatus => {
+                    let Ok(setup) = call(
+                        None,
+                        "computerUseSetup/read",
+                        format!("{{\"sessionId\":{}}}", esc(&msp_sid)),
+                    ) else {
+                        return;
+                    };
+                    let Ok(settings) = call(None, "computerUseSettings/read", "{}".to_string())
+                    else {
+                        return;
+                    };
+                    format!(
+                        "{}\n{}",
+                        cua_state_text(&setup, "Computer use setup"),
+                        cua_settings_text(&settings)
+                    )
+                }
+                CuaAction::SessionStart => {
+                    let cmd = host.mint_cmd("cmd-");
+                    let Ok(state) = call(
+                        None,
+                        "computerUseSetup/start",
+                        format!(
+                            "{{\"commandId\":{},\"sessionId\":{}}}",
+                            esc(&cmd),
+                            esc(&msp_sid)
+                        ),
+                    ) else {
+                        return;
+                    };
+                    cua_state_text(&state, "Computer use setup")
+                }
+                CuaAction::Set { key, value } => {
+                    let Ok(settings) = call(
+                        None,
+                        "computerUseSettings/update",
+                        format!("{{\"{key}\":{}}}", esc(value)),
+                    ) else {
+                        return;
+                    };
+                    cua_settings_text(&settings)
+                }
+                CuaAction::Block { bundle, block } => {
+                    let field = if *block { "blockApps" } else { "unblockApps" };
+                    let Ok(settings) = call(
+                        None,
+                        "computerUseSettings/update",
+                        format!("{{\"{field}\":[{}]}}", esc(bundle)),
+                    ) else {
+                        return;
+                    };
+                    cua_settings_text(&settings)
+                }
+                CuaAction::HostStatus | CuaAction::HostCheck => unreachable!(),
+            }
         }
     };
     settle_command_with_text(
@@ -13187,10 +13262,10 @@ fn run_cua(
 }
 
 /// Human text for a computer-use setup state.
-fn cua_state_text(state: &J) -> String {
+fn cua_state_text(state: &J, label: &str) -> String {
     let field = |key: &str| state.get(key).and_then(J::as_str).unwrap_or("unknown");
     let mut text = format!(
-        "Computer use setup: {} (screen recording {}, accessibility {}, input monitoring {})",
+        "{label}: {} (screen recording {}, accessibility {}, input monitoring {})",
         field("setup"),
         field("screenRecording"),
         field("accessibility"),
