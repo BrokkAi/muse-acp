@@ -58,6 +58,17 @@ pub struct PendingPerm {
     pub child_subagent_id: Option<String>,
 }
 
+/// An approval the Muse host's native reviewer is still evaluating. This is
+/// activity, not a pending decision, so it never creates a PendingPerm.
+#[derive(Clone)]
+pub struct ReviewingApproval {
+    pub source_session_id: String,
+    pub approval_id: String,
+    pub turn_id: Option<String>,
+    pub title: String,
+    pub kind: String,
+}
+
 #[derive(Clone)]
 pub struct PermChoice {
     pub id: String,
@@ -194,6 +205,8 @@ pub struct AcpSession {
     pub ver: u8,
     pub in_flight: Vec<InFlight>,
     pub pending_perm: Option<PendingPerm>,
+    /// Native host reviews that are activity-only and cannot yet be decided.
+    pub approval_reviewing: Vec<ReviewingApproval>,
     /// Approvals and requirement snapshots already opened on this
     /// connection, keyed by the approval's MSP session id, approval id, and
     /// requirement JSON. This suppresses duplicate delivery after a decision
@@ -1365,6 +1378,40 @@ pub fn send_session_status(
             "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{}}}}}",
             esc(acp_sid),
             update
+        ),
+    );
+}
+
+/// Publish approvals currently held by Muse's native reviewer. An empty list
+/// is sent as an explicit null so clients clear their prior activity.
+pub fn send_approval_reviewing(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    reviews: &[ReviewingApproval],
+) {
+    let value = if reviews.is_empty() {
+        "null".to_string()
+    } else {
+        let rows = reviews
+            .iter()
+            .map(|review| {
+                format!(
+                    "{{\"sourceSessionId\":{},\"approvalId\":{},\"title\":{},\"kind\":{}}}",
+                    esc(&review.source_session_id),
+                    esc(&review.approval_id),
+                    esc(&review.title),
+                    esc(&review.kind),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!("[{rows}]")
+    };
+    send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"muse\":{{\"approvalReviewing\":{value}}}}}}}}}}}",
+            esc(acp_sid)
         ),
     );
 }

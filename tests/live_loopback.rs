@@ -496,6 +496,57 @@ fn an_approved_shell_command_runs_and_a_rejected_one_does_not() {
 }
 
 #[test]
+fn native_approval_reviewing_reaches_a_real_host_and_clears() {
+    let test = "native_approval_reviewing_reaches_a_real_host_and_clears";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"shell": shell_step()}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 9), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.prompt(&session, "write it [[script:shell]]");
+    let reviewing = adapter.wait("native approval review activity", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["sessionId"] == json!(session)
+            && frame["params"]["update"]["_meta"]["muse"]["approvalReviewing"].is_array()
+    });
+    let rows = reviewing["params"]["update"]["_meta"]["muse"]["approvalReviewing"]
+        .as_array()
+        .expect("review rows");
+    assert!(
+        rows.iter().any(|row| {
+            row["sourceSessionId"] == json!(session)
+                && row["title"] == json!("printf approved > approved.txt")
+                && row["kind"] == json!("execute")
+        }),
+        "native review carries the approval identity: {reviewing}"
+    );
+    let cleared = adapter.wait("native approval review clear", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["sessionId"] == json!(session)
+            && frame["params"]["update"]["_meta"]["muse"]["approvalReviewing"].is_null()
+    });
+    assert!(
+        cleared["method"] == "session/update",
+        "the release clears native review metadata: {cleared}"
+    );
+    let permission = adapter.permission();
+    assert_eq!(permission["params"]["sessionId"], json!(session));
+    adapter.choose(&permission, "reject_once");
+    assert_eq!(adapter.result(id)["stopReason"], "end_turn");
+    let log = std::fs::read_to_string(&adapter.log).unwrap();
+    assert!(
+        !log.contains("unhandled MSP notification: approval/reviewing"),
+        "native reviewing is handled:\n{log}"
+    );
+    adapter.finish();
+}
+
+#[test]
 fn unlabeled_real_tool_keeps_the_synthesized_title() {
     let test = "unlabeled_real_tool_keeps_the_synthesized_title";
     if !enabled(test) {

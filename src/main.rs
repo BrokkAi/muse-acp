@@ -4303,6 +4303,7 @@ fn handle_acp(
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
+                            approval_reviewing: Vec::new(),
                             approval_seen: std::collections::HashSet::new(),
                             approval_resolved: std::collections::HashSet::new(),
                             resolved_history_unread: false,
@@ -4668,6 +4669,7 @@ fn handle_acp(
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
+                            approval_reviewing: Vec::new(),
                             approval_seen: std::collections::HashSet::new(),
                             approval_resolved: std::collections::HashSet::new(),
                             resolved_history_unread: true,
@@ -5247,6 +5249,7 @@ fn handle_acp(
                             ver,
                             in_flight: Vec::new(),
                             pending_perm: None,
+                            approval_reviewing: Vec::new(),
                             approval_seen: std::collections::HashSet::new(),
                             approval_resolved: std::collections::HashSet::new(),
                             resolved_history_unread: true,
@@ -10404,6 +10407,7 @@ fn handle_msp(
                 Some(s) => s,
                 None => return,
             };
+            clear_turn_approval_reviewing(stdout, sessions, &acp_sid, msp_sid, turn_id);
             // A terminal host event makes an optional feedback form stale.
             // The original permission may still be handled as before, but a
             // form that was already opened cannot submit a late decision.
@@ -10550,6 +10554,9 @@ fn handle_msp(
         "approval/requested" => {
             open_approval(host, stdout, sessions, params);
         }
+        "approval/reviewing" => {
+            observe_approval_reviewing(host, stdout, sessions, params);
+        }
         "approval/resolved" => {
             let msp_sid = params
                 .get("sessionId")
@@ -10563,6 +10570,7 @@ fn handle_msp(
             // them through the same routing or the prompt is never withdrawn.
             if let Some((acp_sid, _, child_subagent_id)) = owner_for_msp_session(sessions, msp_sid)
             {
+                clear_approval_reviewing(stdout, sessions, &acp_sid, msp_sid, approval_id);
                 // Terminal is terminal: remember it and drop any queued
                 // twin, displayed or awaiting auto-review, so a stale
                 // reissue can never reopen it (#238).
@@ -11470,6 +11478,201 @@ fn invalidate_pending_approval(
     }
 }
 
+/// Human title and ACP tool kind shared by actionable approvals and the
+/// native-reviewing activity hint.
+fn approval_title_kind(params: &J) -> (String, &'static str) {
+    let subject = params.get("subject").cloned().unwrap_or(J::Null);
+    let subject_kind = subject.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    let named_tool = if subject_kind == "tool" {
+        subject
+            .non_empty_str("toolName")
+            .or_else(|| params.non_empty_str("toolName"))
+    } else {
+        params
+            .non_empty_str("toolName")
+            .or_else(|| subject.non_empty_str("toolName"))
+    };
+    let tool_name = named_tool.unwrap_or("Muse action");
+    let command = subject.get("command").and_then(|v| v.as_str());
+    let path = subject.get("path").and_then(|v| v.as_str());
+    let target = subject.get("target").and_then(|v| v.as_str());
+    let access = subject.get("access").and_then(|v| v.as_str());
+    let description = subject.get("description").and_then(|v| v.as_str());
+    let title = match subject_kind {
+        "shell" | "process" => command.or(description).unwrap_or(tool_name).to_string(),
+        "fileAccess" => match (access, path) {
+            (Some(access), Some(path)) => format!("{access} {path}"),
+            (None, Some(path)) => path.to_string(),
+            (Some(access), None) => access.to_string(),
+            (None, None) => description.unwrap_or(tool_name).to_string(),
+        },
+        "network" => target.or(description).unwrap_or(tool_name).to_string(),
+        "tool" => named_tool
+            .or(description)
+            .or(command)
+            .or(path)
+            .or(target)
+            .unwrap_or(tool_name)
+            .to_string(),
+        _ => command
+            .or(path)
+            .or(target)
+            .or(access)
+            .or(description)
+            .unwrap_or(tool_name)
+            .to_string(),
+    };
+    let kind = match subject_kind {
+        "shell" | "process" => "execute",
+        "fileAccess" => match access.unwrap_or("").to_ascii_lowercase().as_str() {
+            "read" | "list" | "stat" => "read",
+            "search" => "search",
+            "write" | "create" | "append" | "edit" | "modify" => "edit",
+            "delete" | "remove" => "delete",
+            "move" | "rename" => "move",
+            _ => "other",
+        },
+        "network" => "fetch",
+        // Match the kind the tool's own card gets from its name.
+        "tool" => fold::tool_kind(tool_name),
+        _ => "other",
+    };
+    (title, kind)
+}
+
+/// Remove one native-review activity row and publish the new state.
+fn clear_approval_reviewing(
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    source_session_id: &str,
+    approval_id: &str,
+) {
+    let remaining = {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get_mut(acp_sid) else {
+            return;
+        };
+        let before = s.approval_reviewing.len();
+        s.approval_reviewing.retain(|review| {
+            review.source_session_id != source_session_id || review.approval_id != approval_id
+        });
+        (before != s.approval_reviewing.len()).then(|| s.approval_reviewing.clone())
+    };
+    if let Some(reviews) = remaining {
+        acp::send_approval_reviewing(stdout, acp_sid, &reviews);
+    }
+}
+
+/// Remove native-review rows whose owning turn reached a terminal.
+fn clear_turn_approval_reviewing(
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    source_session_id: &str,
+    turn_id: &str,
+) {
+    let remaining = {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get_mut(acp_sid) else {
+            return;
+        };
+        let before = s.approval_reviewing.len();
+        s.approval_reviewing.retain(|review| {
+            review.source_session_id != source_session_id
+                || review.turn_id.as_deref() != Some(turn_id)
+        });
+        (before != s.approval_reviewing.len()).then(|| s.approval_reviewing.clone())
+    };
+    if let Some(reviews) = remaining {
+        acp::send_approval_reviewing(stdout, acp_sid, &reviews);
+    }
+}
+
+/// Record a native-review activity notice. This never opens, queues, or
+/// decides an approval.
+fn observe_approval_reviewing(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    params: &J,
+) {
+    let msp_sid = params
+        .get("sessionId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let Some((acp_sid, _, _)) = owner_for_msp_session(sessions, msp_sid) else {
+        log(&format!(
+            "approval/reviewing dropped: no ACP session for host session {msp_sid}"
+        ));
+        return;
+    };
+    let approval_id = params
+        .get("approvalId")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if approval_id.is_empty() {
+        log("approval/reviewing dropped: missing approvalId");
+        return;
+    }
+    learn_resolved_approvals(host, sessions, &acp_sid);
+    let (title, kind) = approval_title_kind(params);
+    let turn_id = params
+        .get("turnId")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let changed = {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(s) = map.get_mut(&acp_sid) else {
+            return;
+        };
+        if s.approval_resolved
+            .contains(&(msp_sid.to_string(), approval_id.to_string()))
+        {
+            None
+        } else {
+            let actionable = s.pending_perm.as_ref().is_some_and(|pending| {
+                pending.approval_sid == msp_sid && pending.approval_id == approval_id
+            }) || s.perm_queue.iter().any(|queued| {
+                queued.non_empty_str("sessionId") == Some(msp_sid)
+                    && queued.non_empty_str("approvalId") == Some(approval_id)
+            });
+            if actionable {
+                None
+            } else if let Some(review) = s.approval_reviewing.iter_mut().find(|review| {
+                review.source_session_id == msp_sid && review.approval_id == approval_id
+            }) {
+                let changed =
+                    review.turn_id != turn_id || review.title != title || review.kind != kind;
+                review.turn_id = turn_id;
+                review.title = title;
+                review.kind = kind.to_string();
+                changed.then(|| s.approval_reviewing.clone())
+            } else {
+                s.approval_reviewing.push(acp::ReviewingApproval {
+                    source_session_id: msp_sid.to_string(),
+                    approval_id: approval_id.to_string(),
+                    turn_id,
+                    title,
+                    kind: kind.to_string(),
+                });
+                Some(s.approval_reviewing.clone())
+            }
+        }
+    };
+    match changed {
+        Some(reviews) => {
+            log(&format!(
+                "approval {approval_id} under native review: session={msp_sid}"
+            ));
+            acp::send_approval_reviewing(stdout, &acp_sid, &reviews);
+        }
+        None => log(&format!(
+            "approval/reviewing {approval_id} produced no state change: resolved, actionable, or already current"
+        )),
+    }
+}
+
 /// Open an ACP permission request for MSP approval params (from either the
 /// `approval/requested` event or a reissued `approval/request`). Dedupes by
 /// MSP session and approval id so multi-stage/resumed flows bridge exactly
@@ -11500,6 +11703,7 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
         log("approval dropped: missing approvalId");
         return;
     }
+    clear_approval_reviewing(stdout, sessions, &acp_sid, msp_sid, &approval_id);
     // A terminal approval never reopens, however stale the projection that
     // reissues it (issue #238). This precedes adapter policy so auto-review
     // cannot decide a ghost either. A reattached session reads its history
@@ -11612,64 +11816,8 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
                 .map(str::to_string)
         })
         .unwrap_or_else(|| format!("approval-{approval_id}"));
+    let (title, kind) = approval_title_kind(params);
     let subject = params.get("subject").cloned().unwrap_or(J::Null);
-    let subject_kind = subject.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-    // A tool subject names the specific tool; a top-level name may only be
-    // its wrapper.
-    let named_tool = if subject_kind == "tool" {
-        subject
-            .non_empty_str("toolName")
-            .or_else(|| params.non_empty_str("toolName"))
-    } else {
-        params
-            .non_empty_str("toolName")
-            .or_else(|| subject.non_empty_str("toolName"))
-    };
-    let tool_name = named_tool.unwrap_or("Muse action");
-    let command = subject.get("command").and_then(|v| v.as_str());
-    let path = subject.get("path").and_then(|v| v.as_str());
-    let target = subject.get("target").and_then(|v| v.as_str());
-    let access = subject.get("access").and_then(|v| v.as_str());
-    let description = subject.get("description").and_then(|v| v.as_str());
-    let title = match subject_kind {
-        "shell" | "process" => command.or(description).unwrap_or(tool_name).to_string(),
-        "fileAccess" => match (access, path) {
-            (Some(access), Some(path)) => format!("{access} {path}"),
-            (None, Some(path)) => path.to_string(),
-            (Some(access), None) => access.to_string(),
-            (None, None) => description.unwrap_or(tool_name).to_string(),
-        },
-        "network" => target.or(description).unwrap_or(tool_name).to_string(),
-        "tool" => named_tool
-            .or(description)
-            .or(command)
-            .or(path)
-            .or(target)
-            .unwrap_or(tool_name)
-            .to_string(),
-        _ => command
-            .or(path)
-            .or(target)
-            .or(access)
-            .or(description)
-            .unwrap_or(tool_name)
-            .to_string(),
-    };
-    let kind = match subject_kind {
-        "shell" | "process" => "execute",
-        "fileAccess" => match access.unwrap_or("").to_ascii_lowercase().as_str() {
-            "read" | "list" | "stat" => "read",
-            "search" => "search",
-            "write" | "create" | "append" | "edit" | "modify" => "edit",
-            "delete" | "remove" => "delete",
-            "move" | "rename" => "move",
-            _ => "other",
-        },
-        "network" => "fetch",
-        // Match the kind the tool's own card gets from its name.
-        "tool" => fold::tool_kind(tool_name),
-        _ => "other",
-    };
     let raw_input = match &subject {
         J::Obj(_) => format!(",\"rawInput\":{}", j_to_string(&subject)),
         _ => String::new(),

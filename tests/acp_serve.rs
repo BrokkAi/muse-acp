@@ -1730,6 +1730,149 @@ fn approval_preserves_all_choices_with_deny_option() {
 }
 
 #[test]
+fn approval_reviewing_is_activity_without_a_permission_request() {
+    let mut c = Client::spawn("approval_reviewing_hold", &[("FAKE_REVIEWING_TWICE", "1")]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "review it");
+    let frame = c.wait_for("\"approvalReviewing\":[", Duration::from_secs(15));
+    assert!(
+        frame.contains("\"sourceSessionId\":\"msp-sess-1\"")
+            && frame.contains("\"approvalId\":\"ap-1\"")
+            && frame.contains("\"title\":\"cargo test\"")
+            && frame.contains("\"kind\":\"execute\""),
+        "the native review carries useful identity: {frame}"
+    );
+    c.wait_stderr(
+        "approval/reviewing ap-1 produced no state change",
+        Duration::from_secs(15),
+    );
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+    let reviewing = frames
+        .iter()
+        .filter(|frame| frame.contains("\"approvalReviewing\":["))
+        .count();
+    assert_eq!(reviewing, 1, "a replayed activity notice is idempotent");
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.contains("request_permission")),
+        "native review must never open a permission request: {frames:#?}"
+    );
+    drop(frames);
+    c.finish();
+}
+
+#[test]
+fn approval_reviewing_clears_when_the_request_is_released() {
+    let mut c = Client::spawn("approval_reviewing_then_requested", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "review it");
+    c.wait_for("\"approvalReviewing\":[", Duration::from_secs(15));
+    c.wait_for("\"approvalReviewing\":null", Duration::from_secs(15));
+    let permission = c.wait_for("request_permission", Duration::from_secs(15));
+    assert!(permission.contains(&sid), "{permission}");
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+    let review = frames
+        .iter()
+        .position(|frame| frame.contains("\"approvalReviewing\":["))
+        .expect("review activity");
+    let cleared = frames
+        .iter()
+        .position(|frame| frame.contains("\"approvalReviewing\":null"))
+        .expect("review clear");
+    let requested = frames
+        .iter()
+        .position(|frame| frame.contains("request_permission"))
+        .expect("released permission");
+    assert!(
+        review < cleared && cleared < requested,
+        "release clears activity before presenting the decision: {frames:#?}"
+    );
+    drop(frames);
+    c.finish();
+}
+
+#[test]
+fn approval_reviewing_clears_on_terminal_without_a_request() {
+    let mut c = Client::spawn("approval_reviewing_then_resolved", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "review it");
+    c.wait_for("\"approvalReviewing\":[", Duration::from_secs(15));
+    c.wait_for("\"approvalReviewing\":null", Duration::from_secs(15));
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "{done}");
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.contains("request_permission")),
+        "a resolved native review never opens a permission request"
+    );
+    drop(frames);
+    c.finish();
+}
+
+#[test]
+fn approval_reviewing_clears_on_the_turn_terminal() {
+    let mut c = Client::spawn(
+        "approval_reviewing_hold",
+        &[("FAKE_REVIEWING_THEN_COMPLETE", "1")],
+    );
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "review it");
+    c.wait_for("\"approvalReviewing\":[", Duration::from_secs(15));
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("end_turn"), "{done}");
+    c.wait_for("\"approvalReviewing\":null", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn approval_reviewing_keeps_child_and_parent_ids_distinct() {
+    let mut c = Client::spawn("approval_reviewing_child_identity", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "review both");
+    let frame = c.wait_for(
+        "\"sourceSessionId\":\"child-sess-control\"",
+        Duration::from_secs(15),
+    );
+    assert!(
+        frame.contains("\"sourceSessionId\":\"msp-sess-1\"")
+            && frame.matches("\"approvalId\":\"ap-1\"").count() == 2,
+        "parent and child reviews with the same id remain distinct: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn native_approval_reviewing_does_not_consume_adapter_auto_review() {
+    let mut c = Client::spawn(
+        "approval_reviewing_then_requested",
+        &[("FAKE_REVIEWING_HANG", "1")],
+    );
+    let sid = c.new_session(2, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "review it");
+    c.wait_for("\"approvalReviewing\":[", Duration::from_secs(15));
+    c.wait_for("\"approvalReviewing\":null", Duration::from_secs(15));
+    c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(15));
+    c.wait_stderr("auto-review allow", Duration::from_secs(15));
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.contains("request_permission")),
+        "adapter Auto-review still handles the released approval without prompting"
+    );
+    drop(frames);
+    c.finish();
+}
+
+#[test]
 fn auto_review_approves_a_shell_approval_through_the_reviewer() {
     for ver in [1_u64, 2] {
         let mut c = Client::spawn("approval_hang", &[]);

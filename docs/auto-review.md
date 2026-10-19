@@ -73,6 +73,19 @@ It applies to that session and is off for every new, loaded, resumed, or
 forked session. Turning it off restores the normal prompt immediately for
 later approvals.
 
+## Native host review versus Auto-review
+
+Muse 1.4.9+ can first hold an approval in its own native reviewer. The adapter
+publishes that as `session_info_update._meta.muse.approvalReviewing`; it opens
+no permission request and does not start adapter Auto-review from that
+activity notice.
+
+The layers are independent. If the host later releases the approval as
+`approval/requested`, Auto-review can evaluate it when enabled; otherwise the
+editor receives the permission prompt. If the host resolves it directly as
+`approval/resolved`, the reviewing metadata clears and the approval never
+becomes an editor decision.
+
 ## Limits
 
 - **Muse 1.4.2 or newer.** On Muse 1.3.0 and 1.4.1 the reviewer host's own

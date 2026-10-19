@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Adopt Muse 1.4.9 native approval-reviewing activity (#271). When the host
+  reports `approval/reviewing`, the adapter publishes reversible
+  `session_info_update._meta.muse.approvalReviewing` rows with source session,
+  approval id, title, and tool kind. The activity never opens a permission
+  prompt or starts adapter Auto-review. The row clears when
+  `approval/requested` releases the decision, `approval/resolved` settles it,
+  or the owning turn ends. Parent and child approvals with the same id remain
+  distinct, while the adapter's own Auto-review continues to handle only a
+  later released request.
+
 - Adopt Muse 1.4.9 tool display labels (#272). Tool-card titles now prefer
   `Item.displayLabel.active` while a call runs, `.done` after success, and
   `.neutral` for every other status. Live snapshots, completed items, history
@@ -49,9 +59,8 @@
   an approval the host's native reviewer holds. The vendored bundle is
   byte-identical to what an installed Muse 1.4.10 exports with
   `muse schema generate-json-schema`. The re-pin itself changes no adapter
-  behavior: `approval/reviewing` still takes the unhandled-notification
-  diagnostic path and `displayLabel` adoption lands separately in #272. The
-  re-pin is documentation-only: the schema corpus, the compatibility
+  behavior: native-review activity and `displayLabel` adoption land
+  separately in #271 and #272. The re-pin is documentation-only: the schema corpus, the compatibility
   table (the new fingerprint classifies as degraded until a pinned 1.4.9 or
   1.4.10 build joins the live-host matrix), `PROVENANCE.md`, the ROADMAP
   reference snapshot, sections 1, 2, and 9, the event matrix, and the field
