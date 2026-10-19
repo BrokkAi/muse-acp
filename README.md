@@ -18,6 +18,11 @@ authentication, and approval flow.
 The adapter is one small Rust binary with no runtime dependencies. It supports
 ACP v1 and v2, and installs on macOS, Linux, and Windows.
 
+Client implementers should start with the
+[ACP extension contract](docs/acp-extensions.md). It lists every negotiated
+Muse method, `_meta` shape, capability, fallback, and the ACP standard fields
+used where they exist.
+
 > `muse-acp` is an independent community project. Muse Code and Muse Spark are
 > products of Meta Platforms, Inc. This project is not affiliated with,
 > endorsed by, or supported by Meta.
@@ -444,6 +449,11 @@ error the editor shows if Muse then refuses the profile says why.
   video store through Muse's chunked `media/upload` and submitted as a `video`
   turn part; the receipt is threaded into the turn. Audio is rejected, because
   Muse's input type is closed to `text`, `image`, `skill`, and `video`.
+- **Context compaction** — `/compact` drives Muse's native compaction. ACP v2
+  receives standard `compaction_update`; ACP v1 receives it only after
+  advertising `clientCapabilities.session.compaction`. Older v1 clients get a
+  think-kind tool card fallback. Host token and outcome provenance rides
+  `_meta.muse.contextCompaction`, and no retained summary is invented.
 - **Cut-off replies** — when the provider stream dies mid-reply and Muse
   commits the partial text (`Item.cutOff`, Muse 1.4.7+), that agent message
   is marked once with `_meta.muse.cutOff: true` and the host `itemId`, so an
@@ -452,7 +462,7 @@ error the editor shows if Muse then refuses the profile says why.
   or replayed reply carries it on its own text update. The mark is sent only
   when the host sets the flag, and never cleared.
 - **Usage** — context occupancy as `usage_update`, cumulative session totals,
-  subscription observations under `_meta.museSubscriptionUsage`, and a
+  subscription observations under `_meta.muse.subscriptionUsage`, and a
   session cost that on Muse 1.4.2+ is Muse's own figure (with its partial
   flag) and otherwise is a client-local list-price estimate explicitly
   labeled as not a billing figure.
@@ -476,7 +486,8 @@ error the editor shows if Muse then refuses the profile says why.
   both defaulting off.
 - **Tasks and subagents** — backgrounded shell commands, workflows, and native
   subagents surfaced through negotiated ACP extensions where the client
-  advertises support, with synthesized tool cards otherwise. On Muse 1.4.9+
+  advertises support, with synthesized tool cards otherwise. Actual tool calls
+  carry Muse's programmatic `Item.tool` as standard ACP `ToolCall.name`. On Muse 1.4.9+
   a tool card's title uses the host's `Item.displayLabel`: active wording while
   running, done wording after success, and neutral wording for failure or
   cancellation; older or unlabeled calls retain the synthesized `tool: detail`
@@ -532,9 +543,11 @@ v1 clients put the same `_meta` object under `clientCapabilities`; the older
 boolean form `"computerUse":true` is also accepted. The adapter requests both
 Muse computer-use grants only after receiving that opt-in.
 
-The [MSP event compatibility matrix](docs/event-compatibility.md) records the
-ACP mapping or intentional disposition of every notification in the pinned
-schema. [ROADMAP.md](ROADMAP.md) tracks compatibility, reliability, and release
+The [ACP extension contract](docs/acp-extensions.md) is the complete
+client-facing method and metadata reference. The
+[MSP event compatibility matrix](docs/event-compatibility.md) records the ACP
+mapping or intentional disposition of every notification in the pinned schema.
+[ROADMAP.md](ROADMAP.md) tracks compatibility, reliability, and release
 priorities.
 
 ### Client-provided MCP servers

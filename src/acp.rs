@@ -8,7 +8,7 @@ use std::io::Write;
 use std::sync::{Arc, Mutex};
 
 use crate::fold::SessionFold;
-use crate::json::{J, esc, j_to_string};
+use crate::json::{J, esc, j_to_string, parse_json};
 
 pub type StdoutShared = Arc<Mutex<std::io::Stdout>>;
 
@@ -194,6 +194,45 @@ impl HostTitleFacts {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct SessionMeta(Vec<(String, String)>);
+
+impl SessionMeta {
+    fn set(&mut self, key: &str, value: String) {
+        match self.0.iter_mut().find(|(name, _)| name == key) {
+            Some((_, current)) => *current = value,
+            None => self.0.push((key.to_string(), value)),
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.0.retain(|(name, _)| name != key);
+    }
+
+    fn absorb(&mut self, patch: &J) {
+        let J::Obj(fields) = patch else {
+            return;
+        };
+        for (key, value) in fields {
+            // An explicit null inside the Muse object is an authoritative
+            // clear marker (for example `modelRetry: null`). ACP v2 replaces
+            // the whole `muse` key, so nested nulls are ordinary data rather
+            // than top-level metadata removals.
+            self.set(key, j_to_string(value));
+        }
+    }
+
+    fn json(&self) -> Option<String> {
+        (!self.0.is_empty()).then(|| {
+            self.0
+                .iter()
+                .map(|(key, value)| format!("{}:{value}", esc(key)))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+    }
+}
+
 pub struct AcpSession {
     pub acp_sid: String,
     pub msp_sid: String,
@@ -310,6 +349,10 @@ pub struct AcpSession {
     /// Latest goal block as raw MSP JSON (`"null"` after an explicit clear;
     /// `None` before any fact arrives).
     pub goal_meta: Option<String>,
+    /// Current `session_info_update._meta.muse` members. ACP v2 patches a
+    /// top-level `_meta` key as a whole, so every emission carries this full
+    /// object rather than replacing it with one field at a time.
+    pub(crate) session_meta: SessionMeta,
     /// Latest branch observation as raw MSP JSON (`None` before any fact).
     pub branch_meta: Option<String>,
     /// Latest host attention fact as raw MSP JSON (`None` before any fact).
@@ -333,6 +376,24 @@ pub struct AcpSession {
 }
 
 pub type Sessions = Arc<Mutex<HashMap<String, AcpSession>>>;
+
+impl AcpSession {
+    pub(crate) fn set_session_meta(&mut self, key: &str, value: String) {
+        self.session_meta.set(key, value);
+    }
+
+    pub(crate) fn remove_session_meta(&mut self, key: &str) {
+        self.session_meta.remove(key);
+    }
+
+    fn absorb_session_meta_patch(&mut self, patch: &J) {
+        self.session_meta.absorb(patch);
+    }
+
+    fn session_meta_json(&self) -> Option<String> {
+        self.session_meta.json()
+    }
+}
 
 /// How many unsettled turns keep their accumulated legs.
 const TURN_USAGE_KEEP: usize = 16;
@@ -601,28 +662,33 @@ pub fn send_usage(
     let (Some(used), Some(size)) = (s.usage_used, s.usage_size) else {
         return;
     };
-    let mut meta = String::from("\"museCumulative\":{");
-    meta.push_str(&format!(
+    let mut cumulative = String::from("{");
+    cumulative.push_str(&format!(
         "\"promptTokens\":{},\"outputTokens\":{},\"totalTokens\":{}",
         s.cum_prompt.map(|v| v.to_string()).unwrap_or("null".into()),
         s.cum_output.map(|v| v.to_string()).unwrap_or("null".into()),
         s.cum_total.map(|v| v.to_string()).unwrap_or("null".into()),
     ));
     if let Some(v) = s.cum_cache_read {
-        meta.push_str(&format!(",\"cacheReadTokens\":{v}"));
+        cumulative.push_str(&format!(",\"cacheReadTokens\":{v}"));
     }
     if let Some(v) = s.cum_cache_write {
-        meta.push_str(&format!(",\"cacheWriteTokens\":{v}"));
+        cumulative.push_str(&format!(",\"cacheWriteTokens\":{v}"));
     }
-    meta.push('}');
+    cumulative.push('}');
+    let mut canonical = vec![format!("\"cumulative\":{cumulative}")];
+    let mut legacy = vec![format!("\"museCumulative\":{cumulative}")];
     if let Some(p) = pressure {
-        meta.push_str(&format!(",\"musePressure\":{}", esc(p)));
+        canonical.push(format!("\"pressure\":{}", esc(p)));
+        legacy.push(format!("\"musePressure\":{}", esc(p)));
     }
     if let Some(usage) = s.subscription_usage.as_deref() {
-        meta.push_str(&format!(
-            ",\"museSubscriptionUsage\":{{\"source\":\"msp-host-observation\",\"billing\":false,\"usage\":{usage}}}"
-        ));
+        let subscription =
+            format!("{{\"source\":\"msp-host-observation\",\"billing\":false,\"usage\":{usage}}}");
+        canonical.push(format!("\"subscriptionUsage\":{subscription}"));
+        legacy.push(format!("\"museSubscriptionUsage\":{subscription}"));
     }
+    let meta = format!("\"muse\":{{{}}},{}", canonical.join(","), legacy.join(","));
     // `amount` must be a JSON number: Rust's Display prints `inf`/`NaN`
     // verbatim, which would corrupt the whole frame. ACP's `Cost` allows only
     // `amount`, `currency`, and `_meta`, so the provenance lives in `_meta`.
@@ -654,20 +720,24 @@ pub fn send_usage(
 /// Publish a host subscription observation when ACP has no context window yet.
 /// `usage_update` requires numeric `used` and `size`, so this metadata-only
 /// update keeps the host fact visible without inventing an occupancy pair.
-pub fn send_subscription_usage(stdout: &StdoutShared, s: &AcpSession, clear: bool) {
+pub fn send_subscription_usage(stdout: &StdoutShared, s: &mut AcpSession, clear: bool) {
     if s.subscription_usage.is_none() && !clear {
         return;
     }
     let usage = s.subscription_usage.as_deref().unwrap_or("null");
-    let update = format!(
-        "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"museSubscriptionUsage\":{{\"source\":\"msp-host-observation\",\"billing\":false,\"usage\":{usage}}}}}}}"
-    );
-    send_raw(
+    let subscription =
+        format!("{{\"source\":\"msp-host-observation\",\"billing\":false,\"usage\":{usage}}}");
+    if clear {
+        s.set_session_meta("subscriptionUsage", "null".to_string());
+    } else {
+        s.set_session_meta("subscriptionUsage", subscription.clone());
+    }
+    send_session_info_with_extra(
         stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{update}}}}}}}",
-            esc(&s.acp_sid),
-        ),
+        s,
+        None,
+        None,
+        Some(&format!("\"museSubscriptionUsage\":{subscription}")),
     );
 }
 
@@ -1286,37 +1356,35 @@ pub fn send_plan(stdout: &StdoutShared, acp_sid: &str, ver: u8, items: Option<&J
     );
 }
 
-/// Publish provider-neutral goal state (the presentation codex-acp uses) and
-/// a namespaced branch observation through one `session_info_update`.
-pub fn send_session_meta(
+fn send_session_info_snapshot(
     stdout: &StdoutShared,
-    acp_sid: &str,
-    goal: Option<&str>,
-    branch: Option<&str>,
-) {
-    send_session_info(stdout, acp_sid, None, goal, branch);
-}
-
-/// Push ACP session metadata. Titles are the one standard list-row field that
-/// has a matching ACP update; list membership remains pull-only because ACP
-/// has no session-list change notification.
-pub fn send_session_info(
-    stdout: &StdoutShared,
-    acp_sid: &str,
+    s: &AcpSession,
     title: Option<&str>,
     goal: Option<&str>,
-    branch: Option<&str>,
+) {
+    send_session_info_with_extra(stdout, s, title, goal, None);
+}
+
+fn send_session_info_with_extra(
+    stdout: &StdoutShared,
+    s: &AcpSession,
+    title: Option<&str>,
+    goal: Option<&str>,
+    extra_meta: Option<&str>,
 ) {
     let mut fields = vec!["\"sessionUpdate\":\"session_info_update\"".to_string()];
     if let Some(title) = title {
-        fields.push(format!("\"title\":{}", esc(title)));
+        fields.push(format!("\"title\":{title}"));
     }
     let mut meta = Vec::new();
     if let Some(goal) = goal {
         meta.push(format!("\"goal\":{goal}"));
     }
-    if let Some(branch) = branch {
-        meta.push(format!("\"muse\":{{\"branch\":{branch}}}"));
+    if let Some(muse) = s.session_meta_json() {
+        meta.push(format!("\"muse\":{{{muse}}}"));
+    }
+    if let Some(extra) = extra_meta {
+        meta.push(extra.to_string());
     }
     if !meta.is_empty() {
         fields.push(format!("\"_meta\":{{{}}}", meta.join(",")));
@@ -1324,21 +1392,44 @@ pub fn send_session_info(
     if fields.len() == 1 {
         return;
     }
-    let update = format!("{{{}}}", fields.join(","));
     send_raw(
         stdout,
         &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{}}}}}",
-            esc(acp_sid),
-            update
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{{}}}}}}}",
+            esc(&s.acp_sid),
+            fields.join(",")
         ),
     );
 }
 
-/// Publish the host's session provenance (`sideFrom` or `forkedFrom`) as the
-/// `muse` object of a `session_info_update` `_meta`. The caller passes the
-/// already-serialized host fact, e.g. `{"sideFrom":{...}}`.
-pub fn send_session_provenance(stdout: &StdoutShared, acp_sid: &str, muse: &str) {
+/// Publish provider-neutral goal state and the complete current Muse metadata
+/// snapshot. ACP v2 patches a top-level `_meta` key as a whole, so partial
+/// `muse` objects would erase unrelated session facts.
+pub fn send_session_meta(
+    stdout: &StdoutShared,
+    s: &mut AcpSession,
+    goal: Option<&str>,
+    branch: Option<&str>,
+) {
+    if let Some(branch) = branch {
+        s.set_session_meta("branch", branch.to_string());
+    }
+    send_session_info_snapshot(stdout, s, None, goal);
+}
+
+/// Publish the host's session provenance (`sideFrom` or `forkedFrom`) while
+/// retaining the rest of the current Muse metadata.
+pub fn send_session_provenance(stdout: &StdoutShared, s: &mut AcpSession, muse: &str) {
+    if let Ok(patch) = parse_json(muse) {
+        s.absorb_session_meta_patch(&patch);
+    }
+    send_session_info_snapshot(stdout, s, None, None);
+}
+
+/// A side-chat result can name provenance before the client attaches the new
+/// session. No per-session metadata store exists yet, so this one-off update
+/// carries the patch itself; attach republishes it through the full snapshot.
+pub fn send_session_provenance_only(stdout: &StdoutShared, acp_sid: &str, muse: &str) {
     send_raw(
         stdout,
         &format!(
@@ -1353,16 +1444,15 @@ pub fn send_session_provenance(stdout: &StdoutShared, acp_sid: &str, muse: &str)
 /// standard ACP state when the status or attention projection has one.
 pub fn send_session_status(
     stdout: &StdoutShared,
-    acp_sid: &str,
+    s: &mut AcpSession,
     status: Option<&str>,
     attention: Option<&[String]>,
 ) {
     if status.is_none() && attention.is_none() {
         return;
     }
-    let mut muse = Vec::new();
     if let Some(status) = status {
-        muse.push(format!("\"status\":{}", esc(status)));
+        s.set_session_meta("status", esc(status));
     }
     if let Some(flags) = attention {
         let values = flags
@@ -1370,31 +1460,20 @@ pub fn send_session_status(
             .map(|flag| esc(flag))
             .collect::<Vec<_>>()
             .join(",");
-        muse.push(format!("\"attention\":[{values}]"));
+        s.set_session_meta("attention", format!("[{values}]"));
     }
-    let update = format!(
-        "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"muse\":{{{}}}}}}}",
-        muse.join(",")
-    );
-    send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{}}}}}",
-            esc(acp_sid),
-            update
-        ),
-    );
+    send_session_info_snapshot(stdout, s, None, None);
 }
 
 /// Publish approvals currently held by Muse's native reviewer. An empty list
 /// is sent as an explicit null so clients clear their prior activity.
 pub fn send_approval_reviewing(
     stdout: &StdoutShared,
-    acp_sid: &str,
+    s: &mut AcpSession,
     reviews: &[ReviewingApproval],
 ) {
-    let value = if reviews.is_empty() {
-        "null".to_string()
+    if reviews.is_empty() {
+        s.set_session_meta("approvalReviewing", "null".to_string());
     } else {
         let rows = reviews
             .iter()
@@ -1409,15 +1488,9 @@ pub fn send_approval_reviewing(
             })
             .collect::<Vec<_>>()
             .join(",");
-        format!("[{rows}]")
-    };
-    send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"muse\":{{\"approvalReviewing\":{value}}}}}}}}}}}",
-            esc(acp_sid)
-        ),
-    );
+        s.set_session_meta("approvalReviewing", format!("[{rows}]"));
+    }
+    send_session_info_snapshot(stdout, s, None, None);
 }
 
 /// How a title update represents the optional generated short title.
@@ -1440,39 +1513,110 @@ pub enum GeneratedName<'a> {
 /// with the canonical name.
 pub fn send_session_title(
     stdout: &StdoutShared,
-    acp_sid: &str,
+    s: &mut AcpSession,
     title: Option<&str>,
     name_origin: Option<&str>,
     generated_name: GeneratedName<'_>,
 ) {
-    let title = title.map(esc).unwrap_or_else(|| "null".to_string());
-    let mut muse = Vec::new();
     if let Some(origin) = name_origin {
-        muse.push(format!("\"nameOrigin\":{}", esc(origin)));
+        s.set_session_meta("nameOrigin", esc(origin));
+    } else {
+        s.remove_session_meta("nameOrigin");
     }
     match generated_name {
         GeneratedName::Omit => {}
-        GeneratedName::Clear => muse.push("\"generatedName\":null".to_string()),
-        GeneratedName::Value(name) => muse.push(format!("\"generatedName\":{}", esc(name))),
+        GeneratedName::Clear => s.set_session_meta("generatedName", "null".to_string()),
+        GeneratedName::Value(name) => s.set_session_meta("generatedName", esc(name)),
     }
-    let meta = if muse.is_empty() {
-        String::new()
-    } else {
-        format!(",\"_meta\":{{\"muse\":{{{}}}}}", muse.join(","))
+    let title = title.map(esc).unwrap_or_else(|| "null".to_string());
+    send_session_info_snapshot(stdout, s, Some(&title), None);
+}
+
+/// Send fold output, replacing each `session_info_update` Muse patch with the
+/// complete current metadata snapshot. The fold mutates its own state before
+/// returning the frame, so this is the one interception point needed for hints
+/// such as foreground completion and model retry.
+pub fn send_fold_lines(stdout: &StdoutShared, s: &mut AcpSession, lines: Vec<String>) {
+    for line in lines {
+        send_fold_line(stdout, s, &line);
+    }
+}
+
+pub fn send_fold_line(stdout: &StdoutShared, s: &mut AcpSession, line: &str) {
+    let Ok(mut root @ J::Obj(_)) = parse_json(line) else {
+        send_raw(stdout, line);
+        return;
     };
-    let update = format!("{{\"sessionUpdate\":\"session_info_update\",\"title\":{title}{meta}}}");
-    send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{update}}}}}",
-            esc(acp_sid)
-        ),
-    );
+    let is_session_info = root
+        .get("params")
+        .and_then(|params| params.get("update"))
+        .and_then(|update| update.get("sessionUpdate"))
+        .and_then(J::as_str)
+        == Some("session_info_update");
+    if !is_session_info {
+        send_raw(stdout, line);
+        return;
+    }
+    let patch = root
+        .get("params")
+        .and_then(|params| params.get("update"))
+        .and_then(|update| update.get("_meta"))
+        .and_then(|meta| meta.get("muse"))
+        .cloned();
+    if let Some(patch) = patch.as_ref() {
+        s.absorb_session_meta_patch(patch);
+    }
+    let muse = s
+        .session_meta_json()
+        .and_then(|muse| parse_json(&format!("{{{muse}}}")).ok());
+    let J::Obj(root_fields) = &mut root else {
+        unreachable!();
+    };
+    if let Some((_, J::Obj(params))) = root_fields.iter_mut().find(|(key, _)| key == "params")
+        && let Some((_, J::Obj(update))) = params.iter_mut().find(|(key, _)| key == "update")
+        && let Some((_, J::Obj(meta))) = update.iter_mut().find(|(key, _)| key == "_meta")
+    {
+        meta.retain(|(key, _)| key != "muse");
+        if let Some(muse) = muse {
+            meta.push(("muse".to_string(), muse));
+        }
+    }
+    send_raw(stdout, &j_to_string(&root));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_metadata_snapshots_survive_top_level_patches() {
+        let mut meta = SessionMeta::default();
+        meta.set("branch", r#"{"branch":"main"}"#.to_string());
+        meta.absorb(&parse_json(r#"{"status":"running","attention":[]}"#).unwrap());
+        meta.absorb(&parse_json(r#"{"modelRetry":{"turnId":"turn-1","attempt":2}}"#).unwrap());
+        let snapshot = meta.json().expect("metadata snapshot");
+        let snapshot = parse_json(&format!("{{{snapshot}}}")).unwrap();
+        assert_eq!(
+            snapshot
+                .get("branch")
+                .and_then(|branch| branch.get("branch"))
+                .and_then(J::as_str),
+            Some("main")
+        );
+        assert_eq!(snapshot.get("status").and_then(J::as_str), Some("running"));
+        assert_eq!(
+            snapshot
+                .get("modelRetry")
+                .and_then(|retry| retry.get("attempt"))
+                .and_then(J::as_u64),
+            Some(2)
+        );
+
+        meta.absorb(&parse_json(r#"{"modelRetry":null}"#).unwrap());
+        let snapshot = meta.json().expect("metadata snapshot");
+        assert!(snapshot.contains("\"modelRetry\":null"), "{snapshot}");
+        assert!(snapshot.contains("\"status\":\"running\""), "{snapshot}");
+    }
 
     #[test]
     fn selector_and_command_literals_are_valid_json() {

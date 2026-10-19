@@ -783,8 +783,10 @@ fn host_cache_totals_ride_the_cumulative_metadata() {
     let _pid = c.prompt(&sid, "hi");
     let update = c.wait_for("\"totalTokens\":7500", Duration::from_secs(15));
     assert!(
-        update.contains("\"cacheReadTokens\":100") && update.contains("\"cacheWriteTokens\":25"),
-        "host cache splits must ride museCumulative: {update}"
+        update.contains("\"cumulative\":{\"promptTokens\"")
+            && update.contains("\"cacheReadTokens\":100")
+            && update.contains("\"cacheWriteTokens\":25"),
+        "host cache splits must ride the canonical cumulative metadata: {update}"
     );
     c.finish();
 }
@@ -806,6 +808,10 @@ fn subscription_usage_is_host_observation_separate_from_cost_estimates() {
         );
         assert!(read.contains("\"usedPercent\":11"), "read window: {read}");
         assert!(read.contains("\"usedPercent\":37"), "read weekly: {read}");
+        assert!(
+            read.contains("\"subscriptionUsage\":{\"source\":\"msp-host-observation\""),
+            "canonical read metadata: {read}"
+        );
         assert!(read.contains("\"source\":\"msp-host-observation\""));
         assert!(read.contains("\"billing\":false"));
         assert!(
@@ -824,6 +830,10 @@ fn subscription_usage_is_host_observation_separate_from_cost_estimates() {
             "changed usage for our session: {changed}"
         );
         assert!(changed.contains("\"used\":1500") && changed.contains("\"size\":200000"));
+        assert!(
+            changed.contains("\"subscriptionUsage\":{\"source\":\"msp-host-observation\""),
+            "canonical changed usage: {changed}"
+        );
         assert!(
             changed.contains("\"usedPercent\":61"),
             "changed weekly: {changed}"
@@ -1540,6 +1550,10 @@ fn tool_call_completion_bridges_with_result_text() {
     assert!(
         created.contains("\"status\":\"completed\""),
         "terminal status present: {created}"
+    );
+    assert!(
+        created.contains("\"name\":\"read\""),
+        "programmatic tool name present: {created}"
     );
     let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
     assert!(done.contains("end_turn"), "terminal: {done}");
@@ -8801,6 +8815,41 @@ fn status_changed_seeds_and_targets_session_attention() {
 }
 
 #[test]
+fn v2_session_info_updates_patch_one_complete_muse_object() {
+    let mut c = Client::spawn("metadata_patch", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "exercise metadata patches");
+    let snapshot = c.wait_for_all(
+        &[
+            "\"foregroundCompleted\"",
+            "\"branch\":\"feat/patch-safe\"",
+            "\"status\":\"running\"",
+            "\"attention\":[]",
+            "\"nameOrigin\":\"custom\"",
+            "\"generatedName\":\"Patch safe\"",
+            "\"modelRetry\"",
+            "\"attempt\":1",
+        ],
+        Duration::from_secs(15),
+    );
+    let frame: serde_json::Value = serde_json::from_str(&snapshot).unwrap();
+    let muse = &frame["params"]["update"]["_meta"]["muse"];
+    assert_eq!(muse["branch"]["branch"], "feat/patch-safe", "{snapshot}");
+    assert_eq!(muse["status"], "running", "{snapshot}");
+    assert_eq!(muse["nameOrigin"], "custom", "{snapshot}");
+    assert_eq!(muse["generatedName"], "Patch safe", "{snapshot}");
+    assert_eq!(muse["modelRetry"]["attempt"], 1, "{snapshot}");
+    assert_eq!(
+        muse["foregroundCompleted"]["blockingAgents"][0], "reviewer",
+        "{snapshot}"
+    );
+    let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(accepted.contains("\"result\""), "{accepted}");
+    c.wait_for("\"state\":\"idle\"", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
 fn todo_list_changed_maps_to_an_acp_plan() {
     let mut c = Client::spawn("todo", &[]);
     let sid = c.new_session(1, "");
@@ -8989,24 +9038,60 @@ fn reasoning_completion_without_deltas_emits_the_summary_once() {
 }
 
 #[test]
-fn compact_command_runs_and_surfaces_the_compaction_item() {
+fn compact_command_uses_standard_acp_compaction_when_supported() {
+    for (ver, extra_init) in [
+        (2, ""),
+        (1, r#","clientCapabilities":{"session":{"compaction":{}}}"#),
+    ] {
+        let mut c = Client::spawn("quiet", &[]);
+        let sid = c.new_session(ver, extra_init);
+        let pid = c.prompt(&sid, "/compact");
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"result\""),
+            "v{ver} compact failed: {frame}"
+        );
+        c.wait_log("session/compact", Duration::from_secs(10));
+        let compaction = c.wait_for(
+            "\"sessionUpdate\":\"compaction_update\"",
+            Duration::from_secs(15),
+        );
+        assert!(
+            compaction.contains("\"compactionId\":\"it-c1\"")
+                && compaction.contains("\"status\":\"completed\""),
+            "v{ver} standard compaction lifecycle missing: {compaction}"
+        );
+        assert!(
+            compaction.contains("\"tokensBefore\":12000")
+                && compaction.contains("\"tokensAfter\":8000")
+                && !compaction.contains("\"summary\""),
+            "v{ver} provenance must be metadata and no summary may be invented: {compaction}"
+        );
+        assert!(
+            !compaction.contains("Compact conversation"),
+            "v{ver} standard update must not remain a tool card: {compaction}"
+        );
+        if ver == 2 {
+            c.wait_for("\"state\":\"idle\"", Duration::from_secs(15));
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn compact_command_keeps_the_legacy_v1_tool_card_without_negotiation() {
     let mut c = Client::spawn("quiet", &[]);
-    let sid = c.new_session(2, "");
+    let sid = c.new_session(1, "");
     let pid = c.prompt(&sid, "/compact");
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
     assert!(frame.contains("\"result\""), "compact failed: {frame}");
     c.wait_log("session/compact", Duration::from_secs(10));
-    c.wait_for("\"kind\":\"think\"", Duration::from_secs(15));
     let card = c.wait_for("Compact conversation", Duration::from_secs(15));
     assert!(
-        card.contains("Context compacted (12000 → 8000 tokens)"),
-        "token facts missing: {card}"
+        card.contains("Context compacted (12000 → 8000 tokens)")
+            && card.contains("\"_meta\":{\"contextCompaction\":{\"version\":1}}"),
+        "legacy provenance/card missing: {card}"
     );
-    assert!(
-        card.contains("\"_meta\":{\"contextCompaction\":{\"version\":1}}"),
-        "provenance meta missing: {card}"
-    );
-    c.wait_for("\"state\":\"idle\"", Duration::from_secs(15));
     c.finish();
 }
 
@@ -12833,7 +12918,15 @@ fn session_list_stream_notifications_are_ignored_without_a_grant() {
 fn streamed_rows_preserve_metadata_priority_and_clear_omitted_fields() {
     let mut c = Client::spawn("session_list_stream", &[("FAKE_STREAM_METADATA", "1")]);
     c.new_session(1, "");
-    c.wait_for("\"title\":\"Streamed name\"", Duration::from_secs(15));
+    let streamed = c.wait_for_all(
+        &[
+            "\"title\":\"Streamed name\"",
+            "\"branch\":\"live-branch\"",
+            "\"attention\":[\"inputPending\"]",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(streamed.contains("session_info_update"), "{streamed}");
     let id = c.req("session/list", "{}");
     let listed = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(
@@ -12846,7 +12939,11 @@ fn streamed_rows_preserve_metadata_priority_and_clear_omitted_fields() {
         !listed.contains("Lower priority") && !listed.contains("Initial title"),
         "{listed}"
     );
-    c.wait_for("\"title\":null", Duration::from_secs(15));
+    let cleared_info = c.wait_for("\"title\":null", Duration::from_secs(15));
+    assert!(
+        !cleared_info.contains("live-branch") && !cleared_info.contains("inputPending"),
+        "omitted streamed metadata must clear the session-info snapshot: {cleared_info}"
+    );
     let id = c.req("session/list", "{}");
     let cleared = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(

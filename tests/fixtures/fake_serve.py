@@ -803,6 +803,26 @@ def on_turn_start(params):
             "sessionId": MSP_SID, "status": "idle",
             "viewCursor": "cur-status-2"})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "metadata_patch":
+        notify("session/statusChanged", {
+            "sessionId": MSP_SID, "status": "running", "attention": [],
+            "viewCursor": "cur-patch-status"})
+        notify("session/branchChanged", {
+            "sessionId": MSP_SID, "viewCursor": "cur-patch-branch",
+            "branch": "feat/patch-safe", "vcs": "git",
+            "workspaceRoot": "/home/me/src/proj"})
+        notify("session/nameChanged", {
+            "sessionId": MSP_SID, "name": "Patch-safe metadata",
+            "nameOrigin": "custom", "generatedName": "Patch safe",
+            "viewCursor": "cur-patch-name"})
+        notify("turn/modelRetryScheduled", {
+            **base, "attempt": 1, "nextAttempt": 2, "maxAttempts": 3,
+            "retryDelayMs": 1500, "errorKind": "overloaded",
+            "viewCursor": "cur-patch-retry"})
+        notify("turn/foregroundCompleted", {
+            **base, "blockingAgents": ["reviewer"],
+            "viewCursor": "cur-patch-foreground"})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "session_metadata":
         notify("session/nameChanged", {
             "sessionId": ACTIVE_SESSION[0], "name": "Renamed by host",

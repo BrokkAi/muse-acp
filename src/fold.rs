@@ -179,6 +179,8 @@ enum ItemRole {
 pub struct ToolUpdate<'a> {
     pub create: bool,
     pub tc_id: &'a str,
+    /// The host's programmatic tool identity, when one was reported.
+    pub name: Option<&'a str>,
     pub title: &'a str,
     pub kind: &'a str,
     pub status: &'a str,
@@ -207,6 +209,8 @@ pub struct SessionFold {
     pub spawned_subagents: std::collections::HashSet<String>,
     /// Whether the client negotiated the AIR async-tasks extension.
     pub air_async_tasks: bool,
+    /// ACP v2 always supports standard compaction; ACP v1 must opt in.
+    pub compaction_supported: bool,
     /// Async task ids already announced (spawned updates are idempotent).
     pub announced_tasks: std::collections::HashSet<String>,
     /// Workflow async task ids, keyed by the AIR task id (workflowRunId).
@@ -313,6 +317,7 @@ impl SessionFold {
             native_subagents: false,
             spawned_subagents: std::collections::HashSet::new(),
             air_async_tasks: false,
+            compaction_supported: false,
             announced_tasks: std::collections::HashSet::new(),
             workflow_tasks: HashMap::new(),
             workflow_children: HashMap::new(),
@@ -851,10 +856,71 @@ impl SessionFold {
         (!fields.is_empty()).then_some(fields)
     }
 
-    /// Compaction is host work the user must see, but it is not a tool the
-    /// model called. Present it as a think-kind tool call with provenance
-    /// metadata, matching codex-acp's compaction presentation.
-    fn compaction_line(
+    fn compaction_status(item: &J) -> &'static str {
+        let status = item.get("status").and_then(J::as_str).unwrap_or("");
+        if matches!(status, "inProgress" | "in_progress" | "running" | "started") {
+            return "in_progress";
+        }
+        if status == "cancelled" {
+            return "cancelled";
+        }
+        match item.get("outcome").and_then(J::as_str).unwrap_or("") {
+            "compacted" => "completed",
+            "noop" => "_museNoop",
+            "cancelled" => "cancelled",
+            "failed" => "failed",
+            _ if status == "completed" => "completed",
+            _ if status == "failed" || status == "rejected" || status == "timedOut" => "failed",
+            _ => "_museUnknown",
+        }
+    }
+
+    fn compaction_meta(item: &J) -> String {
+        let mut fields = vec!["\"version\":1".to_string()];
+        for key in [
+            "status",
+            "outcome",
+            "reason",
+            "trigger",
+            "strategyId",
+            "summarizedThrough",
+        ] {
+            if let Some(value) = item.get(key).and_then(J::as_str) {
+                fields.push(format!("\"{key}\":{}", esc(value)));
+            }
+        }
+        for key in ["tokensBefore", "tokensAfter"] {
+            if let Some(value) = item.get(key).and_then(J::as_u64) {
+                fields.push(format!("\"{key}\":{value}"));
+            }
+        }
+        fields.join(",")
+    }
+
+    fn standard_compaction_line(acp_sid: &str, item_id: &str, item: &J) -> String {
+        let mut fields = vec![
+            "\"sessionUpdate\":\"compaction_update\"".to_string(),
+            format!("\"compactionId\":{}", esc(item_id)),
+            format!("\"status\":\"{}\"", Self::compaction_status(item)),
+        ];
+        if Self::compaction_status(item) == "failed"
+            && let Some(reason) = item
+                .get("reason")
+                .and_then(J::as_str)
+                .filter(|reason| !reason.is_empty())
+        {
+            fields.push(format!("\"error\":{}", esc(reason)));
+        }
+        fields.push(format!(
+            "\"_meta\":{{\"muse\":{{\"contextCompaction\":{{{}}}}}}}",
+            Self::compaction_meta(item)
+        ));
+        Self::update_line(acp_sid, &format!("{{{}}}", fields.join(",")))
+    }
+
+    /// Older ACP v1 clients did not negotiate standard compaction. Present the
+    /// same host work as a think-kind tool call with provenance metadata.
+    fn legacy_compaction_line(
         acp_sid: &str,
         ver: u8,
         item_id: &str,
@@ -1669,10 +1735,15 @@ impl SessionFold {
         let mut f = vec![
             format!("\"sessionUpdate\":\"{session_update}\""),
             format!("\"toolCallId\":{}", esc(u.tc_id)),
+        ];
+        if let Some(name) = u.name.filter(|name| !name.is_empty()) {
+            f.push(format!("\"name\":{}", esc(name)));
+        }
+        f.extend([
             format!("\"title\":{}", esc(u.title)),
             format!("\"kind\":\"{}\"", u.kind),
             format!("\"status\":{}", esc(u.status)),
-        ];
+        ]);
         let mut muse_fields = u.muse_fields.unwrap_or_default().to_string();
         if let Some(t) = u.content_text {
             let (text, adapter_cut) = trunc(t);
@@ -1860,7 +1931,7 @@ impl SessionFold {
         let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("");
         if Self::replay_is_in_flight(item) {
             match kind {
-                "toolCall" | "subagent" | "monitorFeed" => {
+                "toolCall" | "subagent" | "monitorFeed" | "compaction" => {
                     self.on_item_snapshot(acp_sid, ver, item, out)
                 }
                 "agentMessage" | "userMessage" => {
@@ -1896,7 +1967,7 @@ impl SessionFold {
         }
 
         match kind {
-            "toolCall" | "subagent" | "monitorFeed" => {
+            "toolCall" | "subagent" | "monitorFeed" | "compaction" => {
                 let wrap = J::Obj(vec![("item".to_string(), item.clone())]);
                 self.on_item_completed(acp_sid, ver, &wrap, out);
             }
@@ -2047,6 +2118,10 @@ impl SessionFold {
                     &ToolUpdate {
                         create: !announced,
                         tc_id: &tc_id,
+                        name: item
+                            .get("tool")
+                            .and_then(J::as_str)
+                            .filter(|name| !name.is_empty()),
                         title: &title,
                         kind: tool_kind(&tool),
                         status: msp_status(status),
@@ -2107,14 +2182,18 @@ impl SessionFold {
                 }
             }
             "compaction" => {
-                let status = msp_status(status);
-                out.push(Self::compaction_line(
-                    acp_sid,
-                    ver,
-                    &item_id,
-                    status,
-                    Self::compaction_content(item).as_deref(),
-                ));
+                if self.compaction_supported {
+                    out.push(Self::standard_compaction_line(acp_sid, &item_id, item));
+                } else {
+                    let status = msp_status(status);
+                    out.push(Self::legacy_compaction_line(
+                        acp_sid,
+                        ver,
+                        &item_id,
+                        status,
+                        Self::compaction_content(item).as_deref(),
+                    ));
+                }
             }
             "subagent" if self.native_subagents => {
                 if let Some(child) = item.get("childSessionId").and_then(|v| v.as_str())
@@ -2388,6 +2467,10 @@ impl SessionFold {
                     &ToolUpdate {
                         create: !announced,
                         tc_id: &tc_id,
+                        name: item
+                            .get("tool")
+                            .and_then(J::as_str)
+                            .filter(|name| !name.is_empty()),
                         title: &title,
                         kind: tool_kind(&tool),
                         status: msp_status(status),
@@ -2489,14 +2572,18 @@ impl SessionFold {
                 self.items.remove(&item_id);
             }
             "compaction" => {
-                let status = msp_status(status);
-                out.push(Self::compaction_line(
-                    acp_sid,
-                    ver,
-                    &item_id,
-                    status,
-                    Self::compaction_content(item).as_deref(),
-                ));
+                if self.compaction_supported {
+                    out.push(Self::standard_compaction_line(acp_sid, &item_id, item));
+                } else {
+                    let status = msp_status(status);
+                    out.push(Self::legacy_compaction_line(
+                        acp_sid,
+                        ver,
+                        &item_id,
+                        status,
+                        Self::compaction_content(item).as_deref(),
+                    ));
+                }
             }
             "subagent" if self.native_subagents => {
                 if let Some(child) = item.get("childSessionId").and_then(|v| v.as_str())
@@ -3147,6 +3234,128 @@ mod corpus_tests {
         assert!(
             out[0].contains("bash: cargo test --help"),
             "title should carry the command, not bare tool: {}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn tool_calls_carry_the_standard_programmatic_name() {
+        let item = parse_json(
+            r#"{"itemId":"it-tool","kind":"toolCall","callId":"call-1","tool":"bash","args":"{\"command\":\"pwd\"}","status":"inProgress","revision":1}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &item, &mut out);
+        let frame = parse_json(&out[0]).unwrap();
+        let update = frame.get("params").and_then(|p| p.get("update")).unwrap();
+        assert_eq!(update.get("name").and_then(J::as_str), Some("bash"));
+        assert_eq!(update.get("title").and_then(J::as_str), Some("bash: pwd"));
+    }
+
+    #[test]
+    fn preferred_compaction_uses_the_standard_update() {
+        let item = parse_json(
+            r#"{"itemId":"it-c1","kind":"compaction","status":"completed","revision":2,"outcome":"compacted","tokensBefore":12000,"tokensAfter":8000,"trigger":"manual"}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        fold.compaction_supported = true;
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &item, &mut out);
+        let frame = parse_json(&out[0]).unwrap();
+        let update = frame.get("params").and_then(|p| p.get("update")).unwrap();
+        assert_eq!(
+            update.get("sessionUpdate").and_then(J::as_str),
+            Some("compaction_update")
+        );
+        assert_eq!(
+            update.get("compactionId").and_then(J::as_str),
+            Some("it-c1")
+        );
+        assert_eq!(update.get("status").and_then(J::as_str), Some("completed"));
+        assert!(update.get("summary").is_none());
+        let provenance = update
+            .get("_meta")
+            .and_then(|meta| meta.get("muse"))
+            .and_then(|muse| muse.get("contextCompaction"))
+            .unwrap();
+        assert_eq!(
+            provenance.get("tokensBefore").and_then(J::as_u64),
+            Some(12000)
+        );
+        assert_eq!(
+            provenance.get("trigger").and_then(J::as_str),
+            Some("manual")
+        );
+    }
+
+    #[test]
+    fn legacy_compaction_remains_a_tool_card() {
+        let item = parse_json(
+            r#"{"itemId":"it-c1","kind":"compaction","status":"completed","revision":2,"outcome":"compacted","tokensBefore":12000,"tokensAfter":8000}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 1, &item, &mut out);
+        let frame = parse_json(&out[0]).unwrap();
+        let update = frame.get("params").and_then(|p| p.get("update")).unwrap();
+        assert_eq!(
+            update.get("sessionUpdate").and_then(J::as_str),
+            Some("tool_call_update")
+        );
+        assert!(out[0].contains("\"_meta\":{\"contextCompaction\":{\"version\":1}}"));
+    }
+
+    #[test]
+    fn standard_compaction_replays_as_the_same_entity() {
+        let item = parse_json(
+            r#"{"itemId":"it-c1","kind":"compaction","status":"completed","revision":2,"outcome":"compacted","tokensBefore":12000,"tokensAfter":8000}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        fold.compaction_supported = true;
+        let mut out = Vec::new();
+        fold.replay_item("sid", 2, &item, &mut out);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert!(
+            out[0].contains("\"sessionUpdate\":\"compaction_update\"")
+                && out[0].contains("\"compactionId\":\"it-c1\"")
+                && out[0].contains("\"status\":\"completed\""),
+            "{}",
+            out[0]
+        );
+    }
+
+    #[test]
+    fn unknown_compaction_status_stays_generic() {
+        let item = parse_json(
+            r#"{"itemId":"it-c1","kind":"compaction","status":"futureTerminal","revision":2}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        fold.compaction_supported = true;
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &item, &mut out);
+        assert!(out[0].contains("\"status\":\"_museUnknown\""), "{}", out[0]);
+    }
+
+    #[test]
+    fn noop_compaction_does_not_claim_context_was_compacted() {
+        let item = parse_json(
+            r#"{"itemId":"it-c1","kind":"compaction","status":"completed","revision":2,"outcome":"noop","reason":"no_compactable_history"}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        fold.compaction_supported = true;
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &item, &mut out);
+        assert!(out[0].contains("\"status\":\"_museNoop\""), "{}", out[0]);
+        assert!(
+            out[0].contains("\"outcome\":\"noop\"")
+                && out[0].contains("\"reason\":\"no_compactable_history\""),
+            "{}",
             out[0]
         );
     }

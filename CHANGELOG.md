@@ -5,6 +5,18 @@
 - Refresh the README adapter comparison: add Muse Spark Code and
   1broseidon/muse-acp, and update npm adoption to the 30 days ending
   2026-10-18.
+
+- Publish a complete ACP extension contract and adopt standard protocol
+  surfaces (#294). `docs/acp-extensions.md` now centralizes negotiated
+  methods, `_meta` shapes, capabilities, fallbacks, and standard mappings.
+  ACP v2 and negotiated ACP v1 clients receive standard `compaction_update`
+  instead of a synthetic tool card, with v1 fallback retained. Actual tool
+  calls carry Muse's programmatic tool name as ACP `ToolCall.name`, and
+  `session_info_update` publishes a complete Muse metadata snapshot so ACP v2
+  top-level patches cannot erase unrelated session facts. Usage metadata now
+  has canonical nested `muse.cumulative`, `muse.pressure`, and
+  `muse.subscriptionUsage` members while retaining the early flat keys.
+
 - Adopt the Muse 1.4.8 resume permission-profile pick (#257). ACP
   `session/load` and `session/resume` accept a non-empty
   `_meta.muse.permissionProfile`; the adapter forwards it only to MSP

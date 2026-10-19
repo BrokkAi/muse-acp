@@ -1,0 +1,195 @@
+# ACP extension contract
+
+This page is the client-facing contract for Muse-specific ACP extensions and
+metadata. It covers both protocol versions. Standard ACP fields take precedence
+whenever they can express the same fact.
+
+
+## Negotiation
+
+ACP v1 clients advertise capabilities under
+`initialize.params.clientCapabilities`; ACP v2 clients use
+`initialize.params.capabilities`. Muse-specific capability opt-ins use
+`_meta.muse`.
+
+| Capability | Direction | Meaning |
+| --- | --- | --- |
+| `_meta.muse.capabilities: ["computerUse"]` | Client to agent | Request the Muse computer-use host grants and `_session/computerUse`. |
+| `_meta.muse.capabilities: ["hooks"]` | Client to agent | Enable `_session/hooks`. |
+| `_meta.muse.capabilities: ["plugins"]` | Client to agent | Enable `_session/plugins`. |
+| `_meta.muse.capabilities: ["readOutput"]` | Client to agent | Enable `_session/readOutput`. |
+| `_meta.muse.capabilities: ["sideChat"]` | Client to agent | Enable `_session/sideChat`. |
+| `_meta.muse.capabilities: ["userShell"]` | Client to agent | Allow `_session/userShell`; AIR `asyncTasks` and a host grant are also required. |
+| `_meta.muse.computerUse: true` | Client to agent | Legacy boolean spelling accepted for computer use. |
+| `_meta.steering.supported: true` | Agent to client | Advertises the `_session/steering` convention. |
+| `_meta.jetbrains.air` | Both | JetBrains AIR capabilities. This namespace belongs to the AIR extension, not Muse metadata. |
+
+ACP v1 clients also advertise standard compaction support with
+`clientCapabilities.session.compaction: {}`. ACP v2 needs no compaction
+capability.
+
+
+## Extension methods
+
+Extension method names begin with `_`. Unsupported methods return JSON-RPC
+method-not-found; clients must negotiate the corresponding capability before
+calling one.
+
+| Method | Enabled by | Purpose and fallback |
+| --- | --- | --- |
+| `_session/steering` | `_meta.steering.supported` | Inject text into an exact turn. The ecosystem `session/inject` proposal remains the future standard. |
+| `_session/readOutput` | `muse.capabilities: ["readOutput"]` | Read host-stored tool output by reference. |
+| `_session/hooks` | `muse.capabilities: ["hooks"]` | Read installed hook handlers. |
+| `_session/sideChat` | `muse.capabilities: ["sideChat"]` | Create a side session from a loaded session. |
+| `_session/plugins` | `muse.capabilities: ["plugins"]` | Read installed plugin rows. |
+| `_session/computerUse` | `muse.capabilities: ["computerUse"]` | Read or update computer-use setup and settings. |
+| `_session/userShell` | `muse.capabilities: ["userShell"]` plus AIR `asyncTasks` and host grant | Run a shell command outside a turn. |
+| `_session/async_task/stop` | AIR `asyncTasks` | Stop one background task. Without it, `session/cancel` maps to host stop-all behavior. |
+| `_session/hooks`, `_session/plugins`, and other reads | Their listed opt-ins | When unavailable, use ordinary prompt commands only where the README documents them; otherwise the surface stays absent. |
+
+Subagent updates use the ACP subagent RFD through
+`capabilities.session.subagents` or AIR `nativeSubagentSessions`. Without
+negotiation they fall back to synthesized tool cards.
+
+
+## Lifecycle request metadata
+
+| Location | Direction | Shape and behavior |
+| --- | --- | --- |
+| `session/load` or `session/resume` `params._meta.muse.permissionProfile` | Client to agent | Non-empty host-catalog profile id. Forwarded to Muse `session/resume`; unknown/unavailable ids keep the host's typed `commandRejected`. `session/fork` never forwards it. |
+| `session/load` or `session/resume` `params._meta.mspSessionId` | Client to agent | Legacy recovery id for a session stored under an adapter-generated ACP id. Omit for normal modern sessions. |
+| `session/load`, `session/resume`, `session/new`, and `session/fork` result `_meta.mspSessionId` | Agent to client | The durable Muse session id. Modern ACP `sessionId` normally already equals it; this is primarily compatibility metadata. |
+| `session/fork` request `_meta.jetbrains.air.forkPoint` | Client to agent | AIR cut-point selector. It is resolved against host history before a fork command is sent. |
+| Prompt `_meta.jetbrains.air.agentFileChangeReportRequest` | Client to agent | Requests one AIR file-change report for the turn. |
+| `_session/steering` `_meta.steering.idleBehavior` | Client to agent | `promptRequired` holds steering until a prompt can be submitted; other values are rejected. |
+
+`session/new` does not accept the Muse resume profile extension. Host
+permission profiles are separate from ACP `approvalMode`.
+
+
+## Lifecycle result metadata
+
+| Location | Shape | Meaning |
+| --- | --- | --- |
+| `session/new`, `session/load`, `session/resume`, `session/fork` result `_meta.mspSessionId` | string | Compatibility id described above. |
+| Fork result `_meta.muse.forkedFrom` | object | Host fork provenance. |
+| Side-chat result / attached side session `_meta.muse.sideFrom` | object | Host side-chat provenance. |
+| Config option `_meta.jetbrains.air.recommendedValue` | string | AIR recommendation metadata; it never changes the selected value. |
+| Auth method `_meta["terminal-auth"]` | `{label, command, args}` | Legacy terminal-auth description used with older editors. |
+
+
+## Session information metadata
+
+ACP `session_info_update` is the shared surface for live session facts.
+In ACP v2, `_meta` patches by top-level key. Muse therefore publishes the
+complete current `muse` object whenever any Muse member changes. Clients must
+not deep-merge partial `muse` objects; they replace the stored `muse` value with
+the value from the latest frame.
+
+| Key | Shape | Meaning |
+| --- | --- | --- |
+| `_meta.goal` | object or `null` | Provider-neutral goal display state. `null` is an authoritative clear. |
+| `_meta.muse.branch` | object or `null` | Branch/VCS/workspace observation from the host. |
+| `_meta.muse.status` | string | Host session status. ACP v2 also receives standard `state_update`. |
+| `_meta.muse.attention` | array of strings | Known host attention flags. Unknown flags are ignored. |
+| `_meta.muse.nameOrigin` | `automatic` or `custom` | Proven title origin. Unknown origins are omitted. |
+| `_meta.muse.generatedName` | string or `null` | Host-generated short title. `null` withdraws a previously published value. |
+| `_meta.muse.sideFrom` | object | Side-chat parent provenance. |
+| `_meta.muse.forkedFrom` | object | Fork provenance. |
+| `_meta.muse.approvalReviewing` | array or absent | Native reviewer activity rows. The key is removed when no rows remain. |
+| `_meta.muse.foregroundCompleted` | object or absent | `turnId` and `blockingAgents` while foreground work is done but background checks hold the prompt open. Removed at the terminal. |
+| `_meta.muse.modelRetry` | object or absent | Current model-attempt backoff details. Removed at the turn terminal. |
+| `_meta.muse.subscriptionUsage` | object or `null` | Host subscription observation, separate from billing and ACP context usage. `null` clears a prior value. The legacy `_meta.museSubscriptionUsage` alias is also emitted. |
+
+The complete `muse` object can contain any combination of the keys above.
+`session/list` rows may also carry `_meta.muse.branch` and
+`_meta.muse.attention`; list rows are pull-only snapshots, not patch targets.
+
+
+## Commands, messages, and tool cards
+
+Standard ACP fields carry standard meaning:
+
+- session title: `session_info_update.title`
+- available-command selector: `availableCommands[].name`
+- tool identity: `ToolCall.name`
+- display title: `ToolCall.title`
+- tool category and lifecycle: `ToolCall.kind` and `ToolCall.status`
+- invocation input: `ToolCall.rawInput`
+- context usage and cost: `usage_update.used`, `.size`, and `.cost`
+
+Muse adds only facts with no standard ACP field:
+
+| Location | Muse metadata |
+| --- | --- |
+| Skill command | `_meta.muse.title`: declared or host display name. The command's `name` remains the selector. |
+| Agent-message update | `_meta.muse.messagePhase`: `commentary` or `finalAnswer`. |
+| Agent-message update | `_meta.muse.cutOff: true` plus `_meta.muse.itemId` when the host committed a partial reply after a provider-stream failure. |
+| Tool/host card | `_meta.muse.itemId`, `outputRef`, `patchRef`, `patchSummary`, and `truncated`. |
+| Unknown or synthetic host item | `_meta.muse.itemKind`. |
+| Monitor card | `_meta.muse.monitorId`, `monitorDescription`, and `truncated`. |
+| Subagent card | `_meta.muse.subagent: {subagentId, childSessionId, controlStatus, depth}`. |
+| Workflow card | `_meta.muse.workflow: {workflowRunId, entryId, scriptId, triggerSource, paused, resumeFromRunId}`. |
+| Hook card | `_meta.muse.hookRun: {hookKey, event, runStatus, reason, handlerKind, enabled}`. |
+| User-shell card | `_meta.muse.userShell: {exitCode, exitSignal}`. |
+| Reminder card | `_meta.muse.reminderChild: {reminderAgentId, generationId, taskId, childSessionId, childSessionLogPath}`. |
+| Background-check card | `_meta.muse.turnId` and `blockingAgents`. |
+
+`_meta.muse.truncated` has either `{source: "host"}` or the adapter truncation
+facts `{source, originalChars, retainedChars, headChars, tailChars}`.
+
+
+## Context compaction
+
+ACP compaction is a standard session-update entity:
+
+| Protocol | Behavior |
+| --- | --- |
+| ACP v2 | Always uses standard `compaction_update`. |
+| ACP v1 with `clientCapabilities.session.compaction: {}` | Uses standard `compaction_update`. |
+| ACP v1 without the capability | Uses a legacy think-kind tool card with `_meta.contextCompaction: {version: 1}`. |
+
+The standard update uses the Muse item id as `compactionId` and maps the host
+operation to `in_progress`, `completed`, `failed`, or `cancelled`. Muse exposes
+no user-visible retained summary on this event, so `summary` is omitted rather
+than synthesized. An unknown future compaction status is sent as the open
+extension status `_museUnknown`; it is never guessed to be success or failure.
+`outcome: "noop"` uses `_museNoop` rather than claiming that context was
+compacted.
+
+Host provenance rides
+`_meta.muse.contextCompaction: {version, status?, outcome?, reason?, trigger?,
+strategyId?, summarizedThrough?, tokensBefore?, tokensAfter?}`.
+
+
+## Usage metadata
+
+ACP context occupancy and cumulative cost use standard `usage_update.used`,
+`.size`, and `.cost`.
+
+| Location | Key and meaning |
+| --- | --- |
+| `usage_update._meta.muse.cumulative` | Counted-once prompt/output/total/cache totals. |
+| `usage_update._meta.muse.pressure` | Host context-pressure label. |
+| `usage_update._meta.muse.subscriptionUsage` | Host subscription observation. |
+| `usage_update.cost._meta.muse` | Cost provenance: host-reported versus adapter catalog estimate, partial and billing flags. |
+| Prompt-result `usage._meta` | `muse.modelCalls`, optional `apiDurationMs`, and per-model `modelUsage`; `mjolnir.dev/usage-scope: "turn"` is a compatibility discriminator. |
+
+The older top-level `museCumulative`, `musePressure`, and
+`museSubscriptionUsage` spellings remain compatibility aliases in the same
+frames. New clients should use the nested `muse` members.
+
+
+## Standard mapping status
+
+| Muse concept | Standard ACP surface | Remaining extension |
+| --- | --- | --- |
+| Session title and generated title | `session_info_update.title` | `generatedName`, `nameOrigin` |
+| Session activity | ACP v2 `state_update` | host `status` and `attention` details |
+| Tool identity and display | `ToolCall.name`, `.title`, `.kind`, `.status`, `.rawInput` | host item references and synthetic-card provenance |
+| Context and cost | `usage_update.used`, `.size`, `.cost` | cumulative/subscription details |
+| Compaction | `compaction_update` with negotiated v1 fallback | legacy v1 tool card and host provenance |
+| Permission requests | `session/request_permission` | `approvalReviewing` activity rows |
+| User questions | `elicitation/create` when negotiated | none |
+| Turn steering | No stable standard method yet | `_session/steering` |
+| Goals and branch | No standard session method/field | `_meta.goal`, `_meta.muse.branch` |
