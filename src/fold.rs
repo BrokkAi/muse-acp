@@ -2801,6 +2801,16 @@ mod corpus_tests {
             assert_eq!(title, want, "{status}");
             assert_eq!(tool, "computer_use", "{status}");
         }
+
+        let no_status = parse_json(
+            r#"{"itemId":"it-label","kind":"toolCall","tool":"computer_use","callId":"call-label","displayLabel":{"active":"Setting up Computer Use","done":"Set up Computer Use","neutral":"Computer Use setup"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            SessionFold::tool_title(&no_status).0,
+            "Computer Use setup",
+            "an absent status uses the neutral form"
+        );
     }
 
     #[test]
@@ -2836,6 +2846,7 @@ mod corpus_tests {
             "",
             ",\"displayLabel\":null",
             ",\"displayLabel\":\"bad\"",
+            ",\"displayLabel\":{\"done\":\"done\",\"neutral\":\"neutral\"}",
             ",\"displayLabel\":{\"active\":\"   \",\"done\":\"done\",\"neutral\":\"neutral\"}",
         ] {
             let item = parse_json(&format!(
