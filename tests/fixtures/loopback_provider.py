@@ -31,7 +31,8 @@ user, so a request whose prompt carries the guardian policy gets the script's
 turn and the reviewer's verdict.
 
 The first line on stdout is the port. The log gets one JSON line per model
-call: {"call", "reply", "last"}, where "last" is the type and role of the
+call: {"call", "reply", "failed", "last"}, where "failed" is the HTTP status
+of a "fail_first" answer (else null) and "last" is the type and role of the
 request's last input item, plus its "output" when it is a tool result and
 the start of its "text".
 Standard library only.
@@ -201,22 +202,24 @@ class Handler(BaseHTTPRequestHandler):
         with LOCK:
             index = CALLS[0]
             CALLS[0] += 1
+            # Only script entries carry "fail_first", and they live as long
+            # as the process, so their identity keys the count.
+            failed = FAILURES.get(id(reply), 0)
+            status = None
+            if failed < reply.get("fail_first", 0):
+                FAILURES[id(reply)] = failed + 1
+                status = reply.get("fail_status", 503)
             with open(LOG, "a") as log:
                 log.write(json.dumps({
-                    "call": index, "reply": reply,
+                    "call": index, "reply": reply, "failed": status,
                     "last": {"type": last.get("type"), "role": last.get("role"),
                              "output": last.get("output"),
                              "text": text_of(last)[:4000]},
                 }) + "\n")
-        with LOCK:
-            failed = FAILURES.get(id(reply), 0)
-            fail = failed < reply.get("fail_first", 0)
-            if fail:
-                FAILURES[id(reply)] = failed + 1
-        if fail:
+        if status is not None:
             body = json.dumps({"error": {"type": "server_error",
                                          "message": "loopback overloaded"}}).encode()
-            self.send_response(reply.get("fail_status", 503))
+            self.send_response(status)
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(body)))
             self.end_headers()

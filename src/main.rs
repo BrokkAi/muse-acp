@@ -14471,7 +14471,7 @@ mod tests {
     #[test]
     fn model_retry_scheduled_diagnostic_carries_the_attempt_detail() {
         let params = parse_json(
-            r#"{"turnId":"t1","sessionId":"s1","attempt":1,"nextAttempt":2,"maxAttempts":3,"retryDelayMs":2000,"errorKind":"someFutureKind","viewCursor":"c","sourceRange":{"first":1,"last":1}}"#,
+            r#"{"turnId":"t1","sessionId":"s1","attempt":1,"nextAttempt":2,"maxAttempts":3,"retryDelayMs":2000,"errorKind":"someFutureKind","viewCursor":"c","sourceRange":{"first":{"id":"e1","sequence":1},"last":{"id":"e1","sequence":1},"stream":{"id":"s","kind":"session"}}}"#,
         )
         .unwrap();
         let line = model_retry_scheduled_log_line(&params);

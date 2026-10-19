@@ -3275,7 +3275,7 @@ mod corpus_tests {
         let mut fold = SessionFold::new();
         let mut out = Vec::new();
         let params = parse_json(
-            r#"{"turnId":"t1","sessionId":"s1","attempt":1,"nextAttempt":2,"maxAttempts":4,"retryDelayMs":1500,"errorKind":"someFutureKind","httpStatus":503,"system":"meta","viewCursor":"c1","sourceRange":{"first":3,"last":3}}"#,
+            r#"{"turnId":"t1","sessionId":"s1","attempt":1,"nextAttempt":2,"maxAttempts":4,"retryDelayMs":1500,"errorKind":"someFutureKind","httpStatus":503,"system":"meta","viewCursor":"c1","sourceRange":{"first":{"id":"e3","sequence":3},"last":{"id":"e3","sequence":3},"stream":{"id":"s","kind":"session"}}}"#,
         )
         .unwrap();
         fold.on_model_retry_scheduled("sid", "t1", &params, &mut out);

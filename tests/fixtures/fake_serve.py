@@ -1187,20 +1187,26 @@ def on_turn_start(params):
         # The model-layer sibling (Muse 1.4.8) is equally non-terminal. The
         # errorKind is open vocabulary and system/httpStatus are optional, so
         # an unknown kind with both omitted must still fold.
-        record = {"id": "ev-mr", "sequence": 4}
-        notify("turn/modelRetryScheduled", {**base,
-                                           "attempt": 1, "nextAttempt": 2,
-                                           "maxAttempts": 4, "retryDelayMs": 1500,
-                                           "errorKind": "someFutureKind",
-                                           "viewCursor": "cur-mr",
-                                           "sourceRange": {"first": record,
-                                                           "last": record,
-                                                           "stream": {"id": "st-1",
-                                                                      "kind": "session"}}})
+        # A copy arriving after the terminal (a replay) is stale and must not
+        # reopen the hint.
+        def model_retry(attempt, cursor):
+            record = {"id": f"ev-{cursor}", "sequence": attempt}
+            notify("turn/modelRetryScheduled", {**base,
+                                               "attempt": attempt,
+                                               "nextAttempt": attempt + 1,
+                                               "maxAttempts": 4, "retryDelayMs": 1500,
+                                               "errorKind": "someFutureKind",
+                                               "viewCursor": cursor,
+                                               "sourceRange": {"first": record,
+                                                               "last": record,
+                                                               "stream": {"id": "st-1",
+                                                                          "kind": "session"}}})
+        model_retry(1, "cur-mr")
         notify("item/completed", {**base, "item": {
             "itemId": "it-mr", "kind": "agentMessage",
             "status": "completed", "text": "recovered"}})
         notify("turn/completed", {**base, "terminal": "completed"})
+        model_retry(2, "cur-mr-stale")
     elif SCENARIO == "foreground_then_completed":
         # Foreground completion is non-terminal: background reminder checks
         # still hold the turn open, so only the later completion settles.

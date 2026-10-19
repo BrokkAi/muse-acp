@@ -602,7 +602,12 @@ fn a_model_retry_is_shown_while_the_turn_stays_open() {
         "a retry chain bound: {hint}"
     );
     assert!(retry["retryDelayMs"].is_u64(), "{hint}");
-    assert!(retry["errorKind"].is_string(), "{hint}");
+    // The failing kind is optional on the wire and open vocabulary: only its
+    // shape is pinned.
+    assert!(
+        retry.get("errorKind").is_none_or(Value::is_string),
+        "{hint}"
+    );
     let result = adapter.result(id);
     assert_eq!(result["stopReason"], "end_turn", "{result}");
     assert!(

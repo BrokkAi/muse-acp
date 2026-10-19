@@ -3089,6 +3089,21 @@ fn turn_model_retry_is_surfaced_and_the_turn_still_settles_once() {
         Duration::from_secs(15),
     );
     c.wait_stderr("errorKind=someFutureKind", Duration::from_secs(15));
+    // A copy after the terminal is stale: logged, but it must not reopen the
+    // hint. The adapter handles host and editor messages on one loop, so the
+    // answer to a later request proves the stale copy was fully handled.
+    c.wait_stderr("attempt=2 next=3", Duration::from_secs(15));
+    let probe = c.req("_muse/noSuchMethod", "{}");
+    c.wait_for(&format!("\"id\":{probe}"), Duration::from_secs(15));
+    let after = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !after.contains("\"attempt\":2"),
+        "a retry for an ended turn emits no hint: {after}"
+    );
     let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
     assert!(
         !stderr.contains("unhandled MSP notification: turn/modelRetryScheduled"),
