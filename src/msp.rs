@@ -51,6 +51,15 @@ pub struct HandshakeInfo {
     /// Whether the `computerUseSetup` capability was requested and granted.
     /// The adapter's computer-use surface stays dark without it.
     pub computer_use_setup: bool,
+    /// `sandboxAvailability` from the handshake (Muse 1.4.7+), verbatim. A
+    /// property of the host process, not a capability: nothing is requested
+    /// or granted, and absent means unknown (the host predates the field).
+    /// Read it through [`HandshakeInfo::sandbox_posture`].
+    pub sandbox_availability: Option<String>,
+    /// `sandboxUnavailableReason` from the handshake, verbatim. Only
+    /// meaningful beside `unavailable`; read it through
+    /// [`HandshakeInfo::sandbox_reason`].
+    pub sandbox_unavailable_reason: Option<String>,
 }
 
 impl HandshakeInfo {
@@ -136,6 +145,59 @@ impl HandshakeInfo {
     /// call the host may reject.
     pub fn allows_session_rename(&self) -> bool {
         self.session_rename || !self.at_least(1, 4, 8)
+    }
+
+    /// Whether this host can enforce its sandbox: `available`,
+    /// `unavailable`, or `unknown`. The vocabulary is open, so an absent
+    /// field (a host before 1.4.7) and a value this adapter does not know
+    /// both read as `unknown`; neither is guessed into an answer.
+    pub fn sandbox_posture(&self) -> &'static str {
+        match self.sandbox_availability.as_deref() {
+            Some("available") => "available",
+            Some("unavailable") => "unavailable",
+            _ => "unknown",
+        }
+    }
+
+    /// Why the host cannot enforce its sandbox, only when it reported
+    /// `unavailable` and sent a reason. A reason this adapter does not know
+    /// reads as `unknown`; a reason beside any other posture is ignored, and
+    /// none is ever inferred.
+    pub fn sandbox_reason(&self) -> Option<&'static str> {
+        if self.sandbox_posture() != "unavailable" {
+            return None;
+        }
+        match self.sandbox_unavailable_reason.as_deref()? {
+            "userNamespacesDenied" => Some("userNamespacesDenied"),
+            "bubblewrapUnavailable" => Some("bubblewrapUnavailable"),
+            _ => Some("unknown"),
+        }
+    }
+
+    /// One machine-readable line with the host's sandbox facts, beside
+    /// `schema-compat` and `host-features`. `reason=none` means the host
+    /// sent no reason (or the posture is not `unavailable`).
+    pub fn sandbox_line(&self) -> String {
+        format!(
+            "host-sandbox server={} availability={} reason={}",
+            self.host_label(),
+            self.sandbox_posture(),
+            self.sandbox_reason().unwrap_or("none")
+        )
+    }
+
+    /// A human warning when the host reports it cannot enforce its sandbox.
+    /// The adapter gates nothing on this; it only makes the posture visible.
+    pub fn sandbox_warning(&self) -> Option<String> {
+        if self.sandbox_posture() != "unavailable" {
+            return None;
+        }
+        Some(format!(
+            "warning: this Muse host reports it cannot enforce its sandbox{}; tool runs are not isolated by it",
+            self.sandbox_reason()
+                .map(|reason| format!(" (reason: {reason})"))
+                .unwrap_or_default()
+        ))
     }
 }
 
@@ -1176,6 +1238,14 @@ impl MspHost {
             ),
             computer_use_setup: computer_use_setup
                 && matches!(res.get("grantedCapabilities"), Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("computerUseSetup"))),
+            sandbox_availability: res
+                .get("sandboxAvailability")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            sandbox_unavailable_reason: res
+                .get("sandboxUnavailableReason")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         };
         if verdict.is_fatal() {
             host.shutdown();
@@ -1896,6 +1966,8 @@ mod durability_tests {
             feedback: false,
             session_rename: false,
             computer_use_setup: false,
+            sandbox_availability: None,
+            sandbox_unavailable_reason: None,
         }
     }
 
@@ -2012,6 +2084,91 @@ mod durability_tests {
         assert_eq!(
             v142.features_line(),
             "host-features server=s/1.4.2-R4684.1 session_delete=true workspace_roots=true session_cost=true"
+        );
+    }
+
+    fn sandbox(availability: Option<&str>, reason: Option<&str>) -> HandshakeInfo {
+        HandshakeInfo {
+            sandbox_availability: availability.map(str::to_string),
+            sandbox_unavailable_reason: reason.map(str::to_string),
+            ..version("1.4.7-R6101.1", None)
+        }
+    }
+
+    #[test]
+    fn sandbox_facts_are_never_fabricated() {
+        // (availability, reason) as sent -> (posture, reported reason, warns)
+        for (availability, reason, posture, reported, warns) in [
+            (Some("available"), None, "available", None, false),
+            (
+                Some("unavailable"),
+                Some("userNamespacesDenied"),
+                "unavailable",
+                Some("userNamespacesDenied"),
+                true,
+            ),
+            (
+                Some("unavailable"),
+                Some("bubblewrapUnavailable"),
+                "unavailable",
+                Some("bubblewrapUnavailable"),
+                true,
+            ),
+            // No reason sent: none is inferred.
+            (Some("unavailable"), None, "unavailable", None, true),
+            // An unknown reason stays unknown rather than borrowing a known one.
+            (
+                Some("unavailable"),
+                Some("seccompDenied"),
+                "unavailable",
+                Some("unknown"),
+                true,
+            ),
+            // A host before 1.4.7 sends nothing: unknown, never a reason.
+            (None, None, "unknown", None, false),
+            // An unknown posture, or a stray reason beside a non-`unavailable`
+            // posture, never surfaces a reason.
+            (
+                Some("partial"),
+                Some("userNamespacesDenied"),
+                "unknown",
+                None,
+                false,
+            ),
+            (
+                Some("available"),
+                Some("userNamespacesDenied"),
+                "available",
+                None,
+                false,
+            ),
+        ] {
+            let host = sandbox(availability, reason);
+            let case = format!("{availability:?}/{reason:?}");
+            assert_eq!(host.sandbox_posture(), posture, "{case}");
+            assert_eq!(host.sandbox_reason(), reported, "{case}");
+            assert_eq!(host.sandbox_warning().is_some(), warns, "{case}");
+            assert_eq!(
+                host.sandbox_line(),
+                format!(
+                    "host-sandbox server=s/1.4.7-R6101.1 availability={posture} reason={}",
+                    reported.unwrap_or("none")
+                ),
+                "{case}"
+            );
+        }
+        assert_eq!(
+            sandbox(Some("unavailable"), Some("userNamespacesDenied"))
+                .sandbox_warning()
+                .unwrap(),
+            "warning: this Muse host reports it cannot enforce its sandbox (reason: userNamespacesDenied); tool runs are not isolated by it"
+        );
+        assert!(
+            !sandbox(Some("unavailable"), None)
+                .sandbox_warning()
+                .unwrap()
+                .contains("reason"),
+            "a warning without a host reason must not name one"
         );
     }
 }
