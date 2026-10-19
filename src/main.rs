@@ -2219,6 +2219,9 @@ fn selftest() -> i32 {
     for line in compat::selftest_lines(env!("CARGO_PKG_VERSION")) {
         println!("[muse-acp] {line}");
     }
+    // Sandbox availability is a fact only a live host reports, so the
+    // offline row says unknown rather than guessing (`--support` probes it).
+    println!("[muse-acp] host-sandbox server=offline availability=unknown reason=none");
     for line in cli_readiness_lines() {
         println!("[muse-acp] {line}");
     }
@@ -2391,6 +2394,7 @@ fn support_bundle() -> i32 {
         ),
         Err(error) => println!("[muse-acp] support-serve-exit status=unavailable error={error}"),
     }
+    println!("[muse-acp] {}", support_sandbox_line());
     // Adapter-relevant configuration, values shown only when they cannot be
     // credentials. Unknown MUSE_* variables are listed by name, redacted.
     let safe = [
@@ -2419,6 +2423,23 @@ fn support_bundle() -> i32 {
     }
     println!("[muse-acp] support note=no tokens, credentials, or workspace files are included");
     0
+}
+
+/// The host's sandbox facts for the support bundle, read from one
+/// `initialize` handshake with a short-lived `muse serve`. Only the
+/// classified facts are printed, never the host's raw strings.
+fn support_sandbox_line() -> String {
+    match msp::MspHost::launch(false, false, false, &[]) {
+        Ok((host, _events)) => {
+            let line = format!("support-{}", host.handshake().sandbox_line());
+            host.shutdown();
+            line
+        }
+        Err(error) => format!(
+            "support-host-sandbox status=unavailable error={}",
+            error.to_string().lines().next().unwrap_or("")
+        ),
+    }
 }
 
 /// Restart a dead durable host and re-attach every known session.
@@ -3361,6 +3382,10 @@ fn main() {
                                 hi.detail
                             ));
                             log(&hi.features_line());
+                            log(&hi.sandbox_line());
+                            if let Some(warning) = hi.sandbox_warning() {
+                                log(&warning);
+                            }
                             log(if hi.session_mcp {
                                 "client MCP servers: forwarded to Muse (sessionMcp granted)"
                             } else {

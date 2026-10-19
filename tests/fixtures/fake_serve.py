@@ -132,7 +132,10 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
 Host identity (every scenario): FAKE_SERVER_VERSION sets serverInfo.version
 (default 0.0.0-fixture, which no version gate accepts), and
 FAKE_SESSION_DURABILITY sets sessionDurability (absent by default, which MSP
-reads as durable).
+reads as durable). FAKE_SANDBOX_AVAILABILITY and FAKE_SANDBOX_UNAVAILABLE_REASON
+set the 1.4.7 sandboxAvailability and sandboxUnavailableReason facts verbatim
+(both absent by default, like a host before 1.4.7); either may carry a value
+outside the published vocabulary.
 
 Session delete: `session/delete` acks, then reports `session/deleteCompleted`.
 FAKE_DELETE_OUTCOME=failed sends a failed terminal with FAKE_DELETE_REASON
@@ -1420,6 +1423,10 @@ def result_for(method, msg):
         }
         if os.environ.get("FAKE_SESSION_DURABILITY", ""):
             result["sessionDurability"] = os.environ["FAKE_SESSION_DURABILITY"]
+        if os.environ.get("FAKE_SANDBOX_AVAILABILITY", ""):
+            result["sandboxAvailability"] = os.environ["FAKE_SANDBOX_AVAILABILITY"]
+        if os.environ.get("FAKE_SANDBOX_UNAVAILABLE_REASON", ""):
+            result["sandboxUnavailableReason"] = os.environ["FAKE_SANDBOX_UNAVAILABLE_REASON"]
         return result
     if method == "approval/listPending":
         if SCENARIO == "pending_reconcile":
