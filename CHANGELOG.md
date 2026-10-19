@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Re-pin the vendored Muse SDK conformance corpus to `ae46934` (2026-10-16,
+  "remirror: 1.4.10"), which publishes the Muse 1.4.9 stable surface that
+  Muse 1.4.10 carries unchanged. The additions over 1.4.8 are additive: the
+  tool-call display label (`Item.displayLabel` with the `ToolDisplayLabel`
+  active/done/neutral triple) and the `approval/reviewing` notification for
+  an approval the host's native reviewer holds. The vendored bundle is
+  byte-identical to what an installed Muse 1.4.10 exports with
+  `muse schema generate-json-schema`. The adapter tolerates both additions
+  unchanged (an inbound `approval/reviewing` takes the unhandled-notification
+  diagnostic path and never settles a prompt; `displayLabel` is ignored), so
+  this re-pin is documentation-only: the schema corpus, the compatibility
+  table (the new fingerprint classifies as degraded until a pinned 1.4.9 or
+  1.4.10 build joins the live-host matrix), `PROVENANCE.md`, the ROADMAP
+  reference snapshot, sections 1, 2, and 9, the event matrix, and the field
+  matrix. Each new surface the adapter does not drive has a tracking issue,
+  #271 through #273.
+
 - Adopt the remaining Muse 1.4.x field-level and vocabulary additions (#224).
   A turn failure that carries the typed `TurnError.quota` detail now names the
   exhausted limit and the provider's reset wait in the transcript, a
