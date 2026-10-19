@@ -588,7 +588,7 @@ fold's unknown-method path logs and continues.
 | `item/readOutput` | Mapped to ACP | Backs the opt-in `_session/readOutput` extension with bounded `offsetBytes`/`lengthBytes` reads of host-stored tool output. |
 | `session/rename` | Mapped to ACP | The adapter-local `/rename <name>` slash command sends `session/rename` and settles the prompt on the host ack; the new title arrives through `session/nameChanged`. |
 | `session/setReasoningEffort` | Mapped to ACP | Sent when the ACP reasoning `configOptions` selector picks a tier; the selector starts at "Muse default" and cannot clear a standing host default. |
-| `skill/list` | Mapped to ACP | Read per session to build the ACP `available_commands_update` catalog; slash prompts naming a listed skill become native skill turn parts. |
+| `skill/list` | Mapped to ACP | Read per session to build the ACP `available_commands_update` catalog; each skill command carries the skill's name as `_meta.muse.title` (see `SkillCatalogEntry.title` in the field matrix below). Slash prompts naming a listed skill become native skill turn parts. |
 | `task/background` | Unsupported pending protocol decision | The adapter observes backgrounded items but does not issue the host control command; tracked by [#38](https://github.com/BrokkAi/muse-acp/issues/38). |
 | `task/stop` | Mapped to ACP | Sent for `_session/async_task/stop` on a backgrounded tool task when AIR async tasks are negotiated; the terminal item event settles the task. |
 | `task/stopAll` | Mapped to ACP | Sent on `session/cancel` when AIR async tasks are negotiated, so cancellation also stops the session's background work. |
@@ -698,11 +698,12 @@ title (`Session.generatedName`,
 `SessionNameChangedParams.generatedName`) in
 [#256](https://github.com/BrokkAi/muse-acp/issues/256); the resume
 permission-profile pick (`SessionResumeParams.permissionProfile`) in
-[#257](https://github.com/BrokkAi/muse-acp/issues/257); the skill's declared
-`title` (`SkillCatalogEntry.title`) in
-[#258](https://github.com/BrokkAi/muse-acp/issues/258); and the
+[#257](https://github.com/BrokkAi/muse-acp/issues/257); and the
 `turn/modelRetryScheduled` notification in
-[#259](https://github.com/BrokkAi/muse-acp/issues/259). The new
+[#259](https://github.com/BrokkAi/muse-acp/issues/259). The skill's declared
+`title` (`SkillCatalogEntry.title`) is adopted
+([#258](https://github.com/BrokkAi/muse-acp/issues/258)); its row is in the
+field matrix below. The new
 `sessionRename` capability was adopted in
 [#260](https://github.com/BrokkAi/muse-acp/issues/260): the adapter requests
 it at `initialize`, records the grant, and keeps `/rename` typed on a host
@@ -742,6 +743,7 @@ cannot drop a member without failing CI.
 | `SessionTokenUsageParams.modelId` | Mapped to ACP | Keys the per-model cost legs under the prompt result's `_meta.muse.modelUsage`; a leg without a `modelId` is counted in the totals and left out rather than given an invented name. |
 | `SessionGoalChangedParams.goal` | Mapped to ACP | An explicit null clears the goal metadata (clear is kept distinct from never-seen); a non-null goal is stored and emitted. |
 | `Item.cutOff` | Mapped to ACP | A partial agent reply the host committed when the provider stream died is marked once with `_meta.muse.cutOff: true` and the host `itemId`, from whichever of `item/updated`, `item/completed`, a gap refill, or a history replay first carries the flag. A streamed reply gets an empty `agent_message_chunk` naming its `messageId` on ACP v2; a resent or replayed reply carries the mark on its own text update. A late mark only names the latest settled reply, and on ACP v1 (chunks attach by position) waits out a newer streaming reply. Never inferred, repeated, or cleared. [#243](https://github.com/BrokkAi/muse-acp/issues/243) |
+| `SkillCatalogEntry.title` | Mapped to ACP | Each skill command in `available_commands_update` carries the skill's name as `_meta.muse.title`: the declared `title` (Muse 1.4.8+, from `SKILL.md` `metadata.display-name`), else the host's `displayName`. The command `name` stays the selector, and the `description` stays the palette summary unless the host sent an empty one, when it falls back to that name. Adapter-local commands carry no title. [#258](https://github.com/BrokkAi/muse-acp/issues/258) |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**

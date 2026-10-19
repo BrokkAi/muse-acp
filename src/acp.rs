@@ -912,6 +912,19 @@ pub fn reasoning_tier_name(tier: &str) -> &str {
     }
 }
 
+/// One `skill/list` row as the ACP command catalog uses it.
+pub struct CatalogSkill {
+    /// The shortcut token, advertised as the command name.
+    pub selector: String,
+    /// The palette summary, advertised as the command description.
+    pub description: String,
+    /// The skill's name for people to read: its declared `title` (Muse
+    /// 1.4.8+), else the host's `displayName`. `None` when the row carries
+    /// neither.
+    pub title: Option<String>,
+    pub argument_hint: Option<String>,
+}
+
 /// One selectable model from the host's `model/list`.
 #[derive(Clone, Default)]
 pub struct CatalogModel {
@@ -1066,11 +1079,7 @@ pub fn session_modes(session_mode: &str) -> String {
 /// Catalog
 /// rows with a local command's name are deduplicated below so each local
 /// command is advertised exactly once.
-fn available_commands_json(
-    ver: u8,
-    skills: &[(String, String, Option<String>)],
-    feedback: bool,
-) -> String {
+fn available_commands_json(ver: u8, skills: &[CatalogSkill], feedback: bool) -> String {
     let input = |hint: &str| {
         if ver == 1 {
             format!("{{\"hint\":{}}}", esc(hint))
@@ -1119,9 +1128,9 @@ fn available_commands_json(
     items.extend(
         skills
             .iter()
-            .filter(|(name, _, _)| {
+            .filter(|skill| {
                 !matches!(
-                    name.as_str(),
+                    skill.selector.as_str(),
                     "cua"
                         | "goal"
                         | "plugin"
@@ -1131,17 +1140,25 @@ fn available_commands_json(
                         | "skill-import"
                         | "workflow"
                         | "workflow-child"
-                ) && !(feedback && name.as_str() == "feedback")
+                ) && !(feedback && skill.selector == "feedback")
             })
-            .map(|(name, description, hint)| {
-                let input = hint
+            .map(|skill| {
+                let input = skill
+                    .argument_hint
                     .as_deref()
                     .map(|hint| format!(",\"input\":{}", input(hint)))
                     .unwrap_or_default();
+                // ACP commands have no human-readable name field (`name` is
+                // the slash token), so the skill's name rides in `_meta`.
+                let meta = skill
+                    .title
+                    .as_deref()
+                    .map(|title| format!(",\"_meta\":{{\"muse\":{{\"title\":{}}}}}", esc(title)))
+                    .unwrap_or_default();
                 format!(
-                    "{{\"name\":{},\"description\":{}{input}}}",
-                    esc(name),
-                    esc(description),
+                    "{{\"name\":{},\"description\":{}{input}{meta}}}",
+                    esc(&skill.selector),
+                    esc(&skill.description),
                 )
             }),
     );
@@ -1158,7 +1175,7 @@ pub fn send_available_commands(
     stdout: &StdoutShared,
     acp_sid: &str,
     ver: u8,
-    skills: &[(String, String, Option<String>)],
+    skills: &[CatalogSkill],
     feedback: bool,
 ) {
     send_raw(
@@ -1392,18 +1409,22 @@ mod tests {
             );
             assert!(options.contains("\"value\":\"on\""));
 
+            let skill =
+                |selector: &str, description: &str, title: Option<&str>, hint| CatalogSkill {
+                    selector: selector.to_string(),
+                    description: description.to_string(),
+                    title: title.map(str::to_string),
+                    argument_hint: hint,
+                };
             let skills = vec![
-                (
-                    "plan".to_string(),
-                    "Create a plan".to_string(),
+                skill(
+                    "plan",
+                    "Create a plan",
+                    Some("Grounded Planner"),
                     Some("what to plan".to_string()),
                 ),
-                ("rename".to_string(), "Host rename skill".to_string(), None),
-                (
-                    "feedback".to_string(),
-                    "Host feedback skill".to_string(),
-                    None,
-                ),
+                skill("rename", "Host rename skill", None, None),
+                skill("feedback", "Host feedback skill", None, None),
             ];
             let commands = available_commands_json(ver, &skills, true);
             assert!(
@@ -1422,6 +1443,18 @@ mod tests {
                 "the local feedback command absorbs a host skill of the same name: {commands}"
             );
             assert!(commands.contains("\"name\":\"plan\""));
+            let plan = items
+                .iter()
+                .find(|item| item.get("name").and_then(|v| v.as_str()) == Some("plan"))
+                .expect("plan command");
+            assert_eq!(
+                plan.get("_meta")
+                    .and_then(|meta| meta.get("muse"))
+                    .and_then(|muse| muse.get("title"))
+                    .and_then(|v| v.as_str()),
+                Some("Grounded Planner"),
+                "the skill's name rides in _meta.muse.title: {commands}"
+            );
             assert!(commands.contains("\"name\":\"goal\""));
             assert!(commands.contains("\"name\":\"compact\""));
             assert!(commands.contains("\"name\":\"rename\""));

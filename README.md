@@ -347,8 +347,10 @@ error the editor shows if Muse then refuses the profile says why.
   at the last effort the way it already starts at the last model. Picking
   `Muse default` forgets the remembered tier.
 - **Skills** — Muse's skill catalog drives ACP `available_commands_update`.
-  Slash prompts such as `/plan` use native skill turn parts; `/compact` invokes
-  Muse's native compaction.
+  Each skill command carries the skill's name as `_meta.muse.title`: the name
+  the skill declares in `SKILL.md` (`metadata.display-name`, Muse 1.4.8+), or
+  Muse's display name when it declares none. Slash prompts such as `/plan`
+  use native skill turn parts; `/compact` invokes Muse's native compaction.
 - **Goals** — `/goal <objective>` sets the session goal, `/goal edit
   <objective>` replaces it, and `/goal pause`, `/goal resume`, `/goal clear`
   manage it, mapping onto the host `goal/*` methods. When a command starts a

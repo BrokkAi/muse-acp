@@ -33,6 +33,7 @@ const ADDITIONS: &[&str] = &[
     "SessionTokenUsageParams.modelId",
     "SessionGoalChangedParams.goal",
     "Item.cutOff",
+    "SkillCatalogEntry.title",
 ];
 
 fn matrix() -> String {
@@ -193,6 +194,7 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("SessionTokenUsageParams", "modelId"),
         ("SessionGoalChangedParams", "goal"),
         ("Item", "cutOff"),
+        ("SkillCatalogEntry", "title"),
     ] {
         assert!(
             has_property(defs, def, member),
