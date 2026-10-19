@@ -10133,7 +10133,7 @@ fn cua_app_choices_and_installed_picker_round_trip() {
 
     let id = c.req(
         "_session/computerUse",
-        &format!("{{\"sessionId\":\"{sid}\",\"installed\":true}}"),
+        &format!("{{\"sessionId\":\"{sid}\",\"installed\":true,\"showBuiltIns\":true}}"),
     );
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(
@@ -10142,10 +10142,11 @@ fn cua_app_choices_and_installed_picker_round_trip() {
             && frame.contains("\"choice\":\"alwaysAllow\"")
             && frame.contains("\"lockedBy\":\"builtIn\"")
             && frame.contains("\"installedApps\":[")
-            && frame.contains("\"bundleId\":\"com.apple.Safari\""),
-        "the structured read includes effective app rows and the installed picker: {frame}"
+            && frame.contains("\"bundleId\":\"com.apple.Safari\"")
+            && frame.contains("\"prefix\":true"),
+        "the structured read combines effective, built-in, and installed rows: {frame}"
     );
-    c.wait_input("\"installed\": true", Duration::from_secs(10));
+    c.wait_input("\"showBuiltIns\": true", Duration::from_secs(10));
 
     let pid = c.prompt(&sid, "/cua status");
     c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));

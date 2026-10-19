@@ -157,3 +157,5 @@ The expected app row text resembles:
 `CuaAction` gains an installed-app read variant and an app-patch variant carrying ordered `(bundleId, choice)` pairs. `parse_cua_command` validates only closed choices and pair shape. `run_cua` forwards reads and writes through the existing typed host-call helper. `cua_settings_text` renders the new host fields without changing existing output for hosts that omit them. No dependency is added.
 
 Change note (2026-10-19): review pass 1 corrected the live app-patch assertion so it requires the unique probe bundle id in the returned settings text instead of matching an earlier generic settings frame.
+
+Change note (2026-10-19): review pass 2 added coverage for combining `installed` and `showBuiltIns` in one extended settings read.
