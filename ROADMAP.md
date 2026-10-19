@@ -13,8 +13,8 @@ access, and useful in real editor workflows.
   (2026-10-16; stable schema version 1, manifest fingerprint
   `sha256:5d3b43e5ccdb7dc4f5a32c380f5f2cde0f10e3059b93610afb2e73f73b1d914c`,
   the Muse 1.4.9 stable surface that Muse 1.4.10 carries unchanged,
-  byte-identical to an installed 1.4.10's own schema export; degraded
-  pending a pinned 1.4.9/1.4.10 CI build)
+  byte-identical to an installed 1.4.10's own schema export and validated by
+  the pinned 1.4.10 build in the live-host matrix)
   and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
@@ -170,10 +170,9 @@ the verdict into richer support bundles.
   reviewer holds. Muse 1.4.10 carries this surface unchanged — its remirror
   touches no stable-schema file — and an installed Muse 1.4.10 exports a
   schema bundle byte-identical to the vendored copy while reporting this
-  fingerprint byte-for-byte, so the adapter classifies it as degraded rather
-  than unknown; with no pinned 1.4.9 or 1.4.10 build in the live-host matrix
-  yet, it stays degraded rather than tested. The new surfaces have their own
-  tracking issues
+  fingerprint byte-for-byte, so the pinned 1.4.10 build in the live-host
+  matrix is what validates the vendored corpus and the fingerprint classifies
+  as tested. The new surfaces have their own tracking issues
   ([#271](https://github.com/BrokkAi/muse-acp/issues/271) through
   [#273](https://github.com/BrokkAi/muse-acp/issues/273)). Before 1.4.6, the
   Python tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
@@ -222,8 +221,7 @@ dev-dependency; the binary stays dependency-free), and replays every corpus
 approval payload through the permission mapping, requiring ordered choices
 plus a deny fallback, and an env-gated `MUSE_ACP_LIVE_HOST=1` smoke test
 drives a real host handshake, session lifecycle, and close (skipped with an
-explicit message by default). No pinned 1.4.9 or 1.4.10 build has joined the
-matrix yet, so the vendored 1.4.9/1.4.10 surface classifies as degraded. The `live-host` CI job also runs
+explicit message by default). The `live-host` CI job also runs
 `tests/live_loopback.rs` on every push against each pinned Muse build on
 Linux x86-64, and the newest on macOS arm64 (downloaded and
 checksum-verified), with no credentials: a real `muse serve`
@@ -236,7 +234,7 @@ session), `/goal`, `write_todos` as an editor plan, the AIR file-change
 report, editor MCP forwarding, the `userInput` form, and a saved
 `:auto-review` profile. Still to come (#176): subagent spawn, since Muse
 offers no subagent tool to a model it does not know. The pinned builds now
-span 1.3.0, 1.4.1 through 1.4.4, and 1.4.6 through 1.4.8.
+span 1.3.0, 1.4.1 through 1.4.4, 1.4.6 through 1.4.8, and 1.4.10.
 
 The 1.4.2 re-pin is adopted: the live suite now also covers ACP
 `session/delete` against a session this run created, the ownership refusal
@@ -257,7 +255,12 @@ Muse 1.4.6, 1.4.7, and 1.4.8 join the matrix too: 1.4.6-R6000.1,
 1.4.7-R6101.1, and 1.4.8-R6256.1 each run on Linux x86-64 and on Windows x64
 for the workspace-root flows, and 1.4.8 takes over from 1.4.4 as the newest
 build that also runs on macOS arm64. Every checksum is the value in the
-release's own published download manifest. The newer surfaces also added two
+release's own published download manifest. Muse 1.4.10-R6427.1 joins the
+same way — full suite on Linux x86-64, workspace-root flows on Windows x64 —
+and takes over from 1.4.8 as the newest build that also runs on macOS arm64;
+its manifest publishes the same `msp_schema_fingerprint` the vendored corpus
+carries, so that leg is what moves the vendored `ae46934` corpus out of
+`degraded`. The newer surfaces also added two
 host details the suite had to absorb: Muse omits the top-level `toolName` for
 MCP tool approvals and carries it only as `subject.toolName`, which is the
 approval-title fix for
@@ -278,7 +281,7 @@ hosts accept it, so the adapter does not version-gate it. The same run met
 Windows host-platform gaps outside those flows: 1.4.1/1.4.2 answer
 `session/delete` with `UnsupportedPlatform`, the bash-based shell tests
 behave differently than on Linux, and 1.4.1 forks fail their boundary check.
-The 1.4.6, 1.4.7, and 1.4.8 legs have not run on a Windows host yet, so CI is
+The 1.4.6, 1.4.7, 1.4.8, and 1.4.10 legs have not run on a Windows host yet, so CI is
 their first Windows evidence.
 
 **Work items**
