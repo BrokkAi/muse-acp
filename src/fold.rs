@@ -1635,8 +1635,24 @@ impl SessionFold {
         None
     }
 
+    fn tool_display_label(item: &J) -> Option<&str> {
+        let labels = item.get("displayLabel")?;
+        let key = match item.get("status").and_then(J::as_str) {
+            Some("inProgress") => "active",
+            Some("completed") => "done",
+            _ => "neutral",
+        };
+        labels
+            .get(key)
+            .and_then(J::as_str)
+            .filter(|label| !label.trim().is_empty())
+    }
+
     fn tool_title(item: &J) -> (String, String) {
         let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("tool");
+        if let Some(label) = Self::tool_display_label(item) {
+            return (label.to_string(), tool.to_string());
+        }
         let top = item
             .get("commandText")
             .or_else(|| item.get("displayText"))
@@ -2763,6 +2779,118 @@ mod corpus_tests {
             out[0].contains("bash: ls -la"),
             "host display text stays authoritative: {}",
             out[0]
+        );
+    }
+
+    #[test]
+    fn tool_display_label_follows_item_status() {
+        for (status, want) in [
+            ("inProgress", "Setting up Computer Use"),
+            ("completed", "Set up Computer Use"),
+            ("failed", "Computer Use setup"),
+            ("rejected", "Computer Use setup"),
+            ("timedOut", "Computer Use setup"),
+            ("cancelled", "Computer Use setup"),
+            ("futureStatus", "Computer Use setup"),
+        ] {
+            let item = parse_json(&format!(
+                r#"{{"itemId":"it-label","kind":"toolCall","status":"{status}","tool":"computer_use","callId":"call-label","displayLabel":{{"active":"Setting up Computer Use","done":"Set up Computer Use","neutral":"Computer Use setup"}}}}"#
+            ))
+            .unwrap();
+            let (title, tool) = SessionFold::tool_title(&item);
+            assert_eq!(title, want, "{status}");
+            assert_eq!(tool, "computer_use", "{status}");
+        }
+
+        let no_status = parse_json(
+            r#"{"itemId":"it-label","kind":"toolCall","tool":"computer_use","callId":"call-label","displayLabel":{"active":"Setting up Computer Use","done":"Set up Computer Use","neutral":"Computer Use setup"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            SessionFold::tool_title(&no_status).0,
+            "Computer Use setup",
+            "an absent status uses the neutral form"
+        );
+    }
+
+    #[test]
+    fn tool_display_label_changes_on_snapshot_update() {
+        let mut fold = SessionFold::new();
+        let active = parse_json(
+            r#"{"itemId":"it-label","kind":"toolCall","status":"inProgress","tool":"computer_use","callId":"call-label","displayLabel":{"active":"Setting up Computer Use","done":"Set up Computer Use","neutral":"Computer Use setup"}}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &active, &mut out);
+        assert!(
+            out[0].contains("\"title\":\"Setting up Computer Use\""),
+            "{out:?}"
+        );
+
+        let done = parse_json(
+            r#"{"itemId":"it-label","kind":"toolCall","status":"completed","revision":2,"tool":"computer_use","callId":"call-label","displayLabel":{"active":"Setting up Computer Use","done":"Set up Computer Use","neutral":"Computer Use setup"}}"#,
+        )
+        .unwrap();
+        out.clear();
+        fold.on_item_snapshot("sid", 2, &done, &mut out);
+        assert!(
+            out[0].contains("\"title\":\"Set up Computer Use\"")
+                && out[0].contains("\"status\":\"completed\""),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn empty_or_missing_tool_display_label_uses_the_fallback() {
+        for display in [
+            "",
+            ",\"displayLabel\":null",
+            ",\"displayLabel\":\"bad\"",
+            ",\"displayLabel\":{\"done\":\"done\",\"neutral\":\"neutral\"}",
+            ",\"displayLabel\":{\"active\":\"   \",\"done\":\"done\",\"neutral\":\"neutral\"}",
+        ] {
+            let item = parse_json(&format!(
+                r#"{{"itemId":"it-fallback","kind":"toolCall","status":"inProgress","tool":"bash","callId":"call-fallback"{display},"args":"{{\"command\":\"cargo test\"}}"}}"#
+            ))
+            .unwrap();
+            let (title, tool) = SessionFold::tool_title(&item);
+            assert_eq!(title, "bash: cargo test", "{display}");
+            assert_eq!(tool, "bash");
+        }
+    }
+
+    #[test]
+    fn replayed_tool_display_label_is_preserved() {
+        let mut fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"it-replay-label","kind":"toolCall","status":"completed","tool":"computer_use","callId":"call-replay-label","displayLabel":{"active":"Setting up Computer Use","done":"Set up Computer Use","neutral":"Computer Use setup"}}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.replay_item("sid", 2, &item, &mut out);
+        assert!(
+            out.iter()
+                .any(|line| line.contains("\"title\":\"Set up Computer Use\"")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn async_task_uses_the_tool_display_label() {
+        let mut fold = SessionFold::new();
+        fold.air_async_tasks = true;
+        let item = parse_json(
+            r#"{"itemId":"it-bg-label","kind":"toolCall","status":"inProgress","tool":"bash","callId":"call-bg-label","background":true,"displayLabel":{"active":"Running the test suite","done":"Ran the test suite","neutral":"Test suite"}}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &item, &mut out);
+        assert!(
+            out.iter().any(
+                |line| line.contains("\"sessionUpdate\":\"async_task_spawned\"")
+                    && line.contains("\"name\":\"Running the test suite\"")
+            ),
+            "{out:?}"
         );
     }
 

@@ -1547,6 +1547,44 @@ fn tool_call_completion_bridges_with_result_text() {
 }
 
 #[test]
+fn tool_display_label_selects_the_status_specific_title() {
+    let mut c = Client::spawn("tool_display_label", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "set up computer use");
+    let active = c.wait_for_all(
+        &[
+            "\"title\":\"Setting up Computer Use\"",
+            "\"status\":\"in_progress\"",
+            "\"toolCallId\":\"call-display-label\"",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(!active.contains("\"title\":\"computer_use:"), "{active}");
+    let done = c.wait_for_all(
+        &[
+            "\"title\":\"Set up Computer Use\"",
+            "\"status\":\"completed\"",
+            "\"toolCallId\":\"call-display-label\"",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(!done.contains("\"title\":\"computer_use:"), "{done}");
+    let neutral = c.wait_for_all(
+        &[
+            "\"title\":\"Computer Use setup\"",
+            "\"status\":\"failed\"",
+            "\"toolCallId\":\"call-display-neutral\"",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(!neutral.contains("\"title\":\"bash:"), "{neutral}");
+    let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(accepted.contains("\"result\":{}"), "{accepted}");
+    c.wait_for_all(&["\"idle\"", "\"end_turn\""], Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
 fn negotiated_file_change_report_uses_successful_host_tool_paths_once() {
     let caps = ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}";
     let mut c = Client::spawn("file_changes", &[]);

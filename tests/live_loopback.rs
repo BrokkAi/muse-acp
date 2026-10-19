@@ -496,6 +496,42 @@ fn an_approved_shell_command_runs_and_a_rejected_one_does_not() {
 }
 
 #[test]
+fn tool_display_label_reaches_a_real_host() {
+    let test = "tool_display_label_reaches_a_real_host";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(
+        json!({"todos": {"tool": {"name": "write_todos", "arguments": {"todos": [
+            {"text": "Inspect the code", "status": "in_progress"},
+        ]}}}}),
+        None,
+    );
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 9), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    adapter.turn(&session, "plan it [[script:todos]]");
+    let tool = adapter.wait("the host-labelled tool card", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["sessionId"] == json!(session)
+            && matches!(
+                frame["params"]["update"]["sessionUpdate"].as_str(),
+                Some("tool_call" | "tool_call_update")
+            )
+            && frame["params"]["update"]["status"] == json!("in_progress")
+    });
+    let title = tool["params"]["update"]["title"].as_str().unwrap_or("");
+    assert_eq!(
+        title, "write_todos",
+        "the ACP tool card must use the host's active label, not the synthesized `write_todos: args` fallback: {tool}"
+    );
+    adapter.finish();
+}
+
+#[test]
 fn cancel_stops_a_streaming_turn() {
     if !enabled("cancel_stops_a_streaming_turn") {
         return;

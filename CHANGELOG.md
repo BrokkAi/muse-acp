@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Adopt Muse 1.4.9 tool display labels (#272). Tool-card titles now prefer
+  `Item.displayLabel.active` while a call runs, `.done` after success, and
+  `.neutral` for every other status. Live snapshots, completed items, history
+  replay, and AIR async-task announcements all use the same selected label.
+  Missing, null, malformed, or empty labels retain the existing synthesized
+  `tool: detail` title, so pre-1.4.9 hosts keep their current presentation. A
+  live 1.4.10 `write_todos` call verifies the host-selected title reaches ACP.
+
 - Reconcile declined turn retractions with the Muse 1.4.10 fold (#273). When
   `turn/retracted` reports `outcome: "declined"`, the submission stood even
   though the interrupt still stops the turn. The adapter now keeps the ACP
@@ -39,10 +47,10 @@
   active/done/neutral triple) and the `approval/reviewing` notification for
   an approval the host's native reviewer holds. The vendored bundle is
   byte-identical to what an installed Muse 1.4.10 exports with
-  `muse schema generate-json-schema`. The adapter tolerates both additions
-  unchanged (an inbound `approval/reviewing` takes the unhandled-notification
-  diagnostic path and never settles a prompt; `displayLabel` is ignored), so
-  this re-pin is documentation-only: the schema corpus, the compatibility
+  `muse schema generate-json-schema`. The re-pin itself changes no adapter
+  behavior: `approval/reviewing` still takes the unhandled-notification
+  diagnostic path and `displayLabel` adoption lands separately in #272. The
+  re-pin is documentation-only: the schema corpus, the compatibility
   table (the new fingerprint classifies as degraded until a pinned 1.4.9 or
   1.4.10 build joins the live-host matrix), `PROVENANCE.md`, the ROADMAP
   reference snapshot, sections 1, 2, and 9, the event matrix, and the field

@@ -452,10 +452,13 @@ error the editor shows if Muse then refuses the profile says why.
   both defaulting off.
 - **Tasks and subagents** — backgrounded shell commands, workflows, and native
   subagents surfaced through negotiated ACP extensions where the client
-  advertises support, with synthesized tool cards otherwise. On Muse 1.4.6+
-  a resume or re-attach asks the host for its authoritative background-task
-  inventory (`task/list`), so work the replayed history did not carry still
-  appears with a stoppable row.
+  advertises support, with synthesized tool cards otherwise. On Muse 1.4.9+
+  a tool card's title uses the host's `Item.displayLabel`: active wording while
+  running, done wording after success, and neutral wording for failure or
+  cancellation; older or unlabeled calls retain the synthesized `tool: detail`
+  title. On Muse 1.4.6+ a resume or re-attach asks the host for its
+  authoritative background-task inventory (`task/list`), so work the replayed
+  history did not carry still appears with a stoppable row.
 - **File changes** — per-turn workspace file-change reports from the host's
   native file tools when the client negotiates the AIR extension.
 - **Stored output** — bounded tool output with head and tail retained, plus

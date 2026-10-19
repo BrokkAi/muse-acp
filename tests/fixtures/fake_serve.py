@@ -10,6 +10,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   happy        agentMessage completion, then turn/completed(completed)
   failed       no message, then turn/completed(failed)
   tool         toolCall completion with result text, then completed
+  tool_display_label toolCall active->done plus a failed neutral card, then
+               completed; titles come from Item.displayLabel
   file_changes successful native file tools, including a replayed completion
   file_changes_ambiguous a shell tool whose writes cannot be inferred safely
   approval     approval/requested notification (two choices), then completed
@@ -764,6 +766,31 @@ def on_turn_start(params):
             "itemId": "it-t1", "kind": "toolCall", "callId": "call-1",
             "status": "completed", "tool": "read",
             "args": {"path": "/tmp/x"}, "result": "file bytes"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "tool_display_label":
+        label = {"active": "Setting up Computer Use",
+                 "done": "Set up Computer Use",
+                 "neutral": "Computer Use setup"}
+        item = {"itemId": "it-display-label", "kind": "toolCall",
+                "turnId": tid, "tool": "computer_use",
+                "callId": "call-display-label",
+                "args": "{\"target\":\"desktop\"}",
+                "displayLabel": label}
+        notify("item/started", {**base, "item": {
+            **item, "revision": 1, "status": "inProgress"}})
+        notify("item/updated", {**base, "item": {
+            **item, "revision": 2, "status": "completed",
+            "visibleOutput": "Computer Use is ready."}})
+        notify("item/completed", {**base, "item": {
+            **item, "revision": 2, "status": "completed",
+            "visibleOutput": "Computer Use is ready."}})
+        failed = {"itemId": "it-display-neutral", "kind": "toolCall",
+                  "turnId": tid, "tool": "bash", "callId": "call-display-neutral",
+                  "args": "{\"command\":\"false\"}",
+                  "status": "failed", "revision": 1,
+                  "failureReason": "command failed",
+                  "displayLabel": label}
+        notify("item/completed", {**base, "item": failed})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "file_changes":
         changes = [
