@@ -23,7 +23,8 @@ The behavior is observable with the fake MSP host and with a real Muse host whos
 - [x] Update README, ROADMAP, event compatibility, CHANGELOG, and this plan.
 - [x] Run all contribution gates and the focused live test.
 - [x] Open [PR #289](https://github.com/BrokkAi/muse-acp/pull/289).
-- [ ] Complete three review/fix passes and merge only after final CI is green.
+- [x] Complete three review/fix passes.
+- [ ] Merge only after final CI is green.
 
 
 ## Surprises & Discoveries
@@ -38,7 +39,7 @@ The behavior is observable with the fake MSP host and with a real Muse host whos
   Evidence: the schema description says an already-published generated pair is carried again at settlement and omissions mean no pair was ever published.
 
 - Observation: an MSP-created or ordinary loopback `muse` session on the installed Muse 1.4.10 does not publish a generated pair, even after several completed turns.
-  Evidence: the live adapter and a TUI/headless Muse session produced canonical first-prompt titles, but no `generatedName` in any lifecycle snapshot or `session/nameChanged`; the native loopback provider logged no session-description call. The live test therefore pins non-fabrication while fake-host tests pin adoption.
+  Evidence: the live adapter and a TUI/headless Muse session produced canonical first-prompt titles, but no `generatedName` in any lifecycle snapshot or `session/nameChanged`; the native loopback provider logged no session-description call. The focused test also passes against the checksum-pinned Muse 1.4.8 binary. The live test therefore pins non-fabrication while fake-host tests pin adoption.
 
 
 ## Decision Log
@@ -66,7 +67,7 @@ The behavior is observable with the fake MSP host and with a real Muse host whos
 
 ## Outcomes & Retrospective
 
-Implementation is complete, all contribution gates pass, and PR #289 is open. Fake-host coverage proves snapshot restoration, live replacement, withdrawal, list-row preservation, and no fabrication. The real-host test proves the compatibility half: a host that publishes no generated pair does not acquire metadata from its canonical title or a custom rename. The three review/fix passes remain.
+Implementation is complete, all contribution gates pass, PR #289 is open, and all three review/fix passes are complete. Fake-host coverage proves snapshot restoration, live replacement, withdrawal, list-row preservation, and no fabrication. The real-host test proves the compatibility half on checksum-pinned Muse 1.4.8 and installed 1.4.10: a host that publishes no generated pair does not acquire metadata from its canonical title or a custom rename. Final CI remains.
 
 
 ## Context and Orientation
@@ -171,3 +172,5 @@ At completion, `src/main.rs` provides a helper that snapshots the canonical titl
 Change note (2026-10-19): review pass 1 corrected the live-test description and progress to match the implemented and locally validated behavior.
 
 Change note (2026-10-19): review pass 2 strengthened the fake-host list test so a canonical list-row change must republish the previously learned generated title, proving that the fold-only value survives a list read rather than merely checking that the response omits it.
+
+Change note (2026-10-19): review pass 3 corrected the lifecycle helper's absent/malformed/clear contract, narrowed the live-host claim to the checksum-pinned 1.4.8 and installed 1.4.10 evidence, removed a 1.4.8 title-event race from the live test, and recorded completion of all three review passes.

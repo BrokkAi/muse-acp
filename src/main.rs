@@ -932,8 +932,9 @@ fn session_name_origin_from_result(res: &J) -> Option<Option<String>> {
 }
 
 /// Read the fold-only generated short title from a lifecycle result. The
-/// outer `Option` says a `Session` snapshot was present; the inner one keeps
-/// the host's absent field distinct from a malformed or empty value.
+/// outer `Option` says a `Session` snapshot was present. Within that snapshot,
+/// absent, malformed, empty, and null values all read as unpublished and
+/// therefore replace any prior generated-title fact with `None`.
 fn session_generated_name_from_result(res: &J) -> Option<Option<String>> {
     let session = res.get("session")?;
     Some(host_text_fact(session.get("generatedName")))

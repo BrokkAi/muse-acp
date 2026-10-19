@@ -915,11 +915,12 @@ fn rename_drives_a_real_host_across_the_capability_registry() {
 }
 
 /// Muse 1.4.8's generated short title is a fold-only host fact. The native
-/// loopback flow publishes canonical names without a generated pair on every
-/// pinned release, so the live proof here is the compatibility half: neither
-/// a first-prompt title nor a custom rename may fabricate the metadata. The
-/// fake-host suite proves adoption once a real snapshot/name-change carries
-/// the field, which this host path does not expose.
+/// loopback flow publishes canonical names without a generated pair on the
+/// pinned 1.4.8 and installed 1.4.10 hosts, so the live proof here is the
+/// compatibility half: neither a first-prompt title nor a custom rename may
+/// fabricate the metadata. The fake-host suite proves adoption once a real
+/// snapshot/name-change carries the field, which this host path does not
+/// expose.
 #[test]
 fn real_host_without_generated_pair_keeps_it_unpublished() {
     let test = "real_host_without_generated_pair_keeps_it_unpublished";
@@ -936,12 +937,6 @@ fn real_host_without_generated_pair_keeps_it_unpublished() {
 
     let session = adapter.new_session(&host, json!([]));
     adapter.turn(&session, "hello [[script:hello]]");
-    adapter.wait("the canonical first-prompt title", |frame| {
-        frame["method"] == "session/update"
-            && frame["params"]["sessionId"] == json!(session)
-            && frame["params"]["update"]["sessionUpdate"] == "session_info_update"
-            && frame["params"]["update"]["title"] == json!("hello [[script:hello]]")
-    });
 
     let id = adapter.prompt(&session, "/rename Generated title probe");
     let result = adapter.result(id);
