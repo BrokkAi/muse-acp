@@ -135,6 +135,9 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   name_origin  Session.nameOrigin is automatic at start and custom (with a
                new name) on resume; one prompt folds custom, an unknown
                future origin, no origin, then an origin-only re-fold
+  generated_name Session.generatedName is restored from the start snapshot,
+               then live nameChanged frames replace it and clear it; list
+               rows carry only the canonical name
   tool_stored_output tool result with outputRef/patchRef metadata
   tool_output_unavailable outputRef exists but item/readOutput fails
   close_stdin  closes the host's stdin after initialization, then exits
@@ -542,6 +545,8 @@ def session_obj(session_id=None, workspace_root=None):
             session["firstUserPrompt"] = "Host first prompt fallback"
     if SCENARIO == "rename_list":
         session["name"] = "Listed name"
+    if SCENARIO == "generated_name":
+        session["name"] = "Canonical title"
     if SCENARIO == "session_list_stream" and session_id == MSP_SID:
         session["title"] = "Initial title"
     return session
@@ -709,6 +714,24 @@ def on_turn_start(params):
                       "sourceRange": {"start": 1, "end": 1}}
             if origin is not None:
                 change["nameOrigin"] = origin
+            notify("session/nameChanged", change)
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "generated_name":
+        changes = {
+            "turn-1": ("Live short title", True),
+            "turn-2": ("Replacement short title", True),
+            "turn-3": (None, False),
+        }
+        if tid in changes:
+            generated_name, present = changes[tid]
+            change = {
+                "sessionId": ACTIVE_SESSION[0],
+                "name": "Canonical title",
+                "viewCursor": f"cur-generated-{tid[-1]}",
+                "sourceRange": {"start": 1, "end": 1},
+            }
+            if present:
+                change["generatedName"] = generated_name
             notify("session/nameChanged", change)
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "failed":
@@ -1649,6 +1672,8 @@ def result_for(method, msg):
         elif SCENARIO == "name_origin":
             result["session"]["name"] = "Auto name"
             result["session"]["nameOrigin"] = "automatic"
+        elif SCENARIO == "generated_name":
+            result["session"]["generatedName"] = "Initial short title"
         return result
     if method == "skill/list":
         log_input(msg.get("params", {}))
@@ -1767,6 +1792,8 @@ def result_for(method, msg):
         elif SCENARIO == "name_origin":
             session["name"] = "Resumed name"
             session["nameOrigin"] = "custom"
+        elif SCENARIO == "generated_name":
+            session["generatedName"] = "Resumed short title"
         elif SCENARIO == "rename_clear":
             session["name"] = None
         elif SCENARIO == "side_chat" and params.get("sessionId") == "msp-sess-side":

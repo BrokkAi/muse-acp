@@ -914,6 +914,69 @@ fn rename_drives_a_real_host_across_the_capability_registry() {
     adapter.finish();
 }
 
+/// Muse 1.4.8's generated short title is a fold-only host fact. The native
+/// loopback flow publishes canonical names without a generated pair on every
+/// pinned release, so the live proof here is the compatibility half: neither
+/// a first-prompt title nor a custom rename may fabricate the metadata. The
+/// fake-host suite proves adoption once a real snapshot/name-change carries
+/// the field, which this host path does not expose.
+#[test]
+fn real_host_without_generated_pair_keeps_it_unpublished() {
+    let test = "real_host_without_generated_pair_keeps_it_unpublished";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "loopback says hello"}}), None);
+    let mut adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    if release < (1, 4, 8) {
+        adapter.finish();
+        return;
+    }
+
+    let session = adapter.new_session(&host, json!([]));
+    adapter.turn(&session, "hello [[script:hello]]");
+    adapter.wait("the canonical first-prompt title", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["sessionId"] == json!(session)
+            && frame["params"]["update"]["sessionUpdate"] == "session_info_update"
+            && frame["params"]["update"]["title"] == json!("hello [[script:hello]]")
+    });
+
+    let id = adapter.prompt(&session, "/rename Generated title probe");
+    let result = adapter.result(id);
+    assert_eq!(result["stopReason"], "end_turn", "{result}");
+    let renamed = adapter.wait("the canonical rename title", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["sessionId"] == json!(session)
+            && frame["params"]["update"]["sessionUpdate"] == "session_info_update"
+            && frame["params"]["update"]["title"]
+                .as_str()
+                .is_some_and(|title| title.eq_ignore_ascii_case("Generated title probe"))
+    });
+    assert!(
+        renamed["params"]["update"]["_meta"]["muse"]
+            .get("generatedName")
+            .is_none(),
+        "a custom rename must not fabricate a generated short title: {renamed}"
+    );
+
+    let output = adapter.frames.0.lock().unwrap();
+    let fabricated = output.frames.iter().find(|frame| {
+        frame["params"]["sessionId"] == json!(session)
+            && frame["params"]["update"]["sessionUpdate"] == json!("session_info_update")
+            && frame["params"]["update"]["_meta"]["muse"]
+                .get("generatedName")
+                .is_some()
+    });
+    assert!(
+        fabricated.is_none(),
+        "a host that published no generated pair must not produce generatedName: {fabricated:#?}"
+    );
+    drop(output);
+    adapter.finish();
+}
+
 /// The Muse release and full label the adapter reported for its host, read
 /// from its own `host-ready` line.
 fn adapter_host_release(adapter: &Adapter) -> ((u64, u64, u64), String) {

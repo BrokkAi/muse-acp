@@ -371,7 +371,10 @@ error the editor shows if Muse then refuses the profile says why.
   `session/rename`; the new title arrives through `session/nameChanged` as an
   ACP `session_info_update`. When the host proves how the name was set
   (Muse 1.4.7+), the update's `_meta.muse.nameOrigin` says `automatic` or
-  `custom`; unknown provenance is omitted, never guessed. The adapter
+  `custom`; unknown provenance is omitted, never guessed. When Muse retains a
+  generated short title (1.4.8+), the same update carries it as
+  `_meta.muse.generatedName`; it is always the host's value and is never
+  inferred from the canonical name. The adapter
   requests the host's `sessionRename` capability at startup. Muse 1.4.8 added it to the grantable registry; a host
   that withholds the grant is answered with the typed `capabilityRequired`
   refusal, while hosts that predate the entry keep serving `session/rename`

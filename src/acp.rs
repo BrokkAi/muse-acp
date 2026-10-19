@@ -171,6 +171,10 @@ pub struct HostTitleFacts {
     /// fact, an unrecognized future value, or a name this fact does not
     /// describe. Never synthesized.
     pub name_origin: Option<String>,
+    /// The host's generated short title, when a durable generated-name pair
+    /// has been published. This is independent of the canonical ACP title and
+    /// is never inferred from `name`.
+    pub generated_name: Option<String>,
     pub title: Option<String>,
     pub first_user_prompt: Option<String>,
 }
@@ -1416,21 +1420,47 @@ pub fn send_approval_reviewing(
     );
 }
 
-/// Publish a host-authored title change. `None` is an explicit clear so a
-/// client can remove a title after the host renames a session back to blank.
-/// A known name origin rides `_meta.muse.nameOrigin`; an unknown one is
-/// omitted, never fabricated.
+/// How a title update represents the optional generated short title.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GeneratedName<'a> {
+    /// The host proved no generated-title fact and none was previously known.
+    Omit,
+    /// A previously published generated title is no longer present in an
+    /// authoritative host snapshot.
+    Clear,
+    /// The host's current generated short title.
+    Value(&'a str),
+}
+
+/// Publish a host-authored title change. A `None` title is an explicit clear
+/// so a client can remove a title after the host renames a session back to
+/// blank. A known name origin rides `_meta.muse.nameOrigin`; an unknown one is
+/// omitted, never fabricated. The generated short title has independently
+/// omitted, present, and explicitly-cleared states so it can never be confused
+/// with the canonical name.
 pub fn send_session_title(
     stdout: &StdoutShared,
     acp_sid: &str,
     title: Option<&str>,
     name_origin: Option<&str>,
+    generated_name: GeneratedName<'_>,
 ) {
     let title = title.map(esc).unwrap_or_else(|| "null".to_string());
-    let origin = name_origin
-        .map(|origin| format!(",\"_meta\":{{\"muse\":{{\"nameOrigin\":{}}}}}", esc(origin)))
-        .unwrap_or_default();
-    let update = format!("{{\"sessionUpdate\":\"session_info_update\",\"title\":{title}{origin}}}");
+    let mut muse = Vec::new();
+    if let Some(origin) = name_origin {
+        muse.push(format!("\"nameOrigin\":{}", esc(origin)));
+    }
+    match generated_name {
+        GeneratedName::Omit => {}
+        GeneratedName::Clear => muse.push("\"generatedName\":null".to_string()),
+        GeneratedName::Value(name) => muse.push(format!("\"generatedName\":{}", esc(name))),
+    }
+    let meta = if muse.is_empty() {
+        String::new()
+    } else {
+        format!(",\"_meta\":{{\"muse\":{{{}}}}}", muse.join(","))
+    };
+    let update = format!("{{\"sessionUpdate\":\"session_info_update\",\"title\":{title}{meta}}}");
     send_raw(
         stdout,
         &format!(
