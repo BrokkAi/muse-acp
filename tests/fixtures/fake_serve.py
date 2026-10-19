@@ -3021,6 +3021,24 @@ def main():
                         log_input(params)
                         send({"jsonrpc": "2.0", "id": ident, "error": error})
                         continue
+                if method == "session/resume":
+                    params = msg.get("params", {})
+                    profile = params.get("permissionProfile")
+                    reason = {
+                        ":missing": "permission_profile_unknown",
+                        ":unavailable": "permission_profile_unavailable",
+                        ":ephemeral": "permission_profile_ephemeral_fixed",
+                    }.get(profile)
+                    if reason:
+                        log_input(params)
+                        send({"jsonrpc": "2.0", "id": ident,
+                              "error": {"code": -32030,
+                                        "message": f"permission profile {reason}",
+                                        "data": {"kind": "commandRejected",
+                                                 "reason": reason,
+                                                 "profileId": profile,
+                                                 "retryable": False}}})
+                        continue
                 if (method == "computerUseSetup/check"
                         and os.environ.get("FAKE_CUA_HOST_BUSY") == "1"):
                     log_input(msg.get("params", {}))

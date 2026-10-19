@@ -285,6 +285,13 @@ to your editor. Your saved Muse settings, editor launcher, and session data are
 left untouched, and the temporary view is removed when the host exits. Other
 permission profiles are passed through unchanged.
 
+On Muse 1.4.8+, an ACP `session/load` or `session/resume` request can select a
+launch profile with
+`{"_meta":{"muse":{"permissionProfile":"<profile-id>"}}}`. The adapter
+forwards it to the host's resume step; omitting it restores retained authority
+only. Unknown or unavailable ids keep the host's typed `commandRejected`
+refusal. `session/fork` never carries the member.
+
 The view links the rest of your configuration instead of copying it, so
 credentials are never copied. Files Muse creates while it runs, such as the
 credential from your first login or your first workspace trust, are written

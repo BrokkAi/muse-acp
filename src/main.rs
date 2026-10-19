@@ -1836,6 +1836,22 @@ fn additional_directories(params: Option<&J>) -> Result<Vec<String>, String> {
     Ok(roots)
 }
 
+/// The client-selected launch profile for ACP `session/load`/`session/resume`.
+/// It is namespaced because ACP has no core permission-profile field.
+fn resume_permission_profile(params: Option<&J>) -> Result<Option<String>, String> {
+    let Some(value) = params
+        .and_then(|params| params.get("_meta"))
+        .and_then(|meta| meta.get("muse"))
+        .and_then(|muse| muse.get("permissionProfile"))
+    else {
+        return Ok(None);
+    };
+    match value {
+        J::Str(profile) if !profile.is_empty() => Ok(Some(profile.clone())),
+        _ => Err("_meta.muse.permissionProfile must be a non-empty string".to_string()),
+    }
+}
+
 fn session_roots(params: Option<&J>, cwd: &str) -> Result<Vec<String>, String> {
     let mut roots = vec![cwd.to_string()];
     for path in additional_directories(params)? {
@@ -1994,13 +2010,21 @@ fn mcp_config_field(servers: Option<&str>) -> String {
 /// with (MSP has no unload), so a different set is rejected as
 /// `session_configuration_conflict`. Retry once without configuration: the
 /// session attaches with the servers it has instead of becoming unusable.
-fn resume_session(host: &Arc<Hosts>, msp_sid: &str, mcp_servers: Option<&str>) -> Result<J, J> {
+fn resume_session(
+    host: &Arc<Hosts>,
+    msp_sid: &str,
+    mcp_servers: Option<&str>,
+    permission_profile: Option<&str>,
+) -> Result<J, J> {
     let send = |servers: Option<&str>| {
         let cmd = host.mint_cmd("cmd-");
+        let profile = permission_profile
+            .map(|profile| format!(",\"permissionProfile\":{}", esc(profile)))
+            .unwrap_or_default();
         host.command(
             "session/resume",
             &format!(
-                "{{\"commandId\":{},\"sessionId\":{},\"history\":\"inline\"{}}}",
+                "{{\"commandId\":{},\"sessionId\":{},\"history\":\"inline\"{}{profile}}}",
                 esc(&cmd),
                 esc(msp_sid),
                 mcp_config_field(servers)
@@ -2035,7 +2059,7 @@ fn reattach_session(
 ) -> Result<(J, bool), J> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let resumed = loop {
-        let attempt = resume_session(hosts, msp_sid, mcp_servers);
+        let attempt = resume_session(hosts, msp_sid, mcp_servers, None);
         let held = attempt.as_ref().err().is_some_and(|e| {
             err_code(e) == -32021 || msp::rejection_reason(e) == Some("runtime_busy")
         });
@@ -4525,6 +4549,13 @@ fn handle_acp(
                 );
                 return;
             }
+            let permission_profile = match resume_permission_profile(params.as_ref()) {
+                Ok(profile) => profile,
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
             // On hosts that carry the root set, the request's roots are
             // validated before any host call: a load with a missing extra
             // folder must fail, not silently activate nothing.
@@ -4590,7 +4621,12 @@ fn handle_acp(
             let session_mode = mode_on_host(session_mode, host.owner(&msp_sid));
             // Ask for inline history explicitly; the host may still downgrade
             // (history.mode reports what was served).
-            match resume_session(host, &msp_sid, mcp_servers.as_deref()) {
+            match resume_session(
+                host,
+                &msp_sid,
+                mcp_servers.as_deref(),
+                permission_profile.as_deref(),
+            ) {
                 Ok(r) => {
                     // Pending questions/approvals survive reconnects; the host
                     // re-issues their requests, which the normal bridge picks
@@ -4990,10 +5026,12 @@ fn handle_acp(
                     }
                     let msg = err_message(&e);
                     let mut text = format!("resume failed: {msg}");
-                    if let Some(hint) = msp::session_profile_hint(&msg) {
+                    if permission_profile.is_none()
+                        && let Some(hint) = msp::session_profile_hint(&msg)
+                    {
                         text.push_str(&hint);
                     }
-                    acp::send_error(stdout, &id, msp::acp_error_code(&e, -32602), &text);
+                    send_host_error(stdout, &id, &e, -32602, &text);
                 }
             }
         }

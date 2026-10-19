@@ -4744,7 +4744,7 @@ fn load_resends_client_mcp_servers_and_survives_a_configuration_conflict() {
     let load = |c: &mut Client| {
         let id = c.req(
             "session/load",
-            r#"{"sessionId":"msp-sess-old","mcpServers":[{"name":"intellij","command":"idea"}]}"#,
+            r#"{"sessionId":"msp-sess-old","mcpServers":[{"name":"intellij","command":"idea"}],"_meta":{"muse":{"permissionProfile":"team-safe"}}}"#,
         );
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
         assert!(frame.contains("\"result\""), "load failed: {frame}");
@@ -4771,7 +4771,9 @@ fn load_resends_client_mcp_servers_and_survives_a_configuration_conflict() {
     let resumes = attaches(&c);
     assert_eq!(resumes.len(), 2, "{resumes:?}");
     assert_eq!(resumes[0]["config"], config);
+    assert_eq!(resumes[0]["permissionProfile"], "team-safe");
     assert!(resumes[1].get("config").is_none(), "{:?}", resumes[1]);
+    assert_eq!(resumes[1]["permissionProfile"], "team-safe");
     assert_ne!(resumes[0]["commandId"], resumes[1]["commandId"]);
 
     // Without a conflict the configuration is sent once and accepted.
@@ -4779,6 +4781,111 @@ fn load_resends_client_mcp_servers_and_survives_a_configuration_conflict() {
     let resumes = attaches(&c);
     assert_eq!(resumes.len(), 3, "{resumes:?}");
     assert_eq!(resumes[2]["config"], config);
+    c.finish();
+}
+
+#[test]
+fn resume_permission_profile_is_request_scoped_and_typed() {
+    for (ver, method) in [(1, "session/load"), (2, "session/resume")] {
+        let mut c = Client::spawn("quiet", &[]);
+        let sid = c.new_session(ver, "");
+
+        let id = c.req(
+            method,
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"muse\":{{\"permissionProfile\":\"team-safe\"}}}}}}"
+            ),
+        );
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"result\""),
+            "{method} with a profile failed: {frame}"
+        );
+        let requests = host_requests(&c, "session/resume");
+        let selected = requests
+            .iter()
+            .find(|params| params["permissionProfile"] == "team-safe")
+            .unwrap_or_else(|| panic!("{method} must forward the profile: {requests:?}"));
+        assert_eq!(selected["history"], "inline", "{selected}");
+
+        // Omission preserves the retained-authority behavior.
+        let id = c.req(method, &format!("{{\"sessionId\":\"{sid}\"}}"));
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\""), "{method} failed: {frame}");
+        let plain = host_requests(&c, "session/resume")
+            .into_iter()
+            .rev()
+            .find(|params| params["history"] == "inline")
+            .expect("plain resume request");
+        assert!(
+            plain.get("permissionProfile").is_none(),
+            "omitted profile must stay omitted: {plain}"
+        );
+
+        // Malformed metadata fails before the host call.
+        let before = host_requests(&c, "session/resume").len();
+        for profile in ["null", "7", "\"\""] {
+            let id = c.req(
+                method,
+                &format!(
+                    "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"muse\":{{\"permissionProfile\":{profile}}}}}}}"
+                ),
+            );
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            assert!(
+                frame.contains("\"code\":-32602") && frame.contains("_meta.muse.permissionProfile"),
+                "{method} malformed profile {profile}: {frame}"
+            );
+        }
+        assert_eq!(
+            host_requests(&c, "session/resume").len(),
+            before,
+            "{method} malformed profiles must not reach the host"
+        );
+
+        // Admission failures keep the host's typed data.
+        for (profile, reason) in [
+            (":missing", "permission_profile_unknown"),
+            (":unavailable", "permission_profile_unavailable"),
+        ] {
+            let id = c.req(
+                method,
+                &format!(
+                    "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"muse\":{{\"permissionProfile\":\"{profile}\"}}}}}}"
+                ),
+            );
+            let frame = c.wait_for_all(
+                &[&format!("\"id\":{id}"), "\"code\":-32030"],
+                Duration::from_secs(15),
+            );
+            assert!(
+                frame.contains("\"kind\":\"commandRejected\"")
+                    && frame.contains(reason)
+                    && frame.contains(profile),
+                "{method} {profile} keeps the typed refusal: {frame}"
+            );
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn session_fork_never_carries_a_permission_profile() {
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let id = c.req(
+        "session/fork",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"muse\":{{\"permissionProfile\":\"team-safe\"}}}}}}"
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "fork failed: {frame}");
+    let fork = &host_requests(&c, "session/fork")[0];
+    assert!(
+        fork.get("permissionProfile").is_none(),
+        "fork must never carry the resume profile: {fork}"
+    );
     c.finish();
 }
 

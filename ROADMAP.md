@@ -722,7 +722,8 @@ title (`Session.generatedName`,
 ([#256](https://github.com/BrokkAi/muse-acp/issues/256); see the field-matrix
 rows below); the resume
 permission-profile pick (`SessionResumeParams.permissionProfile`) in
-[#257](https://github.com/BrokkAi/muse-acp/issues/257). The skill's declared
+[#257](https://github.com/BrokkAi/muse-acp/issues/257) is adopted (see the
+field-matrix row below). The skill's declared
 `title` (`SkillCatalogEntry.title`) is adopted
 ([#258](https://github.com/BrokkAi/muse-acp/issues/258)); its row is in the
 field matrix below. The `turn/modelRetryScheduled` notification is adopted
@@ -773,7 +774,8 @@ cannot drop a member without failing CI.
 | `TurnRetryScheduledParams.httpStatus` | Consumed | Recorded in the `turn/retryScheduled` diagnostic; the event stays non-terminal and never settles the ACP prompt. |
 | `TurnRetryScheduledParams.system` | Consumed | Recorded in the `turn/retryScheduled` diagnostic; the event stays non-terminal and never settles the ACP prompt. |
 | `TurnRetractedParams.outcome` | Mapped to ACP | An explicit `declined` keeps a tracked prompt, active turn, steering target, and second Stop target open until the interrupt's ordinary `turn/completed` terminal; one transcript note explains the held prompt. Accepted, absent, and unknown outcomes keep the final-retract cancellation path. A late declined retract for an already-settled turn is logged and ignored. |
-| `SessionStartParams.permissionProfile` | Intentionally ignored | The adapter selects approval policy with `approvalMode`; the host's permission-profile catalog is not read or pinned here, and the 1.4.8 resume-time pick has its own issue in [#257](https://github.com/BrokkAi/muse-acp/issues/257). |
+| `SessionStartParams.permissionProfile` | Intentionally ignored | New sessions continue to use the host's configured default and the adapter's `approvalMode`; the separate Muse 1.4.8 launch pick on `session/resume` is mapped in the next row. |
+| `SessionResumeParams.permissionProfile` | Mapped to ACP | `session/load` and `session/resume` accept a non-empty `_meta.muse.permissionProfile` and forward it only to MSP `session/resume`, including on the MCP-configuration conflict retry. Unknown/unavailable ids keep the host's typed `commandRejected` data. `session/fork` never carries it. [#257](https://github.com/BrokkAi/muse-acp/issues/257) |
 | `TurnStartParams.userShell` | Intentionally ignored | A `!cmd` queued behind a running turn is the app's own submit; the adapter drives shells through the `session/userShell` command instead. |
 | `Session.sideFrom` | Mapped to ACP | Published as `session_info_update._meta.muse.sideFrom` when present; the nullable spelling tolerates `null` as "no side provenance". |
 | `SessionBranchChangedParams.branch` | Mapped to ACP | Emitted in `session/update` metadata together with the goal; a null `branch` is preserved as null rather than dropped. |

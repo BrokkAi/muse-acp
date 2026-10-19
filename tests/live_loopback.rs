@@ -979,6 +979,71 @@ fn real_host_without_generated_pair_keeps_it_unpublished() {
     adapter.finish();
 }
 
+#[test]
+fn resume_permission_profile_reaches_a_real_host() {
+    let test = "resume_permission_profile_reaches_a_real_host";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 8), test) else {
+        return;
+    };
+
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.request(
+        "session/load",
+        json!({"sessionId": session, "_meta": {"muse": {
+            "permissionProfile": ":ask-me"
+        }}}),
+    );
+    let response = adapter.response(id);
+    if let Some(error) = response.get("error") {
+        assert_eq!(error["code"], json!(-32030), "{response}");
+        assert_eq!(
+            error["data"]["kind"],
+            json!("commandRejected"),
+            "{response}"
+        );
+        assert!(
+            error["data"]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("permission_profile_")),
+            "{response}"
+        );
+    } else {
+        assert_eq!(
+            response["result"]["sessionId"],
+            json!(session),
+            "{response}"
+        );
+    }
+
+    // An absent id must be the host's typed unknown-profile refusal, never a
+    // generic adapter failure.
+    let id = adapter.request(
+        "session/load",
+        json!({"sessionId": session, "_meta": {"muse": {
+            "permissionProfile": ":muse-acp-live-missing"
+        }}}),
+    );
+    let response = adapter.response(id);
+    assert_eq!(response["error"]["code"], json!(-32030), "{response}");
+    assert_eq!(
+        response["error"]["data"]["kind"],
+        json!("commandRejected"),
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["reason"],
+        json!("permission_profile_unknown"),
+        "{response}"
+    );
+    adapter.finish();
+}
+
 /// Muse 1.4.8's monitor task publishes outside-turn `monitorFeed` items when
 /// armed with visible lines. The loopback model starts a finite shell monitor,
 /// and the adapter must expose one stable, sanitized feed card whose identity
