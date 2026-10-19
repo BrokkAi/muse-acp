@@ -866,6 +866,12 @@ def on_turn_start(params):
         notify("approval/reviewing", approval_params(
             sessionId="child-sess-control", viewCursor="cur-child-review", turnId=tid,
             subject={"kind": "tool", "toolName": "child-tool"}))
+        if os.environ.get("FAKE_CHILD_REVIEW_PARENT_TERMINAL") == "1":
+            notify("turn/completed", {**base, "terminal": "completed"})
+        elif os.environ.get("FAKE_CHILD_REVIEW_CHILD_TERMINAL") == "1":
+            notify("turn/completed", {
+                "sessionId": "child-sess-control", "turnId": tid,
+                "terminal": "completed"})
     elif SCENARIO == "approval_reviewing_then_resolved":
         notify("approval/reviewing",
                approval_params(viewCursor="cur-review", turnId=tid))

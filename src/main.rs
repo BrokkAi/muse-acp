@@ -10403,11 +10403,15 @@ fn handle_msp(
             log(&format!(
                 "turn/completed turn={turn_id} terminal={terminal} detail={terminal_detail}"
             ));
+            let cleanup_sid = find_acp_sid(sessions, msp_sid)
+                .or_else(|| owner_for_msp_session(sessions, msp_sid).map(|route| route.0));
+            if let Some(acp_sid) = cleanup_sid {
+                clear_turn_approval_reviewing(stdout, sessions, &acp_sid, turn_id);
+            }
             let acp_sid = match find_acp_sid(sessions, msp_sid) {
                 Some(s) => s,
                 None => return,
             };
-            clear_turn_approval_reviewing(stdout, sessions, &acp_sid, msp_sid, turn_id);
             // A terminal host event makes an optional feedback form stale.
             // The original permission may still be handled as before, but a
             // form that was already opened cannot submit a late decision.
@@ -11569,7 +11573,6 @@ fn clear_turn_approval_reviewing(
     stdout: &StdoutShared,
     sessions: &Sessions,
     acp_sid: &str,
-    source_session_id: &str,
     turn_id: &str,
 ) {
     let remaining = {
@@ -11578,10 +11581,8 @@ fn clear_turn_approval_reviewing(
             return;
         };
         let before = s.approval_reviewing.len();
-        s.approval_reviewing.retain(|review| {
-            review.source_session_id != source_session_id
-                || review.turn_id.as_deref() != Some(turn_id)
-        });
+        s.approval_reviewing
+            .retain(|review| review.turn_id.as_deref() != Some(turn_id));
         (before != s.approval_reviewing.len()).then(|| s.approval_reviewing.clone())
     };
     if let Some(reviews) = remaining {
