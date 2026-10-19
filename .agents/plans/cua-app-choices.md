@@ -159,3 +159,5 @@ The expected app row text resembles:
 Change note (2026-10-19): review pass 1 corrected the live app-patch assertion so it requires the unique probe bundle id in the returned settings text instead of matching an earlier generic settings frame.
 
 Change note (2026-10-19): review pass 2 added coverage for combining `installed` and `showBuiltIns` in one extended settings read.
+
+Change note (2026-10-19): review pass 3 added direct rendering coverage for the `file` lock reason alongside `builtIn`.

@@ -10155,6 +10155,7 @@ fn cua_app_choices_and_installed_picker_round_trip() {
             "Apps:",
             "Acme Editor [com.acme.Editor]: alwaysAllow (last asked 2026-10-01T12:00:00Z)",
             "Finder [com.apple.finder]: blocked (locked by builtIn)",
+            "Managed App [com.acme.Managed]: blocked (locked by file)",
         ],
         Duration::from_secs(15),
     );
