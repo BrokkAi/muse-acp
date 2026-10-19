@@ -9761,20 +9761,21 @@ fn update_host_session_facts(
     host_session: &J,
     lifecycle: bool,
 ) -> Option<HostTitleUpdate> {
-    adopt_session_projection(session, host_session);
     let before = HostTitleSnapshot::of(&session.title_facts);
     update_title_facts(&mut session.title_facts, host_session);
     if lifecycle {
+        adopt_session_projection(session, host_session);
         adopt_generated_name_fact(&mut session.title_facts, host_session);
+        if let Some(branch) = host_session.get("branch") {
+            session.branch_meta = Some(j_to_string(branch));
+            session.set_session_meta("branch", j_to_string(branch));
+        }
+        if let Some(attention) = host_session.get("attention") {
+            session.attention_meta = Some(j_to_string(attention));
+        }
+    } else {
+        adopt_streamed_session_row(session, host_session);
     }
-    if let Some(branch) = host_session.get("branch") {
-        session.branch_meta = Some(j_to_string(branch));
-        session.set_session_meta("branch", j_to_string(branch));
-    }
-    if let Some(attention) = host_session.get("attention") {
-        session.attention_meta = Some(j_to_string(attention));
-    }
-    adopt_session_projection(session, host_session);
     HostTitleUpdate::after(&before, &session.title_facts)
 }
 
