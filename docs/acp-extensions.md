@@ -154,6 +154,8 @@ operation to `in_progress`, `completed`, `failed`, or `cancelled`. Muse exposes
 no user-visible retained summary on this event, so `summary` is omitted rather
 than synthesized. An unknown future compaction status is sent as the open
 extension status `_museUnknown`; it is never guessed to be success or failure.
+`outcome: "noop"` uses `_museNoop` rather than claiming that context was
+compacted.
 
 Host provenance rides
 `_meta.muse.contextCompaction: {version, status?, outcome?, reason?, trigger?,

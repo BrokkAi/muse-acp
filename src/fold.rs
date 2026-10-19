@@ -865,7 +865,8 @@ impl SessionFold {
             return "cancelled";
         }
         match item.get("outcome").and_then(J::as_str).unwrap_or("") {
-            "compacted" | "noop" => "completed",
+            "compacted" => "completed",
+            "noop" => "_museNoop",
             "cancelled" => "cancelled",
             "failed" => "failed",
             _ if status == "completed" => "completed",
@@ -3338,6 +3339,25 @@ mod corpus_tests {
         let mut out = Vec::new();
         fold.on_item_snapshot("sid", 2, &item, &mut out);
         assert!(out[0].contains("\"status\":\"_museUnknown\""), "{}", out[0]);
+    }
+
+    #[test]
+    fn noop_compaction_does_not_claim_context_was_compacted() {
+        let item = parse_json(
+            r#"{"itemId":"it-c1","kind":"compaction","status":"completed","revision":2,"outcome":"noop","reason":"no_compactable_history"}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        fold.compaction_supported = true;
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &item, &mut out);
+        assert!(out[0].contains("\"status\":\"_museNoop\""), "{}", out[0]);
+        assert!(
+            out[0].contains("\"outcome\":\"noop\"")
+                && out[0].contains("\"reason\":\"no_compactable_history\""),
+            "{}",
+            out[0]
+        );
     }
 
     #[test]
