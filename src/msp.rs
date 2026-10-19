@@ -1085,7 +1085,7 @@ impl MspHost {
     pub fn launch(
         user_input_dialogs: bool,
         user_shell: bool,
-        computer_use_setup: bool,
+        computer_use: bool,
         extra_args: &[&str],
     ) -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
         let bin = muse_cli();
@@ -1161,7 +1161,7 @@ impl MspHost {
         std::thread::spawn(move || reader_loop(reader_host, stdout, tx));
         // Handshake.
         let shell_capability = if user_shell { ",\"userShell\"" } else { "" };
-        let cua_capabilities = if computer_use_setup {
+        let cua_capabilities = if computer_use {
             ",\"computerUseSetup\",\"computerUseHostSetup\""
         } else {
             ""
@@ -1241,9 +1241,9 @@ impl MspHost {
                 res.get("grantedCapabilities"),
                 Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("sessionRename"))
             ),
-            computer_use_setup: computer_use_setup
+            computer_use_setup: computer_use
                 && matches!(res.get("grantedCapabilities"), Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("computerUseSetup"))),
-            computer_use_host_setup: computer_use_setup
+            computer_use_host_setup: computer_use
                 && matches!(res.get("grantedCapabilities"), Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("computerUseHostSetup"))),
             sandbox_availability: res
                 .get("sandboxAvailability")
