@@ -4,16 +4,17 @@ This is a living roadmap for `muse-acp`. It records the direction that keeps the
 adapter close to Muse Session Protocol (MSP), safe around approvals and file
 access, and useful in real editor workflows.
 
-- **Last revised:** 2026-10-14
+- **Last revised:** 2026-10-19
 - **Original planning baseline:** `v0.2.5`; current release history is in
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
-- **Reference snapshots used for this revision:** Muse SDK `838d36a`
-  (2026-10-14; stable schema version 1, manifest fingerprint
-  `sha256:4e3200c3c9dc0cd7919d11022630d43f9bc1c5cdda375381e90b0183b5665069`,
-  the Muse 1.4.8 stable surface, validated by the pinned 1.4.8 build in the
-  live-host matrix)
+- **Reference snapshots used for this revision:** Muse SDK `ae46934`
+  (2026-10-16; stable schema version 1, manifest fingerprint
+  `sha256:5d3b43e5ccdb7dc4f5a32c380f5f2cde0f10e3059b93610afb2e73f73b1d914c`,
+  the Muse 1.4.9 stable surface that Muse 1.4.10 carries unchanged,
+  byte-identical to an installed 1.4.10's own schema export; degraded
+  pending a pinned 1.4.9/1.4.10 CI build)
   and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
@@ -89,8 +90,9 @@ the verdict into richer support bundles.
   pin after that published the 1.4.2 fingerprint, the `537cc8d` pin after
   that published the live-validated 1.4.4 fingerprint, the `ea88c822` pin
   after that published the 1.4.6 fingerprint, the `a0c8611` pin after that
-  published the 1.4.7 fingerprint, and the current `838d36a` pin publishes
-  the 1.4.8 fingerprint. Host 1.2.1 reports
+  published the 1.4.7 fingerprint, the `838d36a` pin after that published
+  the 1.4.8 fingerprint, and the current `ae46934` pin publishes the 1.4.9
+  fingerprint that Muse 1.4.10 carries unchanged. Host 1.2.1 reports
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
   bundle via the binary's own `muse schema` export, plus a live 1.2.1
@@ -159,7 +161,21 @@ the verdict into richer support bundles.
   surfaces have their own tracking issues
   ([#253](https://github.com/BrokkAi/muse-acp/issues/253) through
   [#260](https://github.com/BrokkAi/muse-acp/issues/260)). All three builds
-  are pinned, so all three fingerprints classify as tested. Before 1.4.6, the
+  are pinned, so all three fingerprints classify as tested. The `ae46934`
+  pin publishes the 1.4.9 surface
+  (`sha256:5d3b43e5ccdb7dc4f5a32c380f5f2cde0f10e3059b93610afb2e73f73b1d914c`,
+  schema version 1): the tool-call display label (`Item.displayLabel` with
+  the `ToolDisplayLabel` active/done/neutral triple) and the
+  `approval/reviewing` notification for an approval the host's native
+  reviewer holds. Muse 1.4.10 carries this surface unchanged — its remirror
+  touches no stable-schema file — and an installed Muse 1.4.10 exports a
+  schema bundle byte-identical to the vendored copy while reporting this
+  fingerprint byte-for-byte, so the adapter classifies it as degraded rather
+  than unknown; with no pinned 1.4.9 or 1.4.10 build in the live-host matrix
+  yet, it stays degraded rather than tested. The new surfaces have their own
+  tracking issues
+  ([#271](https://github.com/BrokkAi/muse-acp/issues/271) through
+  [#273](https://github.com/BrokkAi/muse-acp/issues/273)). Before 1.4.6, the
   Python tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
   `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
   surface while the top-level schema stayed on 1.3.0-R3401.1. Transcript
@@ -195,7 +211,7 @@ The SDK publishes generated MSP types, a schema bundle, and recorded transcripts
 The Rust adapter should consume those artifacts as conformance inputs.
 
 Status: **emissions validated and permission paths replayed.**
-`tests/protocol/` pins SDK revision `838d36a` (stable manifest, JSON schema
+`tests/protocol/` pins SDK revision `ae46934` (stable manifest, JSON schema
 bundle, 52 golden transcripts) with provenance and license. CI now replays
 every server-side item event through the notification fold (unknown kinds must
 tolerate), validates every emitted ACP frame with the adapter's own parser,
@@ -206,7 +222,8 @@ dev-dependency; the binary stays dependency-free), and replays every corpus
 approval payload through the permission mapping, requiring ordered choices
 plus a deny fallback, and an env-gated `MUSE_ACP_LIVE_HOST=1` smoke test
 drives a real host handshake, session lifecycle, and close (skipped with an
-explicit message by default). The `live-host` CI job also runs
+explicit message by default). No pinned 1.4.9 or 1.4.10 build has joined the
+matrix yet, so the vendored 1.4.9/1.4.10 surface classifies as degraded. The `live-host` CI job also runs
 `tests/live_loopback.rs` on every push against each pinned Muse build on
 Linux x86-64, and the newest on macOS arm64 (downloaded and
 checksum-verified), with no credentials: a real `muse serve`
@@ -266,7 +283,7 @@ their first Windows evidence.
 
 **Work items**
 
-- Pin the SDK revision (currently `838d36a`, 2026-10-14) and vendor
+- Pin the SDK revision (currently `ae46934`, 2026-10-16) and vendor
   `schema/msp/stable/manifest.json`, `schema/msp/stable/msp.schema.json`, and
   the `schema/msp/transcripts/` corpus under `tests/protocol/`, or fetch that
   locked revision in CI. The corpus already covers approvals, cancellation,
@@ -622,11 +639,11 @@ path, preserving the fail-closed policy from §4.
 
 **Muse 1.4.x stable-surface additions**
 
-Muse 1.4.1 through 1.4.8 grew the stable surface well past 1.3.0. The adapter
+Muse 1.4.1 through 1.4.10 grew the stable surface well past 1.3.0. The adapter
 adopts the parts that fit its ACP mapping (workspace roots, reasoning tiers,
 session delete on the hosts that serve it, `feedback/submit`, and
 `session/list` filters) and records an explicit disposition below for the
-rest, with a tracking issue. The pinned `838d36a` bundle is the authority.
+rest, with a tracking issue. The pinned `ae46934` bundle is the authority.
 The rows below record a disposition for the 1.4.x additions the adapter does
 not drive, plus `feedback/submit`, which it does; incoming notifications with
 no adapter arm stay safe because the unknown-method path in the fold logs and
@@ -667,6 +684,7 @@ continues.
 | `pluginMutationsDisabled` (-32037) | Mapped to ACP | Forwarded with its registry code; the host's refusal never degrades to a generic failure. |
 | `turn/modelRetryScheduled` | Mapped to ACP | A durable, non-terminal observation that a provider backoff behind one model attempt is waiting out its delay. The prompt stays open; while the turn runs the attempt facts reach the editor as `session_info_update._meta.muse.modelRetry` (attempt, next, max, delay, and the optional failing `errorKind`/`system`/`httpStatus`), cleared at the turn's terminal, and are logged like `turn/retryScheduled`. An unknown `errorKind` passes through verbatim ([#259](https://github.com/BrokkAi/muse-acp/issues/259)). |
 | `sessionRename` capability | Mapped to ACP | Requested unconditionally at `initialize`, like `sessionListStream` and `feedback`, and recorded on the handshake. Muse 1.4.3–1.4.7 predate the registry entry: they ignore the unknown name and still serve `session/rename`, so `/rename` keeps working there. From 1.4.8 on the name is registered, and a withheld grant answers `/rename` with the typed `capabilityRequired` (-32010, `data.capability` = `sessionRename`) instead of sending an ungranted call. |
+| `approval/reviewing` | Intentionally ignored | A reviewer-held twin of `approval/requested` (Muse 1.4.9+): the host's native reviewer holds the approval, so no permission prompt opens and no decide is answered. An inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt; the release arrives as `approval/requested` (or `approval/resolved`) on the same id. Adopting it is tracked in [#271](https://github.com/BrokkAi/muse-acp/issues/271). |
 
 The remaining 1.4.x field-level and vocabulary additions — the `webSearch`
 item kind, `mcpLinkError`, `TurnError.quota`, the retry/retraction detail
@@ -709,6 +727,16 @@ above). The new
 it at `initialize`, records the grant, and keeps `/rename` typed on a host
 that withholds it (see the §9 row above).
 
+The 1.4.9 additions have their own issues. The tool-call display label
+(`Item.displayLabel`, `ToolDisplayLabel`) is in
+[#272](https://github.com/BrokkAi/muse-acp/issues/272); the native-reviewer
+hold notice (`approval/reviewing`) is in
+[#271](https://github.com/BrokkAi/muse-acp/issues/271). Muse 1.4.10 adds no
+stable-schema surface of its own; its SDK fold clarification for declined
+`turn/retracted` outcomes is re-examined against the adapter's
+settle-both-arms handling in
+[#273](https://github.com/BrokkAi/muse-acp/issues/273).
+
 **Muse 1.4.x field-level and vocabulary additions**
 
 Muse 1.4.6 grew fields and open vocabularies the adapter's tolerant fold had to
@@ -733,7 +761,7 @@ cannot drop a member without failing CI.
 | `TurnRetryScheduledParams.errorKind` | Consumed | Recorded in the `turn/retryScheduled` diagnostic; the event stays non-terminal and never settles the ACP prompt. |
 | `TurnRetryScheduledParams.httpStatus` | Consumed | Recorded in the `turn/retryScheduled` diagnostic; the event stays non-terminal and never settles the ACP prompt. |
 | `TurnRetryScheduledParams.system` | Consumed | Recorded in the `turn/retryScheduled` diagnostic; the event stays non-terminal and never settles the ACP prompt. |
-| `TurnRetractedParams.outcome` | Consumed | Recorded in the `turn/retracted` diagnostic; `accepted` and `declined` both settle the interrupt-paired prompt as cancelled, so the outcome needs no ACP branch. |
+| `TurnRetractedParams.outcome` | Consumed | Recorded in the `turn/retracted` diagnostic; `accepted` and `declined` both settle the interrupt-paired prompt as cancelled, so the outcome needs no ACP branch. Whether a `declined` outcome should instead hold the prompt is re-examined against the SDK 1.4.10 fold in [#273](https://github.com/BrokkAi/muse-acp/issues/273). |
 | `SessionStartParams.permissionProfile` | Intentionally ignored | The adapter selects approval policy with `approvalMode`; the host's permission-profile catalog is not read or pinned here, and the 1.4.8 resume-time pick has its own issue in [#257](https://github.com/BrokkAi/muse-acp/issues/257). |
 | `TurnStartParams.userShell` | Intentionally ignored | A `!cmd` queued behind a running turn is the app's own submit; the adapter drives shells through the `session/userShell` command instead. |
 | `Session.sideFrom` | Mapped to ACP | Published as `session_info_update._meta.muse.sideFrom` when present; the nullable spelling tolerates `null` as "no side provenance". |
@@ -743,6 +771,7 @@ cannot drop a member without failing CI.
 | `SessionTokenUsageParams.modelId` | Mapped to ACP | Keys the per-model cost legs under the prompt result's `_meta.muse.modelUsage`; a leg without a `modelId` is counted in the totals and left out rather than given an invented name. |
 | `SessionGoalChangedParams.goal` | Mapped to ACP | An explicit null clears the goal metadata (clear is kept distinct from never-seen); a non-null goal is stored and emitted. |
 | `Item.cutOff` | Mapped to ACP | A partial agent reply the host committed when the provider stream died is marked once with `_meta.muse.cutOff: true` and the host `itemId`, from whichever of `item/updated`, `item/completed`, a gap refill, or a history replay first carries the flag. A streamed reply gets an empty `agent_message_chunk` naming its `messageId` on ACP v2; a resent or replayed reply carries the mark on its own text update. A late mark only names the latest settled reply, and on ACP v1 (chunks attach by position) waits out a newer streaming reply. Never inferred, repeated, or cleared. [#243](https://github.com/BrokkAi/muse-acp/issues/243) |
+| `Item.displayLabel` | Unsupported pending protocol decision | The tool's own words for the call (`ToolDisplayLabel`: `active` while `inProgress`, `done` on `completed`, `neutral` beside any other status), which the adapter's synthesized tool-call titles do not read yet; adopting it is tracked in [#272](https://github.com/BrokkAi/muse-acp/issues/272). |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**

@@ -2,8 +2,9 @@
 //!
 //! Issue #224 closed the gap between the pinned 1.4.6 stable surface and the
 //! adapter by deciding, per field (later adoptions, such as #243's 1.4.7
-//! `Item.cutOff`, join the same matrix), whether it earns an ACP mapping or an
-//! explicit "Intentionally ignored" disposition. This test keeps that matrix
+//! `Item.cutOff` and #272's 1.4.9 `Item.displayLabel`, join the same matrix),
+//! whether it earns an ACP mapping or an explicit "Intentionally ignored"
+//! disposition. This test keeps that matrix
 //! honest in two ways: every addition has exactly one disposition row in
 //! `ROADMAP.md` section 9, and every addition is still present (and, where it
 //! matters, still nullable) in the vendored schema bundle — so a schema
@@ -33,6 +34,7 @@ const ADDITIONS: &[&str] = &[
     "SessionTokenUsageParams.modelId",
     "SessionGoalChangedParams.goal",
     "Item.cutOff",
+    "Item.displayLabel",
 ];
 
 fn matrix() -> String {
@@ -193,6 +195,7 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("SessionTokenUsageParams", "modelId"),
         ("SessionGoalChangedParams", "goal"),
         ("Item", "cutOff"),
+        ("Item", "displayLabel"),
     ] {
         assert!(
             has_property(defs, def, member),
