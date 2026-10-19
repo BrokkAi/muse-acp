@@ -38,6 +38,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   retracted    turn/retracted for the turn (no completion follows)
   retract_then_completed retract, then a late turn/completed (settle once)
   retry_then_completed turn/retryScheduled, then a normal completion
+  model_retry_then_completed turn/modelRetryScheduled (unknown errorKind, no
+               httpStatus/system), then a normal completion
   foreground_then_completed turn/foregroundCompleted (background checks hold
                         the turn open), then a normal completion
   foreground_then_retracted turn/foregroundCompleted, then turn/retracted
@@ -1186,6 +1188,30 @@ def on_turn_start(params):
             "itemId": "it-rt", "kind": "agentMessage",
             "status": "completed", "text": "recovered"}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "model_retry_then_completed":
+        # The model-layer sibling (Muse 1.4.8) is equally non-terminal. The
+        # errorKind is open vocabulary and system/httpStatus are optional, so
+        # an unknown kind with both omitted must still fold.
+        # A copy arriving after the terminal (a replay) is stale and must not
+        # reopen the hint.
+        def model_retry(attempt, cursor):
+            record = {"id": f"ev-{cursor}", "sequence": attempt}
+            notify("turn/modelRetryScheduled", {**base,
+                                               "attempt": attempt,
+                                               "nextAttempt": attempt + 1,
+                                               "maxAttempts": 4, "retryDelayMs": 1500,
+                                               "errorKind": "someFutureKind",
+                                               "viewCursor": cursor,
+                                               "sourceRange": {"first": record,
+                                                               "last": record,
+                                                               "stream": {"id": "st-1",
+                                                                          "kind": "session"}}})
+        model_retry(1, "cur-mr")
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-mr", "kind": "agentMessage",
+            "status": "completed", "text": "recovered"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+        model_retry(2, "cur-mr-stale")
     elif SCENARIO == "foreground_then_completed":
         # Foreground completion is non-terminal: background reminder checks
         # still hold the turn open, so only the later completion settles.

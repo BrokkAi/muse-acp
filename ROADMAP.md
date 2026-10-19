@@ -682,7 +682,7 @@ continues.
 | `pluginNotFound` (-32035) | Mapped to ACP | Forwarded with its registry code and the host's typed data. |
 | `marketplaceAlreadyExists` (-32036) | Mapped to ACP | Forwarded with its registry code and the host's typed data. |
 | `pluginMutationsDisabled` (-32037) | Mapped to ACP | Forwarded with its registry code; the host's refusal never degrades to a generic failure. |
-| `turn/modelRetryScheduled` | Intentionally ignored | A durable, non-terminal observation that a provider backoff behind one model attempt is waiting out its delay. The adapter has no arm for it, so an inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt; adopting it is tracked in [#259](https://github.com/BrokkAi/muse-acp/issues/259). |
+| `turn/modelRetryScheduled` | Mapped to ACP | A durable, non-terminal observation that a provider backoff behind one model attempt is waiting out its delay. The prompt stays open; while the turn runs the attempt facts reach the editor as `session_info_update._meta.muse.modelRetry` (attempt, next, max, delay, and the optional failing `errorKind`/`system`/`httpStatus`), cleared at the turn's terminal, and are logged like `turn/retryScheduled`. An unknown `errorKind` passes through verbatim ([#259](https://github.com/BrokkAi/muse-acp/issues/259)). |
 | `sessionRename` capability | Mapped to ACP | Requested unconditionally at `initialize`, like `sessionListStream` and `feedback`, and recorded on the handshake. Muse 1.4.3–1.4.7 predate the registry entry: they ignore the unknown name and still serve `session/rename`, so `/rename` keeps working there. From 1.4.8 on the name is registered, and a withheld grant answers `/rename` with the typed `capabilityRequired` (-32010, `data.capability` = `sessionRename`) instead of sending an ungranted call. |
 | `approval/reviewing` | Intentionally ignored | A reviewer-held twin of `approval/requested` (Muse 1.4.9+): the host's native reviewer holds the approval, so no permission prompt opens and no decide is answered. An inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt; the release arrives as `approval/requested` (or `approval/resolved`) on the same id. Adopting it is tracked in [#271](https://github.com/BrokkAi/muse-acp/issues/271). |
 
@@ -716,12 +716,12 @@ title (`Session.generatedName`,
 `SessionNameChangedParams.generatedName`) in
 [#256](https://github.com/BrokkAi/muse-acp/issues/256); the resume
 permission-profile pick (`SessionResumeParams.permissionProfile`) in
-[#257](https://github.com/BrokkAi/muse-acp/issues/257); and the
-`turn/modelRetryScheduled` notification in
-[#259](https://github.com/BrokkAi/muse-acp/issues/259). The skill's declared
+[#257](https://github.com/BrokkAi/muse-acp/issues/257). The skill's declared
 `title` (`SkillCatalogEntry.title`) is adopted
 ([#258](https://github.com/BrokkAi/muse-acp/issues/258)); its row is in the
-field matrix below. The new
+field matrix below. The `turn/modelRetryScheduled` notification is adopted
+([#259](https://github.com/BrokkAi/muse-acp/issues/259); see the §9 row
+above). The new
 `sessionRename` capability was adopted in
 [#260](https://github.com/BrokkAi/muse-acp/issues/260): the adapter requests
 it at `initialize`, records the grant, and keeps `/rename` typed on a host

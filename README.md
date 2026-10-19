@@ -426,6 +426,13 @@ error the editor shows if Muse then refuses the profile says why.
   editor gets `session_info_update._meta.muse.foregroundCompleted` (`turnId`,
   `blockingAgents`) and an in-progress `Background checks: <agents>` card.
   Both clear before the prompt result.
+- **Model retries** — when a provider backs off and Muse 1.4.8+ schedules a
+  retry of the model attempt (`turn/modelRetryScheduled`), the prompt stays
+  open and the editor gets `session_info_update._meta.muse.modelRetry`
+  (`turnId`, `attempt`, `nextAttempt`, `maxAttempts`, `retryDelayMs`, plus the
+  failing `errorKind`, `system`, and `httpStatus` when the host sends them),
+  so it can show "retrying in Ss, attempt N/M". The hint clears with
+  `modelRetry: null` before the prompt result.
 - **Feedback** — `/feedback [bug|bad|good|other] <note>` sends feedback about
   Muse through the host's `feedback/submit` when Muse grants the capability.
   With form elicitation, one form collects the classification, the note, and
