@@ -163,8 +163,14 @@ Local validation on 2026-10-19:
 
 Focused live test against Muse 1.4.10:
 
-    tool_display_label_reaches_a_real_host: passed
-    observed active title on a real write_todos card: write_todos
+    unlabeled_real_tool_keeps_the_synthesized_title: passed
+    observed unlabeled bash fallback title: bash: pwd
+
+The tools reachable on this Linux host (`read_file`, `write_todos`, `bash`,
+and unavailable Computer Use) do not carry `displayLabel`. Exact active/done/
+neutral selection is therefore pinned by the fake host and fold tests; the
+live test proves the compatibility fallback rather than claiming impossible
+localhost evidence for a field the host did not send.
 
 Review/fix commits:
 
