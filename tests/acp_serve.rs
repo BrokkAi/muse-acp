@@ -3056,14 +3056,13 @@ fn declined_retract_preserves_steering_and_second_cancel() {
 #[test]
 fn duplicate_declined_retract_emits_one_notice() {
     let mut c = Client::spawn(
-        "declined_retract_quiet",
+        "declined_retract_then_completed",
         &[("FAKE_DECLINED_RETRACT_TWICE", "1")],
     );
-    let sid = c.new_session(2, "");
-    let _pid = c.prompt(&sid, "hi");
-    c.wait_for("Muse declined to retract", Duration::from_secs(15));
-    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
-    c.wait_for_all(&["\"idle\"", "\"cancelled\""], Duration::from_secs(15));
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("\"stopReason\":\"end_turn\""), "{done}");
     let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
     assert_eq!(
         frames
