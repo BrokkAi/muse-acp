@@ -11668,7 +11668,7 @@ fn observe_approval_reviewing(
             acp::send_approval_reviewing(stdout, &acp_sid, &reviews);
         }
         None => log(&format!(
-            "approval/reviewing {approval_id} ignored: resolved or already actionable"
+            "approval/reviewing {approval_id} produced no state change: resolved, actionable, or already current"
         )),
     }
 }
