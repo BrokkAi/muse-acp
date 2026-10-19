@@ -21,7 +21,9 @@ The card title is derived from the monitor's arm-time description after removing
 - [x] Add unit, fake-host, matrix, and live-host coverage on Muse 1.4.8 and 1.4.10.
 - [x] Update README, ROADMAP, event compatibility, CHANGELOG, and this plan.
 - [x] Run all contribution gates.
-- [ ] Open a pull request, complete three review/fix passes, and merge only after final CI is green.
+- [x] Open [PR #290](https://github.com/BrokkAi/muse-acp/pull/290).
+- [x] Complete three review/fix passes.
+- [ ] Merge only after final CI is green.
 
 
 ## Surprises & Discoveries
@@ -71,7 +73,7 @@ The card title is derived from the monitor's arm-time description after removing
 
 ## Outcomes & Retrospective
 
-Implementation and all contribution gates are complete. One stable ACP card per monitor carries safe description labeling, accumulated feed text, terminal settlement, and host truncation as `_meta.muse.truncated.source = "host"`. The real host path passes on Muse 1.4.8 and 1.4.10 when the monitor is armed with `show_lines: true`. PR review passes and merge remain.
+Implementation, all contribution gates, and all three review/fix passes are complete. One stable ACP card per monitor carries safe description labeling, accumulated feed text, terminal settlement, and host truncation as `_meta.muse.truncated.source = "host"`. The real host path passes on Muse 1.4.8 and 1.4.10 when the monitor is armed with `show_lines: true`. Final CI and merge remain.
 
 
 ## Context and Orientation
