@@ -487,6 +487,13 @@ only when the client opts in too, with the documented fallback otherwise:
   subagent sessions, async-task observation and stops, model and reasoning
   recommendations.
 
+An ACP client opts into these Muse capabilities by adding the listed names to
+its initialize metadata. For computer use, ACP v2 clients send
+`"capabilities":{"_meta":{"muse":{"capabilities":["computerUse"]}}}` and ACP
+v1 clients put the same `_meta` object under `clientCapabilities`; the older
+boolean form `"computerUse":true` is also accepted. The adapter requests both
+Muse computer-use grants only after receiving that opt-in.
+
 The [MSP event compatibility matrix](docs/event-compatibility.md) records the
 ACP mapping or intentional disposition of every notification in the pinned
 schema. [ROADMAP.md](ROADMAP.md) tracks compatibility, reliability, and release

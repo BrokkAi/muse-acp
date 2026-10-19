@@ -9642,13 +9642,14 @@ fn cua_host_status_and_check_require_the_opt_in_and_grant() {
     );
     for (text, want) in [
         ("/cua host", "Host computer use setup: dormant"),
+        ("/cua host status", "Host computer use setup: dormant"),
         ("/cua host check", "Host computer use check: readyForTarget"),
     ] {
         let pid = c.prompt(&sid, text);
         let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
         assert_eq!(frame.matches("\"result\":{}").count(), 1, "{text}: {frame}");
         let shown = c.wait_for_all(&[want, "agent_message_chunk"], Duration::from_secs(15));
-        if text.ends_with("host") {
+        if !text.ends_with("check") {
             assert!(
                 shown.contains("screen recording missing")
                     && shown.contains("accessibility missing")
