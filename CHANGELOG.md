@@ -10,7 +10,7 @@
   emits one transcript note explaining the retained message. Accepted, absent,
   and unrecognized outcomes retain the immediate cancelled settlement. A
   terminal-first declined retract is logged and ignored, matching real Muse
-  1.4.10 ordering after committed output.
+  1.4.10's observed ordering after committed output.
 
 - Adopt Muse 1.4.7 host-level computer use (#240). A client that opts into
   `_meta.muse.computerUse` now has the adapter request both

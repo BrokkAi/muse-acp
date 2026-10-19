@@ -2994,7 +2994,7 @@ fn declined_retract_waits_for_the_normal_terminal() {
             Duration::from_secs(15),
         );
         assert!(
-            note.contains("terminal will settle this prompt"),
+            note.contains("terminal settles this prompt"),
             "the decline explains the held prompt: {note}"
         );
         c.wait_stderr("turn/retracted turn=turn-1", Duration::from_secs(15));

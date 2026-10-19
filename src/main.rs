@@ -10766,7 +10766,7 @@ fn handle_msp(
                         stdout,
                         &acp_sid,
                         ver,
-                        "Muse declined to retract the submitted message; the turn is still stopping and its terminal will settle this prompt.",
+                        "Muse declined to retract the submitted message; the turn remains open until its terminal settles this prompt.",
                     ),
                     Some((_, false)) => {}
                     None => log(&format!(
