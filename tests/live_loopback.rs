@@ -1760,6 +1760,73 @@ fn skill_activation_reaches_a_real_host() {
     adapter.finish();
 }
 
+/// A user skill's declared name (`SKILL.md` `metadata.display-name`) reaches
+/// the ACP command catalog as `_meta.muse.title`, and a skill that declares
+/// none falls back to the host's `displayName`. Muse 1.4.8 added
+/// `SkillCatalogEntry.title`, so older pins skip.
+#[test]
+fn skill_declared_title_reaches_the_command_catalog() {
+    let test = "skill_declared_title_reaches_the_command_catalog";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), None);
+    // User skills live under the throwaway config root, so no workspace trust
+    // is involved.
+    for (id, metadata) in [
+        (
+            "greet-user",
+            "metadata:\n  display-name: Friendly Greeter\n",
+        ),
+        ("tidy-up", ""),
+    ] {
+        let skill = host.dir.join("config/muse/skills").join(id);
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            format!(
+                "---\nname: {id}\ndescription: Loopback skill {id}\n{metadata}---\nSay hello.\n"
+            ),
+        )
+        .unwrap();
+    }
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 8), test) else {
+        return;
+    };
+    adapter.new_session(&host, json!([]));
+    let commands = adapter.wait("the command catalog", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["update"]["sessionUpdate"] == "available_commands_update"
+    });
+    let command = |name: &str| {
+        commands["params"]["update"]["availableCommands"]
+            .as_array()
+            .expect("commands")
+            .iter()
+            .find(|command| command["name"] == name)
+            .unwrap_or_else(|| panic!("/{name} in {commands}"))
+            .clone()
+    };
+    let greet = command("greet-user");
+    assert_eq!(
+        greet["_meta"]["muse"]["title"], "Friendly Greeter",
+        "{greet}"
+    );
+    assert_eq!(greet["description"], "Loopback skill greet-user", "{greet}");
+    // No declared name: the title is the host's own displayName, whatever
+    // spelling this build derives for it.
+    let tidy = command("tidy-up");
+    assert!(
+        tidy["_meta"]["muse"]["title"]
+            .as_str()
+            .is_some_and(|title| !title.is_empty() && title != "Friendly Greeter"),
+        "{tidy}"
+    );
+    adapter.finish();
+}
+
 /// `/skill-import` dry-runs a foreign-ecosystem import through the host's own
 /// directories. `skill/import` arrived in Muse 1.4.6, so older pins skip.
 #[test]
