@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Pin the Muse 1.4.10 build in the live-host matrix. 1.4.10-R6427.1 runs the
+  full loopback suite on Linux x86-64 and the workspace-root flows on Windows
+  x64, and takes over from 1.4.8 as the newest build that also runs on macOS
+  arm64; every checksum is the value in the release's own published download
+  manifest, whose `msp_schema_fingerprint` matches the vendored corpus. The
+  1.4.9/1.4.10 fingerprint therefore classifies as tested rather than
+  degraded. Two 1.4.10 host behaviors needed test-side adaptations: workflow
+  agent calls now validate the session's effort, so the workflow-child live
+  test pins a supported `reasoning_effort` tier (the loopback settings use
+  `"none"`), and `session/fork` resolves the branch creation time from file
+  birth time, which is unavailable on Linux, so the fork live test skips that
+  host refusal there instead of failing the leg (macOS still proves the
+  fork).
+
 - Re-pin the vendored Muse SDK conformance corpus to `ae46934` (2026-10-16,
   "remirror: 1.4.10"), which publishes the Muse 1.4.9 stable surface that
   Muse 1.4.10 carries unchanged. The additions over 1.4.8 are additive: the

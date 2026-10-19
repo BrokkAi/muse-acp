@@ -120,8 +120,9 @@ pub const HOST_148_FINGERPRINT: &str =
 /// generate-json-schema`, and a live 1.4.10 host reports exactly this digest.
 /// Over 1.4.8 the surface is purely additive (`Item.displayLabel` with the
 /// `ToolDisplayLabel` triple, and the `approval/reviewing` notification),
-/// with nothing removed or newly required. It classifies as degraded until a
-/// pinned 1.4.9 or 1.4.10 build joins the live-host matrix.
+/// with nothing removed or newly required. The pinned 1.4.10 build in the
+/// live-host matrix (`tests/live_loopback.rs`) is what validates the
+/// vendored corpus.
 pub const HOST_149_FINGERPRINT: &str =
     "sha256:5d3b43e5ccdb7dc4f5a32c380f5f2cde0f10e3059b93610afb2e73f73b1d914c";
 
@@ -214,8 +215,8 @@ fn table_entry(fingerprint: &str) -> Option<(Status, &'static str)> {
             "validated against live host 1.4.8; the vendored SDK manifest surface",
         ),
         HOST_149_FINGERPRINT => (
-            Status::Degraded,
-            "Muse 1.4.9/1.4.10 surface; byte-identical to the installed 1.4.10 export, pending a pinned CI build",
+            Status::Tested,
+            "validated against live host 1.4.10; the vendored SDK manifest surface",
         ),
         TRANSCRIPT_FIXTURE_FINGERPRINT => (
             Status::Fixture,
@@ -308,12 +309,11 @@ mod tests {
     }
 
     #[test]
-    fn sdk_manifest_surface_is_the_1_4_9_surface_pending_a_ci_pin() {
+    fn sdk_manifest_surface_is_live_validated_by_the_1_4_10_pin() {
         // The vendored SDK manifest (ae46934) publishes the Muse 1.4.9
-        // surface that Muse 1.4.10 carries unchanged. The bundle is
-        // byte-identical to an installed 1.4.10's own schema export, but no
-        // pinned 1.4.9/1.4.10 build is in the live-host matrix yet, so the
-        // surface classifies as degraded rather than tested.
+        // surface that Muse 1.4.10 carries unchanged, and a live 1.4.10 host
+        // reports the same digest, so the pinned 1.4.10 build in the
+        // live-host matrix validates the corpus.
         assert_eq!(
             SDK_MANIFEST_FINGERPRINT,
             "sha256:5d3b43e5ccdb7dc4f5a32c380f5f2cde0f10e3059b93610afb2e73f73b1d914c"
@@ -321,7 +321,7 @@ mod tests {
         assert_eq!(SDK_MANIFEST_FINGERPRINT, HOST_149_FINGERPRINT);
         assert_ne!(SDK_MANIFEST_FINGERPRINT, HOST_148_FINGERPRINT);
         let c = classify(Some(1), SDK_MANIFEST_FINGERPRINT);
-        assert_eq!(c.status, Status::Degraded);
+        assert_eq!(c.status, Status::Tested);
         assert!(!c.is_fatal());
     }
 
@@ -406,12 +406,12 @@ mod tests {
     }
 
     #[test]
-    fn host_149_fingerprint_is_degraded_pending_a_ci_pin() {
+    fn host_149_fingerprint_is_tested() {
         let c = classify(Some(1), HOST_149_FINGERPRINT);
-        assert_eq!(c.status, Status::Degraded);
+        assert_eq!(c.status, Status::Tested);
         assert_eq!(
             c.detail,
-            "Muse 1.4.9/1.4.10 surface; byte-identical to the installed 1.4.10 export, pending a pinned CI build"
+            "validated against live host 1.4.10; the vendored SDK manifest surface"
         );
         assert!(!c.is_fatal());
     }
