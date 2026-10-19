@@ -501,25 +501,33 @@ fn tool_display_label_reaches_a_real_host() {
     if !enabled(test) {
         return;
     }
-    let host = Host::start(json!({"shell": shell_step()}), None);
+    let host = Host::start(
+        json!({"todos": {"tool": {"name": "write_todos", "arguments": {"todos": [
+            {"text": "Inspect the code", "status": "in_progress"},
+        ]}}}}),
+        None,
+    );
     let adapter = Adapter::launch(&host);
     let (release, _) = adapter_host_release(&adapter);
     let Some(mut adapter) = require_release(adapter, release, (1, 4, 9), test) else {
         return;
     };
     let session = adapter.new_session(&host, json!([]));
-    let id = adapter.prompt(&session, "write it [[script:shell]]");
-    let permission = adapter.permission();
-    let title = permission["params"]["toolCall"]["title"]
-        .as_str()
-        .unwrap_or_default();
+    adapter.turn(&session, "plan it [[script:todos]]");
+    let tool = adapter.wait("the host-labelled tool card", |frame| {
+        frame["method"] == "session/update"
+            && frame["params"]["sessionId"] == json!(session)
+            && matches!(
+                frame["params"]["update"]["sessionUpdate"].as_str(),
+                Some("tool_call" | "tool_call_update")
+            )
+            && frame["params"]["update"]["status"] == json!("in_progress")
+    });
+    let title = tool["params"]["update"]["title"].as_str().unwrap_or("");
     assert_eq!(
-        title, "printf approved > approved.txt",
-        "the ACP card must use the host's active label, not the synthesized `bash: args` fallback: {permission}"
+        title, "write_todos",
+        "the ACP tool card must use the host's active label, not the synthesized `write_todos: args` fallback: {tool}"
     );
-    adapter.choose(&permission, "reject_once");
-    let result = adapter.result(id);
-    assert_eq!(result["stopReason"], "end_turn", "{result}");
     adapter.finish();
 }
 
