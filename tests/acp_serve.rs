@@ -9675,6 +9675,17 @@ fn durable_host_crash_restarts_and_reattaches() {
     let marker_str = marker.to_str().unwrap().to_string();
     let mut c = Client::spawn("host_exit", &[("FAKE_RESTART_MARKER", marker_str.as_str())]);
     let sid = c.new_session(1, "");
+    let load = c.req(
+        "session/load",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"muse\":{{\"permissionProfile\":\"team-safe\"}}}}}}"
+        ),
+    );
+    let loaded = c.wait_for(&format!("\"id\":{load}"), Duration::from_secs(15));
+    assert!(
+        loaded.contains("\"result\""),
+        "profile load must succeed before the crash: {loaded}"
+    );
     let p1 = c.prompt(&sid, "before crash");
     let f1 = c.wait_for(&format!("\"id\":{p1}"), Duration::from_secs(15));
     assert!(
@@ -9694,6 +9705,26 @@ fn durable_host_crash_restarts_and_reattaches() {
     assert!(
         f2.contains("\"stopReason\":\"end_turn\""),
         "post-restart prompt failed: {f2}"
+    );
+    let resumes = host_requests(&c, "session/resume");
+    assert!(
+        resumes.len() >= 2,
+        "the client load and replacement-host reattach must both resume: {resumes:?}"
+    );
+    assert_eq!(
+        resumes
+            .iter()
+            .filter(|params| params["permissionProfile"] == "team-safe")
+            .count(),
+        1,
+        "only the client's load may select its launch profile: {resumes:?}"
+    );
+    assert!(
+        resumes
+            .iter()
+            .skip(1)
+            .all(|params| params.get("permissionProfile").is_none()),
+        "adapter recovery must not repeat the client's profile: {resumes:?}"
     );
     c.finish();
     let _ = std::fs::remove_file(&marker);
