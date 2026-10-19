@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Reconcile declined turn retractions with the Muse 1.4.10 fold (#273). When
+  `turn/retracted` reports `outcome: "declined"`, the submission stood even
+  though the interrupt still stops the turn. The adapter now keeps the ACP
+  prompt, active turn, retry/background-check hints, steering target, and
+  second-Stop target alive until the ordinary `turn/completed` terminal, and
+  emits one transcript note explaining the retained message. Accepted, absent,
+  and unrecognized outcomes retain the immediate cancelled settlement. A
+  terminal-first declined retract is logged and ignored, matching real Muse
+  1.4.10's observed ordering after committed output.
+
 - Adopt Muse 1.4.7 host-level computer use (#240). A client that opts into
   `_meta.muse.computerUse` now has the adapter request both
   `computerUseSetup` and `computerUseHostSetup`. `/cua host` reads the host's
