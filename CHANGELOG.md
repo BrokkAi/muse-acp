@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Adopt Muse 1.4.7 host-level computer use (#240). A client that opts into
+  `_meta.muse.computerUse` now has the adapter request both
+  `computerUseSetup` and `computerUseHostSetup`. `/cua host` reads the host's
+  setup state and three macOS grants, and `/cua host check` asks the host to
+  inspect those grants without prompting or opening System Settings. These
+  ordinary prompt commands do not require the custom `_session/computerUse`
+  extension; `/cua status` and `/cua on` remain session-scoped. The grants are
+  independent and fail closed, sessionless setup-change notices are consumed,
+  and a busy helper preserves the host's typed `commandRejected` (`-32030`)
+  `runtime_busy` data.
+
 - Adopt the Muse 1.4.7 `SessionNameOrigin` name provenance (#242). The
   adapter folds `Session.nameOrigin` and `SessionNameChangedParams.nameOrigin`
   with the name they describe and publishes a proven origin (`automatic` or

@@ -9512,7 +9512,10 @@ fn cua_commands_drive_setup_and_settings() {
     }
     c.wait_log("computerUseSetup/start", Duration::from_secs(10));
     // The setup change notice is consumed (no unhandled-notification error).
-    c.wait_stderr("computerUseSetup/changed", Duration::from_secs(10));
+    c.wait_stderr(
+        "computer use session setup changed:",
+        Duration::from_secs(10),
+    );
 
     let pid = c.prompt(&sid, "/cua set screenshots alwaysAllow");
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
@@ -9557,6 +9560,177 @@ fn cua_commands_drive_setup_and_settings() {
         "the command respects the gate: {frame}"
     );
     bare.finish();
+    c.finish();
+}
+
+#[test]
+fn cua_host_status_and_check_require_the_opt_in_and_grant() {
+    const OPT_IN: &str =
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"computerUse\"]}}}";
+    let frames_for = |c: &Client| -> Vec<serde_json::Value> {
+        std::fs::read_to_string(format!("{}.frames", c.fake_log))
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    };
+    let requests = |c: &Client| -> Vec<serde_json::Value> {
+        frames_for(c)
+            .into_iter()
+            .find(|frame| frame["method"] == "initialize")
+            .and_then(|frame| {
+                frame["params"]["capabilities"]["requestedCapabilities"]
+                    .as_array()
+                    .cloned()
+            })
+            .unwrap_or_default()
+    };
+
+    // No ACP opt-in: refuse before reading either grant or sending a method.
+    let mut c = Client::spawn("computer_use", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "/cua host");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32601") && frame.contains("computerUse opt-in"),
+        "the host target must fail closed without opt-in: {frame}"
+    );
+    assert!(
+        !requests(&c).iter().any(|cap| matches!(
+            cap.as_str(),
+            Some("computerUseSetup" | "computerUseHostSetup")
+        )),
+        "computer-use capabilities must not be requested without opt-in"
+    );
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !calls.lines().any(|line| line.starts_with("computerUse")),
+        "the refused command never reaches the host: {calls}"
+    );
+    c.finish();
+
+    // The client opted in, but the host withheld the host-wide grant.
+    let mut c = Client::spawn("computer_use", &[("FAKE_NO_COMPUTER_USE_HOST", "1")]);
+    let sid = c.new_session(2, OPT_IN);
+    let pid = c.prompt(&sid, "/cua host check");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32601") && frame.contains("computerUseHostSetup grant"),
+        "a withheld host grant must fail closed: {frame}"
+    );
+    let requested = requests(&c);
+    for capability in ["computerUseSetup", "computerUseHostSetup"] {
+        assert!(
+            requested.iter().any(|cap| cap.as_str() == Some(capability)),
+            "the opt-in must request {capability}: {requested:?}"
+        );
+    }
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !calls.lines().any(|line| line.starts_with("computerUse")),
+        "the withheld host grant never reaches the host: {calls}"
+    );
+    c.finish();
+
+    // Both grants: host read and check settle with ordinary agent text.
+    let mut c = Client::spawn("computer_use", &[]);
+    let sid = c.new_session(2, OPT_IN);
+    let available = c.wait_for("\"name\":\"cua\"", Duration::from_secs(15));
+    assert!(
+        available.contains("host [status|check]"),
+        "the command catalog documents the host target: {available}"
+    );
+    for (text, want) in [
+        ("/cua host", "Host computer use setup: dormant"),
+        ("/cua host status", "Host computer use setup: dormant"),
+        ("/cua host check", "Host computer use check: readyForTarget"),
+    ] {
+        let pid = c.prompt(&sid, text);
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert_eq!(frame.matches("\"result\":{}").count(), 1, "{text}: {frame}");
+        let shown = c.wait_for_all(&[want, "agent_message_chunk"], Duration::from_secs(15));
+        if !text.ends_with("check") {
+            assert!(
+                shown.contains("screen recording missing")
+                    && shown.contains("accessibility missing")
+                    && shown.contains("input monitoring missing"),
+                "host status names all three grants: {shown}"
+            );
+        } else {
+            assert!(
+                shown.contains("screen recording granted")
+                    && shown.contains("accessibility granted")
+                    && shown.contains("input monitoring missing"),
+                "host check names all three grants: {shown}"
+            );
+        }
+    }
+    c.wait_frame_contains(
+        "\"method\": \"computerUseSetup/check\"",
+        Duration::from_secs(10),
+    );
+    c.wait_stderr(
+        "computer use host setup changed: setup=readyForTarget",
+        Duration::from_secs(10),
+    );
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap();
+    assert!(
+        !stderr.contains("unhandled MSP notification: computerUseSetup/changed"),
+        "the sessionless change notice is explicitly consumed: {stderr}"
+    );
+    let frames = frames_for(&c);
+    let host_read = frames
+        .iter()
+        .find(|frame| frame["method"] == "computerUseSetup/read")
+        .expect("host setup read frame");
+    assert_eq!(
+        host_read["params"],
+        serde_json::json!({}),
+        "host read must omit sessionId"
+    );
+    let host_check = frames
+        .iter()
+        .find(|frame| frame["method"] == "computerUseSetup/check")
+        .expect("host setup check frame");
+    assert_eq!(
+        host_check["params"],
+        serde_json::json!({}),
+        "host check takes no params"
+    );
+    assert!(
+        !frames.iter().any(|frame| frame["method"] == "turn/start"),
+        "host commands settle without starting a model turn"
+    );
+    c.finish();
+
+    // The grants are independent: host setup still works without the
+    // per-session grant, while session setup stays dark.
+    let mut c = Client::spawn("computer_use", &[("FAKE_NO_COMPUTER_USE", "1")]);
+    let sid = c.new_session(2, OPT_IN);
+    let pid = c.prompt(&sid, "/cua host");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\":{}"), "{frame}");
+    c.wait_for("Host computer use setup: dormant", Duration::from_secs(15));
+    let pid = c.prompt(&sid, "/cua status");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32601") && frame.contains("computerUseSetup grant"),
+        "the session target keeps its independent grant gate: {frame}"
+    );
+    c.finish();
+
+    // A busy helper keeps the host's typed command rejection and data.
+    let mut c = Client::spawn("computer_use", &[("FAKE_CUA_HOST_BUSY", "1")]);
+    let sid = c.new_session(2, OPT_IN);
+    let pid = c.prompt(&sid, "/cua host check");
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"code\":-32030")
+            && frame.contains("\"kind\":\"commandRejected\"")
+            && frame.contains("\"reason\":\"runtime_busy\"")
+            && frame.contains("\"retryable\":false"),
+        "the busy refusal must stay typed: {frame}"
+    );
     c.finish();
 }
 
@@ -10940,7 +11114,7 @@ fn emitted_frames_conform_to_the_vendored_schema() {
             ("FAKE_SESSION_ID", DELETE_SESSION_ID),
         ],
     );
-    let caps = ",\"capabilities\":{\"elicitation\":{\"form\":{}},\"subagents\":{}}";
+    let caps = ",\"capabilities\":{\"elicitation\":{\"form\":{}},\"subagents\":{},\"_meta\":{\"muse\":{\"capabilities\":[\"computerUse\"]}}}";
     let sid = c.new_session(2, caps);
     let _pid = c.prompt(&sid, "needs approval");
     c.wait_for("session/request_permission", Duration::from_secs(15));
@@ -10966,6 +11140,11 @@ fn emitted_frames_conform_to_the_vendored_schema() {
     c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
     let cid = c.prompt(&sid, "/compact");
     c.wait_for(&format!("\"id\":{cid}"), Duration::from_secs(15));
+    for text in ["/cua host", "/cua host check"] {
+        let pid = c.prompt(&sid, text);
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\":{}"), "{text}: {frame}");
+    }
     for text in [
         "/goal Green the suite",
         "/goal pause",
@@ -11030,6 +11209,8 @@ fn emitted_frames_conform_to_the_vendored_schema() {
         "session/fork",
         "session/read",
         "session/compact",
+        "computerUseSetup/read",
+        "computerUseSetup/check",
         "session/setModel",
         "turn/start",
         "approval/decide",

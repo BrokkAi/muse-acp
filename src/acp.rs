@@ -1112,7 +1112,9 @@ fn available_commands_json(ver: u8, skills: &[CatalogSkill], feedback: bool) -> 
         ),
         format!(
             "{{\"name\":\"cua\",\"description\":\"Computer-use setup and settings\",\"input\":{}}}",
-            input("[status|on|set <capability> <choice>|block|unblock <bundleId>]")
+            input(
+                "[status|host [status|check]|on|set <capability> <choice>|block|unblock <bundleId>]"
+            )
         ),
         format!(
             "{{\"name\":\"plugin\",\"description\":\"Install plugins and manage marketplaces\",\"input\":{}}}",

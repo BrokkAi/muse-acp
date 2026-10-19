@@ -51,6 +51,9 @@ pub struct HandshakeInfo {
     /// Whether the `computerUseSetup` capability was requested and granted.
     /// The adapter's computer-use surface stays dark without it.
     pub computer_use_setup: bool,
+    /// Whether the host-wide `computerUseHostSetup` capability was requested
+    /// and granted. Host setup reads and checks stay dark without it.
+    pub computer_use_host_setup: bool,
     /// `sandboxAvailability` from the handshake (Muse 1.4.7+), verbatim. A
     /// property of the host process, not a capability: nothing is requested
     /// or granted, and absent means unknown (the host predates the field).
@@ -564,9 +567,9 @@ pub fn turn_auth_diagnostic(
 }
 
 /// ACP reserves -32000 for authentication required. MSP's stable
-/// protocol-surface errors (a rejected skill lookup and the plugin and
-/// marketplace write refusals) keep their registry codes; other MSP errors
-/// retain the caller's existing ACP mapping.
+/// protocol-surface errors (command rejections, a rejected skill lookup, and
+/// the plugin and marketplace write refusals) keep their registry codes;
+/// other MSP errors retain the caller's existing ACP mapping.
 pub fn acp_error_code(error: &J, fallback: i64) -> i64 {
     if auth_failure(&err_message(error)).is_some() {
         return -32000;
@@ -577,6 +580,7 @@ pub fn acp_error_code(error: &J, fallback: i64) -> i64 {
         .and_then(|kind| kind.as_str())
         .unwrap_or("");
     match kind {
+        "commandRejected" => -32030,
         "skillNotFound" => -32032,
         "marketplaceNotFound" => -32034,
         "pluginNotFound" => -32035,
@@ -820,11 +824,11 @@ fn classify_status(status: &ExitStatus, stderr_tail: String) -> ExitClassificati
 }
 
 /// Structured data for the MSP request errors ACP clients need to branch on:
-/// a rejected skill selector, the plugin/marketplace write refusals, and the
-/// capability-gated methods (`capabilityRequired`). The host payload stays
-/// visible so a client sees which selector, marketplace, plugin, or
-/// capability was refused.
-pub fn skill_error_data(error: &J) -> Option<String> {
+/// rejected commands and skill selectors, plugin/marketplace write refusals,
+/// and capability-gated methods. The host payload stays visible so a client
+/// sees which command, selector, marketplace, plugin, or capability was
+/// refused.
+pub fn typed_error_data(error: &J) -> Option<String> {
     let data = error.get("data")?;
     let kind = data
         .get("kind")
@@ -832,7 +836,8 @@ pub fn skill_error_data(error: &J) -> Option<String> {
         .unwrap_or("");
     let typed = matches!(
         kind,
-        "skillNotFound"
+        "commandRejected"
+            | "skillNotFound"
             | "marketplaceNotFound"
             | "pluginNotFound"
             | "marketplaceAlreadyExists"
@@ -1080,7 +1085,7 @@ impl MspHost {
     pub fn launch(
         user_input_dialogs: bool,
         user_shell: bool,
-        computer_use_setup: bool,
+        computer_use: bool,
         extra_args: &[&str],
     ) -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
         let bin = muse_cli();
@@ -1156,8 +1161,8 @@ impl MspHost {
         std::thread::spawn(move || reader_loop(reader_host, stdout, tx));
         // Handshake.
         let shell_capability = if user_shell { ",\"userShell\"" } else { "" };
-        let cua_capability = if computer_use_setup {
-            ",\"computerUseSetup\""
+        let cua_capabilities = if computer_use {
+            ",\"computerUseSetup\",\"computerUseHostSetup\""
         } else {
             ""
         };
@@ -1170,7 +1175,7 @@ impl MspHost {
         // lets session/new report a logged-out host before the first turn
         // (see `MspHost::logged_out`). On Muse 1.4.0 it gates nothing else.
         let init_params = format!(
-            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"experimentalApi":true,"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream","sessionMcp","feedback","sessionRename"{shell_capability}{cua_capability}]}}}}"#,
+            r#"{{"clientInfo":{{"name":"muse_acp","version":{ver}}},"capabilities":{{"experimentalApi":true,"userInputDialogs":{user_input_dialogs},"requestedCapabilities":["sessionListStream","sessionMcp","feedback","sessionRename"{shell_capability}{cua_capabilities}]}}}}"#,
             ver = crate::json::esc(env!("CARGO_PKG_VERSION")),
             user_input_dialogs = user_input_dialogs
         );
@@ -1236,8 +1241,10 @@ impl MspHost {
                 res.get("grantedCapabilities"),
                 Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("sessionRename"))
             ),
-            computer_use_setup: computer_use_setup
+            computer_use_setup: computer_use
                 && matches!(res.get("grantedCapabilities"), Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("computerUseSetup"))),
+            computer_use_host_setup: computer_use
+                && matches!(res.get("grantedCapabilities"), Some(J::Arr(caps)) if caps.iter().any(|c| c.as_str() == Some("computerUseHostSetup"))),
             sandbox_availability: res
                 .get("sandboxAvailability")
                 .and_then(|v| v.as_str())
@@ -1937,12 +1944,25 @@ mod tests {
             Some("sessionRename")
         );
         assert_eq!(
-            super::skill_error_data(&error).as_deref(),
+            super::typed_error_data(&error).as_deref(),
             Some(r#"{"capability":"sessionRename","kind":"capabilityRequired","retryable":false}"#)
         );
         assert_eq!(
             super::err_message(&error),
             "session/rename requires the sessionRename capability"
+        );
+    }
+
+    #[test]
+    fn command_rejected_keeps_the_host_refusal_shape() {
+        let error = crate::json::parse_json(
+            r#"{"code":-32030,"message":"computerUseSetup/check rejected: runtime_busy","data":{"kind":"commandRejected","reason":"runtime_busy","retryable":false}}"#,
+        )
+        .expect("error JSON");
+        assert_eq!(super::acp_error_code(&error, -32603), -32030);
+        assert_eq!(
+            super::typed_error_data(&error).as_deref(),
+            Some(r#"{"kind":"commandRejected","reason":"runtime_busy","retryable":false}"#)
         );
     }
 }
@@ -1966,6 +1986,7 @@ mod durability_tests {
             feedback: false,
             session_rename: false,
             computer_use_setup: false,
+            computer_use_host_setup: false,
             sandbox_availability: None,
             sandbox_unavailable_reason: None,
         }

@@ -1661,10 +1661,11 @@ fn video_resource_links_reach_a_real_host() {
     adapter.finish();
 }
 
-/// The opt-in computer-use extension reaches a real host: either it answers
-/// with the setup state and settings, or the CUA gate answers its typed
-/// `computerUseUnavailable`, never a generic failure. The capability and the
-/// methods arrived in Muse 1.4.6, so older CI pins skip.
+/// The opt-in computer-use surfaces reach a real host. The extension either
+/// answers with session setup and settings or the CUA gate answers its typed
+/// refusal. On Muse 1.4.7+ the ordinary `/cua host` command either renders
+/// host state or reports the independent host grant/gate posture; `/cua host
+/// check` additionally accepts the host's typed runtime-busy refusal.
 #[test]
 fn computer_use_reads_reach_a_real_host_when_negotiated() {
     let test = "computer_use_reads_reach_a_real_host_when_negotiated";
@@ -1702,6 +1703,75 @@ fn computer_use_reads_reach_a_real_host_when_negotiated() {
             response["result"]["setup"].is_object() && response["result"]["settings"].is_object(),
             "{response}"
         );
+    }
+    if release >= (1, 4, 7) {
+        let id = adapter.prompt(&session, "/cua host");
+        let response = adapter.response(id);
+        if let Some(error) = response.get("error") {
+            match error["code"].as_i64() {
+                Some(-32601) => assert!(
+                    error["message"]
+                        .as_str()
+                        .is_some_and(|message| message.contains("computerUseHostSetup")),
+                    "the host grant must be named: {response}"
+                ),
+                Some(-32033) => assert_eq!(
+                    error["data"]["kind"],
+                    json!("computerUseUnavailable"),
+                    "{response}"
+                ),
+                _ => panic!("unexpected host computer-use refusal: {response}"),
+            }
+        } else {
+            assert_eq!(
+                response["result"]["stopReason"],
+                json!("end_turn"),
+                "host status settles as an ordinary command: {response}"
+            );
+            adapter.wait("host computer-use status text", |frame| {
+                frame["method"] == "session/update"
+                    && frame["params"]["sessionId"] == json!(session)
+                    && frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                    && frame["params"]["update"]["content"]["text"]
+                        .as_str()
+                        .is_some_and(|text| text.starts_with("Host computer use setup:"))
+            });
+
+            let id = adapter.prompt(&session, "/cua host check");
+            let response = adapter.response(id);
+            if let Some(error) = response.get("error") {
+                match error["code"].as_i64() {
+                    Some(-32030) => {
+                        assert_eq!(
+                            error["data"]["kind"],
+                            json!("commandRejected"),
+                            "{response}"
+                        );
+                        assert_eq!(error["data"]["reason"], json!("runtime_busy"), "{response}");
+                    }
+                    Some(-32033) => assert_eq!(
+                        error["data"]["kind"],
+                        json!("computerUseUnavailable"),
+                        "{response}"
+                    ),
+                    _ => panic!("unexpected host check refusal: {response}"),
+                }
+            } else {
+                assert_eq!(
+                    response["result"]["stopReason"],
+                    json!("end_turn"),
+                    "host check settles as an ordinary command: {response}"
+                );
+                adapter.wait("host computer-use check text", |frame| {
+                    frame["method"] == "session/update"
+                        && frame["params"]["sessionId"] == json!(session)
+                        && frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                        && frame["params"]["update"]["content"]["text"]
+                            .as_str()
+                            .is_some_and(|text| text.starts_with("Host computer use check:"))
+                });
+            }
+        }
     }
     adapter.finish();
 }

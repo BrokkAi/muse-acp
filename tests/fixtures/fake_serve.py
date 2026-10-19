@@ -167,6 +167,14 @@ a silent rename. FAKE_SERVER_VERSION decides whether that gate applies: a
 1.4.8+ version withholds the capability, while an older version merely
 ignores the unknown name and the adapter keeps driving `session/rename`.
 
+Computer use: `computerUseSetup` and `computerUseHostSetup` are granted
+independently when requested. FAKE_NO_COMPUTER_USE=1 withholds the
+per-session grant; FAKE_NO_COMPUTER_USE_HOST=1 withholds the host grant.
+`computerUseSetup/read` and `/start` answer a session state when sessionId is
+present and a host state when it is omitted. `computerUseSetup/check` answers
+the host state and emits a sessionless `computerUseSetup/changed`.
+FAKE_CUA_HOST_BUSY=1 rejects check with commandRejected runtime_busy.
+
 Session MCP (every scenario): `sessionMcp` is granted when requested unless
 FAKE_NO_SESSION_MCP=1. As on the live host, a non-empty config.mcpServers
 without the grant fails with capabilityRequired. FAKE_MCP_CONFLICT=1 rejects
@@ -211,6 +219,7 @@ CATALOG_READS = [0]
 USER_INPUT_DIALOGS = [True]
 EXPERIMENTAL_API = [False]
 CUA_GRANTED = [False]
+CUA_HOST_GRANTED = [False]
 SESSION_MCP = [False]
 FEEDBACK = [False]
 SESSION_RENAME = [False]
@@ -1449,6 +1458,10 @@ def result_for(method, msg):
                           and os.environ.get("FAKE_NO_COMPUTER_USE") != "1")
         if CUA_GRANTED[0]:
             granted.append("computerUseSetup")
+        CUA_HOST_GRANTED[0] = ("computerUseHostSetup" in requested
+                               and os.environ.get("FAKE_NO_COMPUTER_USE_HOST") != "1")
+        if CUA_HOST_GRANTED[0]:
+            granted.append("computerUseHostSetup")
         SESSION_RENAME[0] = ("sessionRename" in requested
                              and os.environ.get("FAKE_NO_SESSION_RENAME") != "1")
         if SESSION_RENAME[0]:
@@ -2025,12 +2038,27 @@ def result_for(method, msg):
     if method == "computerUseSetup/read":
         params = msg.get("params", {})
         log_input(params)
+        if not params.get("sessionId"):
+            return {"setup": "dormant", "screenRecording": "missing",
+                    "accessibility": "missing", "inputMonitoring": "missing",
+                    "message": "Host computer use is not set up."}
         return {"setup": "dormant", "screenRecording": "missing",
                 "accessibility": "missing", "inputMonitoring": "unknown",
                 "message": "Run /cua on to set up computer use for this session."}
+    if method == "computerUseSetup/check":
+        params = msg.get("params", {})
+        log_input(params)
+        state = {"setup": "readyForTarget", "screenRecording": "granted",
+                 "accessibility": "granted", "inputMonitoring": "missing",
+                 "message": "Host computer-use grants were checked without a prompt."}
+        notify("computerUseSetup/changed", {"state": state})
+        return state
     if method == "computerUseSetup/start":
         params = msg.get("params", {})
         log_input(params)
+        if not params.get("sessionId"):
+            return {"setup": "dormant", "screenRecording": "missing",
+                    "accessibility": "missing", "inputMonitoring": "missing"}
         state = {"setup": "readyForTarget", "screenRecording": "granted",
                  "accessibility": "granted", "inputMonitoring": "missing",
                  "message": "Computer use is ready; some actions still need "
@@ -2691,6 +2719,16 @@ def main():
                           "error": {"code": -32033,
                                     "message": "computer use is unavailable",
                                     "data": {"kind": "computerUseUnavailable"}}})
+                    continue
+                if (method == "computerUseSetup/check"
+                        and os.environ.get("FAKE_CUA_HOST_BUSY") == "1"):
+                    log_input(msg.get("params", {}))
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32030,
+                                    "message": "computerUseSetup/check rejected: runtime_busy",
+                                    "data": {"kind": "commandRejected",
+                                             "reason": "runtime_busy",
+                                             "retryable": False}}})
                     continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
