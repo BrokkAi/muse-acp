@@ -29,7 +29,7 @@ paths; Unix archives retain the installer's versioned parent directory.
    and update CHANGELOG.md. Never reuse a completed release version.
 2. Run the contributing checks and `python3 -m unittest discover -s scripts -p
    'test_*.py'`. Push the topic branch and open a PR to master. `ci.yml` runs on
-   pushes and PRs. `release.yml` runs on master and release-topic pushes; these
+   PRs and on master, release-topic, and tag pushes. `release.yml` runs on master and release-topic pushes; these
    runs build/test all six platforms and validate the publisher without
    publishing. After a release, master keeps the released version until the
    next bump; its `release` runs still build and test every platform, but the

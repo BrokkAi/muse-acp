@@ -1,10 +1,21 @@
 name: ci
 on:
+  # Topic branches are covered by their pull_request run; a branch-wide push
+  # trigger ran every PR commit twice. Master, release topics, and tags keep
+  # push runs because RELEASING.md's preflight and tag checks need them.
   push:
+    branches: ['master', 'brb/release-*']
+    tags: ['v*']
   pull_request:
 
 permissions:
   contents: read
+
+# A new commit on a PR cancels that PR's superseded run. Push runs each get
+# their own group, so release evidence is never cancelled or replaced.
+concurrency:
+  group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   check:
