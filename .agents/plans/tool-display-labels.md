@@ -21,8 +21,9 @@ To see it working, run the focused fold tests and fake-host integration test in 
 - [x] (2026-10-19) Added fake-host active/done/neutral coverage and a live Muse 1.4.10 shell-label test.
 - [x] (2026-10-19) Updated the ROADMAP field matrix, README, and CHANGELOG.
 - [x] (2026-10-19) Ran all local contribution gates successfully.
-- [ ] Open a pull request that closes #272.
-- [ ] Complete three review/fix passes and merge only when the final head's required checks are green.
+- [x] (2026-10-19) Opened [PR #284](https://github.com/BrokkAi/muse-acp/pull/284) to close #272.
+- [x] (2026-10-19) Completed three review/fix passes: covered missing selected members and absent status, moved the live proof from approval-only behavior to a real `write_todos` fold card, and corrected stale evidence text.
+- [ ] Merge only when the final head's required checks are green.
 
 
 ## Surprises & Discoveries
@@ -51,7 +52,7 @@ To see it working, run the focused fold tests and fake-host integration test in 
 
 ## Outcomes & Retrospective
 
-Implementation and focused validation are complete. The reviewed outcome will be recorded after the three review passes and merge.
+Implementation and all three review passes are complete on PR #284. Tool cards now select host-provided active/done/neutral labels by status, all non-tool-card paths retain the synthesis, and live/replay/async-task paths share the same selection. The final remote-check result will be appended before merge.
 
 
 ## Context and Orientation
@@ -164,6 +165,12 @@ Focused live test against Muse 1.4.10:
 
     tool_display_label_reaches_a_real_host: passed
     observed active title on a real write_todos card: write_todos
+
+Review/fix commits:
+
+    4c36158 Pin missing display-label fallbacks
+    6cc5ecc Exercise display labels on a real tool card
+    dd69f7e Align display-label evidence with the tested path
 
 
 ## Interfaces and Dependencies
