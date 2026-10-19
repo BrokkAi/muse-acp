@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Adopt Muse 1.4.8 generated session short titles (#256). The adapter folds
+  the optional `Session.generatedName` snapshot fact through start, resume,
+  load, and fork, and accepts live replacements from
+  `SessionNameChangedParams.generatedName`. Clients receive the host's value
+  as `session_info_update._meta.muse.generatedName`, separate from the
+  canonical ACP title. Missing values publish nothing and are never inferred
+  from the name or title fallback; an authoritative withdrawal after
+  publication sends null. `session/list` rows neither expose nor erase the
+  fold-only fact.
+
 - Adopt Muse 1.4.9 native approval-reviewing activity (#271). When the host
   reports `approval/reviewing`, the adapter publishes reversible
   `session_info_update._meta.muse.approvalReviewing` rows with source session,

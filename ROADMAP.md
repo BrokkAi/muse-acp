@@ -614,7 +614,7 @@ fold's unknown-method path logs and continues.
 | `workflow/cancel` | Mapped to ACP | Sent for `_session/async_task/stop` on a workflow async task (keyed by `workflowRunId`); the ack is admission-only and the workflow settles from subsequent view events. |
 | `workflow/childControl` | Mapped to ACP | The adapter-local `/workflow-child skip\|retry <childId>` slash command sends the child's current attempt from the latest folded workflow item and settles on the admission-only ack; a `stale_attempt` rejection is surfaced, never re-keyed. Workflow cards show each child's id. |
 | `session/modelRouteUnserved` | Intentionally ignored | No ACP mapping or adapter state exists for a host routing observation; the unknown-notification path retains a diagnostic. |
-| `session/nameChanged` | Mapped to ACP | Updates host title facts and publishes a changed title through `session_info_update`. |
+| `session/nameChanged` | Mapped to ACP | Replaces host title facts and publishes changes through `session_info_update`, including name origin and the optional generated short-title metadata. |
 | `session/reasoningEffortChanged` | Mapped to ACP | Updates the standing reasoning default and emits `config_option_update`; negotiated recommendations require a host `default` or `policy` source. |
 | `session/statusChanged` | Mapped to ACP | Publishes host status and attention metadata and ACP v2 state; directs pending-request reconciliation without inventing unknown status values. |
 | `session/viewHealthChanged` | Consumed | Logs the view health and reason with guidance to reattach through resume. |
@@ -716,8 +716,9 @@ item kind with `Item.monitorId`/`Item.monitorDescription` and the widened
 `Item.truncated`/`Item.turnId` text in
 [#255](https://github.com/BrokkAi/muse-acp/issues/255); the generated short
 title (`Session.generatedName`,
-`SessionNameChangedParams.generatedName`) in
-[#256](https://github.com/BrokkAi/muse-acp/issues/256); the resume
+`SessionNameChangedParams.generatedName`) is adopted
+([#256](https://github.com/BrokkAi/muse-acp/issues/256); see the field-matrix
+rows below); the resume
 permission-profile pick (`SessionResumeParams.permissionProfile`) in
 [#257](https://github.com/BrokkAi/muse-acp/issues/257). The skill's declared
 `title` (`SkillCatalogEntry.title`) is adopted
@@ -780,6 +781,8 @@ cannot drop a member without failing CI.
 | `SkillCatalogEntry.title` | Mapped to ACP | Each skill command in `available_commands_update` carries the skill's name as `_meta.muse.title`: the declared `title` (Muse 1.4.8+, from `SKILL.md` `metadata.display-name`), else the host's `displayName`. The command `name` stays the selector, and the `description` stays the palette summary unless the host sent an empty one, when it falls back to that name. Adapter-local commands carry no title. [#258](https://github.com/BrokkAi/muse-acp/issues/258) |
 | `Session.nameOrigin` | Mapped to ACP | The fold-only snapshot origin (`automatic` or `custom`, Muse 1.4.7+) is held with the name it describes and published as `session_info_update._meta.muse.nameOrigin` on attach. Absent and unrecognized future values read as unknown and stay unpublished; `session/list` rows never carry it and never erase a known origin for the same name. [#242](https://github.com/BrokkAi/muse-acp/issues/242) |
 | `SessionNameChangedParams.nameOrigin` | Mapped to ACP | The same origin on the live rename fold rides the title's `session_info_update` as `_meta.muse.nameOrigin`, including when only the origin changed. Omitted or unrecognized reads as unknown for the new name rather than inheriting the previous name's provenance. [#242](https://github.com/BrokkAi/muse-acp/issues/242) |
+| `Session.generatedName` | Mapped to ACP | The fold-only host-generated short title (Muse 1.4.8+) is restored from start, resume, load, and fork snapshots and published as `session_info_update._meta.muse.generatedName`. It remains independent of the canonical title; absence means unpublished and is never inferred from `name` or a title fallback. `session/list` rows never carry it and never erase a known value. [#256](https://github.com/BrokkAi/muse-acp/issues/256) |
+| `SessionNameChangedParams.generatedName` | Mapped to ACP | The live replacement for the generated short title rides `session_info_update._meta.muse.generatedName`, including generated-only changes. An authoritative omission after publication is forwarded as `generatedName: null`; an initial omission publishes no key. [#256](https://github.com/BrokkAi/muse-acp/issues/256) |
 | `Item.messagePhase` | Mapped to ACP | A completed agent reply declares the model-committed phase as `_meta.muse.messagePhase` (`commentary` or `finalAnswer`, Muse 1.4.8+). A streamed reply gets an empty `agent_message_chunk` naming its `messageId` on ACP v2; a resent, replayed, or cut-off reply carries the phase on its own marked update. An absent or unrecognized value reads as `finalAnswer`; the phase is never inferred from position and is never a turn-done signal. [#254](https://github.com/BrokkAi/muse-acp/issues/254) |
 <!-- msp-1.4.x-field-matrix:end -->
 

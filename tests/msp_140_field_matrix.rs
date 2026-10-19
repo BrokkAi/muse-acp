@@ -40,6 +40,8 @@ const ADDITIONS: &[&str] = &[
     "SkillCatalogEntry.title",
     "Session.nameOrigin",
     "SessionNameChangedParams.nameOrigin",
+    "Session.generatedName",
+    "SessionNameChangedParams.generatedName",
     "Item.messagePhase",
 ];
 
@@ -207,6 +209,8 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("SkillCatalogEntry", "title"),
         ("Session", "nameOrigin"),
         ("SessionNameChangedParams", "nameOrigin"),
+        ("Session", "generatedName"),
+        ("SessionNameChangedParams", "generatedName"),
         ("Item", "messagePhase"),
     ] {
         assert!(

@@ -4030,6 +4030,123 @@ fn session_name_origin_reaches_acp_only_when_the_host_proves_it() {
 }
 
 #[test]
+fn generated_session_name_is_fold_only_metadata() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("generated_name", &[]);
+        let sid = c.new_session(ver, "");
+        let started = c.wait_for_all(
+            &[
+                "\"title\":\"Canonical title\"",
+                "\"_meta\":{\"muse\":{\"generatedName\":\"Initial short title\"}}",
+            ],
+            Duration::from_secs(15),
+        );
+        assert!(started.contains(&sid), "v{ver} snapshot title: {started}");
+
+        // A generated-only change must still publish a session-info update.
+        let pid = c.prompt(&sid, "first generated title");
+        let result = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(result.contains("\"result\""), "{result}");
+        if ver == 1 {
+            assert!(result.contains("\"stopReason\":\"end_turn\""), "{result}");
+        }
+        let live = c.wait_for_all(
+            &[
+                "\"sessionUpdate\":\"session_info_update\"",
+                "\"title\":\"Canonical title\"",
+                "\"generatedName\":\"Live short title\"",
+            ],
+            Duration::from_secs(15),
+        );
+        assert!(live.contains(&sid), "v{ver} live generated title: {live}");
+
+        // List rows carry only the canonical fact. Reading one must neither
+        // expose generatedName nor erase the value already held live.
+        let lid = c.req("session/list", "{}");
+        let preserved = c.wait_for_all(
+            &[
+                "\"title\":\"Listed canonical title\"",
+                "\"generatedName\":\"Live short title\"",
+            ],
+            Duration::from_secs(15),
+        );
+        assert!(
+            preserved.contains(&sid),
+            "v{ver} list change preserved generated title: {preserved}"
+        );
+        let listed = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+        assert!(
+            !listed.contains("generatedName"),
+            "v{ver} list rows must not carry generatedName: {listed}"
+        );
+
+        let pid = c.prompt(&sid, "replacement generated title");
+        let result = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(result.contains("\"result\""), "{result}");
+        if ver == 1 {
+            assert!(result.contains("\"stopReason\":\"end_turn\""), "{result}");
+        }
+        c.wait_for(
+            "\"generatedName\":\"Replacement short title\"",
+            Duration::from_secs(15),
+        );
+
+        // An authoritative name change with no retained generated pair
+        // withdraws the client's stale metadata explicitly.
+        let pid = c.prompt(&sid, "clear generated title");
+        let result = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(result.contains("\"result\""), "{result}");
+        if ver == 1 {
+            assert!(result.contains("\"stopReason\":\"end_turn\""), "{result}");
+        }
+        c.wait_for(
+            "\"_meta\":{\"muse\":{\"generatedName\":null}}",
+            Duration::from_secs(15),
+        );
+
+        // The fold-only snapshot fact is restored on attach.
+        let method = if ver == 1 {
+            "session/load"
+        } else {
+            "session/resume"
+        };
+        let rid = c.req(method, &format!("{{\"sessionId\":\"{sid}\"}}"));
+        let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+        assert!(resumed.contains("\"result\""), "{method} failed: {resumed}");
+        let restored = c.wait_for_all(
+            &[
+                "\"title\":\"Canonical title\"",
+                "\"generatedName\":\"Resumed short title\"",
+            ],
+            Duration::from_secs(15),
+        );
+        assert!(
+            restored.contains(&sid),
+            "v{ver} resumed generated title: {restored}"
+        );
+        c.finish();
+    }
+
+    // A host name without a generated pair stays entirely unpublished:
+    // the adapter never promotes the canonical name into generated metadata.
+    let mut c = Client::spawn("rename_live", &[]);
+    let sid = c.new_session(1, "");
+    c.wait_for("\"title\":\"Renamed elsewhere\"", Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("generatedName"),
+        "a host that published no generated pair must remain unpublished: {frames}"
+    );
+    assert!(frames.contains(&sid));
+    drop(frames);
+    c.finish();
+}
+
+#[test]
 fn view_health_failure_is_logged_with_reconnect_context() {
     let mut c = Client::spawn("view_health", &[]);
     let sid = c.new_session(1, "");
