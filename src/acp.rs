@@ -153,6 +153,11 @@ pub struct PendingRecap {
 #[derive(Clone, Default)]
 pub struct HostTitleFacts {
     pub name: Option<String>,
+    /// How the host says `name` was set (`automatic` or `custom`), when a
+    /// fold-only surface proved it. `None` is unknown: absent on the host
+    /// fact, an unrecognized future value, or a name this fact does not
+    /// describe. Never synthesized.
+    pub name_origin: Option<String>,
     pub title: Option<String>,
     pub first_user_prompt: Option<String>,
 }
@@ -163,6 +168,12 @@ impl HostTitleFacts {
             .as_deref()
             .or(self.title.as_deref())
             .or(self.first_user_prompt.as_deref())
+    }
+
+    /// The origin publishable with the selected title. The origin describes
+    /// `name` alone, so a fallback title carries none.
+    pub fn selected_origin(&self) -> Option<&str> {
+        self.name.as_ref().and(self.name_origin.as_deref())
     }
 }
 
@@ -1356,9 +1367,19 @@ pub fn send_session_status(
 
 /// Publish a host-authored title change. `None` is an explicit clear so a
 /// client can remove a title after the host renames a session back to blank.
-pub fn send_session_title(stdout: &StdoutShared, acp_sid: &str, title: Option<&str>) {
+/// A known name origin rides `_meta.muse.nameOrigin`; an unknown one is
+/// omitted, never fabricated.
+pub fn send_session_title(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    title: Option<&str>,
+    name_origin: Option<&str>,
+) {
     let title = title.map(esc).unwrap_or_else(|| "null".to_string());
-    let update = format!("{{\"sessionUpdate\":\"session_info_update\",\"title\":{title}}}");
+    let origin = name_origin
+        .map(|origin| format!(",\"_meta\":{{\"muse\":{{\"nameOrigin\":{}}}}}", esc(origin)))
+        .unwrap_or_default();
+    let update = format!("{{\"sessionUpdate\":\"session_info_update\",\"title\":{title}{origin}}}");
     send_raw(
         stdout,
         &format!(

@@ -639,6 +639,15 @@ fn rename_drives_a_real_host_across_the_capability_registry() {
             .is_some_and(|title| title.eq_ignore_ascii_case("Live rename probe")),
         "{renamed}"
     );
+    // Muse 1.4.7+ folds name provenance: a user rename is `custom`, and
+    // the adapter forwards it as `_meta.muse.nameOrigin`. Older hosts
+    // prove no origin, so the key must stay absent there (#242).
+    let origin = &renamed["params"]["update"]["_meta"]["muse"]["nameOrigin"];
+    if release >= (1, 4, 7) {
+        assert_eq!(origin, &json!("custom"), "{renamed}");
+    } else {
+        assert!(origin.is_null(), "{renamed}");
+    }
     adapter.finish();
 }
 

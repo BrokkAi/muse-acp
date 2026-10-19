@@ -695,9 +695,10 @@ explicit disposition in the field matrix below;
 matrix. The 1.4.7 additions have their own issues: the `InitializeResult`
 sandbox facts
 (`sandboxAvailability`, `sandboxUnavailableReason`) in
-[#241](https://github.com/BrokkAi/muse-acp/issues/241) and `SessionNameOrigin`
-(`Session.nameOrigin`, `SessionNameChangedParams.nameOrigin`) in
-[#242](https://github.com/BrokkAi/muse-acp/issues/242). The `Item.cutOff`
+[#241](https://github.com/BrokkAi/muse-acp/issues/241). `SessionNameOrigin`
+(`Session.nameOrigin`, `SessionNameChangedParams.nameOrigin`) is adopted
+([#242](https://github.com/BrokkAi/muse-acp/issues/242)); its rows are in
+the field matrix below. The `Item.cutOff`
 partial-message mark is adopted
 ([#243](https://github.com/BrokkAi/muse-acp/issues/243)); its row is in the
 field matrix below.
@@ -773,6 +774,8 @@ cannot drop a member without failing CI.
 | `Item.cutOff` | Mapped to ACP | A partial agent reply the host committed when the provider stream died is marked once with `_meta.muse.cutOff: true` and the host `itemId`, from whichever of `item/updated`, `item/completed`, a gap refill, or a history replay first carries the flag. A streamed reply gets an empty `agent_message_chunk` naming its `messageId` on ACP v2; a resent or replayed reply carries the mark on its own text update. A late mark only names the latest settled reply, and on ACP v1 (chunks attach by position) waits out a newer streaming reply. Never inferred, repeated, or cleared. [#243](https://github.com/BrokkAi/muse-acp/issues/243) |
 | `Item.displayLabel` | Unsupported pending protocol decision | The tool's own words for the call (`ToolDisplayLabel`: `active` while `inProgress`, `done` on `completed`, `neutral` beside any other status), which the adapter's synthesized tool-call titles do not read yet; adopting it is tracked in [#272](https://github.com/BrokkAi/muse-acp/issues/272). |
 | `SkillCatalogEntry.title` | Mapped to ACP | Each skill command in `available_commands_update` carries the skill's name as `_meta.muse.title`: the declared `title` (Muse 1.4.8+, from `SKILL.md` `metadata.display-name`), else the host's `displayName`. The command `name` stays the selector, and the `description` stays the palette summary unless the host sent an empty one, when it falls back to that name. Adapter-local commands carry no title. [#258](https://github.com/BrokkAi/muse-acp/issues/258) |
+| `Session.nameOrigin` | Mapped to ACP | The fold-only snapshot origin (`automatic` or `custom`, Muse 1.4.7+) is held with the name it describes and published as `session_info_update._meta.muse.nameOrigin` on attach. Absent and unrecognized future values read as unknown and stay unpublished; `session/list` rows never carry it and never erase a known origin for the same name. [#242](https://github.com/BrokkAi/muse-acp/issues/242) |
+| `SessionNameChangedParams.nameOrigin` | Mapped to ACP | The same origin on the live rename fold rides the title's `session_info_update` as `_meta.muse.nameOrigin`, including when only the origin changed. Omitted or unrecognized reads as unknown for the new name rather than inheriting the previous name's provenance. [#242](https://github.com/BrokkAi/muse-acp/issues/242) |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Adopt the Muse 1.4.7 `SessionNameOrigin` name provenance (#242). The
+  adapter folds `Session.nameOrigin` and `SessionNameChangedParams.nameOrigin`
+  with the name they describe and publishes a proven origin (`automatic` or
+  `custom`) as `_meta.muse.nameOrigin` on the title's `session_info_update`,
+  including origin-only changes and restores on attach. Absent origins and
+  unrecognized future values read as unknown and stay unpublished, and
+  `session/list` rows — which never carry the fold-only origin — neither
+  gain one nor erase a known one for the same name.
+
 - Re-pin the vendored Muse SDK conformance corpus to `ae46934` (2026-10-16,
   "remirror: 1.4.10"), which publishes the Muse 1.4.9 stable surface that
   Muse 1.4.10 carries unchanged. The additions over 1.4.8 are additive: the

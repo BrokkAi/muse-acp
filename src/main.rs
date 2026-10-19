@@ -908,6 +908,41 @@ fn session_name_from_result(res: &J) -> Option<Option<String>> {
     }
 }
 
+/// The name origin a lifecycle result proved for its `Session.name`, in the
+/// same absent-versus-unknown shape as [`session_name_from_result`]: the
+/// outer `Option` says the host sent the member at all. The snapshot state
+/// carries no origin sibling, so only `Session` is consulted.
+fn session_name_origin_from_result(res: &J) -> Option<Option<String>> {
+    let raw = res.get("session")?.get("nameOrigin")?;
+    Some(name_origin_fact(Some(raw)))
+}
+
+/// Adopt an authoritative session name and the origin the same lifecycle
+/// result proved for it. Returns whether the publishable title or its known
+/// origin changed.
+fn adopt_authoritative_name(
+    facts: &mut HostTitleFacts,
+    name: Option<String>,
+    origin: Option<Option<String>>,
+) -> bool {
+    let before = (
+        facts.selected().map(str::to_string),
+        facts.selected_origin().map(str::to_string),
+    );
+    if name != facts.name {
+        facts.name_origin = None;
+        facts.name = name;
+    }
+    if let Some(origin) = origin {
+        facts.name_origin = origin;
+    }
+    before
+        != (
+            facts.selected().map(str::to_string),
+            facts.selected_origin().map(str::to_string),
+        )
+}
+
 /// The host's session provenance, if any: a session carries at most one of
 /// `sideFrom` (side chats) and `forkedFrom` (forks).
 fn session_provenance(session: Option<&J>) -> Option<(&'static str, &J)> {
@@ -1273,7 +1308,8 @@ fn backfill_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions,
     if !want_context && !want_totals && !want_reasoning {
         return;
     }
-    let (mut context, mut cumulative, mut reasoning, mut session_name) = (None, None, None, None);
+    let (mut context, mut cumulative, mut reasoning, mut session_name, mut session_origin) =
+        (None, None, None, None, None);
     // The snapshot rung: the one surface that carries occupancy. The host
     // downgrades freely, so an `inline`/`none` answer here is normal and
     // simply leaves the occupancy unknown until the next live event.
@@ -1288,6 +1324,7 @@ fn backfill_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions,
     ) {
         Ok(r) => {
             session_name = session_name_from_result(&r);
+            session_origin = session_name_origin_from_result(&r);
             if let Some(state) = snapshot_state(&r) {
                 if let Some(cu) = state.get("contextUsage")
                     && matches!(cu, J::Obj(_))
@@ -1360,13 +1397,15 @@ fn backfill_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions,
         adopt_reasoning_effort(s, state);
     }
     if let Some(name) = session_name
-        && s.title_facts.name != name
+        && adopt_authoritative_name(&mut s.title_facts, name, session_origin)
     {
-        s.title_facts.name = name.clone();
-        title_update = Some(s.title_facts.selected().map(str::to_string));
+        title_update = Some((
+            s.title_facts.selected().map(str::to_string),
+            s.title_facts.selected_origin().map(str::to_string),
+        ));
     }
-    if let Some(name) = title_update {
-        acp::send_session_title(stdout, acp_sid, name.as_deref());
+    if let Some((name, origin)) = title_update {
+        acp::send_session_title(stdout, acp_sid, name.as_deref(), origin.as_deref());
     }
     if adopted {
         acp::send_usage(
@@ -4364,7 +4403,12 @@ fn handle_acp(
                         attention.as_deref(),
                     );
                     if let Some(title) = initial_title_facts.selected() {
-                        acp::send_session_title(stdout, &sid, Some(title));
+                        acp::send_session_title(
+                            stdout,
+                            &sid,
+                            Some(title),
+                            initial_title_facts.selected_origin(),
+                        );
                     }
                     acp::send_available_commands(
                         stdout,
@@ -4557,6 +4601,7 @@ fn handle_acp(
                         resume_cwd.clone()
                     };
                     let session_name = session_name_from_result(&r);
+                    let session_origin = session_name_origin_from_result(&r);
                     let roots = match session_roots(params.as_ref(), &restored_cwd) {
                         Ok(roots) => roots,
                         Err(message) => {
@@ -4570,7 +4615,7 @@ fn handle_acp(
                         || (method == "session/resume"
                             && ver == 2
                             && params.as_ref().and_then(|p| p.get("replayFrom")).is_some());
-                    let mut title_update: Option<Option<String>> = None;
+                    let mut title_update: Option<(Option<String>, Option<String>)> = None;
                     {
                         let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                         let entry = map.entry(sid.clone()).or_insert_with(|| AcpSession {
@@ -4656,7 +4701,10 @@ fn handle_acp(
                         if let Some(host_session) = r.get("session")
                             && update_host_session_facts(entry, host_session)
                         {
-                            title_update = Some(entry.title_facts.selected().map(str::to_string));
+                            title_update = Some((
+                                entry.title_facts.selected().map(str::to_string),
+                                entry.title_facts.selected_origin().map(str::to_string),
+                            ));
                         }
                         if !resume_head.is_empty() {
                             entry.view_cursor = resume_head.clone();
@@ -4672,8 +4720,15 @@ fn handle_acp(
                             entry.mode_value = acp::mode_from_msp(&m).to_string();
                         }
                         if let Some(name) = &session_name {
-                            entry.title_facts.name = name.clone();
-                            title_update = Some(entry.title_facts.selected().map(str::to_string));
+                            adopt_authoritative_name(
+                                &mut entry.title_facts,
+                                name.clone(),
+                                session_origin,
+                            );
+                            title_update = Some((
+                                entry.title_facts.selected().map(str::to_string),
+                                entry.title_facts.selected_origin().map(str::to_string),
+                            ));
                         }
                         // A side chat names the session it was opened from; a
                         // fork names its cut point. Publish the provenance on
@@ -4758,8 +4813,8 @@ fn handle_acp(
                         status.as_deref(),
                         attention.as_deref(),
                     );
-                    if let Some(title) = title_update {
-                        acp::send_session_title(stdout, &sid, title.as_deref());
+                    if let Some((title, origin)) = title_update {
+                        acp::send_session_title(stdout, &sid, title.as_deref(), origin.as_deref());
                     }
                     // session/load and an explicit v2 replay already deliver
                     // history to ACP. Replaying the same suffix again through
@@ -5325,7 +5380,12 @@ fn handle_acp(
                     );
                     refresh_subscription_usage(host, stdout, sessions, &new_msp);
                     if let Some(title) = fork_title_facts.selected() {
-                        acp::send_session_title(stdout, &new_msp, Some(title));
+                        acp::send_session_title(
+                            stdout,
+                            &new_msp,
+                            Some(title),
+                            fork_title_facts.selected_origin(),
+                        );
                     }
                     let skills = skill_catalog(host, &new_msp);
                     adopt_skill_catalog(sessions, &new_msp, skills.as_deref());
@@ -6873,6 +6933,7 @@ fn handle_acp(
                                     title_updates.push((
                                         session.acp_sid.clone(),
                                         session.title_facts.selected().map(str::to_string),
+                                        session.title_facts.selected_origin().map(str::to_string),
                                     ));
                                 }
                                 // A held session is appended to the first
@@ -6919,8 +6980,8 @@ fn handle_acp(
                             "session/list skipped {skipped_null_root} row(s) without a workspace root"
                         ));
                     }
-                    for (sid, title) in title_updates {
-                        acp::send_session_title(stdout, &sid, title.as_deref());
+                    for (sid, title, origin) in title_updates {
+                        acp::send_session_title(stdout, &sid, title.as_deref(), origin.as_deref());
                     }
                     // Adapter-held sessions the host page did not mention are
                     // appended to the first page only, so a client paging
@@ -9370,9 +9431,33 @@ fn host_text_fact(value: Option<&J>) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The recognized `SessionNameOrigin` values. The enum is open: an absent
+/// member and any value outside this set both read as unknown.
+fn name_origin_fact(value: Option<&J>) -> Option<String> {
+    match value.and_then(J::as_str) {
+        Some(origin @ ("automatic" | "custom")) => Some(origin.to_string()),
+        _ => None,
+    }
+}
+
 fn update_title_facts(facts: &mut HostTitleFacts, host_session: &J) {
     if let Some(value) = host_session.get("name") {
-        facts.name = host_text_fact(Some(value));
+        let name = host_text_fact(Some(value));
+        // The origin is provenance for one name instance. A different name
+        // must re-prove it; the same name keeps it, so list rows (which
+        // never carry the fold-only origin) cannot erase a known one.
+        if name != facts.name {
+            facts.name_origin = None;
+        }
+        facts.name = name;
+    }
+    // An origin only ever describes the name served beside it. One sent
+    // without a name names nothing the adapter holds, so it is ignored
+    // rather than attributed to an older name.
+    if host_session.get("name").is_some()
+        && let Some(value) = host_session.get("nameOrigin")
+    {
+        facts.name_origin = name_origin_fact(Some(value));
     }
     if let Some(value) = host_session.get("title") {
         facts.title = host_text_fact(Some(value));
@@ -9397,10 +9482,11 @@ fn raw_host_fact(host_session: Option<&J>, key: &str) -> Option<String> {
 }
 
 /// Merge host session metadata into an adapter-owned session and report
-/// whether the selected host-authored title changed.
+/// whether the selected host-authored title or its known origin changed.
 fn update_host_session_facts(session: &mut AcpSession, host_session: &J) -> bool {
     adopt_session_projection(session, host_session);
     let old_title = session.title_facts.selected().map(str::to_string);
+    let old_origin = session.title_facts.selected_origin().map(str::to_string);
     update_title_facts(&mut session.title_facts, host_session);
     if let Some(branch) = host_session.get("branch") {
         session.branch_meta = Some(j_to_string(branch));
@@ -9409,6 +9495,7 @@ fn update_host_session_facts(session: &mut AcpSession, host_session: &J) -> bool
         session.attention_meta = Some(j_to_string(attention));
     }
     old_title != session.title_facts.selected().map(str::to_string)
+        || old_origin != session.title_facts.selected_origin().map(str::to_string)
 }
 
 fn session_info_row(
@@ -10821,20 +10908,26 @@ fn handle_msp(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
-                let (changed, title) = {
+                let (changed, title, origin) = {
                     let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
                     match map.get_mut(&acp_sid) {
                         Some(session) => {
-                            let old_title = session.title_facts.selected().map(str::to_string);
+                            let before = (
+                                session.title_facts.selected().map(str::to_string),
+                                session.title_facts.selected_origin().map(str::to_string),
+                            );
                             update_title_facts(&mut session.title_facts, params);
-                            let title = session.title_facts.selected().map(str::to_string);
-                            (old_title != title, title)
+                            let after = (
+                                session.title_facts.selected().map(str::to_string),
+                                session.title_facts.selected_origin().map(str::to_string),
+                            );
+                            (before != after, after.0, after.1)
                         }
-                        None => (false, None),
+                        None => (false, None, None),
                     }
                 };
                 if changed {
-                    acp::send_session_title(stdout, &acp_sid, title.as_deref());
+                    acp::send_session_title(stdout, &acp_sid, title.as_deref(), origin.as_deref());
                 }
             }
         }
@@ -11070,15 +11163,30 @@ fn handle_msp(
             if let Some(session) = map.values_mut().find(|s| s.msp_sid == msp_sid)
                 && session_row_matches_workspace(row, &session.cwd)
             {
-                let previous_title = session.title_facts.selected().map(str::to_string);
-                // Stream rows replace metadata as a whole, including omitted fields.
+                let previous = (
+                    session.title_facts.selected().map(str::to_string),
+                    session.title_facts.name.clone(),
+                    session.title_facts.name_origin.clone(),
+                );
+                // Stream rows replace metadata as a whole, including omitted
+                // fields. The fold-only name origin is the one exception:
+                // rows never carry it, so its omission asserts nothing and a
+                // known origin survives while the name it describes does.
                 session.title_facts = title_facts(Some(row));
+                if session.title_facts.name == previous.1 && row.get("nameOrigin").is_none() {
+                    session.title_facts.name_origin = previous.2;
+                }
                 session.branch_meta = raw_host_fact(Some(row), "branch");
                 session.attention_meta = raw_host_fact(Some(row), "attention");
                 adopt_session_projection(session, row);
                 let current_title = session.title_facts.selected();
-                if previous_title.as_deref() != current_title {
-                    acp::send_session_title(stdout, &session.acp_sid, current_title);
+                if previous.0.as_deref() != current_title {
+                    acp::send_session_title(
+                        stdout,
+                        &session.acp_sid,
+                        current_title,
+                        session.title_facts.selected_origin(),
+                    );
                 }
             }
         }
@@ -13918,6 +14026,77 @@ fn complete_elicitation(
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn name_origin_folds_only_recognized_values_for_the_current_name() {
+        use super::{HostTitleFacts, parse_json, title_facts, update_title_facts};
+        let parse = |text: &str| parse_json(text).expect("fixture parses");
+
+        // Both v1 origins are held and publishable with their name.
+        for origin in ["automatic", "custom"] {
+            let facts = title_facts(Some(&parse(&format!(
+                "{{\"name\":\"N\",\"nameOrigin\":\"{origin}\"}}"
+            ))));
+            assert_eq!(facts.selected_origin(), Some(origin));
+        }
+        // Absent, an unknown future value, and a non-string all read unknown.
+        for text in [
+            "{\"name\":\"N\"}",
+            "{\"name\":\"N\",\"nameOrigin\":\"conversationGenerated\"}",
+            "{\"name\":\"N\",\"nameOrigin\":null}",
+            "{\"name\":\"N\",\"nameOrigin\":7}",
+        ] {
+            let facts = title_facts(Some(&parse(text)));
+            assert_eq!(facts.selected_origin(), None, "{text}");
+        }
+
+        let mut facts = HostTitleFacts {
+            name: Some("N".to_string()),
+            name_origin: Some("automatic".to_string()),
+            ..HostTitleFacts::default()
+        };
+        // A list row repeats the name without the fold-only origin: the
+        // known origin survives because the row asserts nothing about it.
+        update_title_facts(&mut facts, &parse("{\"name\":\"N\"}"));
+        assert_eq!(facts.selected_origin(), Some("automatic"));
+        // A new name without provenance drops the old name's origin rather
+        // than attributing it to a name it does not describe.
+        update_title_facts(&mut facts, &parse("{\"name\":\"Other\"}"));
+        assert_eq!(facts.selected_origin(), None);
+        // A later fact can still prove the new name's origin, an unknown
+        // value then supersedes it back to unknown, and clearing the name
+        // clears the origin with it.
+        update_title_facts(
+            &mut facts,
+            &parse("{\"name\":\"Other\",\"nameOrigin\":\"custom\"}"),
+        );
+        assert_eq!(facts.selected_origin(), Some("custom"));
+        update_title_facts(
+            &mut facts,
+            &parse("{\"name\":\"Other\",\"nameOrigin\":\"future\"}"),
+        );
+        assert_eq!(facts.selected_origin(), None);
+        update_title_facts(
+            &mut facts,
+            &parse("{\"name\":\"Other\",\"nameOrigin\":\"custom\"}"),
+        );
+        update_title_facts(&mut facts, &parse("{\"name\":null}"));
+        assert_eq!(facts.selected(), None);
+        assert_eq!(facts.name_origin, None);
+        // The origin describes `name` alone: a stray origin served without
+        // a name is ignored entirely, never held for a fallback title or
+        // attributed to a name the adapter already holds.
+        let facts = title_facts(Some(&parse("{\"title\":\"T\",\"nameOrigin\":\"custom\"}")));
+        assert_eq!(facts.selected(), Some("T"));
+        assert_eq!(facts.name_origin, None);
+        let mut facts = HostTitleFacts {
+            name: Some("N".to_string()),
+            name_origin: Some("automatic".to_string()),
+            ..HostTitleFacts::default()
+        };
+        update_title_facts(&mut facts, &parse("{\"nameOrigin\":\"custom\"}"));
+        assert_eq!(facts.selected_origin(), Some("automatic"));
+    }
 
     #[test]
     fn review_deny_notices_end_once_and_name_the_enforced_duration() {

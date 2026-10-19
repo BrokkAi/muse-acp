@@ -45,7 +45,7 @@ are emitted by the MSP host.
 | `session/listChanged` | Mapped to ACP | Replaces a cached list row when `sessionListStream` is granted; pushes a changed active-session title through `session_info_update`. |
 | `session/modelChanged` | Mapped to ACP | Updates the selected model value, resets a held per-turn reasoning tier the new model does not serve, and resends the complete `configOptions` list. |
 | `session/modelRouteUnserved` | Intentionally ignored | No ACP mapping; the unhandled-notification path logs a diagnostic. |
-| `session/nameChanged` | Mapped to ACP | Updates host title facts and publishes a changed title through `session_info_update`. |
+| `session/nameChanged` | Mapped to ACP | Updates host title facts and publishes a changed title through `session_info_update`; a proven name origin (Muse 1.4.7+) rides it as `_meta.muse.nameOrigin`, and an origin-only change publishes too. Absent or unrecognized origins stay unpublished. |
 | `session/reasoningEffortChanged` | Mapped to ACP | Updates the standing reasoning default and emits `config_option_update`; negotiated recommendations require a host `default` or `policy` source. |
 | `session/started` | Internally tracked | Caches the new session's list row when Muse grants `sessionListStream`. The row may arrive before or after the `session/start` result. Clients still request `session/list` to discover membership changes. |
 | `session/statusChanged` | Mapped to ACP | Publishes host status and attention metadata and ACP v2 state; directs pending-request reconciliation without inventing unknown status values. |

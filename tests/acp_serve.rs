@@ -3550,6 +3550,74 @@ fn live_session_rename_updates_the_acp_title() {
 }
 
 #[test]
+fn session_name_origin_reaches_acp_only_when_the_host_proves_it() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("name_origin", &[]);
+        let sid = c.new_session(ver, "");
+        let started = c.wait_for_all(
+            &[
+                "\"sessionUpdate\":\"session_info_update\"",
+                "\"title\":\"Auto name\"",
+                "\"_meta\":{\"muse\":{\"nameOrigin\":\"automatic\"}}",
+            ],
+            Duration::from_secs(15),
+        );
+        assert!(started.contains(&sid), "v{ver} start origin: {started}");
+
+        // List rows never carry the fold-only origin, even while the adapter
+        // holds a known one for the session.
+        let list_id = c.req("session/list", "{}");
+        let listed = c.wait_for(&format!("\"id\":{list_id}"), Duration::from_secs(15));
+        assert!(
+            !listed.contains("nameOrigin"),
+            "v{ver} list rows must not carry nameOrigin: {listed}"
+        );
+
+        let _pid = c.prompt(&sid, "origin probe");
+        let custom = c.wait_for_all(
+            &["\"title\":\"Custom name\"", "\"nameOrigin\":\"custom\""],
+            Duration::from_secs(15),
+        );
+        assert!(custom.contains(&sid), "v{ver} custom origin: {custom}");
+        // An unrecognized future origin reads as unknown: the title still
+        // publishes, with no origin metadata rather than a fabricated one.
+        let future = c.wait_for("\"title\":\"Future name\"", Duration::from_secs(15));
+        assert!(
+            !future.contains("nameOrigin"),
+            "v{ver} unknown origin must be omitted: {future}"
+        );
+        let plain = c.wait_for("\"title\":\"Plain name\"", Duration::from_secs(15));
+        assert!(
+            !plain.contains("nameOrigin"),
+            "v{ver} absent origin must be omitted: {plain}"
+        );
+        // The same name re-folded with provenance is an origin-only change:
+        // it still publishes, so the client learns the origin it lacked.
+        let proven = c.wait_for_all(
+            &["\"title\":\"Plain name\"", "\"nameOrigin\":\"automatic\""],
+            Duration::from_secs(15),
+        );
+        assert!(proven.contains(&sid), "v{ver} origin-only update: {proven}");
+
+        // The fold-only snapshot origin is restored on attach too.
+        let method = if ver == 1 {
+            "session/load"
+        } else {
+            "session/resume"
+        };
+        let rid = c.req(method, &format!("{{\"sessionId\":\"{sid}\"}}"));
+        let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+        assert!(resumed.contains("\"result\""), "{method} failed: {resumed}");
+        let restored = c.wait_for_all(
+            &["\"title\":\"Resumed name\"", "\"nameOrigin\":\"custom\""],
+            Duration::from_secs(15),
+        );
+        assert!(restored.contains(&sid), "v{ver} resumed origin: {restored}");
+        c.finish();
+    }
+}
+
+#[test]
 fn view_health_failure_is_logged_with_reconnect_context() {
     let mut c = Client::spawn("view_health", &[]);
     let sid = c.new_session(1, "");
