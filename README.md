@@ -578,27 +578,29 @@ commands, arguments, URLs, environment values, or headers.
 
 ## How it compares
 
-Several independent projects bridge Muse Code to ACP. They broadly split into
+Several independent projects bridge Muse Code to ACP. Most fall into one of
 two designs: adapters that speak Muse's native session protocol over a
 long-lived `muse serve`, and bridges that wrap the one-shot `muse exec --json`
 event stream. The table below reflects each project's public documentation and
-package metadata as of October 2026; check the projects themselves for
+package metadata as of mid-October 2026; check the projects themselves for
 current behavior.
 
 | Adapter | Language / runtime | Muse transport | Install | Editor targets | License |
 | --- | --- | --- | --- | --- | --- |
 | **muse-acp** (this project) | Rust; single native binary, no runtime | MSP over one long-lived `muse serve` | npm `@brokkai/muse-acp`, release installers, `cargo install` | Zed, JetBrains, any stdio ACP client | Apache-2.0 |
-| [bex-co/muse-code-acp](https://github.com/bex-co/muse-code-acp) | TypeScript; Node.js 22+ | Muse SDK over `muse serve`, with a legacy `muse exec --json` backend | npm `@bex-co/muse-code-acp` | Zed, VS Code, other ACP clients | Apache-2.0 |
+| [bex-co/muse-code-acp](https://github.com/bex-co/muse-code-acp) | TypeScript; Node.js 22+ | Muse SDK over `muse serve`, with a legacy `muse exec --json` backend (`MUSE_CODE_ACP_BACKEND=exec`) | npm `@bex-co/muse-code-acp` | Zed, VS Code, other ACP clients | Apache-2.0 |
+| [RandyNorthrup/muse-spark-code](https://github.com/RandyNorthrup/muse-spark-code) | TypeScript; Node.js 22+ | Muse SDK over `muse serve` on a Muse subscription, or its own agent loop on a Meta Model API key | npm `muse-spark-code-acp`, VS Code Marketplace extension | VS Code-based editors (extension); Zed, JetBrains, Neovim, Emacs (ACP) | MIT |
+| [1broseidon/muse-acp](https://github.com/1broseidon/muse-acp) | Rust | MSP over `muse serve` | `cargo install --git` | Zed, Hotline, any ACP client | Apache-2.0 |
 | [sanjay3290/muse-acp](https://github.com/sanjay3290/muse-acp) | TypeScript; Node.js 20+ | MSP over `muse serve` | npm `muse-acp` | ACP clients (Zed example) | Apache-2.0 |
 | [julianubico/muse-code-acp-bridge](https://github.com/julianubico/muse-code-acp-bridge) | JavaScript; Node.js 22.13+ | `muse exec --json` JSONL | from source (documented npm name not currently published) | acpx custom agents | MIT |
 | [einklover/muse-acp-server](https://github.com/einklover/muse-acp-server) | TypeScript; Node.js 22+ | `muse exec --json`, with model traffic proxied through OpenCode credentials | from source | Paseo | MIT |
 | [jannotix/muse-acp-agent](https://github.com/jannotix/muse-acp-agent) | TypeScript | Uses Muse Code models as the reasoning core | from source | ACP clients | Apache-2.0 |
 
 Relative adoption, from the npm registry's last-30-day download counts
-(2026-09-08 through 2026-10-07), was about 3.6k for `@bex-co/muse-code-acp`,
-1.4k for `@brokkai/muse-acp`, and 140 for `muse-acp`. Download counts include
-CI and mirrors, so treat them as an order-of-magnitude signal, not a usage
-measurement.
+(2026-09-19 through 2026-10-18), was about 4.0k for `@bex-co/muse-code-acp`,
+2.5k for `muse-spark-code-acp`, 2.2k for `@brokkai/muse-acp`, and 160 for
+`muse-acp`. Download counts include CI and mirrors, so treat them as an
+order-of-magnitude signal, not a usage measurement.
 
 The headless `muse exec --json` design is a good fit for one-shot automation and
 scripted workflows. This adapter chooses MSP so a single editor session keeps

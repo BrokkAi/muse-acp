@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Refresh the README adapter comparison: add Muse Spark Code and
+  1broseidon/muse-acp, and update npm adoption to the 30 days ending
+  2026-10-18.
 - Adopt the Muse 1.4.8 resume permission-profile pick (#257). ACP
   `session/load` and `session/resume` accept a non-empty
   `_meta.muse.permissionProfile`; the adapter forwards it only to MSP
