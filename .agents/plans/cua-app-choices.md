@@ -21,7 +21,9 @@ After this change, an editor user can see each app's effective choice, display n
 - [x] Add fake-host, field-matrix, and live-host coverage for app rows, installed rows, patches, and typed refusals.
 - [x] Update README, ROADMAP, event compatibility, CHANGELOG, and this plan.
 - [x] Run all contribution gates.
-- [ ] Open a pull request, complete three review/fix passes, and merge only after final CI is green.
+- [x] Open [PR #291](https://github.com/BrokkAi/muse-acp/pull/291).
+- [x] Complete three review/fix passes.
+- [ ] Merge only after final CI is green.
 
 
 ## Surprises & Discoveries
@@ -68,7 +70,7 @@ After this change, an editor user can see each app's effective choice, display n
 
 ## Outcomes & Retrospective
 
-Implementation, all contribution gates, and live validation are complete. The opt-in extension now forwards the installed-app request, `/cua status` renders effective app rows, `/cua apps` exposes the picker, and `/cua app` writes one atomic multi-app patch while keeping typed host refusals. PR review passes and merge remain.
+Implementation, all contribution gates, live validation, and all three review/fix passes are complete. The opt-in extension now forwards the installed-app request, `/cua status` renders effective app rows, `/cua apps` exposes the picker, and `/cua app` writes one atomic multi-app patch while keeping typed host refusals. Final CI and merge remain.
 
 
 ## Context and Orientation
