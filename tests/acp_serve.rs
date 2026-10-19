@@ -1742,7 +1742,10 @@ fn approval_reviewing_is_activity_without_a_permission_request() {
             && frame.contains("\"kind\":\"execute\""),
         "the native review carries useful identity: {frame}"
     );
-    std::thread::sleep(Duration::from_millis(100));
+    c.wait_stderr(
+        "approval/reviewing ap-1 produced no state change",
+        Duration::from_secs(15),
+    );
     let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
     let reviewing = frames
         .iter()
@@ -1855,6 +1858,7 @@ fn native_approval_reviewing_does_not_consume_adapter_auto_review() {
     c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
     let _pid = c.prompt(&sid, "review it");
     c.wait_for("\"approvalReviewing\":[", Duration::from_secs(15));
+    c.wait_for("\"approvalReviewing\":null", Duration::from_secs(15));
     c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(15));
     c.wait_stderr("auto-review allow", Duration::from_secs(15));
     let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
