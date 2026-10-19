@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Refresh the README adapter comparison: add Muse Spark Code and
+  1broseidon/muse-acp, and update npm adoption to the 30 days ending
+  2026-10-18.
+
 - Publish a complete ACP extension contract and adopt standard protocol
   surfaces (#294). `docs/acp-extensions.md` now centralizes negotiated
   methods, `_meta` shapes, capabilities, fallbacks, and standard mappings.
