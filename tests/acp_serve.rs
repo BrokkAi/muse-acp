@@ -4847,6 +4847,7 @@ fn resume_permission_profile_is_request_scoped_and_typed() {
         for (profile, reason) in [
             (":missing", "permission_profile_unknown"),
             (":unavailable", "permission_profile_unavailable"),
+            (":ephemeral", "permission_profile_ephemeral_fixed"),
         ] {
             let id = c.req(
                 method,
