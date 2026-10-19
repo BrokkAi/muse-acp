@@ -325,8 +325,11 @@ error the editor shows if Muse then refuses the profile says why.
   workspace-local file access. On Muse 1.4.9+ an approval held by Muse's
   native reviewer appears in reversible
   `session_info_update._meta.muse.approvalReviewing` metadata, never as a
-  permission request. The hint clears when the host releases the approval,
-  resolves it, or ends the owning turn.
+  permission request. Each row carries `sourceSessionId`, `approvalId`,
+  `title`, and `kind`; the value becomes `null` when no native reviews remain.
+  The hint clears when the host releases the approval, resolves it, or ends
+  the owning turn. Clients that ignore `_meta` see no change and still receive
+  the ordinary permission request after release.
 - **MCP servers** — stdio and HTTP MCP servers attached by the editor load
   into the Muse session on Muse 1.3.0 and newer; see
   [Client-provided MCP servers](#client-provided-mcp-servers).
