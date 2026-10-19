@@ -12918,7 +12918,15 @@ fn session_list_stream_notifications_are_ignored_without_a_grant() {
 fn streamed_rows_preserve_metadata_priority_and_clear_omitted_fields() {
     let mut c = Client::spawn("session_list_stream", &[("FAKE_STREAM_METADATA", "1")]);
     c.new_session(1, "");
-    c.wait_for("\"title\":\"Streamed name\"", Duration::from_secs(15));
+    let streamed = c.wait_for_all(
+        &[
+            "\"title\":\"Streamed name\"",
+            "\"branch\":\"live-branch\"",
+            "\"attention\":[\"inputPending\"]",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(streamed.contains("session_info_update"), "{streamed}");
     let id = c.req("session/list", "{}");
     let listed = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(
@@ -12931,7 +12939,11 @@ fn streamed_rows_preserve_metadata_priority_and_clear_omitted_fields() {
         !listed.contains("Lower priority") && !listed.contains("Initial title"),
         "{listed}"
     );
-    c.wait_for("\"title\":null", Duration::from_secs(15));
+    let cleared_info = c.wait_for("\"title\":null", Duration::from_secs(15));
+    assert!(
+        !cleared_info.contains("live-branch") && !cleared_info.contains("inputPending"),
+        "omitted streamed metadata must clear the session-info snapshot: {cleared_info}"
+    );
     let id = c.req("session/list", "{}");
     let cleared = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(

@@ -713,10 +713,45 @@ fn adopt_session_projection(s: &mut AcpSession, session: &J) {
     if session.get("status").is_some() {
         s.session_status =
             session_status_projection(session.get("status").and_then(|v| v.as_str()));
+        if let Some(status) = s.session_status.as_deref() {
+            s.set_session_meta("status", esc(status));
+        }
     }
     if session.get("attention").is_some() {
         s.attention = attention_projection(session.get("attention"), &s.msp_sid);
         s.attention_meta = session.get("attention").map(j_to_string);
+        if let Some(flags) = s.attention.as_deref() {
+            let values = flags
+                .iter()
+                .map(|flag| esc(flag))
+                .collect::<Vec<_>>()
+                .join(",");
+            s.set_session_meta("attention", format!("[{values}]"));
+        }
+    }
+}
+
+/// Streamed session-list rows replace metadata as a whole. Unlike a partial
+/// lifecycle snapshot, an omitted status, branch, or attention field is an
+/// authoritative clear.
+fn adopt_streamed_session_row(s: &mut AcpSession, row: &J) {
+    if row.get("status").is_some() || row.get("attention").is_some() {
+        adopt_session_projection(s, row);
+    }
+    if row.get("status").is_none() {
+        s.session_status = None;
+        s.remove_session_meta("status");
+    }
+    if row.get("attention").is_none() {
+        s.attention = None;
+        s.attention_meta = None;
+        s.remove_session_meta("attention");
+    }
+    s.branch_meta = raw_host_fact(Some(row), "branch");
+    if let Some(branch) = s.branch_meta.as_deref() {
+        s.set_session_meta("branch", branch.to_string());
+    } else {
+        s.remove_session_meta("branch");
     }
 }
 
@@ -9734,10 +9769,12 @@ fn update_host_session_facts(
     }
     if let Some(branch) = host_session.get("branch") {
         session.branch_meta = Some(j_to_string(branch));
+        session.set_session_meta("branch", j_to_string(branch));
     }
     if let Some(attention) = host_session.get("attention") {
         session.attention_meta = Some(j_to_string(attention));
     }
+    adopt_session_projection(session, host_session);
     HostTitleUpdate::after(&before, &session.title_facts)
 }
 
@@ -11467,9 +11504,7 @@ fn handle_msp(
                     session.title_facts.name_origin = previous_origin;
                 }
                 session.title_facts.generated_name = before.generated_name.clone();
-                session.branch_meta = raw_host_fact(Some(row), "branch");
-                session.attention_meta = raw_host_fact(Some(row), "attention");
-                adopt_session_projection(session, row);
+                adopt_streamed_session_row(session, row);
                 if let Some(update) = HostTitleUpdate::after(&before, &session.title_facts) {
                     update.send(stdout, session);
                 }
