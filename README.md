@@ -315,7 +315,9 @@ error the editor shows if Muse then refuses the profile says why.
   reported.
 - **Turns** — streamed text and tool updates, queued concurrent prompts,
   cancellation with a terminal event, and exact-turn steering over the
-  `_session/steering` extension (ACP v1 and v2).
+  `_session/steering` extension (ACP v1 and v2). A declined retract keeps the
+  prompt and turn targetable until Muse's interrupt terminal arrives; accepted
+  or legacy retracts settle the prompt as cancelled immediately.
 - **Approvals** — Muse approval requests surfaced as
   `session/request_permission`, with a deny-safe fallback that explains
   failed or unusable editor replies in the transcript, plus optional

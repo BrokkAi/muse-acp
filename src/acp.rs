@@ -18,6 +18,8 @@ pub struct InFlight {
     /// True until the host announces that a queued turn has launched.
     pub queued: bool,
     pub file_report: Option<FileChangeReport>,
+    /// A declined retract keeps this prompt open; report it only once.
+    pub declined_retract_notified: bool,
 }
 
 /// Host-reported file writes accumulated for one requested turn report.

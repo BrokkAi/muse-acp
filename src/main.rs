@@ -5684,6 +5684,7 @@ fn handle_acp(
                                 req_id: id.clone().unwrap_or(J::Null),
                                 queued: false,
                                 file_report: report_request.map(new_file_report),
+                                declined_retract_notified: false,
                             });
                             s.active_turn = Some(turn.to_string());
                             drop(map);
@@ -5953,6 +5954,7 @@ fn handle_acp(
                             req_id: id.clone().unwrap_or(J::Null),
                             queued: !started,
                             file_report: report_request.map(new_file_report),
+                            declined_retract_notified: false,
                         });
                         if started {
                             s.active_turn = Some(turn);
@@ -6558,6 +6560,7 @@ fn handle_acp(
                     req_id: J::Null,
                     queued: false,
                     file_report: None,
+                    declined_retract_notified: false,
                 });
             }
             // Acknowledge the extension before emitting the synthetic echo.
@@ -10719,38 +10722,59 @@ fn handle_msp(
             log(&format!("turn/started turn={turn_id} sess={msp_sid}"));
         }
         "turn/retracted" => {
-            // A durably retracted submission never runs to a normal
-            // terminal: settle the tracked prompt now as cancelled (like
-            // turn/unqueued) so it cannot hang or falsely succeed. A late
-            // turn/completed then finds no tracked prompt left to settle.
-            //
-            // The 1.4.6 `outcome` rides this settlement: `accepted` means the
-            // submitted user message is rolled back, `declined` means the
-            // rollback was refused. Either way the interrupt that produced the
-            // retract already cancelled the turn, so both arms settle the
-            // prompt the same way and the outcome only needs a diagnostic.
+            // An accepted retract is final: settle the tracked prompt now as
+            // cancelled (like turn/unqueued) so it cannot hang or falsely
+            // succeed. A declined retract means the submission stood; the
+            // interrupt still stops the turn, but its ordinary terminal is
+            // what settles the prompt and clears the active turn.
             let msp_sid = params
                 .get("sessionId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+            let outcome = params
+                .get("outcome")
+                .and_then(|v| v.as_str())
+                .unwrap_or("accepted");
             log(&format!(
                 "turn/retracted turn={turn_id} sess={msp_sid} command={} outcome={}",
                 params
                     .get("commandId")
                     .and_then(|v| v.as_str())
                     .unwrap_or("?"),
-                // Absent reads as `accepted` per the schema's additive-optional
-                // rule; an unrecognized value is the open enum's fallback.
-                params
-                    .get("outcome")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("accepted")
+                // Absent and unrecognized values read as accepted.
+                outcome
             ));
             let acp_sid = match find_acp_sid(sessions, msp_sid) {
                 Some(s) => s,
                 None => return,
             };
+            if outcome == "declined" {
+                let notify = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&acp_sid)
+                    .and_then(|s| {
+                        let ver = s.ver;
+                        let held = s.in_flight.iter_mut().find(|f| f.msp_turn == turn_id)?;
+                        let first = !held.declined_retract_notified;
+                        held.declined_retract_notified = true;
+                        Some((ver, first))
+                    });
+                match notify {
+                    Some((ver, true)) => send_agent_text(
+                        stdout,
+                        &acp_sid,
+                        ver,
+                        "Muse declined to retract the submitted message; the turn is still stopping and its terminal will settle this prompt.",
+                    ),
+                    Some((_, false)) => {}
+                    None => log(&format!(
+                        "declined turn/retracted ignored: no tracked prompt for turn {turn_id}"
+                    )),
+                }
+                return;
+            }
             invalidate_pending_approval(stdout, sessions, &acp_sid, None, true);
             let settled = sessions
                 .lock()

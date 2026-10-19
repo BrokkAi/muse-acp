@@ -37,6 +37,11 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   unqueued     turn/unqueued for the turn (never runs)
   retracted    turn/retracted for the turn (no completion follows)
   retract_then_completed retract, then a late turn/completed (settle once)
+  declined_retract_then_completed declined retract, then the normal reply and
+               terminal; the submission stood but the interrupt still ran
+  declined_retract_after_completed terminal first, then the declined retract
+               (the live 1.4.10 order after committed output)
+  declined_retract_quiet declined retract only, for steering and second Stop
   retry_then_completed turn/retryScheduled, then a normal completion
   model_retry_then_completed turn/modelRetryScheduled (unknown errorKind, no
                httpStatus/system), then a normal completion
@@ -1203,6 +1208,27 @@ def on_turn_start(params):
         # A terminal still arrives after the retract: settle exactly once.
         notify("turn/retracted", {**base, "commandId": params.get("commandId", "")})
         notify("turn/completed", {**base, "terminal": "cancelled"})
+    elif SCENARIO == "declined_retract_then_completed":
+        # The interrupt still stops the turn, but the submission stood, so
+        # the adapter must wait for the ordinary terminal instead of settling
+        # cancelled at the retract event.
+        notify("turn/retracted", {**base,
+                                  "commandId": params.get("commandId", ""),
+                                  "outcome": "declined"})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-declined-retract", "kind": "agentMessage",
+            "status": "completed", "revision": 1,
+            "text": "continued after declined retract"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "declined_retract_quiet":
+        notify("turn/retracted", {**base,
+                                  "commandId": params.get("commandId", ""),
+                                  "outcome": "declined"})
+    elif SCENARIO == "declined_retract_after_completed":
+        notify("turn/completed", {**base, "terminal": "cancelled"})
+        notify("turn/retracted", {**base,
+                                  "commandId": params.get("commandId", ""),
+                                  "outcome": "declined"})
     elif SCENARIO == "retry_then_completed":
         # Retry is non-terminal: the later completion settles, exactly once.
         notify("turn/retryScheduled", {**base,

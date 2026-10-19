@@ -2969,19 +2969,110 @@ fn turn_retracted_settles_prompt_cancelled() {
 }
 
 #[test]
-fn declined_retract_still_settles_the_prompt_cancelled() {
-    // A declined retract refuses the user-message rollback, but the interrupt
-    // that produced it already cancelled the turn, so the ACP settlement is
-    // the same as the accepted arm and only the diagnostic differs.
-    let mut c = Client::spawn("retracted", &[("FAKE_RETRACT_OUTCOME", "declined")]);
+fn unknown_retract_outcome_reads_as_accepted() {
+    let mut c = Client::spawn("retracted", &[("FAKE_RETRACT_OUTCOME", "future")]);
     let sid = c.new_session(1, "");
     let pid = c.prompt(&sid, "hi");
     let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert!(
-        done.contains("\"stopReason\":\"cancelled\""),
-        "declined retract still settles: {done}"
-    );
+    assert!(done.contains("\"stopReason\":\"cancelled\""), "{done}");
+    c.wait_stderr("outcome=future", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn declined_retract_waits_for_the_normal_terminal() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("declined_retract_then_completed", &[]);
+        let sid = c.new_session(ver, "");
+        let pid = c.prompt(&sid, "hi");
+        if ver == 2 {
+            let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+            assert!(accepted.contains("\"result\":{}"), "{accepted}");
+        }
+        let note = c.wait_for_all(
+            &["Muse declined to retract", "agent_message_chunk"],
+            Duration::from_secs(15),
+        );
+        assert!(
+            note.contains("terminal will settle this prompt"),
+            "the decline explains the held prompt: {note}"
+        );
+        c.wait_stderr("turn/retracted turn=turn-1", Duration::from_secs(15));
+        c.wait_stderr("outcome=declined", Duration::from_secs(15));
+        if ver == 1 {
+            let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+            assert!(
+                done.contains("\"stopReason\":\"end_turn\"")
+                    && !done.contains("\"stopReason\":\"cancelled\""),
+                "the normal terminal settles the prompt: {done}"
+            );
+        } else {
+            let idle = c.wait_for_all(&["\"idle\"", "\"end_turn\""], Duration::from_secs(15));
+            assert!(!idle.contains("\"cancelled\""), "{idle}");
+        }
+        c.wait_for("continued after declined retract", Duration::from_secs(15));
+        c.finish();
+    }
+}
+
+#[test]
+fn declined_retract_preserves_steering_and_second_cancel() {
+    const STEERING: &str =
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"steering\"]}}}";
+    let mut c = Client::spawn("declined_retract_quiet", &[]);
+    let sid = c.new_session(2, STEERING);
+    let pid = c.prompt(&sid, "hi");
+    let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(accepted.contains("\"result\":{}"), "{accepted}");
+    c.wait_for("Muse declined to retract", Duration::from_secs(15));
     c.wait_stderr("outcome=declined", Duration::from_secs(15));
+    {
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(
+            !frames
+                .iter()
+                .any(|frame| frame.contains("\"state\":\"idle\"")),
+            "a declined retract must not settle the prompt: {frames:#?}"
+        );
+    }
+
+    let steer = c.req(
+        "_session/steering",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"keep going\"}}]}}"
+        ),
+    );
+    let steered = c.wait_for(&format!("\"id\":{steer}"), Duration::from_secs(15));
+    assert!(steered.contains("\"outcome\":\"injected\""), "{steered}");
+    c.wait_input("\"expectedTurnId\": \"turn-1\"", Duration::from_secs(15));
+
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.wait_input("\"turnId\": \"turn-1\"", Duration::from_secs(15));
+    let idle = c.wait_for_all(&["\"idle\"", "\"cancelled\""], Duration::from_secs(15));
+    assert!(idle.contains(&sid), "{idle}");
+    c.finish();
+}
+
+#[test]
+fn declined_retract_after_the_terminal_is_ignored() {
+    let mut c = Client::spawn("declined_retract_after_completed", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("\"stopReason\":\"cancelled\""), "{done}");
+    c.wait_stderr("outcome=declined", Duration::from_secs(15));
+    c.wait_stderr(
+        "declined turn/retracted ignored: no tracked prompt",
+        Duration::from_secs(15),
+    );
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.contains("Muse declined to retract")),
+        "a settled prompt must not receive a late decline note: {frames:#?}"
+    );
+    drop(frames);
     c.finish();
 }
 

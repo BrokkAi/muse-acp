@@ -349,7 +349,6 @@ impl Adapter {
     }
 
     /// Waits until the adapter's log contains `needle`.
-    #[cfg(target_os = "linux")]
     fn wait_log(&self, needle: &str) {
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -523,6 +522,32 @@ fn cancel_stops_a_streaming_turn() {
         "the turn must stop while the model is still streaming, not after {:?}",
         started.elapsed()
     );
+    adapter.finish();
+}
+
+#[test]
+fn declined_retract_after_a_committed_tool_call_keeps_the_terminal_settlement() {
+    let test = "declined_retract_after_a_committed_tool_call_keeps_the_terminal_settlement";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"shell": shell_step()}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 6), test) else {
+        return;
+    };
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.prompt(&session, "write it [[script:shell]]");
+    let permission = adapter.permission();
+    assert_eq!(permission["params"]["toolCall"]["kind"], "execute");
+    adapter.send(
+        json!({"jsonrpc": "2.0", "method": "session/cancel", "params": {"sessionId": session}}),
+    );
+    let result = adapter.result(id);
+    assert_eq!(result["stopReason"], "cancelled", "{result}");
+    adapter.wait_log("outcome=declined");
+    adapter.wait_log("declined turn/retracted ignored: no tracked prompt");
     adapter.finish();
 }
 

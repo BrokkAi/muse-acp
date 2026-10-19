@@ -763,7 +763,7 @@ cannot drop a member without failing CI.
 | `TurnRetryScheduledParams.errorKind` | Consumed | Recorded in the `turn/retryScheduled` diagnostic; the event stays non-terminal and never settles the ACP prompt. |
 | `TurnRetryScheduledParams.httpStatus` | Consumed | Recorded in the `turn/retryScheduled` diagnostic; the event stays non-terminal and never settles the ACP prompt. |
 | `TurnRetryScheduledParams.system` | Consumed | Recorded in the `turn/retryScheduled` diagnostic; the event stays non-terminal and never settles the ACP prompt. |
-| `TurnRetractedParams.outcome` | Consumed | Recorded in the `turn/retracted` diagnostic; `accepted` and `declined` both settle the interrupt-paired prompt as cancelled, so the outcome needs no ACP branch. Whether a `declined` outcome should instead hold the prompt is re-examined against the SDK 1.4.10 fold in [#273](https://github.com/BrokkAi/muse-acp/issues/273). |
+| `TurnRetractedParams.outcome` | Mapped to ACP | An explicit `declined` keeps a tracked prompt, active turn, steering target, and second Stop target open until the interrupt's ordinary `turn/completed` terminal; one transcript note explains the held prompt. Accepted, absent, and unknown outcomes keep the final-retract cancellation path. A late declined retract for an already-settled turn is logged and ignored. |
 | `SessionStartParams.permissionProfile` | Intentionally ignored | The adapter selects approval policy with `approvalMode`; the host's permission-profile catalog is not read or pinned here, and the 1.4.8 resume-time pick has its own issue in [#257](https://github.com/BrokkAi/muse-acp/issues/257). |
 | `TurnStartParams.userShell` | Intentionally ignored | A `!cmd` queued behind a running turn is the app's own submit; the adapter drives shells through the `session/userShell` command instead. |
 | `Session.sideFrom` | Mapped to ACP | Published as `session_info_update._meta.muse.sideFrom` when present; the nullable spelling tolerates `null` as "no side provenance". |
@@ -988,12 +988,17 @@ Status: **implemented (display plus `/goal` control).**
 `session/goalChanged` (including explicit `null` clears) publishes the
 provider-neutral `_meta.goal` presentation on `session_info_update`;
 `session/branchChanged` publishes a namespaced branch observation; both are
-restored from the resume snapshot. `turn/retracted` settles the tracked prompt
-as cancelled (v1 result, v2 idle) and clears the active turn, so a late
-`turn/completed` finds nothing left to settle; `turn/retryScheduled` stays
-non-settling per schema (it never resolves a turn-wait) and records attempt
-facts in diagnostics. Race tests pin retract-then-completed and
-retry-then-completed settle-exactly-once.
+restored from the resume snapshot. An accepted, absent, or unknown
+`turn/retracted` outcome settles the tracked prompt as cancelled (v1 result,
+v2 idle) and clears the active turn, so a late `turn/completed` finds nothing
+left to settle. An explicit `declined` outcome keeps the prompt and active turn
+until the interrupt's ordinary terminal, preserving steering and a second Stop
+target; a late declined retract after the terminal is logged and ignored.
+`turn/retryScheduled` stays non-settling per schema (it never resolves a
+turn-wait) and records attempt facts in diagnostics. Race tests pin accepted
+retract-then-completed, declined running-first and terminal-first ordering,
+second Stop during a declined retract, and retry-then-completed
+settle-exactly-once.
 
 The `/goal` slash command maps onto the stable MSP `goal/set`, `goal/edit`,
 `goal/pause`, `goal/resume`, and `goal/clear` methods with the host TUI
