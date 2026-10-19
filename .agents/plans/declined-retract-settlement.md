@@ -25,8 +25,9 @@ To see it working, run the focused fake-host tests in Validation and Acceptance.
 - [x] (2026-10-19) Added live 1.4.10 coverage using a committed tool call; the real host emits the terminal first and the adapter ignores the later declined event.
 - [x] (2026-10-19) Updated the 1.4.x field matrix, event compatibility matrix, roadmap, README, and changelog.
 - [x] (2026-10-19) Ran all local contribution gates and both focused live cancellation tests successfully.
-- [ ] Open a pull request that closes #273.
-- [ ] Complete three review/fix passes and merge only when the final head's required checks are green.
+- [x] (2026-10-19) Opened [PR #283](https://github.com/BrokkAi/muse-acp/pull/283) to close #273.
+- [x] (2026-10-19) Completed three review/fix passes: covered duplicate declined frames and narrowed the live gate to 1.4.10, made the replay test wait for both frames, and tightened the transcript wording to say the turn remains open rather than implying ongoing work.
+- [ ] Merge only when the final head's required checks are green.
 
 
 ## Surprises & Discoveries
@@ -65,7 +66,7 @@ To see it working, run the focused fake-host tests in Validation and Acceptance.
 
 ## Outcomes & Retrospective
 
-Implementation is in progress. The completed outcome will be recorded after the three review passes and merge.
+Implementation and all three review passes are complete on PR #283. A declined retract now preserves the tracked prompt and active turn for the interrupt terminal, emits one explanatory note, and leaves accepted, absent, unknown, and already-settled ordering on their existing paths. The final validation and remote-check result will be appended before merge.
 
 
 ## Context and Orientation
@@ -170,7 +171,7 @@ Local validation on 2026-10-19:
     cargo clippy --locked --all-targets -- -D warnings
     cargo test --locked
         unit: 156 passed
-        acp_serve: 357 passed
+        acp_serve: 358 passed
         fuzz corpus: 8 passed
         live_host: 1 passed
         live_loopback: 43 passed (disabled unless MUSE_ACP_LOOPBACK=1)
@@ -186,6 +187,12 @@ Focused live tests against Muse 1.4.10:
 
     cancel_stops_a_streaming_turn: passed
     declined_retract_after_a_committed_tool_call_keeps_the_terminal_settlement: passed
+
+Review/fix commits:
+
+    944f205 Cover declined retract replay
+    6cf4b87 Make declined replay test deterministic
+    1e222bc Clarify declined retract notice
 
 
 ## Interfaces and Dependencies
