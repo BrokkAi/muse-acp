@@ -4063,6 +4063,17 @@ fn generated_session_name_is_fold_only_metadata() {
         // List rows carry only the canonical fact. Reading one must neither
         // expose generatedName nor erase the value already held live.
         let lid = c.req("session/list", "{}");
+        let preserved = c.wait_for_all(
+            &[
+                "\"title\":\"Listed canonical title\"",
+                "\"generatedName\":\"Live short title\"",
+            ],
+            Duration::from_secs(15),
+        );
+        assert!(
+            preserved.contains(&sid),
+            "v{ver} list change preserved generated title: {preserved}"
+        );
         let listed = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
         assert!(
             !listed.contains("generatedName"),

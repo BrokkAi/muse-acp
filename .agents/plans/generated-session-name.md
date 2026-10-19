@@ -169,3 +169,5 @@ At completion, `src/acp.rs` defines `HostTitleFacts` with a public `generated_na
 At completion, `src/main.rs` provides a helper that snapshots the canonical title, name origin, and generated name for change detection; an authoritative generated-name replacement helper used by lifecycle snapshots and `SessionNameChangedParams`; and non-authoritative folding used by list rows. No new dependency is required.
 
 Change note (2026-10-19): review pass 1 corrected the live-test description and progress to match the implemented and locally validated behavior.
+
+Change note (2026-10-19): review pass 2 strengthened the fake-host list test so a canonical list-row change must republish the previously learned generated title, proving that the fold-only value survives a list read rather than merely checking that the response omits it.

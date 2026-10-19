@@ -1934,6 +1934,11 @@ def result_for(method, msg):
         bare = session_obj("msp-sess-bare", "/tmp/bare-ws")
         old["updatedAt"] = "2026-08-01T00:00:00Z"
         live["updatedAt"] = "2026-09-04T00:00:00Z"
+        if SCENARIO == "generated_name":
+            # The list surface can change the canonical name but never carries
+            # the fold-only generated short title. The adapter must retain the
+            # value it learned from the lifecycle/name-change fold.
+            live["name"] = "Listed canonical title"
         rows = [live, old, untitled, bare]
         if os.environ.get("FAKE_LIST_NULL_ROOT") == "1":
             rows.append({"sessionId": "msp-sess-noroot", "workspaceRoot": None})
