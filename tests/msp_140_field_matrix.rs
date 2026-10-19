@@ -20,6 +20,10 @@ const END: &str = "<!-- msp-1.4.x-field-matrix:end -->";
 const ADDITIONS: &[&str] = &[
     "ItemKind.webSearch",
     "ItemKind.monitorFeed",
+    "ComputerUseSettings.apps",
+    "ComputerUseSettings.installedApps",
+    "ComputerUseSettingsReadParams.installed",
+    "ComputerUseSettingsUpdateParams.apps",
     "TurnErrorKind.mcpLinkError",
     "TurnError.quota",
     "TurnRetryScheduledParams.errorKind",
@@ -212,6 +216,10 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("Item", "cutOff"),
         ("Item", "monitorId"),
         ("Item", "monitorDescription"),
+        ("ComputerUseSettings", "apps"),
+        ("ComputerUseSettings", "installedApps"),
+        ("ComputerUseSettingsReadParams", "installed"),
+        ("ComputerUseSettingsUpdateParams", "apps"),
         ("InitializeResult", "sandboxAvailability"),
         ("InitializeResult", "sandboxUnavailableReason"),
         ("Item", "displayLabel"),
@@ -225,6 +233,39 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         assert!(
             has_property(defs, def, member),
             "{def}.{member} left the stable surface"
+        );
+    }
+}
+
+#[test]
+fn computer_use_app_definitions_stay_in_the_vendored_bundle() {
+    let schema = schema();
+    let defs = schema.get("$defs").expect("$defs");
+    for def in [
+        "ComputerUseApp",
+        "ComputerUseAppChoice",
+        "ComputerUseAppLock",
+        "ComputerUseAppPatch",
+        "ComputerUseInstalledApp",
+    ] {
+        assert!(defs.get(def).is_some(), "{def} left the stable surface");
+    }
+    let enum_has = |def: &str, value: &str| {
+        defs.get(def)
+            .and_then(|d| d.get("enum"))
+            .and_then(|e| e.as_array())
+            .is_some_and(|values| values.iter().any(|v| v == value))
+    };
+    for value in ["ask", "alwaysAllow", "blocked"] {
+        assert!(
+            enum_has("ComputerUseAppChoice", value),
+            "ComputerUseAppChoice.{value} left the stable surface"
+        );
+    }
+    for value in ["builtIn", "file"] {
+        assert!(
+            enum_has("ComputerUseAppLock", value),
+            "ComputerUseAppLock.{value} left the stable surface"
         );
     }
 }

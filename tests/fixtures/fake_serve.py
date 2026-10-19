@@ -445,6 +445,110 @@ SIDE_CHAT_CMD = [""]
 # The goal turn currently running in the goal_* scenarios ("" when idle).
 GOAL_TURN = [""]
 GOAL_OBJECTIVE = [""]
+CUA_CONTROL = ["ask"]
+CUA_SCREENSHOTS = ["ask"]
+CUA_APPS = [
+    {"bundleId": "com.acme.Editor", "choice": "alwaysAllow",
+     "name": "Acme Editor", "lastAskedAt": "2026-10-01T12:00:00Z"},
+    {"bundleId": "com.acme.Secrets", "choice": "blocked",
+     "name": "Acme Secrets", "lastAskedAt": "2026-10-02T12:00:00Z"},
+    {"bundleId": "com.apple.finder", "choice": "blocked", "name": "Finder",
+     "locked": True, "lockedBy": "builtIn"},
+    {"bundleId": "com.acme.Managed", "choice": "blocked",
+     "name": "Managed App", "locked": True, "lockedBy": "file"},
+]
+CUA_INSTALLED_APPS = [
+    {"bundleId": "com.acme.Editor", "name": "Acme Editor"},
+    {"bundleId": "com.apple.Safari", "name": "Safari"},
+    {"bundleId": "com.apple.finder", "name": "Finder"},
+]
+
+
+def cua_app(bundle_id):
+    for app in CUA_APPS:
+        if app["bundleId"] == bundle_id:
+            return app
+    return None
+
+
+def cua_app_update_error(params):
+    apps = params.get("apps", [])
+    ids = [app.get("bundleId", "") for app in apps]
+    duplicate = next((bundle for bundle in ids if ids.count(bundle) > 1), "")
+    if duplicate:
+        return {"code": -32030, "message": "duplicate app bundle id",
+                "data": {"kind": "commandRejected",
+                         "reason": "duplicate_bundle_id",
+                         "bundleId": duplicate, "retryable": False}}
+    overlap = set(ids) & (set(params.get("blockApps", []))
+                          | set(params.get("unblockApps", [])))
+    if overlap:
+        bundle = sorted(overlap)[0]
+        return {"code": -32030, "message": "app patch overlaps block lists",
+                "data": {"kind": "commandRejected",
+                         "reason": "app_patch_overlap",
+                         "bundleId": bundle, "retryable": False}}
+    for bundle in params.get("blockApps", []) + params.get("unblockApps", []):
+        seen = cua_app(bundle)
+        if seen and seen.get("locked") is True:
+            return {"code": -32030, "message": "locked app cannot change",
+                    "data": {"kind": "commandRejected", "reason": "app_locked",
+                             "bundleId": bundle,
+                             "lockedBy": seen.get("lockedBy", "unknown"),
+                             "retryable": False}}
+    for app in apps:
+        seen = cua_app(app.get("bundleId", ""))
+        if seen and seen.get("locked") is True:
+            return {"code": -32030, "message": "locked app cannot change",
+                    "data": {"kind": "commandRejected", "reason": "app_locked",
+                             "bundleId": seen["bundleId"],
+                             "lockedBy": seen.get("lockedBy", "unknown"),
+                             "retryable": False}}
+    return None
+
+
+def cua_settings(params):
+    for bundle in params.get("blockApps", []):
+        app = cua_app(bundle)
+        if app is None:
+            CUA_APPS.append({"bundleId": bundle, "choice": "blocked"})
+        else:
+            app["choice"] = "blocked"
+    for bundle in params.get("unblockApps", []):
+        app = cua_app(bundle)
+        if app and app.get("locked") is not True:
+            app["choice"] = "ask"
+    for patch in params.get("apps", []):
+        bundle = patch.get("bundleId", "")
+        app = cua_app(bundle)
+        if app is None:
+            CUA_APPS.append({"bundleId": bundle,
+                             "choice": patch.get("choice", "ask")})
+        else:
+            app["choice"] = patch.get("choice", app["choice"])
+    if "computerControl" in params:
+        CUA_CONTROL[0] = params["computerControl"]
+    if "screenshots" in params:
+        CUA_SCREENSHOTS[0] = params["screenshots"]
+    blocked = [{"bundleId": app["bundleId"], "locked": False}
+               for app in CUA_APPS
+               if app.get("choice") == "blocked"
+               and app.get("locked") is not True]
+    if params.get("showBuiltIns") is True:
+        blocked.extend({
+            "bundleId": app["bundleId"],
+            "locked": True,
+            "prefix": app["bundleId"] == "com.apple.finder",
+        } for app in CUA_APPS if app.get("locked") is True)
+    settings = {
+        "computerControl": CUA_CONTROL[0],
+        "screenshots": CUA_SCREENSHOTS[0],
+        "blockedApps": blocked,
+        "apps": [dict(app) for app in CUA_APPS],
+    }
+    if params.get("installed") is True:
+        settings["installedApps"] = [dict(app) for app in CUA_INSTALLED_APPS]
+    return settings
 
 
 def goal_changed(status):
@@ -2271,23 +2375,11 @@ def result_for(method, msg):
     if method == "computerUseSettings/read":
         params = msg.get("params", {})
         log_input(params)
-        apps = [{"bundleId": "com.acme.Secrets", "locked": False}]
-        if params.get("showBuiltIns") is True:
-            apps.append({"bundleId": "com.apple.finder", "locked": True,
-                         "prefix": False})
-        return {"computerControl": "ask", "screenshots": "ask",
-                "blockedApps": apps}
+        return cua_settings(params)
     if method == "computerUseSettings/update":
         params = msg.get("params", {})
         log_input(params)
-        apps = [{"bundleId": "com.acme.Secrets", "locked": False}]
-        for bundle in params.get("blockApps", []):
-            apps.append({"bundleId": bundle, "locked": False})
-        for bundle in params.get("unblockApps", []):
-            apps = [a for a in apps if a["bundleId"] != bundle]
-        return {"computerControl": params.get("computerControl", "ask"),
-                "screenshots": params.get("screenshots", "ask"),
-                "blockedApps": apps}
+        return cua_settings(params)
     if method == "media/upload":
         params = msg.get("params", {})
         # The base64 chunks stay out of the text log; the assembled bytes are
@@ -2922,6 +3014,13 @@ def main():
                                     "message": "computer use is unavailable",
                                     "data": {"kind": "computerUseUnavailable"}}})
                     continue
+                if method == "computerUseSettings/update":
+                    params = msg.get("params", {})
+                    error = cua_app_update_error(params)
+                    if error:
+                        log_input(params)
+                        send({"jsonrpc": "2.0", "id": ident, "error": error})
+                        continue
                 if (method == "computerUseSetup/check"
                         and os.environ.get("FAKE_CUA_HOST_BUSY") == "1"):
                     log_input(msg.get("params", {}))

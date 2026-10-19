@@ -10000,16 +10000,35 @@ fn computer_use_reads_require_the_opt_in_and_the_grant() {
         frame.contains("\"setup\":\"dormant\"")
             && frame.contains("\"computerControl\":\"ask\"")
             && frame.contains("\"bundleId\":\"com.acme.Secrets\"")
-            && !frame.contains("com.apple.finder"),
+            && frame.contains("\"apps\":["),
         "the read returns setup and settings: {frame}"
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&frame).expect("read frame JSON");
+    let settings = &parsed["result"]["settings"];
+    assert!(
+        settings["apps"].as_array().is_some_and(|apps| apps
+            .iter()
+            .any(|app| { app["bundleId"] == "com.apple.finder" && app["locked"] == true })),
+        "the effective app list includes locked rows: {frame}"
+    );
+    assert!(
+        settings["blockedApps"]
+            .as_array()
+            .is_some_and(|apps| apps.iter().all(|app| app["bundleId"] != "com.apple.finder")),
+        "showBuiltIns is still required for the blocked-apps list: {frame}"
     );
     let id = c.req(
         "_session/computerUse",
         &format!("{{\"sessionId\":\"{sid}\",\"showBuiltIns\":true}}"),
     );
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    let parsed: serde_json::Value = serde_json::from_str(&frame).expect("built-in read frame JSON");
     assert!(
-        frame.contains("com.apple.finder") && frame.contains("\"locked\":true"),
+        parsed["result"]["settings"]["blockedApps"]
+            .as_array()
+            .is_some_and(|apps| apps
+                .iter()
+                .any(|app| { app["bundleId"] == "com.apple.finder" && app["locked"] == true })),
         "showBuiltIns adds the locked rows: {frame}"
     );
     c.finish();
@@ -10085,6 +10104,124 @@ fn cua_commands_drive_setup_and_settings() {
         "the command respects the gate: {frame}"
     );
     bare.finish();
+    c.finish();
+}
+
+#[test]
+fn cua_app_choices_and_installed_picker_round_trip() {
+    const OPT_IN: &str =
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"computerUse\"]}}}";
+    let mut c = Client::spawn("computer_use", &[]);
+    let sid = c.new_session(2, OPT_IN);
+    let commands = c.wait_for("\"name\":\"cua\"", Duration::from_secs(15));
+    assert!(
+        commands.contains("apps") && commands.contains("app <bundleId> <choice>"),
+        "the command hint advertises app choices and the installed picker: {commands}"
+    );
+
+    let id = c.req(
+        "_session/computerUse",
+        &format!("{{\"sessionId\":\"{sid}\"}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"apps\":[")
+            && frame.contains("\"bundleId\":\"com.acme.Editor\"")
+            && !frame.contains("\"installedApps\":"),
+        "apps are always present, but the picker is not requested by default: {frame}"
+    );
+
+    let id = c.req(
+        "_session/computerUse",
+        &format!("{{\"sessionId\":\"{sid}\",\"installed\":true}}"),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(
+        frame.contains("\"apps\":[")
+            && frame.contains("\"bundleId\":\"com.acme.Editor\"")
+            && frame.contains("\"choice\":\"alwaysAllow\"")
+            && frame.contains("\"lockedBy\":\"builtIn\"")
+            && frame.contains("\"installedApps\":[")
+            && frame.contains("\"bundleId\":\"com.apple.Safari\""),
+        "the structured read includes effective app rows and the installed picker: {frame}"
+    );
+    c.wait_input("\"installed\": true", Duration::from_secs(10));
+
+    let pid = c.prompt(&sid, "/cua status");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    c.wait_for_all(
+        &[
+            "Apps:",
+            "Acme Editor [com.acme.Editor]: alwaysAllow (last asked 2026-10-01T12:00:00Z)",
+            "Finder [com.apple.finder]: blocked (locked by builtIn)",
+        ],
+        Duration::from_secs(15),
+    );
+
+    let pid = c.prompt(&sid, "/cua apps");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    c.wait_for_all(
+        &["Installed apps:", "Safari [com.apple.Safari]"],
+        Duration::from_secs(15),
+    );
+
+    let pid = c.prompt(
+        &sid,
+        "/cua app com.acme.Editor blocked com.acme.Secrets alwaysAllow",
+    );
+    let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\":{}"), "{frame}");
+    c.wait_input(
+        "\"apps\": [{\"bundleId\": \"com.acme.Editor\", \"choice\": \"blocked\"}",
+        Duration::from_secs(10),
+    );
+    c.wait_for_all(
+        &[
+            "Acme Editor [com.acme.Editor]: blocked",
+            "Acme Secrets [com.acme.Secrets]: alwaysAllow",
+        ],
+        Duration::from_secs(15),
+    );
+
+    // Locked and duplicate rows keep the host's typed refusal.
+    for (text, reason, bundle) in [
+        (
+            "/cua app com.apple.finder ask",
+            "app_locked",
+            "com.apple.finder",
+        ),
+        (
+            "/cua app com.acme.Editor ask com.acme.Editor blocked",
+            "duplicate_bundle_id",
+            "com.acme.Editor",
+        ),
+    ] {
+        let pid = c.prompt(&sid, text);
+        let frame = c.wait_for_all(
+            &[&format!("\"id\":{pid}"), "\"code\":-32030"],
+            Duration::from_secs(15),
+        );
+        assert!(
+            frame.contains("\"code\":-32030")
+                && frame.contains("\"kind\":\"commandRejected\"")
+                && frame.contains(reason)
+                && frame.contains(bundle),
+            "{text} keeps the typed host refusal: {frame}"
+        );
+    }
+
+    for text in [
+        "/cua app",
+        "/cua app com.acme.Editor",
+        "/cua app com.acme.Editor sometimes",
+    ] {
+        let pid = c.prompt(&sid, text);
+        let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"code\":-32602") && frame.contains("usage: /cua"),
+            "{text} fails locally: {frame}"
+        );
+    }
     c.finish();
 }
 

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Adopt Muse 1.4.8 Computer Use app-level choices (#253). The opt-in
+  `_session/computerUse` settings now expose effective `apps` rows and can
+  request `installedApps` with `installed: true`; `/cua status` renders each
+  app's name, effective choice, last-asked time, and lock reason.
+  `/cua apps` lists the installed/running picker source, and `/cua app
+  <bundleId> ask|alwaysAllow|blocked [...]` applies one atomic multi-app patch.
+  Locked, duplicate, and overlapping targets preserve the host's typed
+  `commandRejected` refusal.
+
 - Adopt Muse 1.4.8 monitor feed items (#255). A `monitorFeed` item renders as
   one stable ACP tool card per `monitorId`; streamed `text` deltas accumulate
   into replacement card content and the completed item settles it. The
