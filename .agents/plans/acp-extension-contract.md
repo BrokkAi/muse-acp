@@ -39,8 +39,11 @@ current Muse metadata object and publish it on every session-info update.
   metadata patches.
 - [x] (2026-10-19) Run all contribution gates, including focused live-host
   coverage for standard tool names and compaction compatibility.
-- [ ] Open a pull request, complete three review/fix passes, and merge after
-  final CI is green.
+- [x] (2026-10-19) Open PR #295.
+- [x] (2026-10-19) Complete four review passes. Passes 1-3 found and fixed
+  compaction noop semantics, streamed-row metadata clearing, and duplicate
+  lifecycle adoption. Pass 4 found no new problems, ending the review loop.
+- [ ] Merge after final CI is green.
 
 
 ## Surprises & Discoveries
@@ -120,7 +123,18 @@ updates publish complete Muse metadata snapshots with explicit nested null
 clear markers. Canonical usage annotations now live under the `muse` namespace
 with the earlier flat keys retained for compatibility. The full Cargo suite,
 clippy, format, focused live-host tests, selftest, npm, Python, installer, and
-package smoke gates pass. Pull-request review and CI remain.
+package smoke gates pass. Pull-request review is complete; final CI remains.
+
+PR #295 completed four review passes:
+
+- pass 1 preserved `noop` as `_museNoop` instead of falsely claiming
+  compaction completed;
+- pass 2 made streamed list-row omissions clear canonical metadata;
+- pass 3 unified lifecycle and streamed-row adoption and removed duplicate
+  projection work;
+- pass 4 found no new problems and ended the review loop.
+
+Final CI and merge remain.
 
 
 ## Context and Orientation
@@ -167,8 +181,9 @@ can update independently without erasing previously published Muse fields.
 
 The delivery milestone runs format, clippy, the full Cargo suite, selftest,
 launcher, Python, installer, and package smoke gates; opens a PR with
-`Fixes #294`; performs three review/fix passes; and merges only from a green
-final CI head.
+`Fixes #294`; performs review passes until the first clean pass (at most five),
+fixing every finding before the next pass; and merges only from a green final
+CI head.
 
 
 ## Plan of Work
@@ -192,7 +207,7 @@ cards unchanged because they have no tool programmatic identity.
 
 Add current Muse session metadata storage to `AcpSession` in `src/acp.rs`.
 Provide helpers to set, remove, and serialize it. Refactor
-`send_session_meta`, `send_session_info`, `send_session_provenance`,
+`send_session_meta`, `send_session_provenance`,
 `send_session_status`, `send_approval_reviewing`, and `send_session_title` to
 update the stored object before sending. Intercept fold-generated
 `session_info_update` frames before output, absorb their `muse` patch, and
