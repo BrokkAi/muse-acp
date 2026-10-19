@@ -53,6 +53,15 @@
   joins the ROADMAP section 9 field matrix, and a live loopback test covers it
   on Muse 1.4.7 and later.
 
+- Show each skill's own name in the command catalog (#258). Every skill
+  command in `available_commands_update` now carries `_meta.muse.title`: the
+  name the skill declares in `SKILL.md` (`metadata.display-name`, surfaced by
+  Muse 1.4.8+ as `SkillCatalogEntry.title`), or Muse's `displayName` when the
+  skill declares none. The command name stays the selector and the
+  description stays the skill's summary; a skill whose summary is empty is
+  described by its name instead. The field joins the ROADMAP section 9 field
+  matrix, and a live loopback test covers it on Muse 1.4.8 and later.
+
 - Record the Muse 1.4.7 sandbox-availability facts from the `initialize`
   handshake (#241). The adapter logs
   `host-sandbox server=<host> availability=… reason=…` next to
