@@ -239,6 +239,8 @@ CATALOG_READS = [0]
 # hosts that predate userInputDialogs or ignore it.
 USER_INPUT_DIALOGS = [True]
 EXPERIMENTAL_API = [False]
+# Set once account/logout clears the fixture's stored login.
+ACCOUNT_LOGGED_OUT = [False]
 CUA_GRANTED = [False]
 CUA_HOST_GRANTED = [False]
 SESSION_MCP = [False]
@@ -2888,6 +2890,26 @@ def main():
                         sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))
                         sys.stderr.flush()
                     os._exit(int(os.environ.get("FAKE_HOST_EXIT_CODE", "5")))
+                if method == "account/logout" and SCENARIO.startswith("account_"):
+                    log_input({"accountLogout": True})
+                    if not EXPERIMENTAL_API[0] or SCENARIO == "account_logged_in":
+                        send({"jsonrpc": "2.0", "id": ident,
+                              "error": {"code": -32601,
+                                        "message": "method not found: account/logout",
+                                        "data": {"kind": "methodNotFound"}}})
+                        continue
+                    if SCENARIO == "account_env_key":
+                        # META_API_KEY outranks the stored login, so clearing
+                        # the store leaves the environment key in effect.
+                        send({"jsonrpc": "2.0", "id": ident,
+                              "result": {"state": "envKey",
+                                         "credentialRequired": True}})
+                        continue
+                    ACCOUNT_LOGGED_OUT[0] = True
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "result": {"state": "loggedOut",
+                                     "credentialRequired": True}})
+                    continue
                 if method == "account/read" and SCENARIO.startswith("account_"):
                     # Live 1.4.0: account/* exists only behind experimentalApi.
                     if not EXPERIMENTAL_API[0]:
@@ -2903,6 +2925,12 @@ def main():
                                             "credentialRequired": False},
                         "account_logged_in": {"state": "accountLogin",
                                               "credentialRequired": True},
+                        "account_logout": {"state": "loggedOut"
+                                           if ACCOUNT_LOGGED_OUT[0]
+                                           else "accountLogin",
+                                           "credentialRequired": True},
+                        "account_env_key": {"state": "envKey",
+                                            "credentialRequired": True},
                     }[SCENARIO]
                     send({"jsonrpc": "2.0", "id": ident, "result": state})
                     continue

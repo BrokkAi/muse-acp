@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Implement ACP v2 `auth/logout` and the optional ACP v1 `logout` (#303),
+  now advertised as `agentCapabilities.auth.logout`. Logout calls Muse's
+  experimental `account/logout` and succeeds only once `account/read`
+  reports no credential, so new sessions fail with `-32000` until the user
+  logs in again. A `META_API_KEY` in the agent's environment, a host without
+  `account/logout`, or a credential that remains fails the logout with an
+  explanation. `auth/login` answers `-32602` instead of `-32601`: the only
+  advertised method is terminal auth, which clients must not pass to it.
+
 - Advertise the typed terminal auth method only to clients that support
   terminal auth (#304). ACP v1 clients must send
   `clientCapabilities.auth.terminal: true`; without it they still receive

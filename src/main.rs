@@ -1765,7 +1765,7 @@ fn v2_init(session_mcp: bool, session_delete: bool) -> String {
 }
 
 fn v1_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true}}}"#
+    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"auth":{"logout":{}},"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v1())
         .replace("__MCP_HTTP__", if session_mcp { "true" } else { "false" })
@@ -1855,6 +1855,75 @@ fn reject_if_logged_out(host: &Hosts, stdout: &StdoutShared, id: &Option<J>) -> 
     };
     acp::send_error(stdout, id, -32000, message);
     true
+}
+
+/// ACP `auth/logout` (v2) and `logout` (v1): clear Muse's stored credential
+/// through the host's experimental `account/logout`, then confirm with
+/// `account/read`. Success is reported only once Muse says no credential is
+/// in effect, so a later `session/new` fails with auth-required until the
+/// user logs in again. `META_API_KEY` outranks the stored login and cannot be
+/// removed from here, so it fails the logout instead of being ignored.
+fn logout(host: &Arc<Hosts>, stdout: &StdoutShared, id: &Option<J>) {
+    let state = match host.main_host().command("account/logout", "{}") {
+        Ok(state) => state,
+        Err(error) => {
+            log(&format!("account/logout failed: {}", err_message(&error)));
+            let unavailable = msp::is_method_not_found(&error)
+                || error
+                    .get("data")
+                    .and_then(|data| data.get("kind"))
+                    .and_then(J::as_str)
+                    == Some("experimentalRequired");
+            let message = if unavailable {
+                "this Muse build cannot log out over its protocol; run `muse logout` where \
+                 muse-acp runs, then restart the agent"
+                    .to_string()
+            } else {
+                format!("Muse could not log out: {}", err_message(&error))
+            };
+            acp::send_error(stdout, id, -32603, &message);
+            return;
+        }
+    };
+    // Settings views may still link the old credential.
+    host.refresh_config();
+    let lane = state.get("state").and_then(J::as_str).unwrap_or("");
+    if lane == "envKey" {
+        acp::send_error(
+            stdout,
+            id,
+            -32603,
+            "META_API_KEY is set in muse-acp's environment and takes priority over the Muse \
+             login; remove it from the agent's environment and restart the agent to log out",
+        );
+        return;
+    }
+    let confirmed = lane == "loggedOut"
+        && match host.main_host().command("account/read", "{}") {
+            Ok(read) => read.get("state").and_then(J::as_str) == Some("loggedOut"),
+            Err(error) => {
+                log(&format!(
+                    "account/read after logout failed: {}",
+                    err_message(&error)
+                ));
+                false
+            }
+        };
+    if confirmed {
+        log("logged out of Muse via account/logout");
+        acp::send_result(stdout, id, "{}");
+    } else {
+        acp::send_error(
+            stdout,
+            id,
+            -32603,
+            &format!(
+                "Muse still reports a credential in effect ({}); run `muse logout` where muse-acp \
+                 runs",
+                if lane.is_empty() { "unknown" } else { lane }
+            ),
+        );
+    }
 }
 
 /// Whether `initialize` offered the client a login method: always on ACP v1
@@ -7920,16 +7989,27 @@ fn handle_acp(
                 );
             }
         }
-        "auth/login" | "auth/logout" | "logout" => {
-            // Only `account/read` is used; login and logout stay with the
-            // Muse CLI, so credentials never cross ACP.
-            acp::send_error(
-                stdout,
-                &id,
-                -32601,
-                "Muse authentication is managed outside ACP. Run `muse login` with the configured Muse executable on the machine and OS account running muse-acp, then restart the editor agent.",
-            );
+        "auth/login" => {
+            // The only advertised method is terminal auth, which clients run
+            // in a terminal and must never pass to auth/login. Login itself
+            // stays with the Muse CLI, so credentials never cross ACP.
+            let method_id = params
+                .as_ref()
+                .and_then(|p| p.get("methodId"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let message = if method_id == AUTH_METHOD_ID {
+                format!(
+                    "{AUTH_METHOD_ID:?} is a terminal auth method: run it in a terminal (`muse-acp login`), not through auth/login"
+                )
+            } else {
+                format!(
+                    "unknown auth method; muse-acp offers only the terminal method {AUTH_METHOD_ID:?}"
+                )
+            };
+            acp::send_error(stdout, &id, -32602, &message);
         }
+        "auth/logout" | "logout" => logout(host, stdout, &id),
         "shutdown" | "exit" => {
             if method == "shutdown" {
                 acp::send_result(stdout, &id, "null");
