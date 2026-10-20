@@ -713,6 +713,14 @@ runs `muse login` with the executable selected by `MUSE_CLI`, so you can
 approve the device code in your browser. You can also run either command
 yourself, then restart the editor agent.
 
+The typed `type: "terminal"` method is advertised only to clients that
+declare terminal auth (`clientCapabilities.auth.terminal: true` on ACP v1,
+`capabilities.auth.terminal: {}` on ACP v2). An ACP v1 client without it still
+gets `muse-login` with the legacy `_meta["terminal-auth"]` command, which is
+how Zed and the ACP Registry check find it. An ACP v2 client without it gets
+no auth method, and its auth-required errors ask you to run `muse login`
+instead of naming a button.
+
 ```sh
 muse-acp login                   # or: npx --yes @brokkai/muse-acp login
 ```
