@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Send one-shot user messages as ACP `notice` updates (#308). The note that
+  Muse declined to retract a submitted message is now an `info` notice on
+  ACP v2 and for ACP v1 clients that advertise
+  `clientCapabilities.session.notices`; other v1 clients still get it as
+  agent text. Persistent hints stay clearable `_meta.muse` rows, and
+  Auto-review denials, the deny-safe permission fallback, and rejected
+  approval decisions stay in the transcript, since a notice may be ignored.
+
 - Give question form fields their header as `title`, and keep option
   descriptions and previews (#324). The form message is now the question
   text alone instead of `header: question`, so clients no longer need to
