@@ -1675,6 +1675,69 @@ fn tool_display_label_selects_the_status_specific_title() {
 }
 
 #[test]
+fn file_tools_carry_absolute_follow_along_locations() {
+    for ver in [1u64, 2] {
+        let mut c = Client::spawn("file_changes", &[]);
+        let sid = c.new_session(ver, "");
+        let workspace = std::path::Path::new(&c.fake_log)
+            .parent()
+            .expect("fake log parent")
+            .join("workspace");
+        let _pid = c.prompt(&sid, "change files");
+        let locations = |call: &str| -> Vec<String> {
+            let frame = c.wait_for_all(&[call, "\"locations\""], Duration::from_secs(15));
+            let frame: serde_json::Value = serde_json::from_str(&frame).expect("frame JSON");
+            frame["params"]["update"]["locations"]
+                .as_array()
+                .expect("locations array")
+                .iter()
+                .map(|l| l["path"].as_str().expect("path").to_string())
+                .collect()
+        };
+        assert_eq!(
+            locations("call-it-edit"),
+            [workspace
+                .join("src")
+                .join("edited.rs")
+                .to_str()
+                .unwrap()
+                .to_string()],
+            "v{ver}: an edit resolves against the workspace root"
+        );
+        assert_eq!(
+            locations("call-it-rename"),
+            [
+                workspace.join("old.txt").to_str().unwrap().to_string(),
+                workspace.join("new.txt").to_str().unwrap().to_string(),
+            ],
+            "v{ver}: a move names both ends"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn shell_tools_carry_no_guessed_location() {
+    let mut c = Client::spawn("file_changes_ambiguous", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "change files");
+    let card = c.wait_for("call-shell", Duration::from_secs(15));
+    c.wait_for("\"idle\"", Duration::from_secs(15));
+    assert!(!card.contains("\"locations\""), "{card}");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("inferred.txt\"}]"),
+        "a redirection target is never a location: {frames}"
+    );
+    drop(frames);
+    c.finish();
+}
+
+#[test]
 fn negotiated_file_change_report_uses_successful_host_tool_paths_once() {
     let caps = ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}";
     let mut c = Client::spawn("file_changes", &[]);

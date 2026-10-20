@@ -526,7 +526,10 @@ error the editor shows if Muse then refuses the profile says why.
   the monitor tool call, and host-truncated text is marked in
   `_meta.muse.truncated`.
 - **File changes** — per-turn workspace file-change reports from the host's
-  native file tools when the client negotiates the AIR extension.
+  native file tools when the client negotiates the AIR extension. Tool cards
+  for Muse's file tools carry standard ACP `locations` (absolute paths from
+  their explicit path arguments), so editors can follow along; shell and
+  other tools never get a guessed location.
 - **Stored output** — bounded tool output with head and tail retained, plus
   opt-in `_session/readOutput` access to the host's stored bytes.
 - **Hooks** — `hookRun` items render as hook cards with their event, durable
