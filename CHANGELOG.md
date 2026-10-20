@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Extract the adapter's Muse Session Protocol client into the workspace-local
+  `muse-msp-client` crate (#328), so tools can drive `muse serve` without any
+  ACP code. It launches a host from an explicit configuration (executable,
+  arguments, host flags, environment, working directory, capabilities),
+  completes the handshake with typed grant, fingerprint, and durability
+  facts, correlates requests with per-method deadlines, cancels a pending
+  request through a cloneable handle, routes server requests, classifies host
+  exits, and shuts down within a bounded time. It has no dependencies, so the
+  `muse-acp` binary still ships no third-party code; the JSON parser moved
+  into it. `muse-acp` now drives its hosts through the crate with unchanged
+  frames, logs, timeouts, Muse discovery, and settings handling. Hermetic
+  tests use an in-memory transport and a self-executing fake host; an
+  env-gated test runs the whole flow against a real `muse serve`.
+
 - Send ACP diff content for Muse file edits (#301). On ACP v2, a completed
   tool call with a stored patch (`patchRef`, `kind: "tool_patch"`) gains a
   `diff` content item after its text output: `changes` names each file as
@@ -136,20 +150,6 @@
   default handler fails closed for permissions, elicitation, filesystem, and
   terminal access. Black-box tests drive the existing `muse-acp` binary over
   both protocol versions.
-
-- Extract the adapter's Muse Session Protocol client into the workspace-local
-  `muse-msp-client` crate (#328), so tools can drive `muse serve` without any
-  ACP code. It launches a host from an explicit configuration (executable,
-  arguments, host flags, environment, working directory, capabilities),
-  completes the handshake with typed grant, fingerprint, and durability
-  facts, correlates requests with per-method deadlines, cancels a pending
-  request through a cloneable handle, routes server requests, classifies host
-  exits, and shuts down within a bounded time. It has no dependencies, so the
-  `muse-acp` binary still ships no third-party code; the JSON parser moved
-  into it. `muse-acp` now drives its hosts through the crate with unchanged
-  frames, logs, timeouts, Muse discovery, and settings handling. Hermetic
-  tests use an in-memory transport and a self-executing fake host; an
-  env-gated test runs the whole flow against a real `muse serve`.
 
 ## 0.15.0
 
