@@ -55,6 +55,7 @@ static AIR_FILE_REPORT: AtomicU64 = AtomicU64::new(0); // 1 when per-turn file r
 static MUSE_NOT_INSTALLED: AtomicBool = AtomicBool::new(false); // host launch found no Muse executable
 static AUTH_TERMINAL: AtomicBool = AtomicBool::new(false); // the client advertises terminal auth
 static BOOLEAN_CONFIG: AtomicBool = AtomicBool::new(false); // boolean config options may be offered
+static NOTICES: AtomicBool = AtomicBool::new(false); // `notice` session updates may be sent
 
 const FILE_REPORT_MAX_PATHS: usize = 1024;
 const FILE_REPORT_MAX_PATH_LENGTH: usize = 4096;
@@ -163,6 +164,17 @@ fn client_supports_boolean_config(capabilities: Option<&J>, ver: u64) -> bool {
             .and_then(|session| session.get("configOptions"))
             .and_then(|options| options.get("boolean"))
             .is_some_and(|boolean| matches!(boolean, J::Obj(_)))
+}
+
+/// Whether `notice` session updates may be sent: always in ACP v2, where
+/// clients that do not present them ignore them, and in ACP v1 only after
+/// `clientCapabilities.session.notices`.
+fn client_supports_notices(capabilities: Option<&J>, ver: u64) -> bool {
+    ver >= 2
+        || capabilities
+            .and_then(|caps| caps.get("session"))
+            .and_then(|session| session.get("notices"))
+            .is_some_and(|notices| matches!(notices, J::Obj(_)))
 }
 
 fn client_supports_compaction(capabilities: Option<&J>, ver: u64) -> bool {
@@ -4160,6 +4172,35 @@ fn send_v2_user_message(stdout: &StdoutShared, sid: &str, msg_id: &str, content:
     );
 }
 
+/// A one-shot, user-facing message that needs no clearing and is not session
+/// history. It goes out as an ACP `notice` where the connection allows one;
+/// otherwise as agent text, which is how such messages reached older
+/// clients. Persistent hints never use this: a notice cannot be cleared.
+fn send_one_shot_notice(
+    stdout: &StdoutShared,
+    sid: &str,
+    ver: u8,
+    severity: &str,
+    title: &str,
+    description: &str,
+    fallback_text: &str,
+) {
+    if !NOTICES.load(Ordering::SeqCst) {
+        send_agent_text(stdout, sid, ver, fallback_text);
+        return;
+    }
+    acp::send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"notice\",\"severity\":{},\"title\":{},\"description\":{}}}}}}}",
+            esc(sid),
+            esc(severity),
+            esc(title),
+            esc(description)
+        ),
+    );
+}
+
 /// Echo accepted prompt content (`content` is its ACP JSON array) as v1 user
 /// message chunks sharing one message id.
 /// Prepended to every turn in plan mode.
@@ -4500,6 +4541,7 @@ fn negotiate_acp(msg: &J) -> Result<bool, AcpInitializeError> {
         client_supports_boolean_config(capabilities, v),
         Ordering::SeqCst,
     );
+    NOTICES.store(client_supports_notices(capabilities, v), Ordering::SeqCst);
     let terminal_auth = client_supports_terminal_auth(capabilities, v);
     AUTH_TERMINAL.store(terminal_auth, Ordering::SeqCst);
     if !terminal_auth {
@@ -11465,10 +11507,13 @@ fn handle_msp(
                         Some((ver, first))
                     });
                 match notify {
-                    Some((ver, true)) => send_agent_text(
+                    Some((ver, true)) => send_one_shot_notice(
                         stdout,
                         &acp_sid,
                         ver,
+                        "info",
+                        "Muse declined to retract the submitted message",
+                        "The turn remains open until its terminal settles this prompt.",
                         "Muse declined to retract the submitted message; the turn remains open until its terminal settles this prompt.",
                     ),
                     Some((_, false)) => {}

@@ -3475,14 +3475,24 @@ fn declined_retract_waits_for_the_normal_terminal() {
                 "{accepted}"
             );
         }
+        // ACP v2 gets a live notice; a v1 client without notices keeps the
+        // transcript note.
+        let carrier = if ver == 2 {
+            "\"sessionUpdate\":\"notice\""
+        } else {
+            "agent_message_chunk"
+        };
         let note = c.wait_for_all(
-            &["Muse declined to retract", "agent_message_chunk"],
+            &["Muse declined to retract", carrier],
             Duration::from_secs(15),
         );
         assert!(
             note.contains("terminal settles this prompt"),
             "the decline explains the held prompt: {note}"
         );
+        if ver == 2 {
+            assert!(note.contains("\"severity\":\"info\""), "{note}");
+        }
         c.wait_stderr("turn/retracted turn=turn-1", Duration::from_secs(15));
         c.wait_stderr("outcome=declined", Duration::from_secs(15));
         if ver == 1 {
@@ -3499,6 +3509,32 @@ fn declined_retract_waits_for_the_normal_terminal() {
         c.wait_for("continued after declined retract", Duration::from_secs(15));
         c.finish();
     }
+}
+
+#[test]
+fn v1_clients_that_advertise_notices_get_the_declined_retract_notice() {
+    let mut c = Client::spawn("declined_retract_then_completed", &[]);
+    let sid = c.new_session(1, r#","clientCapabilities":{"session":{"notices":{}}}"#);
+    let _pid = c.prompt(&sid, "hi");
+    let note = c.wait_for("Muse declined to retract", Duration::from_secs(15));
+    assert!(
+        note.contains("\"sessionUpdate\":\"notice\"") && note.contains(&sid),
+        "{note}"
+    );
+    c.wait_for("continued after declined retract", Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains(
+            "\"agent_message_chunk\",\"content\":{\"type\":\"text\",\"text\":\"Muse declined"
+        ),
+        "the note is not duplicated into the transcript: {frames}"
+    );
+    drop(frames);
+    c.finish();
 }
 
 #[test]

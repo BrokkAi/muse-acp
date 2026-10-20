@@ -141,6 +141,19 @@ Muse adds only facts with no standard ACP field:
 | Reminder card | `_meta.muse.reminderChild: {reminderAgentId, generationId, taskId, childSessionId, childSessionLogPath}`. |
 | Background-check card | `_meta.muse.turnId` and `blockingAgents`. |
 
+### Notices
+
+One-shot messages that need no clearing and are not session history use the
+standard `notice` update: always on ACP v2, and on ACP v1 only after
+`clientCapabilities.session.notices: {}`; otherwise the same text arrives as
+agent text. Today that is the note that Muse declined to retract a submitted
+message (`severity: "info"`). Persistent hints (`modelRetry`,
+`foregroundCompleted`, `approvalReviewing`) stay in clearable
+`session_info_update._meta.muse` rows, because a notice cannot be cleared.
+Auto-review denials, the deny-safe permission fallback, and a rejected
+approval decision stay in the transcript: they explain why an action did not
+happen, and an ACP v2 client may ignore notices.
+
 `_meta.muse.truncated` has either `{source: "host"}` or the adapter truncation
 facts `{source, originalChars, retainedChars, headChars, tailChars}`.
 
