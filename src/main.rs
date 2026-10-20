@@ -11570,21 +11570,29 @@ fn handle_msp(
             if let Some((acp_sid, ver)) = find_acp_session(sessions, msp_sid) {
                 observe_file_change(sessions, &acp_sid, &item);
                 // Read outside the session lock: it asks the host. An editor
-                // file tool's diff was recorded by the bridge.
+                // tool's diff or terminal was recorded by the bridge.
                 let diff = (ver == 2)
                     .then(|| tool_patch_diff(host, msp_sid, &item))
-                    .flatten()
-                    .or_else(|| bridge::take_card_content(&acp_sid, &item));
+                    .flatten();
+                let editor = bridge::take_card_content(&acp_sid, &item);
                 let mut out = Vec::new();
                 if let Some(s) = sessions
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .get_mut(&acp_sid)
                 {
-                    if let (Some(diff), Some(item_id)) =
-                        (diff, item.get("itemId").and_then(J::as_str))
-                    {
-                        s.fold.patch_diffs.insert(item_id.to_string(), diff);
+                    if let Some(item_id) = item.get("itemId").and_then(J::as_str) {
+                        match (diff, editor) {
+                            (Some(diff), _) | (None, Some(bridge::CardContent::Diff(diff))) => {
+                                s.fold.patch_diffs.insert(item_id.to_string(), diff);
+                            }
+                            (None, Some(bridge::CardContent::Terminal(terminal))) => {
+                                s.fold
+                                    .editor_terminals
+                                    .insert(item_id.to_string(), terminal);
+                            }
+                            (None, None) => {}
+                        }
                     }
                     s.fold.on_item_completed(&acp_sid, s.ver, params, &mut out);
                     let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("item");
@@ -12720,6 +12728,48 @@ fn invalidate_pending_approval(
     }
 }
 
+/// Retitle the shown prompt for an editor tool's approval when a later copy
+/// of the approval names what the call touches and the first did not (Muse
+/// 1.4.8 opens it from `approval/updated`, before `approval/request` brings
+/// the arguments). Updating the card keeps the user's place in the prompt.
+fn retitle_editor_permission(
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    msp_sid: &str,
+    approval_id: &str,
+    params: &J,
+) {
+    let tool = params
+        .get("subject")
+        .and_then(|s| s.non_empty_str("toolName"))
+        .or_else(|| params.non_empty_str("toolName"))
+        .unwrap_or("");
+    let Some(title) = bridge::approval_title(tool, params.non_empty_str("rawArgs")) else {
+        return;
+    };
+    let card = {
+        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(p) = map.get_mut(acp_sid).and_then(|s| s.pending_perm.as_mut()) else {
+            return;
+        };
+        if p.approval_sid != msp_sid || p.approval_id != approval_id || p.title == title {
+            return;
+        }
+        p.title.clone_from(&title);
+        p.tool_call_id.clone()
+    };
+    acp::send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":{},\"title\":{}}}}}}}",
+            esc(acp_sid),
+            esc(&card),
+            esc(&title)
+        ),
+    );
+}
+
 /// Human title and ACP tool kind shared by actionable approvals and the
 /// native-reviewing activity hint.
 fn approval_title_kind(params: &J) -> (String, &'static str) {
@@ -12749,13 +12799,18 @@ fn approval_title_kind(params: &J) -> (String, &'static str) {
             (None, None) => description.unwrap_or(tool_name).to_string(),
         },
         "network" => target.or(description).unwrap_or(tool_name).to_string(),
-        "tool" => named_tool
-            .or(description)
-            .or(command)
-            .or(path)
-            .or(target)
-            .unwrap_or(tool_name)
-            .to_string(),
+        // An editor tool (bridge.rs) names the file or the full command it
+        // would run, so the user sees what they approve.
+        "tool" => bridge::approval_title(tool_name, params.get("rawArgs").and_then(J::as_str))
+            .or_else(|| {
+                named_tool
+                    .or(description)
+                    .or(command)
+                    .or(path)
+                    .or(target)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| tool_name.to_string()),
         _ => command
             .or(path)
             .or(target)
@@ -12882,6 +12937,9 @@ fn observe_approval_reviewing(
                 review.turn_id = turn_id;
                 review.title = title;
                 review.kind = kind.to_string();
+                if let Some(raw_args) = params.non_empty_str("rawArgs") {
+                    review.raw_args = Some(raw_args.to_string());
+                }
                 changed.then(|| s.approval_reviewing.clone())
             } else {
                 s.approval_reviewing.push(acp::ReviewingApproval {
@@ -12890,6 +12948,7 @@ fn observe_approval_reviewing(
                     turn_id,
                     title,
                     kind: kind.to_string(),
+                    raw_args: params.non_empty_str("rawArgs").map(str::to_string),
                 });
                 Some(s.approval_reviewing.clone())
             }
@@ -12911,6 +12970,63 @@ fn observe_approval_reviewing(
             "approval/reviewing {approval_id} produced no state change: resolved, actionable, or already current"
         )),
     }
+}
+
+/// An editor tool's approval (bridge.rs) with `rawArgs`, so the prompt can
+/// name the file or the full command. Muse can open such an approval through
+/// `approval/updated`, which carries no arguments; they come from the
+/// approval's native-review row, else from `approval/listPending`. None when
+/// nothing needs adding or nothing has them yet.
+fn with_editor_approval_args(
+    host: &Arc<Hosts>,
+    sessions: &Sessions,
+    acp_sid: &str,
+    params: &J,
+) -> Option<J> {
+    let tool = params
+        .get("subject")
+        .and_then(|s| s.non_empty_str("toolName"))
+        .or_else(|| params.non_empty_str("toolName"))?;
+    if !tool.starts_with("mcp__editor__") || params.non_empty_str("rawArgs").is_some() {
+        return None;
+    }
+    let msp_sid = params.non_empty_str("sessionId")?;
+    let approval_id = params.non_empty_str("approvalId")?;
+    let reviewed = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(acp_sid)
+        .and_then(|s| {
+            s.approval_reviewing
+                .iter()
+                .find(|r| r.source_session_id == msp_sid && r.approval_id == approval_id)?
+                .raw_args
+                .clone()
+        });
+    let raw_args = match reviewed {
+        Some(raw_args) => raw_args,
+        None => {
+            let pending = host
+                .command(
+                    "approval/listPending",
+                    &format!("{{\"sessionId\":{}}}", esc(msp_sid)),
+                )
+                .ok()?;
+            let J::Arr(approvals) = pending.get("approvals")? else {
+                return None;
+            };
+            approvals
+                .iter()
+                .find(|row| row.non_empty_str("approvalId") == Some(approval_id))?
+                .non_empty_str("rawArgs")?
+                .to_string()
+        }
+    };
+    let J::Obj(mut fields) = params.clone() else {
+        return None;
+    };
+    fields.push(("rawArgs".to_string(), J::Str(raw_args)));
+    Some(J::Obj(fields))
 }
 
 /// Open an ACP permission request for MSP approval params (from either the
@@ -12943,6 +13059,8 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
         log("approval dropped: missing approvalId");
         return;
     }
+    let enriched = with_editor_approval_args(host, sessions, &acp_sid, params);
+    let params = enriched.as_ref().unwrap_or(params);
     clear_approval_reviewing(stdout, sessions, &acp_sid, msp_sid, &approval_id);
     // A terminal approval never reopens, however stale the projection that
     // reissues it (issue #238). This precedes adapter policy so auto-review
@@ -13031,6 +13149,9 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
     if let Some(req_id) = stale_request {
         acp::send_cancel_request(stdout, &req_id);
     }
+    if duplicate {
+        retitle_editor_permission(stdout, sessions, &acp_sid, msp_sid, &approval_id, params);
+    }
     if duplicate || queued {
         if queued {
             log(&format!(
@@ -13091,6 +13212,8 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
                 owner_msp_sid,
                 child_subagent_id,
                 feedback: None,
+                tool_call_id: tool_call_id.clone(),
+                title: title.clone(),
             });
             s.ver
         } else {

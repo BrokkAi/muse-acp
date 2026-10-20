@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Run commands in ACP v1 editor terminals (#311). When the client
+  advertises `terminal`, the adapter's `editor` MCP server adds
+  `run_in_terminal`, which runs the command line in an editor terminal
+  (`terminal/create`, `wait_for_exit`, `output`, `release`), shows that
+  terminal live on the tool card, and returns the output and exit status to
+  the model. Read-only and Plan sessions refuse it, `cwd` stays inside the
+  session's roots, and `session/cancel` or the call's timeout kills the
+  command. Editor-tool approval prompts now name the file or the full command
+  from the approval's `rawArgs`, retitling an open prompt when Muse 1.4.8
+  sends them late. MCP tool cards take their kind from the tool's own name,
+  so `mcp__editor__run_in_terminal` is `execute`, not `edit`.
+
 - Read and write files through ACP v1 editors (#310). When the client
   advertises `fs.readTextFile` or `fs.writeTextFile`, each Muse session gets
   an adapter-owned MCP server, `editor`, with `read_text_file`,

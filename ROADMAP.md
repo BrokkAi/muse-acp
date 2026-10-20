@@ -519,6 +519,13 @@ decisions are in `.agents/plans/session-mcp-forwarding.md`.
   Read-only and Plan modes. Completed writes carry a standard `diff`. Validated
   live on Muse 1.3.0, 1.4.8, and 1.4.11; the design is in
   `.agents/plans/editor-fs-bridge.md`.
+- Done: ACP v1 editor terminals (#311). The same `editor` server adds
+  `run_in_terminal` for clients that advertise `terminal`: the command runs in
+  an editor terminal through `terminal/*`, the card embeds that terminal, and
+  cancel or the call's timeout kills it. Approval prompts for editor tools
+  name the file or command from the approval's `rawArgs`. Validated live on
+  Muse 1.3.0, 1.4.8, and 1.4.11; the design is in
+  `.agents/plans/editor-terminal-bridge.md`.
 - Open: MSP has no way to add servers to a loaded session or a fork. Revisit
   if the host adds session unload or fork configuration.
 
