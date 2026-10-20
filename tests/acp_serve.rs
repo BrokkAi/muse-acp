@@ -1750,6 +1750,45 @@ fn streamed_tool_output_appends_v2_content_chunks() {
 }
 
 #[test]
+fn v2_shell_output_streams_into_an_agent_owned_terminal() {
+    let mut c = Client::spawn("streamed_output", &[("FAKE_STREAM_TOOL", "bash")]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "build");
+    let done = c.wait_for_all(
+        &["call-stream", "\"status\":\"completed\""],
+        Duration::from_secs(15),
+    );
+    assert!(
+        done.contains("\"content\":[{\"type\":\"terminal\",\"terminalId\":\"term-it-stream\"}]"),
+        "{done}"
+    );
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let created = frames
+        .iter()
+        .position(|f| f.contains("terminal_update") && f.contains("\"command\":\"make\""))
+        .expect("terminal created with its command");
+    let chunks: Vec<usize> = frames
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.contains("terminal_output_chunk"))
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(chunks.len(), 2, "{frames:?}");
+    assert!(frames[chunks[0]].contains(&base64(b"building\n")));
+    let exited = frames
+        .iter()
+        .position(|f| f.contains("\"exitStatus\":{}"))
+        .expect("terminal marked exited");
+    assert!(frames[exited].contains(&base64(b"building\ndone\n")));
+    assert!(created < chunks[0] && chunks[1] < exited, "{frames:?}");
+    assert!(
+        !frames.iter().any(|f| f.contains("tool_call_content_chunk")),
+        "shell output goes to the terminal, not content chunks"
+    );
+    c.finish();
+}
+
+#[test]
 fn stored_tool_patches_become_v2_diff_content() {
     let mut c = Client::spawn("patch_edit", &[]);
     let sid = c.new_session(2, "");
@@ -7599,6 +7638,25 @@ fn malformed_json_is_rejected_and_survived() {
     let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
     assert!(done.contains("end_turn"), "terminal: {done}");
     c.finish();
+}
+
+/// Standard base64, for matching ACP terminal output bytes.
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for chunk in data.chunks(3) {
+        let n = (chunk[0] as u32) << 16
+            | (*chunk.get(1).unwrap_or(&0) as u32) << 8
+            | *chunk.get(2).unwrap_or(&0) as u32;
+        for (i, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            out.push(if i <= chunk.len() {
+                T[((n >> shift) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    out
 }
 
 /// Frames that are JSON arrays: batch replies.
@@ -14192,7 +14250,13 @@ fn user_shell_requires_editor_opt_in_task_controls_and_host_grant() {
             let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
             assert_eq!(frame.contains("\"result\""), allowed, "{frame}");
             if allowed {
-                let done = c.wait_for("shell stopped", Duration::from_secs(15));
+                // ACP v2 shows the output in the shell's terminal.
+                let output = if ver == 2 {
+                    base64(b"shell stopped")
+                } else {
+                    "shell stopped".to_string()
+                };
+                let done = c.wait_for(&output, Duration::from_secs(15));
                 assert!(done.contains("\"exitSignal\":15"), "{done}");
                 c.wait_for("async_task_state_update", Duration::from_secs(15));
                 c.wait_input(command_id, Duration::from_secs(15));
@@ -14395,8 +14459,14 @@ fn user_shell_restart_restores_terminal_without_relaunching_the_command() {
     let id = c.req("_session/userShell", &serde_json::json!({"sessionId":sid,"commandId":"0198a5d2-7b11-7000-8000-000000000009","commandText":"sleep 1"}).to_string());
     c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     c.wait_stderr("host-restarted attempt=1", Duration::from_secs(15));
-    let terminal = c.wait_for("recovered shell terminal", Duration::from_secs(15));
-    assert!(terminal.contains("\"exitCode\":7"), "{terminal}");
+    let terminal = c.wait_for(
+        &base64(b"recovered shell terminal"),
+        Duration::from_secs(15),
+    );
+    assert!(
+        terminal.contains("\"exitStatus\":{\"exitCode\":7}"),
+        "{terminal}"
+    );
     let done = c.wait_for("async_task_state_update", Duration::from_secs(15));
     assert!(done.contains("\"state\":\"completed\""), "{done}");
     let path = c.fake_log.clone();

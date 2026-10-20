@@ -1051,9 +1051,12 @@ def on_turn_start(params):
             "args": json.dumps({"path": "not-written.txt"})}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "streamed_output":
+        shell = os.environ.get("FAKE_STREAM_TOOL") == "bash"
         item = {"itemId": "it-stream", "kind": "toolCall",
-                "callId": "call-stream", "turnId": tid, "tool": "bash",
-                "args": json.dumps({"command": "make"})}
+                "callId": "call-stream", "turnId": tid,
+                "tool": "bash" if shell else "web_fetch",
+                "args": json.dumps({"command": "make"} if shell
+                                   else {"url": "https://example.com"})}
         notify("item/started", {**base, "item": {**item, "status": "inProgress"}})
         for n, chunk in enumerate(("building\n", "done\n")):
             notify("item/delta", {**base, "itemId": "it-stream",

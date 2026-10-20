@@ -540,9 +540,14 @@ error the editor shows if Muse then refuses the profile says why.
   carries standard `diff` content (file changes plus `git_patch` text) built
   from Muse's stored patch; see
   [the extension contract](docs/acp-extensions.md#commands-messages-and-tool-cards).
-- **Streaming tool output** — on ACP v2, tool and shell output appears in
-  the card as Muse streams it (`tool_call_content_chunk`, within the display
-  budget), and the completed card carries the final bounded output.
+- **Streaming tool output** — on ACP v2, tool output appears in the card as
+  Muse streams it (`tool_call_content_chunk`, within the display budget), and
+  the completed card carries the final bounded output. Shell commands (the
+  `bash` tool and user shells) run in an ACP v2 agent-owned terminal instead:
+  the card references the terminal, which gets the command, streamed output
+  chunks, the bounded final output, and an exit status (a user shell's exit
+  code; a `bash` call records none, so its terminal is only marked exited).
+  ACP v1 keeps text cards.
 - **Stored output** — bounded tool output with head and tail retained, plus
   opt-in `_session/readOutput` access to the host's stored bytes.
 - **Hooks** — `hookRun` items render as hook cards with their event, durable
