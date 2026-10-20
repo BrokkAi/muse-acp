@@ -73,7 +73,7 @@ release action; everything else runs in the tag workflow. Push it from an
 authorized CLI identity; do not assume tags pushed with GITHUB_TOKEN will
 trigger Actions. Never create/push tags during preflight. The publication
 workflow builds all platforms before its publisher starts. Release builds pin
-Rust 1.98.1. Both Windows targets use the MSVC `/Brepro` linker option to avoid changing
+Rust 1.99.1. Both Windows targets use the MSVC `/Brepro` linker option to avoid changing
 PE timestamps and identifiers (see [LLVM's reproducible-linking notes](https://blog.llvm.org/2019/11/deterministic-builds-with-clang-and-lld.html)).
 Before uploading, the tag run must compare every unpacked payload with the
 successful branch preflight artifacts at the same commit. A runner/toolchain
