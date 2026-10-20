@@ -1789,6 +1789,23 @@ fn v2_shell_output_streams_into_an_agent_owned_terminal() {
 }
 
 #[test]
+fn muse_1_4_11_damaged_ranges_render_their_facts() {
+    for ver in [1u64, 2] {
+        let mut c = Client::spawn("items_1411", &[]);
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "go");
+        let damaged = c.wait_for("Damaged session log range", Duration::from_secs(15));
+        assert!(
+            damaged.contains("2 missing records, 1 unreadable line")
+                && damaged.contains("Safe fork point: turn turn-good")
+                && damaged.contains("\"damagedRange\":{"),
+            "v{ver}: {damaged}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn stored_tool_patches_become_v2_diff_content() {
     let mut c = Client::spawn("patch_edit", &[]);
     let sid = c.new_session(2, "");

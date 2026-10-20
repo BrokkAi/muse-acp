@@ -1315,6 +1315,62 @@ impl SessionFold {
                 }
                 (title, content, Some(fields.join(",")))
             }
+            "damagedRange" => {
+                // Muse 1.4.11: what one damaged range of the session log
+                // cost, derived from the readable records around it. The
+                // facts ride `_meta` verbatim; the card states them and the
+                // safe fork cut, when one exists.
+                let Some(range @ J::Obj(_)) = item.get("damagedRange") else {
+                    let text = str_field("fallbackText");
+                    return (
+                        text.to_string(),
+                        None,
+                        (!text.is_empty()).then(|| format!("\"itemKind\":{}", esc(kind))),
+                    );
+                };
+                let count = |key: &str| range.get(key).and_then(J::as_u64).unwrap_or(0);
+                let stamp =
+                    |key: &str| range.get(key).and_then(J::as_str).filter(|s| !s.is_empty());
+                let mut lines = Vec::new();
+                let fallback = str_field("fallbackText");
+                if !fallback.is_empty() {
+                    lines.push(fallback.to_string());
+                }
+                lines.push(format!(
+                    "{} missing record{}, {} unreadable line{}",
+                    count("missingRecords"),
+                    if count("missingRecords") == 1 {
+                        ""
+                    } else {
+                        "s"
+                    },
+                    count("unreadableLines"),
+                    if count("unreadableLines") == 1 {
+                        ""
+                    } else {
+                        "s"
+                    }
+                ));
+                match (stamp("readableBeforeAt"), stamp("readableAfterAt")) {
+                    (Some(before), Some(after)) => {
+                        lines.push(format!("Readable before {before} and again from {after}"))
+                    }
+                    (None, Some(after)) => lines.push(format!(
+                        "The log starts damaged; readable again from {after}"
+                    )),
+                    _ => {}
+                }
+                if let Some(turn) = stamp("lastGoodTurnId") {
+                    lines.push(format!(
+                        "Safe fork point: turn {turn}, the last finished turn before the damage"
+                    ));
+                }
+                (
+                    "Damaged session log range".to_string(),
+                    Some(lines.join("\n")),
+                    Some(format!("\"damagedRange\":{}", j_to_string(range))),
+                )
+            }
             _ => {
                 // Unknown future kinds: the schema says a one-line summary
                 // SHOULD ride `fallbackText`; without it there is nothing
@@ -3922,6 +3978,64 @@ mod corpus_tests {
             .and_then(J::as_str)
             .unwrap();
         assert_eq!(text.chars().count(), max_content());
+    }
+
+    fn completed_card(item: &str) -> J {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_completed(
+            "sid",
+            2,
+            &parse_json(&format!(r#"{{"item":{item}}}"#)).unwrap(),
+            &mut out,
+        );
+        parse_json(&out[0])
+            .unwrap()
+            .get("params")
+            .and_then(|p| p.get("update"))
+            .cloned()
+            .unwrap()
+    }
+
+    fn card_text(update: &J) -> String {
+        update
+            .get("content")
+            .and_then(|c| match c {
+                J::Arr(items) => items.first().cloned(),
+                _ => None,
+            })
+            .and_then(|c| c.get("content").and_then(|c| c.get("text")).cloned())
+            .and_then(|t| t.as_str().map(str::to_string))
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn damaged_ranges_state_their_cost_and_the_safe_fork_cut() {
+        let update = completed_card(
+            r#"{"itemId":"dr-1","kind":"damagedRange","turnId":null,"status":"completed","fallbackText":"Part of this session log is unreadable","damagedRange":{"missingRecords":3,"unreadableLines":1,"readableBeforeAt":"2026-10-19T10:00:00Z","readableAfterAt":"2026-10-19T10:05:00Z","lastGoodTurnId":"turn-7"}}"#,
+        );
+        assert_eq!(
+            update.get("title").and_then(J::as_str),
+            Some("Damaged session log range")
+        );
+        assert_eq!(
+            card_text(&update),
+            "Part of this session log is unreadable\n3 missing records, 1 unreadable line\nReadable before 2026-10-19T10:00:00Z and again from 2026-10-19T10:05:00Z\nSafe fork point: turn turn-7, the last finished turn before the damage"
+        );
+        let range = update
+            .get("_meta")
+            .and_then(|m| m.get("muse"))
+            .and_then(|m| m.get("damagedRange"))
+            .unwrap();
+        assert_eq!(range.get("missingRecords").and_then(J::as_u64), Some(3));
+        // A range that starts the log has no before stamp and no fork cut.
+        let update = completed_card(
+            r#"{"itemId":"dr-2","kind":"damagedRange","status":"completed","damagedRange":{"missingRecords":0,"unreadableLines":2,"readableAfterAt":"2026-10-19T10:05:00Z"}}"#,
+        );
+        assert_eq!(
+            card_text(&update),
+            "0 missing records, 2 unreadable lines\nThe log starts damaged; readable again from 2026-10-19T10:05:00Z"
+        );
     }
 
     #[test]
