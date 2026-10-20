@@ -110,6 +110,9 @@ pub struct NewSessionResponse {
 /// The response to `session/prompt`.
 #[derive(Debug, Clone)]
 pub struct PromptResponse {
+    /// ACP v2: the inserted user message's id, the prompt's acceptance
+    /// receipt. ACP v1 prompts have none.
+    pub message_id: Option<String>,
     pub stop_reason: Option<String>,
     pub usage: Option<Value>,
     pub raw: Value,
@@ -391,6 +394,10 @@ impl Client {
             self.core.options.request_timeout,
         )?;
         Ok(PromptResponse {
+            message_id: raw
+                .get("messageId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
             stop_reason: raw
                 .get("stopReason")
                 .and_then(Value::as_str)

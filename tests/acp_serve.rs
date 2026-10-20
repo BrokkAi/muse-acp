@@ -527,7 +527,11 @@ fn recap_holds_the_prompt_until_the_host_summary_settles_it() {
         );
         if ver == 2 {
             let result = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-            assert_eq!(result.matches("\"result\":{}").count(), 1, "{result}");
+            assert_eq!(
+                result.matches("\"result\":{\"messageId\":").count(),
+                1,
+                "{result}"
+            );
             let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
             assert!(
                 idle.contains("end_turn"),
@@ -558,7 +562,11 @@ fn stopping_a_session_cancels_an_in_flight_recap() {
         c.wait_log("recap/cancel", Duration::from_secs(15));
         let result = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
         if ver == 2 {
-            assert_eq!(result.matches("\"result\":{}").count(), 1, "{result}");
+            assert_eq!(
+                result.matches("\"result\":{\"messageId\":").count(),
+                1,
+                "{result}"
+            );
             let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
             assert!(idle.contains("cancelled"), "v2 idle: {idle}");
         } else {
@@ -655,7 +663,11 @@ fn recap_rejects_arguments_and_a_second_in_flight_request() {
 
     let first = c.prompt(&sid, "/recap");
     let frame = c.wait_for(&format!("\"id\":{first}"), Duration::from_secs(15));
-    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    assert_eq!(
+        frame.matches("\"result\":{\"messageId\":").count(),
+        1,
+        "{frame}"
+    );
     let second = c.prompt(&sid, "/recap");
     let frame = c.wait_for(&format!("\"id\":{second}"), Duration::from_secs(15));
     assert!(
@@ -1523,18 +1535,72 @@ fn v2_prompt_accepts_then_echoes_and_idles() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(2, "");
     let pid = c.prompt(&sid, "hi");
-    // v2 MUST: empty accepted response first...
+    // v2 MUST: the acceptance receipt names the inserted message...
     let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert!(accepted.contains("\"result\":{}"), "accepted: {accepted}");
-    // ...then the user-message echo, then running, then idle(end_turn).
+    assert!(
+        accepted.contains("\"result\":{\"messageId\":"),
+        "accepted: {accepted}"
+    );
+    let message_id = extract_str(&accepted, "messageId").expect("messageId");
+    assert!(!message_id.is_empty(), "{accepted}");
+    // ...then the user-message echo under the same id, then running, then
+    // idle(end_turn).
     let echo = c.wait_for("user_message", Duration::from_secs(15));
     assert!(echo.contains(&sid), "echo for our session: {echo}");
+    assert_eq!(
+        extract_str(&echo, "messageId").as_deref(),
+        Some(message_id.as_str()),
+        "the echo reuses the receipt's id: {echo}"
+    );
     let running = c.wait_for("\"running\"", Duration::from_secs(15));
     assert!(running.contains(&sid), "running: {running}");
     let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
     assert!(
         idle.contains("end_turn"),
         "v2 completion metadata never omitted: {idle}"
+    );
+    c.finish();
+}
+
+#[test]
+fn v2_prompts_get_distinct_message_ids() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(2, "");
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let pid = c.prompt(&sid, "same words");
+        let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        let id = extract_str(&accepted, "messageId").expect("messageId");
+        c.wait_for_all(
+            &["\"user_message\"", &format!("\"messageId\":\"{id}\"")],
+            Duration::from_secs(15),
+        );
+        c.wait_for_all(&["\"idle\"", "end_turn"], Duration::from_secs(15));
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1], "identical content still gets its own id");
+    c.finish();
+}
+
+#[test]
+fn v2_local_commands_from_idle_run_then_idle() {
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "/plan");
+    let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let id = extract_str(&accepted, "messageId").expect("messageId");
+    c.wait_for_all(&["\"idle\"", "end_turn"], Duration::from_secs(15));
+    let response = frame_index(&c, &format!("\"id\":{pid}"));
+    let echo = frame_index(
+        &c,
+        &format!("\"sessionUpdate\":\"user_message\",\"messageId\":\"{id}\""),
+    );
+    let running = frame_index(&c, "\"state\":\"running\"");
+    let note = frame_index(&c, "Plan mode is on");
+    let idle = frame_index(&c, "\"state\":\"idle\"");
+    assert!(
+        response < echo && echo < running && running < note && note < idle,
+        "accept, echo, running, local handling, idle: {response} {echo} {running} {note} {idle}"
     );
     c.finish();
 }
@@ -1600,7 +1666,10 @@ fn tool_display_label_selects_the_status_specific_title() {
     );
     assert!(!neutral.contains("\"title\":\"bash:"), "{neutral}");
     let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert!(accepted.contains("\"result\":{}"), "{accepted}");
+    assert!(
+        accepted.contains("\"result\":{\"messageId\":"),
+        "{accepted}"
+    );
     c.wait_for_all(&["\"idle\"", "\"end_turn\""], Duration::from_secs(15));
     c.finish();
 }
@@ -3296,7 +3365,10 @@ fn declined_retract_waits_for_the_normal_terminal() {
         let pid = c.prompt(&sid, "hi");
         if ver == 2 {
             let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-            assert!(accepted.contains("\"result\":{}"), "{accepted}");
+            assert!(
+                accepted.contains("\"result\":{\"messageId\":"),
+                "{accepted}"
+            );
         }
         let note = c.wait_for_all(
             &["Muse declined to retract", "agent_message_chunk"],
@@ -3332,7 +3404,10 @@ fn declined_retract_preserves_steering_and_second_cancel() {
     let sid = c.new_session(2, STEERING);
     let pid = c.prompt(&sid, "hi");
     let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert!(accepted.contains("\"result\":{}"), "{accepted}");
+    assert!(
+        accepted.contains("\"result\":{\"messageId\":"),
+        "{accepted}"
+    );
     c.wait_for("Muse declined to retract", Duration::from_secs(15));
     c.wait_stderr("outcome=declined", Duration::from_secs(15));
     {
@@ -3660,10 +3735,16 @@ fn queued_turns_share_running_until_drained() {
     let sid = c.new_session(2, "");
     let p1 = c.prompt(&sid, "one");
     let a1 = c.wait_for(&format!("\"id\":{p1}"), Duration::from_secs(15));
-    assert!(a1.contains("\"result\":{}"), "first accepted: {a1}");
+    assert!(
+        a1.contains("\"result\":{\"messageId\":"),
+        "first accepted: {a1}"
+    );
     let p2 = c.prompt(&sid, "two");
     let a2 = c.wait_for(&format!("\"id\":{p2}"), Duration::from_secs(15));
-    assert!(a2.contains("\"result\":{}"), "second accepted: {a2}");
+    assert!(
+        a2.contains("\"result\":{\"messageId\":"),
+        "second accepted: {a2}"
+    );
     let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
     assert!(idle.contains("end_turn"), "drains with metadata: {idle}");
     let (idles, log) = {
@@ -5273,7 +5354,11 @@ fn skill_activation_maps_to_the_host_and_refreshes_the_catalog() {
     c.wait_log("skill/list", Duration::from_secs(15));
     let pid = c.prompt(&sid, "/skill-activation plan off");
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    assert_eq!(
+        frame.matches("\"result\":{\"messageId\":").count(),
+        1,
+        "{frame}"
+    );
     c.wait_input("\"selector\": \"plan\"", Duration::from_secs(15));
     let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
     assert!(
@@ -5292,7 +5377,11 @@ fn skill_activation_maps_to_the_host_and_refreshes_the_catalog() {
     // Explicit scopes pass through; the wire vocabulary is closed.
     let pid = c.prompt(&sid, "/skill-activation plan on project");
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    assert_eq!(
+        frame.matches("\"result\":{\"messageId\":").count(),
+        1,
+        "{frame}"
+    );
     c.wait_input("\"scope\": \"project\"", Duration::from_secs(15));
 
     // Usage errors never reach the host.
@@ -5334,7 +5423,11 @@ fn skill_import_renders_the_host_receipt() {
     let sid = c.new_session(2, "");
     let pid = c.prompt(&sid, "/skill-import claude dry-run");
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    assert_eq!(
+        frame.matches("\"result\":{\"messageId\":").count(),
+        1,
+        "{frame}"
+    );
     let receipt = c.wait_for("Skill import dry run", Duration::from_secs(15));
     assert!(
         receipt.contains("2 installed, 1 quarantined, 1 skipped, 1 failed"),
@@ -5353,7 +5446,11 @@ fn skill_import_renders_the_host_receipt() {
     // A real import carries force and refreshes through skill/changed.
     let pid = c.prompt(&sid, "/skill-import codex force");
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    assert_eq!(
+        frame.matches("\"result\":{\"messageId\":").count(),
+        1,
+        "{frame}"
+    );
     c.wait_input("\"force\": true", Duration::from_secs(15));
     wait_log_count(&c, "skill/list", 2);
 
@@ -5553,7 +5650,10 @@ fn goal_wake_reports_running_in_v2() {
     let sid = c.new_session(2, "");
     let pid = c.prompt(&sid, "/goal Green the suite");
     let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert!(accepted.contains("\"result\":{}"), "v2 accepts: {accepted}");
+    assert!(
+        accepted.contains("\"result\":{\"messageId\":"),
+        "v2 accepts: {accepted}"
+    );
     c.wait_for("\"stopReason\":\"end_turn\"", Duration::from_secs(15));
     let running = frame_index(&c, "\"state\":\"running\"");
     let answer = frame_index(&c, "working on the goal");
@@ -8443,30 +8543,26 @@ fn feedback_during_a_running_turn_keeps_the_session_running() {
     c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
     c.wait_for("Usage: /feedback", Duration::from_secs(15));
     let usage = frame_index(&c, "Usage: /feedback");
-    let start = Instant::now();
-    loop {
-        let after: Vec<String> = c
-            .frames
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+    // The command finishes while the turn continues: no idle boundary for
+    // the command alone.
+    std::thread::sleep(Duration::from_millis(300));
+    let accepted = frame_index(&c, &format!("\"id\":{pid}"));
+    let states: Vec<String> = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .skip(accepted)
+        .filter(|f| f.contains("\"state_update\""))
+        .cloned()
+        .collect();
+    assert!(
+        states
             .iter()
-            .skip(usage + 1)
-            .filter(|f| f.contains("\"state_update\""))
-            .cloned()
-            .collect();
-        if let Some(state) = after.first() {
-            assert!(
-                state.contains("\"state\":\"running\""),
-                "a running turn keeps the session running: {state}"
-            );
-            break;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(15),
-            "no state after the feedback reply"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+            .all(|state| state.contains("\"state\":\"running\"")),
+        "a running turn keeps the session running: {states:?}"
+    );
+    assert!(usage > 0);
     c.finish();
 }
 
@@ -10625,7 +10721,11 @@ fn cua_commands_drive_setup_and_settings() {
     ] {
         let pid = c.prompt(&sid, text);
         let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-        assert_eq!(frame.matches("\"result\":{}").count(), 1, "{text}: {frame}");
+        assert_eq!(
+            frame.matches("\"result\":{\"messageId\":").count(),
+            1,
+            "{text}: {frame}"
+        );
         let text_frame = c.wait_for(want, Duration::from_secs(15));
         assert!(
             text_frame.contains("agent_message_chunk"),
@@ -10641,7 +10741,11 @@ fn cua_commands_drive_setup_and_settings() {
 
     let pid = c.prompt(&sid, "/cua set screenshots alwaysAllow");
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    assert_eq!(
+        frame.matches("\"result\":{\"messageId\":").count(),
+        1,
+        "{frame}"
+    );
     c.wait_input("\"screenshots\": \"alwaysAllow\"", Duration::from_secs(10));
     let shown = c.wait_for(
         "Computer use settings: computer control ask, screenshots alwaysAllow",
@@ -10651,14 +10755,22 @@ fn cua_commands_drive_setup_and_settings() {
 
     let pid = c.prompt(&sid, "/cua block com.acme.Other");
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    assert_eq!(
+        frame.matches("\"result\":{\"messageId\":").count(),
+        1,
+        "{frame}"
+    );
     c.wait_input(
         "\"blockApps\": [\"com.acme.Other\"]",
         Duration::from_secs(10),
     );
     let pid = c.prompt(&sid, "/cua unblock com.acme.Secrets");
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    assert_eq!(
+        frame.matches("\"result\":{\"messageId\":").count(),
+        1,
+        "{frame}"
+    );
     c.wait_input(
         "\"unblockApps\": [\"com.acme.Secrets\"]",
         Duration::from_secs(10),
@@ -10750,7 +10862,7 @@ fn cua_app_choices_and_installed_picker_round_trip() {
         "/cua app com.acme.Editor blocked com.acme.Secrets alwaysAllow",
     );
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert!(frame.contains("\"result\":{}"), "{frame}");
+    assert!(frame.contains("\"result\":{\"messageId\":"), "{frame}");
     c.wait_input(
         "\"apps\": [{\"bundleId\": \"com.acme.Editor\", \"choice\": \"blocked\"}",
         Duration::from_secs(10),
@@ -10889,7 +11001,11 @@ fn cua_host_status_and_check_require_the_opt_in_and_grant() {
     ] {
         let pid = c.prompt(&sid, text);
         let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-        assert_eq!(frame.matches("\"result\":{}").count(), 1, "{text}: {frame}");
+        assert_eq!(
+            frame.matches("\"result\":{\"messageId\":").count(),
+            1,
+            "{text}: {frame}"
+        );
         let shown = c.wait_for_all(&[want, "agent_message_chunk"], Duration::from_secs(15));
         if !text.ends_with("check") {
             assert!(
@@ -10951,7 +11067,7 @@ fn cua_host_status_and_check_require_the_opt_in_and_grant() {
     let sid = c.new_session(2, OPT_IN);
     let pid = c.prompt(&sid, "/cua host");
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert!(frame.contains("\"result\":{}"), "{frame}");
+    assert!(frame.contains("\"result\":{\"messageId\":"), "{frame}");
     c.wait_for("Host computer use setup: dormant", Duration::from_secs(15));
     let pid = c.prompt(&sid, "/cua status");
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
@@ -11042,7 +11158,11 @@ fn plugin_commands_map_to_host_writes_and_keep_typed_errors() {
     // Marketplace arm: two words, the second not a scope.
     let pid = c.prompt(&sid, "/plugin install acme threejs");
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    assert_eq!(
+        frame.matches("\"result\":{\"messageId\":").count(),
+        1,
+        "{frame}"
+    );
     c.wait_input("\"marketplace\": \"acme\"", Duration::from_secs(10));
     let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
     assert!(input.contains("\"name\": \"threejs\""), "{input}");
@@ -11050,7 +11170,11 @@ fn plugin_commands_map_to_host_writes_and_keep_typed_errors() {
     // Local path arm with an explicit scope.
     let pid = c.prompt(&sid, "/plugin install /tmp/plugin-dir project");
     let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-    assert_eq!(frame.matches("\"result\":{}").count(), 1, "{frame}");
+    assert_eq!(
+        frame.matches("\"result\":{\"messageId\":").count(),
+        1,
+        "{frame}"
+    );
     c.wait_input("\"path\": \"/tmp/plugin-dir\"", Duration::from_secs(10));
     let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
     assert!(input.contains("\"scope\": \"project\""), "{input}");
@@ -11075,7 +11199,11 @@ fn plugin_commands_map_to_host_writes_and_keep_typed_errors() {
     ] {
         let pid = c.prompt(&sid, text);
         let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-        assert_eq!(frame.matches("\"result\":{}").count(), 1, "{text}: {frame}");
+        assert_eq!(
+            frame.matches("\"result\":{\"messageId\":").count(),
+            1,
+            "{text}: {frame}"
+        );
         c.wait_log(method, Duration::from_secs(10));
         c.wait_input(marker, Duration::from_secs(10));
     }
@@ -12157,7 +12285,7 @@ fn deferred_launch_error_is_not_reported_as_a_failed_run() {
         } else {
             let accepted = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
             assert!(
-                accepted.contains("\"result\":{}"),
+                accepted.contains("\"result\":{\"messageId\":"),
                 "prompt accepted: {accepted}"
             );
             let message = c.wait_for("could not start", Duration::from_secs(15));
@@ -12388,7 +12516,10 @@ fn emitted_frames_conform_to_the_vendored_schema() {
     for text in ["/cua host", "/cua host check"] {
         let pid = c.prompt(&sid, text);
         let frame = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
-        assert!(frame.contains("\"result\":{}"), "{text}: {frame}");
+        assert!(
+            frame.contains("\"result\":{\"messageId\":"),
+            "{text}: {frame}"
+        );
     }
     for text in [
         "/goal Green the suite",
