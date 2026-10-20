@@ -1505,20 +1505,24 @@ pub enum GeneratedName<'a> {
     Value(&'a str),
 }
 
-/// Publish a host-authored title change. A `None` title is an explicit clear
-/// so a client can remove a title after the host renames a session back to
-/// blank. A known name origin rides `_meta.muse.nameOrigin`; an unknown one is
-/// omitted, never fabricated. The generated short title has independently
-/// omitted, present, and explicitly-cleared states so it can never be confused
-/// with the canonical name.
-/// How a session-title update treats the standard `title` member: leave it
-/// out, clear it with an explicit `null`, or publish a value.
+/// How a title update treats the standard `title` member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TitleUpdate<'a> {
+    /// The title did not change; ACP leaves an omitted field as it was.
     Omit,
+    /// The host renamed the session back to blank: an explicit `null`, which
+    /// ACP defines as a clear.
     Clear,
+    /// The host's current title.
     Value(&'a str),
 }
 
+/// Publish a host-authored title change. The title is omitted when it did not
+/// change, since an explicit `null` is a clear and a resent value is noise. A
+/// known name origin rides `_meta.muse.nameOrigin`; an unknown one is omitted,
+/// never fabricated. The generated short title has independently omitted,
+/// present, and explicitly-cleared states so it can never be confused with the
+/// canonical name.
 pub fn send_session_title(
     stdout: &StdoutShared,
     s: &mut AcpSession,

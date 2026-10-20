@@ -1205,13 +1205,14 @@ fn refresh_all_subscription_usage(host: &Arc<Hosts>, stdout: &StdoutShared, sess
     }
 }
 
-/// Read a reattached session's durable history back from the head, once, and
+/// Read a reattached session's durable history back from the head and
 /// remember every approval it already resolved, so a stale pending projection
 /// or reissued request cannot reopen one (issue #238). The walk stops at the
 /// end of the view, on an error, or on a cursor it already asked for; never
 /// on a page count, which would silently miss an old terminal record. History
 /// that cannot be read proves nothing: approvals it never reached keep the
-/// ordinary permission decision, never an implicit approval.
+/// ordinary permission decision, never an implicit approval, and a walk that
+/// did not reach the end stays owed so the next approval reads again.
 fn learn_resolved_approvals(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) {
     let msp_sid = {
         let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
@@ -1227,6 +1228,7 @@ fn learn_resolved_approvals(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &st
     let mut cursor: Option<String> = None;
     let mut requested = std::collections::HashSet::new();
     let mut pages = 0usize;
+    let mut reached_end = false;
     loop {
         // A read of the durable view, like the replay pager: no commandId,
         // so it leaves no admission record in the log it reads.
@@ -1274,7 +1276,10 @@ fn learn_resolved_approvals(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &st
             Some(next) if requested.insert(next.to_string()) => {
                 cursor = Some(next.to_string());
             }
-            _ => break,
+            _ => {
+                reached_end = true;
+                break;
+            }
         }
     }
     let count = resolved.len();
@@ -1284,10 +1289,10 @@ fn learn_resolved_approvals(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &st
         .get_mut(acp_sid)
     {
         s.approval_resolved.extend(resolved);
-        // A read that never returned a page proved nothing; keep the walk
-        // owed so the next approval tries again instead of skipping the
-        // check for the rest of the attachment.
-        if pages == 0 {
+        // A walk that stopped short of the view's end may have missed an
+        // older terminal record; keep it owed so the next approval reads
+        // again instead of skipping the check for the rest of the attachment.
+        if !reached_end {
             s.resolved_history_unread = true;
         }
     }
@@ -8951,14 +8956,13 @@ struct ReviewJob {
 }
 
 /// Drop a queued (not yet running) review for an approval that resolved
-/// elsewhere, so the reviewer never decides a terminal approval.
-fn drop_queued_review(acp_sid: &str, child_subagent_id: &Option<String>, approval_id: &str) {
+/// elsewhere, so the reviewer never decides a terminal approval. Keyed like
+/// `approval_resolved`, by the approval's own MSP session id and approval id.
+fn drop_queued_review(acp_sid: &str, approval_sid: &str, approval_id: &str) {
     let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
     let before = st.queue.len();
     st.queue.retain(|job| {
-        job.acp_sid != acp_sid
-            || job.approval_id != approval_id
-            || &job.child_subagent_id != child_subagent_id
+        job.acp_sid != acp_sid || job.approval_id != approval_id || job.approval_sid != approval_sid
     });
     if st.queue.len() != before {
         log(&format!(
@@ -9829,9 +9833,6 @@ fn update_host_session_facts(
         if let Some(branch) = host_session.get("branch") {
             session.branch_meta = Some(j_to_string(branch));
             session.set_session_meta("branch", j_to_string(branch));
-        }
-        if let Some(attention) = host_session.get("attention") {
-            session.attention_meta = Some(j_to_string(attention));
         }
     } else {
         adopt_pulled_session_row(session, host_session);
@@ -10849,8 +10850,7 @@ fn handle_msp(
                 .unwrap_or("");
             // Child-stream approvals open on their owner session, so resolve
             // them through the same routing or the prompt is never withdrawn.
-            if let Some((acp_sid, _, child_subagent_id)) = owner_for_msp_session(sessions, msp_sid)
-            {
+            if let Some((acp_sid, _, _)) = owner_for_msp_session(sessions, msp_sid) {
                 clear_approval_reviewing(stdout, sessions, &acp_sid, msp_sid, approval_id);
                 // Terminal is terminal: remember it and drop any queued
                 // twin, displayed or awaiting auto-review, so a stale
@@ -10867,7 +10867,7 @@ fn handle_msp(
                             });
                         }
                     }
-                    drop_queued_review(&acp_sid, &child_subagent_id, approval_id);
+                    drop_queued_review(&acp_sid, msp_sid, approval_id);
                 }
                 if invalidate_pending_approval(
                     stdout,

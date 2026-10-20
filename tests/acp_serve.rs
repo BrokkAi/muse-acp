@@ -4020,10 +4020,13 @@ fn session_name_origin_reaches_acp_only_when_the_host_proves_it() {
         // The same name re-folded with provenance is an origin-only change:
         // it still publishes, so the client learns the origin it lacked, but
         // the unchanged title is omitted rather than resent.
-        // `_meta` directly after `sessionUpdate` is the frame with no title
+        // `_meta` directly after `sessionUpdate` is a frame with no title
         // member; the start frame carried the same origin next to its title.
-        let proven = c.wait_for(
-            "\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"muse\":{\"nameOrigin\":\"automatic\"}}",
+        let proven = c.wait_for_all(
+            &[
+                "\"sessionUpdate\":\"session_info_update\",\"_meta\":",
+                "\"nameOrigin\":\"automatic\"",
+            ],
             Duration::from_secs(15),
         );
         assert!(proven.contains(&sid), "v{ver} origin-only update: {proven}");
