@@ -18,12 +18,12 @@ To see it working, run `cargo test --locked --test acp_serve editor_bridge` and 
 ## Progress
 
 
-- [x] (2026-10-20 19:40Z) Prototype: drove a real Muse 1.4.11, 1.4.8, and 1.3.0 host through the built adapter with a throwaway Python HTTP MCP server registered as an editor MCP server (see Surprises & Discoveries).
-- [x] (2026-10-20 19:55Z) Wrote this plan.
-- [x] (2026-10-20 20:30Z) Milestone 1: `src/bridge.rs`, with the HTTP listener, MCP request handling, the three tools, path confinement, pending client requests, and 16 unit tests.
-- [x] (2026-10-20 20:40Z) Milestone 2: the bridge is wired into `src/main.rs` (capability negotiation, `session_mcp_servers` for new/load/resume/fork, response routing, cancel, and diff cards on `item/completed`), and `src/fold.rs` gives the bridge tools locations.
-- [x] (2026-10-20 21:10Z) Milestone 3: the `editor_bridge` fake-host scenario and 7 black-box tests in `tests/acp_serve.rs`, plus the live test `the_editor_file_tools_read_and_edit_through_the_acp_client` in `tests/live_loopback.rs`.
-- [x] (2026-10-20 21:25Z) Milestone 4: README, ROADMAP section 7, and CHANGELOG are updated. The full gate is green (fmt, clippy `-D warnings`, 751 workspace tests, MSRV 1.88 build). The full live suite passes on 1.4.11 (50 tests), and the new live test passes on 1.3.0, 1.4.8, and 1.4.11.
+- [x] (2026-10-20 19:10Z) Prototype: drove a real Muse 1.4.11, 1.4.8, and 1.3.0 host through the built adapter with a throwaway Python HTTP MCP server registered as an editor MCP server (see Surprises & Discoveries).
+- [x] (2026-10-20 19:15Z) Wrote this plan.
+- [x] (2026-10-20 19:25Z) Milestone 1: `src/bridge.rs`, with the HTTP listener, MCP request handling, the three tools, path confinement, pending client requests, and 16 unit tests.
+- [x] (2026-10-20 19:28Z) Milestone 2: the bridge is wired into `src/main.rs` (capability negotiation, `session_mcp_servers` for new/load/resume/fork, response routing, cancel, and diff cards on `item/completed`), and `src/fold.rs` gives the bridge tools locations.
+- [x] (2026-10-20 19:38Z) Milestone 3: the `editor_bridge` fake-host scenario and 7 black-box tests in `tests/acp_serve.rs`, plus the live test `the_editor_file_tools_read_and_edit_through_the_acp_client` in `tests/live_loopback.rs`.
+- [x] (2026-10-20 19:45Z) Milestone 4: README, ROADMAP section 7, and CHANGELOG are updated. The full gate is green (fmt, clippy `-D warnings`, 751 workspace tests, MSRV 1.88 build). The full live suite passes on 1.4.11 (50 tests), and the new live test passes on 1.3.0, 1.4.8, and 1.4.11.
 
 
 ## Surprises & Discoveries
