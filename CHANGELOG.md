@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Enforce ACP v2 `session/resume` replay cursors and state snapshots (#322).
+  `replayFrom` must be omitted, `null`, or `{"type":"start"}`: an unsupported
+  cursor type (such as a custom `_`-prefixed one) or a malformed value (a bare
+  string, `{}`, a non-string `type`) is refused with `-32602` before any host
+  call, instead of resuming with replay anyway. An explicit `null` no longer
+  replays history. Every successful v2 resume now sends a current-state
+  `state_update` after any replay and before the response, derived from open
+  requests and tracked turns when Muse omits the session status.
+
 - Return the inserted user message's `messageId` from every successful ACP v2
   `session/prompt` (#321), including local commands such as `/goal`, `/plan`,
   `/compact`, `/recap`, `/feedback`, `/cua`, and `/skill-import`. The

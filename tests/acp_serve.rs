@@ -6345,6 +6345,98 @@ fn air_recommended_reasoning_falls_back_to_the_model_default() {
 }
 
 #[test]
+fn v2_resume_refuses_unsupported_and_malformed_cursors_before_the_host() {
+    let mut c = Client::spawn("quiet", &[]);
+    c.initialize(2, "");
+    for cursor in [
+        r#"{"type":"_tck_unsupported_cursor"}"#,
+        r#"{"type":"latest"}"#,
+        r#""start""#,
+        r#"{}"#,
+        r#"{"type":5}"#,
+        r#"[]"#,
+    ] {
+        let id = c.req(
+            "session/resume",
+            &format!(r#"{{"sessionId":"msp-sess-1","replayFrom":{cursor}}}"#),
+        );
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        let reply: serde_json::Value = serde_json::from_str(&frame).expect("reply JSON");
+        assert_eq!(reply["error"]["code"], -32602, "{cursor}: {frame}");
+    }
+    assert!(
+        host_requests(&c, "session/resume").is_empty(),
+        "a refused cursor never reaches the host"
+    );
+    c.finish();
+}
+
+#[test]
+fn v2_resume_snapshots_state_after_replay_and_before_the_response() {
+    for (cursor, replays) in [
+        (None, false),
+        (Some("null"), false),
+        (Some(r#"{"type":"start"}"#), true),
+    ] {
+        let mut c = Client::spawn("quiet", &[]);
+        c.initialize(2, "");
+        let params = match cursor {
+            Some(cursor) => format!(r#"{{"sessionId":"msp-sess-1","replayFrom":{cursor}}}"#),
+            None => r#"{"sessionId":"msp-sess-1"}"#.to_string(),
+        };
+        let id = c.req("session/resume", &params);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\""), "{cursor:?}: {frame}");
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let response = frames
+            .iter()
+            .position(|f| f.contains(&format!("\"id\":{id}")))
+            .unwrap();
+        let replayed = frames.iter().position(|f| f.contains("old answer"));
+        assert_eq!(replayed.is_some(), replays, "{cursor:?}: {frames:?}");
+        let snapshot = frames[..response]
+            .iter()
+            .rposition(|f| f.contains("\"state_update\""))
+            .unwrap_or_else(|| panic!("{cursor:?}: no state before the response: {frames:?}"));
+        assert!(
+            frames[snapshot].contains("\"state\":\"idle\""),
+            "{cursor:?}: an idle session snapshots idle: {}",
+            frames[snapshot]
+        );
+        if let Some(replayed) = replayed {
+            assert!(
+                replayed < snapshot,
+                "replay precedes the snapshot: {frames:?}"
+            );
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn v2_resume_snapshot_reports_running_work() {
+    let mut c = Client::spawn("resume_active", &[("FAKE_WORKSPACE_ROOT", "/tmp")]);
+    c.initialize(2, "");
+    let id = c.req("session/resume", r#"{"sessionId":"msp-sess-1"}"#);
+    c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let response = frames
+        .iter()
+        .position(|f| f.contains(&format!("\"id\":{id}")))
+        .unwrap();
+    let snapshot = frames[..response]
+        .iter()
+        .rposition(|f| f.contains("\"state_update\""))
+        .expect("a snapshot before the response");
+    assert!(
+        frames[snapshot].contains("\"state\":\"running\""),
+        "an active turn snapshots running: {}",
+        frames[snapshot]
+    );
+    c.finish();
+}
+
+#[test]
 fn reasoning_effort_default_is_restored_from_resume_snapshot() {
     let mut c = Client::spawn("reasoning_resume", &[]);
     let init = c.req("initialize", &initialize_params(2, ""));
@@ -11729,7 +11821,7 @@ fn async_tasks_reconcile_on_resume() {
     c.notify("initialized", "{}");
     let rid = c.req(
         "session/resume",
-        "{\"sessionId\":\"existing-session\",\"replayFrom\":\"start\"}",
+        "{\"sessionId\":\"existing-session\",\"replayFrom\":{\"type\":\"start\"}}",
     );
     let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
     assert!(resumed.contains("\"result\""), "resume failed: {resumed}");

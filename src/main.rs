@@ -1948,6 +1948,48 @@ fn resume_permission_profile(params: Option<&J>) -> Result<Option<String>, Strin
     }
 }
 
+/// Whether an ACP v2 `session/resume` asks for history replay. Omitted and
+/// `null` mean no replay; `{"type":"start"}` replays all retained history,
+/// the only cursor this adapter supports. The schema admits custom and
+/// future cursor types, which must be refused rather than replaced by
+/// another cursor, and anything else is malformed.
+fn resume_replay_from(params: Option<&J>) -> Result<bool, String> {
+    match params.and_then(|params| params.get("replayFrom")) {
+        None | Some(J::Null) => Ok(false),
+        Some(cursor @ J::Obj(_)) => match cursor.get("type") {
+            Some(J::Str(kind)) if kind == "start" => Ok(true),
+            Some(J::Str(kind)) => Err(format!(
+                "unsupported replayFrom cursor type {}: this agent supports only {{\"type\":\"start\"}}",
+                esc(kind)
+            )),
+            _ => Err("replayFrom must be null or an object with a string type".to_string()),
+        },
+        Some(_) => Err("replayFrom must be null or an object with a string type".to_string()),
+    }
+}
+
+/// The session's current foreground state for an ACP v2 resume snapshot.
+/// The host's attention flags and status lead; without them the adapter's
+/// own view of open requests and tracked turns decides, so a resume never
+/// lacks a snapshot just because the host omitted its folded status.
+fn current_state_snapshot(s: &AcpSession) -> &'static str {
+    if s.attention.as_ref().is_some_and(|flags| !flags.is_empty())
+        || s.pending_perm.is_some()
+        || !s.pending_ui.is_empty()
+        || s.pending_feedback.is_some()
+    {
+        "requires_action"
+    } else if s.session_status.as_deref() == Some("running")
+        || s.active_turn.is_some()
+        || !s.in_flight.is_empty()
+        || s.pending_recap.is_some()
+    {
+        "running"
+    } else {
+        "idle"
+    }
+}
+
 fn session_roots(params: Option<&J>, cwd: &str) -> Result<Vec<String>, String> {
     let mut roots = vec![cwd.to_string()];
     for path in additional_directories(params)? {
@@ -4830,6 +4872,23 @@ fn handle_acp(
                     return;
                 }
             };
+            // ACP v2 resume replays only for a supported cursor; an
+            // unsupported or malformed one is refused before the host is
+            // touched. v1 session/load always replays, and v1
+            // session/resume reconnects silently.
+            let replay = if method == "session/load" {
+                true
+            } else if ver == 2 {
+                match resume_replay_from(params.as_ref()) {
+                    Ok(replay) => replay,
+                    Err(message) => {
+                        acp::send_error(stdout, &id, -32602, &message);
+                        return;
+                    }
+                }
+            } else {
+                false
+            };
             // On hosts that carry the root set, the request's roots are
             // validated before any host call: a load with a missing extra
             // folder must fail, not silently activate nothing.
@@ -4972,12 +5031,6 @@ fn handle_acp(
                             return;
                         }
                     };
-                    // v1 session/load always replays; v2 resumes replay only
-                    // with replayFrom; v1 session/resume reconnects silently.
-                    let replay = method == "session/load"
-                        || (method == "session/resume"
-                            && ver == 2
-                            && params.as_ref().and_then(|p| p.get("replayFrom")).is_some());
                     let title_update: Option<HostTitleUpdate>;
                     {
                         let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
@@ -5276,6 +5329,19 @@ fn handle_acp(
                     let skills = skill_catalog(host, &msp_out);
                     adopt_skill_catalog(sessions, &sid, skills.as_deref());
                     let skills = skills.unwrap_or_default();
+                    // ACP v2: every successful resume sends the current
+                    // foreground state after any replay and before the
+                    // response, even when the host omitted its status.
+                    if ver == 2 {
+                        let state = sessions
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .get(&sid)
+                            .map(current_state_snapshot);
+                        if let Some(state) = state {
+                            acp::send_state(stdout, &sid, state, None);
+                        }
+                    }
                     acp::send_result(stdout, &id, &result);
                     acp::send_available_commands(
                         stdout,
