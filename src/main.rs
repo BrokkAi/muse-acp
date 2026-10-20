@@ -4158,16 +4158,14 @@ fn subagent_control(
     }
 }
 
-/// Record the ACP connection posture before starting the MSP connection.
-///
-/// MSP's `userInputDialogs` capability is connection-scoped, so it must be
-/// derived from ACP `initialize` before the host's own handshake is sent.
+/// A rejected ACP `initialize` request before any connection posture is set.
 #[derive(Debug, PartialEq, Eq)]
 enum AcpInitializeError {
     InvalidParams(&'static str),
     UnsupportedVersion(u16),
 }
 
+/// Validate the required members of ACP v2's client `Implementation` object.
 fn valid_client_info(info: Option<&J>) -> bool {
     let Some(info) = info else {
         return false;
@@ -4177,6 +4175,10 @@ fn valid_client_info(info: Option<&J>) -> bool {
         && matches!(info.get("title"), None | Some(J::Null) | Some(J::Str(_)))
 }
 
+/// Record the ACP connection posture before starting the MSP connection.
+///
+/// MSP's `userInputDialogs` capability is connection-scoped, so it must be
+/// derived from ACP `initialize` before the host's own handshake is sent.
 fn negotiate_acp(msg: &J) -> Result<bool, AcpInitializeError> {
     let Some(params) = msg.get("params") else {
         return Err(AcpInitializeError::InvalidParams(
