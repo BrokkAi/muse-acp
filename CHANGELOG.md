@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Name the picked skill copy on Muse 1.4.11+ (#335). A native skill part now
+  carries the `skill/list` row's `source` (`bundled`, `user`, `project`, or
+  `plugin`, checked against the closed vocabulary) when the catalog holds
+  exactly one copy of that selector, so the host resolves that exact copy.
+  Duplicate selectors, older hosts, and rows without a valid source keep the
+  bare-selector resolution.
+
 - Show shell output through ACP v2 agent-owned terminals (#306). A `bash`
   tool call or user shell that runs gets a terminal: the card's content
   references it, `terminal_update` carries the command (and an explicit

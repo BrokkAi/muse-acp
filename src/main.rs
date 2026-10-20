@@ -1775,6 +1775,9 @@ fn skill_catalog(host: &Arc<Hosts>, msp_sid: &str) -> Option<Vec<acp::CatalogSki
         log("skill/list returned no skills array; retaining the current command catalog");
         return None;
     };
+    // Muse 1.4.11 lets a skill part name the exact catalog copy; older
+    // hosts resolve the bare selector only.
+    let sources = host.handshake().at_least(1, 4, 11);
     let mut skills = Vec::new();
     for row in rows {
         let selector = row
@@ -1804,23 +1807,40 @@ fn skill_catalog(host: &Arc<Hosts>, msp_sid: &str) -> Option<Vec<acp::CatalogSki
             description,
             title: title.map(str::to_string),
             argument_hint: text("argumentHint").map(str::to_string),
+            source: text("source")
+                .filter(|source| {
+                    sources && matches!(*source, "bundled" | "user" | "project" | "plugin")
+                })
+                .map(str::to_string),
         });
     }
     Some(skills)
 }
 
 /// Remember which selectors the session's skill catalog resolves, so prompt
-/// text is submitted as a native skill only when it names one of them.
-/// A failed read forgets the previous catalog: after `skill/changed` it is
-/// known to be stale, so the host decides again until a read succeeds.
+/// text is submitted as a native skill only when it names one of them, and
+/// which copy each names. A selector with two catalog copies keeps no source:
+/// the editor's command cannot say which copy was meant, so the host's bare
+/// resolution decides. A failed read forgets the previous catalog: after
+/// `skill/changed` it is known to be stale, so the host decides again until
+/// a read succeeds.
 fn adopt_skill_catalog(sessions: &Sessions, acp_sid: &str, skills: Option<&[acp::CatalogSkill]>) {
+    let catalog = skills.map(|rows| {
+        let mut selectors: HashMap<String, Option<String>> = HashMap::new();
+        for skill in rows {
+            selectors
+                .entry(skill.selector.clone())
+                .and_modify(|source| *source = None)
+                .or_insert_with(|| skill.source.clone());
+        }
+        selectors
+    });
     if let Some(s) = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get_mut(acp_sid)
     {
-        s.skill_selectors =
-            skills.map(|rows| rows.iter().map(|skill| skill.selector.clone()).collect());
+        s.skill_selectors = catalog;
     }
 }
 
@@ -8656,7 +8676,7 @@ fn video_media_type(mime: &str, uri: &str) -> Option<&'static str> {
 fn extract_prompt_parts(
     params: Option<&J>,
     roots: &[String],
-    skills: Option<&std::collections::HashSet<String>>,
+    skills: Option<&HashMap<String, Option<String>>>,
     media: &mut dyn FnMut(&str, &str) -> Result<String, String>,
 ) -> Result<(Vec<String>, String), String> {
     let p = params.ok_or("session/prompt requires params")?;
@@ -9343,7 +9363,7 @@ fn parse_protocol_command(
 /// intercepted as protocol commands first.)
 fn native_skill_part(
     text: &str,
-    skills: Option<&std::collections::HashSet<String>>,
+    skills: Option<&HashMap<String, Option<String>>>,
 ) -> Option<String> {
     // A leading space intentionally escapes command handling in ACP clients.
     if !text.starts_with('/') {
@@ -9374,13 +9394,19 @@ fn native_skill_part(
         }
     }
 
-    if !explicit && skills.is_some_and(|known| !known.contains(&selector)) {
+    if !explicit && skills.is_some_and(|known| !known.contains_key(&selector)) {
         return None;
     }
 
     let mut part = format!("{{\"type\":\"skill\",\"selector\":{}", esc(&selector));
     if !arguments.is_empty() {
         part.push_str(&format!(",\"arguments\":{}", esc(&arguments)));
+    }
+    if let Some(source) = skills
+        .and_then(|known| known.get(&selector))
+        .and_then(Option::as_deref)
+    {
+        part.push_str(&format!(",\"source\":{}", esc(source)));
     }
     part.push('}');
     Some(part)

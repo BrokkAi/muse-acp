@@ -1945,6 +1945,11 @@ def result_for(method, msg):
                            "source": "user"})
             skills.append({"selector": "tidy", "description": "Tidy imports",
                            "displayName": "Tidy", "source": "project"})
+        if os.environ.get("FAKE_DUPLICATE_SKILL") == "1":
+            # Two catalog copies of one selector, as a project skill can
+            # shadow a bundled one (Muse 1.4.11 `SkillInvocationSource`).
+            skills.append({"selector": "plan", "description": "Project plan",
+                           "displayName": "Plan", "source": "project"})
         if SCENARIO == "skill_not_found":
             # The catalog read races the skill's removal: the adapter still
             # lists `stale`, but the host no longer resolves it.
