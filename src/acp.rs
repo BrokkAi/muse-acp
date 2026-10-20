@@ -368,7 +368,10 @@ pub struct AcpSession {
     pub turn_usage: Vec<TurnUsage>,
     /// Selectors from the host's latest `skill/list` for this session.
     /// `None` until a catalog read succeeds.
-    pub skill_selectors: Option<std::collections::HashSet<String>>,
+    /// The session catalog's skill selectors, each with the picked copy's
+    /// `source` when the catalog holds exactly one copy of that selector and
+    /// the host accepts a source on a skill part (Muse 1.4.11+).
+    pub skill_selectors: Option<HashMap<String, Option<String>>>,
     /// MSP `config.mcpServers` JSON for the client's latest MCP servers. The
     /// host does not persist them, so a restarted host is sent them again
     /// when it loads the session.
@@ -1098,6 +1101,10 @@ pub struct CatalogSkill {
     /// neither.
     pub title: Option<String>,
     pub argument_hint: Option<String>,
+    /// The row's `source`, kept only for the closed skill-invocation
+    /// vocabulary (`bundled`, `user`, `project`, `plugin`) on a host that
+    /// accepts it on a submitted skill part.
+    pub source: Option<String>,
 }
 
 /// One selectable model from the host's `model/list`.
@@ -1767,6 +1774,7 @@ mod tests {
                     description: description.to_string(),
                     title: title.map(str::to_string),
                     argument_hint: hint,
+                    source: None,
                 };
             let skills = vec![
                 skill(

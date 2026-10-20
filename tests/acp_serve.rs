@@ -5593,6 +5593,44 @@ fn set_config_option_returns_full_state() {
     c.finish();
 }
 
+/// The `skill` input parts the fake host received.
+fn submitted_skill_parts(c: &Client) -> Vec<serde_json::Value> {
+    host_requests(c, "turn/start")
+        .iter()
+        .flat_map(|params| params["input"].as_array().cloned().unwrap_or_default())
+        .filter(|part| part["type"] == "skill")
+        .collect()
+}
+
+#[test]
+fn skill_parts_name_the_picked_copy_on_muse_1_4_11() {
+    for (version, duplicate, expected) in [
+        ("1.4.11-R6667.1", false, Some("bundled")),
+        // Two copies of one selector: the editor's command cannot say which.
+        ("1.4.11-R6667.1", true, None),
+        // Older hosts take no source.
+        ("1.4.10-R6427.1", false, None),
+    ] {
+        let mut env = vec![("FAKE_SERVER_VERSION", version)];
+        if duplicate {
+            env.push(("FAKE_DUPLICATE_SKILL", "1"));
+        }
+        let mut c = Client::spawn("quiet", &env);
+        let sid = c.new_session(2, "");
+        let pid = c.prompt(&sid, "/plan add dropdowns");
+        c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        c.wait_input("\"selector\": \"plan\"", Duration::from_secs(15));
+        let parts = submitted_skill_parts(&c);
+        assert_eq!(parts.len(), 1, "{parts:?}");
+        assert_eq!(
+            parts[0]["source"].as_str(),
+            expected,
+            "{version} duplicate={duplicate}: {parts:?}"
+        );
+        c.finish();
+    }
+}
+
 #[test]
 fn slash_command_aliases_use_native_msp_skill_parts() {
     let mut c = Client::spawn("quiet", &[]);

@@ -854,7 +854,7 @@ cannot drop a member without failing CI.
 | `ErrorData.recoveryObservation` | Intentionally ignored | The recovery-dependent construction's observation on an approval error is never read; approval failures keep their existing mapping. |
 | `SessionReadResult.recoveryObservation` | Intentionally ignored | The observation on a read result is never read; resumed and re-attached sessions keep their existing seeding. |
 | `SubagentResult.drained` | Intentionally ignored | The parent-consumed join fact on a workflow-child result is never read; the adapter mints completion off the result itself, not the flag. |
-| `TurnInputPart.source` | Intentionally ignored | Skill parts are sent without a `source`, so the host's bare `(selector)` resolution applies byte-for-byte; the closed vocabulary needs no local validation because the member is never written. |
+| `TurnInputPart.source` | Mapped to ACP | On Muse 1.4.11+ a skill part names its picked catalog copy: the adapter keeps a `skill/list` row's `source` when it is in the closed `bundled`/`user`/`project`/`plugin` vocabulary and the catalog holds exactly one copy of that selector, and sends it with the skill part. Two copies of one selector stay ambiguous to an editor command, so they, older hosts, and rows without a valid source keep the bare `(selector)` resolution. [#335](https://github.com/BrokkAi/muse-acp/issues/335) |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**
