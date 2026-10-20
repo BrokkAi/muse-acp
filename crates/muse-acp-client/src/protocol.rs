@@ -127,8 +127,13 @@ impl InitializeRequest {
             "protocolVersion".to_string(),
             Value::from(self.protocol_version.as_u64()),
         );
+        let client_info_key = if self.protocol_version.as_u64() >= 2 {
+            "info"
+        } else {
+            "clientInfo"
+        };
         params.insert(
-            "clientInfo".to_string(),
+            client_info_key.to_string(),
             serde_json::to_value(&self.client_info).expect("ClientInfo serializes"),
         );
         let capability_key = match self.protocol_version {

@@ -54,10 +54,11 @@ when it calls `Client::close`.
 
 ## Protocol versions
 
-`InitializeRequest::v1()` sends `clientCapabilities`; `InitializeRequest::v2()`
-sends `capabilities`. The client sends the standard `initialized`
-notification after the agent returns a valid `protocolVersion`, including when
-an agent negotiates back from a requested v2 to v1.
+`InitializeRequest::v1()` sends `clientInfo` and `clientCapabilities`;
+`InitializeRequest::v2()` sends `info` and `capabilities`. The client sends the
+standard `initialized` notification after the agent returns a valid
+`protocolVersion`, including when an agent negotiates back from a requested v2
+to v1.
 
 ACP v1 generally keeps `session/prompt` open until the turn finishes. ACP v2
 acknowledges prompt submission and reports progress and completion through
