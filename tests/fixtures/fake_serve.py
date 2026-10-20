@@ -1515,12 +1515,16 @@ def on_turn_start(params):
             "text": "done"}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "goal_branch":
+        goal = {"objective": "Green the suite", "status": "active",
+                "percentComplete": 42,
+                "currentWork": "Fixing fold tests",
+                "nextWork": "Re-run CI"}
+        if os.environ.get("FAKE_GOAL_STAMPS") == "1":
+            # Muse 1.4.11 stamps, verbatim from the durable goal row.
+            goal.update({"createdAtMs": 1792432422000,
+                         "updatedAtMs": 1792436022000})
         notify("session/goalChanged", {
-            "sessionId": MSP_SID, "viewCursor": "cur-g1",
-            "goal": {"objective": "Green the suite", "status": "active",
-                     "percentComplete": 42,
-                     "currentWork": "Fixing fold tests",
-                     "nextWork": "Re-run CI"}})
+            "sessionId": MSP_SID, "viewCursor": "cur-g1", "goal": goal})
         notify("session/branchChanged", {
             "sessionId": MSP_SID, "viewCursor": "cur-b1",
             "branch": "feat/msp", "vcs": "git",

@@ -94,7 +94,7 @@ the value from the latest frame.
 
 | Key | Shape | Meaning |
 | --- | --- | --- |
-| `_meta.goal` | object or `null` | Provider-neutral goal display state. `null` is an authoritative clear. |
+| `_meta.goal` | object or `null` | Provider-neutral goal display state. `null` is an authoritative clear. Muse 1.4.11+ goals carry `createdAtMs` and `updatedAtMs` (epoch milliseconds) verbatim from the durable goal row; a goal whose producer never recorded them omits them, never reporting zero. |
 | `_meta.muse.branch` | object or `null` | Branch/VCS/workspace observation from the host. |
 | `_meta.muse.status` | string | Host session status. ACP v2 also receives standard `state_update`. |
 | `_meta.muse.attention` | array of strings | Known host attention flags. Unknown flags are ignored. |

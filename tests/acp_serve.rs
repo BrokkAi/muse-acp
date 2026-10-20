@@ -10189,6 +10189,45 @@ fn goal_and_branch_state_publish_as_session_metadata() {
 }
 
 #[test]
+fn goal_timestamps_pass_through_verbatim_and_are_never_invented() {
+    for stamped in [true, false] {
+        let env: &[(&str, &str)] = if stamped {
+            &[("FAKE_GOAL_STAMPS", "1")]
+        } else {
+            &[]
+        };
+        let mut c = Client::spawn("goal_branch", env);
+        let sid = c.new_session(2, "");
+        let _pid = c.prompt(&sid, "work");
+        let goal = c.wait_for(
+            "\"goal\":{\"objective\":\"Green the suite\"",
+            Duration::from_secs(15),
+        );
+        c.wait_for("\"idle\"", Duration::from_secs(15));
+        if stamped {
+            assert!(
+                goal.contains("\"createdAtMs\":1792432422000")
+                    && goal.contains("\"updatedAtMs\":1792436022000"),
+                "{goal}"
+            );
+        } else {
+            // A producer that never carried the stamps (tool-result
+            // adoptions, pre-1.4.11 logs) must not read as epoch zero.
+            let frames = c
+                .frames
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .join("\n");
+            assert!(
+                !frames.contains("createdAtMs") && !frames.contains("updatedAtMs"),
+                "{frames}"
+            );
+        }
+        c.finish();
+    }
+}
+
+#[test]
 fn an_explicit_null_goal_clears_the_metadata() {
     let mut c = Client::spawn("goal_clear", &[]);
     let sid = c.new_session(2, "");
