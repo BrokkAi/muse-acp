@@ -1685,6 +1685,92 @@ fn an_editor_mcp_server_tool_asks_first_and_returns_its_output() {
 }
 
 #[test]
+fn the_editor_file_tools_read_and_edit_through_the_acp_client() {
+    if !enabled("the_editor_file_tools_read_and_edit_through_the_acp_client") {
+        return;
+    }
+    let host = Host::start(
+        json!({
+            "read": {"tool": {"name": "mcp__editor__read_text_file",
+                              "arguments": {"path": "notes.txt"}}},
+            "edit": {"tool": {"name": "mcp__editor__edit_text_file",
+                              "arguments": {"path": "notes.txt", "old_string": "draft",
+                                            "new_string": "final"}}},
+        }),
+        None,
+    );
+    std::fs::write(host.workspace().join("notes.txt"), "saved on disk\n").unwrap();
+    let mut adapter = Adapter::launch_with(
+        &host,
+        json!({"fs": {"readTextFile": true, "writeTextFile": true}}),
+    );
+    let session = adapter.new_session(&host, json!([]));
+    let notes = host.workspace().join("notes.txt");
+
+    // A read returns the editor's unsaved text, not the file on disk.
+    let id = adapter.prompt(&session, "read the notes [[script:read]]");
+    let permission = adapter.permission();
+    assert_eq!(
+        permission["params"]["toolCall"]["title"], "mcp__editor__read_text_file",
+        "{permission}"
+    );
+    adapter.choose(&permission, "allow_once");
+    let read = adapter.wait("fs/read_text_file", |frame| {
+        frame["method"] == "fs/read_text_file"
+    });
+    assert_eq!(read["params"]["sessionId"], session.as_str(), "{read}");
+    assert_eq!(read["params"]["path"], notes.to_str().unwrap(), "{read}");
+    adapter.send(json!({"jsonrpc": "2.0", "id": read["id"],
+                        "result": {"content": "an unsaved draft\n"}}));
+    assert_eq!(adapter.result(id)["stopReason"], "end_turn");
+    let results = tool_results(&host);
+    assert!(
+        results
+            .iter()
+            .any(|output| output.contains("an unsaved draft")),
+        "the model read the editor's text: {results:?}"
+    );
+
+    // An edit works on the editor's text and writes the result back.
+    let id = adapter.prompt(&session, "fix the notes [[script:edit]]");
+    let first = permission["id"].clone();
+    let permission = adapter.wait("the edit's permission request", |frame| {
+        frame["method"] == "session/request_permission" && frame["id"] != first
+    });
+    assert_eq!(
+        permission["params"]["toolCall"]["title"], "mcp__editor__edit_text_file",
+        "{permission}"
+    );
+    adapter.choose(&permission, "allow_once");
+    let edit_read = adapter.wait("the edit's fs/read_text_file", |frame| {
+        frame["method"] == "fs/read_text_file" && frame["id"] != read["id"]
+    });
+    adapter.send(json!({"jsonrpc": "2.0", "id": edit_read["id"],
+                        "result": {"content": "an unsaved draft\n"}}));
+    let write = adapter.wait("fs/write_text_file", |frame| {
+        frame["method"] == "fs/write_text_file"
+    });
+    assert_eq!(write["params"]["path"], notes.to_str().unwrap(), "{write}");
+    assert_eq!(write["params"]["content"], "an unsaved final\n", "{write}");
+    adapter.send(json!({"jsonrpc": "2.0", "id": write["id"], "result": null}));
+    assert_eq!(adapter.result(id)["stopReason"], "end_turn");
+    let diff = adapter
+        .updates("tool_call_update")
+        .iter()
+        .flat_map(|update| update["content"].as_array().cloned().unwrap_or_default())
+        .find(|content| content["type"] == "diff")
+        .expect("the edit's card carries a diff");
+    assert_eq!(diff["oldText"], "an unsaved draft\n", "{diff}");
+    assert_eq!(diff["newText"], "an unsaved final\n", "{diff}");
+    assert_eq!(
+        std::fs::read_to_string(&notes).unwrap(),
+        "saved on disk\n",
+        "the editor, not the adapter or Muse, writes the file"
+    );
+    adapter.finish();
+}
+
+#[test]
 fn a_saved_auto_review_profile_still_sends_approvals_to_the_editor() {
     if !enabled("a_saved_auto_review_profile_still_sends_approvals_to_the_editor") {
         return;

@@ -2167,7 +2167,8 @@ impl SessionFold {
 
     /// ACP `locations` for a native file tool, from its explicit path
     /// arguments only: `read_file`, `write_file`, and `edit_file` (and the
-    /// older single-path and move tools) name the files they touch. Shell,
+    /// older single-path and move tools, and the adapter's editor file
+    /// tools) name the files they touch. Shell,
     /// search, MCP, and unknown tools get no location, because a path in a
     /// command line or in tool output is a guess. Relative paths resolve
     /// against the workspace root; `..` is resolved lexically.
@@ -2176,6 +2177,10 @@ impl SessionFold {
         let keys: &[&str] = match tool.as_str() {
             "read_file" | "write_file" | "edit_file" | "create_file" | "delete_file"
             | "remove_file" => &["path", "filePath"],
+            // The adapter's editor file tools (bridge.rs).
+            "mcp__editor__read_text_file"
+            | "mcp__editor__write_text_file"
+            | "mcp__editor__edit_text_file" => &["path"],
             "move_file" | "rename_file" => &[
                 "oldPath",
                 "from",

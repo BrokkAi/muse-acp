@@ -5,6 +5,7 @@
 //! view, so turns stream in as `item/*` + `turn/*` notifications.
 
 mod acp;
+mod bridge;
 mod compat;
 mod diff;
 mod efforts;
@@ -2615,6 +2616,55 @@ fn client_mcp_servers(host: &Arc<Hosts>, params: Option<&J>, applied: bool) -> O
     translation.servers
 }
 
+/// The session's MSP `config.mcpServers`: the client's servers, plus the
+/// editor file tools for an ACP v1 client that advertises `fs` (see
+/// `bridge.rs`). Also returns the editor server's token, which a new session
+/// binds once its id is known; `acp_sid` reuses a loaded session's token, so
+/// the host is sent the same set again. The editor server needs the
+/// `sessionMcp` grant, and a client server with its name takes precedence.
+fn session_mcp_servers(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    params: Option<&J>,
+    applied: bool,
+    acp_sid: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let servers = client_mcp_servers(host, params, applied);
+    if !bridge::offered() {
+        return (servers, None);
+    }
+    if !host.handshake().session_mcp {
+        log("editor file tools unavailable: this Muse host did not grant sessionMcp");
+        return (servers, None);
+    }
+    if mcp::translate(params)
+        .forwarded
+        .iter()
+        .any(|name| name == bridge::SERVER_NAME)
+    {
+        log(&format!(
+            "editor file tools not added: the client supplies its own MCP server named {}",
+            esc(bridge::SERVER_NAME)
+        ));
+        return (servers, None);
+    }
+    let Some(port) = bridge::start(stdout, sessions) else {
+        return (servers, None);
+    };
+    let token = bridge::session_token(acp_sid);
+    let entry = format!(
+        "{}:{}",
+        esc(bridge::SERVER_NAME),
+        bridge::server_entry(port, &token)
+    );
+    let merged = match servers.as_deref().and_then(|s| s.strip_suffix('}')) {
+        Some(open) if open.trim_end() != "{" => format!("{open},{entry}}}"),
+        _ => format!("{{{entry}}}"),
+    };
+    (Some(merged), Some(token))
+}
+
 /// `,"config":{"mcpServers":...}` for `session/start` and `session/resume`.
 fn mcp_config_field(servers: Option<&str>) -> String {
     servers
@@ -4896,6 +4946,7 @@ fn negotiate_acp(msg: &J) -> Result<bool, AcpInitializeError> {
         Ordering::SeqCst,
     );
     NOTICES.store(client_supports_notices(capabilities, v), Ordering::SeqCst);
+    bridge::negotiate(v, capabilities);
     let terminal_auth = client_supports_terminal_auth(capabilities, v);
     AUTH_TERMINAL.store(terminal_auth, Ordering::SeqCst);
     if !terminal_auth {
@@ -4997,6 +5048,9 @@ fn handle_acp(
     // No method: a client response — maybe to our session/request_permission
     // or elicitation/create.
     if method.is_empty() {
+        if bridge::complete(&id, msg) {
+            return;
+        }
         if id.is_some() {
             complete_permission(host, stdout, sessions, &id, msg);
             complete_permission_feedback(host, stdout, sessions, &id, msg);
@@ -5053,7 +5107,8 @@ fn handle_acp(
             // Editors attach their MCP servers (Zed context servers, the
             // JetBrains IDE server) to session setup; MSP 1.3.0 loads them
             // into this session's runtime.
-            let mcp_servers = client_mcp_servers(host, params.as_ref(), true);
+            let (mcp_servers, bridge_token) =
+                session_mcp_servers(host, stdout, sessions, params.as_ref(), true, None);
             // MSP 1.4.1+ carries the whole root set to the host, so Muse's
             // own tools work in the extra folders instead of being confined
             // by the adapter alone. Roots are validated before the session
@@ -5175,6 +5230,9 @@ fn handle_acp(
                     let initial_title_facts = lifecycle_title_facts(host_session);
                     let branch_meta = raw_host_fact(host_session, "branch");
                     let attention_meta = raw_host_fact(host_session, "attention");
+                    if let Some(token) = &bridge_token {
+                        bridge::bind(token, &sid);
+                    }
                     sessions.lock().unwrap_or_else(|p| p.into_inner()).insert(
                         sid.clone(),
                         AcpSession {
@@ -5469,7 +5527,8 @@ fn handle_acp(
                 .filter(|cursor| !cursor.is_empty());
             // The host does not persist session MCP configuration, so a load
             // must carry the client's servers again to restore the tools.
-            let mcp_servers = client_mcp_servers(host, params.as_ref(), true);
+            let (mcp_servers, _) =
+                session_mcp_servers(host, stdout, sessions, params.as_ref(), true, Some(&sid));
             // A session this adapter holds keeps its mode; one loaded fresh
             // takes the mode it was left in, and a read-only or plan session
             // opens on the read-only host.
@@ -6020,7 +6079,8 @@ fn handle_acp(
             // MSP session/fork takes no configuration, and the fork is loaded
             // without MCP servers. Keep the client's set on the record so a
             // restarted host loads the fork with it.
-            let mcp_servers = client_mcp_servers(host, params.as_ref(), false);
+            let (mcp_servers, bridge_token) =
+                session_mcp_servers(host, stdout, sessions, params.as_ref(), false, None);
             // Resolve the source MSP session: known ACP session first, then
             // preserved metadata (same rule as resume).
             let meta_msp_sid = params
@@ -6094,6 +6154,9 @@ fn handle_acp(
                     }
                     host.note_owner(&new_msp, fork_host);
                     modes::save(&new_msp, &fork_mode);
+                    if let Some(token) = &bridge_token {
+                        bridge::bind(token, &new_msp);
+                    }
                     let new_model = new_session
                         .get("modelId")
                         .and_then(|v| v.as_str())
@@ -7664,6 +7727,7 @@ fn handle_acp(
             // `session/cancel` is the ACP all-work gesture. MSP separates
             // background task admission from foreground turn cancellation.
             stop_all_background_tasks(host, sessions, &sid);
+            bridge::cancel_session(&sid);
             // An open question the user has already partly answered settles
             // on the interrupt lane: userInput/interrupt carries the
             // confirmed answers and stops its turn, so the model still sees
@@ -11505,10 +11569,12 @@ fn handle_msp(
             let item = params.get("item").cloned().unwrap_or(J::Null);
             if let Some((acp_sid, ver)) = find_acp_session(sessions, msp_sid) {
                 observe_file_change(sessions, &acp_sid, &item);
-                // Read outside the session lock: it asks the host.
+                // Read outside the session lock: it asks the host. An editor
+                // file tool's diff was recorded by the bridge.
                 let diff = (ver == 2)
                     .then(|| tool_patch_diff(host, msp_sid, &item))
-                    .flatten();
+                    .flatten()
+                    .or_else(|| bridge::take_card_content(&acp_sid, &item));
                 let mut out = Vec::new();
                 if let Some(s) = sessions
                     .lock()

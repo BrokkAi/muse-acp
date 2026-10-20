@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Read and write files through ACP v1 editors (#310). When the client
+  advertises `fs.readTextFile` or `fs.writeTextFile`, each Muse session gets
+  an adapter-owned MCP server, `editor`, with `read_text_file`,
+  `write_text_file`, and `edit_text_file` tools that go through
+  `fs/read_text_file` and `fs/write_text_file`. The model sees unsaved
+  buffers, and the editor applies and tracks the writes. Paths stay inside the
+  session's roots, Read-only and Plan sessions refuse writes, completed writes
+  show a `diff`, and `session/cancel` withdraws a waiting request. The server
+  listens on 127.0.0.1 behind a per-session bearer token and refuses browser
+  requests. Needs Muse 1.3.0+; `MUSE_EDITOR_TOOLS=0` turns it off.
+
 - Correct stale vendored-surface labels after the 1.4.11 re-pin. The
   `--selftest` and handshake detail for the Muse 1.4.8 fingerprint no longer
   calls it "the vendored SDK manifest surface" beside the 1.4.11 row that
