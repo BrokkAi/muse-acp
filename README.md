@@ -517,6 +517,12 @@ error the editor shows if Muse then refuses the profile says why.
   outcome, and terminal reason; opt-in `_session/hooks` reads the session's
   installed handler rows (`hook/list`) and labels those cards with each
   handler's origin and enabled switch.
+- **JSON-RPC batches** — ACP v2 batch arrays follow the JSON-RPC 2.0 rules:
+  each entry runs as if sent alone, the answers that are ready leave together
+  as one array, invalid entries get their own `-32600` with `id: null`, an
+  empty array gets a single `-32600`, and a notification-only batch gets no
+  reply. A prompt that waits on its turn is answered alone when it settles.
+  ACP v1 has no batches, so a v1 batch is refused with one `-32600`.
 
 ### Protocol extensions
 

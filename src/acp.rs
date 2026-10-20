@@ -567,7 +567,81 @@ pub fn id_json(id: &Option<J>) -> String {
     }
 }
 
+/// Responses held back while one ACP v2 batch is dispatched, so the
+/// synchronous answers leave together as one response array. Only responses
+/// to the batch's own request ids are held; a response the adapter settles
+/// later (a prompt that waits on its turn) goes out alone when it is ready.
+struct BatchCapture {
+    ids: std::collections::HashSet<String>,
+    responses: Vec<String>,
+}
+
+static BATCH: Mutex<Option<BatchCapture>> = Mutex::new(None);
+
+/// Start holding responses to `ids` (each request id's JSON text).
+pub fn begin_batch(ids: std::collections::HashSet<String>) {
+    *BATCH.lock().unwrap_or_else(|p| p.into_inner()) = Some(BatchCapture {
+        ids,
+        responses: Vec::new(),
+    });
+}
+
+/// Add a response that belongs in the batch reply but has no request id to
+/// match, such as an invalid entry's `-32600`.
+pub fn batch_error(code: i64, message: &str) {
+    if let Some(batch) = BATCH.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
+        batch.responses.push(format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":{code},\"message\":{}}}}}",
+            esc(message)
+        ));
+    }
+}
+
+/// Stop holding responses and write the held ones as one array. JSON-RPC
+/// forbids an empty array reply, so a batch that produced no response (only
+/// notifications, or requests still in progress) writes nothing.
+pub fn finish_batch(stdout: &StdoutShared) {
+    let Some(batch) = BATCH.lock().unwrap_or_else(|p| p.into_inner()).take() else {
+        return;
+    };
+    if batch.responses.is_empty() {
+        return;
+    }
+    let mut out = stdout.lock().unwrap_or_else(|p| p.into_inner());
+    if crate::shutdown::expiring() {
+        return;
+    }
+    let line = format!("[{}]", batch.responses.join(","));
+    if writeln!(out, "{line}").and_then(|_| out.flush()).is_ok() {
+        for response in &batch.responses {
+            if let Ok(response) = parse_json(response) {
+                crate::shutdown::completed(&response.get("id").cloned());
+            }
+        }
+    } else {
+        crate::shutdown::disconnect();
+    }
+}
+
+/// Hold `line` for the active batch when it answers one of its requests.
+fn held_by_batch(id: &Option<J>, line: &str) -> bool {
+    let Some(id) = id else {
+        return false;
+    };
+    let mut batch = BATCH.lock().unwrap_or_else(|p| p.into_inner());
+    match batch.as_mut() {
+        Some(batch) if batch.ids.contains(&j_to_string(id)) => {
+            batch.responses.push(line.to_string());
+            true
+        }
+        _ => false,
+    }
+}
+
 fn send_response(stdout: &StdoutShared, id: &Option<J>, line: &str) {
+    if held_by_batch(id, line) {
+        return;
+    }
     let mut out = stdout.lock().unwrap_or_else(|p| p.into_inner());
     if crate::shutdown::expiring() {
         return;

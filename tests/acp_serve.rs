@@ -7086,6 +7086,113 @@ fn malformed_json_is_rejected_and_survived() {
     c.finish();
 }
 
+/// Frames that are JSON arrays: batch replies.
+fn batch_frames(c: &Client) -> Vec<serde_json::Value> {
+    c.frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter(|frame| frame.starts_with('['))
+        .map(|frame| serde_json::from_str(frame).expect("batch reply JSON"))
+        .collect()
+}
+
+#[test]
+fn v2_batches_follow_the_json_rpc_batch_rules() {
+    let mut c = Client::spawn("happy", &[]);
+    c.new_session(2, "");
+
+    // An empty batch is one Invalid Request object, not an array.
+    c.raw("[]");
+    let empty = c.wait_for("empty batch", Duration::from_secs(15));
+    let empty: serde_json::Value = serde_json::from_str(&empty).expect("error JSON");
+    assert_eq!(empty["id"], serde_json::Value::Null, "{empty}");
+    assert_eq!(empty["error"]["code"], -32600, "{empty}");
+
+    // Two requests come back together, each echoing its own id.
+    c.raw(
+        r#"[{"jsonrpc":"2.0","id":"batch-a","method":"session/list","params":{}},{"jsonrpc":"2.0","id":"batch-b","method":"session/list","params":{}}]"#,
+    );
+    c.wait_for("\"batch-b\"", Duration::from_secs(15));
+    let replies = batch_frames(&c);
+    assert_eq!(replies.len(), 1, "one response array: {replies:?}");
+    let ids: Vec<&serde_json::Value> = replies[0]
+        .as_array()
+        .expect("array reply")
+        .iter()
+        .map(|reply| &reply["id"])
+        .collect();
+    assert_eq!(ids, ["batch-a", "batch-b"], "{replies:?}");
+    assert!(
+        replies[0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|reply| reply["result"]["sessions"].is_array()),
+        "both requests ran: {replies:?}"
+    );
+
+    // Invalid entries get their own -32600 and do not fail a valid sibling;
+    // the notification gets no reply of its own.
+    c.raw(
+        r#"[17,true,null,{"jsonrpc":"2.0","method":"_muse/batch_notice"},{"jsonrpc":"2.0","id":"batch-c","method":"session/list","params":{}}]"#,
+    );
+    c.wait_for("\"batch-c\"", Duration::from_secs(15));
+    let replies = batch_frames(&c);
+    assert_eq!(replies.len(), 2, "{replies:?}");
+    let mixed = replies[1].as_array().expect("array reply");
+    assert_eq!(
+        mixed.len(),
+        4,
+        "three invalid entries and one request: {mixed:?}"
+    );
+    let invalid: Vec<_> = mixed.iter().filter(|reply| reply["id"].is_null()).collect();
+    assert_eq!(invalid.len(), 3, "{mixed:?}");
+    assert!(
+        invalid.iter().all(|reply| reply["error"]["code"] == -32600),
+        "{mixed:?}"
+    );
+    assert!(
+        mixed
+            .iter()
+            .any(|reply| reply["id"] == "batch-c" && reply["result"]["sessions"].is_array()),
+        "{mixed:?}"
+    );
+
+    // A notification-only batch is never answered, and the connection stays
+    // usable afterwards.
+    c.raw(r#"[{"jsonrpc":"2.0","method":"_muse/batch_notice"}]"#);
+    let id = c.req("session/list", "{}");
+    c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert_eq!(batch_frames(&c).len(), 2, "no reply to notifications");
+    c.finish();
+}
+
+#[test]
+fn v1_batches_are_refused_as_a_whole() {
+    let mut c = Client::spawn("happy", &[]);
+    c.new_session(1, "");
+    c.raw(r#"[{"jsonrpc":"2.0","id":"batch-v1","method":"session/list","params":{}}]"#);
+    let refused = c.wait_for("batches need ACP v2", Duration::from_secs(15));
+    let refused: serde_json::Value = serde_json::from_str(&refused).expect("error JSON");
+    assert_eq!(refused["id"], serde_json::Value::Null, "{refused}");
+    assert_eq!(refused["error"]["code"], -32600, "{refused}");
+    assert!(batch_frames(&c).is_empty());
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("\"batch-v1\""),
+        "the entry did not run: {frames}"
+    );
+    drop(frames);
+    let id = c.req("session/list", "{}");
+    c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    c.finish();
+}
+
 #[test]
 fn invalid_initialize_protocol_versions_do_not_launch_the_host() {
     for (label, params) in [
