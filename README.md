@@ -30,6 +30,13 @@ requests such as permissions and elicitation through a configurable handler.
 It is independent of the adapter binary and of the upstream
 `agent-client-protocol` Rust crate.
 
+Toward Muse, the adapter speaks MSP through
+[`muse-msp-client`](crates/muse-msp-client/README.md), a dependency-free
+synchronous client that launches a configured `muse serve`, performs the
+handshake, correlates requests, routes server requests, and shuts the host
+down within a bounded time. Tools that need Muse sessions without ACP can use
+it directly.
+
 > `muse-acp` is an independent community project. Muse Code and Muse Spark are
 > products of Meta Platforms, Inc. This project is not affiliated with,
 > endorsed by, or supported by Meta.

@@ -59,6 +59,12 @@ npm distribution. It adapts a saved `:auto-review` profile to `:ask-me` for its
 serve child without changing the user's settings. See the README and changelog
 for current behavior.
 
+The MSP transport (handshake, request correlation, method-aware timeouts,
+server-request routing, exit classification, and bounded shutdown) is the
+dependency-free `muse-msp-client` workspace crate, together with the JSON
+parser. The adapter drives its hosts through it and keeps Muse discovery,
+the settings view, diagnostics, and every ACP mapping to itself (#328).
+
 The status paragraphs below distinguish implemented work from open decisions.
 Work-item and acceptance lists retain the original design requirements; they
 are not all outstanding tasks.

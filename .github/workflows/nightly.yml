@@ -189,6 +189,8 @@ jobs:
             done
           else
             cargo test --locked -p muse-acp --test live_loopback -- --test-threads 2
+            # The MSP client crate on its own, without the adapter.
+            cargo test --locked -p muse-msp-client --test live_muse
           fi
 
   npm-launcher:
