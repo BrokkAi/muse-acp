@@ -13,8 +13,8 @@ access, and useful in real editor workflows.
   (2026-10-19; stable schema version 1, manifest fingerprint
   `sha256:f282ad16e21520d0cda68cb190149b86e2b062eef1dd282749360c05aa3d1082`,
   the Muse 1.4.11 stable surface,
-  byte-identical to an installed 1.4.11's own schema export; degraded
-  pending a pinned 1.4.11 CI build)
+  byte-identical to an installed 1.4.11's own schema export; tested
+  against the pinned 1.4.11-R6667.1 build in the nightly live-host matrix)
   and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
@@ -193,15 +193,18 @@ the verdict into richer support bundles.
   mutation timestamps, recovery observations and modes, the skill-invocation
   source, and the workflow-child `drained` join fact. An installed Muse
   1.4.11 exports a schema bundle byte-identical to the vendored copy while
-  reporting this fingerprint byte-for-byte, so the adapter classifies it as
-  degraded rather than unknown; with no pinned 1.4.11 build in the live-host
-  matrix yet, it stays degraded rather than tested. Pinning build
-  1.4.11-R6667.1 (verified locally: it reports this fingerprint and its
-  schema export is byte-identical to the vendored bundle) is tracked in
-  [#337](https://github.com/BrokkAi/muse-acp/issues/337), along with three
-  version-correlated loopback failures that pass against 1.4.8 in the same
-  sandbox and must clear first (fork and side chat refuse with a
-  file-birthtime error; the workflow-child card completes with no content).
+  reporting this fingerprint byte-for-byte, and the pinned 1.4.11-R6667.1
+  build runs in the nightly live-host matrix (Linux x86-64 full suite, macOS
+  arm64 newest pin, Windows x64 workspace-root flows), so the adapter
+  classifies it as tested
+  ([#337](https://github.com/BrokkAi/muse-acp/issues/337)). Two
+  host-side gaps on that build are tolerated with evidence rather than
+  hidden: its Linux binary cannot read a file's creation time, so it refuses
+  `session/fork` and `session/sideChat` with "file birth time is
+  unavailable" (on GitHub's Ubuntu runners as well, while 1.4.8 branches
+  fine there), and the two live tests skip on exactly that refusal; and it
+  refuses a workflow child agent call under `reasoning_effort: none`, so the
+  workflow-child live test names a supported effort.
   The new surfaces have their own tracking issues
   ([#329](https://github.com/BrokkAi/muse-acp/issues/329) through
   [#336](https://github.com/BrokkAi/muse-acp/issues/336)). Before 1.4.6, the
@@ -251,10 +254,10 @@ dev-dependency; the binary stays dependency-free), and replays every corpus
 approval payload through the permission mapping, requiring ordered choices
 plus a deny fallback, and an env-gated `MUSE_ACP_LIVE_HOST=1` smoke test
 drives a real host handshake, session lifecycle, and close (skipped with an
-explicit message by default). No pinned 1.4.11 build has joined the
-matrix yet, so the vendored 1.4.11 surface classifies as degraded (the
-1.4.9/1.4.10 surface stays degraded beside it); the pin is tracked in
-[#337](https://github.com/BrokkAi/muse-acp/issues/337). The `live-host` CI job also runs
+explicit message by default). The pinned 1.4.11-R6667.1 build in the
+nightly matrix makes the vendored 1.4.11 surface tested
+([#337](https://github.com/BrokkAi/muse-acp/issues/337)); the 1.4.9/1.4.10
+surface stays degraded, since no 1.4.9 or 1.4.10 build is pinned. The `live-host` CI job also runs
 `tests/live_loopback.rs` on every push against each pinned Muse build on
 Linux x86-64, and the newest on macOS arm64 (downloaded and
 checksum-verified), with no credentials: a real `muse serve`

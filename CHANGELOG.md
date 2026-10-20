@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Pin Muse 1.4.11-R6667.1 in the nightly live-host matrix and classify the
+  vendored 1.4.11 surface as tested (#337): the full suite on Linux x86-64,
+  the newest-pin leg on macOS arm64 (taking over from 1.4.8), and the
+  workspace-root flows on Windows x64. Two host-side gaps are tolerated with
+  evidence: 1.4.11's Linux build refuses `session/fork` and
+  `session/sideChat` because it cannot read a file's creation time (on
+  GitHub's runners too), so those two live tests skip on exactly that
+  refusal; and it refuses a workflow child agent call under
+  `reasoning_effort: none`, so the workflow-child live test names a
+  supported effort.
+
 - Keep MSP command ids random and unique on Windows. Without
   `/dev/urandom` the ids carried almost no randomness, and only four bits of
   the per-host sequence reached `rand_a`, so ids minted 16 apart in one

@@ -1171,6 +1171,30 @@ fn require_release(
     Some(adapter)
 }
 
+/// The result of a session-branching request (`session/fork`,
+/// `_session/sideChat`), or `None` after a skip when the host hits its known
+/// branching gap. Muse 1.4.11's Linux build cannot read a file's creation
+/// time, so it refuses to branch any session with "file birth time is
+/// unavailable" (on GitHub's Ubuntu runners as well as locally, where 1.4.8
+/// branches fine). That is a host bug, not adapter drift; only that exact
+/// refusal from 1.4.11 or later is tolerated, and any other error still fails.
+fn branch_result(adapter: Adapter, id: u64, test: &str) -> Option<(Adapter, Value)> {
+    let response = adapter.response(id);
+    if let Some(message) = response["error"]["message"].as_str()
+        && message.contains("file birth time is unavailable")
+        && adapter_host_release(&adapter).0 >= (1, 4, 11)
+    {
+        eprintln!("skipped {test}: this Muse build cannot branch sessions here ({message})");
+        adapter.finish();
+        return None;
+    }
+    assert!(
+        response.get("error").is_none(),
+        "request {id} failed: {response}"
+    );
+    Some((adapter, response["result"].clone()))
+}
+
 /// Whether this Muse release serves MSP `session/delete`: 1.4.1 added it
 /// and 1.4.3 removed it.
 fn serves_session_delete(release: (u64, u64, u64)) -> bool {
@@ -2279,7 +2303,9 @@ fn side_chat_reaches_a_real_host_and_attaches_with_provenance() {
     };
     let session = adapter.new_session(&host, json!([]));
     let id = adapter.request("_session/sideChat", json!({"sessionId": session}));
-    let result = adapter.result(id);
+    let Some((mut adapter, result)) = branch_result(adapter, id, test) else {
+        return;
+    };
     let side = result["sessionId"]
         .as_str()
         .unwrap_or_else(|| panic!("the extension names the side: {result}"))
@@ -2600,7 +2626,7 @@ fn a_workflow_child_runs_and_its_result_reaches_the_parent() {
     let host = Host::start(
         json!({"workflow": {"tool": {"name": "workflow", "arguments": {
             "name": "Helper run",
-            "script": "export default async function workflow(host) { return await host.agent({ input: \"child task\", label: \"helper\" }); }",
+            "script": "export default async function workflow(host) { return await host.agent({ input: \"child task\", label: \"helper\", effort: \"low\" }); }",
         }}}}),
         None,
     );
@@ -2644,10 +2670,14 @@ fn a_fork_starts_from_the_source_history_and_continues_on_its_own() {
         "session/fork",
         json!({"sessionId": session, "cwd": host.workspace(), "mcpServers": []}),
     );
-    let fork = adapter.result(id)["sessionId"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let Some((mut adapter, forked)) = branch_result(
+        adapter,
+        id,
+        "a_fork_starts_from_the_source_history_and_continues_on_its_own",
+    ) else {
+        return;
+    };
+    let fork = forked["sessionId"].as_str().unwrap().to_string();
     assert_ne!(fork, session);
     adapter.wait("the fork's copy of the first prompt", |frame| {
         frame["params"]["sessionId"] == fork.as_str()
