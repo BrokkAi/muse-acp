@@ -233,6 +233,28 @@ fn absolute_tool_path(workspace_root: &str, raw: &str) -> Option<String> {
         .flatten()
 }
 
+/// An epoch in milliseconds as a UTC RFC 3339 timestamp, without a date
+/// library (Howard Hinnant's civil-from-days).
+fn utc_from_epoch_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let (days, rem) = (secs / 86_400, secs % 86_400);
+    let z = days as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        rem / 3600,
+        rem % 3600 / 60,
+        rem % 60
+    )
+}
+
 /// Native tools whose call runs a shell command.
 const SHELL_TOOLS: [&str; 3] = ["bash", "shell", "workspace-shell"];
 
@@ -1369,6 +1391,57 @@ impl SessionFold {
                     "Damaged session log range".to_string(),
                     Some(lines.join("\n")),
                     Some(format!("\"damagedRange\":{}", j_to_string(range))),
+                )
+            }
+            "scheduledFire" => {
+                // Muse 1.4.11: one delivery of a scheduled (cron) job, with
+                // its occurrence facts verbatim in `_meta`. Epochs render as
+                // UTC; a missing next fire means a final delivery only when
+                // the occurrence facts are present.
+                let job = str_field("jobId");
+                let delivery = item.get("deliveryNumber").and_then(J::as_u64);
+                let at = |key: &str| item.get(key).and_then(J::as_u64).map(utc_from_epoch_ms);
+                let mut lines = Vec::new();
+                let fallback = str_field("fallbackText");
+                if !fallback.is_empty() {
+                    lines.push(fallback.to_string());
+                }
+                if let Some(n) = delivery {
+                    lines.push(format!("Occurrence {n}"));
+                }
+                if let Some(scheduled) = at("scheduledFireAtMs") {
+                    lines.push(format!("Scheduled for {scheduled}"));
+                }
+                match at("nextFireAtMs") {
+                    Some(next) => lines.push(format!("Next fire: {next}")),
+                    None if delivery.is_some() => lines.push("Final delivery".to_string()),
+                    None => {}
+                }
+                let title = if job.is_empty() {
+                    if fallback.is_empty() {
+                        String::new()
+                    } else {
+                        "Scheduled job fired".to_string()
+                    }
+                } else {
+                    format!("Scheduled job {job} fired")
+                };
+                let fields: Vec<String> = [
+                    "jobId",
+                    "deliveryNumber",
+                    "scheduledFireAtMs",
+                    "nextFireAtMs",
+                ]
+                .into_iter()
+                .filter_map(|key| {
+                    item.get(key)
+                        .map(|v| format!("\"{key}\":{}", j_to_string(v)))
+                })
+                .collect();
+                (
+                    title,
+                    (!lines.is_empty()).then(|| lines.join("\n")),
+                    Some(format!("\"scheduledFire\":{{{}}}", fields.join(","))),
                 )
             }
             _ => {
@@ -3980,6 +4053,18 @@ mod corpus_tests {
         assert_eq!(text.chars().count(), max_content());
     }
 
+    #[test]
+    fn epochs_render_as_utc_timestamps() {
+        for (ms, text) in [
+            (0, "1970-01-01T00:00:00Z"),
+            (1_792_432_422_000, "2026-10-19T17:53:42Z"),
+            (951_782_400_000, "2000-02-29T00:00:00Z"),
+            (4_102_444_799_000, "2099-12-31T23:59:59Z"),
+        ] {
+            assert_eq!(super::utc_from_epoch_ms(ms), text);
+        }
+    }
+
     fn completed_card(item: &str) -> J {
         let mut fold = SessionFold::new();
         let mut out = Vec::new();
@@ -4035,6 +4120,39 @@ mod corpus_tests {
         assert_eq!(
             card_text(&update),
             "0 missing records, 2 unreadable lines\nThe log starts damaged; readable again from 2026-10-19T10:05:00Z"
+        );
+    }
+
+    #[test]
+    fn scheduled_fires_carry_their_occurrence_facts() {
+        let update = completed_card(
+            r#"{"itemId":"sf-1","kind":"scheduledFire","status":"completed","jobId":"job-9","deliveryNumber":4,"scheduledFireAtMs":1792432422000,"nextFireAtMs":1792436022000}"#,
+        );
+        assert_eq!(
+            update.get("title").and_then(J::as_str),
+            Some("Scheduled job job-9 fired")
+        );
+        assert_eq!(
+            card_text(&update),
+            "Occurrence 4\nScheduled for 2026-10-19T17:53:42Z\nNext fire: 2026-10-19T18:53:42Z"
+        );
+        assert_eq!(
+            crate::json::j_to_string(
+                update
+                    .get("_meta")
+                    .and_then(|m| m.get("muse"))
+                    .and_then(|m| m.get("scheduledFire"))
+                    .unwrap()
+            ),
+            r#"{"jobId":"job-9","deliveryNumber":4,"scheduledFireAtMs":1792432422000,"nextFireAtMs":1792436022000}"#
+        );
+        let last = completed_card(
+            r#"{"itemId":"sf-2","kind":"scheduledFire","status":"completed","jobId":"job-9","deliveryNumber":5,"scheduledFireAtMs":1792436022000}"#,
+        );
+        assert!(
+            card_text(&last).ends_with("Final delivery"),
+            "{}",
+            card_text(&last)
         );
     }
 

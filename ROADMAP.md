@@ -784,10 +784,10 @@ The 1.4.11 additions are tolerated, not driven. The `session/leave` command
 and its `session/leaveCompleted` terminal, the monitor-inbox trio, and the
 `leave` close reason need no adapter arm: sessions keep their current
 lifecycle and inbound copies take the unhandled-notification diagnostic
-path (see the §9 rows above). The `damagedRange` item kind renders its own
-card with its facts in `_meta.muse` (#331); `scheduledFire` flows through the
-unknown-kind path, and the remaining field additions carry explicit
-dispositions in the field matrix below.
+path (see the §9 rows above). The `damagedRange` and `scheduledFire` item
+kinds render their own cards with their facts in `_meta.muse` (#331, #332),
+and the remaining field additions carry explicit dispositions in the field
+matrix below.
 
 **Muse 1.4.x field-level and vocabulary additions**
 
@@ -841,12 +841,12 @@ cannot drop a member without failing CI.
 | `SessionNameChangedParams.generatedName` | Mapped to ACP | The live replacement for the generated short title rides `session_info_update._meta.muse.generatedName`, including generated-only changes. An authoritative omission after publication is forwarded as `generatedName: null`; an initial omission publishes no key. [#256](https://github.com/BrokkAi/muse-acp/issues/256) |
 | `Item.messagePhase` | Mapped to ACP | A completed agent reply declares the model-committed phase as `_meta.muse.messagePhase` (`commentary` or `finalAnswer`, Muse 1.4.8+). A streamed reply gets an empty `agent_message_chunk` naming its `messageId` on ACP v2; a resent, replayed, or cut-off reply carries the phase on its own marked update. An absent or unrecognized value reads as `finalAnswer`; the phase is never inferred from position and is never a turn-done signal. [#254](https://github.com/BrokkAi/muse-acp/issues/254) |
 | `ItemKind.damagedRange` | Mapped to ACP | A damaged session-log range (Muse 1.4.11+) renders as a "Damaged session log range" card: the host's `fallbackText`, the records proven missing and unreadable lines, the readable window around the range, and the safe fork cut (`lastGoodTurnId`) when one exists. The `turnId: null` shape is accepted. [#331](https://github.com/BrokkAi/muse-acp/issues/331) |
-| `ItemKind.scheduledFire` | Mapped to ACP | Tolerated through the same unknown-kind generic card path; the occurrence facts (`jobId`, `deliveryNumber`, `scheduledFireAtMs`, `nextFireAtMs`) are not rendered. |
+| `ItemKind.scheduledFire` | Mapped to ACP | One delivery of a scheduled cron job (Muse 1.4.11+) renders as a "Scheduled job <jobId> fired" card with its occurrence number, scheduled time, and next fire (or "Final delivery" when the occurrence facts carry no next fire), epochs shown as UTC. [#332](https://github.com/BrokkAi/muse-acp/issues/332) |
 | `Item.damagedRange` | Mapped to ACP | The range's cost object rides the card's `_meta.muse.damagedRange` verbatim and is stated in its text (see `ItemKind.damagedRange`). |
-| `Item.deliveryNumber` | Intentionally ignored | The scheduled-fire occurrence number is never read. |
-| `Item.jobId` | Intentionally ignored | The scheduled-fire cron job id is never read. |
-| `Item.nextFireAtMs` | Intentionally ignored | The next scheduled epoch is never read. |
-| `Item.scheduledFireAtMs` | Intentionally ignored | The fire's scheduled epoch is never read. |
+| `Item.deliveryNumber` | Mapped to ACP | Shown as the scheduled-fire card's occurrence number and carried in `_meta.muse.scheduledFire`. |
+| `Item.jobId` | Mapped to ACP | Names the scheduled-fire card and rides `_meta.muse.scheduledFire`. |
+| `Item.nextFireAtMs` | Mapped to ACP | Shown as the next fire time (UTC) and carried verbatim in `_meta.muse.scheduledFire`; absent with occurrence facts reads as a final delivery. |
+| `Item.scheduledFireAtMs` | Mapped to ACP | Shown as the fire's scheduled time (UTC) and carried verbatim in `_meta.muse.scheduledFire`. |
 | `Goal.createdAtMs` | Mapped to ACP | The goal block is stored and emitted as raw MSP JSON, so the creation timestamp rides the `session/update` goal metadata verbatim when the host sends it; absence (pre-1.4.11 producers) emits nothing. Never interpreted or fabricated. |
 | `Goal.updatedAtMs` | Mapped to ACP | The mutation timestamp rides the same raw goal metadata verbatim, like its creation stamp above. |
 | `SessionClosedReason.leave` | Consumed | Logged verbatim by the existing `session/closed` arm beside `idle` and `hostShutdown`; unload semantics are unchanged because the adapter never sends `session/leave`. |
