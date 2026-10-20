@@ -122,6 +122,11 @@ Standard ACP fields carry standard meaning:
 - display title: `ToolCall.title`
 - tool category and lifecycle: `ToolCall.kind` and `ToolCall.status`
 - invocation input: `ToolCall.rawInput`
+- streamed tool output on ACP v2: each `item/delta` on a tool or shell card's
+  `output` field is appended with `tool_call_content_chunk`, up to the
+  adapter's display budget (`MUSE_TOOL_OUTPUT_LIMIT`); the completion still
+  replaces the card's whole content with the bounded final output, so the
+  result matches a replacement alone. ACP v1 cards show output at completion
 - file edits on ACP v2: a `diff` content item after the card's text output,
   built from the host's stored patch (`patchRef`, `kind: "tool_patch"`, read
   through `item/readOutput` when the call completes). `changes` lists each
