@@ -1003,6 +1003,9 @@ fn resolve_path(raw: &str, cwd: &str, roots: &[String]) -> Result<String, String
     if raw.trim().is_empty() {
         return Err("path must not be empty".to_string());
     }
+    // A Windows verbatim (`\\?\`) root does not split on `/`.
+    #[cfg(windows)]
+    let raw = &raw.replace('/', "\\");
     let given = Path::new(raw);
     let joined = if given.is_absolute() {
         given.to_path_buf()
@@ -1069,7 +1072,9 @@ mod tests {
         std::fs::create_dir_all(dir.join("outside")).unwrap();
         std::fs::write(dir.join("ws/src/a.rs"), "disk text\n").unwrap();
         std::fs::write(dir.join("outside/secret.txt"), "secret\n").unwrap();
-        std::fs::canonicalize(&dir).unwrap()
+        // Not canonicalized: a Windows verbatim (`\\?\`) path would not split
+        // `/` in a relative tool path, and editors send ordinary paths.
+        dir
     }
 
     /// `dir` joined with `parts` one component at a time, as a string.
