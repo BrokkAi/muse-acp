@@ -4119,8 +4119,10 @@ fn show_reminders() -> bool {
 }
 
 /// A fresh fold configured with the connection's subagent negotiation.
-fn fresh_fold() -> SessionFold {
+/// `workspace_root` resolves relative tool paths for tool-call locations.
+fn fresh_fold(workspace_root: &str) -> SessionFold {
     let mut fold = SessionFold::new();
+    fold.workspace_root = workspace_root.to_string();
     fold.native_subagents = NATIVE_SUBAGENTS.load(Ordering::SeqCst) == 1;
     fold.air_async_tasks = AIR_ASYNC_TASKS.load(Ordering::SeqCst) == 1;
     fold.compaction_supported = COMPACTION.load(Ordering::SeqCst) == 1;
@@ -4862,7 +4864,7 @@ fn handle_acp(
                             ),
                             seen_view_cursors: std::collections::HashSet::new(),
                             refill_twins: std::collections::HashSet::new(),
-                            fold: fresh_fold(),
+                            fold: fresh_fold(&cwd),
                             usage_used: None,
                             usage_size: None,
                             cum_prompt: None,
@@ -5244,7 +5246,7 @@ fn handle_acp(
                             attention: None,
                             seen_view_cursors: std::collections::HashSet::new(),
                             refill_twins: std::collections::HashSet::new(),
-                            fold: fresh_fold(),
+                            fold: fresh_fold(&restored_cwd),
                             usage_used: None,
                             usage_size: None,
                             cum_prompt: None,
@@ -5281,6 +5283,7 @@ fn handle_acp(
                             adopt_session_projection(entry, session);
                         }
                         if !restored_cwd.is_empty() {
+                            entry.fold.workspace_root.clone_from(&restored_cwd);
                             entry.cwd = restored_cwd;
                         }
                         // Resume/load roots are request-scoped. Omitting the
@@ -5789,7 +5792,7 @@ fn handle_acp(
                             return;
                         }
                     };
-                    let mut fork_fold = fresh_fold();
+                    let mut fork_fold = fresh_fold(&restored_cwd);
                     let mut replay_lines = Vec::new();
                     for item in &history_items {
                         fork_fold.replay_item(&new_msp, ver, item, &mut replay_lines);
@@ -5841,7 +5844,7 @@ fn handle_acp(
                             attention: None,
                             seen_view_cursors: std::collections::HashSet::new(),
                             refill_twins: std::collections::HashSet::new(),
-                            fold: fresh_fold(),
+                            fold: fresh_fold(&restored_cwd),
                             usage_used: None,
                             usage_size: None,
                             cum_prompt: None,
@@ -5867,6 +5870,7 @@ fn handle_acp(
                         entry.ver = ver;
                         entry.mcp_servers = mcp_servers;
                         adopt_session_projection(entry, &new_session);
+                        entry.fold.workspace_root.clone_from(&restored_cwd);
                         entry.cwd = restored_cwd;
                         entry.roots = roots;
                         // The fork inherits the source's runtime roots; the
@@ -10622,7 +10626,7 @@ fn drill_down_subagent_child(
         };
         let needs = !s.child_folds.contains_key(child);
         if needs {
-            s.child_folds.insert(child.to_string(), fresh_fold());
+            s.child_folds.insert(child.to_string(), fresh_fold(&s.cwd));
         }
         (s.ver, needs)
     };

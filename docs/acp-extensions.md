@@ -122,6 +122,10 @@ Standard ACP fields carry standard meaning:
 - display title: `ToolCall.title`
 - tool category and lifecycle: `ToolCall.kind` and `ToolCall.status`
 - invocation input: `ToolCall.rawInput`
+- follow-along file locations: `ToolCall.locations`, as absolute paths taken
+  only from the explicit path arguments of Muse's file tools (`read_file`,
+  `write_file`, `edit_file`, and the older single-path and move tools);
+  shell, search, MCP, and unknown tools carry none
 - context usage and cost: `usage_update.used`, `.size`, and `.cost`
 
 Muse adds only facts with no standard ACP field:

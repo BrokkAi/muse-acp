@@ -186,10 +186,49 @@ pub struct ToolUpdate<'a> {
     pub status: &'a str,
     pub content_text: Option<&'a str>,
     pub raw_input: Option<&'a str>,
+    /// ACP `locations` (a JSON array of `{path}`), for follow-along.
+    pub locations: Option<&'a str>,
     /// Host-authored item references and patch facts for the card's `_meta`.
     pub muse_fields: Option<&'a str>,
     /// The host already saturated this surface (`item.truncated`).
     pub host_truncated: bool,
+}
+
+/// An absolute, lexically normalized path for a tool's path argument, or
+/// `None` when it cannot be one (empty, control characters, a relative path
+/// without an absolute workspace root, or `..` above the filesystem root).
+fn absolute_tool_path(workspace_root: &str, raw: &str) -> Option<String> {
+    use std::path::{Component, Path, PathBuf};
+    if raw.is_empty() || raw.len() > 4096 || raw.chars().any(char::is_control) {
+        return None;
+    }
+    let candidate = if Path::new(raw).is_absolute() {
+        PathBuf::from(raw)
+    } else {
+        let root = Path::new(workspace_root);
+        if !root.is_absolute() {
+            return None;
+        }
+        root.join(raw)
+    };
+    let mut normalized = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str())
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return None;
+                }
+            }
+        }
+    }
+    normalized
+        .is_absolute()
+        .then(|| normalized.to_str().map(str::to_string))
+        .flatten()
 }
 
 pub struct SessionFold {
@@ -246,6 +285,9 @@ pub struct SessionFold {
     /// but carry no editor-facing content, so they stay out of the transcript
     /// and only their agent ids reach the stderr diagnostics.
     pub show_reminders: bool,
+    /// The session's workspace root, which resolves relative tool paths
+    /// into the absolute `locations` ACP follow-along needs.
+    pub workspace_root: String,
     /// ACP monitor cards already announced for a durable monitor task id.
     /// Later feed items update the same row instead of minting one per event
     /// batch.
@@ -310,6 +352,7 @@ pub struct SubagentObservation {
 impl SessionFold {
     pub fn new() -> Self {
         Self {
+            workspace_root: String::new(),
             items: HashMap::new(),
             subagents: HashMap::new(),
             done: std::collections::HashSet::new(),
@@ -1766,10 +1809,60 @@ impl SessionFold {
         if let Some(r) = u.raw_input {
             f.push(format!("\"rawInput\":{r}"));
         }
+        if let Some(locations) = u.locations {
+            f.push(format!("\"locations\":{locations}"));
+        }
         if !muse_fields.is_empty() {
             f.push(format!("\"_meta\":{{\"muse\":{{{muse_fields}}}}}"));
         }
         Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
+    }
+
+    /// ACP `locations` for a native file tool, from its explicit path
+    /// arguments only: `read_file`, `write_file`, and `edit_file` (and the
+    /// older single-path and move tools) name the files they touch. Shell,
+    /// search, MCP, and unknown tools get no location, because a path in a
+    /// command line or in tool output is a guess. Relative paths resolve
+    /// against the workspace root; `..` is resolved lexically.
+    fn tool_locations(&self, item: &J) -> Option<String> {
+        let tool = item.get("tool").and_then(J::as_str)?.to_ascii_lowercase();
+        let keys: &[&str] = match tool.as_str() {
+            "read_file" | "write_file" | "edit_file" | "create_file" | "delete_file"
+            | "remove_file" => &["path", "filePath"],
+            "move_file" | "rename_file" => &[
+                "oldPath",
+                "from",
+                "sourcePath",
+                "newPath",
+                "to",
+                "destinationPath",
+            ],
+            _ => return None,
+        };
+        let args = match item.get("args")? {
+            J::Str(raw) => parse_json(raw).ok()?,
+            args @ J::Obj(_) => args.clone(),
+            _ => return None,
+        };
+        let mut paths: Vec<String> = Vec::new();
+        for key in keys {
+            if let Some(path) = args
+                .get(key)
+                .and_then(J::as_str)
+                .and_then(|raw| absolute_tool_path(&self.workspace_root, raw))
+                && !paths.contains(&path)
+            {
+                paths.push(path);
+            }
+        }
+        if paths.is_empty() {
+            return None;
+        }
+        let entries: Vec<String> = paths
+            .iter()
+            .map(|path| format!("{{\"path\":{}}}", esc(path)))
+            .collect();
+        Some(format!("[{}]", entries.join(",")))
     }
 
     fn args_detail(item: &J) -> Option<String> {
@@ -2112,6 +2205,7 @@ impl SessionFold {
                     .map(j_to_string)
                     .unwrap_or_else(|| "{}".to_string());
                 let item_fields = Self::item_muse_fields(item);
+                let locations = self.tool_locations(item);
                 out.push(Self::tool_line(
                     acp_sid,
                     ver,
@@ -2127,6 +2221,7 @@ impl SessionFold {
                         status: msp_status(status),
                         content_text: None,
                         raw_input: Some(&raw),
+                        locations: locations.as_deref(),
                         muse_fields: item_fields.as_deref(),
                         host_truncated: false,
                     },
@@ -2461,6 +2556,7 @@ impl SessionFold {
                 let content = if text.is_empty() { None } else { Some(text) };
                 let raw = item.get("args").map(j_to_string);
                 let item_fields = Self::item_muse_fields(item);
+                let locations = self.tool_locations(item);
                 out.push(Self::tool_line(
                     acp_sid,
                     ver,
@@ -2476,6 +2572,7 @@ impl SessionFold {
                         status: msp_status(status),
                         content_text: content,
                         raw_input: raw.as_deref(),
+                        locations: locations.as_deref(),
                         muse_fields: item_fields.as_deref(),
                         host_truncated: item
                             .get("truncated")
@@ -3235,6 +3332,58 @@ mod corpus_tests {
             out[0].contains("bash: cargo test --help"),
             "title should carry the command, not bare tool: {}",
             out[0]
+        );
+    }
+
+    // The literals are Unix paths; Windows resolution is covered by the
+    // fake-host test, which builds its expectations from real paths.
+    #[cfg(unix)]
+    #[test]
+    fn tool_locations_come_only_from_explicit_file_tool_paths() {
+        let mut fold = SessionFold::new();
+        fold.workspace_root = "/ws".to_string();
+        let item = |tool: &str, args: &str| {
+            parse_json(&format!(
+                r#"{{"tool":{},"args":{}}}"#,
+                crate::json::esc(tool),
+                crate::json::esc(args)
+            ))
+            .unwrap()
+        };
+        assert_eq!(
+            fold.tool_locations(&item("read_file", r#"{"path":"src/a.rs","offset":3}"#))
+                .as_deref(),
+            Some(r#"[{"path":"/ws/src/a.rs"}]"#)
+        );
+        assert_eq!(
+            fold.tool_locations(&item("write_file", r#"{"path":"/abs/./b/../c.txt"}"#))
+                .as_deref(),
+            Some(r#"[{"path":"/abs/c.txt"}]"#)
+        );
+        assert_eq!(
+            fold.tool_locations(&item("move_file", r#"{"from":"a","to":"a"}"#))
+                .as_deref(),
+            Some(r#"[{"path":"/ws/a"}]"#)
+        );
+        for (tool, args) in [
+            ("bash", r#"{"command":"cat src/a.rs > out.txt"}"#),
+            ("search", r#"{"pattern":"x","paths":["src"]}"#),
+            ("mcp__probe__read", r#"{"path":"src/a.rs"}"#),
+            ("read_file", r#"{"path":"../../../../.."}"#),
+            ("read_file", r#"{"path":""}"#),
+            ("read_file", "not json"),
+        ] {
+            assert_eq!(
+                fold.tool_locations(&item(tool, args)),
+                None,
+                "{tool} {args}"
+            );
+        }
+        fold.workspace_root = String::new();
+        assert_eq!(
+            fold.tool_locations(&item("read_file", r#"{"path":"relative.rs"}"#)),
+            None,
+            "a relative path needs an absolute workspace root"
         );
     }
 

@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Send ACP tool-call `locations` for follow-along (#302). Cards for Muse's
+  file tools (`read_file`, `write_file`, `edit_file`, and the older
+  single-path and move tools) carry their explicit path arguments as
+  absolute paths, with relative paths resolved against the session's
+  workspace root, on ACP v1 and v2. Shell, search, MCP, and unknown tools
+  carry no location: a path is never inferred from a command line or tool
+  output.
+
 - Send one-shot user messages as ACP `notice` updates (#308). The note that
   Muse declined to retract a submitted message is now an `info` notice on
   ACP v2 and for ACP v1 clients that advertise
