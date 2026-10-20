@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Correct stale vendored-surface labels after the 1.4.11 re-pin. The
+  `--selftest` and handshake detail for the Muse 1.4.8 fingerprint no longer
+  calls it "the vendored SDK manifest surface" beside the 1.4.11 row that
+  now is; it names the previously vendored `838d36a` surface. ROADMAP's 1.4.8
+  and 1.4.10 notes now compare against the then-vendored bundles.
+
 - Pin Muse 1.4.11-R6667.1 in the nightly live-host matrix and classify the
   vendored 1.4.11 surface as tested (#337): the full suite on Linux x86-64,
   the newest-pin leg on macOS arm64 (taking over from 1.4.8), and the

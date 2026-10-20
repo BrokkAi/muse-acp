@@ -102,9 +102,10 @@ pub const HOST_147_FINGERPRINT: &str =
 /// Stable-surface fingerprint of the Muse 1.4.8 host (schema version 1),
 /// read from that release's published download manifest and reported
 /// byte-for-byte by a live `muse serve` 1.4.8. Its `muse schema
-/// generate-json-schema` export is byte-identical to the vendored `838d36a`
-/// bundle, so the pinned 1.4.8 build in the live-host matrix
-/// (`tests/live_loopback.rs`) is what validates the vendored corpus. Over
+/// generate-json-schema` export is byte-identical to the then-vendored
+/// `838d36a` bundle, so the pinned 1.4.8 build in the live-host matrix
+/// (`tests/live_loopback.rs`) validated that corpus; the corpus has since
+/// moved to the 1.4.11 surface. Over
 /// 1.4.7 the surface is purely additive (`turn/modelRetryScheduled`, the
 /// computer-use app and app-patch vocabulary, `Item.messagePhase` and the
 /// `monitorFeed` fields, `Session.generatedName`, `permissionProfile` on
@@ -226,7 +227,7 @@ fn table_entry(fingerprint: &str) -> Option<(Status, &'static str)> {
         HOST_147_FINGERPRINT => (Status::Tested, "validated against live host 1.4.7"),
         HOST_148_FINGERPRINT => (
             Status::Tested,
-            "validated against live host 1.4.8; the vendored SDK manifest surface",
+            "validated against live host 1.4.8; the previously vendored SDK 838d36a surface",
         ),
         HOST_149_FINGERPRINT => (
             Status::Degraded,
@@ -419,7 +420,7 @@ mod tests {
         assert_eq!(c.status, Status::Tested);
         assert_eq!(
             c.detail,
-            "validated against live host 1.4.8; the vendored SDK manifest surface"
+            "validated against live host 1.4.8; the previously vendored SDK 838d36a surface"
         );
         assert!(!c.is_fatal());
     }
