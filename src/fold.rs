@@ -233,6 +233,16 @@ fn absolute_tool_path(workspace_root: &str, raw: &str) -> Option<String> {
         .flatten()
 }
 
+/// Native tools whose call runs a shell command.
+const SHELL_TOOLS: [&str; 3] = ["bash", "shell", "workspace-shell"];
+
+/// A shell card's command facts, kept for its ACP v2 terminal.
+struct ShellCommand {
+    tc_id: String,
+    command: String,
+    cwd: Option<String>,
+}
+
 pub struct SessionFold {
     items: HashMap<String, ItemRole>,
     /// Latest owner-side observation for each durable subagent. Controls use
@@ -296,6 +306,12 @@ pub struct SessionFold {
     /// Characters of streamed tool output already appended per item id, so
     /// appends stop at the display budget the completion card applies.
     streamed_output: HashMap<String, usize>,
+    /// ACP v2 shell cards: the command facts noted from the card, keyed by
+    /// item id, for the agent-owned terminal opened once it runs.
+    shell_commands: HashMap<String, ShellCommand>,
+    /// Open agent-owned terminals by item id: the terminal id and the
+    /// characters of output already appended.
+    terminals: HashMap<String, (String, usize)>,
     /// ACP monitor cards already announced for a durable monitor task id.
     /// Later feed items update the same row instead of minting one per event
     /// batch.
@@ -363,6 +379,8 @@ impl SessionFold {
             workspace_root: String::new(),
             patch_diffs: HashMap::new(),
             streamed_output: HashMap::new(),
+            shell_commands: HashMap::new(),
+            terminals: HashMap::new(),
             items: HashMap::new(),
             subagents: HashMap::new(),
             done: std::collections::HashSet::new(),
@@ -1833,6 +1851,160 @@ impl SessionFold {
         Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
     }
 
+    /// The command (and an explicit working directory, resolved absolute)
+    /// of a shell tool call or user shell, or `None` for other items.
+    fn shell_facts(&self, item: &J) -> Option<(String, Option<String>)> {
+        match item.get("kind").and_then(J::as_str)? {
+            "userShell" => Some((
+                item.get("commandText").and_then(J::as_str)?.to_string(),
+                None,
+            )),
+            "toolCall" => {
+                let tool = item.get("tool").and_then(J::as_str)?.to_ascii_lowercase();
+                if !SHELL_TOOLS.contains(&tool.as_str()) {
+                    return None;
+                }
+                let args = match item.get("args")? {
+                    J::Str(raw) => parse_json(raw).ok()?,
+                    args @ J::Obj(_) => args.clone(),
+                    _ => return None,
+                };
+                let command = args.get("command").and_then(J::as_str)?.to_string();
+                let cwd = args
+                    .get("workdir")
+                    .and_then(J::as_str)
+                    .and_then(|dir| absolute_tool_path(&self.workspace_root, dir));
+                Some((command, cwd))
+            }
+            _ => None,
+        }
+    }
+
+    /// Note an ACP v2 shell card's command so a terminal can show it once
+    /// the command runs.
+    fn note_shell(&mut self, ver: u8, item_id: &str, tc_id: &str, item: &J) {
+        if ver != 2 || self.shell_commands.contains_key(item_id) {
+            return;
+        }
+        if let Some((command, cwd)) = self.shell_facts(item) {
+            self.shell_commands.insert(
+                item_id.to_string(),
+                ShellCommand {
+                    tc_id: tc_id.to_string(),
+                    command,
+                    cwd,
+                },
+            );
+        }
+    }
+
+    /// The agent-owned terminal for a noted shell card, opening it on first
+    /// use: `terminal_update` with the command, then the card's content
+    /// becomes a reference to it.
+    fn open_terminal(
+        &mut self,
+        acp_sid: &str,
+        item_id: &str,
+        out: &mut Vec<String>,
+    ) -> Option<String> {
+        if let Some((terminal_id, _)) = self.terminals.get(item_id) {
+            return Some(terminal_id.clone());
+        }
+        let shell = self.shell_commands.get(item_id)?;
+        let terminal_id = format!("term-{item_id}");
+        let cwd = shell
+            .cwd
+            .as_deref()
+            .map(|cwd| format!(",\"cwd\":{}", esc(cwd)))
+            .unwrap_or_default();
+        out.push(Self::update_line(
+            acp_sid,
+            &format!(
+                "{{\"sessionUpdate\":\"terminal_update\",\"terminalId\":{},\"command\":{}{cwd}}}",
+                esc(&terminal_id),
+                esc(&shell.command)
+            ),
+        ));
+        out.push(Self::update_line(
+            acp_sid,
+            &format!(
+                "{{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":{},\"content\":[{}]}}",
+                esc(&shell.tc_id),
+                Self::terminal_content(&terminal_id)
+            ),
+        ));
+        self.terminals
+            .insert(item_id.to_string(), (terminal_id.clone(), 0));
+        Some(terminal_id)
+    }
+
+    fn terminal_content(terminal_id: &str) -> String {
+        format!(
+            "{{\"type\":\"terminal\",\"terminalId\":{}}}",
+            esc(terminal_id)
+        )
+    }
+
+    /// Settle a shell card's terminal at the item's terminal state, opening
+    /// it if the command ran without streaming. Returns the terminal content
+    /// item for the card, or `None` to keep the text card: a command that
+    /// never ran (rejected or cancelled before output) gets no terminal.
+    /// The output snapshot is the bounded final output. Exit facts are the
+    /// host's: a user shell's code (its signal number stays in `_meta`, never
+    /// mapped to a name); a shell tool call records none, so its terminal is
+    /// only marked exited.
+    fn finish_terminal(
+        &mut self,
+        acp_sid: &str,
+        item_id: &str,
+        item: &J,
+        status: &str,
+        out: &mut Vec<String>,
+    ) -> Option<String> {
+        let output = item.get("visibleOutput").and_then(J::as_str).unwrap_or("");
+        let ran = self.terminals.contains_key(item_id)
+            || status == "completed"
+            || (status == "failed" && !output.is_empty());
+        if !ran {
+            self.shell_commands.remove(item_id);
+            return None;
+        }
+        let terminal_id = self.open_terminal(acp_sid, item_id, out)?;
+        self.terminals.remove(item_id);
+        self.shell_commands.remove(item_id);
+        let (shown, adapter_cut) = trunc(output);
+        let truncation = if item
+            .get("truncated")
+            .is_some_and(|v| matches!(v, J::Bool(true)))
+        {
+            Some("\"source\":\"host\"".to_string())
+        } else {
+            adapter_cut
+        };
+        let mut exit = Vec::new();
+        if let Some(code) = item.get("exitCode").and_then(J::as_u64) {
+            exit.push(format!("\"exitCode\":{code}"));
+        }
+        if let Some(signal) = item.get("exitSignal").and_then(J::as_u64) {
+            exit.push(format!(
+                "\"_meta\":{{\"muse\":{{\"exitSignal\":{signal}}}}}"
+            ));
+        }
+        let meta = truncation
+            .map(|cut| format!(",\"_meta\":{{\"muse\":{{\"truncated\":{{{cut}}}}}}}"))
+            .unwrap_or_default();
+        out.push(Self::update_line(
+            acp_sid,
+            &format!(
+                "{{\"sessionUpdate\":\"terminal_update\",\"terminalId\":{},\"output\":{{\"data\":{}}},\"exitStatus\":{{{}}}{meta}}}",
+                esc(&terminal_id),
+                esc(&crate::json::b64(shown.as_bytes())),
+                exit.join(",")
+            ),
+        ));
+        Some(Self::terminal_content(&terminal_id))
+    }
+
     /// ACP `locations` for a native file tool, from its explicit path
     /// arguments only: `read_file`, `write_file`, and `edit_file` (and the
     /// older single-path and move tools) name the files they touch. Shell,
@@ -2242,6 +2414,7 @@ impl SessionFold {
                         host_truncated: false,
                     },
                 ));
+                self.note_shell(ver, &item_id, &tc_id, item);
                 let task_id = self.async_task_id_for(&item_id, &tc_id);
                 let backgrounded = item
                     .get("background")
@@ -2352,6 +2525,13 @@ impl SessionFold {
                     meta.as_deref(),
                     Self::item_muse_fields(item).as_deref(),
                 );
+                // Once an ACP v2 user shell streams into its terminal, its
+                // text snapshots must not replace the terminal reference.
+                let content = if kind == "userShell" && self.terminals.contains_key(&item_id) {
+                    None
+                } else {
+                    content
+                };
                 if !title.is_empty() {
                     out.push(Self::card_line(
                         acp_sid,
@@ -2366,6 +2546,9 @@ impl SessionFold {
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
+                }
+                if kind == "userShell" {
+                    self.note_shell(ver, &item_id, &tc_id, item);
                 }
                 if kind == "userShell" && self.air_async_tasks {
                     let task_id = self.async_task_id_for(&item_id, &tc_id);
@@ -2469,6 +2652,31 @@ impl SessionFold {
         // with exactly what a replacement alone would have shown.
         if field == "output" {
             if ver != 2 {
+                return;
+            }
+            // Shell output goes to the card's agent-owned terminal as raw
+            // bytes, within the same budget.
+            if self.shell_commands.contains_key(item_id) {
+                let Some(terminal_id) = self.open_terminal(acp_sid, item_id, out) else {
+                    return;
+                };
+                let Some((_, streamed)) = self.terminals.get_mut(item_id) else {
+                    return;
+                };
+                let budget = max_content().saturating_sub(*streamed);
+                let text: String = delta.chars().take(budget).collect();
+                if text.is_empty() {
+                    return;
+                }
+                *streamed += text.chars().count();
+                out.push(Self::update_line(
+                    acp_sid,
+                    &format!(
+                        "{{\"sessionUpdate\":\"terminal_output_chunk\",\"terminalId\":{},\"data\":{}}}",
+                        esc(&terminal_id),
+                        esc(&crate::json::b64(text.as_bytes()))
+                    ),
+                ));
                 return;
             }
             let Some(ItemRole::Tool { tc_id, .. }) = self.items.get(item_id) else {
@@ -2607,11 +2815,19 @@ impl SessionFold {
                     .or_else(|| item.get("failureReason").and_then(|v| v.as_str()))
                     .filter(|text| !text.is_empty())
                     .unwrap_or("");
-                let content = if text.is_empty() { None } else { Some(text) };
+                // An ACP v2 shell call shows its output in an agent-owned
+                // terminal instead of a text block.
+                self.note_shell(ver, &item_id, &tc_id, item);
+                let terminal = self.finish_terminal(acp_sid, &item_id, item, status, out);
+                let content = if text.is_empty() || terminal.is_some() {
+                    None
+                } else {
+                    Some(text)
+                };
                 let raw = item.get("args").map(j_to_string);
                 let item_fields = Self::item_muse_fields(item);
                 let locations = self.tool_locations(item);
-                let diff = self.patch_diffs.remove(&item_id);
+                let diff = self.patch_diffs.remove(&item_id).or(terminal);
                 out.push(Self::tool_line(
                     acp_sid,
                     ver,
@@ -2773,6 +2989,14 @@ impl SessionFold {
                     meta.as_deref(),
                     Self::item_muse_fields(item).as_deref(),
                 );
+                // An ACP v2 user shell that ran settles in its terminal.
+                let terminal = if kind == "userShell" {
+                    self.note_shell(ver, &item_id, &tc_id, item);
+                    self.finish_terminal(acp_sid, &item_id, item, status, out)
+                } else {
+                    None
+                };
+                let content = if terminal.is_some() { None } else { content };
                 if !title.is_empty() {
                     out.push(Self::card_line(
                         acp_sid,
@@ -2786,6 +3010,15 @@ impl SessionFold {
                         muse_fields.as_deref(),
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
+                    ));
+                }
+                if let Some(terminal) = terminal {
+                    out.push(Self::update_line(
+                        acp_sid,
+                        &format!(
+                            "{{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":{},\"content\":[{terminal}]}}",
+                            esc(&tc_id)
+                        ),
                     ));
                 }
                 if kind == "userShell" && self.air_async_tasks {
@@ -3446,7 +3679,7 @@ mod corpus_tests {
     #[test]
     fn streamed_tool_output_appends_content_chunks_on_v2_only() {
         let started = parse_json(
-            r#"{"itemId":"it-run","kind":"toolCall","callId":"call-run","tool":"bash","args":"{\"command\":\"make\"}","status":"inProgress","revision":1}"#,
+            r#"{"itemId":"it-run","kind":"toolCall","callId":"call-run","tool":"web_fetch","args":"{\"url\":\"https://example.com\"}","status":"inProgress","revision":1}"#,
         )
         .unwrap();
         let delta = |text: &str| {
@@ -3499,7 +3732,7 @@ mod corpus_tests {
                 "sid",
                 ver,
                 &parse_json(
-                    r#"{"item":{"itemId":"it-run","kind":"toolCall","callId":"call-run","tool":"bash","status":"completed","visibleOutput":"building\ndone\n"}}"#,
+                    r#"{"item":{"itemId":"it-run","kind":"toolCall","callId":"call-run","tool":"web_fetch","status":"completed","visibleOutput":"building\ndone\n"}}"#,
                 )
                 .unwrap(),
                 &mut out,
@@ -3511,10 +3744,160 @@ mod corpus_tests {
         }
     }
 
+    fn updates(out: &[String]) -> Vec<J> {
+        out.iter()
+            .map(|line| {
+                parse_json(line)
+                    .unwrap()
+                    .get("params")
+                    .and_then(|p| p.get("update"))
+                    .cloned()
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn field<'a>(update: &'a J, key: &str) -> Option<&'a str> {
+        update.get(key).and_then(J::as_str)
+    }
+
+    #[test]
+    fn v2_shell_calls_stream_into_an_agent_owned_terminal() {
+        let started = parse_json(
+            r#"{"itemId":"it-sh","kind":"toolCall","callId":"call-sh","tool":"bash","args":"{\"command\":\"make\",\"workdir\":\"/ws/sub\"}","status":"inProgress"}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        fold.workspace_root = "/ws".to_string();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &started, &mut out);
+        // Nothing ran yet: no terminal for a call that may still be refused.
+        assert!(!out.iter().any(|l| l.contains("terminal")), "{out:?}");
+        out.clear();
+        fold.on_item_delta(
+            "sid",
+            2,
+            &parse_json(r#"{"itemId":"it-sh","field":"output","delta":"ok\n"}"#).unwrap(),
+            &mut out,
+        );
+        let u = updates(&out);
+        assert_eq!(field(&u[0], "sessionUpdate"), Some("terminal_update"));
+        assert_eq!(field(&u[0], "terminalId"), Some("term-it-sh"));
+        assert_eq!(field(&u[0], "command"), Some("make"));
+        if cfg!(unix) {
+            assert_eq!(field(&u[0], "cwd"), Some("/ws/sub"));
+        }
+        assert_eq!(field(&u[1], "sessionUpdate"), Some("tool_call_update"));
+        assert_eq!(
+            crate::json::j_to_string(u[1].get("content").unwrap()),
+            r#"[{"type":"terminal","terminalId":"term-it-sh"}]"#
+        );
+        assert_eq!(field(&u[2], "sessionUpdate"), Some("terminal_output_chunk"));
+        assert_eq!(field(&u[2], "data"), Some("b2sK"));
+        out.clear();
+        fold.on_item_completed(
+            "sid",
+            2,
+            &parse_json(
+                r#"{"item":{"itemId":"it-sh","kind":"toolCall","callId":"call-sh","tool":"bash","status":"completed","visibleOutput":"ok\n"}}"#,
+            )
+            .unwrap(),
+            &mut out,
+        );
+        let u = updates(&out);
+        assert_eq!(field(&u[0], "sessionUpdate"), Some("terminal_update"));
+        assert_eq!(
+            u[0].get("output")
+                .and_then(|o| o.get("data"))
+                .and_then(J::as_str),
+            Some("b2sK")
+        );
+        // A shell call records no exit code: exited, nothing invented.
+        assert_eq!(
+            crate::json::j_to_string(u[0].get("exitStatus").unwrap()),
+            "{}"
+        );
+        let card = u.last().unwrap();
+        assert_eq!(field(card, "status"), Some("completed"));
+        assert_eq!(
+            crate::json::j_to_string(card.get("content").unwrap()),
+            r#"[{"type":"terminal","terminalId":"term-it-sh"}]"#
+        );
+    }
+
+    #[test]
+    fn shell_terminals_need_a_run_and_v2() {
+        let rejected = parse_json(
+            r#"{"item":{"itemId":"it-no","kind":"toolCall","callId":"call-no","tool":"bash","args":"{\"command\":\"rm -rf x\"}","status":"rejected","failureReason":"denied"}}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_completed("sid", 2, &rejected, &mut out);
+        assert!(!out.iter().any(|l| l.contains("terminal")), "{out:?}");
+        assert!(
+            out[0].contains("denied"),
+            "the refusal keeps its text: {out:?}"
+        );
+        let ran = parse_json(
+            r#"{"item":{"itemId":"it-v1","kind":"toolCall","callId":"call-v1","tool":"bash","args":"{\"command\":\"ls\"}","status":"completed","visibleOutput":"a\n"}}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_completed("sid", 1, &ran, &mut out);
+        assert!(!out.iter().any(|l| l.contains("terminal")), "{out:?}");
+        assert!(out[0].contains(r#""text":"a\n""#), "{out:?}");
+    }
+
+    #[test]
+    fn v2_user_shells_settle_their_terminal_with_the_exit_code() {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_snapshot(
+            "sid",
+            2,
+            &parse_json(
+                r#"{"itemId":"it-us","kind":"userShell","commandText":"cargo test","status":"inProgress"}"#,
+            )
+            .unwrap(),
+            &mut out,
+        );
+        out.clear();
+        fold.on_item_completed(
+            "sid",
+            2,
+            &parse_json(
+                r#"{"item":{"itemId":"it-us","kind":"userShell","commandText":"cargo test","status":"completed","visibleOutput":"fail\n","exitCode":101,"exitSignal":9}}"#,
+            )
+            .unwrap(),
+            &mut out,
+        );
+        let u = updates(&out);
+        let settled = u
+            .iter()
+            .find(|u| u.get("exitStatus").is_some())
+            .expect("exit status");
+        assert_eq!(
+            crate::json::j_to_string(settled.get("exitStatus").unwrap()),
+            r#"{"exitCode":101,"_meta":{"muse":{"exitSignal":9}}}"#
+        );
+        assert_eq!(field(&u[0], "command"), Some("cargo test"));
+        let last = u.last().unwrap();
+        assert_eq!(
+            crate::json::j_to_string(last.get("content").unwrap()),
+            r#"[{"type":"terminal","terminalId":"term-it-us"}]"#
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("exited with code")),
+            "the terminal carries the exit, not a text block: {out:?}"
+        );
+    }
+
     #[test]
     fn streamed_tool_output_stops_at_the_display_budget() {
         let started = parse_json(
-            r#"{"itemId":"it-big","kind":"toolCall","callId":"call-big","tool":"bash","status":"inProgress"}"#,
+            r#"{"itemId":"it-big","kind":"toolCall","callId":"call-big","tool":"web_fetch","status":"inProgress"}"#,
         )
         .unwrap();
         let mut fold = SessionFold::new();

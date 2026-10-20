@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Show shell output through ACP v2 agent-owned terminals (#306). A `bash`
+  tool call or user shell that runs gets a terminal: the card's content
+  references it, `terminal_update` carries the command (and an explicit
+  `workdir`), output streams as base64 `terminal_output_chunk` within the
+  display budget, and the final update replaces the output with the bounded
+  final text and sets `exitStatus` (a user shell's exit code, with its signal
+  number in `_meta`; a `bash` call records no exit code, so its terminal is
+  only marked exited). A call refused or cancelled before it ran keeps its
+  text card, and ACP v1 is unchanged.
+
 - Append streamed tool output with ACP v2 `tool_call_content_chunk` (#307).
   Muse streams a tool or shell card's `visibleOutput` as `item/delta` on the
   `output` field, which the adapter used to drop, so running cards stayed

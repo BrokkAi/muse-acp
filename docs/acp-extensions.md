@@ -127,6 +127,16 @@ Standard ACP fields carry standard meaning:
   adapter's display budget (`MUSE_TOOL_OUTPUT_LIMIT`); the completion still
   replaces the card's whole content with the bounded final output, so the
   result matches a replacement alone. ACP v1 cards show output at completion
+- shell output on ACP v2: a `bash` (or `shell`) tool call or user shell that
+  runs gets an agent-owned terminal `term-<itemId>`. The card's content becomes
+  a `terminal` reference; `terminal_update` carries the command (and `cwd`
+  only for an explicit absolute-resolvable `workdir`), streamed output
+  arrives as base64 `terminal_output_chunk` within the display budget, and the
+  final `terminal_update` replaces the output with the bounded final text and
+  sets `exitStatus`: a user shell's `exitCode`, with its signal number under
+  `exitStatus._meta.muse.exitSignal` because Muse never names signals; a shell
+  tool call records no exit code, so its exit status is empty. A call refused
+  or cancelled before it ran keeps its text card
 - file edits on ACP v2: a `diff` content item after the card's text output,
   built from the host's stored patch (`patchRef`, `kind: "tool_patch"`, read
   through `item/readOutput` when the call completes). `changes` lists each
