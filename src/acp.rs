@@ -1505,16 +1505,28 @@ pub enum GeneratedName<'a> {
     Value(&'a str),
 }
 
-/// Publish a host-authored title change. A `None` title is an explicit clear
-/// so a client can remove a title after the host renames a session back to
-/// blank. A known name origin rides `_meta.muse.nameOrigin`; an unknown one is
-/// omitted, never fabricated. The generated short title has independently
-/// omitted, present, and explicitly-cleared states so it can never be confused
-/// with the canonical name.
+/// How a title update treats the standard `title` member.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TitleUpdate<'a> {
+    /// The title did not change; ACP leaves an omitted field as it was.
+    Omit,
+    /// The host renamed the session back to blank: an explicit `null`, which
+    /// ACP defines as a clear.
+    Clear,
+    /// The host's current title.
+    Value(&'a str),
+}
+
+/// Publish a host-authored title change. The title is omitted when it did not
+/// change, since an explicit `null` is a clear and a resent value is noise. A
+/// known name origin rides `_meta.muse.nameOrigin`; an unknown one is omitted,
+/// never fabricated. The generated short title has independently omitted,
+/// present, and explicitly-cleared states so it can never be confused with the
+/// canonical name.
 pub fn send_session_title(
     stdout: &StdoutShared,
     s: &mut AcpSession,
-    title: Option<&str>,
+    title: TitleUpdate<'_>,
     name_origin: Option<&str>,
     generated_name: GeneratedName<'_>,
 ) {
@@ -1528,8 +1540,12 @@ pub fn send_session_title(
         GeneratedName::Clear => s.set_session_meta("generatedName", "null".to_string()),
         GeneratedName::Value(name) => s.set_session_meta("generatedName", esc(name)),
     }
-    let title = title.map(esc).unwrap_or_else(|| "null".to_string());
-    send_session_info_snapshot(stdout, s, Some(&title), None);
+    let title = match title {
+        TitleUpdate::Omit => None,
+        TitleUpdate::Clear => Some("null".to_string()),
+        TitleUpdate::Value(title) => Some(esc(title)),
+    };
+    send_session_info_snapshot(stdout, s, title.as_deref(), None);
 }
 
 /// Send fold output, replacing each `session_info_update` Muse patch with the
