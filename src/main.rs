@@ -13546,6 +13546,8 @@ fn bridge_user_input(
         // answers map back to originals by position.
         let mut labels = Vec::new();
         let mut display = Vec::new();
+        let mut descriptions = Vec::new();
+        let mut previews = Vec::new();
         if let Some(J::Arr(o)) = q.get("options") {
             for x in o {
                 if let Some(l) = x.get("label").and_then(|v| v.as_str()) {
@@ -13557,6 +13559,17 @@ fn bridge_user_input(
                     }
                     labels.push(l.to_string());
                     display.push(name);
+                    descriptions.push(
+                        x.get("description")
+                            .and_then(J::as_str)
+                            .filter(|d| !d.is_empty())
+                            .map(str::to_string),
+                    );
+                    previews.push(
+                        x.get("preview")
+                            .filter(|p| matches!(p, J::Obj(_)))
+                            .map(j_to_string),
+                    );
                 }
             }
         }
@@ -13579,11 +13592,18 @@ fn bridge_user_input(
         while display.iter().any(|label| label == &explain_value) {
             explain_value.push('_');
         }
+        // The header labels the field; the message asks the question. Either
+        // stands in for the other when the host left it empty.
+        let title = if header.is_empty() { text } else { header };
+        let message = if text.is_empty() { header } else { text };
         ui_qs.push(acp::UiQuestion {
             qid,
             labels,
             display,
-            message: format!("{header}: {text}"),
+            descriptions,
+            previews,
+            title: title.to_string(),
+            message: message.to_string(),
             multiple: !single,
             min,
             max,
@@ -13634,13 +13654,23 @@ fn ui_original(q: &acp::UiQuestion, shown: &str) -> Option<String> {
         .cloned()
 }
 
-fn ui_titled_choice(value: &str, title: &str, description: Option<&str>) -> String {
+/// One titled `oneOf`/`anyOf` choice. `preview` is the host's
+/// `{content, format}` preview JSON, carried under `_meta.muse.preview`.
+fn ui_titled_choice(
+    value: &str,
+    title: &str,
+    description: Option<&str>,
+    preview: Option<&str>,
+) -> String {
     let mut fields = vec![
         format!("\"const\":{}", esc(value)),
         format!("\"title\":{}", esc(title)),
     ];
     if let Some(description) = description {
         fields.push(format!("\"description\":{}", esc(description)));
+    }
+    if let Some(preview) = preview {
+        fields.push(format!("\"_meta\":{{\"muse\":{{\"preview\":{preview}}}}}"));
     }
     format!("{{{}}}", fields.join(","))
 }
@@ -13649,24 +13679,34 @@ fn ui_titled_choice(value: &str, title: &str, description: Option<&str>) -> Stri
 /// client. Option-bearing questions include the inline explanation path.
 fn ui_question_property(index: usize, q: &acp::UiQuestion) -> String {
     let key = format!("q{index}");
+    let title = esc(&q.title);
     if q.labels.is_empty() {
         // Free-text question: no options, plain string answer.
-        return format!("{}: {{\"type\":\"string\"}}", esc(&key));
+        return format!("{}: {{\"type\":\"string\",\"title\":{title}}}", esc(&key));
     }
     let mut choices: Vec<String> = q
         .display
         .iter()
-        .map(|label| ui_titled_choice(label, label, None))
+        .enumerate()
+        .map(|(i, label)| {
+            ui_titled_choice(
+                label,
+                label,
+                q.descriptions.get(i).and_then(Option::as_deref),
+                q.previews.get(i).and_then(Option::as_deref),
+            )
+        })
         .collect();
     choices.push(ui_titled_choice(
         &q.explain_value,
         UI_EXPLAIN_TITLE,
         Some(UI_EXPLAIN_DESCRIPTION),
+        None,
     ));
     let clarification = "\"clarification\":{\"type\":\"string\",\"maxLength\":500,\"title\":\"Clarification\",\"description\":\"Required only when you choose Explain instead.\"}";
     if !q.multiple {
         return format!(
-            "{}: {{\"type\":\"string\",\"oneOf\":[{}]}},{}",
+            "{}: {{\"type\":\"string\",\"title\":{title},\"oneOf\":[{}]}},{}",
             esc(&key),
             choices.join(","),
             clarification
@@ -13677,7 +13717,7 @@ fn ui_question_property(index: usize, q: &acp::UiQuestion) -> String {
     // the user submits real answers.
     let min_items = if q.min > 1 { 1 } else { q.min };
     let mut sch = format!(
-        "{}: {{\"type\":\"array\",\"items\":{{\"anyOf\":[{}]}}",
+        "{}: {{\"type\":\"array\",\"title\":{title},\"items\":{{\"anyOf\":[{}]}}",
         esc(&key),
         choices.join(",")
     );
@@ -13709,8 +13749,8 @@ fn ui_answer_schema(index: usize, q: &acp::UiQuestion) -> String {
     )
 }
 
-/// The form message for one staged question. A single-question prompt keeps
-/// the original plain `header: question` form; a staged prompt numbers the
+/// The form message for one staged question: the question text, which the
+/// field's `title` (the header) labels. A staged prompt numbers the
 /// questions so the user knows how many remain.
 fn ui_answer_message(index: usize, questions: &[acp::UiQuestion]) -> String {
     let message = questions

@@ -2666,6 +2666,40 @@ fn user_input_options_and_inline_explanation_reach_the_client() {
 }
 
 #[test]
+fn question_fields_carry_header_titles_option_descriptions_and_previews() {
+    let mut c = Client::spawn("questions", &[("FAKE_QUESTION_SHAPE", "described")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let form: serde_json::Value = serde_json::from_str(&forms[0]).expect("form JSON");
+    let params = &form["params"];
+    // The header labels the field, so the message no longer carries it.
+    assert_eq!(params["message"], "Which?", "{form}");
+    let field = &params["requestedSchema"]["properties"]["q0"];
+    assert_eq!(field["title"], "Pick: one", "{form}");
+    let choices = field["oneOf"].as_array().expect("titled choices");
+    assert_eq!(choices[0]["const"], "Alpha", "{form}");
+    assert_eq!(choices[0]["description"], "The first letter", "{form}");
+    assert_eq!(
+        choices[0]["_meta"]["muse"]["preview"],
+        serde_json::json!({"format": "markdown", "content": "# Alpha"}),
+        "{form}"
+    );
+    assert_eq!(choices[1]["const"], "Alpha (2)", "{form}");
+    assert_eq!(choices[1]["description"], "Another alpha", "{form}");
+    assert!(choices[1].get("_meta").is_none(), "{form}");
+    assert_eq!(choices[2]["const"], "Beta", "{form}");
+    assert!(choices[2].get("description").is_none(), "{form}");
+    // A deduplicated label still answers with the host's own label.
+    let question_id = form["id"].as_str().expect("form id").to_string();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha (2)\"}}}}}}"
+    ));
+    c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
 fn multiple_user_input_schema_is_valid_for_both_protocol_versions() {
     for (ver, caps) in [
         (1, ",\"clientCapabilities\":{\"elicitation\":{\"form\":{}}}"),

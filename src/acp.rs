@@ -92,7 +92,14 @@ pub struct UiQuestion {
     pub labels: Vec<String>,
     /// Display labels (deduped; shown to the client).
     pub display: Vec<String>,
-    /// The `header: question` line the client sees for this question.
+    /// Host option descriptions, aligned with `labels`.
+    pub descriptions: Vec<Option<String>>,
+    /// Host option previews (`{content, format}` JSON), aligned with
+    /// `labels`; sent under the option's `_meta.muse.preview`.
+    pub previews: Vec<Option<String>>,
+    /// The question's short header: the form field's `title`.
+    pub title: String,
+    /// The question text the client sees in the form message.
     pub message: String,
     /// True for a multiple-selection question (`selection.mode` is
     /// `multiple`). Free-text questions are single.
