@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Keep MSP command ids random and unique on Windows. Without
+  `/dev/urandom` the ids carried almost no randomness, and only four bits of
+  the per-host sequence reached `rand_a`, so ids minted 16 apart in one
+  millisecond collided; Muse treats command ids as idempotency keys. Ids now
+  draw on std's OS-seeded `RandomState` when `/dev/urandom` is missing, and
+  the sequence's low 12 bits keep ids distinct within a millisecond even with
+  no entropy. Found by the new client crate's tests on the Windows nightly
+  legs.
+
 - Log in through the browser with ACP URL elicitation (#315). Clients that
   advertise `elicitation.url` get an agent-handled auth method,
   `muse-device-login`. ACP v2 `auth/login` (or v1 `authenticate`) with it
