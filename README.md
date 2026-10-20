@@ -327,7 +327,12 @@ error the editor shows if Muse then refuses the profile says why.
 ## What's supported
 
 - **Sessions** — new, load, resume, list, close, and fork, with durable Muse
-  session IDs that survive adapter and host restarts. Delete is available on
+  session IDs that survive adapter and host restarts. An ACP v2 resume
+  replays history only for `replayFrom: {"type": "start"}`; an omitted or
+  `null` cursor reconnects without replay, and an unsupported or malformed
+  cursor is refused with `-32602` before Muse is asked. Every successful v2
+  resume sends the current `idle`, `running`, or `requires_action` state after
+  any replay and before its response. Delete is available on
   Muse 1.4.1 and 1.4.2 with durable session logs; Muse 1.4.3 no longer
   serves it, so the adapter does not offer it there. Muse deletes only
   sessions it can prove the running host owns, so a session from an earlier
