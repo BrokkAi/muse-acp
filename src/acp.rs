@@ -56,6 +56,10 @@ pub struct PendingPerm {
     /// When the approval came from a child stream, stop only that child if
     /// the editor cannot answer. An empty value means the owner session.
     pub child_subagent_id: Option<String>,
+    /// The card the prompt names, and its title, so a later copy of the
+    /// approval that adds an editor tool's arguments can retitle it.
+    pub tool_call_id: String,
+    pub title: String,
 }
 
 /// An approval the Muse host's native reviewer is still evaluating. This is
@@ -67,6 +71,9 @@ pub struct ReviewingApproval {
     pub turn_id: Option<String>,
     pub title: String,
     pub kind: String,
+    /// The call's `rawArgs`, kept for the prompt: the `approval/updated`
+    /// that later opens it carries none.
+    pub raw_args: Option<String>,
 }
 
 #[derive(Clone)]

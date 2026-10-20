@@ -1710,8 +1710,10 @@ fn the_editor_file_tools_read_and_edit_through_the_acp_client() {
     // A read returns the editor's unsaved text, not the file on disk.
     let id = adapter.prompt(&session, "read the notes [[script:read]]");
     let permission = adapter.permission();
-    assert_eq!(
-        permission["params"]["toolCall"]["title"], "mcp__editor__read_text_file",
+    assert!(
+        permission["params"]["toolCall"]["title"]
+            .as_str()
+            .is_some_and(|title| title.starts_with("mcp__editor__read_text_file")),
         "{permission}"
     );
     adapter.choose(&permission, "allow_once");
@@ -1737,8 +1739,10 @@ fn the_editor_file_tools_read_and_edit_through_the_acp_client() {
     let permission = adapter.wait("the edit's permission request", |frame| {
         frame["method"] == "session/request_permission" && frame["id"] != first
     });
-    assert_eq!(
-        permission["params"]["toolCall"]["title"], "mcp__editor__edit_text_file",
+    assert!(
+        permission["params"]["toolCall"]["title"]
+            .as_str()
+            .is_some_and(|title| title.starts_with("mcp__editor__edit_text_file")),
         "{permission}"
     );
     adapter.choose(&permission, "allow_once");
@@ -1767,6 +1771,87 @@ fn the_editor_file_tools_read_and_edit_through_the_acp_client() {
         "saved on disk\n",
         "the editor, not the adapter or Muse, writes the file"
     );
+    adapter.finish();
+}
+
+#[test]
+fn the_editor_terminal_runs_a_command_through_the_acp_client() {
+    if !enabled("the_editor_terminal_runs_a_command_through_the_acp_client") {
+        return;
+    }
+    let host = Host::start(
+        json!({"run": {"tool": {"name": "mcp__editor__run_in_terminal",
+                                "arguments": {"command": "cargo --version"}}}}),
+        None,
+    );
+    let mut adapter = Adapter::launch_with(&host, json!({"terminal": true}));
+    let session = adapter.new_session(&host, json!([]));
+    let id = adapter.prompt(&session, "show the cargo version [[script:run]]");
+    let permission = adapter.permission();
+    let card = permission["params"]["toolCall"]["toolCallId"].clone();
+    // The prompt names the command, at once or (Muse 1.4.8) by a retitle of
+    // its card when the arguments arrive.
+    adapter.wait("a prompt that names the command", |frame| {
+        let titled = |title: &Value| {
+            title
+                .as_str()
+                .is_some_and(|title| title == "mcp__editor__run_in_terminal: cargo --version")
+        };
+        (frame["method"] == "session/request_permission"
+            && titled(&frame["params"]["toolCall"]["title"]))
+            || (frame["params"]["update"]["toolCallId"] == card
+                && titled(&frame["params"]["update"]["title"]))
+    });
+    adapter.choose(&permission, "allow_once");
+    let create = adapter.wait("terminal/create", |frame| {
+        frame["method"] == "terminal/create"
+    });
+    assert_eq!(create["params"]["sessionId"], session.as_str(), "{create}");
+    assert_eq!(
+        create["params"]["command"],
+        if cfg!(windows) {
+            "powershell.exe"
+        } else {
+            "bash"
+        },
+        "{create}"
+    );
+    assert_eq!(
+        create["params"]["args"].as_array().unwrap().last().unwrap(),
+        "cargo --version"
+    );
+    assert_eq!(
+        create["params"]["cwd"],
+        host.workspace().to_str().unwrap(),
+        "{create}"
+    );
+    adapter.send(json!({"jsonrpc": "2.0", "id": create["id"], "result": {"terminalId": "t-live"}}));
+    let wait = adapter.wait("terminal/wait_for_exit", |frame| {
+        frame["method"] == "terminal/wait_for_exit"
+    });
+    adapter.send(json!({"jsonrpc": "2.0", "id": wait["id"], "result": {"exitCode": 0}}));
+    let output = adapter.wait("terminal/output", |frame| {
+        frame["method"] == "terminal/output"
+    });
+    adapter.send(json!({"jsonrpc": "2.0", "id": output["id"],
+                        "result": {"output": "cargo 1.99.0\n", "truncated": false}}));
+    let release = adapter.wait("terminal/release", |frame| {
+        frame["method"] == "terminal/release"
+    });
+    adapter.send(json!({"jsonrpc": "2.0", "id": release["id"], "result": null}));
+    assert_eq!(adapter.result(id)["stopReason"], "end_turn");
+    let results = tool_results(&host);
+    assert!(
+        results
+            .iter()
+            .any(|output| output.contains("cargo 1.99.0") && output.contains("[exit code 0]")),
+        "the model got the terminal's output and exit status: {results:?}"
+    );
+    let embedded = adapter
+        .updates("tool_call_update")
+        .iter()
+        .any(|update| update["content"][0]["terminalId"] == "t-live");
+    assert!(embedded, "the card shows the editor terminal");
     adapter.finish();
 }
 

@@ -253,7 +253,7 @@ variable. See [Auto-review](#auto-review-keep-the-boundary-lose-the-busywork).
 | `MUSE_TOOL_OUTPUT_LIMIT` | `8000` | Editor-facing tool output bound, in characters (minimum 200). |
 | `MUSE_LOG` | `normal` | Set to `debug` for per-method protocol tracing (no payloads). |
 | `MUSE_SHOW_REMINDERS` | off | Set to `1`, `true`, `yes`, or `on` to render each background reminder check as its own transcript card instead of one `Background checks` card. |
-| `MUSE_EDITOR_TOOLS` | on | Set to `0`, `false`, `no`, or `off` to stop giving Muse the [editor file tools](#editor-file-access-acp-v1) on ACP v1 clients that advertise `fs`. |
+| `MUSE_EDITOR_TOOLS` | on | Set to `0`, `false`, `no`, or `off` to stop giving Muse the [editor tools](#editor-file-access-acp-v1) on ACP v1 clients that advertise `fs` or `terminal`. |
 | `MUSE_ALLOW_UNSCOPED_READS` | off | **Dangerous.** Set to `1`, `true`, `yes`, or `on` to allow local reads outside the approved workspace roots. |
 
 Without `MUSE_COMMAND_TIMEOUT_MS`, admission deadlines are 30 seconds for the
@@ -383,6 +383,10 @@ error the editor shows if Muse then refuses the profile says why.
   `fs/write_text_file`), so the model sees unsaved buffers and the editor
   tracks its writes; see
   [Editor file access](#editor-file-access-acp-v1).
+- **Editor terminals (ACP v1)** — when an ACP v1 editor advertises
+  `terminal`, Muse gets a tool that runs a command in an editor terminal
+  (`terminal/create`), shown live on the tool card; see
+  [Editor terminals](#editor-terminals-acp-v1).
 - **Questions** — Muse `userInput/requested` bridged to ACP
   `elicitation/create` forms when the client advertises form support; otherwise
   the host falls back to auto-cancel. Each field's `title` is the question's
@@ -689,6 +693,37 @@ or newer (the `sessionMcp` grant).
   A request with an `Origin` header (any browser) is refused.
 - **Turning it off** — set `MUSE_EDITOR_TOOLS=0`. An editor MCP server of its
   own named `editor` also takes precedence over the adapter's.
+
+### Editor terminals (ACP v1)
+
+An ACP v1 editor that advertises `clientCapabilities.terminal` runs commands
+for the agent in its own terminals (`terminal/create`,
+`terminal/wait_for_exit`, `terminal/output`, `terminal/kill`,
+`terminal/release`), where the user watches the output. ACP v2 removed these
+methods. Muse's `bash` tool runs inside Muse, so the same `editor` MCP server
+adds `mcp__editor__run_in_terminal` (`command`, optional `cwd` and
+`timeout_seconds`).
+
+- **Running** — the command line runs as `bash -c <command>` (Windows:
+  `powershell.exe -NoProfile -NonInteractive -Command <command>`), in the
+  session's `cwd` or in `cwd`, which must stay inside the session's roots. The
+  editor keeps the last 256 KiB of output. The model gets the output and the
+  exit code or signal; a command that fails still counts as having run.
+- **Tool cards** — the card shows the editor's terminal as soon as it starts
+  (ACP `terminal` content) and keeps it after the command ends, instead of a
+  copy of the output. Its kind is `execute`.
+- **Approvals** — every call goes through Muse's approval flow, and the
+  prompt names the full command (and `cwd`), from the approval's `rawArgs`.
+  Muse 1.4.8 opens the prompt before it sends the arguments; the adapter then
+  retitles the open prompt. The command runs outside Muse's sandbox, in the
+  editor, so "Always allow this MCP tool" lets the model run any command
+  without asking.
+- **Stopping** — `session/cancel` stops a running command: the adapter
+  withdraws its wait with `$/cancel_request`, kills the terminal, and still
+  returns the output so far. A command that outlives `timeout_seconds`
+  (default 120, at most 1800) is killed the same way. Either way the call
+  fails and the terminal is released.
+- **Modes** — Read-only and Plan sessions refuse the tool.
 
 ## How it compares
 

@@ -1,18 +1,21 @@
-//! Editor file tools: an ACP v1 client's file system, offered to Muse's model
-//! as an MCP server.
+//! Editor tools: an ACP v1 client's file system and terminals, offered to
+//! Muse's model as an MCP server.
 //!
 //! An ACP v1 client that advertises `fs.readTextFile` or `fs.writeTextFile`
 //! accepts `fs/read_text_file` and `fs/write_text_file` from the agent and
-//! answers from its buffers, unsaved changes included. Muse runs its own file
-//! tools and MSP cannot hand them to the adapter, so the adapter gives each
-//! session one more MCP server, `editor`, served over HTTP on 127.0.0.1 from
-//! this process. Its tools turn each call into an `fs/*` request to the client
-//! for the calling session.
+//! answers from its buffers, unsaved changes included. One that advertises
+//! `terminal` runs commands for the agent in its own terminals
+//! (`terminal/*`), where the user watches them. Muse runs its own file and
+//! shell tools and MSP cannot hand them to the adapter, so the adapter gives
+//! each session one more MCP server, `editor`, served over HTTP on 127.0.0.1
+//! from this process. Its tools turn each call into `fs/*` or `terminal/*`
+//! requests to the client for the calling session.
 //!
 //! Every session gets its own bearer token, which both authenticates Muse and
-//! names the session. Paths are confined to the session's roots, and writes
-//! are refused in Read-only and Plan modes, which Muse does not apply to MCP
-//! tools. Muse's approval flow still runs before every call.
+//! names the session. Paths and working directories are confined to the
+//! session's roots, and writes and commands are refused in Read-only and Plan
+//! modes, which Muse does not apply to MCP tools. Muse's approval flow still
+//! runs before every call.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -39,11 +42,15 @@ const MAX_READ_BYTES: usize = 256 * 1024;
 /// The largest old plus new text a diff card carries.
 const MAX_DIFF_BYTES: usize = 1024 * 1024;
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long a command may run by default, and at most.
+const COMMAND_TIMEOUT_SECS: u64 = 120;
+const MAX_COMMAND_TIMEOUT_SECS: u64 = 1800;
 const PROTOCOL_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const INSTRUCTIONS: &str = "These tools read and write files through the user's editor. They see unsaved changes in open editor buffers and keep the editor in sync, so prefer them to read_file, write_file, and edit_file for files in the workspace.";
+const INSTRUCTIONS: &str = "These tools work through the user's editor. The file tools see unsaved changes in open editor buffers and keep the editor in sync, so prefer them to read_file, write_file, and edit_file for files in the workspace. run_in_terminal runs a command in an editor terminal the user can watch.";
 
 static READ: AtomicBool = AtomicBool::new(false);
 static WRITE: AtomicBool = AtomicBool::new(false);
+static TERMINAL: AtomicBool = AtomicBool::new(false);
 /// The listener's port, or None when it could not bind.
 static SERVER: OnceLock<Option<u16>> = OnceLock::new();
 /// Bearer token to ACP session id; empty until a new session is bound.
@@ -58,41 +65,44 @@ type CallKey = (String, String);
 /// Running `tools/call` requests, for `notifications/cancelled`.
 static RUNNING: LazyLock<Mutex<HashMap<CallKey, Arc<AtomicBool>>>> =
     LazyLock::new(Default::default);
-/// Diff content waiting for its tool card to complete.
+/// Card content waiting for its tool card to complete.
 static CARDS: LazyLock<Mutex<Vec<Card>>> = LazyLock::new(Default::default);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// Record the ACP v1 client's `fs` capabilities. ACP v2 has no `fs/*`, and
-/// `MUSE_EDITOR_TOOLS=0` turns the tools off.
+/// Record the ACP v1 client's `fs` and `terminal` capabilities. ACP v2 has
+/// neither, and `MUSE_EDITOR_TOOLS=0` turns the tools off.
 pub fn negotiate(ver: u64, capabilities: Option<&J>) {
-    let fs = capabilities.and_then(|c| c.get("fs")).filter(|_| ver == 1);
+    let v1 = capabilities.filter(|_| ver == 1);
+    let fs = v1.and_then(|c| c.get("fs"));
     let flag = |key: &str| fs.and_then(|fs| fs.get(key)).and_then(J::as_bool) == Some(true);
     let (read, write) = (flag("readTextFile"), flag("writeTextFile"));
+    let terminal = v1.and_then(|c| c.get("terminal")).and_then(J::as_bool) == Some(true);
     let disabled = std::env::var("MUSE_EDITOR_TOOLS").is_ok_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "0" | "false" | "no" | "off"
         )
     });
-    if (read || write) && disabled {
-        log("client advertised fs; editor file tools are off (MUSE_EDITOR_TOOLS)");
+    if (read || write || terminal) && disabled {
+        log("client advertised fs or terminal; editor tools are off (MUSE_EDITOR_TOOLS)");
     }
     READ.store(read && !disabled, Ordering::SeqCst);
     WRITE.store(write && !disabled, Ordering::SeqCst);
+    TERMINAL.store(terminal && !disabled, Ordering::SeqCst);
     if offered() {
         let names = tool_names().join(", ");
         log(&format!(
-            "client advertised fs; Muse sessions get the editor file tools: {names}"
+            "client advertised fs or terminal; Muse sessions get the editor tools: {names}"
         ));
     }
 }
 
 /// Whether sessions on this connection get the editor server.
 pub fn offered() -> bool {
-    READ.load(Ordering::SeqCst) || WRITE.load(Ordering::SeqCst)
+    !tool_names().is_empty()
 }
 
 fn tool_names() -> Vec<&'static str> {
@@ -107,7 +117,36 @@ fn tool_names() -> Vec<&'static str> {
     if read && write {
         names.push("edit_text_file");
     }
+    if TERMINAL.load(Ordering::SeqCst) {
+        names.push("run_in_terminal");
+    }
     names
+}
+
+/// The argument that tells an editor tool's calls apart on a card when Muse
+/// sends no call id.
+fn key_arg(tool: &str) -> &'static str {
+    if tool == "run_in_terminal" {
+        "command"
+    } else {
+        "path"
+    }
+}
+
+/// A permission title for an editor tool's approval that names what the call
+/// would touch, from the approval's `rawArgs`: the file, or the full command.
+/// MCP approvals otherwise show only the tool name.
+pub fn approval_title(tool_name: &str, raw_args: Option<&str>) -> Option<String> {
+    let tool = tool_name.strip_prefix(TOOL_PREFIX)?;
+    let args = parse_json(raw_args?).ok()?;
+    let detail = args.get(key_arg(tool)).and_then(J::as_str)?;
+    let cwd = args
+        .get("cwd")
+        .and_then(J::as_str)
+        .filter(|cwd| tool == "run_in_terminal" && !cwd.is_empty())
+        .map(|cwd| format!(" (in {cwd})"))
+        .unwrap_or_default();
+    Some(format!("{tool_name}: {detail}{cwd}"))
 }
 
 /// Start the listener once and return its port.
@@ -200,10 +239,19 @@ fn cancel_generation(acp_sid: &str) -> u64 {
     lock(&CANCELS).get(acp_sid).copied().unwrap_or(0)
 }
 
-/// The diff recorded for a completed editor tool item, as ACP tool call
-/// content. Matched by `callId` when Muse sent one with the call (1.4.11+),
-/// else by tool and `path` argument, oldest first.
-pub fn take_card_content(acp_sid: &str, item: &J) -> Option<String> {
+/// What an editor tool call adds to its completed card.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CardContent {
+    /// ACP `diff` content from a write or edit.
+    Diff(String),
+    /// ACP `terminal` content from a command.
+    Terminal(String),
+}
+
+/// The content recorded for a completed editor tool item. Matched by
+/// `callId` when Muse sent one with the call (1.4.11+), else by tool and its
+/// `path` or `command` argument, oldest first.
+pub fn take_card_content(acp_sid: &str, item: &J) -> Option<CardContent> {
     let tool = item
         .get("tool")
         .and_then(J::as_str)?
@@ -221,9 +269,9 @@ pub fn take_card_content(acp_sid: &str, item: &J) -> Option<String> {
             args @ J::Obj(_) => args.clone(),
             _ => return None,
         };
-        let path = args.get("path").and_then(J::as_str)?;
+        let key = args.get(key_arg(tool)).and_then(J::as_str)?;
         cards.iter().position(|c| {
-            c.acp_sid == acp_sid && c.call_id.is_none() && c.tool == tool && c.path_arg == path
+            c.acp_sid == acp_sid && c.call_id.is_none() && c.tool == tool && c.key == key
         })
     })?;
     Some(cards.remove(position).content)
@@ -233,8 +281,9 @@ struct Card {
     acp_sid: String,
     call_id: Option<String>,
     tool: String,
-    path_arg: String,
-    content: String,
+    /// The call's `key_arg` value.
+    key: String,
+    content: CardContent,
     at: Instant,
 }
 
@@ -653,6 +702,10 @@ fn tool_list() -> Vec<String> {
             "write_text_file" => format!(
                 r#"{{"name":"write_text_file","title":"Write file in editor","description":"Write a whole text file through the user's editor, creating it if needed. The editor updates open buffers and tracks the change, so prefer it to write_file. Not allowed in Read-only or Plan mode.","inputSchema":{{"type":"object","properties":{{{PATH_SCHEMA},"content":{{"type":"string","description":"The file's complete new text."}}}},"required":["path","content"]}},"annotations":{{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":true,"openWorldHint":false}}}}"#
             ),
+            "run_in_terminal" => format!(
+                r#"{{"name":"run_in_terminal","title":"Run in editor terminal","description":"Run a shell command in a terminal in the user's editor, where the user can watch it, and return its output and exit status. Prefer it to bash for builds, tests, and other commands whose output the user may want to see. The command runs with {} in the workspace root, or in cwd. It is stopped after timeout_seconds (default {COMMAND_TIMEOUT_SECS}, at most {MAX_COMMAND_TIMEOUT_SECS}). Not allowed in Read-only or Plan mode.","inputSchema":{{"type":"object","properties":{{"command":{{"type":"string","description":"The command line to run."}},"cwd":{{"type":"string","description":"Working directory: absolute, or relative to the workspace root."}},"timeout_seconds":{{"type":"integer","minimum":1,"maximum":{MAX_COMMAND_TIMEOUT_SECS},"description":"Seconds to wait before stopping the command."}}}},"required":["command"]}},"annotations":{{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":true}}}}"#,
+                shell().2
+            ),
             _ => format!(
                 r#"{{"name":"edit_text_file","title":"Edit file in editor","description":"Replace text in a file through the user's editor, working on its current text including unsaved changes, so prefer it to edit_file for files the user may have open. old_string must match exactly once unless replace_all is true. Not allowed in Read-only or Plan mode.","inputSchema":{{"type":"object","properties":{{{PATH_SCHEMA},"old_string":{{"type":"string","description":"The exact text to replace."}},"new_string":{{"type":"string","description":"The replacement text."}},"replace_all":{{"type":"boolean","description":"Replace every occurrence instead of exactly one."}}}},"required":["path","old_string","new_string"]}},"annotations":{{"readOnlyHint":false,"destructiveHint":true,"idempotentHint":false,"openWorldHint":false}}}}"#
             ),
@@ -702,40 +755,123 @@ fn call(shared: &Shared, token: &str, request_id: &J, name: &str, params: Option
     let generation = cancel_generation(&context.acp_sid);
     let abort =
         || cancelled.load(Ordering::SeqCst) || cancel_generation(&context.acp_sid) != generation;
-    let client =
-        |method: &str, params: String| client_request(&shared.stdout, method, &params, &abort);
-    let outcome = run_tool(&context, &client, name, args);
+    let client = |method: &str, params: String, wait: Wait| {
+        client_request(&shared.stdout, method, &params, wait, &abort)
+    };
+    let key_value = args
+        .get(key_arg(name))
+        .and_then(J::as_str)
+        .unwrap_or("")
+        .to_string();
+    let embed = |content: &str| {
+        embed_in_card(
+            shared,
+            &context.acp_sid,
+            call_id.as_deref(),
+            name,
+            &key_value,
+            content,
+        )
+    };
+    let outcome = run_tool(&context, &client, &embed, name, args);
     lock(&RUNNING).remove(&key);
     match outcome {
         Ok(output) => {
-            if let Some(diff) = output.diff {
+            if let Some(content) = output.card {
                 record_card(Card {
                     acp_sid: context.acp_sid.clone(),
                     call_id,
                     tool: name.to_string(),
-                    path_arg: args
-                        .get("path")
-                        .and_then(J::as_str)
-                        .unwrap_or("")
-                        .to_string(),
-                    content: diff,
+                    key: key_value,
+                    content,
                     at: Instant::now(),
                 });
             }
-            tool_result(&output.text, false)
+            tool_result(&output.text, output.is_error)
         }
         Err(message) => tool_result(&message, true),
     }
 }
 
-/// Send one ACP request to the client and wait for its answer: the result,
-/// or the error's message.
+/// Show `content` on the running call's card right away (a terminal, so the
+/// user watches the command). Waits briefly for the card's announcement, so
+/// the update never names a card the client has not seen; the completed card
+/// carries the content either way.
+fn embed_in_card(
+    shared: &Shared,
+    acp_sid: &str,
+    call_id: Option<&str>,
+    tool: &str,
+    key: &str,
+    content: &str,
+) {
+    let full_name = format!("{TOOL_PREFIX}{tool}");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let card = loop {
+        let card = lock(&shared.sessions)
+            .get(acp_sid)
+            .and_then(|s| s.fold.editor_card(call_id, &full_name, key_arg(tool), key));
+        if card.is_some() || Instant::now() >= deadline {
+            break card;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let Some(card) = card else { return };
+    acp::send_raw(
+        &shared.stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":{},\"content\":[{content}]}}}}}}",
+            esc(acp_sid),
+            esc(&card)
+        ),
+    );
+}
+
+/// How long to wait for the client's answer, and whether a cancel stops the
+/// wait.
+#[derive(Debug, Clone, Copy)]
+struct Wait {
+    timeout: Duration,
+    abortable: bool,
+}
+
+/// An ordinary request.
+const ASK: Wait = Wait {
+    timeout: CLIENT_TIMEOUT,
+    abortable: true,
+};
+/// Clean-up after a stop: short, and not stopped by the cancel itself.
+const CLEANUP: Wait = Wait {
+    timeout: Duration::from_secs(10),
+    abortable: false,
+};
+
+#[derive(Debug, PartialEq)]
+enum ClientError {
+    Cancelled,
+    TimedOut,
+    /// The client's error message.
+    Failed(String),
+}
+
+impl std::fmt::Display for ClientError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ClientError::Cancelled => f.write_str("the user cancelled the turn"),
+            ClientError::TimedOut => f.write_str("the editor did not answer in time"),
+            ClientError::Failed(message) => f.write_str(message),
+        }
+    }
+}
+
+/// Send one ACP request to the client and wait for its answer.
 fn client_request(
     stdout: &StdoutShared,
     method: &str,
     params: &str,
+    wait: Wait,
     abort: &dyn Fn() -> bool,
-) -> Result<J, String> {
+) -> Result<J, ClientError> {
     let id = J::Str(mint_id("editor-", &REQUEST_IDS));
     let key = j_to_string(&id);
     let (waiter, answer) = mpsc::channel();
@@ -748,19 +884,18 @@ fn client_request(
             esc(method)
         ),
     );
-    let deadline = Instant::now() + CLIENT_TIMEOUT;
+    let deadline = Instant::now() + wait.timeout;
     let outcome = loop {
         match answer.recv_timeout(Duration::from_millis(200)) {
             Ok(response) => break Ok(response),
-            Err(RecvTimeoutError::Disconnected) => break Err("the editor did not answer".into()),
-            Err(RecvTimeoutError::Timeout) if abort() => {
-                break Err("The user cancelled the turn.".to_string());
+            Err(RecvTimeoutError::Disconnected) => {
+                break Err(ClientError::Failed("the editor did not answer".into()));
+            }
+            Err(RecvTimeoutError::Timeout) if wait.abortable && abort() => {
+                break Err(ClientError::Cancelled);
             }
             Err(RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
-                break Err(format!(
-                    "the editor did not answer {method} within {} seconds",
-                    CLIENT_TIMEOUT.as_secs()
-                ));
+                break Err(ClientError::TimedOut);
             }
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -775,7 +910,7 @@ fn client_request(
             .and_then(J::as_str)
             .filter(|m| !m.is_empty())
             .unwrap_or("request failed");
-        return Err(message.to_string());
+        return Err(ClientError::Failed(message.to_string()));
     }
     Ok(response.get("result").cloned().unwrap_or(J::Null))
 }
@@ -795,16 +930,31 @@ struct ToolContext {
 #[derive(Debug)]
 struct ToolOutput {
     text: String,
-    /// ACP `diff` tool call content for the card.
-    diff: Option<String>,
+    is_error: bool,
+    /// Content for the completed card.
+    card: Option<CardContent>,
 }
 
-/// Sends one ACP request to the client: method and params JSON.
-type Client<'a> = dyn Fn(&str, String) -> Result<J, String> + 'a;
+impl ToolOutput {
+    fn text(text: String) -> ToolOutput {
+        ToolOutput {
+            text,
+            is_error: false,
+            card: None,
+        }
+    }
+}
+
+/// Sends one ACP request to the client: method, params JSON, and how long to
+/// wait.
+type Client<'a> = dyn Fn(&str, String, Wait) -> Result<J, ClientError> + 'a;
+/// Shows ACP tool call content on the running call's card.
+type Embed<'a> = dyn Fn(&str) + 'a;
 
 fn run_tool(
     context: &ToolContext,
     client: &Client<'_>,
+    embed: &Embed<'_>,
     name: &str,
     args: &J,
 ) -> Result<ToolOutput, String> {
@@ -812,6 +962,7 @@ fn run_tool(
         "read_text_file" => read_tool(context, client, args),
         "write_text_file" => write_tool(context, client, args),
         "edit_text_file" => edit_tool(context, client, args),
+        "run_in_terminal" => terminal_tool(context, client, embed, args),
         _ => Err(format!("unknown tool: {name}")),
     }
 }
@@ -832,12 +983,22 @@ fn line_arg(args: &J, key: &str) -> Result<Option<u64>, String> {
     }
 }
 
-fn writable(context: &ToolContext) -> Result<(), String> {
+/// Refuse `action` (writing files, running commands) in Read-only and Plan
+/// modes.
+fn allowed(context: &ToolContext, action: &str) -> Result<(), String> {
     match context.mode.as_str() {
-        "readOnly" => Err("This session is in Read-only mode, which does not allow writing files. The user can switch the mode to Default.".to_string()),
-        "plan" => Err("This session is in Plan mode, which does not allow writing files. Describe the change in the plan instead.".to_string()),
+        "readOnly" => Err(format!(
+            "This session is in Read-only mode, which does not allow {action}. The user can switch the mode to Default."
+        )),
+        "plan" => Err(format!(
+            "This session is in Plan mode, which does not allow {action}. Describe the step in the plan instead."
+        )),
         _ => Ok(()),
     }
+}
+
+fn writable(context: &ToolContext) -> Result<(), String> {
+    allowed(context, "writing files")
 }
 
 fn editor_read(
@@ -858,7 +1019,7 @@ fn editor_read(
         params.push_str(&format!(",\"limit\":{limit}"));
     }
     params.push('}');
-    let result = client("fs/read_text_file", params)
+    let result = client("fs/read_text_file", params, ASK)
         .map_err(|e| format!("The editor could not read {path}: {e}"))?;
     result
         .get("content")
@@ -881,6 +1042,7 @@ fn editor_write(
             esc(path),
             esc(content)
         ),
+        ASK,
     )
     .map(|_| ())
     .map_err(|e| format!("The editor could not write {path}: {e}"))
@@ -890,10 +1052,7 @@ fn read_tool(context: &ToolContext, client: &Client<'_>, args: &J) -> Result<Too
     let path = resolve_path(string_arg(args, "path")?, &context.cwd, &context.roots)?;
     let range = (line_arg(args, "line")?, line_arg(args, "limit")?);
     let text = editor_read(context, client, &path, range)?;
-    Ok(ToolOutput {
-        text: bounded(text),
-        diff: None,
-    })
+    Ok(ToolOutput::text(bounded(text)))
 }
 
 /// Cut a long read at a character boundary and say how to read the rest.
@@ -936,7 +1095,8 @@ fn write_tool(context: &ToolContext, client: &Client<'_>, args: &J) -> Result<To
             if old.is_some() { "Wrote" } else { "Created" },
             content.lines().count()
         ),
-        diff: diff_content(&path, old.as_deref(), content),
+        is_error: false,
+        card: diff_content(&path, old.as_deref(), content).map(CardContent::Diff),
     })
 }
 
@@ -975,8 +1135,152 @@ fn edit_tool(context: &ToolContext, client: &Client<'_>, args: &J) -> Result<Too
             "Edited {path} through the editor ({count} replacement{}).",
             if count == 1 { "" } else { "s" }
         ),
-        diff: diff_content(&path, Some(&text), &edited),
+        is_error: false,
+        card: diff_content(&path, Some(&text), &edited).map(CardContent::Diff),
     })
+}
+
+/// The shell a command line runs in: program, the arguments before the
+/// command line, and its name for the tool description. ACP clients either
+/// run `command` with `args` directly or wrap both, quoted, in the user's
+/// shell (Zed); an explicit shell with the line as one argument works for
+/// both.
+fn shell() -> (&'static str, &'static [&'static str], &'static str) {
+    if cfg!(windows) {
+        (
+            "powershell.exe",
+            &["-NoProfile", "-NonInteractive", "-Command"],
+            "Windows PowerShell (powershell -Command)",
+        )
+    } else {
+        ("bash", &["-c"], "bash -c")
+    }
+}
+
+fn terminal_tool(
+    context: &ToolContext,
+    client: &Client<'_>,
+    embed: &Embed<'_>,
+    args: &J,
+) -> Result<ToolOutput, String> {
+    allowed(context, "running commands")?;
+    let command = string_arg(args, "command")?;
+    if command.trim().is_empty() {
+        return Err("command must not be empty".to_string());
+    }
+    let cwd = match args.get("cwd") {
+        None | Some(J::Null) => ".",
+        Some(J::Str(cwd)) => cwd.as_str(),
+        Some(_) => return Err("cwd must be a string".to_string()),
+    };
+    let cwd = resolve_path(cwd, &context.cwd, &context.roots)?;
+    let timeout = match args.get("timeout_seconds") {
+        None | Some(J::Null) => COMMAND_TIMEOUT_SECS,
+        Some(value) => match value.as_u64() {
+            Some(n) if (1..=MAX_COMMAND_TIMEOUT_SECS).contains(&n) => n,
+            _ => {
+                return Err(format!(
+                    "timeout_seconds must be an integer from 1 to {MAX_COMMAND_TIMEOUT_SECS}"
+                ));
+            }
+        },
+    };
+    let (program, flags, _) = shell();
+    let argv = flags
+        .iter()
+        .copied()
+        .chain([command])
+        .map(esc)
+        .collect::<Vec<_>>()
+        .join(",");
+    let sid = esc(&context.acp_sid);
+    let created = client(
+        "terminal/create",
+        format!(
+            "{{\"sessionId\":{sid},\"command\":{},\"args\":[{argv}],\"cwd\":{},\"outputByteLimit\":{MAX_READ_BYTES}}}",
+            esc(program),
+            esc(&cwd)
+        ),
+        ASK,
+    )
+    .map_err(|e| format!("The editor could not start a terminal: {e}"))?;
+    let terminal_id = created
+        .get("terminalId")
+        .and_then(J::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or("The editor returned no terminal id.")?
+        .to_string();
+    let terminal = format!(
+        "{{\"sessionId\":{sid},\"terminalId\":{}}}",
+        esc(&terminal_id)
+    );
+    let content = format!(
+        "{{\"type\":\"terminal\",\"terminalId\":{}}}",
+        esc(&terminal_id)
+    );
+    embed(&content);
+    let waited = client(
+        "terminal/wait_for_exit",
+        terminal.clone(),
+        Wait {
+            timeout: Duration::from_secs(timeout),
+            abortable: true,
+        },
+    );
+    if waited.is_err() {
+        let _ = client("terminal/kill", terminal.clone(), CLEANUP);
+    }
+    let output = client("terminal/output", terminal.clone(), CLEANUP).ok();
+    let _ = client("terminal/release", terminal, CLEANUP);
+    let mut text = output
+        .as_ref()
+        .and_then(|o| o.get("output"))
+        .and_then(J::as_str)
+        .unwrap_or("")
+        .to_string();
+    if output
+        .as_ref()
+        .and_then(|o| o.get("truncated"))
+        .and_then(J::as_bool)
+        == Some(true)
+    {
+        text.insert_str(
+            0,
+            &format!("[output truncated to its last {MAX_READ_BYTES} bytes]\n"),
+        );
+    }
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    let (status, is_error) = match &waited {
+        Ok(exit) => (exit_status(exit), false),
+        Err(ClientError::Cancelled) => ("[stopped: the user cancelled the turn]".to_string(), true),
+        Err(ClientError::TimedOut) => (
+            format!("[stopped: the command ran longer than {timeout} seconds]"),
+            true,
+        ),
+        Err(ClientError::Failed(message)) => (
+            format!("[the editor lost track of the command: {message}]"),
+            true,
+        ),
+    };
+    text.push_str(&status);
+    Ok(ToolOutput {
+        text,
+        is_error,
+        card: Some(CardContent::Terminal(content)),
+    })
+}
+
+/// `[exit code N]` or `[terminated by signal S]` from an ACP exit status.
+fn exit_status(exit: &J) -> String {
+    if let Some(code) = exit.get("exitCode").filter(|c| !matches!(c, J::Null)) {
+        return format!("[exit code {}]", j_to_string(code));
+    }
+    match exit.get("signal").and_then(J::as_str) {
+        Some(signal) => format!("[terminated by signal {signal}]"),
+        None => "[exited]".to_string(),
+    }
 }
 
 /// ACP `diff` tool call content, or None when the texts are too large to
@@ -1118,7 +1422,7 @@ mod tests {
             }
         }
 
-        fn answer(&self, method: &str, params: String) -> Result<J, String> {
+        fn answer(&self, method: &str, params: String) -> Result<J, ClientError> {
             let params = parse_json(&params).unwrap();
             self.requests
                 .borrow_mut()
@@ -1130,7 +1434,7 @@ mod tests {
                     .borrow()
                     .get(&path)
                     .map(|text| parse_json(&format!("{{\"content\":{}}}", esc(text))).unwrap())
-                    .ok_or_else(|| "Resource not found".to_string()),
+                    .ok_or_else(|| ClientError::Failed("Resource not found".to_string())),
                 "fs/write_text_file" => {
                     let content = params.get("content").and_then(J::as_str).unwrap();
                     self.buffers.borrow_mut().insert(path, content.to_string());
@@ -1157,8 +1461,8 @@ mod tests {
     ) -> Result<ToolOutput, String> {
         READ.store(true, Ordering::SeqCst);
         WRITE.store(true, Ordering::SeqCst);
-        let client = |method: &str, params: String| editor.answer(method, params);
-        run_tool(context, &client, name, &args(json))
+        let client = |method: &str, params: String, _: Wait| editor.answer(method, params);
+        run_tool(context, &client, &|_| {}, name, &args(json))
     }
 
     #[test]
@@ -1174,7 +1478,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(output.text, "unsaved buffer\n");
-        assert!(output.diff.is_none());
+        assert!(output.card.is_none());
         let requests = editor.requests.borrow();
         let (method, params) = &requests[0];
         assert_eq!(method, "fs/read_text_file");
@@ -1253,7 +1557,7 @@ mod tests {
             output.text,
             format!("Created {file} through the editor (2 lines).")
         );
-        let diff = parse_json(output.diff.as_deref().unwrap()).unwrap();
+        let diff = diff_json(&output);
         assert_eq!(diff.get("type").and_then(J::as_str), Some("diff"));
         assert_eq!(diff.get("path").and_then(J::as_str), Some(file.as_str()));
         assert!(matches!(diff.get("oldText"), Some(J::Null)));
@@ -1278,7 +1582,7 @@ mod tests {
         )
         .unwrap();
         assert!(output.text.starts_with("Wrote "), "{}", output.text);
-        let diff = parse_json(output.diff.as_deref().unwrap()).unwrap();
+        let diff = diff_json(&output);
         assert_eq!(
             diff.get("oldText").and_then(J::as_str),
             Some("buffer text\n")
@@ -1303,7 +1607,7 @@ mod tests {
             format!("Edited {file} through the editor (1 replacement).")
         );
         assert_eq!(editor.buffers.borrow()[&file], "fn a() {}\nfn c() {}\n");
-        let diff = parse_json(output.diff.as_deref().unwrap()).unwrap();
+        let diff = diff_json(&output);
         assert_eq!(
             diff.get("oldText").and_then(J::as_str),
             Some("fn a() {}\nfn b() {}\n")
@@ -1413,6 +1717,13 @@ mod tests {
         assert!(cut.contains("[truncated: "), "marker");
         assert!(cut.len() < MAX_READ_BYTES + 100);
         assert_eq!(bounded("short".to_string()), "short");
+    }
+
+    fn diff_json(output: &ToolOutput) -> J {
+        match &output.card {
+            Some(CardContent::Diff(diff)) => parse_json(diff).unwrap(),
+            other => panic!("expected a diff card, got {other:?}"),
+        }
     }
 
     fn request(raw: &str) -> Result<Request, ReadError> {
@@ -1597,37 +1908,282 @@ mod tests {
     }
 
     #[test]
-    fn card_content_matches_by_call_id_then_by_path() {
-        for (call_id, path) in [(Some("call-1"), "a.rs"), (None, "b.rs")] {
+    fn card_content_matches_by_call_id_then_by_key_argument() {
+        for (call_id, tool, key) in [
+            (Some("call-1"), "write_text_file", "a.rs"),
+            (None, "write_text_file", "b.rs"),
+            (None, "run_in_terminal", "make"),
+        ] {
             record_card(Card {
                 acp_sid: "sess-cards".into(),
                 call_id: call_id.map(str::to_string),
-                tool: "write_text_file".into(),
-                path_arg: path.into(),
-                content: format!("diff-{path}"),
+                tool: tool.into(),
+                key: key.into(),
+                content: if tool == "run_in_terminal" {
+                    CardContent::Terminal(format!("term-{key}"))
+                } else {
+                    CardContent::Diff(format!("diff-{key}"))
+                },
                 at: Instant::now(),
             });
         }
-        let item = |call: &str, path: &str| {
+        let item = |tool: &str, call: &str, key: &str, value: &str| {
             parse_json(&format!(
-                "{{\"tool\":\"mcp__editor__write_text_file\",\"callId\":{},\"args\":{}}}",
+                "{{\"tool\":\"mcp__editor__{tool}\",\"callId\":{},\"args\":{}}}",
                 esc(call),
-                esc(&format!("{{\"path\":{}}}", esc(path)))
+                esc(&format!("{{{}:{}}}", esc(key), esc(value)))
             ))
             .unwrap()
         };
-        assert_eq!(take_card_content("other", &item("call-1", "a.rs")), None);
+        let write = |call: &str, path: &str| item("write_text_file", call, "path", path);
+        assert_eq!(take_card_content("other", &write("call-1", "a.rs")), None);
         assert_eq!(
-            take_card_content("sess-cards", &item("call-1", "a.rs")).as_deref(),
-            Some("diff-a.rs")
+            take_card_content("sess-cards", &write("call-1", "a.rs")),
+            Some(CardContent::Diff("diff-a.rs".into()))
         );
         assert_eq!(
-            take_card_content("sess-cards", &item("call-9", "b.rs")).as_deref(),
-            Some("diff-b.rs")
+            take_card_content("sess-cards", &write("call-9", "b.rs")),
+            Some(CardContent::Diff("diff-b.rs".into()))
         );
         assert_eq!(
-            take_card_content("sess-cards", &item("call-9", "b.rs")),
+            take_card_content("sess-cards", &write("call-9", "b.rs")),
             None
         );
+        assert_eq!(
+            take_card_content(
+                "sess-cards",
+                &item("run_in_terminal", "c", "command", "make")
+            ),
+            Some(CardContent::Terminal("term-make".into()))
+        );
+    }
+
+    #[test]
+    fn approval_titles_name_the_file_or_the_full_command() {
+        let title = |tool: &str, raw: &str| approval_title(tool, Some(raw));
+        assert_eq!(
+            title(
+                "mcp__editor__run_in_terminal",
+                r#"{"command":"rm -rf build && make"}"#
+            )
+            .as_deref(),
+            Some("mcp__editor__run_in_terminal: rm -rf build && make")
+        );
+        assert_eq!(
+            title(
+                "mcp__editor__run_in_terminal",
+                r#"{"command":"make","cwd":"sub"}"#
+            )
+            .as_deref(),
+            Some("mcp__editor__run_in_terminal: make (in sub)")
+        );
+        assert_eq!(
+            title(
+                "mcp__editor__write_text_file",
+                r#"{"path":"src/a.rs","content":"x"}"#
+            )
+            .as_deref(),
+            Some("mcp__editor__write_text_file: src/a.rs")
+        );
+        assert_eq!(title("mcp__other__run", r#"{"command":"x"}"#), None);
+        assert_eq!(title("mcp__editor__run_in_terminal", "not json"), None);
+        assert_eq!(approval_title("mcp__editor__run_in_terminal", None), None);
+    }
+
+    /// A fake editor terminal: `wait` decides how the wait for exit ends.
+    struct Terminals {
+        wait: Result<&'static str, ClientError>,
+        requests: RefCell<Vec<(String, J)>>,
+        embedded: RefCell<Vec<String>>,
+    }
+
+    impl Terminals {
+        fn new(wait: Result<&'static str, ClientError>) -> Terminals {
+            Terminals {
+                wait,
+                requests: RefCell::new(Vec::new()),
+                embedded: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn run(&self, context: &ToolContext, json: &str) -> Result<ToolOutput, String> {
+            TERMINAL.store(true, Ordering::SeqCst);
+            let client = |method: &str, params: String, wait: Wait| {
+                let params = parse_json(&params).unwrap();
+                self.requests
+                    .borrow_mut()
+                    .push((method.to_string(), params.clone()));
+                if method != "terminal/create" {
+                    assert_eq!(params.get("terminalId").and_then(J::as_str), Some("term-1"));
+                }
+                match method {
+                    "terminal/create" => Ok(parse_json(r#"{"terminalId":"term-1"}"#).unwrap()),
+                    "terminal/wait_for_exit" => {
+                        assert!(wait.abortable, "a cancel stops the wait");
+                        match &self.wait {
+                            Ok(exit) => Ok(parse_json(exit).unwrap()),
+                            Err(ClientError::Cancelled) => Err(ClientError::Cancelled),
+                            Err(ClientError::TimedOut) => Err(ClientError::TimedOut),
+                            Err(ClientError::Failed(m)) => Err(ClientError::Failed(m.clone())),
+                        }
+                    }
+                    "terminal/output" => {
+                        assert!(!wait.abortable, "clean-up survives the cancel");
+                        Ok(parse_json(r#"{"output":"built","truncated":false}"#).unwrap())
+                    }
+                    "terminal/kill" | "terminal/release" => {
+                        assert!(!wait.abortable, "clean-up survives the cancel");
+                        Ok(J::Null)
+                    }
+                    other => panic!("unexpected {other}"),
+                }
+            };
+            let embed = |content: &str| self.embedded.borrow_mut().push(content.to_string());
+            run_tool(context, &client, &embed, "run_in_terminal", &args(json))
+        }
+
+        fn methods(&self) -> Vec<String> {
+            self.requests
+                .borrow()
+                .iter()
+                .map(|(m, _)| m.clone())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn a_command_runs_in_an_editor_terminal_shown_on_its_card() {
+        let dir = workspace("terminal");
+        let terminals = Terminals::new(Ok(r#"{"exitCode":2,"signal":null}"#));
+        let output = terminals
+            .run(
+                &context(&dir, "default"),
+                r#"{"command":"cargo build","cwd":"src"}"#,
+            )
+            .unwrap();
+        assert_eq!(output.text, "built\n[exit code 2]");
+        assert!(!output.is_error, "a failing command still ran");
+        let content = r#"{"type":"terminal","terminalId":"term-1"}"#;
+        assert_eq!(
+            output.card,
+            Some(CardContent::Terminal(content.to_string()))
+        );
+        assert_eq!(*terminals.embedded.borrow(), [content]);
+        assert_eq!(
+            terminals.methods(),
+            [
+                "terminal/create",
+                "terminal/wait_for_exit",
+                "terminal/output",
+                "terminal/release"
+            ]
+        );
+        let requests = terminals.requests.borrow();
+        let create = &requests[0].1;
+        assert_eq!(create.get("sessionId").and_then(J::as_str), Some("sess-1"));
+        let (program, flags, _) = shell();
+        assert_eq!(create.get("command").and_then(J::as_str), Some(program));
+        let argv: Vec<&str> = match create.get("args") {
+            Some(J::Arr(args)) => args.iter().filter_map(J::as_str).collect(),
+            other => panic!("args: {other:?}"),
+        };
+        assert_eq!(argv, [flags, &["cargo build"]].concat());
+        assert_eq!(
+            create.get("cwd").and_then(J::as_str),
+            Some(file(&dir, &["ws", "src"]).as_str())
+        );
+        assert_eq!(
+            create.get("outputByteLimit").and_then(J::as_u64),
+            Some(MAX_READ_BYTES as u64)
+        );
+    }
+
+    #[test]
+    fn a_stopped_command_is_killed_and_still_reports_its_output() {
+        let dir = workspace("terminal-stop");
+        for (wait, expected) in [
+            (
+                Err(ClientError::TimedOut),
+                "built\n[stopped: the command ran longer than 5 seconds]",
+            ),
+            (
+                Err(ClientError::Cancelled),
+                "built\n[stopped: the user cancelled the turn]",
+            ),
+        ] {
+            let terminals = Terminals::new(wait);
+            let output = terminals
+                .run(
+                    &context(&dir, "default"),
+                    r#"{"command":"sleep 99","timeout_seconds":5}"#,
+                )
+                .unwrap();
+            assert_eq!(output.text, expected);
+            assert!(output.is_error);
+            assert!(matches!(output.card, Some(CardContent::Terminal(_))));
+            assert_eq!(
+                terminals.methods(),
+                [
+                    "terminal/create",
+                    "terminal/wait_for_exit",
+                    "terminal/kill",
+                    "terminal/output",
+                    "terminal/release"
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn commands_are_refused_before_a_terminal_opens() {
+        let dir = workspace("terminal-refused");
+        for (mode, json, expected) in [
+            (
+                "readOnly",
+                r#"{"command":"make"}"#,
+                "does not allow running commands",
+            ),
+            (
+                "plan",
+                r#"{"command":"make"}"#,
+                "does not allow running commands",
+            ),
+            (
+                "default",
+                r#"{"command":"make","cwd":"../outside"}"#,
+                "outside the session's workspace roots",
+            ),
+            (
+                "default",
+                r#"{"command":"  "}"#,
+                "command must not be empty",
+            ),
+            (
+                "default",
+                r#"{"command":"make","timeout_seconds":0}"#,
+                "timeout_seconds must be",
+            ),
+            (
+                "default",
+                r#"{"command":"make","timeout_seconds":99999}"#,
+                "timeout_seconds must be",
+            ),
+        ] {
+            let terminals = Terminals::new(Ok("{}"));
+            let error = terminals.run(&context(&dir, mode), json).unwrap_err();
+            assert!(error.contains(expected), "{mode} {json}: {error}");
+            assert!(terminals.methods().is_empty());
+        }
+    }
+
+    #[test]
+    fn exit_statuses_read_as_text() {
+        let status = |json: &str| exit_status(&parse_json(json).unwrap());
+        assert_eq!(status(r#"{"exitCode":0}"#), "[exit code 0]");
+        assert_eq!(
+            status(r#"{"exitCode":null,"signal":"SIGKILL"}"#),
+            "[terminated by signal SIGKILL]"
+        );
+        assert_eq!(status("{}"), "[exited]");
     }
 }

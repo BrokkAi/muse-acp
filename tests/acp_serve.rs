@@ -15584,3 +15584,239 @@ fn loading_a_session_again_keeps_its_editor_token() {
     );
     c.finish();
 }
+
+// ---- Editor terminals (ACP v1 terminal/* through the adapter's MCP server) ----
+
+const TERMINAL_CAPS: &str = r#","clientCapabilities":{"terminal":true}"#;
+
+#[test]
+fn editor_terminal_runs_a_command_in_a_client_terminal_shown_on_its_card() {
+    let log = bridge_log_path("terminal");
+    let calls = r#"[{"name":"run_in_terminal","arguments":{"command":"make test","cwd":"sub"}}]"#;
+    let mut c = Client::spawn(
+        "editor_bridge",
+        &[("FAKE_BRIDGE_CALLS", calls), ("FAKE_BRIDGE_LOG", &log)],
+    );
+    let sid = c.new_session(1, TERMINAL_CAPS);
+    let ws = session_workspace(&c);
+    std::fs::create_dir_all(ws.join("sub")).unwrap();
+    let pid = c.prompt(&sid, "run the tests");
+    let create = c.wait_request("terminal/create", 0, Duration::from_secs(15));
+    let params = &create["params"];
+    assert_eq!(params["sessionId"], sid.as_str());
+    let shell = if cfg!(windows) {
+        "powershell.exe"
+    } else {
+        "bash"
+    };
+    assert_eq!(params["command"], shell, "{create}");
+    let args = params["args"].as_array().unwrap();
+    assert_eq!(
+        args.last().unwrap(),
+        "make test",
+        "the line is one argument: {create}"
+    );
+    assert_eq!(params["cwd"], ws.join("sub").to_str().unwrap());
+    assert_eq!(params["outputByteLimit"], 262144);
+    c.answer(&create, r#"{"terminalId":"term-7"}"#);
+    // The running card shows the terminal at once.
+    let live = c.wait_for_all(
+        &[
+            "\"tool_call_update\"",
+            "\"toolCallId\":\"call-e0\"",
+            "\"terminalId\":\"term-7\"",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(
+        !live.contains("\"status\""),
+        "a content-only update: {live}"
+    );
+    let wait = c.wait_request("terminal/wait_for_exit", 0, Duration::from_secs(15));
+    assert_eq!(wait["params"]["terminalId"], "term-7");
+    c.answer(&wait, r#"{"exitCode":0,"signal":null}"#);
+    let output = c.wait_request("terminal/output", 0, Duration::from_secs(15));
+    c.answer(&output, r#"{"output":"all passed\n","truncated":false}"#);
+    let release = c.wait_request("terminal/release", 0, Duration::from_secs(15));
+    c.answer(&release, "null");
+    let done = c.wait_for_all(
+        &[
+            "\"tool_call_update\"",
+            "\"toolCallId\":\"call-e0\"",
+            "\"status\":\"completed\"",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(
+        done.contains(r#""content":[{"type":"terminal","terminalId":"term-7"}]"#)
+            && done.contains(r#""kind":"execute""#),
+        "the completed card keeps the terminal instead of text: {done}"
+    );
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("terminal/kill"),
+        "a finished command is not killed"
+    );
+    drop(frames);
+    let entries = bridge_log(&log);
+    let called = entries
+        .iter()
+        .find(|e| e["method"] == "tools/call")
+        .unwrap();
+    assert_eq!(
+        called["body"]["result"]["content"][0]["text"],
+        "all passed\n[exit code 0]"
+    );
+    assert_eq!(called["body"]["result"]["isError"], false);
+    c.finish();
+}
+
+#[test]
+fn cancelling_the_turn_kills_and_releases_a_running_command() {
+    let log = bridge_log_path("terminal-cancel");
+    let calls = r#"[{"name":"run_in_terminal","arguments":{"command":"sleep 600"}}]"#;
+    let mut c = Client::spawn(
+        "editor_bridge",
+        &[("FAKE_BRIDGE_CALLS", calls), ("FAKE_BRIDGE_LOG", &log)],
+    );
+    let sid = c.new_session(1, TERMINAL_CAPS);
+    c.prompt(&sid, "wait forever");
+    let create = c.wait_request("terminal/create", 0, Duration::from_secs(15));
+    c.answer(&create, r#"{"terminalId":"term-9"}"#);
+    let wait = c.wait_request("terminal/wait_for_exit", 0, Duration::from_secs(15));
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let withdrawn = c.wait_for("$/cancel_request", Duration::from_secs(15));
+    assert!(
+        withdrawn.contains(&format!("\"requestId\":{}", wait["id"])),
+        "{withdrawn}"
+    );
+    let kill = c.wait_request("terminal/kill", 0, Duration::from_secs(15));
+    assert_eq!(kill["params"]["terminalId"], "term-9");
+    c.answer(&kill, "{}");
+    let output = c.wait_request("terminal/output", 0, Duration::from_secs(15));
+    c.answer(
+        &output,
+        r#"{"output":"partial\n","truncated":false,"exitStatus":{"signal":"SIGKILL"}}"#,
+    );
+    let release = c.wait_request("terminal/release", 0, Duration::from_secs(15));
+    c.answer(&release, "null");
+    let failed = c.wait_for_all(
+        &[
+            "\"tool_call_update\"",
+            "\"toolCallId\":\"call-e0\"",
+            "\"status\":\"failed\"",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(
+        failed.contains(r#""terminalId":"term-9""#),
+        "the stopped command's card keeps its terminal: {failed}"
+    );
+    let entries = bridge_log(&log);
+    let called = entries
+        .iter()
+        .find(|e| e["method"] == "tools/call")
+        .unwrap();
+    assert_eq!(
+        called["body"]["result"]["content"][0]["text"],
+        "partial\n[stopped: the user cancelled the turn]"
+    );
+    c.finish();
+}
+
+#[test]
+fn editor_terminal_is_offered_only_with_the_terminal_capability() {
+    for (extra, expected) in [
+        (TERMINAL_CAPS, vec!["run_in_terminal"]),
+        (
+            r#","clientCapabilities":{"terminal":true,"fs":{"readTextFile":true}}"#,
+            vec!["read_text_file", "run_in_terminal"],
+        ),
+        (r#","clientCapabilities":{"terminal":false}"#, vec![]),
+    ] {
+        let log = bridge_log_path("terminal-offer");
+        let mut c = Client::spawn("editor_bridge", &[("FAKE_BRIDGE_LOG", &log)]);
+        let sid = c.new_session(1, extra);
+        let pid = c.prompt(&sid, "list");
+        c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        let entries = bridge_log(&log);
+        let names: Vec<String> = entries
+            .iter()
+            .find(|e| e["method"] == "tools/list")
+            .map(|listed| {
+                listed["body"]["result"]["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|tool| tool["name"].as_str().unwrap().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(names, expected, "{extra}");
+        c.finish();
+    }
+}
+
+#[test]
+fn an_editor_terminal_approval_names_the_command_it_would_run() {
+    // Muse 1.4.11 opens the prompt from an approval/updated without the
+    // arguments, after an approval/reviewing that had them.
+    let mut c = Client::spawn(
+        "editor_approval_updated",
+        &[("FAKE_APPROVAL_SUBJECT", "editor-terminal")],
+    );
+    let sid = c.new_session(1, "");
+    c.prompt(&sid, "clean");
+    let permission = c.wait_for("session/request_permission", Duration::from_secs(15));
+    assert!(
+        permission.contains(r#""title":"mcp__editor__run_in_terminal: rm -rf build""#),
+        "{permission}"
+    );
+    assert!(permission.contains(r#""kind":"execute""#), "{permission}");
+    c.finish();
+
+    // Muse 1.4.8 opens it first and sends the arguments after: the shown
+    // prompt's card is retitled, not reopened.
+    let mut c = Client::spawn(
+        "editor_approval_late_args",
+        &[("FAKE_APPROVAL_SUBJECT", "editor-terminal")],
+    );
+    let sid = c.new_session(1, "");
+    c.prompt(&sid, "clean");
+    let permission = c.wait_for("session/request_permission", Duration::from_secs(15));
+    assert!(
+        permission.contains(r#""title":"mcp__editor__run_in_terminal""#),
+        "{permission}"
+    );
+    let card: serde_json::Value = serde_json::from_str(&permission).unwrap();
+    let card_id = card["params"]["toolCall"]["toolCallId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let retitled = c.wait_for_all(
+        &[
+            "\"tool_call_update\"",
+            &format!("\"toolCallId\":\"{card_id}\""),
+            r#""title":"mcp__editor__run_in_terminal: rm -rf build""#,
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(retitled.contains("session/update"), "{retitled}");
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert_eq!(
+        frames.matches("session/request_permission").count(),
+        1,
+        "the prompt is not reopened: {frames}"
+    );
+    drop(frames);
+    c.finish();
+}

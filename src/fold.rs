@@ -50,6 +50,12 @@ fn trunc(s: &str) -> (String, Option<String>) {
 
 pub(crate) fn tool_kind(tool: &str) -> &'static str {
     let t = tool.to_lowercase();
+    // An MCP tool, `mcp__<server>__<tool>`, is classified by its own name:
+    // a server named `editor` or `readwise` says nothing about the call.
+    let t = t
+        .strip_prefix("mcp__")
+        .and_then(|rest| rest.split_once("__"))
+        .map_or(t.as_str(), |(_, name)| name);
     if t.contains("read") || t.contains("list") || t.contains("cat") {
         "read"
     } else if t.contains("write")
@@ -334,6 +340,13 @@ pub struct SessionFold {
     /// ACP v2 `diff` content fetched for a completed tool's stored patch,
     /// keyed by item id and taken once by that item's completion card.
     pub patch_diffs: HashMap<String, String>,
+    /// ACP `terminal` content an editor tool call (bridge.rs) showed, keyed
+    /// by item id and taken once by that item's completion card, which shows
+    /// the terminal instead of the output text.
+    pub editor_terminals: HashMap<String, String>,
+    /// Announced, running editor tool calls in start order: item id, card
+    /// id, tool, and arguments, so the bridge can find a call's card.
+    editor_calls: Vec<(String, String, String, J)>,
     /// Characters of streamed tool output already appended per item id, so
     /// appends stop at the display budget the completion card applies.
     streamed_output: HashMap<String, usize>,
@@ -412,6 +425,8 @@ impl SessionFold {
         Self {
             workspace_root: String::new(),
             patch_diffs: HashMap::new(),
+            editor_terminals: HashMap::new(),
+            editor_calls: Vec::new(),
             streamed_output: HashMap::new(),
             shell_commands: HashMap::new(),
             terminals: HashMap::new(),
@@ -709,6 +724,25 @@ impl SessionFold {
 
     /// The ACP tool-call id already assigned to a toolCall item, so an
     /// approval for it can point at the same card.
+    /// The announced card of a running editor tool call: the one with
+    /// `call_id` when Muse sent it, else the oldest `tool` call whose `key`
+    /// argument is `value`.
+    pub fn editor_card(
+        &self,
+        call_id: Option<&str>,
+        tool: &str,
+        key: &str,
+        value: &str,
+    ) -> Option<String> {
+        self.editor_calls
+            .iter()
+            .find(|(_, tc_id, name, args)| match call_id {
+                Some(call_id) => tc_id == call_id,
+                None => name == tool && args.get(key).and_then(J::as_str) == Some(value),
+            })
+            .map(|(_, tc_id, _, _)| tc_id.clone())
+    }
+
     pub fn tool_call_id(&self, item_id: &str) -> Option<&str> {
         match self.items.get(item_id) {
             Some(ItemRole::Tool { tc_id, .. }) => Some(tc_id),
@@ -2692,6 +2726,17 @@ impl SessionFold {
                 if let Some(ItemRole::Tool { announced, .. }) = self.items.get_mut(&item_id) {
                     *announced = true;
                 }
+                if tool.starts_with("mcp__editor__")
+                    && !self.editor_calls.iter().any(|(id, ..)| *id == item_id)
+                {
+                    let args = match item.get("args") {
+                        Some(J::Str(raw)) => parse_json(raw).unwrap_or(J::Null),
+                        Some(args) => args.clone(),
+                        None => J::Null,
+                    };
+                    self.editor_calls
+                        .push((item_id.clone(), tc_id.clone(), tool, args));
+                }
             }
             "agentMessage" | "userMessage" => {
                 if !self.items.contains_key(&item_id) {
@@ -3072,7 +3117,10 @@ impl SessionFold {
                 // An ACP v2 shell call shows its output in an agent-owned
                 // terminal instead of a text block.
                 self.note_shell(ver, &item_id, &tc_id, item);
-                let terminal = self.finish_terminal(acp_sid, &item_id, item, status, out);
+                self.editor_calls.retain(|(id, ..)| *id != item_id);
+                let terminal = self
+                    .finish_terminal(acp_sid, &item_id, item, status, out)
+                    .or_else(|| self.editor_terminals.remove(&item_id));
                 let content = if text.is_empty() || terminal.is_some() {
                     None
                 } else {
@@ -4509,6 +4557,16 @@ mod corpus_tests {
             "{}",
             out[0]
         );
+    }
+
+    #[test]
+    fn mcp_tools_are_classified_by_their_own_name() {
+        assert_eq!(super::tool_kind("mcp__editor__run_in_terminal"), "execute");
+        assert_eq!(super::tool_kind("mcp__editor__read_text_file"), "read");
+        assert_eq!(super::tool_kind("mcp__editor__write_text_file"), "edit");
+        assert_eq!(super::tool_kind("mcp__readwise__fetch_article"), "fetch");
+        assert_eq!(super::tool_kind("mcp__probe__secret_word"), "other");
+        assert_eq!(super::tool_kind("edit_file"), "edit");
     }
 
     #[test]

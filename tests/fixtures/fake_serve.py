@@ -202,6 +202,13 @@ without the grant fails with capabilityRequired. FAKE_MCP_CONFLICT=1 rejects
 the first session/resume that carries a non-empty config.mcpServers with the
 live `session_configuration_conflict` error.
 
+Editor tool approvals: FAKE_APPROVAL_SUBJECT=editor-terminal makes the
+approval an `mcp__editor__run_in_terminal` call with rawArgs. The scenarios
+`editor_approval_updated` (approval/reviewing with rawArgs, then an
+approval/updated without them) and `editor_approval_late_args`
+(approval/updated without rawArgs, then approval/requested with them) leave
+the turn open.
+
 Editor file tools: `editor_bridge` records the adapter's `editor` server from
 session/start or session/resume config.mcpServers and, on turn/start, plays
 Muse's MCP client against it from a thread: initialize, the initialized
@@ -294,6 +301,12 @@ if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "file-write":
     APPROVAL_PARAMS["subject"] = {
         "kind": "fileAccess", "access": "write", "path": "/tmp/output.txt",
     }
+if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "editor-terminal":
+    # The adapter's editor terminal tool, with the call's arguments.
+    APPROVAL_PARAMS["toolName"] = "mcp__editor__run_in_terminal"
+    APPROVAL_PARAMS["subject"] = {"kind": "tool",
+                                  "toolName": "mcp__editor__run_in_terminal"}
+    APPROVAL_PARAMS["rawArgs"] = json.dumps({"command": "rm -rf build"})
 if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "mcp-tool":
     # Muse 1.4.6 MCP shape (#239): no top-level toolName/toolCallId; the
     # tool name lives only on the subject.
@@ -1232,6 +1245,26 @@ def on_turn_start(params):
                     "status": "accepted", "turnId": tid,
                     "startedNewTurn": True}
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO in ("editor_approval_updated", "editor_approval_late_args"):
+        # An approval/updated opens the prompt without the call's rawArgs.
+        # Muse 1.4.11 sent them earlier on approval/reviewing; 1.4.8 sends
+        # them after, on approval/request(ed).
+        bare = {key: value for key, value in approval_params().items()
+                if key not in ("rawArgs", "toolName", "toolCallId")}
+        if SCENARIO == "editor_approval_updated":
+            notify("approval/reviewing", approval_params(
+                viewCursor="cur-review", turnId=tid))
+            notify("approval/updated", {**bare, "viewCursor": "cur-updated",
+                                        "change": {"kind": "reviewCompleted"}})
+        else:
+            notify("approval/updated", {**bare, "viewCursor": "cur-updated",
+                                        "change": {"kind": "reviewStarted"}})
+            time.sleep(0.3)
+            notify("approval/requested", approval_params(
+                viewCursor="cur-requested", turnId=tid))
+        return {"commandId": params.get("commandId", ""),
+                "status": "accepted", "turnId": tid,
+                "startedNewTurn": True}
     elif SCENARIO == "approval_reviewing_hold":
         review = approval_params(viewCursor="cur-review", turnId=tid)
         notify("approval/reviewing", review)
