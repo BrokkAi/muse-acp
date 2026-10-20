@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/muse-acp-client"]
+members = ["crates/muse-acp-client", "crates/muse-msp-client"]
 resolver = "3"
 
 [package]
@@ -14,9 +14,12 @@ readme = "README.md"
 publish = false
 
 [dependencies]
+# The workspace's own MSP client. It has no dependencies of its own, so the
+# shipped binary stays free of third-party code.
+muse-msp-client = { path = "crates/muse-msp-client" }
 
 [dev-dependencies]
 # Test-only schema validation against the vendored MSP bundle; the shipped
-# binary remains dependency-free.
+# binary remains free of third-party dependencies.
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 muse-acp-client = { path = "crates/muse-acp-client" }
