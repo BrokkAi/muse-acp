@@ -13,6 +13,15 @@
   one form submission instead of a separate workflow-choice form first;
   choosing the inline explanation still sends `userInput/clarify`.
 
+- Add the workspace-local `muse-acp-client` crate, an independent synchronous
+  Rust SDK for driving ACP v1 or v2 agents over stdio. It provides process and
+  custom transport ownership, initialization, session and prompt helpers,
+  request correlation and timeouts, streaming events, agent-cancelled
+  requests, stderr capture, and a configurable reverse-request handler. The
+  default handler fails closed for permissions, elicitation, filesystem, and
+  terminal access. Black-box tests drive the existing `muse-acp` binary over
+  both protocol versions.
+
 ## 0.15.0
 
 - Build release binaries with Rust 1.99.1 (previously 1.98.1). The minimum
