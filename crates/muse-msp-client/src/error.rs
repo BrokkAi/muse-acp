@@ -254,3 +254,89 @@ impl fmt::Display for Diagnostic<'_> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::json::parse_json;
+
+    /// `muse-acp` logs these lines verbatim, so a wording change is a
+    /// change to its diagnostic contract.
+    #[test]
+    fn diagnostic_lines_are_stable() {
+        let id = parse_json(r#""s-1""#).unwrap();
+        let wait = io::Error::other("busy");
+        for (diagnostic, line) in [
+            (
+                Diagnostic::InvalidUtf8Frame,
+                "serve parse error: invalid UTF-8 frame",
+            ),
+            (
+                Diagnostic::MalformedFrame {
+                    error: "trailing characters",
+                },
+                "serve parse error: trailing characters",
+            ),
+            (
+                Diagnostic::UnsupportedServerRequest {
+                    method: "future/request",
+                    id: &id,
+                },
+                "unsupported MSP server request: future/request id=\"s-1\"",
+            ),
+            (
+                Diagnostic::UnknownResponse { id: "7" },
+                "serve response for unknown id 7",
+            ),
+            (
+                Diagnostic::Notification {
+                    method: "turn/started",
+                },
+                "msp<-host method=turn/started",
+            ),
+            (
+                Diagnostic::ShutdownWriterLockTimeout,
+                "serve shutdown timed out waiting for writer lock",
+            ),
+            (
+                Diagnostic::ShutdownChildLockTimeout,
+                "serve shutdown timed out waiting for child lock",
+            ),
+            (
+                Diagnostic::ShutdownChildExitTimeout,
+                "serve shutdown timed out waiting for child exit",
+            ),
+            (
+                Diagnostic::ShutdownWaitFailed { error: &wait },
+                "serve shutdown wait failed: busy",
+            ),
+            (
+                Diagnostic::StderrCaptured { bytes: 12 },
+                "serve stderr captured 12 bytes",
+            ),
+        ] {
+            assert_eq!(diagnostic.to_string(), line);
+        }
+    }
+
+    #[test]
+    fn host_errors_expose_their_typed_fields() {
+        let error = MspError::Rpc(
+            parse_json(r#"{"code":-32030,"message":"rejected","data":{"kind":"commandRejected"}}"#)
+                .unwrap(),
+        );
+        assert_eq!(error.code(), Some(-32030));
+        assert_eq!(error.message(), Some("rejected"));
+        assert_eq!(error.kind(), Some("commandRejected"));
+        assert_eq!(error.to_string(), "host error -32030: rejected");
+        assert_eq!(MspError::HostClosed.code(), None);
+        assert_eq!(
+            HandshakeError::Initialized(MspError::Write(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "serve stdin closed"
+            )))
+            .to_string(),
+            "serve notify failed: serve stdin closed"
+        );
+    }
+}

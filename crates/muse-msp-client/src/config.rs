@@ -330,6 +330,22 @@ impl LaunchConfig {
         &self.program
     }
 
+    /// The arguments after `serve`, then the host flags, as launched.
+    pub fn get_args(&self) -> impl Iterator<Item = &OsStr> {
+        self.args
+            .iter()
+            .map(OsString::as_os_str)
+            .chain(self.flags.args().into_iter().map(OsStr::new))
+    }
+
+    /// The environment changes, in order: `None` removes a variable. Like
+    /// [`Command::get_envs`], this does not list the inherited environment.
+    pub fn get_envs(&self) -> impl Iterator<Item = (&OsStr, Option<&OsStr>)> {
+        self.env
+            .iter()
+            .map(|(key, value)| (key.as_os_str(), value.as_deref()))
+    }
+
     pub(crate) fn command(&self) -> Command {
         let mut command = Command::new(&self.program);
         command.arg("serve");

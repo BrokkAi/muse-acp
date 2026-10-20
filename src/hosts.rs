@@ -15,13 +15,22 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use crate::json::{J, parse_json};
-use crate::msp::{HandshakeInfo, LaunchError, MspEvent, MspHost, mk_err};
+use crate::msp::{HandshakeInfo, HostFlags, LaunchError, MspEvent, MspHost, mk_err};
 
-/// Flags that make Muse refuse workspace writes and shell commands.
-pub const READ_ONLY_ARGS: [&str; 2] = ["--disable-write", "--disable-shell"];
+/// Flags that make Muse refuse workspace writes and shell commands
+/// (`--disable-write --disable-shell`).
+pub const READ_ONLY_FLAGS: HostFlags = HostFlags {
+    no_session_log: false,
+    disable_write: true,
+    disable_shell: true,
+};
 /// The reviewer host is read-only and memory-only: `--no-session-log` keeps
 /// every review out of the user's saved session list.
-pub const REVIEWER_ARGS: [&str; 3] = ["--no-session-log", "--disable-write", "--disable-shell"];
+pub const REVIEWER_FLAGS: HostFlags = HostFlags {
+    no_session_log: true,
+    disable_write: true,
+    disable_shell: true,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostKind {
@@ -39,11 +48,11 @@ impl HostKind {
         }
     }
 
-    fn args(self) -> &'static [&'static str] {
+    fn flags(self) -> HostFlags {
         match self {
-            HostKind::Main => &[],
-            HostKind::ReadOnly => &READ_ONLY_ARGS,
-            HostKind::Reviewer => &REVIEWER_ARGS,
+            HostKind::Main => HostFlags::default(),
+            HostKind::ReadOnly => READ_ONLY_FLAGS,
+            HostKind::Reviewer => REVIEWER_FLAGS,
         }
     }
 }
@@ -319,7 +328,7 @@ fn launch_process(
     forward: &Forward,
 ) -> Result<(Arc<MspHost>, u64), LaunchError> {
     let (host, events) =
-        MspHost::launch(user_input_dialogs, user_shell, computer_use, kind.args())?;
+        MspHost::launch(user_input_dialogs, user_shell, computer_use, kind.flags())?;
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
     forward(HostTag { kind, generation }, events);
     Ok((host, generation))

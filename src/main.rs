@@ -37,7 +37,9 @@ use acp::{
 use fold::SessionFold;
 use hosts::{HostKind, HostTag, Hosts};
 use json::{J, esc, j_to_string, mint_id, parse_json};
-use msp::{ExitClassification, ExitKind, LaunchError, MspEvent, err_code, err_message, log};
+use msp::{
+    ExitClassification, ExitKind, ExitMessage, LaunchError, MspEvent, err_code, err_message, log,
+};
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static VER: AtomicU64 = AtomicU64::new(0); // negotiated ACP version for the connection
@@ -2866,7 +2868,7 @@ fn support_bundle() -> i32 {
 /// `initialize` handshake with a short-lived `muse serve`. Only the
 /// classified facts are printed, never the host's raw strings.
 fn support_sandbox_line() -> String {
-    match msp::MspHost::launch(false, false, false, &[]) {
+    match msp::MspHost::launch(false, false, false, msp::HostFlags::default()) {
         Ok((host, _events)) => {
             let line = format!("support-{}", host.handshake().sandbox_line());
             host.shutdown();
@@ -3890,7 +3892,7 @@ fn main() {
                     handle_msp(active_host, &stdout, &sessions, &lists, &method, &params);
                 }
             }
-            LoopMsg::Msp(tag, MspEvent::Request { method, params }) => {
+            LoopMsg::Msp(tag, MspEvent::Request { method, params, .. }) => {
                 // Reissued server requests (multi-stage approvals, resumed
                 // questions) carry their own payloads: bridge them too.
                 if let Some(active_host) = host.as_ref()
@@ -3914,8 +3916,8 @@ fn main() {
                                 &params,
                             );
                         }
-                        // reader_loop answers unknown methods with methodNotFound
-                        // before forwarding; this arm is defense in depth.
+                        // The client answers unknown methods with methodNotFound
+                        // and never forwards them; this arm is defense in depth.
                         _ => log(&format!("internal: unhandled known MSP request: {method}")),
                     }
                 }
@@ -3928,7 +3930,7 @@ fn main() {
                 }
                 shutdown::exit(0);
             }
-            LoopMsg::Msp(tag, MspEvent::Eof(why)) => {
+            LoopMsg::Msp(tag, MspEvent::Closed { reason: why }) => {
                 let Some(hosts) = host.as_ref().cloned() else {
                     continue;
                 };
@@ -4076,6 +4078,9 @@ fn main() {
                     shutdown::exit(1);
                 }
             }
+            // Stderr lines are never requested, and a later event kind has
+            // no handler yet.
+            LoopMsg::Msp(_, _) => {}
         }
     }
 }

@@ -13,9 +13,10 @@ use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use muse_msp_client::LaunchConfig;
 
 use crate::json::{J, j_to_string, parse_json};
 
@@ -211,15 +212,15 @@ fn prepare(source: &Path) -> io::Result<Option<HostConfig>> {
 
 /// Never fails the launch: without a view, `muse serve` reads the saved
 /// settings itself, and a refused profile reaches the editor with guidance.
-pub fn configure(cmd: &mut Command) -> Option<HostConfig> {
+pub fn configure(launch: &mut LaunchConfig) -> Option<HostConfig> {
     let source = config_root(
         std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")),
     )?;
-    configure_from(cmd, &source)
+    configure_from(launch, &source)
 }
 
-fn configure_from(cmd: &mut Command, source: &Path) -> Option<HostConfig> {
+fn configure_from(launch: &mut LaunchConfig, source: &Path) -> Option<HostConfig> {
     #[cfg(windows)]
     windows::sweep();
     let prepared = prepare(source);
@@ -234,7 +235,7 @@ fn configure_from(cmd: &mut Command, source: &Path) -> Option<HostConfig> {
             return None;
         }
     };
-    cmd.env("XDG_CONFIG_HOME", &config.root);
+    launch.env("XDG_CONFIG_HOME", &config.root);
     crate::msp::log("using :ask-me for muse serve; saved :auto-review settings remain unchanged");
     Some(config)
 }
@@ -379,15 +380,15 @@ mod tests {
         // The settings stay readable, but the folder cannot be listed.
         fs::set_permissions(&muse, fs::Permissions::from_mode(0o100)).unwrap();
         let listable = fs::read_dir(&muse).is_ok();
-        let mut cmd = Command::new("muse");
-        let config = configure_from(&mut cmd, &source.root);
+        let mut launch = LaunchConfig::new("muse");
+        let config = configure_from(&mut launch, &source.root);
         fs::set_permissions(&muse, fs::Permissions::from_mode(0o700)).unwrap();
         if listable {
             // Permissions do not bind this user (for example, root).
             return;
         }
         assert!(config.is_none());
-        assert!(cmd.get_envs().all(|(key, _)| key != "XDG_CONFIG_HOME"));
+        assert!(launch.get_envs().all(|(key, _)| key != "XDG_CONFIG_HOME"));
     }
 
     /// How Muse saves a file: write a new one, then rename it over the old.
