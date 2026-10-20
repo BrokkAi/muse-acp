@@ -101,13 +101,10 @@ pub struct UiQuestion {
     pub min: u64,
     /// Maximum selections for a multiple-selection question.
     pub max: Option<u64>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum UiStage {
-    Route,
-    Answers,
-    Clarification,
+    /// Internal choice value for the inline clarification path. This is
+    /// chosen after display labels are deduplicated so it cannot alias a
+    /// host-provided answer.
+    pub explain_value: String,
 }
 
 #[derive(Clone)]
@@ -121,10 +118,6 @@ pub struct PendingUi {
     /// `userInput/interrupt`, which also stops this turn.
     pub turn_id: String,
     pub questions: Vec<UiQuestion>,
-    pub stage: UiStage,
-    /// The form shown after choosing structured answers.
-    pub answer_schema: String,
-    pub answer_message: String,
     pub tool_call_id: String,
     /// The question the staged answer form is asking, as an index into
     /// `questions`. Single-question prompts ask `0` directly.
