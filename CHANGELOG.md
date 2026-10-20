@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Document `session/set_model` as a non-standard compatibility method (#305).
+  It is the legacy unstable ACP v0.10 `SetSessionModelRequest`, absent from
+  every current schema, and is kept for older clients and scripts; the
+  adapter never returns the legacy `models` session state that makes
+  compliant clients call it. A test now pins that the standard `model`
+  selector follows a change made through it.
+
 - Implement ACP v2 `auth/logout` and the optional ACP v1 `logout` (#303),
   now advertised as `agentCapabilities.auth.logout`. Logout calls Muse's
   experimental `account/logout` and succeeds only once `account/read`

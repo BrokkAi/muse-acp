@@ -4711,6 +4711,30 @@ fn legacy_set_model_accepts_model_id_and_forwards_to_msp() {
         }),
         "MSP setModel receives the requested modelId: {frames}"
     );
+    // The standard selector follows the legacy change.
+    let answered = frame_index(&c, &format!("\"id\":{model_id}"));
+    let start = Instant::now();
+    loop {
+        let followed = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .skip(answered + 1)
+            .any(|f| {
+                f.contains("\"config_option_update\"")
+                    && f.contains(&sid)
+                    && f.contains("\"currentValue\":\"fake-model\"")
+            });
+        if followed {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "no config_option_update after session/set_model"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     c.finish();
 }
 

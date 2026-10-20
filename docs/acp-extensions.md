@@ -47,6 +47,12 @@ calling one.
 | `_session/async_task/stop` | AIR `asyncTasks` | Stop one background task. Without it, `session/cancel` maps to host stop-all behavior. |
 | `_session/hooks`, `_session/plugins`, and other reads | Their listed opt-ins | When unavailable, use ordinary prompt commands only where the README documents them; otherwise the surface stays absent. |
 
+### Compatibility methods
+
+| Method | Status | Behavior |
+| --- | --- | --- |
+| `session/set_model` | Non-standard. The legacy unstable `SetSessionModelRequest` (ACP v0.10), absent from every current v1 and v2 schema. | Accepts `{sessionId, modelId}`, forwards the id to Muse `session/setModel`, and answers `{"model": modelId}`; Muse's `session/modelChanged` then moves the standard `model` selector through `config_option_update`. New clients should use `session/set_config_option` with the `model` option instead. The adapter never returns the legacy `models` session state, so clients that follow that unstable feature do not call it; it remains for older clients and scripts. |
+
 Subagent updates use the ACP subagent RFD through
 `capabilities.session.subagents` or AIR `nativeSubagentSessions`. Without
 negotiation they fall back to synthesized tool cards.
