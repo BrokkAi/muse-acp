@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Fix two nightly failures introduced this cycle. A `src/diff.rs` test helper
+  used only by Unix tests was dead code on Windows, which failed clippy on
+  both Windows legs. The `muse-msp-client` live test waited only for the
+  `approval/request` server request, which Muse 1.3.0 never sends (it
+  announces approvals with the `approval/requested` notification alone), so
+  the 1.3.0 leg timed out; it now decides each approval once from whichever
+  arrives.
+
 - Render Muse 1.4.11 `scheduledFire` items (#332). A scheduled cron fire
   becomes a "Scheduled job <jobId> fired" card with its occurrence number,
   its scheduled and next fire times in UTC (or "Final delivery" when the
