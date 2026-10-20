@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Advertise the typed terminal auth method only to clients that support
+  terminal auth (#304). ACP v1 clients must send
+  `clientCapabilities.auth.terminal: true`; without it they still receive
+  `muse-login` with the legacy `_meta["terminal-auth"]` command (which Zed
+  and the ACP Registry check read) but no `type: "terminal"`. ACP v2 clients
+  must send `capabilities.auth.terminal: {}`; without it `authMethods` is
+  empty, and auth-required errors ask the user to run `muse login` instead of
+  naming a login button.
+
 - Enforce ACP v2 `session/resume` replay cursors and state snapshots (#322).
   `replayFrom` must be omitted, `null`, or `{"type":"start"}`: an unsupported
   cursor type (such as a custom `_`-prefixed one) or a malformed value (a bare

@@ -13249,10 +13249,12 @@ fn authentication_initialize_failure_has_external_login_guidance() {
 fn terminal_auth_method_runs_muse_acp_login() {
     for version in [1, 2] {
         let mut c = Client::spawn("quiet", &[]);
-        let id = c.req(
-            "initialize",
-            &initialize_params(version, r#","clientCapabilities":{}"#),
-        );
+        let capabilities = if version == 1 {
+            r#","clientCapabilities":{"auth":{"terminal":true}}"#
+        } else {
+            r#","capabilities":{"auth":{"terminal":{}}}"#
+        };
+        let id = c.req("initialize", &initialize_params(version, capabilities));
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
         let reply: serde_json::Value = serde_json::from_str(&frame).expect("initialize json");
         let methods = reply["result"]["authMethods"]
@@ -13297,6 +13299,62 @@ fn terminal_auth_method_runs_muse_acp_login() {
         );
         c.finish();
     }
+}
+
+#[test]
+fn terminal_auth_is_offered_only_to_clients_that_support_it() {
+    // ACP v1 clients without `auth.terminal` keep the legacy description
+    // (which is how older clients and the ACP Registry find the login) but
+    // never the typed terminal method; v2 has no legacy convention.
+    for (version, capabilities) in [
+        (1, r#","clientCapabilities":{}"#),
+        (1, r#","clientCapabilities":{"auth":{"terminal":false}}"#),
+        (1, r#","clientCapabilities":{"auth":{"futureAuth":true}}"#),
+        (2, ""),
+        (2, r#","capabilities":{"auth":{"terminal":null}}"#),
+        (
+            2,
+            r#","capabilities":{"auth":{"futureAuth":{}},"futureCapability":{}}"#,
+        ),
+    ] {
+        let mut c = Client::spawn("quiet", &[]);
+        let id = c.req("initialize", &initialize_params(version, capabilities));
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        let reply: serde_json::Value = serde_json::from_str(&frame).expect("initialize json");
+        let methods = reply["result"]["authMethods"]
+            .as_array()
+            .unwrap_or_else(|| panic!("v{version} {capabilities}: {frame}"));
+        assert!(
+            methods.iter().all(|method| method["type"] != "terminal"),
+            "v{version} {capabilities}: {frame}"
+        );
+        if version == 1 {
+            assert_eq!(methods.len(), 1, "{frame}");
+            assert_eq!(methods[0]["id"], "muse-login", "{frame}");
+            assert_eq!(
+                methods[0]["_meta"]["terminal-auth"]["args"],
+                serde_json::json!(["login"]),
+                "{frame}"
+            );
+        } else {
+            assert!(methods.is_empty(), "{capabilities}: {frame}");
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn logged_out_v2_client_without_terminal_auth_is_told_to_run_muse_login() {
+    let mut c = Client::spawn("account_logged_out", &[]);
+    c.initialize(2, "");
+    let id = c.req("session/new", &format!("{{\"cwd\":{}}}", temp_cwd_json()));
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"code\":-32000"), "{frame}");
+    assert!(
+        frame.contains("muse login") && !frame.contains("Log in with Muse"),
+        "no button was offered, so none is named: {frame}"
+    );
+    c.finish();
 }
 
 #[test]

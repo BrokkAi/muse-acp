@@ -53,6 +53,7 @@ static PLUGINS: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates p
 static COMPUTER_USE: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates computer-use setup
 static AIR_FILE_REPORT: AtomicU64 = AtomicU64::new(0); // 1 when per-turn file reports are negotiated
 static MUSE_NOT_INSTALLED: AtomicBool = AtomicBool::new(false); // host launch found no Muse executable
+static AUTH_TERMINAL: AtomicBool = AtomicBool::new(false); // the client advertises terminal auth
 
 const FILE_REPORT_MAX_PATHS: usize = 1024;
 const FILE_REPORT_MAX_PATH_LENGTH: usize = 4096;
@@ -1801,16 +1802,19 @@ fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
         }
         // Auth-required, so clients show the button that installs Muse.
         Some(_) if id.is_some() && MUSE_NOT_INSTALLED.load(Ordering::SeqCst) => {
-            acp::send_error(
-                stdout,
-                &id,
-                -32000,
-                &format!(
+            let message = if login_method_offered() {
+                format!(
                     "Muse Code is not installed. Choose **{AUTH_METHOD_NAME_INSTALL}** to install \
                      it and log in, or install it yourself \
                      (https://dev.meta.ai/docs/muse-code) and restart the agent. ({reason})"
-                ),
-            );
+                )
+            } else {
+                format!(
+                    "Muse Code is not installed. Install it (https://dev.meta.ai/docs/muse-code), \
+                     run `muse login`, and restart the agent. ({reason})"
+                )
+            };
+            acp::send_error(stdout, &id, -32000, &message);
         }
         Some(_) if id.is_some() => {
             let code = if msp::auth_failure(reason).is_some() {
@@ -1842,14 +1846,21 @@ fn reject_if_logged_out(host: &Hosts, stdout: &StdoutShared, id: &Option<J>) -> 
     }
     // Shown above the client's login buttons, so lead with the button; the
     // manual route covers clients without terminal auth.
-    acp::send_error(
-        stdout,
-        id,
-        -32000,
+    let message = if login_method_offered() {
         "Muse is not logged in. Choose **Log in with Muse** to approve a code in your browser, \
-         or run `muse login` where muse-acp runs and restart the agent.",
-    );
+         or run `muse login` where muse-acp runs and restart the agent."
+    } else {
+        "Muse is not logged in. Run `muse login` where muse-acp runs, approve the code in your \
+         browser, and restart the agent."
+    };
+    acp::send_error(stdout, id, -32000, message);
     true
+}
+
+/// Whether `initialize` offered the client a login method: always on ACP v1
+/// (typed or legacy), and on ACP v2 only to clients with terminal auth.
+fn login_method_offered() -> bool {
+    negotiated_ver() == 1 || AUTH_TERMINAL.load(Ordering::SeqCst)
 }
 
 /// The single ACP auth method: terminal auth that re-runs this adapter as
@@ -1873,6 +1884,20 @@ fn auth_method_label() -> (&'static str, &'static str) {
     }
 }
 
+/// Whether the client advertised terminal authentication: ACP v1's
+/// `clientCapabilities.auth.terminal: true`, or ACP v2's
+/// `capabilities.auth.terminal` object. Absent, `null`, or any other shape
+/// advertises nothing.
+fn client_supports_terminal_auth(capabilities: Option<&J>, ver: u64) -> bool {
+    let terminal = capabilities
+        .and_then(|c| c.get("auth"))
+        .and_then(|auth| auth.get("terminal"));
+    match ver {
+        1 => matches!(terminal, Some(J::Bool(true))),
+        _ => matches!(terminal, Some(J::Obj(_))),
+    }
+}
+
 fn auth_methods_v1() -> String {
     let (name, description) = auth_method_label();
     // Clients predating the typed method read the `_meta` terminal-auth
@@ -1888,15 +1913,31 @@ fn auth_methods_v1() -> String {
             )
         })
         .unwrap_or_default();
+    // The typed terminal method is reserved for clients that advertise
+    // terminal auth. Others keep only the legacy description, which is how
+    // clients (and the ACP Registry check) that predate the typed method
+    // find the login.
+    let typed = if AUTH_TERMINAL.load(Ordering::SeqCst) {
+        r#","type":"terminal","args":["login"]"#
+    } else {
+        ""
+    };
     format!(
-        r#"[{{"id":{},"name":{},"description":{},"type":"terminal","args":["login"]{legacy}}}]"#,
+        r#"[{{"id":{},"name":{},"description":{}{typed}{legacy}}}]"#,
         esc(AUTH_METHOD_ID),
         esc(name),
         esc(description)
     )
 }
 
+/// ACP v2 has no legacy terminal-auth convention, and an agent may advertise
+/// a terminal method only to a client that supports terminal auth. Without
+/// it there is no login the client could start, so none is advertised and
+/// auth-required errors explain `muse login` instead.
 fn auth_methods_v2() -> String {
+    if !AUTH_TERMINAL.load(Ordering::SeqCst) {
+        return "[]".to_string();
+    }
     let (name, description) = auth_method_label();
     format!(
         r#"[{{"methodId":{},"name":{},"description":{},"type":"terminal","args":["login"]}}]"#,
@@ -4372,6 +4413,11 @@ fn negotiate_acp(msg: &J) -> Result<bool, AcpInitializeError> {
         .and_then(|e| e.get("form"))
         .is_some_and(|f| matches!(f, J::Obj(_)));
     ELICIT_FORM.store(u64::from(form), Ordering::SeqCst);
+    let terminal_auth = client_supports_terminal_auth(capabilities, v);
+    AUTH_TERMINAL.store(terminal_auth, Ordering::SeqCst);
+    if !terminal_auth {
+        log("client did not advertise terminal auth; no typed terminal login method is offered");
+    }
     let subagents = client_supports_subagents(capabilities);
     NATIVE_SUBAGENTS.store(u64::from(subagents), Ordering::SeqCst);
     let compaction = client_supports_compaction(capabilities, v);
