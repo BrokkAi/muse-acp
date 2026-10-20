@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Return the inserted user message's `messageId` from every successful ACP v2
+  `session/prompt` (#321), including local commands such as `/goal`, `/plan`,
+  `/compact`, `/recap`, `/feedback`, `/cua`, and `/skill-import`. The
+  `user_message` update now carries the same id instead of a separately
+  minted one, and repeated prompts receive distinct ids. A local command
+  handled from idle reports `running` before its `idle(end_turn)`, and a
+  `/feedback` form stopped or closed before its prompt was inserted answers
+  `-32800` instead of an empty success. `muse-acp-client` exposes the receipt
+  as `PromptResponse::message_id`.
+
 - Handle ACP v2 JSON-RPC batch arrays (#319). An empty batch receives one
   `-32600` object with `id: null`; each valid entry is dispatched as if it
   arrived alone; invalid entries receive their own `-32600` without failing

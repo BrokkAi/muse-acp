@@ -3957,14 +3957,38 @@ fn negotiated_ver() -> u8 {
     }
 }
 
-fn send_v2_user_message(stdout: &StdoutShared, sid: &str, content: &str) {
+/// Accept an ACP v2 prompt: answer with the inserted user message's
+/// `messageId`, then report that message under the same id. Acceptance means
+/// insertion, so every successful v2 `session/prompt` path answers here
+/// rather than with an empty result.
+fn accept_v2_prompt(stdout: &StdoutShared, prompt_req: &Option<J>, sid: &str, content: &str) {
     let msg_id = mint_id("msg-", &ID_COUNTER);
+    acp::send_result(
+        stdout,
+        prompt_req,
+        &format!("{{\"messageId\":{}}}", esc(&msg_id)),
+    );
+    send_v2_user_message(stdout, sid, &msg_id, content);
+}
+
+/// Answer an ACP v2 prompt that was cancelled before its message was
+/// inserted. Only an inserted prompt may succeed.
+fn cancel_v2_prompt_before_insertion(stdout: &StdoutShared, prompt_req: &Option<J>) {
+    acp::send_error(
+        stdout,
+        prompt_req,
+        -32800,
+        "the prompt was cancelled before it was accepted",
+    );
+}
+
+fn send_v2_user_message(stdout: &StdoutShared, sid: &str, msg_id: &str, content: &str) {
     acp::send_raw(
         stdout,
         &format!(
             "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"user_message\",\"messageId\":{},\"content\":{}}}}}}}",
             esc(sid),
-            esc(&msg_id),
+            esc(msg_id),
             content
         ),
     );
@@ -5981,8 +6005,7 @@ fn handle_acp(
                             s.active_turn = Some(turn.to_string());
                             drop(map);
                             if ver == 2 {
-                                acp::send_result(stdout, &id, "{}");
-                                send_v2_user_message(stdout, &sid, &acp_content);
+                                accept_v2_prompt(stdout, &id, &sid, &acp_content);
                                 acp::send_state(stdout, &sid, "running", None);
                             } else {
                                 // v1: the prompt response arrives with the
@@ -5996,13 +6019,13 @@ fn handle_acp(
                             .is_some_and(|s| s.active_turn.is_some() || !s.in_flight.is_empty());
                         drop(map);
                         if ver == 2 {
-                            acp::send_result(stdout, &id, "{}");
-                            send_v2_user_message(stdout, &sid, &acp_content);
+                            // A local command uses the foreground lifecycle
+                            // even without model work: running, then idle.
                             // The command is done, not the session: a turn
                             // that is still running keeps it running.
-                            if busy {
-                                acp::send_state(stdout, &sid, "running", None);
-                            } else {
+                            accept_v2_prompt(stdout, &id, &sid, &acp_content);
+                            acp::send_state(stdout, &sid, "running", None);
+                            if !busy {
                                 acp::send_state(stdout, &sid, "idle", Some("end_turn"));
                             }
                         } else {
@@ -6065,10 +6088,17 @@ fn handle_acp(
                 }
                 let note = "Plan mode is on: Muse can read and plan, but cannot write files or run shell commands. Change the mode to implement.";
                 if ver == 2 {
-                    acp::send_result(stdout, &id, "{}");
-                    send_v2_user_message(stdout, &sid, &acp_content);
+                    let busy = sessions
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .get(&sid)
+                        .is_some_and(|s| s.active_turn.is_some() || !s.in_flight.is_empty());
+                    accept_v2_prompt(stdout, &id, &sid, &acp_content);
+                    acp::send_state(stdout, &sid, "running", None);
                     send_agent_text(stdout, &sid, ver, note);
-                    acp::send_state(stdout, &sid, "idle", Some("end_turn"));
+                    if !busy {
+                        acp::send_state(stdout, &sid, "idle", Some("end_turn"));
+                    }
                 } else {
                     send_v1_user_message(stdout, &sid, &acp_content);
                     send_agent_text(stdout, &sid, ver, note);
@@ -6141,14 +6171,12 @@ fn handle_acp(
                         .unwrap_or_else(|p| p.into_inner())
                         .get(&sid)
                         .is_some_and(|s| s.active_turn.is_some() || !s.in_flight.is_empty());
-                    acp::send_result(stdout, &id, "{}");
-                    send_v2_user_message(stdout, &sid, &acp_content);
+                    accept_v2_prompt(stdout, &id, &sid, &acp_content);
+                    acp::send_state(stdout, &sid, "running", None);
                     note(stdout);
                     // The command is done, not the session: a turn that is
                     // still running keeps it running.
-                    if busy {
-                        acp::send_state(stdout, &sid, "running", None);
-                    } else {
+                    if !busy {
                         acp::send_state(stdout, &sid, "idle", Some("end_turn"));
                     }
                 } else {
@@ -6253,10 +6281,10 @@ fn handle_acp(
                         }
                     }
                     if ver == 2 {
-                        // Accepted: empty response, then the user-message echo
-                        // (v2 MUST), then running.
-                        acp::send_result(stdout, &id, "{}");
-                        send_v2_user_message(stdout, &sid, &acp_content);
+                        // Accepted: the inserted message's id, then the
+                        // user-message echo under that id (v2 MUST), then
+                        // running.
+                        accept_v2_prompt(stdout, &id, &sid, &acp_content);
                         acp::send_state(stdout, &sid, "running", None);
                     } else {
                         // v1 prompt flow echoes user content as chunks.
@@ -6867,7 +6895,7 @@ fn handle_acp(
             // echoes chunks like its prompt flow and has no state update.
             acp::send_result(stdout, &id, &format!("{{\"outcome\":{}}}", esc(outcome)));
             if negotiated_ver() == 2 {
-                send_v2_user_message(stdout, &sid, &acp_content);
+                send_v2_user_message(stdout, &sid, &mint_id("msg-", &ID_COUNTER), &acp_content);
                 acp::send_state(stdout, &sid, "running", None);
             } else {
                 send_v1_user_message(stdout, &sid, &acp_content);
@@ -12995,7 +13023,9 @@ fn drop_acp_session(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) -
             if let Some(f) = s.pending_feedback {
                 acp::send_cancel_request(stdout, &f.req_id);
                 if s.ver == 2 {
-                    acp::send_result(stdout, &Some(f.prompt_req), "{}");
+                    // The feedback form runs before its prompt is inserted,
+                    // so closing prevented insertion.
+                    cancel_v2_prompt_before_insertion(stdout, &Some(f.prompt_req));
                     acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
                 } else {
                     acp::send_result(
@@ -13609,21 +13639,18 @@ fn settle_command_with_text(
 ) {
     let prompt_req = Some(prompt_req.clone());
     if ver == 2 {
-        acp::send_result(stdout, &prompt_req, "{}");
-        if !prompt_content.is_empty() {
-            send_v2_user_message(stdout, acp_sid, prompt_content);
-        }
-        send_agent_text(stdout, acp_sid, ver, text);
-        // The command is done, not the session: a turn that is still running
-        // keeps it running.
+        // A local command uses the foreground lifecycle even without model
+        // work: running, then idle. The command is done, not the session: a
+        // turn that is still running keeps it running.
         let busy = sessions
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(acp_sid)
             .is_some_and(|s| s.active_turn.is_some() || !s.in_flight.is_empty());
-        if busy {
-            acp::send_state(stdout, acp_sid, "running", None);
-        } else {
+        accept_v2_prompt(stdout, &prompt_req, acp_sid, prompt_content);
+        acp::send_state(stdout, acp_sid, "running", None);
+        send_agent_text(stdout, acp_sid, ver, text);
+        if !busy {
             acp::send_state(stdout, acp_sid, "idle", Some("end_turn"));
         }
     } else {
@@ -13711,8 +13738,7 @@ fn start_recap(
         return;
     }
     if ver == 2 {
-        acp::send_result(stdout, &prompt_req, "{}");
-        send_v2_user_message(stdout, acp_sid, prompt_content);
+        accept_v2_prompt(stdout, &prompt_req, acp_sid, prompt_content);
         acp::send_state(stdout, acp_sid, "running", None);
     } else {
         send_v1_user_message(stdout, acp_sid, prompt_content);
@@ -14443,7 +14469,9 @@ fn settle_feedback_cancelled(stdout: &StdoutShared, sessions: &Sessions, acp_sid
     };
     acp::send_cancel_request(stdout, &pending.req_id);
     if pending.ver == 2 {
-        acp::send_result(stdout, &Some(pending.prompt_req), "{}");
+        // The form runs before the prompt is inserted, so a stop prevents
+        // insertion.
+        cancel_v2_prompt_before_insertion(stdout, &Some(pending.prompt_req));
         acp::send_state(stdout, acp_sid, "idle", Some("cancelled"));
     } else {
         acp::send_result(

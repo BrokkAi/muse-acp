@@ -93,9 +93,20 @@ fn exercise_protocol(version: ProtocolVersion, label: &str) {
     let session = client
         .new_session(NewSessionRequest::new(root.join("workspace")))
         .expect("new session");
-    client
+    let prompted = client
         .prompt(PromptRequest::text(&session.session_id, "Say hello"))
         .expect("prompt");
+    match version {
+        ProtocolVersion::V2 => assert!(
+            prompted
+                .message_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty()),
+            "v2 prompts are accepted with the inserted message id: {:?}",
+            prompted.raw
+        ),
+        _ => assert_eq!(prompted.message_id, None, "{:?}", prompted.raw),
+    }
 
     assert_agent_message(&client, Instant::now() + Duration::from_secs(3));
     client.close().expect("close client");

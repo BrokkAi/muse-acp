@@ -339,7 +339,12 @@ error the editor shows if Muse then refuses the profile says why.
   cancellation with a terminal event, and exact-turn steering over the
   `_session/steering` extension (ACP v1 and v2). A declined retract keeps the
   prompt and turn targetable until Muse's interrupt terminal arrives; accepted
-  or legacy retracts settle the prompt as cancelled immediately.
+  or legacy retracts settle the prompt as cancelled immediately. On ACP v2
+  every accepted prompt, local commands included, is answered with the
+  inserted user message's `messageId`, and the `user_message` update reuses
+  it. A local command handled from idle reports `running` before its
+  `idle(end_turn)`; a `/feedback` form stopped before the prompt is inserted
+  answers `-32800`.
 - **Approvals** — Muse approval requests surfaced as
   `session/request_permission`, with a deny-safe fallback that explains
   failed or unusable editor replies in the transcript, plus optional
