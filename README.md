@@ -64,9 +64,11 @@ flowchart TD
     D -- deny --> F[approval/decide with a rejecting choice + rationale]
 ```
 
-Auto-review is off by default. Select **On** in the **Auto-review**
-selector, next to Approval Mode in clients that render ACP `configOptions`,
-and it applies to that session only. See the
+Auto-review is off by default. Turn on the **Auto-review** toggle (ACP v2,
+or ACP v1 clients that advertise
+`clientCapabilities.session.configOptions.boolean`) or select **On** in the
+**Auto-review** selector (other ACP v1 clients), next to Approval Mode in
+clients that render ACP `configOptions`, and it applies to that session only. See the
 [Auto-review guide](docs/auto-review.md) for the policy, the reviewer's
 inputs, the decision thresholds, and the failure behavior.
 

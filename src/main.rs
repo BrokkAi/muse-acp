@@ -54,6 +54,7 @@ static COMPUTER_USE: AtomicU64 = AtomicU64::new(0); // 1 when the client negotia
 static AIR_FILE_REPORT: AtomicU64 = AtomicU64::new(0); // 1 when per-turn file reports are negotiated
 static MUSE_NOT_INSTALLED: AtomicBool = AtomicBool::new(false); // host launch found no Muse executable
 static AUTH_TERMINAL: AtomicBool = AtomicBool::new(false); // the client advertises terminal auth
+static BOOLEAN_CONFIG: AtomicBool = AtomicBool::new(false); // boolean config options may be offered
 
 const FILE_REPORT_MAX_PATHS: usize = 1024;
 const FILE_REPORT_MAX_PATH_LENGTH: usize = 4096;
@@ -152,6 +153,18 @@ fn client_supports_subagents(capabilities: Option<&J>) -> bool {
 
 /// ACP v2 has no compaction capability gate. ACP v1 requires
 /// `clientCapabilities.session.compaction: {}`.
+/// Whether `configOptions` may carry `type: "boolean"` entries: always in
+/// ACP v2, and in ACP v1 only after
+/// `clientCapabilities.session.configOptions.boolean`.
+fn client_supports_boolean_config(capabilities: Option<&J>, ver: u64) -> bool {
+    ver >= 2
+        || capabilities
+            .and_then(|caps| caps.get("session"))
+            .and_then(|session| session.get("configOptions"))
+            .and_then(|options| options.get("boolean"))
+            .is_some_and(|boolean| matches!(boolean, J::Obj(_)))
+}
+
 fn client_supports_compaction(capabilities: Option<&J>, ver: u64) -> bool {
     ver >= 2
         || capabilities
@@ -3378,6 +3391,7 @@ fn config_options_with_models(
             reasoning_effort: &s.reasoning_effort,
             offer_muse_default: s.reasoning_effort_source.is_none(),
             auto_review: s.auto_review,
+            boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
             recommendations: (
                 recommended_model(models).as_deref(),
                 recommended_reasoning(s, models).as_deref(),
@@ -4482,6 +4496,10 @@ fn negotiate_acp(msg: &J) -> Result<bool, AcpInitializeError> {
         .and_then(|e| e.get("form"))
         .is_some_and(|f| matches!(f, J::Obj(_)));
     ELICIT_FORM.store(u64::from(form), Ordering::SeqCst);
+    BOOLEAN_CONFIG.store(
+        client_supports_boolean_config(capabilities, v),
+        Ordering::SeqCst,
+    );
     let terminal_auth = client_supports_terminal_auth(capabilities, v);
     AUTH_TERMINAL.store(terminal_auth, Ordering::SeqCst);
     if !terminal_auth {
@@ -4862,6 +4880,7 @@ fn handle_acp(
                                     reasoning_effort: &reasoning_new,
                                     offer_muse_default: offer_default_new,
                                     auto_review: false,
+                                    boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
                                     recommendations: (
                                         recommended_model(&models).as_deref(),
                                         recommended_reasoning_for(&cur_model, None, &models)
@@ -4885,6 +4904,7 @@ fn handle_acp(
                                     reasoning_effort: &reasoning_new,
                                     offer_muse_default: offer_default_new,
                                     auto_review: false,
+                                    boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
                                     recommendations: (
                                         recommended_model(&models).as_deref(),
                                         recommended_reasoning_for(&cur_model, None, &models)
@@ -5409,6 +5429,7 @@ fn handle_acp(
                                     reasoning_effort: &reasoning_v,
                                     offer_muse_default: offer_default_v,
                                     auto_review: auto_review_v,
+                                    boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
                                     recommendations: (
                                         recommended_model(&models).as_deref(),
                                         recommended_v.as_deref(),
@@ -5431,6 +5452,7 @@ fn handle_acp(
                                     reasoning_effort: &reasoning_v,
                                     offer_muse_default: offer_default_v,
                                     auto_review: auto_review_v,
+                                    boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
                                     recommendations: (
                                         recommended_model(&models).as_deref(),
                                         recommended_v.as_deref(),
@@ -5870,6 +5892,7 @@ fn handle_acp(
                                     reasoning_effort: &reasoning_out,
                                     offer_muse_default: offer_default_out,
                                     auto_review: auto_review_out,
+                                    boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
                                     recommendations: (
                                         recommended_model(&models).as_deref(),
                                         recommended_out.as_deref(),
@@ -5892,6 +5915,7 @@ fn handle_acp(
                                     reasoning_effort: &reasoning_out,
                                     offer_muse_default: offer_default_out,
                                     auto_review: auto_review_out,
+                                    boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
                                     recommendations: (
                                         recommended_model(&models).as_deref(),
                                         recommended_out.as_deref(),
@@ -7612,12 +7636,26 @@ fn handle_acp(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
-            let value = params
-                .as_ref()
-                .and_then(|p| p.get("value"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            // A boolean value (`type: "boolean"`) is only meaningful for the
+            // Auto-review toggle; it maps onto the selector's own ids.
+            let value = match params.as_ref().and_then(|p| p.get("value")) {
+                Some(J::Bool(on)) if key == "auto_review" => if *on {
+                    acp::AUTO_REVIEW_ON
+                } else {
+                    acp::AUTO_REVIEW_OFF
+                }
+                .to_string(),
+                Some(J::Bool(_)) => {
+                    acp::send_error(
+                        stdout,
+                        &id,
+                        -32602,
+                        &format!("{key} takes a value id, not a boolean"),
+                    );
+                    return;
+                }
+                value => value.and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            };
             let msp_sid = match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
                 Some(s) => s.msp_sid.clone(),
                 None => {

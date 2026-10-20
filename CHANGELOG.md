@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Offer Auto-review as an ACP boolean config option (#309). ACP v2 clients,
+  and ACP v1 clients that advertise
+  `clientCapabilities.session.configOptions.boolean`, get a
+  `type: "boolean"` toggle; other v1 clients keep the `off`/`on` selector.
+  `session/set_config_option` accepts `type: "boolean"` values for it (and
+  still the `off`/`on` ids), and refuses a boolean for any other option with
+  `-32602`.
+
 - Document `session/set_model` as a non-standard compatibility method (#305).
   It is the legacy unstable ACP v0.10 `SetSessionModelRequest`, absent from
   every current schema, and is kept for older clients and scripts; the
