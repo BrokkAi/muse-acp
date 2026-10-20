@@ -1050,6 +1050,18 @@ def on_turn_start(params):
             "turnId": tid, "status": "rejected", "tool": "write_file",
             "args": json.dumps({"path": "not-written.txt"})}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "streamed_output":
+        item = {"itemId": "it-stream", "kind": "toolCall",
+                "callId": "call-stream", "turnId": tid, "tool": "bash",
+                "args": json.dumps({"command": "make"})}
+        notify("item/started", {**base, "item": {**item, "status": "inProgress"}})
+        for n, chunk in enumerate(("building\n", "done\n")):
+            notify("item/delta", {**base, "itemId": "it-stream",
+                                  "field": "output", "delta": chunk,
+                                  "viewCursor": f"cur-stream-{n}"})
+        notify("item/completed", {**base, "item": {
+            **item, "status": "completed", "visibleOutput": "building\ndone\n"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "patch_edit":
         body = json.dumps(patch_document())
         notify("item/completed", {**base, "item": {

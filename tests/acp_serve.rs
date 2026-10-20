@@ -1717,6 +1717,39 @@ fn file_tools_carry_absolute_follow_along_locations() {
 }
 
 #[test]
+fn streamed_tool_output_appends_v2_content_chunks() {
+    for ver in [1u64, 2] {
+        let mut c = Client::spawn("streamed_output", &[]);
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "build");
+        let done = c.wait_for_all(
+            &["call-stream", "\"status\":\"completed\""],
+            Duration::from_secs(15),
+        );
+        assert!(done.contains("building\\ndone\\n"), "{done}");
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let chunks: Vec<&String> = frames
+            .iter()
+            .filter(|f| f.contains("tool_call_content_chunk"))
+            .collect();
+        if ver == 1 {
+            assert!(chunks.is_empty(), "{chunks:?}");
+        } else {
+            assert_eq!(chunks.len(), 2, "{frames:?}");
+            assert!(chunks[0].contains("\"toolCallId\":\"call-stream\""));
+            assert!(chunks[0].contains("building\\n") && chunks[1].contains("done\\n"));
+            let completed = frames.iter().position(|f| f == &done).unwrap();
+            let last_chunk = frames
+                .iter()
+                .rposition(|f| f.contains("tool_call_content_chunk"))
+                .unwrap();
+            assert!(last_chunk < completed, "chunks precede the replacement");
+        }
+        c.finish();
+    }
+}
+
+#[test]
 fn stored_tool_patches_become_v2_diff_content() {
     let mut c = Client::spawn("patch_edit", &[]);
     let sid = c.new_session(2, "");

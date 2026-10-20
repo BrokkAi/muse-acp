@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Append streamed tool output with ACP v2 `tool_call_content_chunk` (#307).
+  Muse streams a tool or shell card's `visibleOutput` as `item/delta` on the
+  `output` field, which the adapter used to drop, so running cards stayed
+  empty until completion. ACP v2 now appends each delta to the card, up to
+  the display budget; the completion still replaces the whole content with
+  the bounded final output, so clients end with what a replacement alone
+  would show. ACP v1 is unchanged.
+
 - Extract the adapter's Muse Session Protocol client into the workspace-local
   `muse-msp-client` crate (#328), so tools can drive `muse serve` without any
   ACP code. It launches a host from an explicit configuration (executable,

@@ -293,6 +293,9 @@ pub struct SessionFold {
     /// ACP v2 `diff` content fetched for a completed tool's stored patch,
     /// keyed by item id and taken once by that item's completion card.
     pub patch_diffs: HashMap<String, String>,
+    /// Characters of streamed tool output already appended per item id, so
+    /// appends stop at the display budget the completion card applies.
+    streamed_output: HashMap<String, usize>,
     /// ACP monitor cards already announced for a durable monitor task id.
     /// Later feed items update the same row instead of minting one per event
     /// batch.
@@ -359,6 +362,7 @@ impl SessionFold {
         Self {
             workspace_root: String::new(),
             patch_diffs: HashMap::new(),
+            streamed_output: HashMap::new(),
             items: HashMap::new(),
             subagents: HashMap::new(),
             done: std::collections::HashSet::new(),
@@ -2457,6 +2461,37 @@ impl SessionFold {
             Some(s) if !s.is_empty() => s,
             _ => return,
         };
+        // Tool and shell output (`visibleOutput`) streams as `output`. ACP v2
+        // appends it to the card with `tool_call_content_chunk`; v1 has no
+        // append, so its card keeps the completion's full content. Appends
+        // stop at the display budget, and the completion still replaces the
+        // whole collection with the bounded final text, so the client ends
+        // with exactly what a replacement alone would have shown.
+        if field == "output" {
+            if ver != 2 {
+                return;
+            }
+            let Some(ItemRole::Tool { tc_id, .. }) = self.items.get(item_id) else {
+                return;
+            };
+            let tc_id = tc_id.clone();
+            let streamed = self.streamed_output.entry(item_id.to_string()).or_insert(0);
+            let budget = max_content().saturating_sub(*streamed);
+            let text: String = delta.chars().take(budget).collect();
+            if text.is_empty() {
+                return;
+            }
+            *streamed += text.chars().count();
+            out.push(Self::update_line(
+                acp_sid,
+                &format!(
+                    "{{\"sessionUpdate\":\"tool_call_content_chunk\",\"toolCallId\":{},\"content\":{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}",
+                    esc(&tc_id),
+                    esc(&text)
+                ),
+            ));
+            return;
+        }
         if field == "text" {
             match self.items.get_mut(item_id) {
                 Some(ItemRole::Message { msg_id, streamed }) => {
@@ -2513,6 +2548,13 @@ impl SessionFold {
 
     /// item/completed carries the authoritative final object.
     pub fn on_item_completed(&mut self, acp_sid: &str, ver: u8, params: &J, out: &mut Vec<String>) {
+        if let Some(item_id) = params
+            .get("item")
+            .and_then(|item| item.get("itemId"))
+            .and_then(J::as_str)
+        {
+            self.streamed_output.remove(item_id);
+        }
         let item = match params.get("item") {
             Some(i) => i,
             None => return,
@@ -3399,6 +3441,104 @@ mod corpus_tests {
             None,
             "a relative path needs an absolute workspace root"
         );
+    }
+
+    #[test]
+    fn streamed_tool_output_appends_content_chunks_on_v2_only() {
+        let started = parse_json(
+            r#"{"itemId":"it-run","kind":"toolCall","callId":"call-run","tool":"bash","args":"{\"command\":\"make\"}","status":"inProgress","revision":1}"#,
+        )
+        .unwrap();
+        let delta = |text: &str| {
+            parse_json(&format!(
+                r#"{{"itemId":"it-run","field":"output","delta":{},"sessionId":"s","viewCursor":"c"}}"#,
+                crate::json::esc(text)
+            ))
+            .unwrap()
+        };
+        for ver in [1u8, 2] {
+            let mut fold = SessionFold::new();
+            let mut out = Vec::new();
+            fold.on_item_snapshot("sid", ver, &started, &mut out);
+            out.clear();
+            fold.on_item_delta("sid", ver, &delta("building\n"), &mut out);
+            fold.on_item_delta("sid", ver, &delta("done\n"), &mut out);
+            // A delta for an item without a card has nowhere to go.
+            fold.on_item_delta(
+                "sid",
+                ver,
+                &parse_json(r#"{"itemId":"it-unknown","field":"output","delta":"x"}"#).unwrap(),
+                &mut out,
+            );
+            if ver == 1 {
+                assert!(out.is_empty(), "v1 has no append: {out:?}");
+                continue;
+            }
+            assert_eq!(out.len(), 2, "{out:?}");
+            let chunk = parse_json(&out[0]).unwrap();
+            let update = chunk.get("params").and_then(|p| p.get("update")).unwrap();
+            assert_eq!(
+                update.get("sessionUpdate").and_then(J::as_str),
+                Some("tool_call_content_chunk")
+            );
+            assert_eq!(
+                update.get("toolCallId").and_then(J::as_str),
+                Some("call-run")
+            );
+            assert_eq!(
+                update
+                    .get("content")
+                    .and_then(|c| c.get("content"))
+                    .and_then(|c| c.get("text"))
+                    .and_then(J::as_str),
+                Some("building\n")
+            );
+            // The completion still replaces the whole collection.
+            out.clear();
+            fold.on_item_completed(
+                "sid",
+                ver,
+                &parse_json(
+                    r#"{"item":{"itemId":"it-run","kind":"toolCall","callId":"call-run","tool":"bash","status":"completed","visibleOutput":"building\ndone\n"}}"#,
+                )
+                .unwrap(),
+                &mut out,
+            );
+            assert!(
+                out[0].contains(r#""content":[{"type":"content","content":{"type":"text","text":"building\ndone\n"}}]"#),
+                "{out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn streamed_tool_output_stops_at_the_display_budget() {
+        let started = parse_json(
+            r#"{"itemId":"it-big","kind":"toolCall","callId":"call-big","tool":"bash","status":"inProgress"}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &started, &mut out);
+        out.clear();
+        let big = "x".repeat(max_content() + 10);
+        let delta = parse_json(&format!(
+            r#"{{"itemId":"it-big","field":"output","delta":"{big}"}}"#
+        ))
+        .unwrap();
+        fold.on_item_delta("sid", 2, &delta, &mut out);
+        fold.on_item_delta("sid", 2, &delta, &mut out);
+        assert_eq!(out.len(), 1, "appends stop at the budget");
+        let chunk = parse_json(&out[0]).unwrap();
+        let text = chunk
+            .get("params")
+            .and_then(|p| p.get("update"))
+            .and_then(|u| u.get("content"))
+            .and_then(|c| c.get("content"))
+            .and_then(|c| c.get("text"))
+            .and_then(J::as_str)
+            .unwrap();
+        assert_eq!(text.chars().count(), max_content());
     }
 
     #[test]
