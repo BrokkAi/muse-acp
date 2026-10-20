@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.15.0
 
 - Build release binaries with Rust 1.99.1 (previously 1.98.1). The minimum
   Rust version for source builds stays 1.88.
