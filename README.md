@@ -772,6 +772,13 @@ Muse's installer puts `muse` in `~/.local/bin` (`%LOCALAPPDATA%\Programs\muse`
 on Windows, or `MUSE_INSTALL_DIR`), and the adapter looks there when `muse` is
 not on the editor's `PATH`.
 
+Clients that can open a URL elicitation (`elicitation.url`) also get an
+agent-handled method, `muse-device-login`: `auth/login` (v2) or `authenticate`
+(v1) starts Muse's device-code login, the editor opens Muse's sign-in page
+with the code to confirm, and the request succeeds once Muse grants the
+login. Declining the page cancels the login. No credential passes through
+ACP; Muse stores it as `muse login` would.
+
 ACP `auth/logout` (v2) and `logout` (v1, advertised as
 `agentCapabilities.auth.logout`) clear Muse's stored login through Muse's
 `account/logout` and succeed only once `account/read` reports no credential;

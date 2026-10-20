@@ -13901,6 +13901,95 @@ fn logout_clears_the_muse_credential_and_gates_new_sessions() {
 }
 
 #[test]
+fn device_login_is_offered_only_to_clients_that_can_open_a_url() {
+    for (version, capabilities, offered) in [
+        (2, r#","capabilities":{"elicitation":{"url":{}}}"#, true),
+        (2, r#","capabilities":{"elicitation":{"form":{}}}"#, false),
+        (
+            1,
+            r#","clientCapabilities":{"elicitation":{"url":{}}}"#,
+            true,
+        ),
+        (1, r#","clientCapabilities":{}"#, false),
+    ] {
+        let mut c = Client::spawn("quiet", &[]);
+        let id = c.req("initialize", &initialize_params(version, capabilities));
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert_eq!(
+            frame.contains("muse-device-login"),
+            offered,
+            "v{version} {capabilities}: {frame}"
+        );
+        if offered && version == 2 {
+            assert!(frame.contains("\"type\":\"agent\""), "{frame}");
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn device_login_hands_the_browser_step_to_a_url_elicitation() {
+    for (outcome, granted) in [("granted", true), ("expired", false)] {
+        let mut c = Client::spawn("quiet", &[("FAKE_LOGIN_OUTCOME", outcome)]);
+        c.initialize(2, r#","capabilities":{"elicitation":{"url":{}}}"#);
+        let login = c.req("auth/login", r#"{"methodId":"muse-device-login"}"#);
+        let elicit = c.wait_for("\"mode\":\"url\"", Duration::from_secs(15));
+        let elicit: serde_json::Value = serde_json::from_str(&elicit).expect("elicitation JSON");
+        let params = &elicit["params"];
+        assert_eq!(
+            params["url"], "https://login.example.test/device",
+            "{elicit}"
+        );
+        assert_eq!(
+            params["requestId"], login,
+            "request-scoped to the login: {elicit}"
+        );
+        assert!(
+            params["message"].as_str().unwrap().contains("ABCD-EFGH"),
+            "{elicit}"
+        );
+        let elicitation_id = params["elicitationId"].as_str().unwrap().to_string();
+        // Opening the page is consent only; the login waits for Muse.
+        c.raw(&format!(
+            r#"{{"jsonrpc":"2.0","id":{},"result":{{"action":"accept"}}}}"#,
+            elicit["id"]
+        ));
+        let done = c.wait_for(&format!("\"id\":{login}"), Duration::from_secs(15));
+        let completed = c.wait_for("elicitation/complete", Duration::from_secs(15));
+        assert!(completed.contains(&elicitation_id), "{completed}");
+        if granted {
+            assert!(done.contains("\"result\":{}"), "{done}");
+        } else {
+            assert!(
+                done.contains("\"code\":-32000") && done.contains("expired"),
+                "{done}"
+            );
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn declining_the_login_page_cancels_the_device_login() {
+    let mut c = Client::spawn("quiet", &[("FAKE_LOGIN_OUTCOME", "wait")]);
+    c.initialize(2, r#","capabilities":{"elicitation":{"url":{}}}"#);
+    let login = c.req("auth/login", r#"{"methodId":"muse-device-login"}"#);
+    let elicit = c.wait_for("\"mode\":\"url\"", Duration::from_secs(15));
+    let elicit: serde_json::Value = serde_json::from_str(&elicit).expect("elicitation JSON");
+    c.raw(&format!(
+        r#"{{"jsonrpc":"2.0","id":{},"result":{{"action":"decline"}}}}"#,
+        elicit["id"]
+    ));
+    let done = c.wait_for(&format!("\"id\":{login}"), Duration::from_secs(15));
+    assert!(
+        done.contains("\"code\":-32000") && done.contains("cancelled"),
+        "{done}"
+    );
+    c.wait_input("loginCancel", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
 fn logout_fails_closed_when_a_credential_remains() {
     for (scenario, needle) in [
         ("account_env_key", "META_API_KEY"),

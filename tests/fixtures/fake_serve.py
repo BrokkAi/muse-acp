@@ -2979,6 +2979,23 @@ def main():
                         sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))
                         sys.stderr.flush()
                     os._exit(int(os.environ.get("FAKE_HOST_EXIT_CODE", "5")))
+                if method == "account/loginStart":
+                    # Experimental device-code login (behind experimentalApi).
+                    log_input({"loginStart": msg.get("params", {})})
+                    send({"jsonrpc": "2.0", "id": ident, "result": {
+                        "verificationUrl": "https://login.example.test/device",
+                        "userCode": "ABCD-EFGH"}})
+                    outcome = os.environ.get("FAKE_LOGIN_OUTCOME", "granted")
+                    if outcome != "wait":
+                        completed = {"outcome": outcome}
+                        if outcome != "granted":
+                            completed["message"] = "The code expired"
+                        notify("account/loginCompleted", completed)
+                    continue
+                if method == "account/loginCancel":
+                    log_input({"loginCancel": True})
+                    send({"jsonrpc": "2.0", "id": ident, "result": {"cancelled": True}})
+                    continue
                 if method == "account/logout" and SCENARIO.startswith("account_"):
                     log_input({"accountLogout": True})
                     if not EXPERIMENTAL_API[0] or SCENARIO == "account_logged_in":

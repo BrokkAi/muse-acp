@@ -450,11 +450,15 @@ ACP terminal auth method, `muse-login`, which runs `muse-acp login` and hands
 the terminal to `muse login`. The ACP Registry requires an `agent` or
 `terminal` method. The handshake also succeeds when `muse serve` cannot
 start, so registry validation and editors without Muse get the auth method
-and a per-request diagnostic instead of a dead agent. Muse 1.3.0 also exposes
-an experimental `account/*` surface, but the adapter deliberately keeps it
-deferred: `experimentalApi` is opt-in, the pinned stable bundle does not
-contain those methods, and terminal auth needs no credential-handling path.
-Browserless-login guidance remains documented below.
+and a per-request diagnostic instead of a dead agent. The adapter already
+negotiates `experimentalApi` for `account/read`, and uses `account/logout`
+for ACP logout (#303) and the device-code branch of `account/loginStart` for
+an in-protocol `agent` method, `muse-device-login`, offered only to clients
+that advertise `elicitation.url` (#315): the verification page reaches the
+client as a request-scoped URL elicitation, `account/loginCompleted` closes it
+with `elicitation/complete`, and the login answers only once Muse grants it.
+The secret-bearing `apiKey` branch stays out of scope, so no credential
+crosses ACP. Browserless-login guidance remains documented below.
 
 **Work items**
 
@@ -462,11 +466,10 @@ Browserless-login guidance remains documented below.
   unsupported host version, and host startup failure.
 - Include the executable path and host version where available.
 - Provide the next user action for each failure.
-- Terminal auth (`muse-login` -> `muse-acp login`) is implemented. Revisit
-  in-protocol `agent` auth only with an explicit `experimentalApi` posture
-  decision. If adopted, expose the device-code branch of `account/loginStart`
-  only; keep the secret-bearing `apiKey` branch out of scope and use
-  `account/read`/`account/changed` to improve readiness diagnostics.
+- Terminal auth (`muse-login` -> `muse-acp login`) is implemented, and so is
+  the device-code `agent` method for URL-capable clients (#315); the
+  secret-bearing `apiKey` branch stays out of scope. `account/changed` could
+  still improve readiness diagnostics.
 - Add browserless/remote-environment guidance.
 
 **Acceptance criteria**

@@ -44,6 +44,7 @@ use msp::{
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static VER: AtomicU64 = AtomicU64::new(0); // negotiated ACP version for the connection
 static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the client advertises elicitation.form
+static ELICIT_URL: AtomicBool = AtomicBool::new(false); // the client advertises elicitation.url
 static NATIVE_SUBAGENTS: AtomicU64 = AtomicU64::new(0); // 1 when subagent sessions are negotiated
 static AIR_ASYNC_TASKS: AtomicU64 = AtomicU64::new(0); // 1 when the client wants async-task updates
 static AIR_RECOMMENDED: AtomicU64 = AtomicU64::new(0); // 1 when the client wants recommendedValue metadata
@@ -2033,6 +2034,171 @@ fn reject_if_logged_out(host: &Hosts, stdout: &StdoutShared, id: &Option<J>) -> 
     true
 }
 
+/// One device-code login in flight: the `auth/login` (or v1
+/// `authenticate`) request it will answer, and the URL elicitation that
+/// handed its verification page to the client.
+struct DeviceLogin {
+    login_req: Option<J>,
+    elicitation_id: String,
+    elicit_req: J,
+}
+
+static DEVICE_LOGIN: Mutex<Option<DeviceLogin>> = Mutex::new(None);
+
+/// Start Muse's device-code login (experimental `account/loginStart`) and
+/// hand its verification page to the client as a request-scoped URL
+/// elicitation, with the code to confirm in the message. The login request
+/// stays open until Muse reports the flow's terminal (`account/loginCompleted`):
+/// it succeeds only on `granted`. No credential crosses ACP; Muse stores it.
+fn start_device_login(host: &Arc<Hosts>, stdout: &StdoutShared, id: &Option<J>) {
+    if DEVICE_LOGIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_some()
+    {
+        acp::send_error(
+            stdout,
+            id,
+            -32602,
+            "a Muse login is already waiting for the browser; finish or cancel it first",
+        );
+        return;
+    }
+    let started = match host
+        .main_host()
+        .command("account/loginStart", r#"{"type":"deviceCode"}"#)
+    {
+        Ok(started) => started,
+        Err(error) => {
+            log(&format!(
+                "account/loginStart failed: {}",
+                err_message(&error)
+            ));
+            let message = if msp::is_method_not_found(&error) {
+                "this Muse build cannot start a login over its protocol; run `muse login` where muse-acp runs, then restart the agent".to_string()
+            } else {
+                format!("Muse could not start a login: {}", err_message(&error))
+            };
+            acp::send_error(stdout, id, -32603, &message);
+            return;
+        }
+    };
+    let (Some(url), Some(code)) = (
+        started.get("verificationUrl").and_then(J::as_str),
+        started.get("userCode").and_then(J::as_str),
+    ) else {
+        acp::send_error(
+            stdout,
+            id,
+            -32603,
+            "Muse started no device-code login (no verification page or code)",
+        );
+        return;
+    };
+    let elicitation_id = mint_id("login-", &ID_COUNTER);
+    let elicit_req = J::Str(mint_id("elic-", &ID_COUNTER));
+    *DEVICE_LOGIN.lock().unwrap_or_else(|p| p.into_inner()) = Some(DeviceLogin {
+        login_req: id.clone(),
+        elicitation_id: elicitation_id.clone(),
+        elicit_req: elicit_req.clone(),
+    });
+    log("device login started; verification page handed to the client");
+    acp::send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"elicitation/create\",\"params\":{{\"requestId\":{},\"mode\":\"url\",\"elicitationId\":{},\"url\":{},\"message\":{}}}}}",
+            j_to_string(&elicit_req),
+            acp::id_json(id),
+            esc(&elicitation_id),
+            esc(url),
+            esc(&format!(
+                "Sign in to Muse in your browser and confirm the code {code}."
+            ))
+        ),
+    );
+}
+
+/// The client's answer to the login's URL elicitation. `accept` only means
+/// the user agreed to open the page, so the login keeps waiting for Muse's
+/// terminal; a decline or dismissal cancels the flow.
+fn complete_device_login_elicitation(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    id: &Option<J>,
+    msg: &J,
+) {
+    let Some(id) = id else {
+        return;
+    };
+    let mut pending = DEVICE_LOGIN.lock().unwrap_or_else(|p| p.into_inner());
+    if pending
+        .as_ref()
+        .is_none_or(|login| j_to_string(&login.elicit_req) != j_to_string(id))
+    {
+        return;
+    }
+    let accepted = msg.get("error").is_none()
+        && msg
+            .get("result")
+            .and_then(|r| r.get("action"))
+            .and_then(J::as_str)
+            == Some("accept");
+    if accepted {
+        return;
+    }
+    let login = pending.take().expect("matched pending login");
+    drop(pending);
+    if let Err(error) = host.main_host().command("account/loginCancel", "{}") {
+        log(&format!(
+            "account/loginCancel failed: {}",
+            err_message(&error)
+        ));
+    }
+    acp::send_error(stdout, &login.login_req, -32000, "Muse login was cancelled");
+}
+
+/// Muse's terminal for the device-code flow (`account/loginCompleted`):
+/// close the URL interaction and answer the login, succeeding only when the
+/// login was granted. The display message never carries key material.
+fn finish_device_login(host: &Arc<Hosts>, stdout: &StdoutShared, params: &J) {
+    let Some(login) = DEVICE_LOGIN
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .take()
+    else {
+        return;
+    };
+    acp::send_raw(
+        stdout,
+        &format!(
+            "{{\"jsonrpc\":\"2.0\",\"method\":\"elicitation/complete\",\"params\":{{\"elicitationId\":{}}}}}",
+            esc(&login.elicitation_id)
+        ),
+    );
+    let outcome = params
+        .get("outcome")
+        .and_then(J::as_str)
+        .unwrap_or("unknown");
+    log(&format!("device login ended: {outcome}"));
+    if outcome == "granted" {
+        // A settings view may still link the old credential.
+        host.refresh_config();
+        acp::send_result(stdout, &login.login_req, "{}");
+        return;
+    }
+    let detail = params
+        .get("message")
+        .and_then(J::as_str)
+        .map(|message| format!(": {message}"))
+        .unwrap_or_default();
+    acp::send_error(
+        stdout,
+        &login.login_req,
+        -32000,
+        &format!("Muse login {outcome}{detail}"),
+    );
+}
+
 /// ACP `auth/logout` (v2) and `logout` (v1): clear Muse's stored credential
 /// through the host's experimental `account/logout`, then confirm with
 /// `account/read`. Success is reported only once Muse says no credential is
@@ -2118,6 +2284,12 @@ const AUTH_METHOD_NAME: &str = "Log in with Muse";
 const AUTH_METHOD_DESCRIPTION: &str =
     "Run `muse login` in a terminal and approve the code in your browser";
 const AUTH_METHOD_NAME_INSTALL: &str = "Set up Muse Code";
+/// The agent-handled login: Muse's device-code flow, handed to the browser
+/// through a URL elicitation. Offered only to clients with `elicitation.url`.
+const DEVICE_LOGIN_ID: &str = "muse-device-login";
+const DEVICE_LOGIN_NAME: &str = "Log in with Muse in your browser";
+const DEVICE_LOGIN_DESCRIPTION: &str =
+    "Open Muse's sign-in page from the editor and approve the code it shows";
 const AUTH_METHOD_DESCRIPTION_INSTALL: &str =
     "Install Muse Code with its official installer, then log in with `muse login`";
 
@@ -2168,10 +2340,30 @@ fn auth_methods_v1() -> String {
         ""
     };
     format!(
-        r#"[{{"id":{},"name":{},"description":{}{typed}{legacy}}}]"#,
+        r#"[{{"id":{},"name":{},"description":{}{typed}{legacy}}}{}]"#,
         esc(AUTH_METHOD_ID),
         esc(name),
-        esc(description)
+        esc(description),
+        device_login_method("id")
+    )
+}
+
+/// The device-login method entry (with a leading comma), when the client can
+/// open a URL elicitation and Muse is installed; empty otherwise.
+fn device_login_method(id_key: &str) -> String {
+    if !ELICIT_URL.load(Ordering::SeqCst) || MUSE_NOT_INSTALLED.load(Ordering::SeqCst) {
+        return String::new();
+    }
+    let typed = if id_key == "methodId" {
+        r#","type":"agent""#
+    } else {
+        ""
+    };
+    format!(
+        r#",{{"{id_key}":{},"name":{},"description":{}{typed}}}"#,
+        esc(DEVICE_LOGIN_ID),
+        esc(DEVICE_LOGIN_NAME),
+        esc(DEVICE_LOGIN_DESCRIPTION)
     )
 }
 
@@ -2180,12 +2372,13 @@ fn auth_methods_v1() -> String {
 /// it there is no login the client could start, so none is advertised and
 /// auth-required errors explain `muse login` instead.
 fn auth_methods_v2() -> String {
+    let device = device_login_method("methodId");
     if !AUTH_TERMINAL.load(Ordering::SeqCst) {
-        return "[]".to_string();
+        return format!("[{}]", device.trim_start_matches(','));
     }
     let (name, description) = auth_method_label();
     format!(
-        r#"[{{"methodId":{},"name":{},"description":{},"type":"terminal","args":["login"]}}]"#,
+        r#"[{{"methodId":{},"name":{},"description":{},"type":"terminal","args":["login"]}}{device}]"#,
         esc(AUTH_METHOD_ID),
         esc(name),
         esc(description)
@@ -4693,6 +4886,11 @@ fn negotiate_acp(msg: &J) -> Result<bool, AcpInitializeError> {
         .and_then(|e| e.get("form"))
         .is_some_and(|f| matches!(f, J::Obj(_)));
     ELICIT_FORM.store(u64::from(form), Ordering::SeqCst);
+    let url = capabilities
+        .and_then(|c| c.get("elicitation"))
+        .and_then(|e| e.get("url"))
+        .is_some_and(|u| matches!(u, J::Obj(_)));
+    ELICIT_URL.store(url, Ordering::SeqCst);
     BOOLEAN_CONFIG.store(
         client_supports_boolean_config(capabilities, v),
         Ordering::SeqCst,
@@ -4804,6 +5002,7 @@ fn handle_acp(
             complete_permission_feedback(host, stdout, sessions, &id, msg);
             complete_feedback(host, stdout, sessions, &id, msg);
             complete_elicitation(host, stdout, sessions, &id, msg);
+            complete_device_login_elicitation(host, stdout, &id, msg);
         }
         return;
     }
@@ -8233,6 +8432,8 @@ fn handle_acp(
                 // A settings view may still link the old credential.
                 host.refresh_config();
                 acp::send_result(stdout, &id, "{}");
+            } else if method_id == DEVICE_LOGIN_ID && !device_login_method("id").is_empty() {
+                start_device_login(host, stdout, &id);
             } else {
                 acp::send_error(
                     stdout,
@@ -8251,14 +8452,16 @@ fn handle_acp(
                 .and_then(|p| p.get("methodId"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            if method_id == DEVICE_LOGIN_ID && !device_login_method("methodId").is_empty() {
+                start_device_login(host, stdout, &id);
+                return;
+            }
             let message = if method_id == AUTH_METHOD_ID {
                 format!(
                     "{AUTH_METHOD_ID:?} is a terminal auth method: run it in a terminal (`muse-acp login`), not through auth/login"
                 )
             } else {
-                format!(
-                    "unknown auth method; muse-acp offers only the terminal method {AUTH_METHOD_ID:?}"
-                )
+                format!("unknown auth method {method_id:?}")
             };
             acp::send_error(stdout, &id, -32602, &message);
         }
@@ -12271,6 +12474,7 @@ fn handle_msp(
             }
         }
 
+        "account/loginCompleted" => finish_device_login(host, stdout, params),
         "session/leaveCompleted" => {
             // The terminal for an admitted `session/leave`. The ACP session
             // is already closed, so this settles nothing; it records whether

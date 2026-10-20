@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Log in through the browser with ACP URL elicitation (#315). Clients that
+  advertise `elicitation.url` get an agent-handled auth method,
+  `muse-device-login`. ACP v2 `auth/login` (or v1 `authenticate`) with it
+  starts Muse's device-code login (experimental `account/loginStart`), sends
+  the verification page as a request-scoped URL elicitation with the code to
+  confirm, and answers once Muse's `account/loginCompleted` arrives, after
+  `elicitation/complete`: `{}` when the login is granted, `-32000` otherwise.
+  Declining the page cancels the flow through `account/loginCancel`. No
+  credential passes through ACP.
+
 - Relay Muse 1.4.11 recovery observations on host errors (#334). A refused
   resume, load, fork, or prompt whose host error carries a complete
   `recoveryObservation` now keeps it in the ACP error's
