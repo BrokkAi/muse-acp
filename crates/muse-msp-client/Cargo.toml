@@ -1,0 +1,20 @@
+[package]
+name = "muse-msp-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Synchronous, dependency-free Rust client for the Muse Session Protocol"
+license = "Apache-2.0"
+repository = "https://github.com/BrokkAi/muse-acp"
+readme = "README.md"
+publish = false
+
+# Deliberately empty: `muse-acp` depends on this crate and its shipped binary
+# must stay free of third-party code.
+[dependencies]
+
+# The test binary doubles as a scripted fake `muse serve`, so it supplies its
+# own `main` instead of the libtest harness.
+[[test]]
+name = "process"
+harness = false

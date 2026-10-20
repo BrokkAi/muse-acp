@@ -19,6 +19,7 @@ name = "muse-acp"
 version = "0.15.0"
 dependencies = [
  "muse-acp-client",
+ "muse-msp-client",
  "serde_json",
 ]
 
@@ -29,6 +30,10 @@ dependencies = [
  "serde",
  "serde_json",
 ]
+
+[[package]]
+name = "muse-msp-client"
+version = "0.1.0"
 
 [[package]]
 name = "proc-macro2"

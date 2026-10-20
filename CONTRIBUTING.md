@@ -16,6 +16,13 @@ settings:
 MUSE_ACP_LOOPBACK=1 cargo test --locked -p muse-acp --test live_loopback
 ```
 
+The same switch runs the MSP client crate's own live test, which drives
+`muse serve` through `crates/muse-msp-client` without the adapter:
+
+```sh
+MUSE_ACP_LOOPBACK=1 cargo test --locked -p muse-msp-client --test live_muse
+```
+
 Set `MUSE_CLI` to test a specific Muse build. The nightly workflow
 (`.github/workflows/nightly.yml`) runs this suite against each pinned build it
 lists; run it on a branch with `gh workflow run nightly --ref <branch>` when a

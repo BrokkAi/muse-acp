@@ -2,7 +2,7 @@
 #[path = "../invariants.rs"]
 mod invariants;
 #[allow(dead_code)]
-#[path = "../../src/json.rs"]
+#[path = "../../crates/muse-msp-client/src/json.rs"]
 mod json;
 
 libfuzzer_sys::fuzz_target!(|data: &[u8]| {
