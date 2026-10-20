@@ -719,9 +719,9 @@ continues.
 | `approval/reviewing` | Mapped to ACP | A reviewer-held activity notice, not a request. The adapter publishes reversible `session_info_update._meta.muse.approvalReviewing` rows keyed by source MSP session and approval id, with title and ACP tool kind. No permission prompt or decision is opened. `approval/requested` clears the row before normal approval handling; `approval/resolved` or the owning turn terminal also clears it. Adapter Auto-review remains independent and can handle the later release. [#271](https://github.com/BrokkAi/muse-acp/issues/271) |
 | `session/leave` | Mapped to ACP | ACP `session/close` on Muse 1.4.11+ releases the host session after the close has stopped its work and dropped local state: the adapter sends `session/leave` with an explicit `stop: true` and answers the close on admission. The session stays in `session/list` as not loaded, and a resume reloads it; a refused leave is logged and Muse keeps the session loaded until idle. [#329](https://github.com/BrokkAi/muse-acp/issues/329) |
 | `session/leaveCompleted` | Consumed | Correlated with the admitted `session/leave` by `commandId` (like `session/deleteCompleted`) and logged with its `outcome` and `reason`; it settles no ACP request. [#329](https://github.com/BrokkAi/muse-acp/issues/329) |
-| `monitor/inboxItemAdmitted` | Intentionally ignored | One monitor inbox admission (Muse 1.4.11+): the gate-off fold key the adapter does not consume. An inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt. Adopting the trio is tracked in [#330](https://github.com/BrokkAi/muse-acp/issues/330). |
-| `monitor/inboxItemDrained` | Intentionally ignored | One monitor inbox drain with its recorded stamp (Muse 1.4.11+): a consumption marker the adapter does not fold. An inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt. See [#330](https://github.com/BrokkAi/muse-acp/issues/330). |
-| `monitor/inboxItemVoided` | Intentionally ignored | One wake-missed void (Muse 1.4.11+): count-only, with no transcript row by schema design. An inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt. See [#330](https://github.com/BrokkAi/muse-acp/issues/330). |
+| `monitor/inboxItemAdmitted` | Mapped to ACP | One monitor inbox admission (Muse 1.4.11+). Counted as pending against its monitor task (`taskId`, the monitor card's `monitorId`), and the monitor card's `_meta.muse.monitorInbox {pending, drained, voided}` is refreshed. The delivery text stays with the agent; it is not echoed to the transcript. [#330](https://github.com/BrokkAi/muse-acp/issues/330) |
+| `monitor/inboxItemDrained` | Mapped to ACP | One inbox drain (Muse 1.4.11+): the item counts as drained unless a void of the same item carries a later recorded stamp (drain-vs-void latest-wins on `drainedAt`/`voidedAt`). Refreshes the card's `monitorInbox` counts. [#330](https://github.com/BrokkAi/muse-acp/issues/330) |
+| `monitor/inboxItemVoided` | Mapped to ACP | One wake-missed void (Muse 1.4.11+): count-only by schema design, so it only moves the item to the card's `voided` count (latest-wins against a drain) and never adds a transcript row. [#330](https://github.com/BrokkAi/muse-acp/issues/330) |
 
 The remaining 1.4.x field-level and vocabulary additions — the `webSearch`
 item kind, `mcpLinkError`, `TurnError.quota`, the retry/retraction detail
@@ -782,9 +782,8 @@ settle-both-arms handling in
 
 ACP `session/close` releases the host session through the 1.4.11
 `session/leave` command, whose `session/leaveCompleted` terminal is
-correlated and logged (#329). The monitor-inbox trio needs no adapter arm:
-inbound copies take the unhandled-notification diagnostic path (see the §9
-rows above). The `damagedRange` and `scheduledFire` item
+correlated and logged (#329). The monitor-inbox trio keeps per-monitor
+pending, drained, and voided counts on the monitor card (#330). The `damagedRange` and `scheduledFire` item
 kinds render their own cards with their facts in `_meta.muse` (#331, #332),
 and the remaining field additions carry explicit dispositions in the field
 matrix below.

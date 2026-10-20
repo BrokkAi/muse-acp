@@ -258,6 +258,15 @@ fn utc_from_epoch_ms(ms: u64) -> String {
 /// Native tools whose call runs a shell command.
 const SHELL_TOOLS: [&str; 3] = ["bash", "shell", "workspace-shell"];
 
+/// One monitor inbox item: its monitor task and the recorded stamps of a
+/// drain and a void, which settle it latest-wins.
+#[derive(Default)]
+struct InboxItem {
+    task_id: Option<String>,
+    drained_at: Option<String>,
+    voided_at: Option<String>,
+}
+
 /// A shell card's command facts, kept for its ACP v2 terminal.
 struct ShellCommand {
     tc_id: String,
@@ -338,6 +347,9 @@ pub struct SessionFold {
     /// Later feed items update the same row instead of minting one per event
     /// batch.
     monitor_cards: std::collections::HashSet<String>,
+    /// Muse 1.4.11 monitor inbox items by inbox item id: the owning monitor
+    /// task and the recorded drain and void stamps, if any.
+    monitor_inbox: HashMap<String, InboxItem>,
     /// The open "background checks" card of a turn whose foreground work is
     /// done while reminder agents hold it open (`turn/foregroundCompleted`),
     /// as `(turn id, card id)`. Settled at the turn's terminal.
@@ -422,6 +434,7 @@ impl SessionFold {
             reminder_cards: HashMap::new(),
             show_reminders: false,
             monitor_cards: std::collections::HashSet::new(),
+            monitor_inbox: HashMap::new(),
             background_checks: None,
             model_retry: None,
             last_message: None,
@@ -2442,6 +2455,10 @@ impl SessionFold {
             .and_then(J::as_str)
             .filter(|value| !value.is_empty())
             .unwrap_or(item_id);
+        let muse_fields = Self::merge_muse_fields(
+            muse_fields.as_deref(),
+            self.inbox_counts(monitor_id).as_deref(),
+        );
         let tc_id = format!("monitor-{monitor_id}");
         let create = self.monitor_cards.insert(tc_id.clone());
         let host_truncated = item
@@ -2489,6 +2506,91 @@ impl SessionFold {
             (!text.is_empty()).then_some(text.as_str()),
             muse_fields.as_deref(),
             effective_truncated,
+        ));
+    }
+
+    /// The `monitorInbox` counts for one monitor task, once it has inbox
+    /// items: still pending, drained to the agent, and voided (a missed
+    /// wake). A drain and a void of one item settle latest-wins on their
+    /// recorded RFC 3339 stamps, as Muse's own fold does.
+    fn inbox_counts(&self, task_id: &str) -> Option<String> {
+        let (mut pending, mut drained, mut voided) = (0, 0, 0);
+        for item in self
+            .monitor_inbox
+            .values()
+            .filter(|item| item.task_id.as_deref() == Some(task_id))
+        {
+            match (&item.drained_at, &item.voided_at) {
+                (None, None) => pending += 1,
+                (Some(_), None) => drained += 1,
+                (None, Some(_)) => voided += 1,
+                (Some(drain), Some(void)) if void > drain => voided += 1,
+                (Some(_), Some(_)) => drained += 1,
+            }
+        }
+        (pending + drained + voided > 0).then(|| {
+            format!(
+                "\"monitorInbox\":{{\"pending\":{pending},\"drained\":{drained},\"voided\":{voided}}}"
+            )
+        })
+    }
+
+    /// Muse 1.4.11 monitor inbox lifecycle (`monitor/inboxItemAdmitted`,
+    /// `...Drained`, `...Voided`). Each change updates the owning monitor's
+    /// card with fresh `_meta.muse.monitorInbox` counts. A void is count-only
+    /// by schema design, so nothing reaches the transcript; inbox items of a
+    /// monitor without a card yet are counted and shown once its card exists.
+    pub fn on_monitor_inbox(
+        &mut self,
+        acp_sid: &str,
+        method: &str,
+        params: &J,
+        out: &mut Vec<String>,
+    ) {
+        let Some(item_id) = params.get("itemId").and_then(J::as_str) else {
+            return;
+        };
+        let stamp = |key: &str| params.get(key).and_then(J::as_str).map(str::to_string);
+        let entry = self.monitor_inbox.entry(item_id.to_string()).or_default();
+        match method {
+            "monitor/inboxItemAdmitted" => {
+                if let Some(task) = params.get("taskId").and_then(J::as_str) {
+                    entry.task_id = Some(task.to_string());
+                }
+            }
+            "monitor/inboxItemDrained" => entry.drained_at = stamp("drainedAt"),
+            "monitor/inboxItemVoided" => entry.voided_at = stamp("voidedAt"),
+            _ => return,
+        }
+        let Some(task_id) = entry.task_id.clone() else {
+            return;
+        };
+        let tc_id = format!("monitor-{task_id}");
+        if !self.monitor_cards.contains(&tc_id) {
+            return;
+        }
+        let card_fields = self.items.values().find_map(|role| match role {
+            ItemRole::Monitor {
+                tc_id: card,
+                muse_fields,
+                ..
+            } if *card == tc_id => muse_fields.clone(),
+            _ => None,
+        });
+        // Clients may replace `_meta.muse` wholesale, so the card's own
+        // fields ride along with the counts.
+        let Some(fields) = Self::merge_muse_fields(
+            card_fields.as_deref(),
+            self.inbox_counts(&task_id).as_deref(),
+        ) else {
+            return;
+        };
+        out.push(Self::update_line(
+            acp_sid,
+            &format!(
+                "{{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":{},\"_meta\":{{\"muse\":{{{fields}}}}}}}",
+                esc(&tc_id)
+            ),
         ));
     }
 
@@ -4203,6 +4305,83 @@ mod corpus_tests {
             !pending.contains("drained") && !pending.contains("Delivered"),
             "{pending}"
         );
+    }
+
+    #[test]
+    fn monitor_inbox_counts_ride_the_monitor_card_latest_wins() {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_snapshot(
+            "sid",
+            2,
+            &parse_json(
+                r#"{"itemId":"feed-1","kind":"monitorFeed","monitorId":"mon-1","monitorDescription":"Build watcher","status":"inProgress","turnId":null,"text":"watching\n"}"#,
+            )
+            .unwrap(),
+            &mut out,
+        );
+        out.clear();
+        let event = |method: &str, body: &str, fold: &mut SessionFold, out: &mut Vec<String>| {
+            fold.on_monitor_inbox("sid", method, &parse_json(body).unwrap(), out);
+        };
+        for id in ["in-1", "in-2", "in-3"] {
+            event(
+                "monitor/inboxItemAdmitted",
+                &format!(
+                    r#"{{"itemId":"{id}","taskId":"mon-1","sessionId":"s","body":"b","summary":"s","eventIndex":1,"eventKind":"line","queuedAt":"2026-10-20T10:00:00Z","showLines":true}}"#
+                ),
+                &mut fold,
+                &mut out,
+            );
+        }
+        event(
+            "monitor/inboxItemDrained",
+            r#"{"itemId":"in-1","drainedAt":"2026-10-20T10:01:00Z","deliveryVisible":true}"#,
+            &mut fold,
+            &mut out,
+        );
+        event(
+            "monitor/inboxItemVoided",
+            r#"{"itemId":"in-2","voidedAt":"2026-10-20T10:01:00Z"}"#,
+            &mut fold,
+            &mut out,
+        );
+        // A later void beats an earlier drain of the same item.
+        event(
+            "monitor/inboxItemDrained",
+            r#"{"itemId":"in-3","drainedAt":"2026-10-20T10:02:00Z","deliveryVisible":true}"#,
+            &mut fold,
+            &mut out,
+        );
+        event(
+            "monitor/inboxItemVoided",
+            r#"{"itemId":"in-3","voidedAt":"2026-10-20T10:03:00Z"}"#,
+            &mut fold,
+            &mut out,
+        );
+        let last = out.last().unwrap();
+        assert!(
+            last.contains(r#""monitorInbox":{"pending":0,"drained":1,"voided":2}"#),
+            "{last}"
+        );
+        assert!(
+            last.contains(r#""toolCallId":"monitor-mon-1""#)
+                && last.contains(r#""monitorId":"mon-1""#),
+            "the card keeps its own metadata: {last}"
+        );
+        assert!(
+            out[0].contains(r#""monitorInbox":{"pending":1,"drained":0,"voided":0}"#),
+            "{out:?}"
+        );
+        // Inbox events for a monitor with no card stay off the transcript.
+        out.clear();
+        event(
+            "monitor/inboxItemAdmitted",
+            r#"{"itemId":"in-9","taskId":"mon-unknown"}"#,
+            &mut fold,
+            &mut out,
+        );
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]

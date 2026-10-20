@@ -11934,6 +11934,23 @@ fn handle_msp(
                 );
             }
         }
+        "monitor/inboxItemAdmitted" | "monitor/inboxItemDrained" | "monitor/inboxItemVoided" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+                let mut out = Vec::new();
+                if let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&acp_sid)
+                {
+                    s.fold.on_monitor_inbox(&acp_sid, method, params, &mut out);
+                }
+                send_fold_output(stdout, sessions, &acp_sid, out);
+            }
+        }
         "session/todoListChanged" => {
             let msp_sid = params
                 .get("sessionId")
