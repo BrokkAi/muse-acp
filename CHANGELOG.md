@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Release closed sessions in Muse 1.4.11 (#329). After ACP `session/close`
+  stops a session's work and drops its local state, the adapter sends
+  `session/leave` with an explicit `stop: true`, so Muse unloads the session
+  instead of holding it until it idle-unloads. The `session/leaveCompleted`
+  terminal is correlated by `commandId` and logged with its outcome and
+  reason. The session stays in `session/list` as not loaded and a resume
+  reloads it. Older hosts are unchanged.
+
 - Document and pin Muse 1.4.11 goal timestamps (#333). Goal metadata
   carries `createdAtMs` and `updatedAtMs` verbatim when Muse records them and
   omits them otherwise, never reporting a fabricated zero; a fake-host test

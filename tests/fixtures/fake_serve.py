@@ -2220,6 +2220,12 @@ def result_for(method, msg):
         params = msg.get("params", {})
         log_input(params)
         return {"commandId": params.get("commandId", ""), "status": "accepted"}
+    if method == "session/leave":
+        # Muse 1.4.11: an admission-only ack; the release follows as
+        # `session/leaveCompleted` (sent after the ack in the main loop).
+        params = msg.get("params", {})
+        log_input(params)
+        return {"commandId": params.get("commandId", ""), "status": "accepted"}
     if method == "feedback/submit":
         params = msg.get("params", {})
         log_input(params)
@@ -3296,6 +3302,19 @@ def main():
                 if method == "model/list" and SCENARIO == "stdout_close_stays_alive":
                     os.close(1)
                     time.sleep(1.0)
+                if method == "session/leave":
+                    params = msg.get("params", {})
+                    failed = os.environ.get("FAKE_LEAVE_OUTCOME") == "failed"
+                    completed = {"commandId": params.get("commandId", ""),
+                                 "sessionId": params.get("sessionId", ""),
+                                 "outcome": "failed" if failed else "released"}
+                    if failed:
+                        completed["reason"] = "timeout"
+                    notify("session/leaveCompleted", completed)
+                    if not failed:
+                        notify("session/closed", {
+                            "sessionId": params.get("sessionId", ""),
+                            "reason": "leave"})
                 if method == "session/delete":
                     # The ack is out; now report the outcome as the host's
                     # later terminal notification.

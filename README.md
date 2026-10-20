@@ -336,7 +336,9 @@ error the editor shows if Muse then refuses the profile says why.
 ## What's supported
 
 - **Sessions** — new, load, resume, list, close, and fork, with durable Muse
-  session IDs that survive adapter and host restarts. An ACP v2 resume
+  session IDs that survive adapter and host restarts. On Muse 1.4.11+ closing
+  a session also releases it in Muse (`session/leave`), so it stops holding
+  host resources; it stays listed and a resume reloads it. An ACP v2 resume
   replays history only for `replayFrom: {"type": "start"}`; an omitted or
   `null` cursor reconnects without replay, and an unsupported or malformed
   cursor is refused with `-32602` before Muse is asked. Every successful v2
