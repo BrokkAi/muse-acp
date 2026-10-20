@@ -91,6 +91,11 @@ struct PendingDelete {
     host_kind: HostKind,
 }
 
+/// Admitted Muse `session/leave` commands awaiting `session/leaveCompleted`,
+/// keyed by command id, with the host session they release.
+static LEAVES: LazyLock<Mutex<HashMap<String, String>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 static DELETES: LazyLock<Mutex<HashMap<String, PendingDelete>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -7269,8 +7274,16 @@ fn handle_acp(
                 return;
             }
             cancel_session_turns(host, sessions, &sid);
+            let msp_sid = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&sid)
+                .map(|s| s.msp_sid.clone());
             if drop_acp_session(stdout, sessions, &sid) {
                 acp::send_result(stdout, &id, "{}");
+                if let Some(msp_sid) = msp_sid {
+                    leave_session(host, &msp_sid);
+                }
             } else {
                 acp::send_error(stdout, &id, -32602, "unknown sessionId");
             }
@@ -10539,6 +10552,46 @@ fn answer_delete_waiters(
 }
 
 /// Remove one pending delete by command id.
+/// Release a closed session on hosts that can (Muse 1.4.11 `session/leave`),
+/// so it stops holding host resources until Muse would have idle-unloaded
+/// it. The ACP close has already stopped the session's work; `stop` asks the
+/// host explicitly to cancel anything still unfinished before leaving, rather
+/// than relying on the omitted default. The ack only admits the command; the
+/// release (or failure) arrives as `session/leaveCompleted`. The session
+/// stays in `session/list` as not loaded, and a resume reloads it.
+fn leave_session(host: &Arc<Hosts>, msp_sid: &str) {
+    if !host.handshake().at_least(1, 4, 11) {
+        return;
+    }
+    let cmd = host.mint_cmd("cmd-");
+    LEAVES
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(cmd.clone(), msp_sid.to_string());
+    match host.command(
+        "session/leave",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{},\"stop\":true}}",
+            esc(&cmd),
+            esc(msp_sid)
+        ),
+    ) {
+        Ok(_) => log(&format!(
+            "session/leave admitted session={msp_sid} command={cmd}"
+        )),
+        Err(error) => {
+            LEAVES
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&cmd);
+            log(&format!(
+                "session/leave refused session={msp_sid}: {}; Muse keeps it loaded until idle",
+                err_message(&error)
+            ));
+        }
+    }
+}
+
 fn take_pending_delete(cmd: &str) -> Option<PendingDelete> {
     DELETES
         .lock()
@@ -12149,6 +12202,35 @@ fn handle_msp(
             }
         }
 
+        "session/leaveCompleted" => {
+            // The terminal for an admitted `session/leave`. The ACP session
+            // is already closed, so this settles nothing; it records whether
+            // Muse released the session. `outcome` and `reason` are open.
+            let cmd = params.get("commandId").and_then(J::as_str).unwrap_or("");
+            let msp_sid = params.get("sessionId").and_then(J::as_str).unwrap_or("");
+            let outcome = params
+                .get("outcome")
+                .and_then(J::as_str)
+                .unwrap_or("unknown");
+            let reason = params
+                .get("reason")
+                .and_then(J::as_str)
+                .map(|reason| format!(" reason={reason}"))
+                .unwrap_or_default();
+            let ours = LEAVES
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(cmd)
+                .is_some();
+            log(&format!(
+                "session/leaveCompleted session={msp_sid} outcome={outcome}{reason}{}",
+                if ours {
+                    ""
+                } else {
+                    " (not requested by this adapter)"
+                }
+            ));
+        }
         "session/deleteCompleted" => {
             // The terminal for an admitted MSP `session/delete`. `outcome` is
             // an open enum: an unknown value leaves the command pending, as

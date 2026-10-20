@@ -45,7 +45,7 @@ are emitted by the MSP host.
 | `session/closed` | Consumed | Logs the unload and its reason. An unload is not a deletion: the session is `notLoaded`, its log stays on disk, and `session/resume` reloads it, so it stays in ACP `session/list`. |
 | `session/contextUsage` | Mapped to ACP | Replaces the tracked context occupancy and emits ACP `usage_update` with used tokens, window size, and Muse pressure metadata. |
 | `session/goalChanged` | Mapped to ACP | Stores replacement-or-clear semantics and emits the goal in `session/update` metadata together with branch state. |
-| `session/leaveCompleted` | Intentionally ignored | The correlated terminal of an admitted `session/leave` (Muse 1.4.11+). The adapter never sends `session/leave`, so an inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt. |
+| `session/leaveCompleted` | Consumed | The terminal of the `session/leave` the adapter sends when the editor closes a session on Muse 1.4.11+. Correlated by `commandId` and logged with its open `outcome` (`released`, `failed`) and `reason`; the ACP close was already answered, so it settles nothing. A terminal the adapter did not request is logged as such. [#329](https://github.com/BrokkAi/muse-acp/issues/329) |
 | `session/listChanged` | Mapped to ACP | Replaces a cached list row when `sessionListStream` is granted; pushes a changed active-session title through `session_info_update`. |
 | `session/modelChanged` | Mapped to ACP | Updates the selected model value, resets a held per-turn reasoning tier the new model does not serve, and resends the complete `configOptions` list. |
 | `session/modelRouteUnserved` | Intentionally ignored | No ACP mapping; the unhandled-notification path logs a diagnostic. |

@@ -717,8 +717,8 @@ continues.
 | `turn/modelRetryScheduled` | Mapped to ACP | A durable, non-terminal observation that a provider backoff behind one model attempt is waiting out its delay. The prompt stays open; while the turn runs the attempt facts reach the editor as `session_info_update._meta.muse.modelRetry` (attempt, next, max, delay, and the optional failing `errorKind`/`system`/`httpStatus`), cleared at the turn's terminal, and are logged like `turn/retryScheduled`. An unknown `errorKind` passes through verbatim ([#259](https://github.com/BrokkAi/muse-acp/issues/259)). |
 | `sessionRename` capability | Mapped to ACP | Requested unconditionally at `initialize`, like `sessionListStream` and `feedback`, and recorded on the handshake. Muse 1.4.3–1.4.7 predate the registry entry: they ignore the unknown name and still serve `session/rename`, so `/rename` keeps working there. From 1.4.8 on the name is registered, and a withheld grant answers `/rename` with the typed `capabilityRequired` (-32010, `data.capability` = `sessionRename`) instead of sending an ungranted call. |
 | `approval/reviewing` | Mapped to ACP | A reviewer-held activity notice, not a request. The adapter publishes reversible `session_info_update._meta.muse.approvalReviewing` rows keyed by source MSP session and approval id, with title and ACP tool kind. No permission prompt or decision is opened. `approval/requested` clears the row before normal approval handling; `approval/resolved` or the owning turn terminal also clears it. Adapter Auto-review remains independent and can handle the later release. [#271](https://github.com/BrokkAi/muse-acp/issues/271) |
-| `session/leave` | Intentionally ignored | A client command that releases one loaded session (Muse 1.4.11+). The adapter never sends it: sessions stay loaded until Muse idle-unloads them or the host shuts down, so the `session/closed` handling is unchanged. Adopting it is tracked in [#329](https://github.com/BrokkAi/muse-acp/issues/329). |
-| `session/leaveCompleted` | Intentionally ignored | The correlated terminal of an admitted `session/leave` (Muse 1.4.11+). The adapter never sends `session/leave`, so an inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt. See [#329](https://github.com/BrokkAi/muse-acp/issues/329). |
+| `session/leave` | Mapped to ACP | ACP `session/close` on Muse 1.4.11+ releases the host session after the close has stopped its work and dropped local state: the adapter sends `session/leave` with an explicit `stop: true` and answers the close on admission. The session stays in `session/list` as not loaded, and a resume reloads it; a refused leave is logged and Muse keeps the session loaded until idle. [#329](https://github.com/BrokkAi/muse-acp/issues/329) |
+| `session/leaveCompleted` | Consumed | Correlated with the admitted `session/leave` by `commandId` (like `session/deleteCompleted`) and logged with its `outcome` and `reason`; it settles no ACP request. [#329](https://github.com/BrokkAi/muse-acp/issues/329) |
 | `monitor/inboxItemAdmitted` | Intentionally ignored | One monitor inbox admission (Muse 1.4.11+): the gate-off fold key the adapter does not consume. An inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt. Adopting the trio is tracked in [#330](https://github.com/BrokkAi/muse-acp/issues/330). |
 | `monitor/inboxItemDrained` | Intentionally ignored | One monitor inbox drain with its recorded stamp (Muse 1.4.11+): a consumption marker the adapter does not fold. An inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt. See [#330](https://github.com/BrokkAi/muse-acp/issues/330). |
 | `monitor/inboxItemVoided` | Intentionally ignored | One wake-missed void (Muse 1.4.11+): count-only, with no transcript row by schema design. An inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt. See [#330](https://github.com/BrokkAi/muse-acp/issues/330). |
@@ -780,11 +780,11 @@ stable-schema surface of its own; its SDK fold clarification for declined
 settle-both-arms handling in
 [#273](https://github.com/BrokkAi/muse-acp/issues/273).
 
-The 1.4.11 additions are tolerated, not driven. The `session/leave` command
-and its `session/leaveCompleted` terminal, the monitor-inbox trio, and the
-`leave` close reason need no adapter arm: sessions keep their current
-lifecycle and inbound copies take the unhandled-notification diagnostic
-path (see the §9 rows above). The `damagedRange` and `scheduledFire` item
+ACP `session/close` releases the host session through the 1.4.11
+`session/leave` command, whose `session/leaveCompleted` terminal is
+correlated and logged (#329). The monitor-inbox trio needs no adapter arm:
+inbound copies take the unhandled-notification diagnostic path (see the §9
+rows above). The `damagedRange` and `scheduledFire` item
 kinds render their own cards with their facts in `_meta.muse` (#331, #332),
 and the remaining field additions carry explicit dispositions in the field
 matrix below.
@@ -849,7 +849,7 @@ cannot drop a member without failing CI.
 | `Item.scheduledFireAtMs` | Mapped to ACP | Shown as the fire's scheduled time (UTC) and carried verbatim in `_meta.muse.scheduledFire`. |
 | `Goal.createdAtMs` | Mapped to ACP | The goal block is stored and emitted as raw MSP JSON, so the creation timestamp rides the `session/update` goal metadata (`_meta.goal.createdAtMs`) verbatim when the host sends it; absence (tool-result adoptions, pre-1.4.11 logs) emits nothing, never a fabricated zero. The adapter keeps the verbatim epoch rather than rendering an age, which editors can derive. A fake-host test pins both cases. [#333](https://github.com/BrokkAi/muse-acp/issues/333) |
 | `Goal.updatedAtMs` | Mapped to ACP | The mutation timestamp rides the same raw goal metadata verbatim, like its creation stamp above, and is likewise never fabricated when absent. [#333](https://github.com/BrokkAi/muse-acp/issues/333) |
-| `SessionClosedReason.leave` | Consumed | Logged verbatim by the existing `session/closed` arm beside `idle` and `hostShutdown`; unload semantics are unchanged because the adapter never sends `session/leave`. |
+| `SessionClosedReason.leave` | Consumed | Logged verbatim by the existing `session/closed` arm beside `idle` and `hostShutdown`; it follows the `session/leave` the adapter sends when the editor closes a session. |
 | `SessionResumeParams.recoveryMode` | Intentionally ignored | The cold-resume replacement choice is never sent; omission preserves the retained choice, which is the schema's legacy behavior. |
 | `SessionStartParams.recoveryMode` | Intentionally ignored | The recovery choice for a new session is never sent; omission keeps legacy behavior, which the schema calls out explicitly. |
 | `ErrorData.recoveryObservation` | Intentionally ignored | The recovery-dependent construction's observation on an approval error is never read; approval failures keep their existing mapping. |

@@ -10228,6 +10228,46 @@ fn goal_timestamps_pass_through_verbatim_and_are_never_invented() {
 }
 
 #[test]
+fn closing_a_session_releases_it_on_muse_1_4_11() {
+    for (version, outcome, leaves) in [
+        ("1.4.11-R6667.1", "released", true),
+        ("1.4.11-R6667.1", "failed", true),
+        ("1.4.10-R6427.1", "", false),
+    ] {
+        let mut c = Client::spawn(
+            "quiet",
+            &[
+                ("FAKE_SERVER_VERSION", version),
+                ("FAKE_LEAVE_OUTCOME", outcome),
+            ],
+        );
+        let sid = c.new_session(2, "");
+        let id = c.req("session/close", &format!("{{\"sessionId\":\"{sid}\"}}"));
+        let closed = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(closed.contains("\"result\":{}"), "{closed}");
+        if leaves {
+            c.wait_stderr(
+                &format!("session/leaveCompleted session={sid} outcome={outcome}"),
+                Duration::from_secs(15),
+            );
+            let requests = host_requests(&c, "session/leave");
+            assert_eq!(requests.len(), 1, "{requests:?}");
+            assert_eq!(requests[0]["sessionId"], sid.as_str());
+            assert_eq!(requests[0]["stop"], true, "unfinished work stops first");
+            if outcome == "failed" {
+                c.wait_stderr("reason=timeout", Duration::from_secs(5));
+            }
+        } else {
+            // Give a stray leave time to show up.
+            let list = c.req("session/list", "{}");
+            c.wait_for(&format!("\"id\":{list}"), Duration::from_secs(15));
+            assert!(host_requests(&c, "session/leave").is_empty());
+        }
+        c.finish();
+    }
+}
+
+#[test]
 fn an_explicit_null_goal_clears_the_metadata() {
     let mut c = Client::spawn("goal_clear", &[]);
     let sid = c.new_session(2, "");
