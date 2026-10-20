@@ -240,7 +240,7 @@ impl fmt::Debug for MspClient {
 
 impl Drop for MspClient {
     fn drop(&mut self) {
-        if !self.core.close_started.swap(true, Ordering::SeqCst) {
+        if !self.core.close_started.load(Ordering::SeqCst) {
             let core = self.core.clone();
             std::thread::spawn(move || core.close(true));
         }
@@ -528,7 +528,6 @@ impl MspClient {
     /// observed exiting (or for custom transports). Every step is bounded,
     /// and calling it again only re-checks the already stopped host.
     pub fn close(&self) -> Option<ExitClassification> {
-        self.core.close_started.store(true, Ordering::SeqCst);
         self.core.close(false)
     }
 
@@ -763,6 +762,9 @@ impl Core {
     /// so a broken host cannot strand the caller. `quiet` skips diagnostics
     /// and the watchdog, for the background close after a drop.
     fn close(&self, quiet: bool) -> Option<ExitClassification> {
+        // Any close, including one the reader starts, makes a later drop a
+        // no-op.
+        self.close_started.store(true, Ordering::SeqCst);
         let _guard = if quiet {
             None
         } else {
