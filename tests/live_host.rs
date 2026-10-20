@@ -152,7 +152,10 @@ fn live_host_smoke() {
         return;
     }
     let mut c = LiveClient::spawn();
-    let id = c.req("initialize", "{\"protocolVersion\":2}");
+    let id = c.req(
+        "initialize",
+        "{\"protocolVersion\":2,\"info\":{\"name\":\"muse-acp-live-test\",\"version\":\"0.0.0\"}}",
+    );
     let init = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(30));
     assert!(init.contains("\"result\""), "handshake failed: {init}");
 

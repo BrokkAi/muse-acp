@@ -72,6 +72,16 @@ fn canonical_text(path: &std::path::Path) -> String {
     canonical.to_string_lossy().into_owned()
 }
 
+fn initialize_params(ver: u64, extra: &str) -> String {
+    if ver >= 2 {
+        format!(
+            r#"{{"protocolVersion":{ver},"info":{{"name":"muse-acp-test-client","version":"0.0.0"}}{extra}}}"#
+        )
+    } else {
+        format!(r#"{{"protocolVersion":{ver}{extra}}}"#)
+    }
+}
+
 struct Client {
     child: Child,
     stdin: std::process::ChildStdin,
@@ -369,10 +379,7 @@ impl Client {
     /// New session via initialize + initialized + session/new. Returns the
     /// ACP session id.
     fn initialize(&mut self, ver: u64, extra_init: &str) {
-        let init = self.req(
-            "initialize",
-            &format!("{{\"protocolVersion\":{ver}{extra_init}}}"),
-        );
+        let init = self.req("initialize", &initialize_params(ver, extra_init));
         let frame = self.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
         assert!(frame.contains("\"result\""), "init failed: {frame}");
         assert!(
@@ -421,7 +428,7 @@ impl Client {
         cwd: &std::path::Path,
         additional: &[&std::path::Path],
     ) -> String {
-        let init = self.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        let init = self.req("initialize", &initialize_params(ver, ""));
         let frame = self.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
         assert!(
             frame.contains("\"additionalDirectories\":{}"),
@@ -1163,7 +1170,7 @@ fn inline_history_resume_reads_usage_back_from_the_view() {
     // backward page of the view the host just handed us.
     for (ver, method) in [(1u64, "session/load"), (2, "session/resume")] {
         let mut c = Client::spawn("usage_inline", &[]);
-        let init = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        let init = c.req("initialize", &initialize_params(ver, ""));
         c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
         c.notify("initialized", "{}");
         let lid = c.req(method, "{\"sessionId\":\"msp-sess-1\"}");
@@ -1199,7 +1206,7 @@ fn a_downgraded_resume_still_recovers_the_running_totals() {
     // instead of nulls.
     for (ver, method) in [(1u64, "session/load"), (2, "session/resume")] {
         let mut c = Client::spawn("usage_inline_nosnapshot", &[]);
-        let init = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        let init = c.req("initialize", &initialize_params(ver, ""));
         c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
         c.notify("initialized", "{}");
         let lid = c.req(method, "{\"sessionId\":\"msp-sess-1\"}");
@@ -1265,7 +1272,7 @@ fn load_and_resume_restore_usage_from_the_history_snapshot() {
     // snapshot's own state a reattached session reports nothing at all.
     for (ver, method) in [(1u64, "session/load"), (2, "session/resume")] {
         let mut c = Client::spawn("usage_resume", &[]);
-        let init = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        let init = c.req("initialize", &initialize_params(ver, ""));
         c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
         c.notify("initialized", "{}");
         let params = if ver == 2 {
@@ -2556,12 +2563,8 @@ fn resumed_user_input_is_presented_once_and_remains_answerable() {
         (2, "session/resume", "capabilities"),
     ] {
         let mut c = Client::spawn("questions_resume", &[]);
-        let init = c.req(
-            "initialize",
-            &format!(
-                "{{\"protocolVersion\":{ver},\"{caps}\":{{\"elicitation\":{{\"form\":{{}}}}}}}}"
-            ),
-        );
+        let extra = format!(r#","{caps}":{{"elicitation":{{"form":{{}}}}}}"#);
+        let init = c.req("initialize", &initialize_params(ver, &extra));
         c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
         c.notify("initialized", "{}");
         let load = c.req(method, "{\"sessionId\":\"msp-sess-1\"}");
@@ -4570,7 +4573,7 @@ fn host_requests(c: &Client, method: &str) -> Vec<serde_json::Value> {
 /// Initialize ACP `ver` and open a session whose `mcpServers` is the given
 /// JSON. Returns the initialize and session/new result frames.
 fn open_with_mcp(c: &mut Client, ver: u64, servers: &str) -> (String, String) {
-    let init = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+    let init = c.req("initialize", &initialize_params(ver, ""));
     let init_frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     assert!(
         init_frame.contains("\"result\""),
@@ -6151,7 +6154,7 @@ fn air_recommended_reasoning_falls_back_to_the_model_default() {
 #[test]
 fn reasoning_effort_default_is_restored_from_resume_snapshot() {
     let mut c = Client::spawn("reasoning_resume", &[]);
-    let init = c.req("initialize", "{\"protocolVersion\":2}");
+    let init = c.req("initialize", &initialize_params(2, ""));
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
     let rid = c.req(
@@ -6347,7 +6350,7 @@ fn steering_idle_policy_is_race_safe() {
 #[test]
 fn steering_targets_a_turn_rehydrated_by_resume() {
     let mut c = Client::spawn("resume_active", &[]);
-    let init = c.req("initialize", "{\"protocolVersion\":2}");
+    let init = c.req("initialize", &initialize_params(2, ""));
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
     let resume_id = c.req("session/resume", "{\"sessionId\":\"existing-session\"}");
@@ -6991,9 +6994,106 @@ fn malformed_json_is_rejected_and_survived() {
 }
 
 #[test]
+fn invalid_initialize_protocol_versions_do_not_launch_the_host() {
+    for (label, params) in [
+        ("missing", r#"{}"#),
+        ("null params", r#"null"#),
+        ("null version", r#"{"protocolVersion":null}"#),
+        ("string version", r#"{"protocolVersion":"2"}"#),
+        ("negative version", r#"{"protocolVersion":-1}"#),
+        ("out of range version", r#"{"protocolVersion":65536}"#),
+    ] {
+        let mut c = Client::spawn("quiet", &[]);
+        let id = c.req("initialize", params);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        let reply: serde_json::Value =
+            serde_json::from_str(&frame).expect("initialize response JSON");
+        assert_eq!(
+            reply["error"]["code"], -32602,
+            "{label} protocolVersion must be invalid params: {frame}"
+        );
+        assert!(
+            !std::path::Path::new(&c.fake_log).exists(),
+            "{label} protocolVersion launched the host: {frame}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn v2_initialize_requires_well_formed_info_before_launching_the_host() {
+    for (label, params) in [
+        ("missing", r#"{"protocolVersion":2}"#),
+        ("null", r#"{"protocolVersion":2,"info":null}"#),
+        ("missing fields", r#"{"protocolVersion":2,"info":{}}"#),
+        (
+            "non-string name",
+            r#"{"protocolVersion":2,"info":{"name":7,"version":"1.0.0"}}"#,
+        ),
+        (
+            "non-string title",
+            r#"{"protocolVersion":2,"info":{"name":"client","title":7,"version":"1.0.0"}}"#,
+        ),
+    ] {
+        let mut c = Client::spawn("quiet", &[]);
+        let id = c.req("initialize", params);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        let reply: serde_json::Value =
+            serde_json::from_str(&frame).expect("initialize response JSON");
+        assert_eq!(
+            reply["error"]["code"], -32602,
+            "v2 info {label} must be invalid params: {frame}"
+        );
+        assert!(
+            !std::path::Path::new(&c.fake_log).exists(),
+            "v2 info {label} launched the host: {frame}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn initialize_selects_the_highest_supported_version_at_or_below_the_request() {
+    let params = r#"{"protocolVersion":65535,"info":{"name":"client","version":"1.0.0"}}"#;
+    let mut c = Client::spawn("quiet", &[]);
+    let id = c.req("initialize", params);
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    let reply: serde_json::Value = serde_json::from_str(&frame).expect("initialize response JSON");
+    assert_eq!(
+        reply["result"]["protocolVersion"], 2,
+        "a request above the supported range must select the highest supported version: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn unsupported_initialize_version_returns_structured_version_data() {
+    let params = r#"{"protocolVersion":0,"info":{"name":"client","version":"1.0.0"}}"#;
+    let mut c = Client::spawn("quiet", &[]);
+    let id = c.req("initialize", params);
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    let reply: serde_json::Value = serde_json::from_str(&frame).expect("initialize response JSON");
+    assert_eq!(
+        reply["error"]["code"], -32022,
+        "unsupported version must use the protocol error: {frame}"
+    );
+    assert_eq!(reply["error"]["data"]["requested"], 0, "{frame}");
+    assert_eq!(
+        reply["error"]["data"]["supported"],
+        serde_json::json!([1, 2]),
+        "{frame}"
+    );
+    assert!(
+        !std::path::Path::new(&c.fake_log).exists(),
+        "an unsupported version launched the host: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
 fn invalid_session_roots_are_rejected() {
     let mut c = Client::spawn("happy", &[]);
-    let init = c.req("initialize", "{\"protocolVersion\":2}");
+    let init = c.req("initialize", &initialize_params(2, ""));
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
 
@@ -7291,7 +7391,7 @@ fn session_delete_is_advertised_only_where_the_host_supports_it() {
     // delete); 1.4.3 dropped the method, so it stays hidden there too.
     for ver in [1u64, 2] {
         let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.2")]);
-        let id = c.req("initialize", &format!("{{\"protocolVersion\":{ver}}}"));
+        let id = c.req("initialize", &initialize_params(ver, ""));
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
         assert!(
             frame.contains("\"delete\":{}"),
@@ -7847,7 +7947,7 @@ fn steering_never_carries_workspace_roots() {
             ("FAKE_WORKSPACE_ROOT", workspace.to_str().unwrap()),
         ],
     );
-    let init = c.req("initialize", "{\"protocolVersion\":2}");
+    let init = c.req("initialize", &initialize_params(2, ""));
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
     let resume = c.req(
@@ -11292,7 +11392,10 @@ fn async_tasks_reconcile_on_resume() {
     let mut c = Client::spawn("async_resume", &[]);
     let init = c.req(
         "initialize",
-        "{\"protocolVersion\":2,\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}}",
+        &initialize_params(
+            2,
+            r#","capabilities":{"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["asyncTasks"]}}}}"#,
+        ),
     );
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
@@ -12725,7 +12828,7 @@ fn terminal_auth_method_runs_muse_acp_login() {
         let mut c = Client::spawn("quiet", &[]);
         let id = c.req(
             "initialize",
-            &format!(r#"{{"protocolVersion":{version},"clientCapabilities":{{}}}}"#),
+            &initialize_params(version, r#","clientCapabilities":{}"#),
         );
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
         let reply: serde_json::Value = serde_json::from_str(&frame).expect("initialize json");
