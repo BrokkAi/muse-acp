@@ -13,7 +13,7 @@ It needs Muse installed but no Muse account, and it never reads your Muse
 settings:
 
 ```sh
-MUSE_ACP_LOOPBACK=1 cargo test --locked --test live_loopback
+MUSE_ACP_LOOPBACK=1 cargo test --locked -p muse-acp --test live_loopback
 ```
 
 Set `MUSE_CLI` to test a specific Muse build. The nightly workflow
@@ -26,8 +26,8 @@ Before submitting a pull request, run:
 
 ```sh
 cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
 cargo run --locked -- --selftest
 node --test npm/test/launcher.test.cjs
 python3 -m unittest discover -s scripts -p 'test_*.py'
@@ -68,5 +68,5 @@ See [RELEASING.md](RELEASING.md) for preparation, exact-commit checks, publicati
 and recovery. Preflight branch pushes and manual dispatches do not publish.
 
 Coverage-guided JSON fuzzing uses a separate development package and optional
-manual CI workflow; see [fuzz/README.md](fuzz/README.md). `cargo test --locked`
+manual CI workflow; see [fuzz/README.md](fuzz/README.md). `cargo test --locked --workspace`
 also runs its checked-in seed corpus without requiring nightly or libFuzzer.

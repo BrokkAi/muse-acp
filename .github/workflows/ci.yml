@@ -43,8 +43,8 @@ jobs:
           [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $PWD 'install.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
           if ($errors.Count -gt 0) { throw ($errors | Out-String) }
       - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
       - run: ./target/debug/muse-acp --selftest
       - run: node scripts/smoke_npm.cjs target/debug/muse-acp
 
@@ -58,7 +58,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           toolchain: 1.88.0
-      - run: cargo test --locked
+      - run: cargo test --locked --workspace
 
   npm-launcher:
     # macOS and Windows run in nightly.yml.

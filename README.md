@@ -23,6 +23,13 @@ Client implementers should start with the
 Muse method, `_meta` shape, capability, fallback, and the ACP standard fields
 used where they exist.
 
+The workspace also contains a reusable synchronous ACP client SDK,
+[`muse-acp-client`](crates/muse-acp-client/README.md). It can launch any ACP
+stdio agent, negotiate ACP v1 or v2, stream session updates, and route agent
+requests such as permissions and elicitation through a configurable handler.
+It is independent of the adapter binary and of the upstream
+`agent-client-protocol` Rust crate.
+
 > `muse-acp` is an independent community project. Muse Code and Muse Spark are
 > products of Meta Platforms, Inc. This project is not affiliated with,
 > endorsed by, or supported by Meta.
@@ -791,8 +798,8 @@ Before submitting a change:
 
 ```sh
 cargo fmt --check
-cargo clippy --locked --all-targets -- -D warnings
-cargo test --locked
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo test --locked --workspace
 cargo run --locked -- --selftest
 node --test npm/test/launcher.test.cjs
 python3 -m unittest discover -s scripts -p 'test_*.py'

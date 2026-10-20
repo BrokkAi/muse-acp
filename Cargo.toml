@@ -1,3 +1,7 @@
+[workspace]
+members = ["crates/muse-acp-client"]
+resolver = "3"
+
 [package]
 name = "muse-acp"
 version = "0.15.0"
@@ -15,3 +19,4 @@ publish = false
 # Test-only schema validation against the vendored MSP bundle; the shipped
 # binary remains dependency-free.
 serde_json = { version = "1", features = ["arbitrary_precision"] }
+muse-acp-client = { path = "crates/muse-acp-client" }
