@@ -2600,7 +2600,7 @@ fn a_workflow_child_runs_and_its_result_reaches_the_parent() {
     let host = Host::start(
         json!({"workflow": {"tool": {"name": "workflow", "arguments": {
             "name": "Helper run",
-            "script": "export default async function workflow(host) { return await host.agent({ input: \"child task\", label: \"helper\" }); }",
+            "script": "export default async function workflow(host) { return await host.agent({ input: \"child task\", label: \"helper\", effort: \"low\" }); }",
         }}}}),
         None,
     );
