@@ -369,9 +369,13 @@ error the editor shows if Muse then refuses the profile says why.
   [Client-provided MCP servers](#client-provided-mcp-servers).
 - **Questions** — Muse `userInput/requested` bridged to ACP
   `elicitation/create` forms when the client advertises form support; otherwise
-  the host falls back to auto-cancel. Option-bearing forms include an
-  **Explain instead** choice and an inline clarification field; choosing it
-  sends `userInput/clarify` instead of a structured answer. Multi-question
+  the host falls back to auto-cancel. Each field's `title` is the question's
+  header and the form message is the question text. Options are titled
+  `oneOf`/`anyOf` entries that keep Muse's option `description`, with any
+  option preview under the entry's `_meta.muse.preview`. Option-bearing
+  forms include an **Explain instead** choice and an inline clarification
+  field; choosing it sends `userInput/clarify` instead of a structured
+  answer. Multi-question
   prompts are asked one question per form so each confirmed answer is held by
   the adapter: stopping mid-way (or declining a later question) sends
   `userInput/interrupt` with the answers already given, which settles the

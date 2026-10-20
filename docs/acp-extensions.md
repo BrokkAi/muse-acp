@@ -196,6 +196,6 @@ frames. New clients should use the nested `muse` members.
 | Context and cost | `usage_update.used`, `.size`, `.cost` | cumulative/subscription details |
 | Compaction | `compaction_update` with negotiated v1 fallback | legacy v1 tool card and host provenance |
 | Permission requests | `session/request_permission` | `approvalReviewing` activity rows |
-| User questions | `elicitation/create` when negotiated | none |
+| User questions | `elicitation/create` when negotiated, with titled fields and choices | option previews in a choice's `_meta.muse.preview` (`{content, format}`) |
 | Turn steering | No stable standard method yet | `_session/steering` |
 | Goals and branch | No standard session method/field | `_meta.goal`, `_meta.muse.branch` |

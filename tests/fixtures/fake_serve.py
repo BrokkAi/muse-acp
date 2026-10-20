@@ -772,6 +772,15 @@ def question_params(user_input_id="ui-1"):
         questions[0]["selection"] = {"mode": "multiple", "minSelections": 2, "maxSelections": 2}
     if shape == "explain_collision":
         questions[0]["options"] = [{"label": "_explain"}, {"label": "Beta"}]
+    if shape == "described":
+        # A header containing ": " and two options sharing a label.
+        questions[0]["header"] = "Pick: one"
+        questions[0]["options"] = [
+            {"label": "Alpha", "description": "The first letter",
+             "preview": {"format": "markdown", "content": "# Alpha"}},
+            {"label": "Alpha", "description": "Another alpha"},
+            {"label": "Beta"},
+        ]
     if shape == "mixed":
         questions.extend([
             {"id": "q1", "header": "Pick many", "question": "Which ones?",

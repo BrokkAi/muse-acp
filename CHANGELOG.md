@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Give question form fields their header as `title`, and keep option
+  descriptions and previews (#324). The form message is now the question
+  text alone instead of `header: question`, so clients no longer need to
+  split it to label the field. Each option's Muse `description` becomes the
+  titled choice's `description`, and its `preview` (`{content, format}`)
+  rides the choice's `_meta.muse.preview`. Deduplicated labels still answer
+  with the host's original label.
+
 - Offer Auto-review as an ACP boolean config option (#309). ACP v2 clients,
   and ACP v1 clients that advertise
   `clientCapabilities.session.configOptions.boolean`, get a
