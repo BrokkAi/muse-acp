@@ -1788,10 +1788,10 @@ fn send_initialize(stdout: &StdoutShared, id: &Option<J>, session_mcp: bool, ses
 fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
     let id = msg.get("id").cloned();
     match msg.get("method").and_then(J::as_str) {
-        Some("initialize") => {
-            negotiate_acp(msg);
-            send_initialize(stdout, &id, false, false);
-        }
+        Some("initialize") => match negotiate_acp(msg) {
+            Ok(_) => send_initialize(stdout, &id, false, false),
+            Err(error) => send_acp_initialize_error(stdout, &id, error),
+        },
         Some(method @ ("shutdown" | "exit")) => {
             if method == "shutdown" {
                 acp::send_result(stdout, &id, "null");
@@ -3516,7 +3516,17 @@ fn main() {
                                 );
                                 continue;
                             }
-                            let user_input_dialogs = negotiate_acp(&v);
+                            let user_input_dialogs = match negotiate_acp(&v) {
+                                Ok(form) => form,
+                                Err(error) => {
+                                    send_acp_initialize_error(
+                                        &stdout,
+                                        &v.get("id").cloned(),
+                                        error,
+                                    );
+                                    continue;
+                                }
+                            };
                             let forward_tx = tx.clone();
                             let forward: hosts::Forward = Box::new(move |tag, events| {
                                 let tx = forward_tx.clone();
@@ -4152,20 +4162,58 @@ fn subagent_control(
 ///
 /// MSP's `userInputDialogs` capability is connection-scoped, so it must be
 /// derived from ACP `initialize` before the host's own handshake is sent.
-fn negotiate_acp(msg: &J) -> bool {
-    let params = msg.get("params");
-    let requested = params
-        .and_then(|p| p.get("protocolVersion"))
-        .and_then(|n| n.as_u64())
-        .unwrap_or(1);
+#[derive(Debug, PartialEq, Eq)]
+enum AcpInitializeError {
+    InvalidParams(&'static str),
+    UnsupportedVersion(u16),
+}
+
+fn valid_client_info(info: Option<&J>) -> bool {
+    let Some(info) = info else {
+        return false;
+    };
+    info.get("name").and_then(J::as_str).is_some()
+        && info.get("version").and_then(J::as_str).is_some()
+        && matches!(info.get("title"), None | Some(J::Null) | Some(J::Str(_)))
+}
+
+fn negotiate_acp(msg: &J) -> Result<bool, AcpInitializeError> {
+    let Some(params) = msg.get("params") else {
+        return Err(AcpInitializeError::InvalidParams(
+            "initialize params must be an object with protocolVersion",
+        ));
+    };
+    if !matches!(params, J::Obj(_)) {
+        return Err(AcpInitializeError::InvalidParams(
+            "initialize params must be an object with protocolVersion",
+        ));
+    }
+    let requested = match params.get("protocolVersion") {
+        Some(J::Num(raw)) => raw.parse::<u16>().map_err(|_| {
+            AcpInitializeError::InvalidParams(
+                "protocolVersion must be an integer from 0 through 65535",
+            )
+        })?,
+        _ => {
+            return Err(AcpInitializeError::InvalidParams(
+                "protocolVersion must be an integer from 0 through 65535",
+            ));
+        }
+    };
+    if requested == 0 {
+        return Err(AcpInitializeError::UnsupportedVersion(requested));
+    }
     let v = if requested >= 2 { 2 } else { 1 };
+    if v == 2 && !valid_client_info(params.get("info")) {
+        return Err(AcpInitializeError::InvalidParams(
+            "ACP v2 initialize requires info.name and info.version strings",
+        ));
+    }
     VER.store(v, Ordering::SeqCst);
-    let capabilities = params.and_then(|p| {
-        p.get(if v == 1 {
-            "clientCapabilities"
-        } else {
-            "capabilities"
-        })
+    let capabilities = params.get(if v == 1 {
+        "clientCapabilities"
+    } else {
+        "capabilities"
     });
     // Both ACP versions can advertise the form elicitation extension.
     let form = capabilities
@@ -4228,7 +4276,24 @@ fn negotiate_acp(msg: &J) -> bool {
     if compaction {
         log("client negotiated standard ACP compaction");
     }
-    form
+    Ok(form)
+}
+
+fn send_acp_initialize_error(stdout: &StdoutShared, id: &Option<J>, error: AcpInitializeError) {
+    match error {
+        AcpInitializeError::InvalidParams(message) => {
+            acp::send_error(stdout, id, -32602, message);
+        }
+        AcpInitializeError::UnsupportedVersion(requested) => {
+            acp::send_error_with_data(
+                stdout,
+                id,
+                -32022,
+                "Unsupported protocol version",
+                &format!(r#"{{"requested":{requested},"supported":[1,2]}}"#),
+            );
+        }
+    }
 }
 
 fn handle_acp(

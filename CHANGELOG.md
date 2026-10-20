@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Validate ACP initialization before launching Muse (#320). Missing,
+  non-integer, negative, or out-of-range protocol versions receive `-32602`;
+  unsupported versions receive `-32022` with `requested` and `supported`
+  data; requests above the supported range select the highest version at or
+  below the request; and ACP v2 requires a well-formed client `info` object.
+
 ## 0.15.0
 
 - Build release binaries with Rust 1.99.1 (previously 1.98.1). The minimum
