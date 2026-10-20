@@ -1511,10 +1511,18 @@ pub enum GeneratedName<'a> {
 /// omitted, never fabricated. The generated short title has independently
 /// omitted, present, and explicitly-cleared states so it can never be confused
 /// with the canonical name.
+/// How a session-title update treats the standard `title` member: leave it
+/// out, clear it with an explicit `null`, or publish a value.
+pub enum TitleUpdate<'a> {
+    Omit,
+    Clear,
+    Value(&'a str),
+}
+
 pub fn send_session_title(
     stdout: &StdoutShared,
     s: &mut AcpSession,
-    title: Option<&str>,
+    title: TitleUpdate<'_>,
     name_origin: Option<&str>,
     generated_name: GeneratedName<'_>,
 ) {
@@ -1528,8 +1536,12 @@ pub fn send_session_title(
         GeneratedName::Clear => s.set_session_meta("generatedName", "null".to_string()),
         GeneratedName::Value(name) => s.set_session_meta("generatedName", esc(name)),
     }
-    let title = title.map(esc).unwrap_or_else(|| "null".to_string());
-    send_session_info_snapshot(stdout, s, Some(&title), None);
+    let title = match title {
+        TitleUpdate::Omit => None,
+        TitleUpdate::Clear => Some("null".to_string()),
+        TitleUpdate::Value(title) => Some(esc(title)),
+    };
+    send_session_info_snapshot(stdout, s, title.as_deref(), None);
 }
 
 /// Send fold output, replacing each `session_info_update` Muse patch with the

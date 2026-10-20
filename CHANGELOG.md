@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Fix post-0.14.0 review findings. An auto-review verdict is discarded when
+  its approval reached `approval/resolved` while the reviewer turn ran, so a
+  terminal approval is never decided again or failed closed against live
+  work. A resolved-approval history read that returns no page keeps the walk
+  owed for the next approval instead of disabling the #238 check for the
+  attachment. `session_info_update` omits an unchanged `title` on
+  generated-name-only and origin-only changes, since ACP reads an explicit
+  `title: null` as a clear.
+
 - Refresh the README adapter comparison: add Muse Spark Code and
   1broseidon/muse-acp, and update npm adoption to the 30 days ending
   2026-10-18.

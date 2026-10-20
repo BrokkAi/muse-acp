@@ -764,9 +764,6 @@ fn adopt_pulled_session_row(s: &mut AcpSession, row: &J) {
         s.branch_meta = Some(branch.clone());
         s.set_session_meta("branch", branch);
     }
-    if let Some(attention) = row.get("attention") {
-        s.attention_meta = Some(j_to_string(attention));
-    }
 }
 
 /// The status event always carries a status. Its omitted attention member is
@@ -1287,6 +1284,12 @@ fn learn_resolved_approvals(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &st
         .get_mut(acp_sid)
     {
         s.approval_resolved.extend(resolved);
+        // A read that never returned a page proved nothing; keep the walk
+        // owed so the next approval tries again instead of skipping the
+        // check for the rest of the attachment.
+        if pages == 0 {
+            s.resolved_history_unread = true;
+        }
     }
     log(&format!(
         "resolved-approval history: {count} resolved approval(s) in {pages} page(s)"
@@ -8936,6 +8939,9 @@ fn confined_path(path: &str, roots: &[String]) -> Result<std::path::PathBuf, Str
 struct ReviewJob {
     acp_sid: String,
     owner_msp_sid: String,
+    /// The approval's own MSP session id: a child stream's approval keeps the
+    /// child's id, which with `approval_id` keys `approval_resolved`.
+    approval_sid: String,
     ver: u8,
     approval_id: String,
     requirement: J,
@@ -8959,6 +8965,28 @@ fn drop_queued_review(acp_sid: &str, child_subagent_id: &Option<String>, approva
             "auto-review dropped queued {approval_id}: resolved elsewhere"
         ));
     }
+}
+
+/// True when the approval a finished review would decide already has a
+/// durable terminal decision (`approval/resolved` arrived while the reviewer
+/// turn ran). Its verdict must then be discarded: a decide would be rejected
+/// by the host, and failing closed would cancel live work for a ghost.
+fn review_job_resolved(sessions: &Sessions, job: &ReviewJob) -> bool {
+    let resolved = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&job.acp_sid)
+        .is_some_and(|s| {
+            s.approval_resolved
+                .contains(&(job.approval_sid.clone(), job.approval_id.clone()))
+        });
+    if resolved {
+        log(&format!(
+            "auto-review discarded verdict for {}: resolved elsewhere",
+            job.approval_id
+        ));
+    }
+    resolved
 }
 
 #[derive(Default)]
@@ -9079,6 +9107,7 @@ fn enqueue_review(
     let job = ReviewJob {
         acp_sid: acp_sid.to_string(),
         owner_msp_sid: owner_msp_sid.to_string(),
+        approval_sid: approval_sid.to_string(),
         ver,
         approval_id: approval_id.to_string(),
         requirement,
@@ -9344,6 +9373,10 @@ fn finish_review(
     job: ReviewJob,
     text: &str,
 ) {
+    if review_job_resolved(sessions, &job) {
+        start_next_review(host, stdout, sessions);
+        return;
+    }
     match reviewer::parse_assessment(text) {
         Some(assessment) => match reviewer::effective_outcome(&assessment) {
             reviewer::Outcome::Allow => match reviewer::allow_choice(&job.choices) {
@@ -9418,8 +9451,10 @@ fn fail_review_turn(
     terminal: &str,
     params: &J,
 ) {
-    let rationale = reviewer::failed_turn_rationale(terminal, params);
-    deny_review_job(host, stdout, sessions, job, ReviewDeny::Plain, &rationale);
+    if !review_job_resolved(sessions, &job) {
+        let rationale = reviewer::failed_turn_rationale(terminal, params);
+        deny_review_job(host, stdout, sessions, job, ReviewDeny::Plain, &rationale);
+    }
     reset_reviewer_host(host);
     start_next_review(host, stdout, sessions);
 }
@@ -9443,14 +9478,16 @@ fn expire_review_deadline(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &S
     };
     if let Some((job, timeout)) = expired {
         log(&format!("auto-review timed out for {}", job.approval_id));
-        deny_review_job(
-            host,
-            stdout,
-            sessions,
-            job,
-            ReviewDeny::Plain,
-            &format!("reviewer timed out after {}", short_duration(timeout)),
-        );
+        if !review_job_resolved(sessions, &job) {
+            deny_review_job(
+                host,
+                stdout,
+                sessions,
+                job,
+                ReviewDeny::Plain,
+                &format!("reviewer timed out after {}", short_duration(timeout)),
+            );
+        }
         reset_reviewer_host(host);
         start_next_review(host, stdout, sessions);
     }
@@ -9651,7 +9688,10 @@ impl HostTitleSnapshot {
 }
 
 struct HostTitleUpdate {
-    title: Option<String>,
+    /// `None` omits the key, `Some(None)` clears the published title, and
+    /// `Some(Some(value))` publishes the selected host title. ACP reads an
+    /// explicit `title: null` as a clear, so an unchanged title is omitted.
+    title: Option<Option<String>>,
     name_origin: Option<String>,
     /// `None` omits the key, `Some(None)` clears a stale value, and
     /// `Some(Some(value))` publishes the host's current generated title.
@@ -9669,8 +9709,9 @@ impl HostTitleUpdate {
             None if before.generated_name.is_some() => Some(None),
             None => None,
         };
+        let title = (before.title != after.title).then(|| after.title.clone());
         Some(Self {
-            title: after.title,
+            title,
             name_origin: after.name_origin,
             generated_name,
         })
@@ -9682,10 +9723,15 @@ impl HostTitleUpdate {
             Some(None) => acp::GeneratedName::Clear,
             Some(Some(name)) => acp::GeneratedName::Value(name),
         };
+        let title = match &self.title {
+            None => acp::TitleUpdate::Omit,
+            Some(None) => acp::TitleUpdate::Clear,
+            Some(Some(title)) => acp::TitleUpdate::Value(title),
+        };
         acp::send_session_title(
             stdout,
             s,
-            self.title.as_deref(),
+            title,
             self.name_origin.as_deref(),
             generated_name,
         );
@@ -10635,14 +10681,15 @@ fn handle_msp(
             log(&format!(
                 "turn/completed turn={turn_id} terminal={terminal} detail={terminal_detail}"
             ));
-            let cleanup_sid = find_acp_sid(sessions, msp_sid)
+            let direct_sid = find_acp_sid(sessions, msp_sid);
+            let cleanup_sid = direct_sid
+                .clone()
                 .or_else(|| owner_for_msp_session(sessions, msp_sid).map(|route| route.0));
             if let Some(acp_sid) = cleanup_sid {
                 clear_turn_approval_reviewing(stdout, sessions, &acp_sid, turn_id);
             }
-            let acp_sid = match find_acp_sid(sessions, msp_sid) {
-                Some(s) => s,
-                None => return,
+            let Some(acp_sid) = direct_sid else {
+                return;
             };
             // A terminal host event makes an optional feedback form stale.
             // The original permission may still be handled as before, but a
@@ -11852,13 +11899,14 @@ fn observe_approval_reviewing(
         }
     };
     match changed {
-        Some(_) => {
+        Some(reviews) => {
             log(&format!(
                 "approval {approval_id} under native review: session={msp_sid}"
             ));
+            // Publish the snapshot that produced the change, not whatever
+            // the vector holds once the lock is retaken.
             let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
             if let Some(s) = map.get_mut(&acp_sid) {
-                let reviews = s.approval_reviewing.clone();
                 acp::send_approval_reviewing(stdout, s, &reviews);
             }
         }
@@ -14795,11 +14843,24 @@ mod tests {
             ..HostTitleFacts::default()
         });
         let update = HostTitleUpdate::after(&before, &facts).expect("generated-only change");
-        assert_eq!(update.title.as_deref(), Some("Canonical title"));
+        // The unchanged title is omitted: an explicit `title: null` is a
+        // clear in ACP, and resending the value is noise.
+        assert_eq!(update.title, None);
         assert_eq!(
             update.generated_name,
             Some(Some("New short title".to_string()))
         );
+
+        // A title that goes away is cleared explicitly.
+        let update = HostTitleUpdate::after(
+            &HostTitleSnapshot::of(&facts),
+            &HostTitleFacts {
+                generated_name: Some("New short title".to_string()),
+                ..HostTitleFacts::default()
+            },
+        )
+        .expect("title withdrawal");
+        assert_eq!(update.title, Some(None));
 
         let before = HostTitleSnapshot::of(&facts);
         let after = HostTitleFacts {

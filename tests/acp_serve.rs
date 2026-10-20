@@ -4018,9 +4018,12 @@ fn session_name_origin_reaches_acp_only_when_the_host_proves_it() {
             "v{ver} absent origin must be omitted: {plain}"
         );
         // The same name re-folded with provenance is an origin-only change:
-        // it still publishes, so the client learns the origin it lacked.
-        let proven = c.wait_for_all(
-            &["\"title\":\"Plain name\"", "\"nameOrigin\":\"automatic\""],
+        // it still publishes, so the client learns the origin it lacked, but
+        // the unchanged title is omitted rather than resent.
+        // `_meta` directly after `sessionUpdate` is the frame with no title
+        // member; the start frame carried the same origin next to its title.
+        let proven = c.wait_for(
+            "\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"muse\":{\"nameOrigin\":\"automatic\"}}",
             Duration::from_secs(15),
         );
         assert!(proven.contains(&sid), "v{ver} origin-only update: {proven}");
@@ -4057,7 +4060,9 @@ fn generated_session_name_is_fold_only_metadata() {
         );
         assert!(started.contains(&sid), "v{ver} snapshot title: {started}");
 
-        // A generated-only change must still publish a session-info update.
+        // A generated-only change must still publish a session-info update,
+        // without the unchanged title: `title: null` is a clear in ACP and a
+        // resent value is noise, so an unchanged title is omitted.
         let pid = c.prompt(&sid, "first generated title");
         let result = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
         assert!(result.contains("\"result\""), "{result}");
@@ -4067,12 +4072,15 @@ fn generated_session_name_is_fold_only_metadata() {
         let live = c.wait_for_all(
             &[
                 "\"sessionUpdate\":\"session_info_update\"",
-                "\"title\":\"Canonical title\"",
                 "\"generatedName\":\"Live short title\"",
             ],
             Duration::from_secs(15),
         );
         assert!(live.contains(&sid), "v{ver} live generated title: {live}");
+        assert!(
+            !live.contains("\"title\""),
+            "v{ver} unchanged title must be omitted: {live}"
+        );
 
         // List rows carry only the canonical fact. Reading one must neither
         // expose generatedName nor erase the value already held live.
@@ -4127,11 +4135,8 @@ fn generated_session_name_is_fold_only_metadata() {
         let rid = c.req(method, &format!("{{\"sessionId\":\"{sid}\"}}"));
         let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
         assert!(resumed.contains("\"result\""), "{method} failed: {resumed}");
-        let restored = c.wait_for_all(
-            &[
-                "\"title\":\"Canonical title\"",
-                "\"generatedName\":\"Resumed short title\"",
-            ],
+        let restored = c.wait_for(
+            "\"generatedName\":\"Resumed short title\"",
             Duration::from_secs(15),
         );
         assert!(
