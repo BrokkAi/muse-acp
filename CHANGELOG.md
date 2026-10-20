@@ -8,6 +8,11 @@
   data; requests above the supported range select the highest version at or
   below the request; and ACP v2 requires a well-formed client `info` object.
 
+- Put the **Explain instead** choice and clarification text directly inside
+  option-bearing Muse question forms. Answering a normal question now takes
+  one form submission instead of a separate workflow-choice form first;
+  choosing the inline explanation still sends `userInput/clarify`.
+
 ## 0.15.0
 
 - Build release binaries with Rust 1.99.1 (previously 1.98.1). The minimum

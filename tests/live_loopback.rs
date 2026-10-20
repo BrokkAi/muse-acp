@@ -1827,12 +1827,6 @@ fn a_user_input_question_becomes_an_editor_form_and_the_answer_reaches_muse() {
     let mut adapter = Adapter::launch_with(&host, json!({"elicitation": {"form": {}}}));
     let session = adapter.new_session(&host, json!([]));
     let prompt = adapter.prompt(&session, "ask me [[script:ask]]");
-    let route = form(&adapter, "route");
-    adapter.send(json!({
-        "jsonrpc": "2.0",
-        "id": route["id"],
-        "result": {"action": "accept", "content": {"route": "Answer questions"}},
-    }));
     let question = form(&adapter, "q0");
     assert!(
         question["params"]["message"]
@@ -1840,13 +1834,17 @@ fn a_user_input_question_becomes_an_editor_form_and_the_answer_reaches_muse() {
             .is_some_and(|message| message.contains("Which color should the notes use?")),
         "{question}"
     );
-    let red = question["params"]["requestedSchema"]["properties"]["q0"]["enum"]
+    let red = question["params"]["requestedSchema"]["properties"]["q0"]["oneOf"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|choice| choice.as_str().is_some_and(|label| label.contains("Red")))
-        .unwrap_or_else(|| panic!("no Red choice in {question}"))
-        .clone();
+        .find(|choice| {
+            choice["const"]
+                .as_str()
+                .is_some_and(|label| label.contains("Red"))
+        })
+        .map(|choice| choice["const"].clone())
+        .unwrap_or_else(|| panic!("no Red choice in {question}"));
     adapter.send(json!({
         "jsonrpc": "2.0",
         "id": question["id"],
@@ -1889,12 +1887,6 @@ fn stopping_a_staged_question_interrupts_with_the_confirmed_answer() {
     };
     let session = adapter.new_session(&host, json!([]));
     let prompt = adapter.prompt(&session, "ask me [[script:ask]]");
-    let route = form(&adapter, "route");
-    adapter.send(json!({
-        "jsonrpc": "2.0",
-        "id": route["id"],
-        "result": {"action": "accept", "content": {"route": "Answer questions"}},
-    }));
     let first = form(&adapter, "q0");
     assert!(
         first["params"]["requestedSchema"]["properties"]
@@ -1902,13 +1894,17 @@ fn stopping_a_staged_question_interrupts_with_the_confirmed_answer() {
             .is_none(),
         "questions are staged one at a time: {first}"
     );
-    let red = first["params"]["requestedSchema"]["properties"]["q0"]["enum"]
+    let red = first["params"]["requestedSchema"]["properties"]["q0"]["oneOf"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|choice| choice.as_str().is_some_and(|label| label.contains("Red")))
-        .unwrap_or_else(|| panic!("no Red choice in {first}"))
-        .clone();
+        .find(|choice| {
+            choice["const"]
+                .as_str()
+                .is_some_and(|label| label.contains("Red"))
+        })
+        .map(|choice| choice["const"].clone())
+        .unwrap_or_else(|| panic!("no Red choice in {first}"));
     adapter.send(json!({
         "jsonrpc": "2.0",
         "id": first["id"],

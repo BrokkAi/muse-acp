@@ -2480,12 +2480,11 @@ fn tool_permission_title_prefers_the_subject_then_its_description() {
 }
 
 #[test]
-fn user_input_options_reach_the_client() {
+fn user_input_options_and_inline_explanation_reach_the_client() {
     let mut c = Client::spawn("questions", &[]);
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
     let _pid = c.prompt(&sid, "ask me");
-    // The bridge announces requires_action, then offers a route before the
-    // existing enum schema (there is no user_input update).
+    // The bridge announces requires_action, then offers the question itself.
     let state = c.wait_for("requires_action", Duration::from_secs(15));
     assert!(state.contains(&sid), "state for our session: {state}");
     let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
@@ -2500,19 +2499,20 @@ fn user_input_options_reach_the_client() {
         "form capability must be declared to MSP: {msp_init}"
     );
     assert!(
-        elicit.contains("Answer questions") && elicit.contains("Explain instead"),
-        "route choices bridged: {elicit}"
+        elicit.contains("\"q0\"")
+            && elicit.contains("Alpha")
+            && elicit.contains("Beta")
+            && elicit.contains("Explain instead")
+            && elicit.contains("\"clarification\"")
+            && !elicit.contains("\"route\""),
+        "question and inline explanation are bridged in one form: {elicit}"
     );
-    let route_id = extract_str(elicit, "id").unwrap();
+    let question_id = extract_str(elicit, "id").unwrap();
     c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
     ));
-    let answer = c.wait_for_elicitation_count(2, Duration::from_secs(15));
-    assert!(
-        answer[1].contains("Alpha") && answer[1].contains("Beta"),
-        "option answers bridged after route: {}",
-        answer[1]
-    );
+    c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
+    assert_eq!(c.elicitation_frames().len(), 1);
     let log = c
         .frames
         .lock()
@@ -2534,26 +2534,131 @@ fn multiple_user_input_schema_is_valid_for_both_protocol_versions() {
         let mut c = Client::spawn("questions_multiple", &[]);
         let sid = c.new_session(ver, caps);
         let _pid = c.prompt(&sid, "ask me");
-        let elicit = c.wait_for("elicitation/create", Duration::from_secs(15));
-        let route_id = extract_str(&elicit, "id").unwrap();
-        c.raw(&serde_json::json!({"jsonrpc":"2.0","id":route_id,"result":{"action":"accept","content":{"route":"Answer questions"}}}).to_string());
-        let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+        let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
         let frame: serde_json::Value =
-            serde_json::from_str(&forms[1]).expect("multiple-selection elicitation is valid JSON");
+            serde_json::from_str(&forms[0]).expect("multiple-selection elicitation is valid JSON");
         let schema = &frame["params"]["requestedSchema"]["properties"]["q0"];
         assert_eq!(
             schema["type"], "array",
             "v{ver} question uses an array schema"
         );
-        assert_eq!(schema["items"]["type"], "string");
+        let choices = schema["items"]["anyOf"].as_array().expect("titled choices");
         assert_eq!(
-            schema["items"]["enum"],
-            serde_json::json!(["Alpha", "Beta"])
+            choices.len(),
+            3,
+            "two host choices plus explain: {choices:?}"
         );
+        assert_eq!(choices[0]["const"], "Alpha");
+        assert_eq!(choices[1]["const"], "Beta");
+        assert_eq!(choices[2]["const"], "_explain");
+        assert_eq!(choices[2]["title"], "Explain instead");
         assert_eq!(schema["minItems"], 1);
         assert_eq!(schema["maxItems"], 2);
+        assert_eq!(
+            frame["params"]["requestedSchema"]["properties"]["clarification"]["maxLength"],
+            500
+        );
         c.finish();
     }
+}
+
+#[test]
+fn multiple_choice_explanation_must_be_exclusive_and_stays_correctable() {
+    let mut c = Client::spawn("questions_multiple", &[]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let question_id = extract_str(&forms[0], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":[\"_explain\",\"Red\"],\"clarification\":\"Explain the premise.\"}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    assert!(
+        forms[1].contains("Choose Explain instead by itself"),
+        "ambiguous selection is correctable in the same form: {}",
+        forms[1]
+    );
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(
+        !calls
+            .lines()
+            .any(|line| matches!(line, "userInput/answer" | "userInput/clarify")),
+        "an ambiguous explain choice reaches no host command: {calls}"
+    );
+
+    let question_id = extract_str(&forms[1], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":[\"_explain\"],\"clarification\":\"Explain the premise.\"}}}}}}"
+    ));
+    c.wait_input("\"clarification\"", Duration::from_secs(15));
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert_eq!(
+        calls.lines().filter(|m| *m == "userInput/clarify").count(),
+        1
+    );
+    assert!(!calls.lines().any(|m| m == "userInput/answer"));
+    c.finish();
+}
+
+#[test]
+fn multiple_choice_real_answers_keep_the_host_minimum() {
+    let mut c = Client::spawn("questions", &[("FAKE_QUESTION_SHAPE", "strict_multiple")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let frame: serde_json::Value = serde_json::from_str(&forms[0]).unwrap();
+    let schema = &frame["params"]["requestedSchema"]["properties"]["q0"];
+    assert_eq!(
+        schema["minItems"], 1,
+        "schema leaves room for the one-item explain branch: {schema}"
+    );
+    let question_id = extract_str(&forms[0], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":[\"Alpha\"]}}}}}}"
+    ));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    assert!(
+        forms[1].contains("Select at least 2 answers"),
+        "the adapter enforces the original minimum: {}",
+        forms[1]
+    );
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(!calls.lines().any(|m| m == "userInput/answer"));
+
+    let question_id = extract_str(&forms[1], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":[\"Alpha\",\"Beta\"]}}}}}}"
+    ));
+    c.wait_input(
+        "\"selectedLabels\": [\"Alpha\", \"Beta\"]",
+        Duration::from_secs(15),
+    );
+    c.finish();
+}
+
+#[test]
+fn explain_sentinel_does_not_hijack_a_real_host_label() {
+    let mut c = Client::spawn("questions", &[("FAKE_QUESTION_SHAPE", "explain_collision")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
+    let _pid = c.prompt(&sid, "ask me");
+    let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
+    let frame: serde_json::Value = serde_json::from_str(&forms[0]).unwrap();
+    let choices = frame["params"]["requestedSchema"]["properties"]["q0"]["oneOf"]
+        .as_array()
+        .unwrap();
+    let values = choices
+        .iter()
+        .map(|choice| choice["const"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(values, ["_explain", "Beta", "_explain_"]);
+    let question_id = extract_str(&forms[0], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"_explain\"}}}}}}"
+    ));
+    c.wait_input("\"selectedLabel\": \"_explain\"", Duration::from_secs(15));
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert!(!calls.lines().any(|m| m == "userInput/clarify"));
+    c.finish();
 }
 
 #[test]
@@ -2585,12 +2690,7 @@ fn resumed_user_input_is_presented_once_and_remains_answerable() {
             usage.contains("\"used\":120") && usage.contains("\"totalTokens\":360"),
             "v{ver} backfill still restores usage: {usage}"
         );
-        let first_route_id = extract_str(&forms[0], "id").unwrap();
-        c.raw(&format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":\"{first_route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
-        ));
-        let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
-        let first_answer_id = extract_str(&forms[1], "id").unwrap();
+        let first_answer_id = extract_str(&forms[0], "id").unwrap();
         c.raw(&format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":\"{first_answer_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
         ));
@@ -2604,18 +2704,13 @@ fn resumed_user_input_is_presented_once_and_remains_answerable() {
         } else {
             c.wait_for("\"idle\"", Duration::from_secs(15));
         }
-        let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
-        let second_route_id = extract_str(&forms[2], "id").unwrap();
-        c.raw(&format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":\"{second_route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
-        ));
-        let forms = c.wait_for_elicitation_count(4, Duration::from_secs(15));
+        let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
         assert_eq!(
             forms.len(),
-            4,
+            2,
             "v{ver} one form per distinct question: {forms:?}"
         );
-        let second_id = extract_str(&forms[3], "id").unwrap();
+        let second_id = extract_str(&forms[1], "id").unwrap();
         assert_ne!(first_answer_id, second_id);
         c.raw(&format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":\"{second_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Beta\"}}}}}}"
@@ -2645,19 +2740,18 @@ fn v1_questions_use_advertised_client_form_capability() {
         "elicitation for our session: {elicit}"
     );
     assert!(
-        elicit.contains("Explain instead"),
-        "explanation route advertised in v1: {elicit}"
+        elicit.contains("\"q0\"")
+            && elicit.contains("Alpha")
+            && elicit.contains("Explain instead")
+            && elicit.contains("\"clarification\""),
+        "question and inline explanation advertised in v1: {elicit}"
     );
-    let route_id = extract_str(elicit, "id").unwrap();
+    let question_id = extract_str(elicit, "id").unwrap();
     c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
     ));
-    let answer = c.wait_for_elicitation_count(2, Duration::from_secs(15));
-    assert!(
-        answer[1].contains("Alpha") && answer[1].contains("Beta"),
-        "v1 answer form: {}",
-        answer[1]
-    );
+    c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
+    assert_eq!(c.elicitation_frames().len(), 1);
     let frames = c
         .frames
         .lock()
@@ -2671,7 +2765,7 @@ fn v1_questions_use_advertised_client_form_capability() {
 }
 
 #[test]
-fn explanation_route_sends_one_clarification_for_both_protocol_versions() {
+fn inline_explanation_sends_one_clarification_for_both_protocol_versions() {
     for ver in [1, 2] {
         let mut c = Client::spawn("questions", &[]);
         let caps = if ver == 1 {
@@ -2682,19 +2776,14 @@ fn explanation_route_sends_one_clarification_for_both_protocol_versions() {
         let sid = c.new_session(ver, caps);
         let _pid = c.prompt(&sid, "ask me");
         let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
-        let route_id = extract_str(&forms[0], "id").unwrap();
-        c.raw(&format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Explain instead\"}}}}}}"
-        ));
-        let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
         assert!(
-            forms[1].contains("clarification") && forms[1].contains("maxLength\":500"),
-            "v{ver} clarification form: {}",
-            forms[1]
+            forms[0].contains("\"maxLength\":500") && forms[0].contains("_explain"),
+            "v{ver} question carries the inline explanation path: {}",
+            forms[0]
         );
-        let clarification_id = extract_str(&forms[1], "id").unwrap();
+        let question_id = extract_str(&forms[0], "id").unwrap();
         c.raw(&format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":\"{clarification_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"clarification\":\"The premise does not fit my situation.\"}}}}}}"
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"_explain\",\"clarification\":\"The premise does not fit my situation.\"}}}}}}"
         ));
         c.wait_log("userInput/clarify", Duration::from_secs(15));
         c.wait_input(
@@ -2713,6 +2802,11 @@ fn explanation_route_sends_one_clarification_for_both_protocol_versions() {
         assert!(inputs.contains("\"userInputId\": \"ui-1\""));
         assert!(inputs.contains("\"format\": \"text\""));
         assert!(inputs.contains("The premise does not fit my situation."));
+        assert_eq!(
+            c.elicitation_frames().len(),
+            1,
+            "v{ver} explanation stays inside the question form"
+        );
         c.finish();
     }
 }
@@ -2727,21 +2821,16 @@ fn invalid_clarifications_are_correctable_without_a_host_command() {
         let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
         let _pid = c.prompt(&sid, "ask me");
         let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
-        let route_id = extract_str(&forms[0], "id").unwrap();
+        let question_id = extract_str(&forms[0], "id").unwrap();
         c.raw(&format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Explain instead\"}}}}}}"
-        ));
-        let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
-        let clarification_id = extract_str(&forms[1], "id").unwrap();
-        c.raw(&format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":\"{clarification_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"clarification\":{}}}}}}}",
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"_explain\",\"clarification\":{}}}}}}}",
             serde_json::to_string(&bad).unwrap()
         ));
-        let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
+        let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
         assert!(
-            forms[2].contains(message),
+            forms[1].contains(message),
             "correctable validation message: {}",
-            forms[2]
+            forms[1]
         );
         let calls = std::fs::read_to_string(&c.fake_log).unwrap();
         assert!(!calls.lines().any(|m| m == "userInput/clarify"));
@@ -2761,21 +2850,16 @@ fn host_clarification_rejection_is_visible_and_remains_correctable() {
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
     let _pid = c.prompt(&sid, "ask me");
     let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
-    let route_id = extract_str(&forms[0], "id").unwrap();
+    let question_id = extract_str(&forms[0], "id").unwrap();
     c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Explain instead\"}}}}}}"
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"_explain\",\"clarification\":\"Please reconsider the premise.\"}}}}}}"
     ));
     let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
-    let clarification_id = extract_str(&forms[1], "id").unwrap();
-    c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{clarification_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"clarification\":\"Please reconsider the premise.\"}}}}}}"
-    ));
-    let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
     assert!(
-        forms[2].contains("Muse rejected the clarification")
-            && forms[2].contains("clarification rejected by fixture"),
+        forms[1].contains("Muse rejected the clarification")
+            && forms[1].contains("clarification rejected by fixture"),
         "host rejection is visible in the replacement form: {}",
-        forms[2]
+        forms[1]
     );
     let calls = std::fs::read_to_string(&c.fake_log).unwrap();
     assert_eq!(
@@ -2787,40 +2871,40 @@ fn host_clarification_rejection_is_visible_and_remains_correctable() {
 }
 
 #[test]
-fn stale_form_replies_cannot_settle_a_later_stage() {
+fn duplicate_reply_to_a_settled_question_is_ignored() {
     let mut c = Client::spawn("questions", &[]);
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
     let _pid = c.prompt(&sid, "ask me");
     let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
-    let old_route_id = extract_str(&forms[0], "id").unwrap();
+    let question_id = extract_str(&forms[0], "id").unwrap();
     c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{old_route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
-    ));
-    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
-    c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{old_route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Explain instead\"}}}}}}"
-    ));
-    std::thread::sleep(Duration::from_millis(100));
-    assert_eq!(c.elicitation_frames().len(), 2);
-    let answer_id = extract_str(&forms[1], "id").unwrap();
-    c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{answer_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
     ));
     c.wait_input("\"selectedLabel\": \"Alpha\"", Duration::from_secs(15));
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Beta\"}}}}}}"
+    ));
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(c.elicitation_frames().len(), 1);
     let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert_eq!(
+        calls.lines().filter(|m| *m == "userInput/answer").count(),
+        1,
+        "a duplicate reply must not submit a second answer: {calls}"
+    );
     assert!(!calls.lines().any(|m| m == "userInput/clarify"));
     c.finish();
 }
 
 #[test]
-fn declining_the_route_cancels_the_pending_question() {
+fn declining_the_question_cancels_the_pending_prompt() {
     let mut c = Client::spawn("questions", &[]);
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
     let _pid = c.prompt(&sid, "ask me");
     let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
-    let route_id = extract_str(&forms[0], "id").unwrap();
+    let question_id = extract_str(&forms[0], "id").unwrap();
     c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"decline\"}}}}"
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{question_id}\",\"result\":{{\"action\":\"decline\"}}}}"
     ));
     c.wait_log("userInput/cancel", Duration::from_secs(15));
     assert_eq!(c.elicitation_frames().len(), 1);
@@ -2836,47 +2920,42 @@ fn structured_question_shapes_keep_the_existing_answer_mapping() {
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
     let _pid = c.prompt(&sid, "ask me");
     let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
-    let route_id = extract_str(&forms[0], "id").unwrap();
-    c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
-    ));
     // Multi-question prompts are staged one question per form so a stop can
     // carry the answers already confirmed (see
     // `partial_user_input_interrupts_with_confirmed_answers`). Each form
     // keeps its question's original index in the property key.
-    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
     assert!(
-        forms[1].contains("\"q0\"")
-            && forms[1].contains("Alpha")
-            && forms[1].contains("Question 1 of 3"),
+        forms[0].contains("\"q0\"")
+            && forms[0].contains("Alpha")
+            && forms[0].contains("Question 1 of 3"),
         "first staged question: {}",
-        forms[1]
+        forms[0]
     );
-    let q0_id = extract_str(&forms[1], "id").unwrap();
+    let q0_id = extract_str(&forms[0], "id").unwrap();
     c.raw(&format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":\"{q0_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
     ));
-    let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
     assert!(
-        forms[2].contains("\"q1\"")
-            && forms[2].contains("Red")
-            && forms[2].contains("Question 2 of 3"),
+        forms[1].contains("\"q1\"")
+            && forms[1].contains("Red")
+            && forms[1].contains("Question 2 of 3"),
         "multiple-selection question staged second: {}",
-        forms[2]
+        forms[1]
     );
-    let q1_id = extract_str(&forms[2], "id").unwrap();
+    let q1_id = extract_str(&forms[1], "id").unwrap();
     c.raw(&format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":\"{q1_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q1\":[\"Red\",\"Blue\"]}}}}}}"
     ));
-    let forms = c.wait_for_elicitation_count(4, Duration::from_secs(15));
+    let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
     assert!(
-        forms[3].contains("\"q2\"")
-            && forms[3].contains("Why?")
-            && forms[3].contains("Question 3 of 3"),
+        forms[2].contains("\"q2\"")
+            && forms[2].contains("Why?")
+            && forms[2].contains("Question 3 of 3"),
         "free-text question staged last: {}",
-        forms[3]
+        forms[2]
     );
-    let q2_id = extract_str(&forms[3], "id").unwrap();
+    let q2_id = extract_str(&forms[2], "id").unwrap();
     c.raw(&format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":\"{q2_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q2\":\"because\"}}}}}}"
     ));
@@ -2902,27 +2981,46 @@ fn staged_question_pair_at_second_form() -> (Client, String) {
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
     let _pid = c.prompt(&sid, "ask me");
     let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
-    let route_id = extract_str(&forms[0], "id").unwrap();
-    c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
-    ));
-    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
     assert!(
-        forms[1].contains("Alpha") && !forms[1].contains("Gamma"),
+        forms[0].contains("Alpha") && !forms[0].contains("Gamma"),
         "only the first question is asked: {}",
-        forms[1]
+        forms[0]
     );
-    let q0_id = extract_str(&forms[1], "id").unwrap();
+    let q0_id = extract_str(&forms[0], "id").unwrap();
     c.raw(&format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":\"{q0_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
     ));
-    let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
     assert!(
-        forms[2].contains("Gamma") && forms[2].contains("Question 2 of 2"),
+        forms[1].contains("Gamma") && forms[1].contains("Question 2 of 2"),
         "second question staged after the first answer: {}",
-        forms[2]
+        forms[1]
     );
     (c, sid)
+}
+
+#[test]
+fn explanation_on_a_later_staged_question_replaces_the_answer_flow() {
+    let (mut c, _sid) = staged_question_pair_at_second_form();
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    let second_id = extract_str(&forms[1], "id").unwrap();
+    c.raw(&format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":\"{second_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q1\":\"_explain\",\"clarification\":\"The second premise does not apply.\"}}}}}}"
+    ));
+    c.wait_input("\"clarification\"", Duration::from_secs(15));
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    assert_eq!(
+        calls.lines().filter(|m| *m == "userInput/clarify").count(),
+        1
+    );
+    assert!(
+        !calls.lines().any(|line| line == "userInput/answer"),
+        "MSP clarification cannot also carry confirmed answers: {calls}"
+    );
+    let inputs = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
+    assert!(inputs.contains("The second premise does not apply."));
+    assert!(!inputs.contains("\"selectedLabel\": \"Alpha\""));
+    c.finish();
 }
 
 /// ACP forms are atomic: a reply either carries a full answer set or none.
@@ -3047,17 +3145,12 @@ fn declining_after_a_confirmed_answer_interrupts_with_it() {
     let sid = c.new_session(2, ",\"capabilities\":{\"elicitation\":{\"form\":{}}}");
     let _pid = c.prompt(&sid, "ask me");
     let forms = c.wait_for_elicitation_count(1, Duration::from_secs(15));
-    let route_id = extract_str(&forms[0], "id").unwrap();
-    c.raw(&format!(
-        "{{\"jsonrpc\":\"2.0\",\"id\":\"{route_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
-    ));
-    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
-    let q0_id = extract_str(&forms[1], "id").unwrap();
+    let q0_id = extract_str(&forms[0], "id").unwrap();
     c.raw(&format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":\"{q0_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
     ));
-    let forms = c.wait_for_elicitation_count(3, Duration::from_secs(15));
-    let q1_id = extract_str(&forms[2], "id").unwrap();
+    let forms = c.wait_for_elicitation_count(2, Duration::from_secs(15));
+    let q1_id = extract_str(&forms[1], "id").unwrap();
     c.raw(&format!(
         "{{\"jsonrpc\":\"2.0\",\"id\":\"{q1_id}\",\"result\":{{\"action\":\"decline\"}}}}"
     ));
@@ -3793,7 +3886,7 @@ fn a_question_settled_elsewhere_withdraws_its_form() {
         );
         // A late answer to the withdrawn form reaches nothing on the host.
         c.raw(&format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"route\":\"Answer questions\"}}}}}}"
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{form_id}\",\"result\":{{\"action\":\"accept\",\"content\":{{\"q0\":\"Alpha\"}}}}}}"
         ));
         std::thread::sleep(Duration::from_millis(200));
         let log = std::fs::read_to_string(&c.fake_log).unwrap_or_default();

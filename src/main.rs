@@ -12982,8 +12982,9 @@ fn fail_in_flight(stdout: &StdoutShared, s: &mut AcpSession, message: &str) {
     }
 }
 
-const UI_ROUTE_ANSWER: &str = "Answer questions";
-const UI_ROUTE_EXPLAIN: &str = "Explain instead";
+const UI_EXPLAIN_VALUE: &str = "_explain";
+const UI_EXPLAIN_TITLE: &str = "Explain instead";
+const UI_EXPLAIN_DESCRIPTION: &str = "Explain what you meant instead of choosing an answer.";
 
 /// Send one ACP form request for a pending MSP user-input flow.
 fn send_elicitation_form(
@@ -13015,7 +13016,6 @@ fn send_elicitation_form(
 /// One pending form to show the client, with the staged-answer state that
 /// must be stored alongside it.
 struct PendingUiForm {
-    stage: acp::UiStage,
     message: String,
     schema: String,
     confirmed: Vec<String>,
@@ -13041,9 +13041,6 @@ fn show_pending_ui(
             return false;
         };
         p.req_id = req_id.clone();
-        p.stage = form.stage;
-        p.answer_schema = form.schema.clone();
-        p.answer_message = form.message.clone();
         p.confirmed = form.confirmed;
         p.question_index = form.question_index;
         p.tool_call_id.clone()
@@ -13066,7 +13063,6 @@ fn reissue_pending_ui(
     sessions: &Sessions,
     acp_sid: &str,
     idx: usize,
-    stage: acp::UiStage,
     message: String,
     schema: &str,
 ) -> bool {
@@ -13086,7 +13082,6 @@ fn reissue_pending_ui(
         acp_sid,
         idx,
         PendingUiForm {
-            stage,
             message,
             schema: schema.to_string(),
             confirmed,
@@ -13115,7 +13110,6 @@ fn ask_next_ui_question(
         acp_sid,
         idx,
         PendingUiForm {
-            stage: acp::UiStage::Answers,
             message: ui_answer_message(next, questions),
             schema: ui_answer_schema(next, question),
             confirmed,
@@ -13232,6 +13226,10 @@ fn bridge_user_input(
             .get("selection")
             .and_then(|s| s.get("maxSelections"))
             .and_then(|v| v.as_u64());
+        let mut explain_value = UI_EXPLAIN_VALUE.to_string();
+        while display.iter().any(|label| label == &explain_value) {
+            explain_value.push('_');
+        }
         ui_qs.push(acp::UiQuestion {
             qid,
             labels,
@@ -13240,38 +13238,14 @@ fn bridge_user_input(
             multiple: !single,
             min,
             max,
+            explain_value,
         });
     }
     if ui_qs.is_empty() {
         return false;
     }
-    let answer_message = ui_qs
-        .iter()
-        .map(|q| q.message.clone())
-        .collect::<Vec<_>>()
-        .join("\n");
-    // The stored Answers-stage schema always describes the first staged
-    // question; later questions overwrite it as the walk advances.
-    let answer_schema = ui_answer_schema(0, &ui_qs[0]);
-    let has_options = ui_qs.iter().any(|q| !q.labels.is_empty());
-    let (stage, schema, form_message) = if has_options {
-        let route_schema = format!(
-            "{{\"type\":\"object\",\"properties\":{{\"route\":{{\"type\":\"string\",\"enum\":[{},{}]}}}},\"required\":[\"route\"]}}",
-            esc(UI_ROUTE_ANSWER),
-            esc(UI_ROUTE_EXPLAIN)
-        );
-        (
-            acp::UiStage::Route,
-            route_schema,
-            format!("Choose how to respond to this question:\n{answer_message}"),
-        )
-    } else {
-        (
-            acp::UiStage::Answers,
-            ui_answer_schema(0, &ui_qs[0]),
-            ui_answer_message(0, &ui_qs),
-        )
-    };
+    let form_message = ui_answer_message(0, &ui_qs);
+    let schema = ui_answer_schema(0, &ui_qs[0]);
     let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
     if let Some(s) = sessions
         .lock()
@@ -13284,9 +13258,6 @@ fn bridge_user_input(
             owner_msp_sid: owner_msp_sid.to_string(),
             turn_id,
             questions: ui_qs,
-            stage,
-            answer_schema,
-            answer_message,
             tool_call_id: tool_call.clone(),
             question_index: 0,
             confirmed: Vec::new(),
@@ -13314,32 +13285,58 @@ fn ui_original(q: &acp::UiQuestion, shown: &str) -> Option<String> {
         .cloned()
 }
 
+fn ui_titled_choice(value: &str, title: &str, description: Option<&str>) -> String {
+    let mut fields = vec![
+        format!("\"const\":{}", esc(value)),
+        format!("\"title\":{}", esc(title)),
+    ];
+    if let Some(description) = description {
+        fields.push(format!("\"description\":{}", esc(description)));
+    }
+    format!("{{{}}}", fields.join(","))
+}
+
 /// The JSON Schema property for one question, keyed `q<index>` for the
-/// client. ACP forms present one property per question.
+/// client. Option-bearing questions include the inline explanation path.
 fn ui_question_property(index: usize, q: &acp::UiQuestion) -> String {
     let key = format!("q{index}");
     if q.labels.is_empty() {
         // Free-text question: no options, plain string answer.
         return format!("{}: {{\"type\":\"string\"}}", esc(&key));
     }
-    let en: Vec<String> = q.display.iter().map(|l| esc(l)).collect();
+    let mut choices: Vec<String> = q
+        .display
+        .iter()
+        .map(|label| ui_titled_choice(label, label, None))
+        .collect();
+    choices.push(ui_titled_choice(
+        &q.explain_value,
+        UI_EXPLAIN_TITLE,
+        Some(UI_EXPLAIN_DESCRIPTION),
+    ));
+    let clarification = "\"clarification\":{\"type\":\"string\",\"maxLength\":500,\"title\":\"Clarification\",\"description\":\"Required only when you choose Explain instead.\"}";
     if !q.multiple {
         return format!(
-            "{}: {{\"type\":\"string\",\"enum\":[{}]}}",
+            "{}: {{\"type\":\"string\",\"oneOf\":[{}]}},{}",
             esc(&key),
-            en.join(",")
+            choices.join(","),
+            clarification
         );
     }
+    // The explain branch is one array item. Relax a larger host minimum to
+    // one here; complete_elicitation still enforces the host minimum when
+    // the user submits real answers.
+    let min_items = if q.min > 1 { 1 } else { q.min };
     let mut sch = format!(
-        "{}: {{\"type\":\"array\",\"items\":{{\"type\":\"string\",\"enum\":[{}]}}",
+        "{}: {{\"type\":\"array\",\"items\":{{\"anyOf\":[{}]}}",
         esc(&key),
-        en.join(",")
+        choices.join(",")
     );
-    sch.push_str(&format!(",\"minItems\":{}", q.min));
+    sch.push_str(&format!(",\"minItems\":{min_items}"));
     if let Some(m) = q.max {
-        sch.push_str(&format!(",\"maxItems\":{m}"));
+        sch.push_str(&format!(",\"maxItems\":{}", m.max(1)));
     }
-    sch.push('}');
+    sch.push_str(&format!("}},{clarification}"));
     sch
 }
 
@@ -13376,6 +13373,61 @@ fn ui_answer_message(index: usize, questions: &[acp::UiQuestion]) -> String {
     } else {
         format!("Question {} of {}:\n{message}", index + 1, questions.len())
     }
+}
+
+/// Whether the current question selected the inline explain path. An explain
+/// value mixed with real multiple-choice selections is ambiguous because MSP
+/// clarification cannot also carry those answers.
+fn ui_explain_selected(
+    q: &acp::UiQuestion,
+    index: usize,
+    content: &J,
+) -> Result<bool, &'static str> {
+    let key = format!("q{index}");
+    match (q.multiple, content.get(key.as_str())) {
+        (false, Some(J::Str(value))) => Ok(value == &q.explain_value),
+        (true, Some(J::Arr(values))) => {
+            let selected = values
+                .iter()
+                .filter(|value| value.as_str() == Some(q.explain_value.as_str()))
+                .count();
+            if selected == 0 {
+                Ok(false)
+            } else if selected == 1 && values.len() == 1 {
+                Ok(true)
+            } else {
+                Err("Choose Explain instead by itself, or select an answer.")
+            }
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Enforce the host's multiple-selection bounds after the schema has relaxed
+/// its minimum to keep an explain-only one-item selection valid.
+fn ui_multiple_answer_error(q: &acp::UiQuestion, index: usize, content: &J) -> Option<String> {
+    if !q.multiple {
+        return None;
+    }
+    let key = format!("q{index}");
+    let Some(J::Arr(values)) = content.get(key.as_str()) else {
+        return None;
+    };
+    let count = values.len() as u64;
+    if count < q.min {
+        return Some(format!(
+            "Select at least {} answer{} to continue.",
+            q.min,
+            if q.min == 1 { "" } else { "s" }
+        ));
+    }
+    q.max.filter(|max| count > *max).map(|max| {
+        format!(
+            "Select no more than {} answer{} to continue.",
+            max,
+            if max == 1 { "" } else { "s" }
+        )
+    })
 }
 
 /// Convert one client form answer into an MSP `UserInputAnswer` object, or
@@ -13421,10 +13473,6 @@ fn ui_answer_json(q: &acp::UiQuestion, index: usize, content: &J) -> Option<Stri
         }
         _ => None,
     }
-}
-
-fn clarification_schema() -> &'static str {
-    "{\"type\":\"object\",\"properties\":{\"clarification\":{\"type\":\"string\",\"maxLength\":500}},\"required\":[\"clarification\"]}"
 }
 
 const FEEDBACK_HELP: &str = "Usage: /feedback [bug|bad|good|other] <note>";
@@ -14537,230 +14585,187 @@ fn complete_elicitation(
         .and_then(|r| r.get("content"))
         .cloned()
         .unwrap_or(J::Null);
-    match pending.stage {
-        acp::UiStage::Route => {
-            let route = content.get("route").and_then(|v| v.as_str());
-            match route {
-                Some(UI_ROUTE_ANSWER) => {
-                    // The answer walk now asks one question at a time and
-                    // holds each confirmed answer, so a stop can settle the
-                    // prompt with what the user already confirmed.
-                    reissue_pending_ui(
-                        stdout,
-                        sessions,
-                        &acp_sid,
-                        idx,
-                        acp::UiStage::Answers,
-                        ui_answer_message(0, &pending.questions),
-                        &ui_answer_schema(0, &pending.questions[0]),
-                    );
+    let index = pending.question_index;
+    let Some(question) = pending.questions.get(index) else {
+        log(&format!(
+            "pending userInput {} has no question {index}",
+            pending.user_input_id
+        ));
+        return;
+    };
+    let form_message = ui_answer_message(index, &pending.questions);
+    let form_schema = ui_answer_schema(index, question);
+    let explaining = match ui_explain_selected(question, index, &content) {
+        Ok(value) => value,
+        Err(message) => {
+            reissue_pending_ui(
+                stdout,
+                sessions,
+                &acp_sid,
+                idx,
+                format!("{form_message}\n\n{message}"),
+                &form_schema,
+            );
+            return;
+        }
+    };
+    if explaining {
+        let Some(clarification) = content.get("clarification").and_then(|v| v.as_str()) else {
+            reissue_pending_ui(
+                stdout,
+                sessions,
+                &acp_sid,
+                idx,
+                format!("{form_message}\n\nEnter a clarification before submitting."),
+                &form_schema,
+            );
+            return;
+        };
+        if clarification.trim().is_empty() {
+            reissue_pending_ui(
+                stdout,
+                sessions,
+                &acp_sid,
+                idx,
+                format!("{form_message}\n\nEnter a clarification before submitting."),
+                &form_schema,
+            );
+            return;
+        }
+        if clarification.chars().count() > 500 {
+            reissue_pending_ui(
+                stdout,
+                sessions,
+                &acp_sid,
+                idx,
+                format!("{form_message}\n\nClarifications must be 500 characters or fewer."),
+                &form_schema,
+            );
+            return;
+        }
+        let cmd = host.mint_cmd("cmd-");
+        match host.command(
+            "userInput/clarify",
+            &format!(
+                "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{},\"clarification\":{{\"format\":\"text\",\"content\":{}}}}}",
+                esc(&cmd),
+                esc(&msp_sid),
+                esc(&pending.user_input_id),
+                esc(clarification)
+            ),
+        ) {
+            Ok(_) => {
+                remove_pending_ui(sessions, &acp_sid, &idv);
+                let busy = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&acp_sid)
+                    .map(|s| s.ver == 2 && !s.in_flight.is_empty())
+                    .unwrap_or(false);
+                if busy {
+                    acp::send_state(stdout, &acp_sid, "running", None);
                 }
-                Some(UI_ROUTE_EXPLAIN) => {
-                    reissue_pending_ui(
-                        stdout,
-                        sessions,
-                        &acp_sid,
-                        idx,
-                        acp::UiStage::Clarification,
-                        format!(
-                            "{}\n\nExplain what you meant instead of choosing an answer.",
-                            pending.answer_message
-                        ),
-                        clarification_schema(),
-                    );
-                }
-                _ => {
-                    reissue_pending_ui(
-                        stdout,
-                        sessions,
-                        &acp_sid,
-                        idx,
-                        acp::UiStage::Route,
-                        "Choose either Answer questions or Explain instead.".to_string(),
-                        "{\"type\":\"object\",\"properties\":{\"route\":{\"type\":\"string\",\"enum\":[\"Answer questions\",\"Explain instead\"]}},\"required\":[\"route\"]}",
-                    );
-                }
+            }
+            Err(e) => {
+                reissue_pending_ui(
+                    stdout,
+                    sessions,
+                    &acp_sid,
+                    idx,
+                    format!(
+                        "{form_message}\n\nMuse rejected the clarification: {}",
+                        err_message(&e)
+                    ),
+                    &form_schema,
+                );
             }
         }
-        acp::UiStage::Answers => {
-            let index = pending.question_index;
-            let Some(question) = pending.questions.get(index) else {
-                log(&format!(
-                    "pending userInput {} has no question {index}",
-                    pending.user_input_id
-                ));
-                return;
-            };
-            let answer = ui_answer_json(question, index, &content).or_else(|| {
-                // An optional multiple-selection question may be left empty;
-                // that is a valid answer for a zero minimum.
-                (!ui_question_required(question)).then(|| {
-                    format!(
-                        "{{\"questionId\":{},\"selectedLabels\":[]}}",
-                        esc(&question.qid)
-                    )
-                })
-            });
-            let Some(answer) = answer else {
-                reissue_pending_ui(
-                    stdout,
-                    sessions,
-                    &acp_sid,
-                    idx,
-                    acp::UiStage::Answers,
-                    format!(
-                        "{}\n\nAnswer this question to continue.",
-                        ui_answer_message(index, &pending.questions)
-                    ),
-                    &ui_answer_schema(index, &pending.questions[index]),
-                );
-                return;
-            };
-            let mut confirmed = pending.confirmed.clone();
-            confirmed.push(answer);
-            if index + 1 < pending.questions.len() {
-                ask_next_ui_question(
-                    stdout,
-                    sessions,
-                    &acp_sid,
-                    idx,
-                    &pending.questions,
-                    index + 1,
-                    confirmed,
-                );
-                return;
-            }
-            let cmd = host.mint_cmd("cmd-");
-            let answers = format!("[{}]", confirmed.join(","));
-            match host.command(
-                "userInput/answer",
-                &format!(
-                    "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{},\"answers\":{}}}",
-                    esc(&cmd),
-                    esc(&msp_sid),
-                    esc(&pending.user_input_id),
-                    answers
-                ),
-            ) {
-                Ok(_) => {
-                    remove_pending_ui(sessions, &acp_sid, &idv);
-                    let busy = sessions
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .get(&acp_sid)
-                        .map(|s| s.ver == 2 && !s.in_flight.is_empty())
-                        .unwrap_or(false);
-                    if busy {
-                        acp::send_state(stdout, &acp_sid, "running", None);
-                    }
-                }
-                Err(e) => {
-                    // The rejected answer is not held: the same question is
-                    // asked again with the error text.
-                    let message = format!(
-                        "{}\n\nMuse rejected the answer: {}",
-                        ui_answer_message(index, &pending.questions),
-                        err_message(&e)
-                    );
-                    reissue_pending_ui(
-                        stdout,
-                        sessions,
-                        &acp_sid,
-                        idx,
-                        acp::UiStage::Answers,
-                        message,
-                        &ui_answer_schema(index, &pending.questions[index]),
-                    );
-                }
+        return;
+    }
+    if let Some(message) = ui_multiple_answer_error(question, index, &content) {
+        reissue_pending_ui(
+            stdout,
+            sessions,
+            &acp_sid,
+            idx,
+            format!("{form_message}\n\n{message}"),
+            &form_schema,
+        );
+        return;
+    }
+    let answer = ui_answer_json(question, index, &content).or_else(|| {
+        // An optional multiple-selection question may be left empty; that
+        // is a valid answer for a zero minimum.
+        (!ui_question_required(question)).then(|| {
+            format!(
+                "{{\"questionId\":{},\"selectedLabels\":[]}}",
+                esc(&question.qid)
+            )
+        })
+    });
+    let Some(answer) = answer else {
+        reissue_pending_ui(
+            stdout,
+            sessions,
+            &acp_sid,
+            idx,
+            format!("{form_message}\n\nAnswer this question to continue."),
+            &form_schema,
+        );
+        return;
+    };
+    let mut confirmed = pending.confirmed.clone();
+    confirmed.push(answer);
+    if index + 1 < pending.questions.len() {
+        ask_next_ui_question(
+            stdout,
+            sessions,
+            &acp_sid,
+            idx,
+            &pending.questions,
+            index + 1,
+            confirmed,
+        );
+        return;
+    }
+    let cmd = host.mint_cmd("cmd-");
+    let answers = format!("[{}]", confirmed.join(","));
+    match host.command(
+        "userInput/answer",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{},\"answers\":{}}}",
+            esc(&cmd),
+            esc(&msp_sid),
+            esc(&pending.user_input_id),
+            answers
+        ),
+    ) {
+        Ok(_) => {
+            remove_pending_ui(sessions, &acp_sid, &idv);
+            let busy = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&acp_sid)
+                .map(|s| s.ver == 2 && !s.in_flight.is_empty())
+                .unwrap_or(false);
+            if busy {
+                acp::send_state(stdout, &acp_sid, "running", None);
             }
         }
-        acp::UiStage::Clarification => {
-            let Some(clarification) = content.get("clarification").and_then(|v| v.as_str()) else {
-                reissue_pending_ui(
-                    stdout,
-                    sessions,
-                    &acp_sid,
-                    idx,
-                    acp::UiStage::Clarification,
-                    format!(
-                        "{}\n\nEnter a clarification before submitting.",
-                        pending.answer_message
-                    ),
-                    clarification_schema(),
-                );
-                return;
-            };
-            let trimmed = clarification.trim();
-            if trimmed.is_empty() {
-                reissue_pending_ui(
-                    stdout,
-                    sessions,
-                    &acp_sid,
-                    idx,
-                    acp::UiStage::Clarification,
-                    format!(
-                        "{}\n\nEnter a clarification before submitting.",
-                        pending.answer_message
-                    ),
-                    clarification_schema(),
-                );
-                return;
-            }
-            if clarification.chars().count() > 500 {
-                reissue_pending_ui(
-                    stdout,
-                    sessions,
-                    &acp_sid,
-                    idx,
-                    acp::UiStage::Clarification,
-                    format!(
-                        "{}\n\nClarifications must be 500 characters or fewer.",
-                        pending.answer_message
-                    ),
-                    clarification_schema(),
-                );
-                return;
-            }
-            let cmd = host.mint_cmd("cmd-");
-            match host.command(
-                "userInput/clarify",
-                &format!(
-                    "{{\"commandId\":{},\"sessionId\":{},\"userInputId\":{},\"clarification\":{{\"format\":\"text\",\"content\":{}}}}}",
-                    esc(&cmd),
-                    esc(&msp_sid),
-                    esc(&pending.user_input_id),
-                    esc(clarification)
+        Err(e) => {
+            // The rejected answer is not held: the same question is asked
+            // again with the error text.
+            reissue_pending_ui(
+                stdout,
+                sessions,
+                &acp_sid,
+                idx,
+                format!(
+                    "{form_message}\n\nMuse rejected the answer: {}",
+                    err_message(&e)
                 ),
-            ) {
-                Ok(_) => {
-                    remove_pending_ui(sessions, &acp_sid, &idv);
-                    let busy = sessions
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .get(&acp_sid)
-                        .map(|s| s.ver == 2 && !s.in_flight.is_empty())
-                        .unwrap_or(false);
-                    if busy {
-                        acp::send_state(stdout, &acp_sid, "running", None);
-                    }
-                }
-                Err(e) => {
-                    let message = format!(
-                        "{}\n\nMuse rejected the clarification: {}",
-                        pending.answer_message,
-                        err_message(&e)
-                    );
-                    reissue_pending_ui(
-                        stdout,
-                        sessions,
-                        &acp_sid,
-                        idx,
-                        acp::UiStage::Clarification,
-                        message,
-                        clarification_schema(),
-                    );
-                }
-            }
+                &form_schema,
+            );
         }
     }
 }

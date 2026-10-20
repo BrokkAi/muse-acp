@@ -758,6 +758,7 @@ TODO_ITEMS = [
 
 
 def question_params(user_input_id="ui-1"):
+    shape = os.environ.get("FAKE_QUESTION_SHAPE", "")
     questions = [{
         "id": "q0", "header": "Pick", "question": "Which?",
         "selection": {"mode": "single"},
@@ -765,7 +766,11 @@ def question_params(user_input_id="ui-1"):
     }]
     if SCENARIO == "questions_multiple":
         questions[0]["selection"] = {"mode": "multiple", "minSelections": 1, "maxSelections": 2}
-    if os.environ.get("FAKE_QUESTION_SHAPE", "") == "mixed":
+    if shape == "strict_multiple":
+        questions[0]["selection"] = {"mode": "multiple", "minSelections": 2, "maxSelections": 2}
+    if shape == "explain_collision":
+        questions[0]["options"] = [{"label": "_explain"}, {"label": "Beta"}]
+    if shape == "mixed":
         questions.extend([
             {"id": "q1", "header": "Pick many", "question": "Which ones?",
              "selection": {"mode": "multiple", "minSelections": 1,
@@ -774,7 +779,7 @@ def question_params(user_input_id="ui-1"):
             {"id": "q2", "header": "Explain", "question": "Why?",
              "selection": {"mode": "single"}},
         ])
-    if os.environ.get("FAKE_QUESTION_SHAPE", "") == "pair":
+    if shape == "pair":
         questions.append({
             "id": "q1", "header": "Second", "question": "Which second?",
             "selection": {"mode": "single"},
