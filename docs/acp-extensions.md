@@ -163,7 +163,7 @@ Muse adds only facts with no standard ACP field:
 | Agent-message update | `_meta.muse.cutOff: true` plus `_meta.muse.itemId` when the host committed a partial reply after a provider-stream failure. |
 | Tool/host card | `_meta.muse.itemId`, `outputRef`, `patchRef`, `patchSummary`, and `truncated`. |
 | Unknown or synthetic host item | `_meta.muse.itemKind`. |
-| Monitor card | `_meta.muse.monitorId`, `monitorDescription`, and `truncated`. |
+| Monitor card | `_meta.muse.monitorId`, `monitorDescription`, and `truncated`. On Muse 1.4.11+, `monitorInbox: {pending, drained, voided}` counts the monitor's inbox items: admitted and not yet settled, drained to the agent, and voided by a missed wake (a drain and a void of one item settle latest-wins on their recorded stamps). |
 | Subagent card | `_meta.muse.subagent: {subagentId, childSessionId, controlStatus, depth, drained}`. `drained: true` (Muse 1.4.11+) is the host's fact that the parent consumed the result, also stated in the card text; it is absent until then and never cleared. |
 | Workflow card | `_meta.muse.workflow: {workflowRunId, entryId, scriptId, triggerSource, paused, resumeFromRunId}`. |
 | Hook card | `_meta.muse.hookRun: {hookKey, event, runStatus, reason, handlerKind, enabled}`. |

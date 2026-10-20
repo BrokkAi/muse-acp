@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Count Muse 1.4.11 monitor inbox events on the monitor card (#330).
+  `monitor/inboxItemAdmitted`, `...Drained`, and `...Voided` used to take the
+  unhandled-notification path; they now keep per-monitor counts in the
+  monitor card's `_meta.muse.monitorInbox {pending, drained, voided}`,
+  settling a drain and a void of one item latest-wins on their recorded
+  stamps, as Muse's own fold does. Voids stay count-only, with no transcript
+  row.
+
 - Surface the Muse 1.4.11 subagent `drained` join fact (#336). When the host
   reports that the parent consumed a subagent's result, the subagent card
   says "Delivered to the parent agent." and carries
