@@ -743,13 +743,22 @@ Muse's installer puts `muse` in `~/.local/bin` (`%LOCALAPPDATA%\Programs\muse`
 on Windows, or `MUSE_INSTALL_DIR`), and the adapter looks there when `muse` is
 not on the editor's `PATH`.
 
+ACP `auth/logout` (v2) and `logout` (v1, advertised as
+`agentCapabilities.auth.logout`) clear Muse's stored login through Muse's
+`account/logout` and succeed only once `account/read` reports no credential;
+new sessions then fail with `-32000` until you log in again. A
+`META_API_KEY` in the agent's environment cannot be removed from ACP, so
+logout fails and says so instead of pretending. `auth/login` answers
+`-32602`: `muse-login` is a terminal method, which clients run in a terminal
+rather than through `auth/login`.
+
 Run the login **where the adapter runs, as the same OS user**. For SSH,
 containers, remote IDE backends, or a different OS account, a login on your
 desktop does not help; log in on the remote host. The adapter never opens a
 browser, never prompts for credentials over ACP stdio, and never copies
 credentials between machines. Its only ACP auth method runs Muse's own login
-in a terminal, and `account/read` never returns key material, so credentials
-stay in the Muse environment.
+in a terminal, and neither `account/read` nor `account/logout` returns key
+material, so credentials stay in the Muse environment.
 
 ## Sandbox advisory for Linux arm64
 

@@ -13291,12 +13291,80 @@ fn terminal_auth_method_runs_muse_acp_login() {
             frame.contains("\"code\":-32602") && frame.contains("muse-login"),
             "v{version}: {frame}"
         );
-        let id = c.req("auth/logout", "{}");
+        // The terminal method is never an auth/login method.
+        let id = c.req("auth/login", r#"{"methodId":"muse-login"}"#);
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
         assert!(
-            frame.contains("\"code\":-32601") && frame.contains("muse login"),
+            frame.contains("\"code\":-32602") && frame.contains("terminal"),
             "v{version}: {frame}"
         );
+        let id = c.req("auth/login", r#"{"methodId":"other"}"#);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"code\":-32602"), "v{version}: {frame}");
+        c.finish();
+    }
+}
+
+#[test]
+fn logout_clears_the_muse_credential_and_gates_new_sessions() {
+    for (version, method, capabilities) in [
+        (
+            1,
+            "logout",
+            r#","clientCapabilities":{"auth":{"terminal":true}}"#,
+        ),
+        (
+            2,
+            "auth/logout",
+            r#","capabilities":{"auth":{"terminal":{}}}"#,
+        ),
+    ] {
+        let mut c = Client::spawn("account_logout", &[]);
+        let init = c.req("initialize", &initialize_params(version, capabilities));
+        let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+        if version == 1 {
+            let reply: serde_json::Value = serde_json::from_str(&frame).expect("init JSON");
+            assert_eq!(
+                reply["result"]["agentCapabilities"]["auth"]["logout"],
+                serde_json::json!({}),
+                "v1 advertises logout: {frame}"
+            );
+        }
+        c.notify("initialized", "{}");
+        let new = format!("{{\"cwd\":{}}}", temp_cwd_json());
+        let id = c.req("session/new", &new);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"result\""),
+            "v{version} logged in: {frame}"
+        );
+        let id = c.req(method, "{}");
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\":{}"), "v{version}: {frame}");
+        c.wait_input("accountLogout", Duration::from_secs(15));
+        let id = c.req("session/new", &new);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"code\":-32000"),
+            "v{version} auth is required again after logout: {frame}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn logout_fails_closed_when_a_credential_remains() {
+    for (scenario, needle) in [
+        ("account_env_key", "META_API_KEY"),
+        ("account_logged_in", "muse logout"),
+    ] {
+        let mut c = Client::spawn(scenario, &[]);
+        c.initialize(2, r#","capabilities":{"auth":{"terminal":{}}}"#);
+        let id = c.req("auth/logout", "{}");
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        let reply: serde_json::Value = serde_json::from_str(&frame).expect("reply JSON");
+        assert_eq!(reply["error"]["code"], -32603, "{scenario}: {frame}");
+        assert!(frame.contains(needle), "{scenario}: {frame}");
         c.finish();
     }
 }
