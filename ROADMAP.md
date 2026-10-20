@@ -510,6 +510,15 @@ decisions are in `.agents/plans/session-mcp-forwarding.md`.
 - Done: lifecycle. Loads re-send the servers, a conflicting reload attaches to
   the running set, and a restarted host gets the servers again. Forks start
   without them until Muse loads the fork again.
+- Done: ACP v1 editor file access (#310). MSP cannot delegate Muse's own
+  file tools, so the adapter adds its own session MCP server, `editor`, served
+  over HTTP on 127.0.0.1 with a per-session bearer token. Its
+  `read_text_file`, `write_text_file`, and `edit_text_file` tools call the
+  client's `fs/read_text_file` and `fs/write_text_file` for clients that
+  advertise `fs`, confined to the session's roots and refused for writes in
+  Read-only and Plan modes. Completed writes carry a standard `diff`. Validated
+  live on Muse 1.3.0, 1.4.8, and 1.4.11; the design is in
+  `.agents/plans/editor-fs-bridge.md`.
 - Open: MSP has no way to add servers to a loaded session or a fork. Revisit
   if the host adds session unload or fork configuration.
 

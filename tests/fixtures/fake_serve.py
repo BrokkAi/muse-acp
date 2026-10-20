@@ -202,6 +202,17 @@ without the grant fails with capabilityRequired. FAKE_MCP_CONFLICT=1 rejects
 the first session/resume that carries a non-empty config.mcpServers with the
 live `session_configuration_conflict` error.
 
+Editor file tools: `editor_bridge` records the adapter's `editor` server from
+session/start or session/resume config.mcpServers and, on turn/start, plays
+Muse's MCP client against it from a thread: initialize, the initialized
+notification, tools/list, then one tools/call per FAKE_BRIDGE_CALLS entry
+({name, arguments, noCallId?}), each between item/started and item/completed
+for `mcp__editor__<name>`, then turn/completed. FAKE_BRIDGE_PROBE=1 also
+sends requests without the token, with a wrong token, with an Origin
+header, and a GET. Every exchange and each start/resume config is appended
+to FAKE_BRIDGE_LOG as one JSON line. Without an `editor` server the turn
+answers "no editor server".
+
 Log flood (fixture self-test): FAKE_LOG_FLOOD=N speaks no MSP. The process
 prints `ready`, waits for one stdin line, then appends N lines
 `<FAKE_FLOOD_TAG>-<i>` to FAKE_LOG, so a test can start several at once.
@@ -213,7 +224,10 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
+import urllib.error
+import urllib.request
 
 FP = "sha256:03312c213efd14277a0e0a102f70adeae497a469ca4edf7242f479953ed758b7"
 SCHEMA = {"fingerprint": FP, "version": 1}
@@ -386,9 +400,14 @@ def log_input(params):
         append_line(path, json.dumps(params))
 
 
+SEND_LOCK = threading.Lock()
+
+
 def send(obj):
-    sys.stdout.write(json.dumps(obj) + "\n")
-    sys.stdout.flush()
+    # The editor_bridge scenario notifies from a thread.
+    with SEND_LOCK:
+        sys.stdout.write(json.dumps(obj) + "\n")
+        sys.stdout.flush()
 
 
 def folder_identity(path):
@@ -811,6 +830,89 @@ def question_params(user_input_id="ui-1"):
             "viewCursor": "cur-8", "questions": questions}
 
 
+EDITOR = [None]
+# The bridge is on 127.0.0.1; never route it through an environment proxy.
+BRIDGE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def bridge_log(entry):
+    path = os.environ.get("FAKE_BRIDGE_LOG")
+    if path:
+        append_line(path, json.dumps(entry))
+
+
+def bridge_post(entry, body, headers=None, method="POST"):
+    """One HTTP exchange with the adapter's editor server: (status, JSON)."""
+    data = None if body is None else json.dumps(body).encode()
+    request = urllib.request.Request(entry["url"], data=data, method=method)
+    for name, value in (entry.get("headers") or {} if headers is None
+                        else headers).items():
+        request.add_header(name, value)
+    request.add_header("content-type", "application/json")
+    request.add_header("accept", "application/json, text/event-stream")
+    try:
+        with BRIDGE_OPENER.open(request, timeout=60) as response:
+            status, raw = response.status, response.read()
+    except urllib.error.HTTPError as error:
+        status, raw = error.code, error.read()
+    return status, (json.loads(raw) if raw else None)
+
+
+def editor_bridge_turn(base):
+    entry = EDITOR[0]
+    if entry is None:
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-none", "kind": "agentMessage",
+            "status": "completed", "text": "no editor server"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+        return
+    ids = iter(range(1, 1000))
+
+    def rpc(method, params):
+        status, body = bridge_post(entry, {"jsonrpc": "2.0", "id": next(ids),
+                                           "method": method, "params": params})
+        bridge_log({"method": method, "status": status, "body": body})
+        return body
+
+    rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                       "clientInfo": {"name": "fake-muse", "version": "0"}})
+    status, _ = bridge_post(entry, {"jsonrpc": "2.0",
+                                    "method": "notifications/initialized"})
+    bridge_log({"method": "notifications/initialized", "status": status})
+    rpc("tools/list", {})
+    if os.environ.get("FAKE_BRIDGE_PROBE") == "1":
+        ping = {"jsonrpc": "2.0", "id": 99, "method": "ping"}
+        for label, headers, method, body in [
+                ("no_token", {}, "POST", ping),
+                ("wrong_token", {"Authorization": "Bearer nope"}, "POST", ping),
+                ("origin", {**entry["headers"], "Origin": "http://example.com"},
+                 "POST", ping),
+                ("get", entry["headers"], "GET", None)]:
+            status, _ = bridge_post(entry, body, headers, method)
+            bridge_log({"probe": label, "status": status})
+    calls = json.loads(os.environ.get("FAKE_BRIDGE_CALLS", "[]"))
+    for index, call in enumerate(calls):
+        call_id = "call-e%d" % index
+        item = {"itemId": "it-e%d" % index, "kind": "toolCall",
+                "callId": call_id, "status": "inProgress",
+                "tool": "mcp__editor__" + call["name"],
+                "args": json.dumps(call["arguments"])}
+        notify("item/started", {**base, "item": item})
+        params = {"name": call["name"], "arguments": call["arguments"]}
+        if not call.get("noCallId"):
+            params["_meta"] = {"callId": call_id}
+        body = rpc("tools/call", params) or {}
+        result = body.get("result") or {}
+        text = "".join(part.get("text", "") for part in result.get("content", []))
+        if result.get("isError") or "error" in body:
+            done = {**item, "status": "failed",
+                    "failureReason": text or json.dumps(body.get("error"))}
+        else:
+            done = {**item, "status": "completed", "result": text}
+        notify("item/completed", {**base, "item": done})
+    notify("turn/completed", {**base, "terminal": "completed"})
+
+
 def on_turn_start(params):
     tid = turn_id()
     base = {"sessionId": ACTIVE_SESSION[0], "turnId": tid}
@@ -998,6 +1100,9 @@ def on_turn_start(params):
                 "retryable": True,
             },
         })
+    elif SCENARIO == "editor_bridge":
+        threading.Thread(target=editor_bridge_turn, args=(base,),
+                         daemon=True).start()
     elif SCENARIO == "tool":
         notify("item/completed", {**base, "item": {
             "itemId": "it-t1", "kind": "toolCall", "callId": "call-1",
@@ -2926,6 +3031,11 @@ def main():
                                              "outputRef": "out-1"}}})
                     continue
                 mcp_servers = ((msg.get("params") or {}).get("config") or {}).get("mcpServers")
+                if (SCENARIO == "editor_bridge"
+                        and method in ("session/start", "session/resume")):
+                    bridge_log({"config": method, "servers": mcp_servers or {}})
+                    if mcp_servers and "editor" in mcp_servers:
+                        EDITOR[0] = mcp_servers["editor"]
                 if method in ("session/start", "session/resume") and mcp_servers:
                     if not SESSION_MCP[0]:
                         # Live 1.4.1 refusal without the grant.

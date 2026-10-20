@@ -253,6 +253,7 @@ variable. See [Auto-review](#auto-review-keep-the-boundary-lose-the-busywork).
 | `MUSE_TOOL_OUTPUT_LIMIT` | `8000` | Editor-facing tool output bound, in characters (minimum 200). |
 | `MUSE_LOG` | `normal` | Set to `debug` for per-method protocol tracing (no payloads). |
 | `MUSE_SHOW_REMINDERS` | off | Set to `1`, `true`, `yes`, or `on` to render each background reminder check as its own transcript card instead of one `Background checks` card. |
+| `MUSE_EDITOR_TOOLS` | on | Set to `0`, `false`, `no`, or `off` to stop giving Muse the [editor file tools](#editor-file-access-acp-v1) on ACP v1 clients that advertise `fs`. |
 | `MUSE_ALLOW_UNSCOPED_READS` | off | **Dangerous.** Set to `1`, `true`, `yes`, or `on` to allow local reads outside the approved workspace roots. |
 
 Without `MUSE_COMMAND_TIMEOUT_MS`, admission deadlines are 30 seconds for the
@@ -376,6 +377,12 @@ error the editor shows if Muse then refuses the profile says why.
 - **MCP servers** — stdio and HTTP MCP servers attached by the editor load
   into the Muse session on Muse 1.3.0 and newer; see
   [Client-provided MCP servers](#client-provided-mcp-servers).
+- **Editor file access (ACP v1)** — when an ACP v1 editor advertises
+  `fs.readTextFile` or `fs.writeTextFile`, Muse gets tools that read and
+  write files through the editor (`fs/read_text_file`,
+  `fs/write_text_file`), so the model sees unsaved buffers and the editor
+  tracks its writes; see
+  [Editor file access](#editor-file-access-acp-v1).
 - **Questions** — Muse `userInput/requested` bridged to ACP
   `elicitation/create` forms when the client advertises form support; otherwise
   the host falls back to auto-cancel. Each field's `title` is the question's
@@ -643,6 +650,46 @@ passes. It needs Muse 1.3.0 or newer: the adapter requests the host's
 The adapter log names forwarded and dropped servers but never prints their
 commands, arguments, URLs, environment values, or headers.
 
+### Editor file access (ACP v1)
+
+An ACP v1 editor can offer the agent its own file system: with
+`clientCapabilities.fs.readTextFile` the agent may ask it for a file's text
+(`fs/read_text_file`), which includes changes the user has not saved, and
+with `fs.writeTextFile` it may hand the editor new text to write
+(`fs/write_text_file`), so open buffers update and the editor tracks the
+change. ACP v2 removed both methods.
+
+Muse runs its own `read_file`, `write_file`, and `edit_file` tools and has no
+way to delegate them, so `muse-acp` gives each session one more MCP server,
+named `editor`, whose tools go through the editor instead. It needs Muse 1.3.0
+or newer (the `sessionMcp` grant).
+
+- **Tools** — `mcp__editor__read_text_file` (`path`, optional `line` and
+  `limit`) with `fs.readTextFile`; `mcp__editor__write_text_file` (`path`,
+  `content`) with `fs.writeTextFile`; and `mcp__editor__edit_text_file`
+  (`path`, `old_string`, `new_string`, optional `replace_all`) with both. Their
+  descriptions ask the model to prefer them to Muse's own file tools; Muse's
+  own tools stay available.
+- **Approvals** — like any MCP tool, every call goes through Muse's approval
+  flow first. "Always allow this MCP tool" keeps a tool from asking again.
+- **Scope** — paths are relative to the session's `cwd` or absolute, and must
+  stay inside the session's roots (`cwd` plus `additionalDirectories`), with
+  symlinks resolved; `MUSE_ALLOW_UNSCOPED_READS` does not widen this. A path
+  outside fails the call without contacting the editor.
+- **Modes** — Read-only and Plan sessions refuse the write and edit tools.
+  Muse's `--disable-write` covers only its own tools, so the adapter enforces
+  this itself.
+- **Tool cards** — cards carry the file as an ACP `location`, and a completed
+  write or edit carries a standard `diff` from the editor's previous text.
+- **Cancel** — `session/cancel` withdraws a waiting editor request with
+  `$/cancel_request` and fails the call.
+- **Transport** — the server listens on `127.0.0.1` on a random port, from
+  the first session that needs it. Each session has its own 256-bit bearer
+  token, sent to Muse in the server's `Authorization` header and never logged.
+  A request with an `Origin` header (any browser) is refused.
+- **Turning it off** — set `MUSE_EDITOR_TOOLS=0`. An editor MCP server of its
+  own named `editor` also takes precedence over the adapter's.
+
 ## How it compares
 
 Several independent projects bridge Muse Code to ACP. Most fall into one of
@@ -725,7 +772,9 @@ percent-encoded separators, case differences, and symlinks cannot escape the
 approved roots. Only valid UTF-8 text without binary control bytes is expanded,
 up to 256 KiB per resource; malformed `file://` escapes and remote hosts are
 rejected. Setting `MUSE_ALLOW_UNSCOPED_READS` disables this boundary and should
-not be used with untrusted sessions.
+not be used with untrusted sessions. The
+[editor file tools](#editor-file-access-acp-v1) apply the same root check to
+every path and ignore that setting.
 
 ## Authentication and remote environments
 

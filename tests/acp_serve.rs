@@ -15199,3 +15199,388 @@ fn picking_the_muse_default_forgets_the_remembered_effort() {
     );
     c.finish();
 }
+
+// ---- Editor file tools (ACP v1 fs/* through the adapter's MCP server) ----
+
+const FS_CAPS: &str = r#","clientCapabilities":{"fs":{"readTextFile":true,"writeTextFile":true}}"#;
+
+/// A fresh path for the fake host's FAKE_BRIDGE_LOG.
+fn bridge_log_path(label: &str) -> String {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    std::env::temp_dir()
+        .join(format!(
+            "acp-bridge-{}-{label}-{}.log",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+fn bridge_log(path: &str) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_default()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("bridge log line"))
+        .collect()
+}
+
+/// The `editor` entry of each session/start or session/resume config.
+fn bridge_configs(path: &str) -> Vec<Option<serde_json::Value>> {
+    bridge_log(path)
+        .into_iter()
+        .filter(|entry| entry.get("config").is_some())
+        .map(|entry| entry["servers"].get("editor").cloned())
+        .collect()
+}
+
+fn session_workspace(c: &Client) -> std::path::PathBuf {
+    std::path::Path::new(&c.fake_log)
+        .parent()
+        .unwrap()
+        .join("workspace")
+}
+
+impl Client {
+    /// The `n`th (0-based) adapter request for `method`, waiting for it.
+    fn wait_request(&self, method: &str, n: usize, timeout: Duration) -> serde_json::Value {
+        let needle = format!("\"method\":\"{method}\"");
+        let start = Instant::now();
+        loop {
+            {
+                let frames = self.frames.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(frame) = frames.iter().filter(|f| f.contains(&needle)).nth(n) {
+                    return serde_json::from_str(frame).expect("request frame");
+                }
+            }
+            if start.elapsed() > timeout {
+                panic!(
+                    "no request #{n} for {method}; got:\n{}",
+                    self.frames
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .join("\n")
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Answer an adapter request with `result` (JSON text).
+    fn answer(&mut self, request: &serde_json::Value, result: &str) {
+        self.raw(&format!(
+            r#"{{"jsonrpc":"2.0","id":{},"result":{result}}}"#,
+            request["id"]
+        ));
+    }
+}
+
+#[test]
+fn editor_bridge_reads_the_editor_text_through_fs_read_text_file() {
+    let log = bridge_log_path("read");
+    let calls = r#"[{"name":"read_text_file","arguments":{"path":"src/a.rs","line":3,"limit":2}}]"#;
+    let mut c = Client::spawn(
+        "editor_bridge",
+        &[("FAKE_BRIDGE_CALLS", calls), ("FAKE_BRIDGE_LOG", &log)],
+    );
+    let sid = c.new_session(1, FS_CAPS);
+    let ws = session_workspace(&c);
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    std::fs::write(ws.join("src").join("a.rs"), "saved on disk\n").unwrap();
+    let pid = c.prompt(&sid, "read it");
+    let read = c.wait_request("fs/read_text_file", 0, Duration::from_secs(15));
+    let params = &read["params"];
+    assert_eq!(params["sessionId"], sid.as_str(), "{read}");
+    let expected = ws.join("src").join("a.rs");
+    assert_eq!(params["path"], expected.to_str().unwrap(), "{read}");
+    assert_eq!(
+        (params["line"].as_u64(), params["limit"].as_u64()),
+        (Some(3), Some(2))
+    );
+    c.answer(&read, r#"{"content":"unsaved buffer text"}"#);
+    let done = c.wait_for_all(
+        &[
+            "\"tool_call_update\"",
+            "\"status\":\"completed\"",
+            "mcp__editor__read_text_file",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(
+        done.contains("unsaved buffer text"),
+        "the model gets the editor's text: {done}"
+    );
+    assert!(
+        done.contains("\"locations\":[{\"path\":"),
+        "follow-along location: {done}"
+    );
+    let result = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(result.contains("\"stopReason\":\"end_turn\""), "{result}");
+    let entries = bridge_log(&log);
+    let initialize = entries
+        .iter()
+        .find(|e| e["method"] == "initialize")
+        .unwrap();
+    assert_eq!(
+        initialize["body"]["result"]["protocolVersion"],
+        "2025-06-18"
+    );
+    let listed = entries
+        .iter()
+        .find(|e| e["method"] == "tools/list")
+        .unwrap();
+    let names: Vec<&str> = listed["body"]["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        ["read_text_file", "write_text_file", "edit_text_file"]
+    );
+    c.finish();
+}
+
+#[test]
+fn editor_bridge_writes_and_edits_through_the_client_with_diff_cards() {
+    let log = bridge_log_path("write");
+    // The edit carries no `_meta.callId`, as Muse before 1.4.11 sends it, so
+    // its diff is matched to the card by tool and path.
+    let calls = r#"[{"name":"write_text_file","arguments":{"path":"new.txt","content":"fresh\n"}},{"name":"edit_text_file","arguments":{"path":"src/a.rs","old_string":"old","new_string":"new"},"noCallId":true}]"#;
+    let mut c = Client::spawn(
+        "editor_bridge",
+        &[("FAKE_BRIDGE_CALLS", calls), ("FAKE_BRIDGE_LOG", &log)],
+    );
+    let sid = c.new_session(1, FS_CAPS);
+    let ws = session_workspace(&c);
+    std::fs::create_dir_all(ws.join("src")).unwrap();
+    c.prompt(&sid, "write and edit");
+    // The write first reads the editor's current text for the diff.
+    let before = c.wait_request("fs/read_text_file", 0, Duration::from_secs(15));
+    c.raw(&format!(
+        r#"{{"jsonrpc":"2.0","id":{},"error":{{"code":-32002,"message":"Resource not found"}}}}"#,
+        before["id"]
+    ));
+    let write = c.wait_request("fs/write_text_file", 0, Duration::from_secs(15));
+    assert_eq!(
+        write["params"]["path"],
+        ws.join("new.txt").to_str().unwrap()
+    );
+    assert_eq!(write["params"]["content"], "fresh\n");
+    c.answer(&write, "null");
+    let created = c.wait_for_all(
+        &[
+            "\"tool_call_update\"",
+            "\"toolCallId\":\"call-e0\"",
+            "\"status\":\"completed\"",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(
+        created.contains(r#""type":"diff""#)
+            && created.contains(r#""oldText":null"#)
+            && created.contains(r#""newText":"fresh\n""#),
+        "a new file's diff: {created}"
+    );
+    let read = c.wait_request("fs/read_text_file", 1, Duration::from_secs(15));
+    assert_eq!(
+        read["params"]["path"],
+        ws.join("src").join("a.rs").to_str().unwrap()
+    );
+    c.answer(&read, r#"{"content":"the old line\n"}"#);
+    let edit = c.wait_request("fs/write_text_file", 1, Duration::from_secs(15));
+    assert_eq!(edit["params"]["content"], "the new line\n");
+    c.answer(&edit, "{}");
+    let edited = c.wait_for_all(
+        &[
+            "\"tool_call_update\"",
+            "\"toolCallId\":\"call-e1\"",
+            "\"status\":\"completed\"",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(
+        edited.contains(r#""oldText":"the old line\n""#)
+            && edited.contains(r#""newText":"the new line\n""#),
+        "the edit's diff, matched without a call id: {edited}"
+    );
+    c.finish();
+}
+
+#[test]
+fn editor_bridge_refuses_paths_outside_the_session_roots() {
+    let log = bridge_log_path("outside");
+    let calls = r#"[{"name":"read_text_file","arguments":{"path":"../outside.txt"}}]"#;
+    let mut c = Client::spawn(
+        "editor_bridge",
+        &[("FAKE_BRIDGE_CALLS", calls), ("FAKE_BRIDGE_LOG", &log)],
+    );
+    let sid = c.new_session(1, FS_CAPS);
+    let pid = c.prompt(&sid, "escape");
+    let failed = c.wait_for_all(
+        &["\"tool_call_update\"", "\"status\":\"failed\""],
+        Duration::from_secs(15),
+    );
+    assert!(
+        failed.contains("outside the session's workspace roots"),
+        "{failed}"
+    );
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("fs/read_text_file"),
+        "nothing reached the editor: {frames}"
+    );
+    drop(frames);
+    c.finish();
+}
+
+#[test]
+fn editor_bridge_is_offered_only_to_acp_v1_clients_that_advertise_fs() {
+    for (ver, extra, env) in [
+        (1u64, "", None),
+        (
+            1,
+            r#","clientCapabilities":{"fs":{"readTextFile":false}}"#,
+            None,
+        ),
+        (1, FS_CAPS, Some(("MUSE_EDITOR_TOOLS", "0"))),
+        (
+            2,
+            r#","capabilities":{"fs":{"readTextFile":true,"writeTextFile":true}}"#,
+            None,
+        ),
+    ] {
+        let log = bridge_log_path("offer");
+        let mut vars = vec![("FAKE_BRIDGE_LOG", log.as_str())];
+        vars.extend(env);
+        let mut c = Client::spawn("editor_bridge", &vars);
+        c.new_session(ver, extra);
+        let configs = bridge_configs(&log);
+        assert_eq!(configs.len(), 1, "v{ver} {extra}: {configs:?}");
+        assert!(configs[0].is_none(), "v{ver} {extra} {env:?}: {configs:?}");
+        c.finish();
+    }
+    // Only reads: no write or edit tool.
+    let log = bridge_log_path("read-only-fs");
+    let mut c = Client::spawn("editor_bridge", &[("FAKE_BRIDGE_LOG", &log)]);
+    let sid = c.new_session(1, r#","clientCapabilities":{"fs":{"readTextFile":true}}"#);
+    let pid = c.prompt(&sid, "list");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let entries = bridge_log(&log);
+    let listed = entries
+        .iter()
+        .find(|e| e["method"] == "tools/list")
+        .unwrap();
+    let tools = listed["body"]["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 1, "{listed}");
+    assert_eq!(tools[0]["name"], "read_text_file");
+    c.finish();
+}
+
+#[test]
+fn editor_bridge_http_needs_the_session_token_and_refuses_browsers() {
+    let log = bridge_log_path("probe");
+    let mut c = Client::spawn(
+        "editor_bridge",
+        &[("FAKE_BRIDGE_LOG", &log), ("FAKE_BRIDGE_PROBE", "1")],
+    );
+    let sid = c.new_session(1, FS_CAPS);
+    let entry = bridge_configs(&log)[0]
+        .clone()
+        .expect("editor server configured");
+    assert_eq!(entry["transport"], "streamableHttp");
+    assert_eq!(entry["mode"], "optional");
+    assert!(
+        entry["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://127.0.0.1:"),
+        "{entry}"
+    );
+    let auth = entry["headers"]["Authorization"].as_str().unwrap();
+    assert!(
+        auth.starts_with("Bearer ") && auth.len() == "Bearer ".len() + 64,
+        "{entry}"
+    );
+    let pid = c.prompt(&sid, "probe");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let statuses: Vec<(String, u64)> = bridge_log(&log)
+        .iter()
+        .filter_map(|e| Some((e["probe"].as_str()?.to_string(), e["status"].as_u64()?)))
+        .collect();
+    assert_eq!(
+        statuses,
+        [
+            ("no_token".to_string(), 401),
+            ("wrong_token".to_string(), 401),
+            ("origin".to_string(), 403),
+            ("get".to_string(), 405)
+        ]
+    );
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap();
+    assert!(
+        !stderr.contains(&auth["Bearer ".len()..]),
+        "the token is never logged"
+    );
+    c.finish();
+}
+
+#[test]
+fn cancelling_the_turn_withdraws_a_waiting_editor_request() {
+    let log = bridge_log_path("cancel");
+    let calls = r#"[{"name":"read_text_file","arguments":{"path":"a.txt"}}]"#;
+    let mut c = Client::spawn(
+        "editor_bridge",
+        &[("FAKE_BRIDGE_CALLS", calls), ("FAKE_BRIDGE_LOG", &log)],
+    );
+    let sid = c.new_session(1, FS_CAPS);
+    c.prompt(&sid, "read and wait");
+    let read = c.wait_request("fs/read_text_file", 0, Duration::from_secs(15));
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let withdrawn = c.wait_for("$/cancel_request", Duration::from_secs(15));
+    assert!(
+        withdrawn.contains(&format!("\"requestId\":{}", read["id"])),
+        "{withdrawn}"
+    );
+    let failed = c.wait_for_all(
+        &["\"tool_call_update\"", "\"status\":\"failed\""],
+        Duration::from_secs(15),
+    );
+    assert!(failed.contains("cancelled the turn"), "{failed}");
+    // A late answer to the withdrawn request is ignored.
+    c.answer(&read, r#"{"content":"too late"}"#);
+    c.finish();
+}
+
+#[test]
+fn loading_a_session_again_keeps_its_editor_token() {
+    let log = bridge_log_path("reload");
+    let mut c = Client::spawn("editor_bridge", &[("FAKE_BRIDGE_LOG", &log)]);
+    let sid = c.new_session(1, FS_CAPS);
+    let cwd = session_workspace(&c)
+        .to_str()
+        .unwrap()
+        .replace('\\', "\\\\");
+    let lid = c.req(
+        "session/load",
+        &format!("{{\"sessionId\":\"{sid}\",\"cwd\":\"{cwd}\",\"mcpServers\":[]}}"),
+    );
+    let loaded = c.wait_for(&format!("\"id\":{lid}"), Duration::from_secs(15));
+    assert!(loaded.contains("\"result\""), "{loaded}");
+    // The load's own resume carries the set; a later re-attach resume may
+    // carry none, which keeps the loaded set.
+    let configs: Vec<_> = bridge_configs(&log).into_iter().flatten().collect();
+    assert_eq!(configs.len(), 2, "start and load: {configs:?}");
+    assert_eq!(
+        configs[0], configs[1],
+        "the host sees the same MCP set again"
+    );
+    c.finish();
+}
