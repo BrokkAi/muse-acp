@@ -264,9 +264,52 @@ fn the_client_alone_drives_a_real_host_through_a_session() {
         .to_string();
 
     // Read notifications, answer the server request, decide the approval.
+    // Muse 1.3.0 announces approvals only with the `approval/requested`
+    // notification; later hosts also send the `approval/request` server
+    // request. Decide each approval once, from whichever arrives first.
     let deadline = Instant::now() + WAIT;
     let mut seen = Vec::new();
     let mut decided = false;
+    let mut decided_ids: Vec<String> = Vec::new();
+    let mut decide = |params: &J| {
+        let approval = params
+            .get("approvalId")
+            .and_then(J::as_str)
+            .expect("approval id")
+            .to_string();
+        if decided_ids.contains(&approval) {
+            return;
+        }
+        let approve = match params.get("availableChoices") {
+            Some(J::Arr(choices)) => choices
+                .iter()
+                .find(|choice| choice.get("decision").and_then(J::as_str) == Some("approved"))
+                .and_then(|choice| choice.get("choiceId"))
+                .and_then(J::as_str)
+                .expect("an approve-once choice")
+                .to_string(),
+            _ => panic!("approval without choices: {}", j_to_string(params)),
+        };
+        let decision = client
+            .request(
+                "approval/decide",
+                Params::raw(format!(
+                    r#"{{"commandId":{},"sessionId":{},"approvalId":{},"requirementId":{},"choiceId":{}}}"#,
+                    esc(&client.mint_command_id()),
+                    esc(&session),
+                    esc(&approval),
+                    j_to_string(params.get("currentRequirementId").expect("requirement")),
+                    esc(&approve)
+                )),
+            )
+            .expect("approval/decide");
+        assert!(
+            decision.get("status").is_some(),
+            "{}",
+            j_to_string(&decision)
+        );
+        decided_ids.push(approval);
+    };
     let terminal = loop {
         match next_event(&events, deadline) {
             MspEvent::Request { id, method, params } => {
@@ -274,39 +317,14 @@ fn the_client_alone_drives_a_real_host_through_a_session() {
                 client
                     .respond(&id, Params::empty())
                     .expect("answer approval/request");
-                let approve = match params.get("availableChoices") {
-                    Some(J::Arr(choices)) => choices
-                        .iter()
-                        .find(|choice| {
-                            choice.get("decision").and_then(J::as_str) == Some("approved")
-                        })
-                        .and_then(|choice| choice.get("choiceId"))
-                        .and_then(J::as_str)
-                        .expect("an approve-once choice")
-                        .to_string(),
-                    _ => panic!("approval without choices: {}", j_to_string(&params)),
-                };
-                let decision = client
-                    .request(
-                        "approval/decide",
-                        Params::raw(format!(
-                            r#"{{"commandId":{},"sessionId":{},"approvalId":{},"requirementId":{},"choiceId":{}}}"#,
-                            esc(&client.mint_command_id()),
-                            esc(&session),
-                            esc(params.get("approvalId").and_then(J::as_str).expect("approval id")),
-                            j_to_string(params.get("currentRequirementId").expect("requirement")),
-                            esc(&approve)
-                        )),
-                    )
-                    .expect("approval/decide");
-                assert!(
-                    decision.get("status").is_some(),
-                    "{}",
-                    j_to_string(&decision)
-                );
+                decide(&params);
                 decided = true;
             }
             MspEvent::Notification { method, params } => {
+                if method == "approval/requested" {
+                    decide(&params);
+                    decided = true;
+                }
                 seen.push(method.clone());
                 if method == "turn/completed"
                     && params.get("turnId").and_then(J::as_str) == Some(turn_id.as_str())

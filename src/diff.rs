@@ -159,6 +159,7 @@ mod tests {
         acp_v2_diff(tool, &parse_json(document).unwrap()).map(|d| parse_json(&d).unwrap())
     }
 
+    #[cfg(unix)]
     fn text(diff: &J) -> &str {
         diff.get("patch")
             .and_then(|p| p.get("text"))
