@@ -19,9 +19,9 @@ To see it working: run `cargo test --locked -p muse-msp-client` for the hermetic
 - [x] (2026-10-20 17:10Z) Wrote this ExecPlan.
 - [x] (2026-10-20 17:20Z) Milestone 1: created the crate, moved the JSON core into it, re-exported it from the adapter, repointed the fuzz paths. Workspace tests unchanged (adapter unit tests 171, crate JSON tests 6).
 - [x] (2026-10-20 18:05Z) Milestone 2: implemented the client (transport, correlation, process ownership, handshake, events, cancellation, close) with 33 unit tests over an in-memory transport and 12 process tests against a self-executing fake host; three consecutive runs passed, the process suite takes about 1.5 seconds.
-- [ ] Milestone 3: port `src/msp.rs`, `src/hosts.rs`, and `src/host_config.rs` onto the crate with unchanged behavior.
-- [ ] Milestone 4: acceptance test against a real `muse serve`, crate README and example, docs, CHANGELOG, nightly workflow.
-- [ ] Milestone 5: run every gate and the live loopback comparison; record outcomes.
+- [x] (2026-10-20 18:40Z) Milestone 3: ported `src/msp.rs`, `src/hosts.rs`, `src/host_config.rs`, and the event patterns in `src/main.rs` onto the crate. All 170 adapter unit tests and 383 `tests/acp_serve.rs` tests pass. A raw-byte comparison against the baseline binary (fake host behind `tee`) showed identical host-bound frames and identical stderr for the `happy`, `approval_req`, and `host_exit` scenarios; `--selftest` and `--support` (with Muse installed and with a missing `MUSE_CLI`) print identical output.
+- [x] (2026-10-20 19:10Z) Milestone 4: added `crates/muse-msp-client/tests/live_muse.rs` (passes against Muse 1.4.11 in under a second, three runs), `examples/session.rs` (ran it against the same isolated host: it declined, then approved, a shell call), the crate README, and updates to `README.md`, `CHANGELOG.md`, `ROADMAP.md`, `CONTRIBUTING.md`, `fuzz/README.md`, and the nightly live-host job.
+- [x] (2026-10-20 19:30Z) Milestone 5: every gate passes (see Artifacts), including the workspace suite on Rust 1.88.0, the npm smoke and launcher tests; the live loopback suite gives the same 46 passed and the same 3 failures, for the same reasons, as before the change.
 
 ## Surprises & Discoveries
 
@@ -30,6 +30,12 @@ To see it working: run `cargo test --locked -p muse-msp-client` for the hermetic
 
 - Observation: when a write times out, the client kills the host before failing the pending waiters (the original order), so the reader usually sees the killed host's stdout close first and the waiters report `MspError::HostClosed` rather than `Closed("serve stdin write timed out; host terminated")`. The adapter has always had this race; it maps `HostClosed` to the reaped exit message.
   Evidence: the first run of `a_stuck_write_kills_the_host` failed with "unexpected Err(HostClosed)"; the test now accepts either settlement and asserts it happens within a second.
+
+- Observation: with the `malformed_msp` fake-host scenario, the order of the reader thread's "serve parse error" lines relative to the main thread's `host-ready` line differs from run to run, even between two runs of the unmodified baseline binary. It is a pre-existing race between two threads writing to stderr, not a change in behavior.
+  Evidence: two baseline runs produced `stderr identical run0 vs run1: False` with only those lines moved.
+
+- Observation: `rustup` did not have Rust 1.88 installed; installing it with `rustup toolchain install 1.88.0 --profile minimal` worked, and `cargo +1.88.0 test --locked --workspace` passes with a separate target directory.
+  Evidence: every suite reported `test result: ok` under 1.88.0.
 
 ## Decision Log
 
@@ -73,9 +79,40 @@ To see it working: run `cargo test --locked -p muse-msp-client` for the hermetic
   Rationale: the tests must run on Linux, macOS, and Windows (the nightly workflow runs the workspace tests on all three) without Python or Muse. A self-executing Rust binary gives real pipes, real exit codes, and a real kill without a test-only binary target in the library.
   Date/Author: 2026-10-20 / Claude
 
+- Decision: the adapter passes typed `HostFlags` (`READ_ONLY_FLAGS`, `REVIEWER_FLAGS` in `src/hosts.rs`) instead of string slices, and `host_config::configure` takes the `LaunchConfig`. `LaunchConfig::get_args` and `get_envs` mirror `std::process::Command` so tests can inspect a configuration.
+  Rationale: the issue asks for host-lifetime flags in the launch configuration; the flags emit in the same order as the old constants, so the command line is unchanged.
+  Date/Author: 2026-10-20 / Claude
+
+- Decision: the adapter logs crate diagnostics with their `Display` text, and the crate pins every line in `diagnostic_lines_are_stable`.
+  Rationale: the strings were ported from the adapter's log lines; keeping one copy avoids drift, and the test makes any wording change a deliberate change to the adapter's diagnostic contract. Notification diagnostics go to the adapter's `MUSE_LOG=debug` tracing instead.
+  Date/Author: 2026-10-20 / Claude
+
+- Decision: run the crate's live test in the nightly live-host job right after the adapter's suite (not on the Windows legs, which run only the workspace-root flows).
+  Rationale: it proves the acceptance flow against every pinned Muse build without credentials, and like the rest of that job it is not a pull-request gate.
+  Date/Author: 2026-10-20 / Claude
+
 ## Outcomes & Retrospective
 
-(To be written at completion.)
+The extraction is complete. `crates/muse-msp-client` is a dependency-free,
+synchronous MSP client: explicit launch configuration, a two-phase or
+one-call launch, typed handshake facts, per-method deadlines, cancellable
+pending requests, mode-based server-request routing, events for
+notifications, requests, stderr lines, and closure, exit classification, a
+stdin-closed probe, and bounded close. The adapter drives all three of its
+hosts through it and kept every behavior the issue lists: the host-bound
+bytes and logs match the old binary, and every adapter test, the live
+loopback suite, `--selftest`, and `--support` give the same results.
+
+The acceptance flow from the issue runs in `tests/live_muse.rs` with only the
+crate: launch, handshake, session, command, notifications, an answered server
+request and decided approval, one cancelled request, and a clean close.
+
+Remaining gaps are deliberate: no typed mirrors of MSP methods, no reconnect
+or restart logic (the adapter keeps its own durable-host restart), and
+cancellation stays local because MSP has no request-cancellation message. The
+two-phase API turned out to be the key design choice: it let the adapter keep
+its exact launch ordering and error wording without the crate knowing about
+either.
 
 ## Context and Orientation
 
@@ -135,13 +172,48 @@ All steps are additive edits plus one file move; rerunning the commands is safe.
 
 ## Artifacts and Notes
 
-Baseline live loopback result on unmodified `origin/master`:
+Baseline live loopback result on unmodified `origin/master`, and the same
+suite after the change (per-test results identical; each failure has the same
+message, "file birth time is unavailable" for fork and side chat, and "the
+card follows the child to completion: nullnull" for the workflow child):
 
-    test result: FAILED. 46 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.90s
-    failures:
+    before: test result: FAILED. 46 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.90s
+    after:  test result: FAILED. 46 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 17.98s
+    failures (both):
         a_fork_starts_from_the_source_history_and_continues_on_its_own
         a_workflow_child_runs_and_its_result_reaches_the_parent
         side_chat_reaches_a_real_host_and_attaches_with_provenance
+
+Gates at completion:
+
+    cargo fmt --check                                              ok
+    cargo clippy --locked --workspace --all-targets -- -D warnings ok
+    cargo test --locked --workspace                                ok (adapter 170 + 383 + others; crate 35 unit, 12 process, 1 doc)
+    cargo +1.88.0 test --locked --workspace                        ok
+    cargo run --locked -- --selftest                               ok, output identical to the baseline
+    python3 -m unittest discover -s scripts -p 'test_*.py'         OK (skipped=6)
+    sh -n install.sh                                               ok
+    node scripts/smoke_npm.cjs target/debug/muse-acp               ok
+    node --test npm/test/launcher.test.cjs                         4 passed
+    MUSE_ACP_LOOPBACK=1 cargo test --locked -p muse-msp-client --test live_muse   1 passed (0.85s)
+
+The live acceptance test prints the host it reached:
+
+    host 1.4.11 fingerprint sha256:f282ad16e21520d0cda68cb190149b86e2b062eef1dd282749360c05aa3d1082 durable=true
+    test the_client_alone_drives_a_real_host_through_a_session ... ok
+
+The example against the same isolated host:
+
+    $ session <muse> <ws> 'write the artifact [[script:shell]]'
+    connected to muse 1.4.11 (schema Some(1), sha256:f282ad16...)
+    approval for bash: abort
+    muse: done
+    turn completed
+    muse serve shut down cleanly (exit code 0)
+    $ session <muse> <ws> 'write the artifact [[script:shell]]' --approve
+    approval for bash: allow_once
+    ...
+    approved.txt: approved
 
 ## Interfaces and Dependencies
 
@@ -149,6 +221,8 @@ The crate has no dependencies and no dev-dependencies. Its public surface, in `c
 
     pub mod json;   // J, parse_json, esc, j_to_string
     pub use client::{MspClient, MspEvent, Params, PendingRequest, RequestHandle, default_timeout};
+    // MspEvent: Notification { method, params }, Request { id, method, params },
+    //           Stderr { line }, Closed { reason }; #[non_exhaustive].
     pub use config::{Capabilities, ClientInfo, ClientOptions, HostFlags, LaunchConfig, ServerRequestMode, ShutdownPolicy, Transport};
     pub use error::{Diagnostic, HandshakeError, LaunchError, MspError};
     pub use exit::{ExitClassification, ExitKind, classify_exit_parts};
@@ -178,4 +252,8 @@ The central methods:
     impl PendingRequest { pub fn id(&self) -> u64; pub fn handle(&self) -> RequestHandle; pub fn wait(self) -> Result<J, MspError>; }
     impl RequestHandle { pub fn id(&self) -> u64; pub fn cancel(&self) -> bool; }
 
-`muse-acp` gains `muse-msp-client = { path = "crates/muse-msp-client" }` under `[dependencies]`; this adds no third-party code to the binary.
+`LaunchConfig` (by `&mut self`, like `std::process::Command`): `new(program)`, `arg`, `args`, `host_flags(HostFlags)`, `env`, `env_remove`, `env_clear`, `current_dir`, `shutdown_policy(ShutdownPolicy)`, `options(ClientOptions)`, `program`, `get_args`, `get_envs`. `ClientOptions` (by value): `client_info`, `capabilities`, `server_request(method, ServerRequestMode)`, `request_timeout`, `write_timeout`, `stderr_events`, `diagnostics(Fn(&Diagnostic))`, `watchdog(Fn(&'static str) -> guard)`, `handshake_check(Fn(&Handshake) -> Result<(), String>)`. `Transport::new(reader, writer).on_terminate(f)`.
+
+`muse-acp` gains `muse-msp-client = { path = "crates/muse-msp-client" }` under `[dependencies]`; this adds no third-party code to the binary. In the adapter, `src/msp.rs` re-exports `ExitClassification`, `ExitKind`, `HostFlags`, and `MspEvent`, adds the `ExitMessage` trait (`editor_message`), and keeps `MspHost::launch(user_input_dialogs, user_shell, computer_use, flags: HostFlags)`, `command`, `reap`, `shutdown`, `force_stop`, `mint_cmd`, `logged_out`, `refresh_config`, and `handshake` with their old behavior.
+
+Revision note (2026-10-20, completion): filled in Progress, Surprises, the last three decisions, Outcomes, Artifacts, and the final interface details after implementing and verifying every milestone.
