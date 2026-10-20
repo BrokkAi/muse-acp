@@ -213,6 +213,18 @@ Host provenance rides
 strategyId?, summarizedThrough?, tokensBefore?, tokensAfter?}`.
 
 
+## Error data
+
+A host refusal that reaches the editor keeps Muse's typed data where the
+adapter forwards it (`commandRejected`, `capabilityRequired`, and similar
+kinds). On Muse 1.4.11+, an error that carries a complete recovery
+observation also has `data.recoveryObservation` with the construction's
+`constructionId`, `sessionId`, `requestedMode`, `effectiveMode`,
+`effectiveSource`, and `qualification`, verbatim. It describes whether
+recovery was available for that construction; it is never an acceptance
+receipt for the failed request. An incomplete observation is dropped.
+
+
 ## Usage metadata
 
 ACP context occupancy and cumulative cost use standard `usage_update.used`,

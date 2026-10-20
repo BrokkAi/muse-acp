@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Relay Muse 1.4.11 recovery observations on host errors (#334). A refused
+  resume, load, fork, or prompt whose host error carries a complete
+  `recoveryObservation` now keeps it in the ACP error's
+  `data.recoveryObservation` and logs one diagnostic line; an approval
+  decision failure logs it as well. Incomplete observations are dropped,
+  and the qualification is never read as acceptance. The recovery choice
+  (`recoveryMode`) stays unsent: ACP has no recovery concept to expose, and
+  omission keeps Muse's retained or legacy behavior.
+
 - Count Muse 1.4.11 monitor inbox events on the monitor card (#330).
   `monitor/inboxItemAdmitted`, `...Drained`, and `...Voided` used to take the
   unhandled-notification path; they now keep per-monitor counts in the

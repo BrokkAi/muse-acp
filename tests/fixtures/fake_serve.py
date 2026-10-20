@@ -3050,6 +3050,24 @@ def main():
                                     "data": {"kind": "invalidParams"}}})
                     continue
                 if (method == "session/resume"
+                        and os.environ.get("FAKE_RESUME_RECOVERY")):
+                    # Muse 1.4.11: a refused recovery-dependent construction
+                    # carries its coherent observation. "partial" drops a
+                    # required member, which makes it unusable.
+                    observation = {
+                        "constructionId": "construct-1",
+                        "sessionId": msg.get("params", {}).get("sessionId"),
+                        "requestedMode": "on", "effectiveMode": "off",
+                        "effectiveSource": "hostPolicy",
+                        "qualification": "unavailable"}
+                    if os.environ["FAKE_RESUME_RECOVERY"] == "partial":
+                        del observation["qualification"]
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32603, "message": "recovery unavailable",
+                                    "data": {"kind": "internal",
+                                             "recoveryObservation": observation}}})
+                    continue
+                if (method == "session/resume"
                         and os.environ.get("FAKE_RESUME_NOT_FOUND") == "1"):
                     send({"jsonrpc": "2.0", "id": ident,
                           "error": {"code": -32020, "message": "session not found",

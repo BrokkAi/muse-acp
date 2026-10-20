@@ -1851,11 +1851,62 @@ fn adopt_skill_catalog(sessions: &Sessions, acp_sid: &str, skills: Option<&[acp:
 
 fn send_host_error(stdout: &StdoutShared, id: &Option<J>, error: &J, fallback: i64, message: &str) {
     let code = msp::acp_error_code(error, fallback);
-    if let Some(data) = msp::typed_error_data(error) {
-        acp::send_error_with_data(stdout, id, code, message, &data);
-    } else {
-        acp::send_error(stdout, id, code, message);
+    let recovery = recovery_observation(error);
+    if let Some(observation) = recovery {
+        log(&recovery_observation_line(observation));
     }
+    match (msp::typed_error_data(error), recovery) {
+        // Typed data is forwarded whole, observation included.
+        (Some(data), _) => acp::send_error_with_data(stdout, id, code, message, &data),
+        (None, Some(observation)) => acp::send_error_with_data(
+            stdout,
+            id,
+            code,
+            message,
+            &format!("{{\"recoveryObservation\":{}}}", j_to_string(observation)),
+        ),
+        (None, None) => acp::send_error(stdout, id, code, message),
+    }
+}
+
+/// The recovery observation on a Muse 1.4.11+ error
+/// (`ErrorData.recoveryObservation`): the original recovery-dependent
+/// construction's coherent snapshot. All six members are required and
+/// non-null; an absent or unusable observation establishes no supported
+/// recovery, so it is dropped rather than half-reported. Its
+/// `qualification` assesses the construction and is never an operation's
+/// acceptance receipt, so nothing here treats it as success.
+fn recovery_observation(error: &J) -> Option<&J> {
+    let observation = error.get("data")?.get("recoveryObservation")?;
+    [
+        "constructionId",
+        "sessionId",
+        "requestedMode",
+        "effectiveMode",
+        "effectiveSource",
+        "qualification",
+    ]
+    .iter()
+    .all(|key| {
+        observation
+            .get(key)
+            .and_then(J::as_str)
+            .is_some_and(|value| !value.is_empty())
+    })
+    .then_some(observation)
+}
+
+fn recovery_observation_line(observation: &J) -> String {
+    let field = |key: &str| observation.get(key).and_then(J::as_str).unwrap_or("");
+    format!(
+        "recovery observation session={} construction={} requested={} effective={} source={} qualification={}",
+        field("sessionId"),
+        field("constructionId"),
+        field("requestedMode"),
+        field("effectiveMode"),
+        field("effectiveSource"),
+        field("qualification")
+    )
 }
 
 enum LoopMsg {
@@ -6108,10 +6159,11 @@ fn handle_acp(
                         host.handshake().feedback,
                     );
                 }
-                Err(e) => acp::send_error(
+                Err(e) => send_host_error(
                     stdout,
                     &id,
-                    msp::acp_error_code(&e, -32602),
+                    &e,
+                    -32602,
                     &format!("fork failed: {}", err_message(&e)),
                 ),
             }
@@ -12932,6 +12984,9 @@ fn send_permission_decision(
                 decision.approval_id,
                 err_message(&e)
             ));
+            if let Some(observation) = recovery_observation(&e) {
+                log(&recovery_observation_line(observation));
+            }
             if let Some(notice) = &decision.deny_notice {
                 send_agent_text(stdout, acp_sid, decision.ver, notice);
             }

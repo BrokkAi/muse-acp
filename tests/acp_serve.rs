@@ -10268,6 +10268,31 @@ fn closing_a_session_releases_it_on_muse_1_4_11() {
 }
 
 #[test]
+fn recovery_observations_on_host_errors_reach_the_editor_and_the_log() {
+    for (shape, complete) in [("complete", true), ("partial", false)] {
+        let mut c = Client::spawn("quiet", &[("FAKE_RESUME_RECOVERY", shape)]);
+        c.initialize(2, "");
+        let id = c.req("session/resume", r#"{"sessionId":"msp-sess-1"}"#);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        let reply: serde_json::Value = serde_json::from_str(&frame).expect("reply JSON");
+        assert!(reply["error"].is_object(), "{frame}");
+        let observation = &reply["error"]["data"]["recoveryObservation"];
+        if complete {
+            assert_eq!(observation["qualification"], "unavailable", "{frame}");
+            assert_eq!(observation["effectiveSource"], "hostPolicy", "{frame}");
+            c.wait_stderr(
+                "recovery observation session=msp-sess-1 construction=construct-1 requested=on effective=off source=hostPolicy qualification=unavailable",
+                Duration::from_secs(10),
+            );
+        } else {
+            // An unusable observation establishes nothing and is not relayed.
+            assert!(observation.is_null(), "{frame}");
+        }
+        c.finish();
+    }
+}
+
+#[test]
 fn an_explicit_null_goal_clears_the_metadata() {
     let mut c = Client::spawn("goal_clear", &[]);
     let sid = c.new_session(2, "");
