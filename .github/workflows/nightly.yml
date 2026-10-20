@@ -29,8 +29,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
       - run: cargo run --locked -- --selftest
 
   # Real `muse serve` against a loopback model provider: no credentials or
@@ -185,10 +185,10 @@ jobs:
               a_mode_change_keeps_other_new_sessions_usable \
               a_restarted_adapter_loads_the_session_with_its_history \
               plan_mode_survives_an_adapter_restart; do
-              cargo test --locked --test live_loopback -- --exact --test-threads 1 "$test"
+              cargo test --locked -p muse-acp --test live_loopback -- --exact --test-threads 1 "$test"
             done
           else
-            cargo test --locked --test live_loopback -- --test-threads 2
+            cargo test --locked -p muse-acp --test live_loopback -- --test-threads 2
           fi
 
   npm-launcher:

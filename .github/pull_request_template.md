@@ -7,8 +7,8 @@
 <!-- List the checks you ran. -->
 
 - [ ] `cargo fmt --check`
-- [ ] `cargo clippy --locked --all-targets -- -D warnings`
-- [ ] `cargo test --locked`
+- [ ] `cargo clippy --locked --workspace --all-targets -- -D warnings`
+- [ ] `cargo test --locked --workspace`
 - [ ] `cargo run --locked -- --selftest`
 
 ## Security and compatibility
