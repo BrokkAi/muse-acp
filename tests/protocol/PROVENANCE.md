@@ -7,8 +7,9 @@
   This revision publishes the Muse 1.4.11 stable surface. The
   vendored `stable/` bundle is byte-identical to what an installed Muse
   1.4.11 exports with `muse schema generate-json-schema`, which reports this
-  fingerprint byte-for-byte. No pinned 1.4.11 build is in the
-  live-host matrix yet, so the adapter classifies this surface as degraded.
+  fingerprint byte-for-byte. The pinned 1.4.11-R6667.1 build in the
+  nightly live-host matrix reports it, so the adapter classifies this surface
+  as tested.
   Only `schema/msp/` was copied, without `schema/msp/msp.d.ts`; the
   revision's `python/`, `clients/`, and `scripts/` trees are not vendored.
   The previous pin was `ae46934` (Muse 1.4.10 carrying the 1.4.9 surface,
