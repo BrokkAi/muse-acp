@@ -3,7 +3,10 @@
 Auto-review sends every Muse permission request to a reviewer agent instead of
 to you. The reviewer approves or denies the action and explains why. It is off
 by default, scoped to one editor session, and shown as an ACP `configOptions`
-selector.
+entry: a `type: "boolean"` toggle for ACP v2 clients and for ACP v1 clients
+that advertise `clientCapabilities.session.configOptions.boolean`, and an
+`off`/`on` selector for other ACP v1 clients. `session/set_config_option`
+accepts a boolean value or the `off`/`on` ids for it either way.
 
 ## How it works
 

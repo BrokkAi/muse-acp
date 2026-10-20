@@ -1981,6 +1981,63 @@ fn native_approval_reviewing_does_not_consume_adapter_auto_review() {
 }
 
 #[test]
+fn auto_review_toggle_shape_follows_the_boolean_capability() {
+    for (ver, capabilities, boolean) in [
+        (1u64, "", false),
+        (
+            1,
+            r#","clientCapabilities":{"session":{"configOptions":{"boolean":{}}}}"#,
+            true,
+        ),
+        (2, "", true),
+    ] {
+        let mut c = Client::spawn("quiet", &[]);
+        let sid = c.new_session(ver, capabilities);
+        let created = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|frame| frame.contains("auto_review") && frame.contains("\"currentValue\""))
+            .cloned()
+            .expect("auto-review option in session/new");
+        assert_eq!(
+            created.contains("\"type\":\"boolean\",\"currentValue\":false"),
+            boolean,
+            "v{ver} {capabilities}: {created}"
+        );
+        // A toggle accepts booleans; the off/on ids keep working for any
+        // client, and a boolean for a selector is refused.
+        for (value, expected) in [
+            (r#""type":"boolean","value":true"#, true),
+            (r#""value":"off""#, false),
+        ] {
+            let id = c.req(
+                "session/set_config_option",
+                &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",{value}}}"),
+            );
+            let done = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            let shown = if boolean {
+                format!("\"type\":\"boolean\",\"currentValue\":{expected}")
+            } else {
+                format!(
+                    "\"currentValue\":\"{}\"",
+                    if expected { "on" } else { "off" }
+                )
+            };
+            assert!(done.contains(&shown), "v{ver} {value}: {done}");
+        }
+        let id = c.req(
+            "session/set_config_option",
+            &format!(r#"{{"sessionId":"{sid}","configId":"model","type":"boolean","value":true}}"#),
+        );
+        let refused = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(refused.contains("\"code\":-32602"), "{refused}");
+        c.finish();
+    }
+}
+
+#[test]
 fn auto_review_approves_a_shell_approval_through_the_reviewer() {
     for ver in [1_u64, 2] {
         let mut c = Client::spawn("approval_hang", &[]);
@@ -1993,17 +2050,31 @@ fn auto_review_approves_a_shell_approval_through_the_reviewer() {
             .find(|frame| frame.contains("auto_review") && frame.contains("\"currentValue\""))
             .cloned()
             .expect("auto-review selector in session/new");
+        // ACP v2 offers a boolean toggle; v1 keeps the off/on selector.
+        let (off, on, set_value) = if ver == 2 {
+            (
+                "\"type\":\"boolean\",\"currentValue\":false",
+                "\"type\":\"boolean\",\"currentValue\":true",
+                r#""type":"boolean","value":true"#,
+            )
+        } else {
+            (
+                "\"currentValue\":\"off\"",
+                "\"currentValue\":\"on\"",
+                r#""value":"on""#,
+            )
+        };
         assert!(
-            initial.contains("\"currentValue\":\"off\""),
+            initial.contains(off),
             "auto-review must default off: {initial}"
         );
         let set_id = c.req(
             "session/set_config_option",
-            &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+            &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",{set_value}}}"),
         );
         let set_done = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
         assert!(
-            set_done.contains("\"currentValue\":\"on\""),
+            set_done.contains(on),
             "auto-review selector must reflect the set value: {set_done}"
         );
         let _pid = c.prompt(&sid, "run the tests");

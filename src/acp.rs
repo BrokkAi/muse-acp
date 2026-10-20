@@ -1119,6 +1119,9 @@ pub struct ConfigOptions<'a> {
     pub offer_muse_default: bool,
     /// True when the adapter-side auto-review selector is `on`.
     pub auto_review: bool,
+    /// Whether the client accepts `type: "boolean"` options; Auto-review is
+    /// then a boolean toggle instead of an off/on selector.
+    pub boolean_toggles: bool,
     /// AIR recommended model and reasoning values, when negotiated.
     pub recommendations: (Option<&'a str>, Option<&'a str>),
 }
@@ -1209,18 +1212,29 @@ pub fn config_options(ver: u8, options: ConfigOptions<'_>, models: &[CatalogMode
     } else {
         ""
     };
-    let auto_review_value = if options.auto_review {
-        AUTO_REVIEW_ON
+    // A client that accepts boolean options gets a toggle; others keep the
+    // off/on selector.
+    let auto_review_shape = if options.boolean_toggles {
+        format!(
+            "\"type\":\"boolean\",\"currentValue\":{}",
+            options.auto_review
+        )
     } else {
-        AUTO_REVIEW_OFF
+        format!(
+            "\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"off\",\"name\":\"Off\"}},{{\"value\":\"on\",\"name\":\"On\"}}]",
+            esc(if options.auto_review {
+                AUTO_REVIEW_ON
+            } else {
+                AUTO_REVIEW_OFF
+            })
+        )
     };
     format!(
-        "[{{\"{id_key}\":\"mode\",\"name\":\"Mode\",\"description\":\"What Muse may change: Read-only and Plan cannot write files or run shell commands\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"approval_mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"auto_review\",\"name\":\"Auto-review\",\"description\":\"Dangerous: send every permission request to an auto-review agent that can approve or deny it without asking you\",\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"off\",\"name\":\"Off\"}},{{\"value\":\"on\",\"name\":\"On\"}}]}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{reasoning_options_json}]{reasoning_meta}}}]",
+        "[{{\"{id_key}\":\"mode\",\"name\":\"Mode\",\"description\":\"What Muse may change: Read-only and Plan cannot write files or run shell commands\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"approval_mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"auto_review\",\"name\":\"Auto-review\",\"description\":\"Dangerous: send every permission request to an auto-review agent that can approve or deny it without asking you\",{auto_review_shape}}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{reasoning_options_json}]{reasoning_meta}}}]",
         esc(options.session_mode),
         mode_options_json("value", &SESSION_MODES),
         esc(options.approval_mode),
         mode_options_json("value", &APPROVAL_MODES),
-        esc(auto_review_value),
         esc(options.model),
         model_opts.join(","),
         esc(options.reasoning_effort)
@@ -1719,6 +1733,7 @@ mod tests {
                     reasoning_effort: "medium",
                     offer_muse_default: true,
                     auto_review: false,
+                    boolean_toggles: false,
                     recommendations: (None, None),
                 },
                 &models,
@@ -1821,6 +1836,7 @@ mod tests {
                 reasoning_effort: "max",
                 offer_muse_default: false,
                 auto_review: true,
+                boolean_toggles: false,
                 recommendations: (None, None),
             },
             &models,
@@ -1834,6 +1850,38 @@ mod tests {
             options.contains("\"currentValue\":\"on\""),
             "auto-review state must be advertised: {options}"
         );
+    }
+
+    #[test]
+    fn auto_review_is_a_boolean_toggle_for_clients_that_accept_one() {
+        for (ver, id_key) in [(1, "id"), (2, "configId")] {
+            for on in [false, true] {
+                let options = config_options(
+                    ver,
+                    ConfigOptions {
+                        session_mode: "default",
+                        approval_mode: "promptUnmatched",
+                        model: "fake-model",
+                        reasoning_effort: "max",
+                        offer_muse_default: false,
+                        auto_review: on,
+                        boolean_toggles: true,
+                        recommendations: (None, None),
+                    },
+                    &[],
+                );
+                let J::Arr(items) = crate::json::parse_json(&options).expect("JSON") else {
+                    panic!("config options must be an array");
+                };
+                let toggle = items
+                    .iter()
+                    .find(|item| item.get(id_key).and_then(J::as_str) == Some("auto_review"))
+                    .expect("auto-review option");
+                assert_eq!(toggle.get("type").and_then(J::as_str), Some("boolean"));
+                assert!(matches!(toggle.get("currentValue"), Some(J::Bool(v)) if *v == on));
+                assert!(toggle.get("options").is_none(), "{options}");
+            }
+        }
     }
 
     #[test]
