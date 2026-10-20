@@ -119,7 +119,8 @@ pub struct PendingRequest {
     handle: RequestHandle,
     method: String,
     timeout: Duration,
-    deadline: Instant,
+    /// `None` when the timeout is too large to represent: wait without one.
+    deadline: Option<Instant>,
     reply: Receiver<Reply>,
 }
 
@@ -152,8 +153,16 @@ impl PendingRequest {
     /// the frame finished writing.
     pub fn wait(self) -> Result<J, MspError> {
         let id = self.handle.id;
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
-        match self.reply.recv_timeout(remaining) {
+        let received = match self.deadline {
+            Some(deadline) => self
+                .reply
+                .recv_timeout(deadline.saturating_duration_since(Instant::now())),
+            None => self
+                .reply
+                .recv()
+                .map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        match received {
             Ok(Reply::Result(result)) => Ok(result),
             Ok(Reply::Error(error)) => Err(MspError::Rpc(error)),
             Ok(Reply::Closed(reason)) => Err(MspError::Closed(reason)),
@@ -242,7 +251,11 @@ impl Drop for MspClient {
     fn drop(&mut self) {
         if !self.core.close_started.load(Ordering::SeqCst) {
             let core = self.core.clone();
-            std::thread::spawn(move || core.close(true));
+            // Never panic in drop, even when no thread can be spawned; the
+            // host then outlives this client, as it would without the close.
+            let _ = std::thread::Builder::new()
+                .name("msp-client-close".into())
+                .spawn(move || core.close(true));
         }
     }
 }
@@ -438,7 +451,7 @@ impl MspClient {
             },
             method: method.to_string(),
             timeout,
-            deadline: Instant::now() + timeout,
+            deadline: Instant::now().checked_add(timeout),
             reply: rx,
         })
     }
@@ -520,6 +533,11 @@ impl MspClient {
     /// custom transports.
     pub fn reap(&self) -> Option<ExitClassification> {
         self.core.reap()
+    }
+
+    /// Whether a close (or forced stop) has started on this client.
+    pub fn is_closing(&self) -> bool {
+        self.core.close_started.load(Ordering::SeqCst)
     }
 
     /// Stop the host: fail every pending request, close its stdin, wait for

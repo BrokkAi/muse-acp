@@ -464,7 +464,8 @@ pub fn acp_error_code(error: &J, fallback: i64) -> i64 {
 
 /// Editor-facing wording for a host exit. It names `muse-acp` and its
 /// launch settings, so it belongs to the adapter rather than the client
-/// crate, which classifies the exit.
+/// crate, which classifies the exit. Show editors `editor_message()`, never
+/// the classification's `Display` text, which is the crate's own wording.
 pub trait ExitMessage {
     /// Message suitable for an editor-facing terminal or launch diagnostic.
     fn editor_message(&self) -> String;
@@ -585,7 +586,9 @@ pub fn capability_required_error(method: &str, capability: &str) -> J {
 /// One running `muse serve`: the crate's client plus the adapter's view of
 /// its handshake and the private settings view it was launched with.
 pub struct MspHost {
-    client: MspClient,
+    /// Shared so a host dropped without a close can finish closing in the
+    /// background before its settings view is removed.
+    client: Arc<MspClient>,
     handshake: Mutex<HandshakeInfo>,
     host_config: Mutex<Option<crate::host_config::HostConfig>>,
 }
@@ -637,6 +640,8 @@ impl MspHost {
     /// deadline around it.
     pub fn reap(&self) -> Option<ExitClassification> {
         let exit = self.client.reap()?;
+        // Removing (or, on Windows, restoring) the view touches the disk.
+        let _deadline = crate::shutdown::deadline("settings view cleanup");
         self.host_config
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -649,11 +654,39 @@ impl MspHost {
     /// broken host cannot strand adapter shutdown.
     pub fn shutdown(&self) {
         if self.client.close().is_some() {
+            let _deadline = crate::shutdown::deadline("settings view cleanup");
             self.host_config
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .take();
         }
+    }
+}
+
+impl Drop for MspHost {
+    /// Every adapter path closes a host before dropping it. Should one ever
+    /// be dropped while running, the settings view must outlive the child,
+    /// which may still write `auth.json` or `trust.json` there: close it in
+    /// the background first, then remove the view.
+    fn drop(&mut self) {
+        let config = self
+            .host_config
+            .get_mut()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        let Some(config) = config else {
+            return;
+        };
+        if self.client.is_closing() {
+            return;
+        }
+        let client = self.client.clone();
+        let _ = std::thread::Builder::new()
+            .name("muse-host-drop".into())
+            .spawn(move || {
+                client.close();
+                drop(config);
+            });
     }
 }
 
@@ -681,7 +714,7 @@ impl MspHost {
             other => LaunchError::Startup(other.to_string()),
         })?;
         let host = Arc::new(MspHost {
-            client,
+            client: Arc::new(client),
             handshake: Mutex::new(HandshakeInfo::default()),
             host_config: Mutex::new(host_config),
         });

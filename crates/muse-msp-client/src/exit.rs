@@ -85,6 +85,9 @@ impl ExitClassification {
     }
 }
 
+/// The crate's own one-line wording ("muse serve shut down cleanly (exit
+/// code 0)"). Embedders that show exits to their users usually phrase them
+/// in their own terms, as `muse-acp` does through its `ExitMessage` trait.
 impl fmt::Display for ExitClassification {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind {

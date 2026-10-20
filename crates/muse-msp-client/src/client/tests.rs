@@ -312,6 +312,21 @@ fn the_request_timeout_option_overrides_the_method_table() {
 }
 
 #[test]
+fn a_timeout_too_large_to_represent_waits_without_a_deadline() {
+    let h = harness(ClientOptions::default());
+    let pending = h
+        .client
+        .start_request("test/forever", Params::empty(), Duration::MAX)
+        .unwrap();
+    assert_eq!(
+        h.peer.recv_text(),
+        r#"{"jsonrpc":"2.0","id":1,"method":"test/forever","params":{}}"#
+    );
+    h.peer.send(&response("1", r#"{"done":true}"#));
+    assert!(pending.wait().unwrap().get("done").is_some());
+}
+
+#[test]
 fn a_cancelled_request_settles_once_and_ignores_its_late_response() {
     let h = harness(ClientOptions::default());
     let pending = h
