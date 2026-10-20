@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Render Muse 1.4.11 `damagedRange` items (#331). A damaged session-log
+  range becomes a "Damaged session log range" card stating the records
+  proven missing, the unreadable lines, the readable window around the
+  range, and the safe fork cut (`lastGoodTurnId`), with the range object in
+  `_meta.muse.damagedRange`. It used to fall back to a generic card.
+
 - Name the picked skill copy on Muse 1.4.11+ (#335). A native skill part now
   carries the `skill/list` row's `source` (`bundled`, `user`, `project`, or
   `plugin`, checked against the closed vocabulary) when the catalog holds

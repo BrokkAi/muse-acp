@@ -784,9 +784,10 @@ The 1.4.11 additions are tolerated, not driven. The `session/leave` command
 and its `session/leaveCompleted` terminal, the monitor-inbox trio, and the
 `leave` close reason need no adapter arm: sessions keep their current
 lifecycle and inbound copies take the unhandled-notification diagnostic
-path (see the §9 rows above). The `damagedRange` and `scheduledFire` item
-kinds flow through the unknown-kind path, and the remaining field additions
-carry explicit dispositions in the field matrix below.
+path (see the §9 rows above). The `damagedRange` item kind renders its own
+card with its facts in `_meta.muse` (#331); `scheduledFire` flows through the
+unknown-kind path, and the remaining field additions carry explicit
+dispositions in the field matrix below.
 
 **Muse 1.4.x field-level and vocabulary additions**
 
@@ -839,9 +840,9 @@ cannot drop a member without failing CI.
 | `Session.generatedName` | Mapped to ACP | The fold-only host-generated short title (Muse 1.4.8+) is restored from start, resume, load, and fork snapshots and published as `session_info_update._meta.muse.generatedName`. It remains independent of the canonical title; absence means unpublished and is never inferred from `name` or a title fallback. `session/list` rows never carry it and never erase a known value. [#256](https://github.com/BrokkAi/muse-acp/issues/256) |
 | `SessionNameChangedParams.generatedName` | Mapped to ACP | The live replacement for the generated short title rides `session_info_update._meta.muse.generatedName`, including generated-only changes. An authoritative omission after publication is forwarded as `generatedName: null`; an initial omission publishes no key. [#256](https://github.com/BrokkAi/muse-acp/issues/256) |
 | `Item.messagePhase` | Mapped to ACP | A completed agent reply declares the model-committed phase as `_meta.muse.messagePhase` (`commentary` or `finalAnswer`, Muse 1.4.8+). A streamed reply gets an empty `agent_message_chunk` naming its `messageId` on ACP v2; a resent, replayed, or cut-off reply carries the phase on its own marked update. An absent or unrecognized value reads as `finalAnswer`; the phase is never inferred from position and is never a turn-done signal. [#254](https://github.com/BrokkAi/muse-acp/issues/254) |
-| `ItemKind.damagedRange` | Mapped to ACP | Tolerated through the unknown-kind generic card path from the item's `fallbackText`, like any future kind; a frame without one emits nothing. The range facts (`missingRecords`, `unreadableLines`, stamps) are not rendered, and the `turnId: null` shape is accepted. |
+| `ItemKind.damagedRange` | Mapped to ACP | A damaged session-log range (Muse 1.4.11+) renders as a "Damaged session log range" card: the host's `fallbackText`, the records proven missing and unreadable lines, the readable window around the range, and the safe fork cut (`lastGoodTurnId`) when one exists. The `turnId: null` shape is accepted. [#331](https://github.com/BrokkAi/muse-acp/issues/331) |
 | `ItemKind.scheduledFire` | Mapped to ACP | Tolerated through the same unknown-kind generic card path; the occurrence facts (`jobId`, `deliveryNumber`, `scheduledFireAtMs`, `nextFireAtMs`) are not rendered. |
-| `Item.damagedRange` | Intentionally ignored | The damaged-range cost object on an item is never read; the range kind itself is tolerated through the unknown-kind path above. |
+| `Item.damagedRange` | Mapped to ACP | The range's cost object rides the card's `_meta.muse.damagedRange` verbatim and is stated in its text (see `ItemKind.damagedRange`). |
 | `Item.deliveryNumber` | Intentionally ignored | The scheduled-fire occurrence number is never read. |
 | `Item.jobId` | Intentionally ignored | The scheduled-fire cron job id is never read. |
 | `Item.nextFireAtMs` | Intentionally ignored | The next scheduled epoch is never read. |

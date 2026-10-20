@@ -1050,6 +1050,18 @@ def on_turn_start(params):
             "turnId": tid, "status": "rejected", "tool": "write_file",
             "args": json.dumps({"path": "not-written.txt"})}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "items_1411":
+        # Muse 1.4.11 kinds, as the stable schema describes them: a damaged
+        # log range (turnId null).
+        notify("item/completed", {**base, "item": {
+            "itemId": "dr-1", "kind": "damagedRange", "turnId": None,
+            "status": "completed",
+            "fallbackText": "Part of this session log is unreadable",
+            "damagedRange": {"missingRecords": 2, "unreadableLines": 1,
+                             "readableBeforeAt": "2026-10-19T10:00:00Z",
+                             "readableAfterAt": "2026-10-19T10:05:00Z",
+                             "lastGoodTurnId": "turn-good"}}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "streamed_output":
         shell = os.environ.get("FAKE_STREAM_TOOL") == "bash"
         item = {"itemId": "it-stream", "kind": "toolCall",

@@ -170,6 +170,7 @@ Muse adds only facts with no standard ACP field:
 | User-shell card | `_meta.muse.userShell: {exitCode, exitSignal}`. |
 | Reminder card | `_meta.muse.reminderChild: {reminderAgentId, generationId, taskId, childSessionId, childSessionLogPath}`. |
 | Background-check card | `_meta.muse.turnId` and `blockingAgents`. |
+| Damaged session-log range card (Muse 1.4.11+) | `_meta.muse.damagedRange: {missingRecords, unreadableLines, readableBeforeAt, readableAfterAt, lastGoodTurnId}`, verbatim. `lastGoodTurnId` is the safe fork cut. |
 
 ### Notices
 
