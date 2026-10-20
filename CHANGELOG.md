@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Handle ACP v2 JSON-RPC batch arrays (#319). An empty batch receives one
+  `-32600` object with `id: null`; each valid entry is dispatched as if it
+  arrived alone; invalid entries receive their own `-32600` without failing
+  their siblings; responses ready when the batch has been dispatched leave as
+  one array; and notification-only batches receive no reply. Previously a
+  batch was silently dropped. ACP v1 batches are refused with one `-32600`
+  instead of being dropped.
+
 - Re-pin the vendored Muse SDK conformance corpus to `22a8a56` (2026-10-19,
   "remirror: 1.4.11"), which publishes the Muse 1.4.11 stable surface. The
   additions over 1.4.9/1.4.10 are additive: the `session/leave` command with

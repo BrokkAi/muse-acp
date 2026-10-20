@@ -3420,13 +3420,19 @@ fn main() {
                             continue;
                         }
                     };
-                    if let Ok(msg) = parse_json(line.trim()) {
-                        shutdown::register_request(&msg);
-                        if matches!(
-                            msg.get("method").and_then(J::as_str),
-                            Some("shutdown" | "exit")
-                        ) {
-                            shutdown::disconnect();
+                    if let Ok(frame) = parse_json(line.trim()) {
+                        let messages = match &frame {
+                            J::Arr(entries) => entries.as_slice(),
+                            _ => std::slice::from_ref(&frame),
+                        };
+                        for msg in messages {
+                            shutdown::register_request(msg);
+                            if matches!(
+                                msg.get("method").and_then(J::as_str),
+                                Some("shutdown" | "exit")
+                            ) {
+                                shutdown::disconnect();
+                            }
                         }
                     }
                     if stdin_tx.send(LoopMsg::AcpLine(line.to_string())).is_err() {
@@ -3498,6 +3504,26 @@ fn main() {
                     continue;
                 }
                 match parse_json(trimmed) {
+                    Ok(J::Arr(entries)) => {
+                        if let Some(reason) = host_unavailable.as_deref() {
+                            dispatch_batch(&stdout, &entries, |msg| {
+                                serve_without_host(&stdout, msg, reason)
+                            });
+                        } else if let Some(host) = host.as_ref() {
+                            dispatch_batch(&stdout, &entries, |msg| {
+                                handle_acp(host, &stdout, &sessions, &lists, msg)
+                            });
+                        } else {
+                            // Before initialize no ACP version is negotiated,
+                            // and initialize must not travel in a batch.
+                            acp::send_error(
+                                &stdout,
+                                &None,
+                                -32600,
+                                "initialize must be the first ACP request",
+                            );
+                        }
+                    }
                     Ok(v) => {
                         if let Some(reason) = host_unavailable.as_deref() {
                             serve_without_host(&stdout, &v, reason);
@@ -3801,6 +3827,63 @@ fn main() {
             }
         }
     }
+}
+
+/// Whether a batch entry is a JSON-RPC message the adapter can dispatch: a
+/// request or notification (a string `method`), or a client response to one
+/// of the adapter's own requests.
+fn valid_batch_entry(entry: &J) -> bool {
+    if !matches!(entry, J::Obj(_)) {
+        return false;
+    }
+    match entry.get("method") {
+        Some(method) => method.as_str().is_some(),
+        None => {
+            entry.get("id").is_some()
+                && (entry.get("result").is_some() || entry.get("error").is_some())
+        }
+    }
+}
+
+/// Dispatch one ACP v2 JSON-RPC batch. Each valid entry runs as if it had
+/// arrived alone; invalid entries get their own `-32600` with `id: null`
+/// without failing their siblings. Responses produced while the batch is
+/// dispatched leave together as one array, and a batch with nothing to answer
+/// (only notifications or client responses) gets no reply. Stable ACP v1
+/// frames one message per line and has no batches, so a v1 batch is refused
+/// as a whole instead of being dropped without a word.
+fn dispatch_batch(stdout: &StdoutShared, entries: &[J], mut dispatch: impl FnMut(&J)) {
+    if entries.is_empty() {
+        acp::send_error(stdout, &None, -32600, "invalid request: empty batch");
+        return;
+    }
+    if negotiated_ver() != 2 {
+        acp::send_error(
+            stdout,
+            &None,
+            -32600,
+            "invalid request: JSON-RPC batches need ACP v2",
+        );
+        return;
+    }
+    let requests = entries
+        .iter()
+        .filter(|entry| valid_batch_entry(entry) && entry.get("method").is_some())
+        .filter_map(|entry| entry.get("id"))
+        .map(j_to_string)
+        .collect();
+    acp::begin_batch(requests);
+    for entry in entries {
+        if valid_batch_entry(entry) {
+            dispatch(entry);
+        } else {
+            acp::batch_error(
+                -32600,
+                "invalid request: batch entry is not a JSON-RPC message",
+            );
+        }
+    }
+    acp::finish_batch(stdout);
 }
 
 /// The catalog's default model, but only when the client asked for AIR

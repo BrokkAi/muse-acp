@@ -125,6 +125,9 @@ pub fn settle(stdout: &StdoutShared, message: &str) {
     } else {
         message
     };
+    // A `shutdown` dispatched inside a batch must not strand the answers its
+    // siblings already produced.
+    crate::acp::finish_batch(stdout);
     let mut out = stdout.lock().unwrap_or_else(|p| p.into_inner());
     let Some(requests) = REQUESTS.get() else {
         return;
