@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Render Muse 1.4.11 `scheduledFire` items (#332). A scheduled cron fire
+  becomes a "Scheduled job <jobId> fired" card with its occurrence number,
+  its scheduled and next fire times in UTC (or "Final delivery" when the
+  occurrence facts carry no next fire), and the occurrence facts verbatim in
+  `_meta.muse.scheduledFire`. It used to fall back to a generic card.
+
 - Render Muse 1.4.11 `damagedRange` items (#331). A damaged session-log
   range becomes a "Damaged session log range" card stating the records
   proven missing, the unreadable lines, the readable window around the

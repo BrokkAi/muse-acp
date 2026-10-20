@@ -1789,7 +1789,7 @@ fn v2_shell_output_streams_into_an_agent_owned_terminal() {
 }
 
 #[test]
-fn muse_1_4_11_damaged_ranges_render_their_facts() {
+fn muse_1_4_11_damaged_ranges_and_scheduled_fires_render_their_facts() {
     for ver in [1u64, 2] {
         let mut c = Client::spawn("items_1411", &[]);
         let sid = c.new_session(ver, "");
@@ -1800,6 +1800,14 @@ fn muse_1_4_11_damaged_ranges_render_their_facts() {
                 && damaged.contains("Safe fork point: turn turn-good")
                 && damaged.contains("\"damagedRange\":{"),
             "v{ver}: {damaged}"
+        );
+        let fired = c.wait_for("Scheduled job job-9 fired", Duration::from_secs(15));
+        assert!(
+            fired.contains("Occurrence 2")
+                && fired.contains("Scheduled for 2026-10-19T17:53:42Z")
+                && fired.contains("Final delivery")
+                && fired.contains("\"scheduledFire\":{\"jobId\":\"job-9\""),
+            "v{ver}: {fired}"
         );
         c.finish();
     }

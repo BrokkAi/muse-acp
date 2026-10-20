@@ -1051,8 +1051,8 @@ def on_turn_start(params):
             "args": json.dumps({"path": "not-written.txt"})}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "items_1411":
-        # Muse 1.4.11 kinds, as the stable schema describes them: a damaged
-        # log range (turnId null).
+        # Muse 1.4.11 kinds: a damaged log range (turnId null) and a
+        # scheduled cron fire, as the stable schema describes them.
         notify("item/completed", {**base, "item": {
             "itemId": "dr-1", "kind": "damagedRange", "turnId": None,
             "status": "completed",
@@ -1061,6 +1061,11 @@ def on_turn_start(params):
                              "readableBeforeAt": "2026-10-19T10:00:00Z",
                              "readableAfterAt": "2026-10-19T10:05:00Z",
                              "lastGoodTurnId": "turn-good"}}})
+        notify("item/completed", {**base, "item": {
+            "itemId": "sf-1", "kind": "scheduledFire", "turnId": tid,
+            "status": "completed", "fallbackText": "Scheduled prompt",
+            "jobId": "job-9", "deliveryNumber": 2,
+            "scheduledFireAtMs": 1792432422000}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "streamed_output":
         shell = os.environ.get("FAKE_STREAM_TOOL") == "bash"
