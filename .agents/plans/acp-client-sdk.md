@@ -20,7 +20,7 @@ The result is demonstrated by a workspace crate with its own unit tests and by a
 - [x] (2026-10-20T16:55Z) Added the crate guide and focused tests for response correlation, notifications, reverse requests, version-specific initialization, timeout behavior, EOF, and agent-request cancellation.
 - [x] (2026-10-20T17:00Z) Added black-box ACP v1 and v2 tests that launch the existing `muse-acp` binary against `tests/fixtures/fake_serve.py`.
 - [x] (2026-10-20T17:05Z) Ran `cargo fmt --check`, workspace clippy with warnings denied, the complete workspace test suite, the adapter self-test, Python release-script tests, and installer shell syntax checks. The Node launcher test was attempted but hung in this container and was interrupted after several minutes.
-- [ ] Create the tracking issue for extracting `src/msp.rs` into `muse-msp-client`, or report the exact credential blocker if GitHub authentication remains unavailable. Blocked: `gh auth status` reports the active `foundev` token is invalid, and neither `GH_TOKEN` nor `GITHUB_TOKEN` is set. The exact issue title and body are preserved in `.agents/docs/msp-client-extraction.md`.
+- [x] (2026-10-20T17:20Z) Created issue #328, "Extract msp.rs into a reusable Muse MSP client crate", after running the GitHub operation outside the restricted sandbox.
 
 ## Surprises & Discoveries
 
@@ -33,8 +33,8 @@ The result is demonstrated by a workspace crate with its own unit tests and by a
 - Observation: ACP v1 keeps the `session/prompt` request open until the turn terminates, while the existing adapter settles v2 through `state_update`. The client must expose the prompt response and streaming events independently so callers can use both versions correctly.
   Evidence: `src/main.rs` sends prompt results for v1 at the turn terminal and sends v2 state updates instead.
 
-- Observation: GitHub issue creation cannot proceed in this environment. The active `gh` account is `foundev`, but its token is invalid, neither `GH_TOKEN` nor `GITHUB_TOKEN` is set, and the Git credential helper has no GitHub password.
-  Evidence: `gh auth status` exits 1 with "The token in default is invalid"; `git credential fill` reports no password.
+- Observation: GitHub writes need access outside the restricted sandbox even though the public repository can be read from inside it. The sandboxed `gh auth status` did not expose a usable credential, while the explicitly approved unsandboxed branch push, PR creation, and issue creation all succeeded.
+  Evidence: the branch produced PR #327 and the MSP follow-up produced issue #328.
 
 - Observation: the existing Node launcher test did not reach its first test in this container. A 45-second timeout cancelled the file while Node's event loop contained only a pending promise; this occurs before any launcher assertion and is independent of the new Rust crate.
   Evidence: `timeout 45s node --test npm/test/launcher.test.cjs` exited 124 with `tests 1`, `pass 0`, `cancelled 1`, and no child diagnostics.
@@ -65,8 +65,8 @@ The result is demonstrated by a workspace crate with its own unit tests and by a
   Rationale: the user explicitly requested the ACP client extraction now and an issue for the MSP client. Mixing the two increases review and regression risk.
   Date/Author: 2026-10-20 / Codex
 
-- Decision: preserve the MSP issue as a repository-local agent note when the remote issue cannot be created.
-  Rationale: a complete title, scope, non-goals, acceptance criteria, and the exact credential failure avoid losing the design work and let a user with a fresh GitHub login create the issue without repeating the investigation.
+- Decision: track the MSP extraction in issue #328 rather than mixing it into the ACP client PR.
+  Rationale: focused changes are reviewable and independently releasable. The issue records the required transport extraction, coupling removals, public API, failure behavior, tests, and non-goals.
   Date/Author: 2026-10-20 / Codex
 
 ## Outcomes & Retrospective
@@ -86,10 +86,7 @@ extension, a public pending-request handle, and an async adapter. Unknown
 extension data remains lossless through `serde_json::Value`, and callers can
 still issue any method through `request`.
 
-The MSP issue was not created because GitHub authentication is invalid in this
-environment. Its issue-ready title and body are preserved in
-`.agents/docs/msp-client-extraction.md`; creating the remote issue requires a
-fresh `gh auth login` or a valid token supplied by the user.
+The MSP extraction is tracked in issue #328. The implementation PR is #327.
 
 ## Context and Orientation
 
