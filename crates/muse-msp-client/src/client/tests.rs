@@ -683,6 +683,18 @@ fn params_serialize_values_and_pass_raw_text_through() {
 }
 
 #[test]
+fn command_ids_stay_unique_within_a_millisecond_without_entropy() {
+    // The worst case where no random source is available: only the
+    // sequence separates ids minted in the same millisecond.
+    let mut seen = std::collections::HashSet::new();
+    for n in 0..4096 {
+        let id = super::uuid_v7(n, 1_792_432_422_000, [0; 10]);
+        assert_eq!(id.as_bytes()[14], b'7', "{id}");
+        assert!(seen.insert(id), "sequence {n} collided");
+    }
+}
+
+#[test]
 fn command_ids_are_unique_uuid_v7() {
     let h = harness(ClientOptions::default());
     let mut seen = std::collections::HashSet::new();

@@ -247,6 +247,31 @@ impl fmt::Debug for MspClient {
     }
 }
 
+/// A UUIDv7 from a millisecond timestamp, the per-host command sequence
+/// `n`, and ten random bytes. The sequence's low 12 bits fill `rand_a`, so
+/// ids minted in one millisecond stay distinct even with no entropy at all.
+pub(crate) fn uuid_v7(n: u64, ms: u64, mut r: [u8; 10]) -> String {
+    r[0] ^= ((n >> 8) & 0x0f) as u8;
+    r[1] ^= (n & 0xff) as u8;
+    r[9] ^= ((n >> 12) & 0xff) as u8;
+    let b = u16::from_be_bytes([r[0], r[1]]) & 0x0fff;
+    let c = u16::from_be_bytes([r[2], r[3]]) & 0x3fff | 0x8000;
+    let d = ((r[4] as u64) << 40)
+        | ((r[5] as u64) << 32)
+        | ((r[6] as u64) << 24)
+        | ((r[7] as u64) << 16)
+        | ((r[8] as u64) << 8)
+        | (r[9] as u64);
+    format!(
+        "{:08x}-{:04x}-7{:03x}-{:04x}-{:012x}",
+        (ms >> 16) as u32,
+        (ms & 0xffff) as u16,
+        b,
+        c,
+        d
+    )
+}
+
 impl Drop for MspClient {
     fn drop(&mut self) {
         if !self.core.close_started.load(Ordering::SeqCst) {
@@ -495,27 +520,23 @@ impl MspClient {
             .unwrap_or(0) as u64
             & 0xffffffffffff;
         let mut r = [0u8; 10];
-        if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-            let _ = Read::read_exact(&mut f, &mut r);
+        let urandom =
+            std::fs::File::open("/dev/urandom").and_then(|mut f| Read::read_exact(&mut f, &mut r));
+        if urandom.is_err() {
+            // No /dev/urandom (Windows): std's `RandomState` keys come from
+            // the OS generator, and each new state differs.
+            use std::hash::{BuildHasher, Hasher};
+            let word = |salt: u64| {
+                let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+                h.write_u64(n);
+                h.write_u64(ms);
+                h.write_u64(salt);
+                h.finish().to_be_bytes()
+            };
+            r[..8].copy_from_slice(&word(0));
+            r[8..].copy_from_slice(&word(1)[..2]);
         }
-        r[0] ^= (n & 0xff) as u8;
-        r[9] ^= ((n >> 8) & 0xff) as u8;
-        let b = u16::from_be_bytes([r[0], r[1]]) & 0x0fff;
-        let c = u16::from_be_bytes([r[2], r[3]]) & 0x3fff | 0x8000;
-        let d = ((r[4] as u64) << 40)
-            | ((r[5] as u64) << 32)
-            | ((r[6] as u64) << 24)
-            | ((r[7] as u64) << 16)
-            | ((r[8] as u64) << 8)
-            | (r[9] as u64);
-        format!(
-            "{:08x}-{:04x}-7{:03x}-{:04x}-{:012x}",
-            (ms >> 16) as u32,
-            (ms & 0xffff) as u16,
-            b,
-            c,
-            d
-        )
+        uuid_v7(n, ms, r)
     }
 
     /// The bounded stderr tail of a launched host (at most 100 lines and
