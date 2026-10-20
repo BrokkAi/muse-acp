@@ -7910,6 +7910,10 @@ fn handle_acp(
                 ),
             }
         }
+        // Not in any current ACP schema: the legacy unstable
+        // `SetSessionModelRequest` (ACP v0.10). Kept as a documented
+        // compatibility method with the same effect as the `model`
+        // config option; see docs/acp-extensions.md.
         "session/set_model" => {
             let sid = params
                 .as_ref()
@@ -7957,6 +7961,8 @@ fn handle_acp(
                     {
                         s.model_value = value.clone();
                     }
+                    // Muse's `session/modelChanged` then moves the standard
+                    // `model` selector, as for `session/set_config_option`.
                     acp::send_result(stdout, &id, &format!("{{\"model\":{}}}", esc(&value)))
                 }
                 Err(e) => acp::send_error(
