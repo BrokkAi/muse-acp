@@ -7277,22 +7277,22 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 }
 
 #[test]
-fn sdk_manifest_fingerprint_is_degraded_pending_the_1_4_10_pin() {
-    // The vendored SDK manifest (ae46934) publishes the Muse 1.4.9 surface
-    // that Muse 1.4.10 carries unchanged. No pinned 1.4.9/1.4.10 build is in
-    // the live-host matrix yet, so the adapter degrades loudly instead of
-    // warning about an unknown surface, and keeps serving.
+fn sdk_manifest_fingerprint_is_degraded_pending_the_1_4_11_pin() {
+    // The vendored SDK manifest (22a8a56) publishes the Muse 1.4.11 surface.
+    // No pinned 1.4.11 build is in the live-host matrix yet, so the adapter
+    // degrades loudly instead of warning about an unknown surface, and keeps
+    // serving.
     let mut c = Client::spawn(
         "quiet",
         &[(
             "FAKE_FINGERPRINT",
-            "sha256:5d3b43e5ccdb7dc4f5a32c380f5f2cde0f10e3059b93610afb2e73f73b1d914c",
+            "sha256:f282ad16e21520d0cda68cb190149b86e2b062eef1dd282749360c05aa3d1082",
         )],
     );
     c.initialize(1, "");
     c.wait_stderr("status=degraded", Duration::from_secs(10));
     c.wait_stderr(
-        "Muse 1.4.9/1.4.10 surface; byte-identical to the installed 1.4.10 export, pending a pinned CI build",
+        "Muse 1.4.11 surface; byte-identical to the installed 1.4.11 export, pending a pinned CI build",
         Duration::from_secs(10),
     );
     c.finish();

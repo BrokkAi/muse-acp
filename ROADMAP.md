@@ -4,17 +4,17 @@ This is a living roadmap for `muse-acp`. It records the direction that keeps the
 adapter close to Muse Session Protocol (MSP), safe around approvals and file
 access, and useful in real editor workflows.
 
-- **Last revised:** 2026-10-19
+- **Last revised:** 2026-10-20
 - **Original planning baseline:** `v0.2.5`; current release history is in
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
-- **Reference snapshots used for this revision:** Muse SDK `ae46934`
-  (2026-10-16; stable schema version 1, manifest fingerprint
-  `sha256:5d3b43e5ccdb7dc4f5a32c380f5f2cde0f10e3059b93610afb2e73f73b1d914c`,
-  the Muse 1.4.9 stable surface that Muse 1.4.10 carries unchanged,
-  byte-identical to an installed 1.4.10's own schema export; degraded
-  pending a pinned 1.4.9/1.4.10 CI build)
+- **Reference snapshots used for this revision:** Muse SDK `22a8a56`
+  (2026-10-19; stable schema version 1, manifest fingerprint
+  `sha256:f282ad16e21520d0cda68cb190149b86e2b062eef1dd282749360c05aa3d1082`,
+  the Muse 1.4.11 stable surface,
+  byte-identical to an installed 1.4.11's own schema export; degraded
+  pending a pinned 1.4.11 CI build)
   and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
@@ -91,8 +91,9 @@ the verdict into richer support bundles.
   that published the live-validated 1.4.4 fingerprint, the `ea88c822` pin
   after that published the 1.4.6 fingerprint, the `a0c8611` pin after that
   published the 1.4.7 fingerprint, the `838d36a` pin after that published
-  the 1.4.8 fingerprint, and the current `ae46934` pin publishes the 1.4.9
-  fingerprint that Muse 1.4.10 carries unchanged. Host 1.2.1 reports
+  the 1.4.8 fingerprint, the `ae46934` pin after that published the 1.4.9
+  fingerprint that Muse 1.4.10 carries unchanged, and the current `22a8a56`
+  pin publishes the 1.4.11 fingerprint. Host 1.2.1 reports
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
   bundle via the binary's own `muse schema` export, plus a live 1.2.1
@@ -175,7 +176,29 @@ the verdict into richer support bundles.
   yet, it stays degraded rather than tested. The new surfaces have their own
   tracking issues
   ([#271](https://github.com/BrokkAi/muse-acp/issues/271) through
-  [#273](https://github.com/BrokkAi/muse-acp/issues/273)). Before 1.4.6, the
+  [#273](https://github.com/BrokkAi/muse-acp/issues/273)). The `22a8a56`
+  pin publishes the 1.4.11 surface
+  (`sha256:f282ad16e21520d0cda68cb190149b86e2b062eef1dd282749360c05aa3d1082`,
+  schema version 1): the `session/leave` command with its
+  `session/leaveCompleted` terminal and the `leave` reason on
+  `session/closed`, the monitor-inbox trio (`monitor/inboxItemAdmitted`,
+  `monitor/inboxItemDrained`, `monitor/inboxItemVoided`), the `damagedRange`
+  and `scheduledFire` item kinds with their item fields, goal creation and
+  mutation timestamps, recovery observations and modes, the skill-invocation
+  source, and the workflow-child `drained` join fact. An installed Muse
+  1.4.11 exports a schema bundle byte-identical to the vendored copy while
+  reporting this fingerprint byte-for-byte, so the adapter classifies it as
+  degraded rather than unknown; with no pinned 1.4.11 build in the live-host
+  matrix yet, it stays degraded rather than tested. Pinning build
+  1.4.11-R6667.1 (verified locally: it reports this fingerprint and its
+  schema export is byte-identical to the vendored bundle) is tracked in
+  [#337](https://github.com/BrokkAi/muse-acp/issues/337), along with three
+  version-correlated loopback failures that pass against 1.4.8 in the same
+  sandbox and must clear first (fork and side chat refuse with a
+  file-birthtime error; the workflow-child card completes with no content).
+  The new surfaces have their own tracking issues
+  ([#329](https://github.com/BrokkAi/muse-acp/issues/329) through
+  [#336](https://github.com/BrokkAi/muse-acp/issues/336)). Before 1.4.6, the
   Python tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
   `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
   surface while the top-level schema stayed on 1.3.0-R3401.1. Transcript
@@ -211,7 +234,7 @@ The SDK publishes generated MSP types, a schema bundle, and recorded transcripts
 The Rust adapter should consume those artifacts as conformance inputs.
 
 Status: **emissions validated and permission paths replayed.**
-`tests/protocol/` pins SDK revision `ae46934` (stable manifest, JSON schema
+`tests/protocol/` pins SDK revision `22a8a56` (stable manifest, JSON schema
 bundle, 52 golden transcripts) with provenance and license. CI now replays
 every server-side item event through the notification fold (unknown kinds must
 tolerate), validates every emitted ACP frame with the adapter's own parser,
@@ -222,8 +245,10 @@ dev-dependency; the binary stays dependency-free), and replays every corpus
 approval payload through the permission mapping, requiring ordered choices
 plus a deny fallback, and an env-gated `MUSE_ACP_LIVE_HOST=1` smoke test
 drives a real host handshake, session lifecycle, and close (skipped with an
-explicit message by default). No pinned 1.4.9 or 1.4.10 build has joined the
-matrix yet, so the vendored 1.4.9/1.4.10 surface classifies as degraded. The `live-host` CI job also runs
+explicit message by default). No pinned 1.4.11 build has joined the
+matrix yet, so the vendored 1.4.11 surface classifies as degraded (the
+1.4.9/1.4.10 surface stays degraded beside it); the pin is tracked in
+[#337](https://github.com/BrokkAi/muse-acp/issues/337). The `live-host` CI job also runs
 `tests/live_loopback.rs` on every push against each pinned Muse build on
 Linux x86-64, and the newest on macOS arm64 (downloaded and
 checksum-verified), with no credentials: a real `muse serve`
@@ -283,7 +308,7 @@ their first Windows evidence.
 
 **Work items**
 
-- Pin the SDK revision (currently `ae46934`, 2026-10-16) and vendor
+- Pin the SDK revision (currently `22a8a56`, 2026-10-19) and vendor
   `schema/msp/stable/manifest.json`, `schema/msp/stable/msp.schema.json`, and
   the `schema/msp/transcripts/` corpus under `tests/protocol/`, or fetch that
   locked revision in CI. The corpus already covers approvals, cancellation,
@@ -639,11 +664,11 @@ path, preserving the fail-closed policy from §4.
 
 **Muse 1.4.x stable-surface additions**
 
-Muse 1.4.1 through 1.4.10 grew the stable surface well past 1.3.0. The adapter
+Muse 1.4.1 through 1.4.11 grew the stable surface well past 1.3.0. The adapter
 adopts the parts that fit its ACP mapping (workspace roots, reasoning tiers,
 session delete on the hosts that serve it, `feedback/submit`, and
 `session/list` filters) and records an explicit disposition below for the
-rest, with a tracking issue. The pinned `ae46934` bundle is the authority.
+rest, with a tracking issue. The pinned `22a8a56` bundle is the authority.
 The rows below record a disposition for the 1.4.x additions the adapter does
 not drive, plus `feedback/submit`, which it does; incoming notifications with
 no adapter arm stay safe because the unknown-method path in the fold logs and
@@ -686,6 +711,11 @@ continues.
 | `turn/modelRetryScheduled` | Mapped to ACP | A durable, non-terminal observation that a provider backoff behind one model attempt is waiting out its delay. The prompt stays open; while the turn runs the attempt facts reach the editor as `session_info_update._meta.muse.modelRetry` (attempt, next, max, delay, and the optional failing `errorKind`/`system`/`httpStatus`), cleared at the turn's terminal, and are logged like `turn/retryScheduled`. An unknown `errorKind` passes through verbatim ([#259](https://github.com/BrokkAi/muse-acp/issues/259)). |
 | `sessionRename` capability | Mapped to ACP | Requested unconditionally at `initialize`, like `sessionListStream` and `feedback`, and recorded on the handshake. Muse 1.4.3–1.4.7 predate the registry entry: they ignore the unknown name and still serve `session/rename`, so `/rename` keeps working there. From 1.4.8 on the name is registered, and a withheld grant answers `/rename` with the typed `capabilityRequired` (-32010, `data.capability` = `sessionRename`) instead of sending an ungranted call. |
 | `approval/reviewing` | Mapped to ACP | A reviewer-held activity notice, not a request. The adapter publishes reversible `session_info_update._meta.muse.approvalReviewing` rows keyed by source MSP session and approval id, with title and ACP tool kind. No permission prompt or decision is opened. `approval/requested` clears the row before normal approval handling; `approval/resolved` or the owning turn terminal also clears it. Adapter Auto-review remains independent and can handle the later release. [#271](https://github.com/BrokkAi/muse-acp/issues/271) |
+| `session/leave` | Intentionally ignored | A client command that releases one loaded session (Muse 1.4.11+). The adapter never sends it: sessions stay loaded until Muse idle-unloads them or the host shuts down, so the `session/closed` handling is unchanged. Adopting it is tracked in [#329](https://github.com/BrokkAi/muse-acp/issues/329). |
+| `session/leaveCompleted` | Intentionally ignored | The correlated terminal of an admitted `session/leave` (Muse 1.4.11+). The adapter never sends `session/leave`, so an inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt. See [#329](https://github.com/BrokkAi/muse-acp/issues/329). |
+| `monitor/inboxItemAdmitted` | Intentionally ignored | One monitor inbox admission (Muse 1.4.11+): the gate-off fold key the adapter does not consume. An inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt. Adopting the trio is tracked in [#330](https://github.com/BrokkAi/muse-acp/issues/330). |
+| `monitor/inboxItemDrained` | Intentionally ignored | One monitor inbox drain with its recorded stamp (Muse 1.4.11+): a consumption marker the adapter does not fold. An inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt. See [#330](https://github.com/BrokkAi/muse-acp/issues/330). |
+| `monitor/inboxItemVoided` | Intentionally ignored | One wake-missed void (Muse 1.4.11+): count-only, with no transcript row by schema design. An inbound copy takes the unhandled-notification diagnostic path and never settles the ACP prompt. See [#330](https://github.com/BrokkAi/muse-acp/issues/330). |
 
 The remaining 1.4.x field-level and vocabulary additions — the `webSearch`
 item kind, `mcpLinkError`, `TurnError.quota`, the retry/retraction detail
@@ -744,6 +774,14 @@ stable-schema surface of its own; its SDK fold clarification for declined
 settle-both-arms handling in
 [#273](https://github.com/BrokkAi/muse-acp/issues/273).
 
+The 1.4.11 additions are tolerated, not driven. The `session/leave` command
+and its `session/leaveCompleted` terminal, the monitor-inbox trio, and the
+`leave` close reason need no adapter arm: sessions keep their current
+lifecycle and inbound copies take the unhandled-notification diagnostic
+path (see the §9 rows above). The `damagedRange` and `scheduledFire` item
+kinds flow through the unknown-kind path, and the remaining field additions
+carry explicit dispositions in the field matrix below.
+
 **Muse 1.4.x field-level and vocabulary additions**
 
 Muse 1.4.6 grew fields and open vocabularies the adapter's tolerant fold had to
@@ -795,6 +833,22 @@ cannot drop a member without failing CI.
 | `Session.generatedName` | Mapped to ACP | The fold-only host-generated short title (Muse 1.4.8+) is restored from start, resume, load, and fork snapshots and published as `session_info_update._meta.muse.generatedName`. It remains independent of the canonical title; absence means unpublished and is never inferred from `name` or a title fallback. `session/list` rows never carry it and never erase a known value. [#256](https://github.com/BrokkAi/muse-acp/issues/256) |
 | `SessionNameChangedParams.generatedName` | Mapped to ACP | The live replacement for the generated short title rides `session_info_update._meta.muse.generatedName`, including generated-only changes. An authoritative omission after publication is forwarded as `generatedName: null`; an initial omission publishes no key. [#256](https://github.com/BrokkAi/muse-acp/issues/256) |
 | `Item.messagePhase` | Mapped to ACP | A completed agent reply declares the model-committed phase as `_meta.muse.messagePhase` (`commentary` or `finalAnswer`, Muse 1.4.8+). A streamed reply gets an empty `agent_message_chunk` naming its `messageId` on ACP v2; a resent, replayed, or cut-off reply carries the phase on its own marked update. An absent or unrecognized value reads as `finalAnswer`; the phase is never inferred from position and is never a turn-done signal. [#254](https://github.com/BrokkAi/muse-acp/issues/254) |
+| `ItemKind.damagedRange` | Mapped to ACP | Tolerated through the unknown-kind generic card path from the item's `fallbackText`, like any future kind; a frame without one emits nothing. The range facts (`missingRecords`, `unreadableLines`, stamps) are not rendered, and the `turnId: null` shape is accepted. |
+| `ItemKind.scheduledFire` | Mapped to ACP | Tolerated through the same unknown-kind generic card path; the occurrence facts (`jobId`, `deliveryNumber`, `scheduledFireAtMs`, `nextFireAtMs`) are not rendered. |
+| `Item.damagedRange` | Intentionally ignored | The damaged-range cost object on an item is never read; the range kind itself is tolerated through the unknown-kind path above. |
+| `Item.deliveryNumber` | Intentionally ignored | The scheduled-fire occurrence number is never read. |
+| `Item.jobId` | Intentionally ignored | The scheduled-fire cron job id is never read. |
+| `Item.nextFireAtMs` | Intentionally ignored | The next scheduled epoch is never read. |
+| `Item.scheduledFireAtMs` | Intentionally ignored | The fire's scheduled epoch is never read. |
+| `Goal.createdAtMs` | Mapped to ACP | The goal block is stored and emitted as raw MSP JSON, so the creation timestamp rides the `session/update` goal metadata verbatim when the host sends it; absence (pre-1.4.11 producers) emits nothing. Never interpreted or fabricated. |
+| `Goal.updatedAtMs` | Mapped to ACP | The mutation timestamp rides the same raw goal metadata verbatim, like its creation stamp above. |
+| `SessionClosedReason.leave` | Consumed | Logged verbatim by the existing `session/closed` arm beside `idle` and `hostShutdown`; unload semantics are unchanged because the adapter never sends `session/leave`. |
+| `SessionResumeParams.recoveryMode` | Intentionally ignored | The cold-resume replacement choice is never sent; omission preserves the retained choice, which is the schema's legacy behavior. |
+| `SessionStartParams.recoveryMode` | Intentionally ignored | The recovery choice for a new session is never sent; omission keeps legacy behavior, which the schema calls out explicitly. |
+| `ErrorData.recoveryObservation` | Intentionally ignored | The recovery-dependent construction's observation on an approval error is never read; approval failures keep their existing mapping. |
+| `SessionReadResult.recoveryObservation` | Intentionally ignored | The observation on a read result is never read; resumed and re-attached sessions keep their existing seeding. |
+| `SubagentResult.drained` | Intentionally ignored | The parent-consumed join fact on a workflow-child result is never read; the adapter mints completion off the result itself, not the flag. |
+| `TurnInputPart.source` | Intentionally ignored | Skill parts are sent without a `source`, so the host's bare `(selector)` resolution applies byte-for-byte; the closed vocabulary needs no local validation because the member is never written. |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**

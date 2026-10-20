@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+- Re-pin the vendored Muse SDK conformance corpus to `22a8a56` (2026-10-19,
+  "remirror: 1.4.11"), which publishes the Muse 1.4.11 stable surface. The
+  additions over 1.4.9/1.4.10 are additive: the `session/leave` command with
+  its `session/leaveCompleted` terminal and the `leave` reason on
+  `session/closed`, the monitor-inbox trio (`monitor/inboxItemAdmitted`,
+  `monitor/inboxItemDrained`, `monitor/inboxItemVoided`), the `damagedRange`
+  and `scheduledFire` item kinds with their item fields, goal creation and
+  mutation timestamps, recovery observations and modes, the skill-invocation
+  source, and the workflow-child `drained` join fact. The vendored bundle is
+  byte-identical to what an installed Muse 1.4.11 exports with
+  `muse schema generate-json-schema`. The adapter tolerates the additions
+  unchanged (inbound copies of the new notifications take the
+  unhandled-notification diagnostic path and never settle a prompt; the new
+  kinds flow through the unknown-kind card path; the goal timestamps ride
+  the raw goal metadata), so this re-pin is documentation-only: the schema
+  corpus, the compatibility table (the new fingerprint classifies as
+  degraded until a pinned 1.4.11 build joins the live-host matrix, tracked
+  in #337), `PROVENANCE.md`, the ROADMAP reference snapshot, sections 1, 2,
+  and 9, the event matrix, and the field matrix. Each new surface the
+  adapter does not drive has a tracking issue, #329 through #336.
+
 - Validate ACP initialization before launching Muse (#320). Missing,
   non-integer, negative, or out-of-range protocol versions receive `-32602`;
   unsupported versions receive `-32022` with `requested` and `supported`

@@ -2,7 +2,9 @@
 //!
 //! Issue #224 closed the gap between the pinned 1.4.6 stable surface and the
 //! adapter by deciding, per field (later adoptions, such as #243's 1.4.7
-//! `Item.cutOff` and #272's 1.4.9 `Item.displayLabel`, join the same matrix),
+//! `Item.cutOff`, #272's 1.4.9 `Item.displayLabel`, and the 1.4.11 re-pin's
+//! item kinds, goal timestamps, recovery members, and skill source, join the
+//! same matrix),
 //! whether it earns an ACP mapping or an explicit "Intentionally ignored"
 //! disposition. This test keeps that matrix
 //! honest in two ways: every addition has exactly one disposition row in
@@ -51,6 +53,22 @@ const ADDITIONS: &[&str] = &[
     "Session.generatedName",
     "SessionNameChangedParams.generatedName",
     "Item.messagePhase",
+    "ItemKind.damagedRange",
+    "ItemKind.scheduledFire",
+    "Item.damagedRange",
+    "Item.deliveryNumber",
+    "Item.jobId",
+    "Item.nextFireAtMs",
+    "Item.scheduledFireAtMs",
+    "Goal.createdAtMs",
+    "Goal.updatedAtMs",
+    "SessionClosedReason.leave",
+    "SessionResumeParams.recoveryMode",
+    "SessionStartParams.recoveryMode",
+    "ErrorData.recoveryObservation",
+    "SessionReadResult.recoveryObservation",
+    "SubagentResult.drained",
+    "TurnInputPart.source",
 ];
 
 fn matrix() -> String {
@@ -197,6 +215,18 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         "ItemKind.monitorFeed left the stable surface"
     );
     assert!(
+        enum_has("ItemKind", "damagedRange"),
+        "ItemKind.damagedRange left the stable surface"
+    );
+    assert!(
+        enum_has("ItemKind", "scheduledFire"),
+        "ItemKind.scheduledFire left the stable surface"
+    );
+    assert!(
+        enum_has("SessionClosedReason", "leave"),
+        "SessionClosedReason.leave left the stable surface"
+    );
+    assert!(
         enum_has("TurnErrorKind", "mcpLinkError"),
         "TurnErrorKind.mcpLinkError left the stable surface"
     );
@@ -231,6 +261,19 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("Session", "generatedName"),
         ("SessionNameChangedParams", "generatedName"),
         ("Item", "messagePhase"),
+        ("Item", "damagedRange"),
+        ("Item", "deliveryNumber"),
+        ("Item", "jobId"),
+        ("Item", "nextFireAtMs"),
+        ("Item", "scheduledFireAtMs"),
+        ("Goal", "createdAtMs"),
+        ("Goal", "updatedAtMs"),
+        ("SessionResumeParams", "recoveryMode"),
+        ("SessionStartParams", "recoveryMode"),
+        ("ErrorData", "recoveryObservation"),
+        ("SessionReadResult", "recoveryObservation"),
+        ("SubagentResult", "drained"),
+        ("TurnInputPart", "source"),
     ] {
         assert!(
             has_property(defs, def, member),

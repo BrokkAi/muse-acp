@@ -125,15 +125,30 @@ pub const HOST_148_FINGERPRINT: &str =
 pub const HOST_149_FINGERPRINT: &str =
     "sha256:5d3b43e5ccdb7dc4f5a32c380f5f2cde0f10e3059b93610afb2e73f73b1d914c";
 
+/// Stable-surface fingerprint of the Muse 1.4.11 host (schema version 1).
+/// The SDK's `22a8a56` pin (2026-10-19, "remirror: 1.4.11") publishes this
+/// surface: its stable bundle is byte-identical to what an installed Muse
+/// 1.4.11 exports with `muse schema generate-json-schema`, and a live
+/// 1.4.11 host reports exactly this digest. Over 1.4.9/1.4.10 the surface
+/// is purely additive (the `session/leave` command with its
+/// `session/leaveCompleted` terminal, the `leave` reason on
+/// `session/closed`, the monitor-inbox trio, the `damagedRange` and
+/// `scheduledFire` item kinds, goal timestamps, recovery observations and
+/// modes, and the skill-invocation source), with nothing removed or newly
+/// required. It classifies as degraded until a pinned 1.4.11 build joins
+/// the live-host matrix.
+pub const HOST_1411_FINGERPRINT: &str =
+    "sha256:f282ad16e21520d0cda68cb190149b86e2b062eef1dd282749360c05aa3d1082";
+
 /// Fingerprint published by the vendored Muse SDK manifest at revision
-/// `ae46934` (schema version 1), which describes the Muse 1.4.9 stable
-/// surface that Muse 1.4.10 carries unchanged. The vendored bundle is
-/// byte-identical to the schema an installed Muse 1.4.10 exports with
-/// `muse schema generate-json-schema`, and a live 1.4.10 host reports
-/// exactly this digest, so the constant aliases [`HOST_149_FINGERPRINT`]:
-/// one table entry and one match arm cover both the manifest check in
-/// `corpus_tests` and the `sdk-manifest` row in [`selftest_lines`].
-pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_149_FINGERPRINT;
+/// `22a8a56` (schema version 1), which describes the Muse 1.4.11 stable
+/// surface. The vendored bundle is byte-identical to the schema an installed
+/// Muse 1.4.11 exports with `muse schema generate-json-schema`, and a live
+/// 1.4.11 host reports exactly this digest, so the constant aliases
+/// [`HOST_1411_FINGERPRINT`]: one table entry and one match arm cover both
+/// the manifest check in `corpus_tests` and the `sdk-manifest` row in
+/// [`selftest_lines`].
+pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_1411_FINGERPRINT;
 
 /// Fingerprint embedded in the SDK conformance-transcript fixtures. It is
 /// deliberately distinct from every host fingerprint and must never be
@@ -217,6 +232,10 @@ fn table_entry(fingerprint: &str) -> Option<(Status, &'static str)> {
             Status::Degraded,
             "Muse 1.4.9/1.4.10 surface; byte-identical to the installed 1.4.10 export, pending a pinned CI build",
         ),
+        HOST_1411_FINGERPRINT => (
+            Status::Degraded,
+            "Muse 1.4.11 surface; byte-identical to the installed 1.4.11 export, pending a pinned CI build",
+        ),
         TRANSCRIPT_FIXTURE_FINGERPRINT => (
             Status::Fixture,
             "transcript fixture fingerprint; never a live-host result",
@@ -283,6 +302,7 @@ pub fn selftest_lines(adapter_version: &str) -> Vec<String> {
         (HOST_147_FINGERPRINT, "host-1.4.7"),
         (HOST_148_FINGERPRINT, "host-1.4.8"),
         (HOST_149_FINGERPRINT, "host-1.4.9"),
+        (HOST_1411_FINGERPRINT, "host-1.4.11"),
         (TRANSCRIPT_FIXTURE_FINGERPRINT, "transcript-fixture"),
     ] {
         let c = classify(Some(SUPPORTED_SCHEMA_VERSION), fp);
@@ -308,18 +328,18 @@ mod tests {
     }
 
     #[test]
-    fn sdk_manifest_surface_is_the_1_4_9_surface_pending_a_ci_pin() {
-        // The vendored SDK manifest (ae46934) publishes the Muse 1.4.9
-        // surface that Muse 1.4.10 carries unchanged. The bundle is
-        // byte-identical to an installed 1.4.10's own schema export, but no
-        // pinned 1.4.9/1.4.10 build is in the live-host matrix yet, so the
-        // surface classifies as degraded rather than tested.
+    fn sdk_manifest_surface_is_the_1_4_11_surface_pending_a_ci_pin() {
+        // The vendored SDK manifest (22a8a56) publishes the Muse 1.4.11
+        // surface. The bundle is byte-identical to an installed 1.4.11's own
+        // schema export, but no pinned 1.4.11 build is in the live-host
+        // matrix yet, so the surface classifies as degraded rather than
+        // tested.
         assert_eq!(
             SDK_MANIFEST_FINGERPRINT,
-            "sha256:5d3b43e5ccdb7dc4f5a32c380f5f2cde0f10e3059b93610afb2e73f73b1d914c"
+            "sha256:f282ad16e21520d0cda68cb190149b86e2b062eef1dd282749360c05aa3d1082"
         );
-        assert_eq!(SDK_MANIFEST_FINGERPRINT, HOST_149_FINGERPRINT);
-        assert_ne!(SDK_MANIFEST_FINGERPRINT, HOST_148_FINGERPRINT);
+        assert_eq!(SDK_MANIFEST_FINGERPRINT, HOST_1411_FINGERPRINT);
+        assert_ne!(SDK_MANIFEST_FINGERPRINT, HOST_149_FINGERPRINT);
         let c = classify(Some(1), SDK_MANIFEST_FINGERPRINT);
         assert_eq!(c.status, Status::Degraded);
         assert!(!c.is_fatal());
@@ -417,6 +437,17 @@ mod tests {
     }
 
     #[test]
+    fn host_1411_fingerprint_is_degraded_pending_a_ci_pin() {
+        let c = classify(Some(1), HOST_1411_FINGERPRINT);
+        assert_eq!(c.status, Status::Degraded);
+        assert_eq!(
+            c.detail,
+            "Muse 1.4.11 surface; byte-identical to the installed 1.4.11 export, pending a pinned CI build"
+        );
+        assert!(!c.is_fatal());
+    }
+
+    #[test]
     fn transcript_fixture_fingerprint_is_never_host_compatibility() {
         let c = classify(Some(1), TRANSCRIPT_FIXTURE_FINGERPRINT);
         assert_eq!(c.status, Status::Fixture);
@@ -459,7 +490,7 @@ mod tests {
         let lines = selftest_lines("0.2.5");
         assert!(lines[0].contains("adapter=0.2.5"));
         assert!(lines[0].contains("host=offline"));
-        assert_eq!(lines.len(), 15);
+        assert_eq!(lines.len(), 16);
         assert!(lines.iter().any(|l| l.contains("kind=sdk-manifest")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.2.1")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.3.0")));
@@ -472,6 +503,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.7")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.8")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.9")));
+        assert!(lines.iter().any(|l| l.contains("kind=host-1.4.11")));
         assert!(lines.iter().any(|l| l.contains("kind=transcript-fixture")));
     }
 }
