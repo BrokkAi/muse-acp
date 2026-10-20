@@ -6,6 +6,7 @@
 
 mod acp;
 mod compat;
+mod diff;
 mod efforts;
 mod fold;
 mod host_config;
@@ -389,6 +390,78 @@ fn observe_file_change(sessions: &Sessions, acp_sid: &str, item: &J) {
         report.paths.push(path);
         report.encoded_path_bytes += encoded_bytes;
     }
+}
+
+/// The largest stored patch the adapter reads for a diff card. A larger
+/// patch keeps the text card.
+const PATCH_MAX_BYTES: u64 = 1024 * 1024;
+
+/// ACP v2 `diff` content for a successful tool call's stored patch
+/// (`patchRef`, `kind: "tool_patch"`), read through `item/readOutput`.
+/// `None` keeps the ordinary text card: no patch, an unavailable or oversized
+/// one, or a document the adapter does not recognize. A diff is never
+/// synthesized for a call without a stored patch.
+fn tool_patch_diff(host: &Arc<Hosts>, msp_sid: &str, item: &J) -> Option<String> {
+    if item.get("kind").and_then(J::as_str) != Some("toolCall")
+        || item.get("status").and_then(J::as_str) != Some("completed")
+    {
+        return None;
+    }
+    let patch = item.get("patchRef")?;
+    if patch.get("kind").and_then(J::as_str) != Some("tool_patch")
+        || patch.get("availability").and_then(J::as_str) != Some("available")
+        || patch
+            .get("byteLen")
+            .and_then(J::as_u64)
+            .is_some_and(|len| len > PATCH_MAX_BYTES)
+    {
+        return None;
+    }
+    let patch_id = patch.get("id").and_then(J::as_str)?;
+    let item_id = item.get("itemId").and_then(J::as_str)?;
+    let mut body = String::new();
+    loop {
+        let read = host
+            .command(
+                "item/readOutput",
+                &format!(
+                    "{{\"sessionId\":{},\"itemId\":{},\"outputRef\":{},\"offsetBytes\":{}}}",
+                    esc(msp_sid),
+                    esc(item_id),
+                    esc(patch_id),
+                    body.len()
+                ),
+            )
+            .map_err(|error| {
+                log(&format!(
+                    "tool patch {patch_id} unread: {}",
+                    err_message(&error)
+                ))
+            })
+            .ok()?;
+        if read.get("encoding").and_then(J::as_str) != Some("utf8") {
+            return None;
+        }
+        body.push_str(read.get("content").and_then(J::as_str)?);
+        let served = read.get("byteLen").and_then(J::as_u64).unwrap_or(0);
+        if read
+            .get("eof")
+            .is_some_and(|eof| matches!(eof, J::Bool(true)))
+        {
+            break;
+        }
+        if served == 0 || body.len() as u64 > PATCH_MAX_BYTES {
+            return None;
+        }
+    }
+    let tool = item.get("tool").and_then(J::as_str).unwrap_or("");
+    let diff = diff::acp_v2_diff(tool, &parse_json(&body).ok()?);
+    if diff.is_none() {
+        log(&format!(
+            "tool patch {patch_id} not recognized; keeping the text card"
+        ));
+    }
+    diff
 }
 
 fn send_file_report(stdout: &StdoutShared, acp_sid: &str, report: FileChangeReport) {
@@ -11091,14 +11164,23 @@ fn handle_msp(
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
             let item = params.get("item").cloned().unwrap_or(J::Null);
-            if let Some(acp_sid) = find_acp_sid(sessions, msp_sid) {
+            if let Some((acp_sid, ver)) = find_acp_session(sessions, msp_sid) {
                 observe_file_change(sessions, &acp_sid, &item);
+                // Read outside the session lock: it asks the host.
+                let diff = (ver == 2)
+                    .then(|| tool_patch_diff(host, msp_sid, &item))
+                    .flatten();
                 let mut out = Vec::new();
                 if let Some(s) = sessions
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
                     .get_mut(&acp_sid)
                 {
+                    if let (Some(diff), Some(item_id)) =
+                        (diff, item.get("itemId").and_then(J::as_str))
+                    {
+                        s.fold.patch_diffs.insert(item_id.to_string(), diff);
+                    }
                     s.fold.on_item_completed(&acp_sid, s.ver, params, &mut out);
                     let kind = item.get("kind").and_then(|v| v.as_str()).unwrap_or("item");
                     let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("");

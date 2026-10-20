@@ -529,7 +529,10 @@ error the editor shows if Muse then refuses the profile says why.
   native file tools when the client negotiates the AIR extension. Tool cards
   for Muse's file tools carry standard ACP `locations` (absolute paths from
   their explicit path arguments), so editors can follow along; shell and
-  other tools never get a guessed location.
+  other tools never get a guessed location. On ACP v2 a completed edit also
+  carries standard `diff` content (file changes plus `git_patch` text) built
+  from Muse's stored patch; see
+  [the extension contract](docs/acp-extensions.md#commands-messages-and-tool-cards).
 - **Stored output** — bounded tool output with head and tail retained, plus
   opt-in `_session/readOutput` access to the host's stored bytes.
 - **Hooks** — `hookRun` items render as hook cards with their event, durable
