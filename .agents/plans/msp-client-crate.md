@@ -17,8 +17,8 @@ To see it working: run `cargo test --locked -p muse-msp-client` for the hermetic
 - [x] (2026-10-20 16:40Z) Read `AGENTS.md`, `CONTRIBUTING.md`, `.agents/PLANS.md`, `src/msp.rs`, `src/hosts.rs`, `src/shutdown.rs`, `src/host_config.rs`, `src/json.rs`, `src/compat.rs`, the `crates/muse-acp-client` crate and its plan, CI workflows, and the live loopback harness.
 - [x] (2026-10-20 16:45Z) Ran the live loopback suite on unmodified `origin/master` (exported to `/tmp/muse-acp-baseline` so later edits cannot leak into it): 46 passed, 3 failed (`a_fork_starts_from_the_source_history_and_continues_on_its_own`, `a_workflow_child_runs_and_its_result_reaches_the_parent`, `side_chat_reaches_a_real_host_and_attaches_with_provenance`).
 - [x] (2026-10-20 17:10Z) Wrote this ExecPlan.
-- [ ] Milestone 1: create the crate, move the JSON core into it, re-export it from the adapter, repoint the fuzz paths.
-- [ ] Milestone 2: implement the client (transport, correlation, process ownership, handshake, events, cancellation, close) with hermetic tests.
+- [x] (2026-10-20 17:20Z) Milestone 1: created the crate, moved the JSON core into it, re-exported it from the adapter, repointed the fuzz paths. Workspace tests unchanged (adapter unit tests 171, crate JSON tests 6).
+- [x] (2026-10-20 18:05Z) Milestone 2: implemented the client (transport, correlation, process ownership, handshake, events, cancellation, close) with 33 unit tests over an in-memory transport and 12 process tests against a self-executing fake host; three consecutive runs passed, the process suite takes about 1.5 seconds.
 - [ ] Milestone 3: port `src/msp.rs`, `src/hosts.rs`, and `src/host_config.rs` onto the crate with unchanged behavior.
 - [ ] Milestone 4: acceptance test against a real `muse serve`, crate README and example, docs, CHANGELOG, nightly workflow.
 - [ ] Milestone 5: run every gate and the live loopback comparison; record outcomes.
@@ -27,6 +27,9 @@ To see it working: run `cargo test --locked -p muse-msp-client` for the hermetic
 
 - Observation: on this machine (Muse 1.4.11) the shell-approval live tests now pass; the three baseline failures are host-side limitations (file birth time is unavailable for fork and side chat, and the workflow child card never completes).
   Evidence: `/tmp/muse-acp-live-before.log`, "test result: FAILED. 46 passed; 3 failed".
+
+- Observation: when a write times out, the client kills the host before failing the pending waiters (the original order), so the reader usually sees the killed host's stdout close first and the waiters report `MspError::HostClosed` rather than `Closed("serve stdin write timed out; host terminated")`. The adapter has always had this race; it maps `HostClosed` to the reaped exit message.
+  Evidence: the first run of `a_stuck_write_kills_the_host` failed with "unexpected Err(HostClosed)"; the test now accepts either settlement and asserts it happens within a second.
 
 ## Decision Log
 
