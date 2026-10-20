@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Document and pin Muse 1.4.11 goal timestamps (#333). Goal metadata
+  carries `createdAtMs` and `updatedAtMs` verbatim when Muse records them and
+  omits them otherwise, never reporting a fabricated zero; a fake-host test
+  pins both cases. The adapter keeps the verbatim epochs rather than
+  rendering an age.
+
 - Fix two nightly failures introduced this cycle. A `src/diff.rs` test helper
   used only by Unix tests was dead code on Windows, which failed clippy on
   both Windows legs. The `muse-msp-client` live test waited only for the
