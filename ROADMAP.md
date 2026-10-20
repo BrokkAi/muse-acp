@@ -163,8 +163,8 @@ the verdict into richer support bundles.
   the skill's declared `title`, the `turn/modelRetryScheduled` notification,
   and the `sessionRename` capability. Muse 1.4.8-R6256.1 reports this
   fingerprint byte-for-byte, and its `muse schema generate-json-schema` export
-  is byte-identical to the vendored bundle and manifest, so the pinned 1.4.8
-  build in the live-host matrix is what validates the vendored corpus; the new
+  is byte-identical to the then-vendored `838d36a` bundle and manifest, so the
+  pinned 1.4.8 build in the live-host matrix validated that corpus; the new
   surfaces have their own tracking issues
   ([#253](https://github.com/BrokkAi/muse-acp/issues/253) through
   [#260](https://github.com/BrokkAi/muse-acp/issues/260)). All three builds
@@ -176,8 +176,8 @@ the verdict into richer support bundles.
   `approval/reviewing` notification for an approval the host's native
   reviewer holds. Muse 1.4.10 carries this surface unchanged — its remirror
   touches no stable-schema file — and an installed Muse 1.4.10 exports a
-  schema bundle byte-identical to the vendored copy while reporting this
-  fingerprint byte-for-byte, so the adapter classifies it as degraded rather
+  schema bundle byte-identical to the then-vendored `ae46934` copy while
+  reporting this fingerprint byte-for-byte, so the adapter classifies it as degraded rather
   than unknown; with no pinned 1.4.9 or 1.4.10 build in the live-host matrix
   yet, it stays degraded rather than tested. The new surfaces have their own
   tracking issues
