@@ -1096,6 +1096,14 @@ impl SessionFold {
                     (true, false) => objective.to_string(),
                     (true, true) => str_field("fallbackText").to_string(),
                 };
+                // Muse 1.4.11 says when the parent consumed the result
+                // (`result.drained`, never cleared once set). The card's
+                // completion still follows the item's own status; the join
+                // is the host's fact to report, never derived here.
+                let drained = item
+                    .get("result")
+                    .and_then(|r| r.get("drained"))
+                    .is_some_and(|v| matches!(v, J::Bool(true)));
                 let content = item
                     .get("result")
                     .and_then(|r| r.get("summary"))
@@ -1105,6 +1113,15 @@ impl SessionFold {
                         let failure = str_field("failureReason");
                         (!failure.is_empty()).then_some(failure.to_string())
                     });
+                let content = if drained {
+                    Some(match content {
+                        Some(text) => format!("{text}\nDelivered to the parent agent."),
+                        None => "Delivered to the parent agent.".to_string(),
+                    })
+                } else {
+                    content
+                };
+                let drained_fact = J::Bool(true);
                 let meta = meta_obj(
                     "subagent",
                     vec![
@@ -1118,6 +1135,7 @@ impl SessionFold {
                             item.get("controlStatus").unwrap_or(&J::Null),
                         ),
                         ("depth", item.get("depth").unwrap_or(&J::Null)),
+                        ("drained", if drained { &drained_fact } else { &J::Null }),
                     ],
                 );
                 (title, content, meta)
@@ -4153,6 +4171,37 @@ mod corpus_tests {
             card_text(&last).ends_with("Final delivery"),
             "{}",
             card_text(&last)
+        );
+    }
+
+    #[test]
+    fn a_drained_subagent_result_says_the_parent_consumed_it() {
+        let card = |result: &str| {
+            let mut fold = SessionFold::new();
+            let mut out = Vec::new();
+            fold.on_item_completed(
+                "sid",
+                2,
+                &parse_json(&format!(
+                    r#"{{"item":{{"itemId":"sa-1","kind":"subagent","status":"completed","subagentId":"sub-1","agentPath":"helper","objective":"check","result":{result}}}}}"#
+                ))
+                .unwrap(),
+                &mut out,
+            );
+            out[0].clone()
+        };
+        let drained =
+            card(r#"{"summary":"all good","artifactRefs":[],"evidenceRefs":[],"drained":true}"#);
+        assert!(
+            drained.contains(r#""text":"all good\nDelivered to the parent agent.""#),
+            "{drained}"
+        );
+        assert!(drained.contains(r#""drained":true"#), "{drained}");
+        let pending = card(r#"{"summary":"all good","artifactRefs":[],"evidenceRefs":[]}"#);
+        assert!(pending.contains(r#""text":"all good""#), "{pending}");
+        assert!(
+            !pending.contains("drained") && !pending.contains("Delivered"),
+            "{pending}"
         );
     }
 

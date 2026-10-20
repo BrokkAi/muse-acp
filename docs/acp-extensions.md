@@ -164,7 +164,7 @@ Muse adds only facts with no standard ACP field:
 | Tool/host card | `_meta.muse.itemId`, `outputRef`, `patchRef`, `patchSummary`, and `truncated`. |
 | Unknown or synthetic host item | `_meta.muse.itemKind`. |
 | Monitor card | `_meta.muse.monitorId`, `monitorDescription`, and `truncated`. |
-| Subagent card | `_meta.muse.subagent: {subagentId, childSessionId, controlStatus, depth}`. |
+| Subagent card | `_meta.muse.subagent: {subagentId, childSessionId, controlStatus, depth, drained}`. `drained: true` (Muse 1.4.11+) is the host's fact that the parent consumed the result, also stated in the card text; it is absent until then and never cleared. |
 | Workflow card | `_meta.muse.workflow: {workflowRunId, entryId, scriptId, triggerSource, paused, resumeFromRunId}`. |
 | Hook card | `_meta.muse.hookRun: {hookKey, event, runStatus, reason, handlerKind, enabled}`. |
 | User-shell card | `_meta.muse.userShell: {exitCode, exitSignal}`. |

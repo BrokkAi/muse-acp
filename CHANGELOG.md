@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Surface the Muse 1.4.11 subagent `drained` join fact (#336). When the host
+  reports that the parent consumed a subagent's result, the subagent card
+  says "Delivered to the parent agent." and carries
+  `_meta.muse.subagent.drained: true`. Card completion still follows the
+  item's own status; the adapter never derives the join itself.
+
 - Release closed sessions in Muse 1.4.11 (#329). After ACP `session/close`
   stops a session's work and drops its local state, the adapter sends
   `session/leave` with an explicit `stop: true`, so Muse unloads the session
