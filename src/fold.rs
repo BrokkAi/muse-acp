@@ -188,6 +188,8 @@ pub struct ToolUpdate<'a> {
     pub raw_input: Option<&'a str>,
     /// ACP `locations` (a JSON array of `{path}`), for follow-along.
     pub locations: Option<&'a str>,
+    /// One more tool-call content item after the text, such as a `diff`.
+    pub extra_content: Option<&'a str>,
     /// Host-authored item references and patch facts for the card's `_meta`.
     pub muse_fields: Option<&'a str>,
     /// The host already saturated this surface (`item.truncated`).
@@ -288,6 +290,9 @@ pub struct SessionFold {
     /// The session's workspace root, which resolves relative tool paths
     /// into the absolute `locations` ACP follow-along needs.
     pub workspace_root: String,
+    /// ACP v2 `diff` content fetched for a completed tool's stored patch,
+    /// keyed by item id and taken once by that item's completion card.
+    pub patch_diffs: HashMap<String, String>,
     /// ACP monitor cards already announced for a durable monitor task id.
     /// Later feed items update the same row instead of minting one per event
     /// batch.
@@ -353,6 +358,7 @@ impl SessionFold {
     pub fn new() -> Self {
         Self {
             workspace_root: String::new(),
+            patch_diffs: HashMap::new(),
             items: HashMap::new(),
             subagents: HashMap::new(),
             done: std::collections::HashSet::new(),
@@ -1788,10 +1794,11 @@ impl SessionFold {
             format!("\"status\":{}", esc(u.status)),
         ]);
         let mut muse_fields = u.muse_fields.unwrap_or_default().to_string();
+        let mut content = Vec::new();
         if let Some(t) = u.content_text {
             let (text, adapter_cut) = trunc(t);
-            f.push(format!(
-                "\"content\":[{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]",
+            content.push(format!(
+                "{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}",
                 esc(&text)
             ));
             let truncation = if u.host_truncated {
@@ -1805,6 +1812,10 @@ impl SessionFold {
                 }
                 muse_fields.push_str(&format!("\"truncated\":{{{cut}}}"));
             }
+        }
+        content.extend(u.extra_content.map(str::to_string));
+        if !content.is_empty() {
+            f.push(format!("\"content\":[{}]", content.join(",")));
         }
         if let Some(r) = u.raw_input {
             f.push(format!("\"rawInput\":{r}"));
@@ -2222,6 +2233,7 @@ impl SessionFold {
                         content_text: None,
                         raw_input: Some(&raw),
                         locations: locations.as_deref(),
+                        extra_content: None,
                         muse_fields: item_fields.as_deref(),
                         host_truncated: false,
                     },
@@ -2557,6 +2569,7 @@ impl SessionFold {
                 let raw = item.get("args").map(j_to_string);
                 let item_fields = Self::item_muse_fields(item);
                 let locations = self.tool_locations(item);
+                let diff = self.patch_diffs.remove(&item_id);
                 out.push(Self::tool_line(
                     acp_sid,
                     ver,
@@ -2573,6 +2586,7 @@ impl SessionFold {
                         content_text: content,
                         raw_input: raw.as_deref(),
                         locations: locations.as_deref(),
+                        extra_content: diff.as_deref(),
                         muse_fields: item_fields.as_deref(),
                         host_truncated: item
                             .get("truncated")

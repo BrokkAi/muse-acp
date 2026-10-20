@@ -122,6 +122,17 @@ Standard ACP fields carry standard meaning:
 - display title: `ToolCall.title`
 - tool category and lifecycle: `ToolCall.kind` and `ToolCall.status`
 - invocation input: `ToolCall.rawInput`
+- file edits on ACP v2: a `diff` content item after the card's text output,
+  built from the host's stored patch (`patchRef`, `kind: "tool_patch"`, read
+  through `item/readOutput` when the call completes). `changes` lists each
+  file as `modify`, or as `add` when a whole-file write (`write_file`,
+  `create_file`) replaced no prior lines; `patch` is `git_patch` text with
+  absolute paths. Muse's stored patch records neither file modes nor a
+  missing final newline, so the patch carries no mode lines or
+  `\ No newline at end of file` markers, and rewriting an existing empty file
+  reads as an add. Calls without a stored patch, history replays, and ACP v1
+  (whose `oldText`/`newText` need whole-file contents the patch does not
+  hold) keep the text card
 - follow-along file locations: `ToolCall.locations`, as absolute paths taken
   only from the explicit path arguments of Muse's file tools (`read_file`,
   `write_file`, `edit_file`, and the older single-path and move tools);

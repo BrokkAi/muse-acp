@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Send ACP diff content for Muse file edits (#301). On ACP v2, a completed
+  tool call with a stored patch (`patchRef`, `kind: "tool_patch"`) gains a
+  `diff` content item after its text output: `changes` names each file as
+  `modify` (or `add` for a whole-file write that replaced no prior lines),
+  and `patch` is `git_patch` text with absolute paths, built from the patch
+  document read through `item/readOutput` (whose layout was established
+  against a live Muse 1.4.11). Calls without a stored patch, unrecognized or
+  oversized patches, history replays, and ACP v1 keep the text card; no diff
+  is ever synthesized.
+
 - Send ACP tool-call `locations` for follow-along (#302). Cards for Muse's
   file tools (`read_file`, `write_file`, `edit_file`, and the older
   single-path and move tools) carry their explicit path arguments as

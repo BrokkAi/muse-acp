@@ -661,6 +661,14 @@ def session_obj(session_id=None, workspace_root=None):
     return session
 
 
+def patch_document():
+    """The stored `tool_patch` JSON a live Muse 1.4.11 writes for an edit."""
+    return {"files": [{"path": os.path.abspath("notes.txt"), "hunks": [{
+        "oldStart": 1, "oldLines": 3, "newStart": 1, "newLines": 4,
+        "lines": [" line one", "-hello notes", "+bye notes", "+extra",
+                  " line three"]}]}]}
+
+
 def history_items():
     return [
         {"itemId": "h-1", "kind": "userMessage", "text": "old question"},
@@ -1041,6 +1049,25 @@ def on_turn_start(params):
             "itemId": "it-rejected", "kind": "toolCall", "callId": "call-no",
             "turnId": tid, "status": "rejected", "tool": "write_file",
             "args": json.dumps({"path": "not-written.txt"})}})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "patch_edit":
+        body = json.dumps(patch_document())
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-patch", "kind": "toolCall", "callId": "call-patch",
+            "turnId": tid, "status": "completed", "tool": "edit_file",
+            "args": json.dumps({"path": "notes.txt", "find": "hello notes",
+                                "replace": "bye notes\nextra"}),
+            "result": "edited",
+            "patchRef": {"id": "tool_patch-it-patch", "kind": "tool_patch",
+                         "availability": "available",
+                         "mediaType": "application/json",
+                         "byteLen": len(body.encode())},
+            "patchSummary": {"files": 1, "added": 2, "removed": 1}}})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-plain", "kind": "toolCall", "callId": "call-plain",
+            "turnId": tid, "status": "completed", "tool": "write_file",
+            "args": json.dumps({"path": "plain.txt", "content": "x"}),
+            "result": "wrote"}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "file_changes_subagent":
         notify("item/completed", {**base, "item": {
@@ -1912,6 +1939,12 @@ def result_for(method, msg):
     if method == "item/readOutput":
         params = msg.get("params", {})
         offset = params.get("offsetBytes", 0)
+        if params.get("outputRef", "").startswith("tool_patch-"):
+            log_input({"patchRead": params.get("outputRef")})
+            body = json.dumps(patch_document())
+            return {"byteLen": len(body.encode()), "content": body,
+                    "encoding": "utf8", "eof": True,
+                    "mediaType": "application/json", "offsetBytes": offset}
         return {"byteLen": 18, "content": "full stored output",
                 "encoding": "utf8", "eof": True,
                 "mediaType": "text/plain", "offsetBytes": offset}

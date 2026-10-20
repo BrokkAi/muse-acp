@@ -1717,6 +1717,68 @@ fn file_tools_carry_absolute_follow_along_locations() {
 }
 
 #[test]
+fn stored_tool_patches_become_v2_diff_content() {
+    let mut c = Client::spawn("patch_edit", &[]);
+    let sid = c.new_session(2, "");
+    let _pid = c.prompt(&sid, "edit");
+    let card = c.wait_for_all(&["call-patch", "\"diff\""], Duration::from_secs(15));
+    let card: serde_json::Value = serde_json::from_str(&card).expect("card JSON");
+    let content = card["params"]["update"]["content"]
+        .as_array()
+        .expect("content")
+        .clone();
+    assert_eq!(content.len(), 2, "text output and diff: {card}");
+    assert_eq!(content[0]["type"], "content", "{card}");
+    let diff = &content[1];
+    assert_eq!(diff["type"], "diff", "{card}");
+    assert_eq!(diff["changes"][0]["operation"], "modify", "{card}");
+    let path = diff["changes"][0]["path"].as_str().expect("path");
+    assert!(
+        std::path::Path::new(path).is_absolute() && path.ends_with("notes.txt"),
+        "{card}"
+    );
+    assert_eq!(diff["patch"]["format"], "git_patch", "{card}");
+    let text = diff["patch"]["text"].as_str().expect("patch text");
+    assert!(
+        text.starts_with("diff --git ")
+            && text.contains(
+                "@@ -1,3 +1,4 @@\n line one\n-hello notes\n+bye notes\n+extra\n line three\n"
+            ),
+        "{text}"
+    );
+    c.wait_input("tool_patch-it-patch", Duration::from_secs(15));
+    // A call without a stored patch keeps its text card.
+    let plain = c.wait_for_all(
+        &["call-plain", "\"status\":\"completed\""],
+        Duration::from_secs(15),
+    );
+    assert!(!plain.contains("\"diff\""), "{plain}");
+    c.finish();
+}
+
+#[test]
+fn v1_keeps_text_cards_for_stored_tool_patches() {
+    let mut c = Client::spawn("patch_edit", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "edit");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(frames.contains("call-patch"), "{frames}");
+    assert!(!frames.contains("\"type\":\"diff\""), "{frames}");
+    drop(frames);
+    let reads = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap_or_default();
+    assert!(
+        !reads.contains("patchRead"),
+        "v1 never reads the patch: {reads}"
+    );
+    c.finish();
+}
+
+#[test]
 fn shell_tools_carry_no_guessed_location() {
     let mut c = Client::spawn("file_changes_ambiguous", &[]);
     let sid = c.new_session(2, "");
