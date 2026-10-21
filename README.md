@@ -23,11 +23,13 @@ Client implementers should start with the
 Muse method, `_meta` shape, capability, fallback, and the ACP standard fields
 used where they exist.
 
-The workspace also contains a reusable synchronous ACP client SDK,
-[`acp-lite`](crates/acp-lite/README.md). It can launch any ACP
-stdio agent, negotiate ACP v1 or v2, stream session updates, and route agent
-requests such as permissions and elicitation through a configurable handler.
-It is independent of the adapter binary and of the upstream
+The workspace also contains a reusable synchronous ACP SDK for both sides of
+the protocol, [`acp-lite`](crates/acp-lite/README.md). Its client side can
+launch any ACP stdio agent, negotiate ACP v1 or v2, stream session updates,
+and route agent requests such as permissions and elicitation through a
+configurable handler. Its agent side answers a client's requests and batches,
+streams notifications, and matches the agent's own requests to the client with
+their answers. It is independent of the adapter binary and of the upstream
 `agent-client-protocol` Rust crate.
 
 Toward Muse, the adapter speaks MSP through
