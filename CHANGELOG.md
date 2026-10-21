@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Rename the workspace's synchronous ACP client SDK from `muse-acp-client` to
+  `acp-lite` (`crates/acp-lite`, library `acp_lite`). Nothing in it is
+  Muse-specific; it works with any ACP stdio agent. Its default client name in
+  `initialize` is now `acp-lite`. The crate is still unpublished.
+
 ## 0.16.0
 
 - Add `muse-acp logout`, which runs `muse logout` in the terminal and

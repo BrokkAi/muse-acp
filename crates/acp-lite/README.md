@@ -1,6 +1,6 @@
-# muse-acp-client
+# acp-lite
 
-`muse-acp-client` is a synchronous Rust client for the
+`acp-lite` is a synchronous Rust client for the
 [Agent Client Protocol](https://agentclientprotocol.com/) (ACP). It launches
 or connects to an ACP stdio agent, performs the v1 or v2 handshake, correlates
 JSON-RPC requests, streams session updates, and routes requests from the agent
@@ -18,11 +18,11 @@ from another package in this repository:
 
 ```toml
 [dependencies]
-muse-acp-client = { path = "crates/muse-acp-client" }
+acp-lite = { path = "crates/acp-lite" }
 ```
 
 ```rust
-use muse_acp_client::{
+use acp_lite::{
     AgentProcess, Client, ClientOptions, ContentBlock, DenyAllHandler,
     InitializeRequest, NewSessionRequest, PromptRequest,
 };
@@ -72,7 +72,7 @@ filesystem access, and terminals. Implement `ClientHandler` and return a
 `RequestOutcome`:
 
 ```rust
-use muse_acp_client::{
+use acp_lite::{
     ClientHandler, IncomingRequest, RequestContext, RequestOutcome,
 };
 use serde_json::json;

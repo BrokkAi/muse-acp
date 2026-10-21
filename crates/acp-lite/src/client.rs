@@ -1351,7 +1351,7 @@ mod tests {
         assert_eq!(frame["params"]["protocolVersion"], 2);
         assert!(frame["params"].get("capabilities").is_some());
         assert!(frame["params"].get("clientCapabilities").is_none());
-        assert_eq!(frame["params"]["info"]["name"], "muse-acp-client");
+        assert_eq!(frame["params"]["info"]["name"], "acp-lite");
         assert!(frame["params"].get("clientInfo").is_none());
         send_frame(
             &incoming,

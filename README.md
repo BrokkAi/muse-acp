@@ -24,7 +24,7 @@ Muse method, `_meta` shape, capability, fallback, and the ACP standard fields
 used where they exist.
 
 The workspace also contains a reusable synchronous ACP client SDK,
-[`muse-acp-client`](crates/muse-acp-client/README.md). It can launch any ACP
+[`acp-lite`](crates/acp-lite/README.md). It can launch any ACP
 stdio agent, negotiate ACP v1 or v2, stream session updates, and route agent
 requests such as permissions and elicitation through a configurable handler.
 It is independent of the adapter binary and of the upstream

@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/muse-acp-client", "crates/muse-msp-client"]
+members = ["crates/acp-lite", "crates/muse-msp-client"]
 resolver = "3"
 
 [package]
@@ -22,4 +22,4 @@ muse-msp-client = { path = "crates/muse-msp-client" }
 # Test-only schema validation against the vendored MSP bundle; the shipped
 # binary remains free of third-party dependencies.
 serde_json = { version = "1", features = ["arbitrary_precision"] }
-muse-acp-client = { path = "crates/muse-acp-client" }
+acp-lite = { path = "crates/acp-lite" }

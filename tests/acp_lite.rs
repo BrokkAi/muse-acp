@@ -1,10 +1,10 @@
-//! Black-box tests for the extracted `muse-acp-client` SDK.
+//! Black-box tests for the extracted `acp-lite` SDK.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use muse_acp_client::{
+use acp_lite::{
     AgentProcess, Client, ClientError, ClientEvent, ClientOptions, DenyAllHandler,
     InitializeRequest, NewSessionRequest, PromptRequest, ProtocolVersion,
 };
@@ -17,7 +17,7 @@ fn fixture() -> String {
 
 fn temp_root(label: &str) -> PathBuf {
     let root = std::env::temp_dir().join(format!(
-        "muse-acp-client-{label}-{}-{}",
+        "acp-lite-{label}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
