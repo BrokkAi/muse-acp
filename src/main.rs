@@ -2096,18 +2096,11 @@ fn start_device_login(host: &Arc<Hosts>, stdout: &StdoutShared, id: &Option<J>) 
         return;
     };
     let elicitation_id = mint_id("login-", &ID_COUNTER);
-    let elicit_req = J::Str(mint_id("elic-", &ID_COUNTER));
-    *DEVICE_LOGIN.lock().unwrap_or_else(|p| p.into_inner()) = Some(DeviceLogin {
-        login_req: id.clone(),
-        elicitation_id: elicitation_id.clone(),
-        elicit_req: elicit_req.clone(),
-    });
-    log("device login started; verification page handed to the client");
-    acp::send_raw(
+    let Some(elicit_req) = acp::send_request(
         stdout,
+        "elicitation/create",
         &format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"elicitation/create\",\"params\":{{\"requestId\":{},\"mode\":\"url\",\"elicitationId\":{},\"url\":{},\"message\":{}}}}}",
-            j_to_string(&elicit_req),
+            "{{\"requestId\":{},\"mode\":\"url\",\"elicitationId\":{},\"url\":{},\"message\":{}}}",
             acp::id_json(id),
             esc(&elicitation_id),
             esc(url),
@@ -2115,7 +2108,18 @@ fn start_device_login(host: &Arc<Hosts>, stdout: &StdoutShared, id: &Option<J>) 
                 "Sign in to Muse in your browser and confirm the code {code}."
             ))
         ),
-    );
+        acp::TAG_DEVICE_LOGIN,
+    ) else {
+        return;
+    };
+    // The answer is handled on this loop after this returns, so the login
+    // is recorded before it can arrive.
+    *DEVICE_LOGIN.lock().unwrap_or_else(|p| p.into_inner()) = Some(DeviceLogin {
+        login_req: id.clone(),
+        elicitation_id,
+        elicit_req,
+    });
+    log("device login started; verification page handed to the client");
 }
 
 /// The client's answer to the login's URL elicitation. `accept` only means
@@ -4081,6 +4085,14 @@ fn main() {
                     );
                 }
             }
+            LoopMsg::Acp(AgentEvent::Response(response)) => {
+                // An untagged answer is a late one to a withdrawn request.
+                if let (Some(host), Some(tag)) = (host.as_ref(), response.tag.clone())
+                    && let Some(msg) = acp_message(&AgentEvent::Response(response))
+                {
+                    complete_client_request(host, &stdout, &sessions, &tag, &msg);
+                }
+            }
             LoopMsg::Acp(AgentEvent::Closed { .. }) => {
                 fail_all_with_message(&stdout, &sessions, "editor disconnected");
                 shutdown::settle(&stdout, "editor disconnected");
@@ -4388,6 +4400,31 @@ fn main() {
 /// Whether a batch entry is a JSON-RPC message the adapter can dispatch: a
 /// request or notification (a string `method`), or a client response to one
 /// of the adapter's own requests.
+/// Hand the client's answer to the adapter's request tagged `tag` to that
+/// flow. Each `complete_*` checks the id against the request it is waiting
+/// for, so an answer to an older copy is ignored.
+fn complete_client_request(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    tag: &str,
+    msg: &J,
+) {
+    let id = msg.get("id").cloned();
+    match tag {
+        acp::TAG_PERMISSION => complete_permission(host, stdout, sessions, &id, msg),
+        acp::TAG_PERMISSION_FEEDBACK => {
+            complete_permission_feedback(host, stdout, sessions, &id, msg);
+        }
+        acp::TAG_FEEDBACK => complete_feedback(host, stdout, sessions, &id, msg),
+        acp::TAG_ELICITATION => complete_elicitation(host, stdout, sessions, &id, msg),
+        acp::TAG_DEVICE_LOGIN => complete_device_login_elicitation(host, stdout, &id, msg),
+        other => log(&format!(
+            "internal: an answer for an unknown request kind {other}"
+        )),
+    }
+}
+
 /// Whether `event` ends the editor connection: the end of input, or a
 /// `shutdown`/`exit` message, alone or in a batch.
 fn ends_connection(event: &AgentEvent) -> bool {
@@ -5050,19 +5087,9 @@ fn handle_acp(
     let id = msg.get("id").cloned();
     let params = msg.get("params").cloned();
 
-    // No method: a client response — maybe to our session/request_permission
-    // or elicitation/create.
+    // No method: not a request or notification. The client's answers to the
+    // adapter's own requests reach `complete_client_request` instead.
     if method.is_empty() {
-        if bridge::complete(&id, msg) {
-            return;
-        }
-        if id.is_some() {
-            complete_permission(host, stdout, sessions, &id, msg);
-            complete_permission_feedback(host, stdout, sessions, &id, msg);
-            complete_feedback(host, stdout, sessions, &id, msg);
-            complete_elicitation(host, stdout, sessions, &id, msg);
-            complete_device_login_elicitation(host, stdout, &id, msg);
-        }
         return;
     }
 
@@ -13204,26 +13231,13 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
         );
         return;
     }
-    let req_id = J::Str(mint_id("perm-", &ID_COUNTER));
-    let ver = {
-        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(s) = map.get_mut(&acp_sid) {
-            s.pending_perm = Some(PendingPerm {
-                req_id: req_id.clone(),
-                approval_sid: msp_sid.to_string(),
-                approval_id,
-                requirement,
-                choices,
-                owner_msp_sid,
-                child_subagent_id,
-                feedback: None,
-                tool_call_id: tool_call_id.clone(),
-                title: title.clone(),
-            });
-            s.ver
-        } else {
-            return;
-        }
+    let Some(ver) = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&acp_sid)
+        .map(|s| s.ver)
+    else {
+        return;
     };
     if ver == 2 {
         acp::send_state(stdout, &acp_sid, "requires_action", None);
@@ -13246,13 +13260,34 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
             options_json
         )
     };
-    acp::send_raw(
+    // The answer is handled on this loop, after this function returns, so
+    // the permission is recorded before it can arrive.
+    let Some(req_id) = acp::send_request(
         stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"session/request_permission\",\"params\":{params}}}",
-            j_to_string(&req_id),
-        ),
-    );
+        "session/request_permission",
+        &params,
+        acp::TAG_PERMISSION,
+    ) else {
+        return;
+    };
+    if let Some(s) = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(&acp_sid)
+    {
+        s.pending_perm = Some(PendingPerm {
+            req_id,
+            approval_sid: msp_sid.to_string(),
+            approval_id,
+            requirement,
+            choices,
+            owner_msp_sid,
+            child_subagent_id,
+            feedback: None,
+            tool_call_id,
+            title,
+        });
+    }
 }
 
 /// Offer optional guidance after an explicitly selected eligible rejection.
@@ -13263,35 +13298,46 @@ fn offer_permission_feedback(
     acp_sid: &str,
     choice_id: &str,
 ) -> bool {
-    let req_id = J::Str(mint_id("feedback-", &ID_COUNTER));
     let ver = {
-        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(s) = map.get_mut(acp_sid) else {
-            return false;
-        };
-        let Some(p) = s.pending_perm.as_mut() else {
-            return false;
-        };
-        if p.feedback.is_some() {
-            return false;
+        let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+        match map.get(acp_sid) {
+            Some(s)
+                if s.pending_perm
+                    .as_ref()
+                    .is_some_and(|p| p.feedback.is_none()) =>
+            {
+                s.ver
+            }
+            _ => return false,
         }
-        p.feedback = Some(acp::PendingFeedback {
-            req_id: req_id.clone(),
-            choice_id: choice_id.to_string(),
-        });
-        s.ver
     };
     if ver == 2 {
         acp::send_state(stdout, acp_sid, "requires_action", None);
     }
-    acp::send_raw(
+    let Some(req_id) = acp::send_request(
         stdout,
+        "elicitation/create",
         &format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"elicitation/create\",\"params\":{{\"sessionId\":{},\"mode\":\"form\",\"message\":\"Optional guidance for rejecting this action\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{{\"feedback\":{{\"type\":\"string\",\"description\":\"Explain the constraint or suggest an alternative (optional)\"}}}}}}}}}}",
-            j_to_string(&req_id),
+            "{{\"sessionId\":{},\"mode\":\"form\",\"message\":\"Optional guidance for rejecting this action\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{{\"feedback\":{{\"type\":\"string\",\"description\":\"Explain the constraint or suggest an alternative (optional)\"}}}}}}}}",
             esc(acp_sid),
         ),
-    );
+        acp::TAG_PERMISSION_FEEDBACK,
+    ) else {
+        return false;
+    };
+    // The answer is handled on this loop after this returns, so the form is
+    // recorded before it can arrive.
+    if let Some(p) = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(acp_sid)
+        .and_then(|s| s.pending_perm.as_mut())
+    {
+        p.feedback = Some(acp::PendingFeedback {
+            req_id,
+            choice_id: choice_id.to_string(),
+        });
+    }
     true
 }
 
@@ -14050,30 +14096,34 @@ const UI_EXPLAIN_TITLE: &str = "Explain instead";
 const UI_EXPLAIN_DESCRIPTION: &str = "Explain what you meant instead of choosing an answer.";
 
 /// Send one ACP form request for a pending MSP user-input flow.
+/// Send a form to the client. Returns its request id, which the flow named
+/// by `tag` stores to recognize the answer, or `None` when it could not be
+/// written.
 fn send_elicitation_form(
     stdout: &StdoutShared,
     acp_sid: &str,
-    req_id: &J,
     tool_call_id: &str,
     message: &str,
     schema: &str,
-) {
+    tag: &str,
+) -> Option<J> {
     let tool_f = if tool_call_id.is_empty() {
         String::new()
     } else {
         format!(",\"toolCallId\":{}", esc(tool_call_id))
     };
-    acp::send_raw(
+    acp::send_request(
         stdout,
+        "elicitation/create",
         &format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"method\":\"elicitation/create\",\"params\":{{\"sessionId\":{}{},\"mode\":\"form\",\"message\":{},\"requestedSchema\":{}}}}}",
-            j_to_string(req_id),
+            "{{\"sessionId\":{}{},\"mode\":\"form\",\"message\":{},\"requestedSchema\":{}}}",
             esc(acp_sid),
             tool_f,
             esc(message),
             schema
         ),
-    );
+        tag,
+    )
 }
 
 /// One pending form to show the client, with the staged-answer state that
@@ -14094,7 +14144,6 @@ fn show_pending_ui(
     idx: usize,
     form: PendingUiForm,
 ) -> bool {
-    let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
     let tool_call_id = {
         let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
         let Some(s) = map.get_mut(acp_sid) else {
@@ -14103,19 +14152,31 @@ fn show_pending_ui(
         let Some(p) = s.pending_ui.get_mut(idx) else {
             return false;
         };
-        p.req_id = req_id.clone();
         p.confirmed = form.confirmed;
         p.question_index = form.question_index;
         p.tool_call_id.clone()
     };
-    send_elicitation_form(
+    let Some(req_id) = send_elicitation_form(
         stdout,
         acp_sid,
-        &req_id,
         &tool_call_id,
         &form.message,
         &form.schema,
-    );
+        acp::TAG_ELICITATION,
+    ) else {
+        return false;
+    };
+    // Answers are handled on this loop after this returns, so the new id is
+    // stored before any can arrive, and a late answer to an older copy no
+    // longer matches.
+    if let Some(p) = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(acp_sid)
+        .and_then(|s| s.pending_ui.get_mut(idx))
+    {
+        p.req_id = req_id;
+    }
     true
 }
 
@@ -14329,14 +14390,14 @@ fn bridge_user_input(
     }
     let form_message = ui_answer_message(0, &ui_qs);
     let schema = ui_answer_schema(0, &ui_qs[0]);
-    let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
     if let Some(s) = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get_mut(acp_sid)
     {
+        // The form's request id is stored once it is sent.
         s.pending_ui.push(acp::PendingUi {
-            req_id: req_id.clone(),
+            req_id: J::Null,
             user_input_id: user_input_id.clone(),
             owner_msp_sid: owner_msp_sid.to_string(),
             turn_id,
@@ -14345,17 +14406,38 @@ fn bridge_user_input(
             question_index: 0,
             confirmed: Vec::new(),
         });
-        log(&format!(
-            "bridging userInput {user_input_id} to elicitation {}",
-            j_to_string(&req_id)
-        ));
         if s.ver == 2 {
             acp::send_state(stdout, acp_sid, "requires_action", None);
         }
     } else {
         return false;
     }
-    send_elicitation_form(stdout, acp_sid, &req_id, &tool_call, &form_message, &schema);
+    let Some(req_id) = send_elicitation_form(
+        stdout,
+        acp_sid,
+        &tool_call,
+        &form_message,
+        &schema,
+        acp::TAG_ELICITATION,
+    ) else {
+        return true;
+    };
+    log(&format!(
+        "bridging userInput {user_input_id} to elicitation {}",
+        j_to_string(&req_id)
+    ));
+    if let Some(p) = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(acp_sid)
+        .and_then(|s| {
+            s.pending_ui
+                .iter_mut()
+                .find(|p| p.user_input_id == user_input_id)
+        })
+    {
+        p.req_id = req_id;
+    }
     true
 }
 
@@ -15377,15 +15459,15 @@ fn start_feedback(
             Some((classification, note)) => (Some(classification), note),
             None => (None, argument.trim().to_string()),
         };
-        let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
         let stored = {
             let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
             match map.get_mut(acp_sid) {
                 // One form at a time: replacing it would strand its prompt.
                 Some(s) if s.pending_feedback.is_some() => Some(false),
                 Some(s) => {
+                    // The form's request id is stored once it is sent.
                     s.pending_feedback = Some(acp::PendingFeedbackForm {
-                        req_id: req_id.clone(),
+                        req_id: J::Null,
                         prompt_req: prompt_req.clone().unwrap_or(J::Null),
                         prompt_content: prompt_content.to_string(),
                         ver,
@@ -15411,14 +15493,23 @@ fn start_feedback(
         if ver == 2 {
             acp::send_state(stdout, acp_sid, "requires_action", None);
         }
-        send_elicitation_form(
+        let req_id = send_elicitation_form(
             stdout,
             acp_sid,
-            &req_id,
             "",
             "Send feedback about Muse",
             &feedback_form_schema(classification.as_deref(), &note),
+            acp::TAG_FEEDBACK,
         );
+        if let Some(req_id) = req_id
+            && let Some(pending) = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(acp_sid)
+                .and_then(|s| s.pending_feedback.as_mut())
+        {
+            pending.req_id = req_id;
+        }
         return;
     }
     let prompt_req = prompt_req.unwrap_or(J::Null);
@@ -15558,24 +15649,31 @@ fn complete_feedback(
     if let Some(problem) = problem {
         // Reissue with the submitted values so correcting one field does not
         // lose the others.
-        let req_id = J::Str(mint_id("elic-", &ID_COUNTER));
-        let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-        let Some(s) = map.get_mut(&acp_sid) else {
+        let open = sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&acp_sid)
+            .is_some_and(|s| s.pending_feedback.is_some());
+        if !open {
             return;
-        };
-        let Some(pending) = s.pending_feedback.as_mut() else {
-            return;
-        };
-        pending.req_id = req_id.clone();
-        drop(map);
-        send_elicitation_form(
+        }
+        let req_id = send_elicitation_form(
             stdout,
             &acp_sid,
-            &req_id,
             "",
             &format!("{problem}\n\nSend feedback about Muse"),
             &feedback_form_schema(Some(&classification), &note),
+            acp::TAG_FEEDBACK,
         );
+        if let Some(req_id) = req_id
+            && let Some(pending) = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&acp_sid)
+                .and_then(|s| s.pending_feedback.as_mut())
+        {
+            pending.req_id = req_id;
+        }
         return;
     }
     if let Some(s) = sessions

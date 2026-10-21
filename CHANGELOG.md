@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Send the adapter's own requests to the editor through `acp-lite`'s request
+  tracking. Permission prompts, rejection-guidance and feedback forms,
+  question forms, the device-login page, and the editor-tool bridge's `fs/*`
+  and `terminal/*` calls are tagged by flow, and each answer goes straight to
+  its flow. That replaces six id matchers tried in turn and the bridge's own
+  pending map. Request ids now look like `acp-lite-N`. Behavior is otherwise
+  unchanged.
+
 - `muse-acp` now reads and writes ACP through `acp-lite`'s agent side. The
   stdin reader, line framing, JSON-RPC batch handling, the request registry
   that fails unanswered requests at shutdown, and the response writers moved
