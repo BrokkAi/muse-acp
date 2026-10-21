@@ -3067,8 +3067,7 @@ fn login() -> i32 {
 /// `muse-acp logout`: clear Muse's stored login from the terminal, for the
 /// same OS user the adapter runs as. Muse owns the credential, so the adapter
 /// only hands its terminal to the configured `muse logout` and reports that
-/// exit status. It never offers Muse's installer: installing cannot remove a
-/// credential, and a missing Muse already reports the spawn error.
+/// exit status.
 fn logout_subcommand() -> i32 {
     let bin = msp::muse_cli();
     eprintln!("[muse-acp] running `{bin} logout`");
