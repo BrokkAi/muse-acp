@@ -14,12 +14,11 @@ readme = "README.md"
 publish = false
 
 [dependencies]
-# The workspace's own MSP client. It has no dependencies of its own, so the
-# shipped binary stays free of third-party code.
+# The workspace's own MSP client, which has no dependencies of its own.
 muse-msp-client = { path = "crates/muse-msp-client" }
-
-[dev-dependencies]
-# Test-only schema validation against the vendored MSP bundle; the shipped
-# binary remains free of third-party dependencies.
-serde_json = { version = "1", features = ["arbitrary_precision"] }
+# ACP goes through acp-lite's agent side. The adapter converts its own JSON
+# values to and from serde_json at that boundary, keeping number text and key
+# order.
 acp-lite = { path = "crates/acp-lite" }
+serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order", "raw_value"] }
+

@@ -9,8 +9,8 @@ repository = "https://github.com/BrokkAi/muse-acp"
 readme = "README.md"
 publish = false
 
-# Deliberately empty: `muse-acp` depends on this crate and its shipped binary
-# must stay free of third-party code.
+# Deliberately empty: the crate is dependency-free, so anything that drives
+# Muse can use it without pulling in other crates.
 [dependencies]
 
 # The test binary doubles as a scripted fake `muse serve`, so it supplies its

@@ -1,6 +1,7 @@
 //! JSON for the adapter. The value type, parser, and serializer live in the
-//! `muse-msp-client` crate (std only, so the binary stays free of third-party
-//! code); this module re-exports them and adds the adapter's own helpers.
+//! `muse-msp-client` crate (std only); this module re-exports them and adds
+//! the adapter's own helpers. ACP frames travel as `serde_json` values through
+//! `acp-lite`, and `to_value`/`from_value` convert at that one boundary.
 
 pub use muse_msp_client::json::*;
 
@@ -37,6 +38,63 @@ pub fn mint_id(prefix: &str, counter: &std::sync::atomic::AtomicU64) -> String {
     }
     let hex: String = tail.iter().map(|b| format!("{b:02x}")).collect();
     format!("{prefix}{n}-{hex}")
+}
+
+/// `j` as a `serde_json` value, for the ACP connection. Numbers keep their
+/// digits (`arbitrary_precision`; only exponent notation is normalized, as
+/// `1e400` to `1e+400`) and objects their key order (`preserve_order`), so
+/// converting back gives the same `J`.
+pub fn to_value(j: &J) -> serde_json::Value {
+    use serde_json::Value;
+    match j {
+        J::Null => Value::Null,
+        J::Bool(b) => Value::Bool(*b),
+        J::Num(text) => text
+            .parse::<serde_json::Number>()
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        J::Str(s) => Value::String(s.clone()),
+        J::Arr(items) => Value::Array(items.iter().map(to_value).collect()),
+        J::Obj(pairs) => Value::Object(
+            pairs
+                .iter()
+                .map(|(key, value)| (key.clone(), to_value(value)))
+                .collect(),
+        ),
+    }
+}
+
+/// A `serde_json` value from the ACP connection as `J`.
+pub fn from_value(value: &serde_json::Value) -> J {
+    use serde_json::Value;
+    match value {
+        Value::Null => J::Null,
+        Value::Bool(b) => J::Bool(*b),
+        Value::Number(n) => J::Num(n.to_string()),
+        Value::String(s) => J::Str(s.clone()),
+        Value::Array(items) => J::Arr(items.iter().map(from_value).collect()),
+        Value::Object(map) => J::Obj(
+            map.iter()
+                .map(|(key, value)| (key.clone(), from_value(value)))
+                .collect(),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod conversion_tests {
+    use super::*;
+
+    #[test]
+    fn values_round_trip_with_number_text_and_key_order() {
+        let text = r#"{"z":1,"a":[1.50,-0,12345678901234567890123,1e+400],"m":{"b":null,"a":true},"s":"é\n\u2028"}"#;
+        let j = parse_json(text).unwrap();
+        let value = to_value(&j);
+        assert_eq!(value.to_string(), j_to_string(&j));
+        assert_eq!(j_to_string(&from_value(&value)), j_to_string(&j));
+        let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
+        assert_eq!(keys, ["z", "a", "m", "s"]);
+    }
 }
 
 #[cfg(test)]

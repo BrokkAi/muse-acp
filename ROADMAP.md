@@ -249,8 +249,7 @@ every server-side item event through the notification fold (unknown kinds must
 tolerate), validates every emitted ACP frame with the adapter's own parser,
 fails if the vendored manifest fingerprint drifts from the compatibility
 table, validates every adapter→host request frame against the schema bundle's
-required fields and property types (via a test-only `serde_json`
-dev-dependency; the binary stays dependency-free), and replays every corpus
+required fields and property types (via `serde_json`), and replays every corpus
 approval payload through the permission mapping, requiring ordered choices
 plus a deny fallback, and an env-gated `MUSE_ACP_LIVE_HOST=1` smoke test
 drives a real host handshake, session lifecycle, and close (skipped with an
