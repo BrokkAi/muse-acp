@@ -67,7 +67,7 @@ impl ClientInfo {
 
 impl Default for ClientInfo {
     fn default() -> Self {
-        Self::new("muse-acp-client", env!("CARGO_PKG_VERSION"))
+        Self::new("acp-lite", env!("CARGO_PKG_VERSION"))
     }
 }
 

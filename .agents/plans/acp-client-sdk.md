@@ -6,7 +6,7 @@ This plan follows the repository standard in `.agents/PLANS.md`.
 
 ## Purpose / Big Picture
 
-`muse-acp` currently contains the agent half of the Agent Client Protocol: editors send requests to the binary and the binary sends session updates back. That code proves the wire behavior but is not reusable by programs that need to launch and drive ACP agents. After this change, a Rust application can depend on the new `muse-acp-client` library, launch any ACP stdio agent, initialize either protocol version, create a session, send a prompt, observe streaming events, answer or refuse agent-initiated requests safely, and shut the child process down without writing JSON-RPC transport code itself.
+`muse-acp` currently contains the agent half of the Agent Client Protocol: editors send requests to the binary and the binary sends session updates back. That code proves the wire behavior but is not reusable by programs that need to launch and drive ACP agents. After this change, a Rust application can depend on the new `acp-lite` library, launch any ACP stdio agent, initialize either protocol version, create a session, send a prompt, observe streaming events, answer or refuse agent-initiated requests safely, and shut the child process down without writing JSON-RPC transport code itself.
 
 The result is demonstrated by a workspace crate with its own unit tests and by a black-box test that uses the new client to drive the existing `muse-acp` binary against `tests/fixtures/fake_serve.py`. The MSP side remains in `src/msp.rs`; a separate GitHub issue will track its extraction. GitHub issue creation is an external operation and is recorded in Progress rather than implemented in code.
 
@@ -14,7 +14,7 @@ The result is demonstrated by a workspace crate with its own unit tests and by a
 
 - [x] (2026-10-20T16:20Z) Inspected the current ACP agent loop, the official Rust ACP SDK surface cached in the local Cargo registry, and the fake Muse host tests. Established that the missing reusable layer is the client-side connection runtime, not the agent request router.
 - [x] (2026-10-20T16:20Z) Created this ExecPlan.
-- [x] (2026-10-20T16:35Z) Added the Cargo workspace and `crates/muse-acp-client`, with `muse-acp` kept as a dependency-free binary package.
+- [x] (2026-10-20T16:35Z) Added the Cargo workspace and `crates/acp-lite`, with `muse-acp` kept as a dependency-free binary package.
 - [x] (2026-10-20T16:45Z) Implemented the NDJSON JSON-RPC connection core, process transport, request correlation, timeouts, event delivery, safe inbound-request dispatch, and bounded shutdown.
 - [x] (2026-10-20T16:50Z) Implemented safe default request handling and common ACP helpers for initialization, sessions, prompts, cancellation, listing, loading, resuming, deleting, and closing.
 - [x] (2026-10-20T16:55Z) Added the crate guide and focused tests for response correlation, notifications, reverse requests, version-specific initialization, timeout behavior, EOF, and agent-request cancellation.
@@ -71,7 +71,7 @@ The result is demonstrated by a workspace crate with its own unit tests and by a
 
 ## Outcomes & Retrospective
 
-The ACP client extraction is implemented. `muse-acp-client` is a synchronous,
+The ACP client extraction is implemented. `acp-lite` is a synchronous,
 runtime-independent client with configurable process and custom transports,
 ACP v1/v2 initialization, session and prompt helpers, request correlation and
 timeouts, streaming events, reverse-request dispatch on independent threads,
@@ -94,7 +94,7 @@ The repository root is a Rust binary package named `muse-acp`. `src/main.rs` con
 
 ACP is a JSON-RPC 2.0 protocol carried as one JSON object per newline over an agent's stdin and stdout. A client sends requests with an `id` and receives matching responses. Notifications have no `id`. Agents may also send requests back to clients, for example to ask permission to run a tool. The client must keep reading while a request is pending so notifications and reverse requests continue to flow.
 
-The new library lives at `crates/muse-acp-client/`. The root `Cargo.toml` becomes the root package of a workspace containing that crate. The binary remains at the repository root and is not rewritten to use the new client, because it is the agent rather than the client. A root integration test uses the library as a client against the binary.
+The new library lives at `crates/acp-lite/`. The root `Cargo.toml` becomes the root package of a workspace containing that crate. The binary remains at the repository root and is not rewritten to use the new client, because it is the agent rather than the client. A root integration test uses the library as a client against the binary.
 
 ## Plan of Work
 
@@ -159,7 +159,7 @@ Its body should describe the current `MspHost` transport and correlation behavio
 
 The crate manifest uses `serde` with derive support and `serde_json`. It does not depend on `muse-acp` or `agent-client-protocol`.
 
-In `crates/muse-acp-client/src/lib.rs`, expose:
+In `crates/acp-lite/src/lib.rs`, expose:
 
     pub struct AgentProcess;
     pub struct Client;
@@ -201,3 +201,5 @@ The central public methods are:
     }
 
 `ClientHandle` exposes the same request and notification operations without owning the child process. `ClientHandler` must be `Send + Sync + 'static`. `RequestOutcome` contains either a JSON result or an `RpcError`.
+
+Revision note (2026-10-21): the crate was renamed from `muse-acp-client` to `acp-lite` (directory `crates/acp-lite`, library `acp_lite`, black-box tests in `tests/acp_lite.rs`), because nothing in it is Muse-specific. References above use the new name.

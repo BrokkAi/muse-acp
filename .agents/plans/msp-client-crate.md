@@ -14,7 +14,7 @@ To see it working: run `cargo test --locked -p muse-msp-client` for the hermetic
 
 ## Progress
 
-- [x] (2026-10-20 16:40Z) Read `AGENTS.md`, `CONTRIBUTING.md`, `.agents/PLANS.md`, `src/msp.rs`, `src/hosts.rs`, `src/shutdown.rs`, `src/host_config.rs`, `src/json.rs`, `src/compat.rs`, the `crates/muse-acp-client` crate and its plan, CI workflows, and the live loopback harness.
+- [x] (2026-10-20 16:40Z) Read `AGENTS.md`, `CONTRIBUTING.md`, `.agents/PLANS.md`, `src/msp.rs`, `src/hosts.rs`, `src/shutdown.rs`, `src/host_config.rs`, `src/json.rs`, `src/compat.rs`, the `crates/acp-lite` crate and its plan, CI workflows, and the live loopback harness.
 - [x] (2026-10-20 16:45Z) Ran the live loopback suite on unmodified `origin/master` (exported to `/tmp/muse-acp-baseline` so later edits cannot leak into it): 46 passed, 3 failed (`a_fork_starts_from_the_source_history_and_continues_on_its_own`, `a_workflow_child_runs_and_its_result_reaches_the_parent`, `side_chat_reaches_a_real_host_and_attaches_with_provenance`).
 - [x] (2026-10-20 17:10Z) Wrote this ExecPlan.
 - [x] (2026-10-20 17:20Z) Milestone 1: created the crate, moved the JSON core into it, re-exported it from the adapter, repointed the fuzz paths. Workspace tests unchanged (adapter unit tests 171, crate JSON tests 6).
@@ -39,7 +39,7 @@ To see it working: run `cargo test --locked -p muse-msp-client` for the hermetic
 
 ## Decision Log
 
-- Decision: name the crate `muse-msp-client` (library `muse_msp_client`), version 0.1.0, `publish = false`, edition 2024, `rust-version = "1.88"`, like `crates/muse-acp-client`.
+- Decision: name the crate `muse-msp-client` (library `muse_msp_client`), version 0.1.0, `publish = false`, edition 2024, `rust-version = "1.88"`, like `crates/acp-lite`.
   Rationale: the issue proposes the name; matching the sibling crate's manifest keeps CI (MSRV job) and release tooling unchanged.
   Date/Author: 2026-10-20 / Claude
 
@@ -116,7 +116,7 @@ either.
 
 ## Context and Orientation
 
-The repository root is a Cargo workspace. The root package `muse-acp` (manifest `Cargo.toml`) builds one binary from `src/main.rs`; its `[dependencies]` table is empty and must stay free of third-party crates. `crates/muse-acp-client` is an unrelated ACP client SDK that uses `serde`; it is a workspace member listed in the root `[workspace] members`.
+The repository root is a Cargo workspace. The root package `muse-acp` (manifest `Cargo.toml`) builds one binary from `src/main.rs`; its `[dependencies]` table is empty and must stay free of third-party crates. `crates/acp-lite` is an unrelated ACP client SDK that uses `serde`; it is a workspace member listed in the root `[workspace] members`.
 
 Terms used in this plan:
 
@@ -257,3 +257,5 @@ The central methods:
 `muse-acp` gains `muse-msp-client = { path = "crates/muse-msp-client" }` under `[dependencies]`; this adds no third-party code to the binary. In the adapter, `src/msp.rs` re-exports `ExitClassification`, `ExitKind`, `HostFlags`, and `MspEvent`, adds the `ExitMessage` trait (`editor_message`), and keeps `MspHost::launch(user_input_dialogs, user_shell, computer_use, flags: HostFlags)`, `command`, `reap`, `shutdown`, `force_stop`, `mint_cmd`, `logged_out`, `refresh_config`, and `handshake` with their old behavior.
 
 Revision note (2026-10-20, completion): filled in Progress, Surprises, the last three decisions, Outcomes, Artifacts, and the final interface details after implementing and verifying every milestone.
+
+Revision note (2026-10-21): the sibling ACP client crate this plan refers to was renamed from `muse-acp-client` to `acp-lite`; references above use the new name.

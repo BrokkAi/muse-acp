@@ -1,6 +1,6 @@
 //! A small, synchronous client for the Agent Client Protocol.
 //!
-//! `muse-acp-client` owns an ACP stdio agent process, correlates JSON-RPC
+//! `acp-lite` owns an ACP stdio agent process, correlates JSON-RPC
 //! responses, streams notifications, and invokes a [`ClientHandler`] for
 //! requests the agent sends back to the client. It has no async runtime and
 //! does not depend on `muse-acp`.
@@ -8,7 +8,7 @@
 //! # Example
 //!
 //! ```no_run
-//! use muse_acp_client::{
+//! use acp_lite::{
 //!     AgentProcess, Client, ClientHandler, ClientOptions, ContentBlock,
 //!     InitializeRequest, NewSessionRequest, PromptRequest,
 //! };
@@ -18,7 +18,7 @@
 //! let agent = AgentProcess::new("muse-acp");
 //! let client = Client::spawn(
 //!     agent,
-//!     Arc::new(muse_acp_client::DenyAllHandler),
+//!     Arc::new(acp_lite::DenyAllHandler),
 //!     ClientOptions::default(),
 //! )?;
 //!
