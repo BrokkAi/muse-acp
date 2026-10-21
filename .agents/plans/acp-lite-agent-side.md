@@ -32,7 +32,7 @@ The work lands in three pull requests, one per milestone. The behavior of `muse-
 - [x] (2026-10-21 12:35Z) Wrote this plan.
 - [x] (2026-10-21 13:05Z) Milestone 1: `acp_lite::agent` (`crates/acp-lite/src/agent.rs`, with `read_frame` moved to `src/frame.rs`), 10 unit tests, the round-trip test `crates/acp-lite/tests/agent_round_trip.rs`, `examples/echo_agent.rs`, and README docs. PR 1.
 - [x] (2026-10-21 13:17Z) Milestone 2: `StdoutShared` is now `acp_lite::AgentConnection`. The stdin pump is `AgentConnection::stdio`, the loop takes `LoopMsg::Acp(AgentEvent)`, and `acp_message` rebuilds the `J` object `handle_acp` reads. `dispatch_batch` uses `hold`, `acp::send_*` write through the connection, and `shutdown::settle` is `fail_unanswered`. `register_request`/`completed`, the batch capture, `valid_batch_entry`, and `LoopMsg::AcpLine`/`AcpInvalidUtf8`/`AcpEof` are gone. `json::to_value`/`from_value` convert at the boundary. Workspace tests (423 black-box), the live suite (51), TCK v1 (CONFORMANT, 63 passed), and TCK v2 (23/23 mandatory; the same two baseline failures, FORK-201 host bug and advisory STATE-204) all match master. PR 2.
-- [ ] Milestone 3: `muse-acp`'s requests to the client (permission, permission feedback, feedback form, elicitation, device-login form, editor bridge) use the agent connection's correlation, and the chain of `complete_*` id matchers is removed. PR 3.
+- [x] (2026-10-21 13:26Z) Milestone 3: permission, permission-feedback, feedback-form, elicitation, and device-login requests go out with `acp::send_request` (`request_routed_raw` with an `acp::TAG_*` tag). The loop's `AgentEvent::Response` arm passes tagged answers to `complete_client_request`, which calls the one matching `complete_*`. `send_cancel_request` is `cancel_request`. The bridge's `client_request` uses `send_request_raw` with `PendingRequest::wait_timeout`/`cancel`, and its `PENDING`/`REQUEST_IDS`/`complete` are gone. `handle_acp` no longer tries every matcher. Workspace tests (775), the live suite (51), TCK v1 (CONFORMANT), and TCK v2 (23/23 mandatory, same two baseline failures) match master. PR 3.
 
 
 ## Surprises & Discoveries
@@ -92,7 +92,24 @@ The work lands in three pull requests, one per milestone. The behavior of `muse-
 ## Outcomes & Retrospective
 
 
-(To be written at completion.)
+`acp-lite` now has both sides of ACP, and `muse-acp` is its first agent. All of `muse-acp`'s ACP transport now lives in the library:
+
+- framing and bad-frame handling;
+- batches;
+- answering each request once, and failing the rest at shutdown;
+- matching the agent's own requests with the client's answers.
+
+The adapter keeps only Muse logic. Removed from the adapter:
+
+- the stdin pump;
+- the batch capture;
+- the global request registry;
+- six id matchers tried in turn on every answer;
+- the bridge's own pending map.
+
+Each milestone left ACP behavior unchanged, checked by the 423 black-box tests, the 51 live tests, and both TCK versions.
+
+What remains: the flows still mint and check their own state around the library's ids. That is intended: the id check is what ignores answers to superseded forms. The adapter still converts between its `J` values and `serde_json` at the boundary rather than using `serde_json` throughout, which keeps the change mechanical. A later change could move `handle_acp` onto typed requests.
 
 
 ## Context and Orientation
@@ -260,3 +277,5 @@ Each milestone is one PR that leaves everything working. If milestone 2 or 3 reg
 Revision note (2026-10-21): milestone 1 is done. The agent-side types are named `ClientRequest`/`ClientNotification`/`ClientResponse` to avoid the client side's `IncomingRequest`, and answers the connection did not send surface with `tag: None` for milestone 2's sake.
 
 Revision note (2026-10-21, later): milestone 2 is done; progress and two discoveries (exponent normalization, unlimited frame size) recorded.
+
+Revision note (2026-10-21, final): milestone 3 is done, and outcomes are written.

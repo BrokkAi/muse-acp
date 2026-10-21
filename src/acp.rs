@@ -635,19 +635,48 @@ pub fn send_error(stdout: &StdoutShared, id: &Option<J>, code: i64, message: &st
     send_rpc_error(stdout, id, RpcError::new(code, message));
 }
 
+/// The flows that send requests to the client. The connection tags each
+/// request, and the main loop hands the client's answer to the flow's
+/// `complete_*` function, which checks the id against the flow's state.
+pub const TAG_PERMISSION: &str = "permission";
+pub const TAG_PERMISSION_FEEDBACK: &str = "permission-feedback";
+pub const TAG_FEEDBACK: &str = "feedback";
+pub const TAG_ELICITATION: &str = "elicitation";
+pub const TAG_DEVICE_LOGIN: &str = "device-login";
+
+/// Send a request to the client. Its answer comes back to the main loop as an
+/// `AgentEvent::Response` carrying `tag`. Returns the request's id, for the
+/// flow's state and for `send_cancel_request`, or `None` when it could not be
+/// written (the editor is gone, and the shutdown deadline is running).
+pub fn send_request(
+    stdout: &StdoutShared,
+    method: &str,
+    params_json: &str,
+    tag: &str,
+) -> Option<J> {
+    let params = match RawValue::from_string(params_json.to_string()) {
+        Ok(params) => params,
+        Err(error) => {
+            crate::msp::log(&format!("internal: invalid {method} params: {error}"));
+            return None;
+        }
+    };
+    match stdout.request_routed_raw(method, &params, tag) {
+        Ok(id) => Some(crate::json::from_value(id.value())),
+        Err(_) => {
+            crate::shutdown::disconnect();
+            None
+        }
+    }
+}
+
 /// Withdraw a request this adapter sent to the client (a permission prompt
 /// or form). ACP cancels an outgoing request with `$/cancel_request`; a
 /// JSON-RPC error with our own id would be a response to a request the
-/// client never made. The client still answers the original id, and that
-/// late answer is ignored because the id is no longer pending.
+/// client never made. The client may still answer the original id; that late
+/// answer arrives untagged and is ignored.
 pub fn send_cancel_request(stdout: &StdoutShared, request_id: &J) {
-    send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"$/cancel_request\",\"params\":{{\"requestId\":{}}}}}",
-            j_to_string(request_id)
-        ),
-    );
+    written(stdout.cancel_request(&self::request_id(request_id)));
 }
 
 /// Send an ACP error while retaining structured data supplied by MSP.

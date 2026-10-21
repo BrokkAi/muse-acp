@@ -21,13 +21,15 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use acp_lite::AgentError;
+use serde_json::value::RawValue;
+
 use crate::acp::{self, Sessions, StdoutShared};
-use crate::json::{J, esc, j_to_string, mint_id, parse_json};
+use crate::json::{J, esc, j_to_string, parse_json};
 use crate::msp::log;
 
 /// The MCP server name; the model sees `mcp__editor__<tool>`.
@@ -55,9 +57,6 @@ static TERMINAL: AtomicBool = AtomicBool::new(false);
 static SERVER: OnceLock<Option<u16>> = OnceLock::new();
 /// Bearer token to ACP session id; empty until a new session is bound.
 static TOKENS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
-/// Client requests awaiting an answer, by JSON request id.
-static PENDING: LazyLock<Mutex<HashMap<String, mpsc::Sender<J>>>> = LazyLock::new(Default::default);
-static REQUEST_IDS: AtomicU64 = AtomicU64::new(1);
 /// Bumped by `session/cancel`; a call started under an older value stops.
 static CANCELS: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(Default::default);
 /// A running `tools/call`: its token and MCP request id (JSON text).
@@ -217,17 +216,6 @@ pub fn server_entry(port: u16, token: &str) -> String {
         esc(&format!("http://127.0.0.1:{port}{ENDPOINT}")),
         esc(&format!("Bearer {token}"))
     )
-}
-
-/// Route a client response to the editor request waiting for it. True when
-/// the id was one of ours.
-pub fn complete(id: &Option<J>, msg: &J) -> bool {
-    let Some(id) = id else { return false };
-    let Some(waiter) = lock(&PENDING).remove(&j_to_string(id)) else {
-        return false;
-    };
-    let _ = waiter.send(msg.clone());
-    true
 }
 
 /// Stop the session's running editor calls (`session/cancel`).
@@ -872,47 +860,37 @@ fn client_request(
     wait: Wait,
     abort: &dyn Fn() -> bool,
 ) -> Result<J, ClientError> {
-    let id = J::Str(mint_id("editor-", &REQUEST_IDS));
-    let key = j_to_string(&id);
-    let (waiter, answer) = mpsc::channel();
-    lock(&PENDING).insert(key.clone(), waiter);
+    let params = RawValue::from_string(params.to_string()).map_err(|error| {
+        ClientError::Failed(format!("internal: invalid {method} params: {error}"))
+    })?;
     crate::msp::trace_method("acp->client", method);
-    acp::send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{key},\"method\":{},\"params\":{params}}}",
-            esc(method)
-        ),
-    );
+    let mut pending = stdout.send_request_raw(method, &params).map_err(|_| {
+        crate::shutdown::disconnect();
+        ClientError::Failed("the editor did not answer".into())
+    })?;
     let deadline = Instant::now() + wait.timeout;
-    let outcome = loop {
-        match answer.recv_timeout(Duration::from_millis(200)) {
-            Ok(response) => break Ok(response),
-            Err(RecvTimeoutError::Disconnected) => {
-                break Err(ClientError::Failed("the editor did not answer".into()));
-            }
-            Err(RecvTimeoutError::Timeout) if wait.abortable && abort() => {
-                break Err(ClientError::Cancelled);
-            }
-            Err(RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
-                break Err(ClientError::TimedOut);
-            }
-            Err(RecvTimeoutError::Timeout) => {}
+    loop {
+        if let Some(outcome) = pending.wait_timeout(Duration::from_millis(200)) {
+            return match outcome {
+                Ok(result) => Ok(crate::json::from_value(&result)),
+                Err(AgentError::Rpc(error)) if !error.message.is_empty() => {
+                    Err(ClientError::Failed(error.message))
+                }
+                Err(AgentError::Rpc(_)) => Err(ClientError::Failed("request failed".into())),
+                Err(_) => Err(ClientError::Failed("the editor did not answer".into())),
+            };
         }
-    };
-    if lock(&PENDING).remove(&key).is_some() {
-        acp::send_cancel_request(stdout, &id);
+        let stop = if wait.abortable && abort() {
+            ClientError::Cancelled
+        } else if Instant::now() >= deadline {
+            ClientError::TimedOut
+        } else {
+            continue;
+        };
+        // Withdraw it with `$/cancel_request`; a late answer is ignored.
+        let _ = pending.cancel();
+        return Err(stop);
     }
-    let response = outcome?;
-    if let Some(error) = response.get("error") {
-        let message = error
-            .get("message")
-            .and_then(J::as_str)
-            .filter(|m| !m.is_empty())
-            .unwrap_or("request failed");
-        return Err(ClientError::Failed(message.to_string()));
-    }
-    Ok(response.get("result").cloned().unwrap_or(J::Null))
 }
 
 // ---- Tools ----
