@@ -4,13 +4,19 @@
 //! v1 shapes verified live.
 
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::{Arc, Mutex};
+
+use acp_lite::{AgentError, RequestId, RpcError};
+use serde_json::value::RawValue;
 
 use crate::fold::SessionFold;
 use crate::json::{J, esc, j_to_string, parse_json};
 
-pub type StdoutShared = Arc<Mutex<std::io::Stdout>>;
+/// The editor connection. Every ACP frame goes out through `acp-lite`'s
+/// agent side, which writes to stdout, tracks which requests are still
+/// unanswered, and holds batch responses. The name predates that: it was a
+/// shared stdout handle.
+pub type StdoutShared = acp_lite::AgentConnection;
 
 pub struct InFlight {
     pub msp_turn: String,
@@ -571,8 +577,15 @@ pub fn take_turn_usage(s: &mut AcpSession, turn_id: &str) -> Option<TurnUsage> {
 }
 
 pub fn send_raw(stdout: &StdoutShared, line: &str) {
-    let mut out = stdout.lock().unwrap_or_else(|p| p.into_inner());
-    if writeln!(out, "{line}").and_then(|_| out.flush()).is_err() {
+    match RawValue::from_string(line.to_string()) {
+        Ok(frame) => written(stdout.send_raw_frame(&frame)),
+        Err(error) => crate::msp::log(&format!("internal: dropped an invalid ACP frame: {error}")),
+    }
+}
+
+/// A failed write means the editor is gone: start the shutdown deadline.
+fn written(outcome: Result<(), AgentError>) {
+    if outcome.is_err() {
         crate::shutdown::disconnect();
     }
 }
@@ -584,117 +597,42 @@ pub fn id_json(id: &Option<J>) -> String {
     }
 }
 
-/// Responses held back while one ACP v2 batch is dispatched, so the
-/// synchronous answers leave together as one response array. Only responses
-/// to the batch's own request ids are held; a response the adapter settles
-/// later (a prompt that waits on its turn) goes out alone when it is ready.
-struct BatchCapture {
-    ids: std::collections::HashSet<String>,
-    responses: Vec<String>,
-}
-
-static BATCH: Mutex<Option<BatchCapture>> = Mutex::new(None);
-
-/// Start holding responses to `ids` (each request id's JSON text).
-pub fn begin_batch(ids: std::collections::HashSet<String>) {
-    *BATCH.lock().unwrap_or_else(|p| p.into_inner()) = Some(BatchCapture {
-        ids,
-        responses: Vec::new(),
-    });
-}
-
-/// Add a response that belongs in the batch reply but has no request id to
-/// match, such as an invalid entry's `-32600`.
-pub fn batch_error(code: i64, message: &str) {
-    if let Some(batch) = BATCH.lock().unwrap_or_else(|p| p.into_inner()).as_mut() {
-        batch.responses.push(format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{{\"code\":{code},\"message\":{}}}}}",
-            esc(message)
-        ));
-    }
-}
-
-/// Stop holding responses and write the held ones as one array. JSON-RPC
-/// forbids an empty array reply, so a batch that produced no response (only
-/// notifications, or requests still in progress) writes nothing.
-pub fn finish_batch(stdout: &StdoutShared) {
-    let Some(batch) = BATCH.lock().unwrap_or_else(|p| p.into_inner()).take() else {
-        return;
-    };
-    if batch.responses.is_empty() {
-        return;
-    }
-    let mut out = stdout.lock().unwrap_or_else(|p| p.into_inner());
-    if crate::shutdown::expiring() {
-        return;
-    }
-    let line = format!("[{}]", batch.responses.join(","));
-    if writeln!(out, "{line}").and_then(|_| out.flush()).is_ok() {
-        for response in &batch.responses {
-            if let Ok(response) = parse_json(response) {
-                crate::shutdown::completed(&response.get("id").cloned());
-            }
-        }
-    } else {
-        crate::shutdown::disconnect();
-    }
-}
-
-/// Hold `line` for the active batch when it answers one of its requests.
-fn held_by_batch(id: &Option<J>, line: &str) -> bool {
-    let Some(id) = id else {
-        return false;
-    };
-    let mut batch = BATCH.lock().unwrap_or_else(|p| p.into_inner());
-    match batch.as_mut() {
-        Some(batch) if batch.ids.contains(&j_to_string(id)) => {
-            batch.responses.push(line.to_string());
-            true
-        }
-        _ => false,
-    }
-}
-
-fn send_response(stdout: &StdoutShared, id: &Option<J>, line: &str) {
-    if held_by_batch(id, line) {
-        return;
-    }
-    let mut out = stdout.lock().unwrap_or_else(|p| p.into_inner());
-    if crate::shutdown::expiring() {
-        return;
-    }
-    if writeln!(out, "{line}").and_then(|_| out.flush()).is_ok() {
-        crate::shutdown::completed(id);
-    } else {
-        crate::shutdown::disconnect();
-    }
+/// The connection's id for a request id the adapter holds as `J`.
+pub fn request_id(id: &J) -> RequestId {
+    RequestId::new(crate::json::to_value(id))
 }
 
 pub fn send_result(stdout: &StdoutShared, id: &Option<J>, result_json: &str) {
-    if id.is_none() {
+    let Some(id) = id else {
+        return;
+    };
+    if crate::shutdown::expiring() {
         return;
     }
-    send_response(
-        stdout,
-        id,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{}}}",
-            id_json(id),
-            result_json
-        ),
-    );
+    match RawValue::from_string(result_json.to_string()) {
+        Ok(result) => written(stdout.respond_raw(&request_id(id), &result)),
+        Err(error) => {
+            crate::msp::log(&format!("internal: invalid ACP result JSON: {error}"));
+            send_error(
+                stdout,
+                &Some(id.clone()),
+                -32603,
+                "internal error: invalid result",
+            );
+        }
+    }
+}
+
+fn send_rpc_error(stdout: &StdoutShared, id: &Option<J>, error: RpcError) {
+    if crate::shutdown::expiring() {
+        return;
+    }
+    let id = id.as_ref().map(request_id);
+    written(stdout.respond_error(id.as_ref(), error));
 }
 
 pub fn send_error(stdout: &StdoutShared, id: &Option<J>, code: i64, message: &str) {
-    send_response(
-        stdout,
-        id,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":{code},\"message\":{}}}}}",
-            id_json(id),
-            esc(message)
-        ),
-    );
+    send_rpc_error(stdout, id, RpcError::new(code, message));
 }
 
 /// Withdraw a request this adapter sent to the client (a permission prompt
@@ -720,15 +658,12 @@ pub fn send_error_with_data(
     message: &str,
     data_json: &str,
 ) {
-    send_response(
-        stdout,
-        id,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":{code},\"message\":{},\"data\":{data_json}}}}}",
-            id_json(id),
-            esc(message),
-        ),
-    );
+    let mut error = RpcError::new(code, message);
+    match serde_json::from_str(data_json) {
+        Ok(data) => error = error.with_data(data),
+        Err(problem) => crate::msp::log(&format!("internal: invalid ACP error data: {problem}")),
+    }
+    send_rpc_error(stdout, id, error);
 }
 
 /// `usage_update` for both ACP versions (`{used, size}` plus counted-once

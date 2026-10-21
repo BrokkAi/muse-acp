@@ -3,8 +3,7 @@
 The `json` target compiles the production parser and serializer
 (`crates/muse-msp-client/src/json.rs`, shared by the adapter and the MSP
 client crate) directly. Its libFuzzer and serde_json dependencies belong to
-this separate test package; the shipped adapter still has no third-party
-runtime dependencies.
+this separate test package and never reach the shipped adapter.
 
 Install [cargo-fuzz](https://rust-fuzz.github.io/book/cargo-fuzz/setup.html) and
 a nightly toolchain (without changing your default):

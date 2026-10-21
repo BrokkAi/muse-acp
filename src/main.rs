@@ -23,7 +23,6 @@ mod zed;
 
 use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader};
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
 use std::sync::{
@@ -35,6 +34,7 @@ use std::sync::{
 use acp::{
     AcpSession, FileChangeReport, HostTitleFacts, InFlight, PendingPerm, Sessions, StdoutShared,
 };
+use acp_lite::{AgentConnection, AgentEvent, AgentOptions};
 use fold::SessionFold;
 use hosts::{HostKind, HostTag, Hosts};
 use json::{J, esc, j_to_string, mint_id, parse_json};
@@ -1912,9 +1912,8 @@ fn recovery_observation_line(observation: &J) -> String {
 }
 
 enum LoopMsg {
-    AcpLine(String),
-    AcpInvalidUtf8,
-    AcpEof,
+    /// A message from the editor, as `acp-lite`'s agent side read it.
+    Acp(AgentEvent),
     Msp(HostTag, MspEvent),
 }
 
@@ -3988,63 +3987,32 @@ fn main() {
     if let Some(exit_code) = zed::dispatch(&args) {
         shutdown::exit(exit_code);
     }
-    let stdout: StdoutShared = Arc::new(Mutex::new(std::io::stdout()));
-    shutdown::initialize(&stdout);
     let sessions: Sessions = Arc::new(Mutex::new(std::collections::HashMap::new()));
     let lists: SessionLists = Arc::new(Mutex::new(SessionListCache::default()));
     let (tx, rx) = mpsc::channel::<LoopMsg>();
 
-    // ACP stdin pump. EOF ends the adapter: the client is gone, and the
-    // serve host (our child) dies with us.
-    let stdin_tx = tx.clone();
-    std::thread::spawn(move || {
-        let mut reader = BufReader::new(std::io::stdin());
-        let mut frame = Vec::new();
-        loop {
-            frame.clear();
-            match reader.read_until(b'\n', &mut frame) {
-                Ok(0) => {
-                    shutdown::disconnect();
-                    let _ = stdin_tx.send(LoopMsg::AcpEof);
-                    break;
-                }
-                Ok(_) => {
-                    let line = match std::str::from_utf8(&frame) {
-                        Ok(line) => line,
-                        Err(_) => {
-                            if stdin_tx.send(LoopMsg::AcpInvalidUtf8).is_err() {
-                                break;
-                            }
-                            continue;
-                        }
-                    };
-                    if let Ok(frame) = parse_json(line.trim()) {
-                        let messages = match &frame {
-                            J::Arr(entries) => entries.as_slice(),
-                            _ => std::slice::from_ref(&frame),
-                        };
-                        for msg in messages {
-                            shutdown::register_request(msg);
-                            if matches!(
-                                msg.get("method").and_then(J::as_str),
-                                Some("shutdown" | "exit")
-                            ) {
-                                shutdown::disconnect();
-                            }
-                        }
-                    }
-                    if stdin_tx.send(LoopMsg::AcpLine(line.to_string())).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    shutdown::disconnect();
-                    let _ = stdin_tx.send(LoopMsg::AcpEof);
-                    break;
-                }
+    // The ACP reader thread. A `shutdown` or `exit` message, and the end of
+    // input, start the shutdown deadline before the loop sees them, so a loop
+    // stuck on a host command still exits. EOF ends the adapter: the client
+    // is gone, and the serve host (our child) dies with us. The connection
+    // answers frames that are not JSON itself.
+    let acp_tx = tx.clone();
+    let (stdout, _acp_reader) = AgentConnection::stdio(
+        // The adapter never capped a frame: an inline image prompt can be
+        // large.
+        AgentOptions::default().max_frame_bytes(usize::MAX),
+        move |event| {
+            if ends_connection(&event) {
+                shutdown::disconnect();
             }
-        }
+            let _ = acp_tx.send(LoopMsg::Acp(event));
+        },
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("[muse-acp] cannot read ACP from stdin: {error}");
+        shutdown::exit(1)
     });
+    shutdown::initialize(&stdout);
 
     // Defer the MSP launch until ACP initialize has supplied the client
     // capabilities. `userInputDialogs` is fixed for the MSP connection, so
@@ -4093,141 +4061,136 @@ fn main() {
             shutdown::exit(1);
         }
         match msg {
-            LoopMsg::AcpInvalidUtf8 => {
-                acp::send_error(&stdout, &None, -32700, "parse error: invalid UTF-8 frame")
+            LoopMsg::Acp(AgentEvent::Batch(batch)) => {
+                if let Some(reason) = host_unavailable.as_deref() {
+                    dispatch_batch(&stdout, &batch, |msg| {
+                        serve_without_host(&stdout, msg, reason)
+                    });
+                } else if let Some(host) = host.as_ref() {
+                    dispatch_batch(&stdout, &batch, |msg| {
+                        handle_acp(host, &stdout, &sessions, &lists, msg)
+                    });
+                } else {
+                    // Before initialize no ACP version is negotiated, and
+                    // initialize must not travel in a batch.
+                    acp::send_error(
+                        &stdout,
+                        &None,
+                        -32600,
+                        "initialize must be the first ACP request",
+                    );
+                }
             }
-            LoopMsg::AcpLine(line) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
+            LoopMsg::Acp(AgentEvent::Closed { .. }) => {
+                fail_all_with_message(&stdout, &sessions, "editor disconnected");
+                shutdown::settle(&stdout, "editor disconnected");
+                if let Some(host) = host.as_ref() {
+                    host.shutdown();
+                }
+                shutdown::exit(0);
+            }
+            LoopMsg::Acp(event) => {
+                let Some(v) = acp_message(&event) else {
+                    continue;
+                };
+                if let Some(reason) = host_unavailable.as_deref() {
+                    serve_without_host(&stdout, &v, reason);
                     continue;
                 }
-                match parse_json(trimmed) {
-                    Ok(J::Arr(entries)) => {
-                        if let Some(reason) = host_unavailable.as_deref() {
-                            dispatch_batch(&stdout, &entries, |msg| {
-                                serve_without_host(&stdout, msg, reason)
-                            });
-                        } else if let Some(host) = host.as_ref() {
-                            dispatch_batch(&stdout, &entries, |msg| {
-                                handle_acp(host, &stdout, &sessions, &lists, msg)
-                            });
-                        } else {
-                            // Before initialize no ACP version is negotiated,
-                            // and initialize must not travel in a batch.
-                            acp::send_error(
-                                &stdout,
-                                &None,
-                                -32600,
-                                "initialize must be the first ACP request",
-                            );
-                        }
+                if host.is_none() {
+                    let is_initialize =
+                        v.get("method").and_then(|m| m.as_str()) == Some("initialize");
+                    if !is_initialize {
+                        let id = v.get("id").cloned();
+                        acp::send_error(
+                            &stdout,
+                            &id,
+                            -32600,
+                            "initialize must be the first ACP request",
+                        );
+                        continue;
                     }
-                    Ok(v) => {
-                        if let Some(reason) = host_unavailable.as_deref() {
-                            serve_without_host(&stdout, &v, reason);
+                    let user_input_dialogs = match negotiate_acp(&v) {
+                        Ok(form) => form,
+                        Err(error) => {
+                            send_acp_initialize_error(&stdout, &v.get("id").cloned(), error);
                             continue;
                         }
-                        if host.is_none() {
-                            let is_initialize =
-                                v.get("method").and_then(|m| m.as_str()) == Some("initialize");
-                            if !is_initialize {
-                                let id = v.get("id").cloned();
-                                acp::send_error(
-                                    &stdout,
-                                    &id,
-                                    -32600,
-                                    "initialize must be the first ACP request",
-                                );
-                                continue;
-                            }
-                            let user_input_dialogs = match negotiate_acp(&v) {
-                                Ok(form) => form,
-                                Err(error) => {
-                                    send_acp_initialize_error(
-                                        &stdout,
-                                        &v.get("id").cloned(),
-                                        error,
-                                    );
-                                    continue;
+                    };
+                    let forward_tx = tx.clone();
+                    let forward: hosts::Forward = Box::new(move |tag, events| {
+                        let tx = forward_tx.clone();
+                        std::thread::spawn(move || {
+                            for ev in events {
+                                if tx.send(LoopMsg::Msp(tag, ev)).is_err() {
+                                    break;
                                 }
-                            };
-                            let forward_tx = tx.clone();
-                            let forward: hosts::Forward = Box::new(move |tag, events| {
-                                let tx = forward_tx.clone();
-                                std::thread::spawn(move || {
-                                    for ev in events {
-                                        if tx.send(LoopMsg::Msp(tag, ev)).is_err() {
-                                            break;
-                                        }
-                                    }
-                                });
-                            });
-                            let new_host = match Hosts::launch(
-                                user_input_dialogs,
-                                USER_SHELL.load(Ordering::SeqCst) == 1,
-                                COMPUTER_USE.load(Ordering::SeqCst) == 1,
-                                forward,
-                            ) {
-                                Ok(h) => h,
-                                Err(e) => {
-                                    // Still complete the handshake: clients (and
-                                    // the ACP registry check) need the advertised
-                                    // auth methods even where Muse cannot start,
-                                    // and a request error explains more than a
-                                    // dead agent.
-                                    if let LaunchError::HostExit(exit) = &e {
-                                        for line in exit.support_lines("serve-exit") {
-                                            log(&line);
-                                        }
-                                    }
-                                    eprintln!("[muse-acp] host unavailable: {e}");
-                                    if matches!(e, LaunchError::NotInstalled(_)) {
-                                        MUSE_NOT_INSTALLED.store(true, Ordering::SeqCst);
-                                    }
-                                    let reason = e.to_string();
-                                    serve_without_host(&stdout, &v, &reason);
-                                    host_unavailable = Some(reason);
-                                    continue;
-                                }
-                            };
-                            let hi = new_host.handshake();
-                            log(&format!(
-                                "host-ready server={} schema_version={} fingerprint={} status={} detail={}",
-                                hi.host_label(),
-                                hi.schema_version
-                                    .map(|v| v.to_string())
-                                    .unwrap_or_else(|| "absent".into()),
-                                hi.fingerprint,
-                                hi.status,
-                                hi.detail
-                            ));
-                            log(&hi.features_line());
-                            log(&hi.sandbox_line());
-                            if let Some(warning) = hi.sandbox_warning() {
-                                log(&warning);
                             }
-                            log(if hi.session_mcp {
-                                "client MCP servers: forwarded to Muse (sessionMcp granted)"
-                            } else {
-                                "client MCP servers: dropped (this Muse host did not grant sessionMcp)"
-                            });
-                            log(&format!(
-                                "session rename: granted={} available={}",
-                                hi.session_rename,
-                                hi.allows_session_rename()
-                            ));
-                            host = Some(new_host);
+                        });
+                    });
+                    let new_host = match Hosts::launch(
+                        user_input_dialogs,
+                        USER_SHELL.load(Ordering::SeqCst) == 1,
+                        COMPUTER_USE.load(Ordering::SeqCst) == 1,
+                        forward,
+                    ) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            // Still complete the handshake: clients (and
+                            // the ACP registry check) need the advertised
+                            // auth methods even where Muse cannot start,
+                            // and a request error explains more than a
+                            // dead agent.
+                            if let LaunchError::HostExit(exit) = &e {
+                                for line in exit.support_lines("serve-exit") {
+                                    log(&line);
+                                }
+                            }
+                            eprintln!("[muse-acp] host unavailable: {e}");
+                            if matches!(e, LaunchError::NotInstalled(_)) {
+                                MUSE_NOT_INSTALLED.store(true, Ordering::SeqCst);
+                            }
+                            let reason = e.to_string();
+                            serve_without_host(&stdout, &v, &reason);
+                            host_unavailable = Some(reason);
+                            continue;
                         }
-                        handle_acp(
-                            host.as_ref().expect("MSP host initialized"),
-                            &stdout,
-                            &sessions,
-                            &lists,
-                            &v,
-                        );
+                    };
+                    let hi = new_host.handshake();
+                    log(&format!(
+                        "host-ready server={} schema_version={} fingerprint={} status={} detail={}",
+                        hi.host_label(),
+                        hi.schema_version
+                            .map(|v| v.to_string())
+                            .unwrap_or_else(|| "absent".into()),
+                        hi.fingerprint,
+                        hi.status,
+                        hi.detail
+                    ));
+                    log(&hi.features_line());
+                    log(&hi.sandbox_line());
+                    if let Some(warning) = hi.sandbox_warning() {
+                        log(&warning);
                     }
-                    Err(e) => acp::send_error(&stdout, &None, -32700, &format!("parse error: {e}")),
+                    log(if hi.session_mcp {
+                        "client MCP servers: forwarded to Muse (sessionMcp granted)"
+                    } else {
+                        "client MCP servers: dropped (this Muse host did not grant sessionMcp)"
+                    });
+                    log(&format!(
+                        "session rename: granted={} available={}",
+                        hi.session_rename,
+                        hi.allows_session_rename()
+                    ));
+                    host = Some(new_host);
                 }
+                handle_acp(
+                    host.as_ref().expect("MSP host initialized"),
+                    &stdout,
+                    &sessions,
+                    &lists,
+                    &v,
+                );
             }
             LoopMsg::Msp(tag, MspEvent::Notification { method, params }) => {
                 if let Some(active_host) = host.as_ref()
@@ -4266,14 +4229,6 @@ fn main() {
                         _ => log(&format!("internal: unhandled known MSP request: {method}")),
                     }
                 }
-            }
-            LoopMsg::AcpEof => {
-                fail_all_with_message(&stdout, &sessions, "editor disconnected");
-                shutdown::settle(&stdout, "editor disconnected");
-                if let Some(host) = host.as_ref() {
-                    host.shutdown();
-                }
-                shutdown::exit(0);
             }
             LoopMsg::Msp(tag, MspEvent::Closed { reason: why }) => {
                 let Some(hosts) = host.as_ref().cloned() else {
@@ -4433,17 +4388,54 @@ fn main() {
 /// Whether a batch entry is a JSON-RPC message the adapter can dispatch: a
 /// request or notification (a string `method`), or a client response to one
 /// of the adapter's own requests.
-fn valid_batch_entry(entry: &J) -> bool {
-    if !matches!(entry, J::Obj(_)) {
-        return false;
+/// Whether `event` ends the editor connection: the end of input, or a
+/// `shutdown`/`exit` message, alone or in a batch.
+fn ends_connection(event: &AgentEvent) -> bool {
+    match event {
+        AgentEvent::Closed { .. } => true,
+        AgentEvent::Request(request) => matches!(request.method.as_str(), "shutdown" | "exit"),
+        AgentEvent::Notification(note) => matches!(note.method.as_str(), "shutdown" | "exit"),
+        AgentEvent::Batch(batch) => batch.entries.iter().any(ends_connection),
+        _ => false,
     }
-    match entry.get("method") {
-        Some(method) => method.as_str().is_some(),
-        None => {
-            entry.get("id").is_some()
-                && (entry.get("result").is_some() || entry.get("error").is_some())
+}
+
+/// An editor message as the `J` object `handle_acp` reads: `id`, `method`,
+/// and `params` for requests and notifications, `id` and `result` or `error`
+/// for the client's answers. A value that is not a message stays as it was.
+fn acp_message(event: &AgentEvent) -> Option<J> {
+    let mut fields = vec![("jsonrpc".to_string(), J::Str("2.0".to_string()))];
+    let (id, method, params) = match event {
+        AgentEvent::Request(request) => (
+            Some(request.id.value()),
+            Some(&request.method),
+            &request.params,
+        ),
+        AgentEvent::Notification(note) => (None, Some(&note.method), &note.params),
+        AgentEvent::Response(response) => {
+            fields.push(("id".to_string(), json::from_value(response.id.value())));
+            match &response.outcome {
+                Ok(result) => fields.push(("result".to_string(), json::from_value(result))),
+                Err(error) => fields.push((
+                    "error".to_string(),
+                    json::from_value(&serde_json::to_value(error).ok()?),
+                )),
+            }
+            return Some(J::Obj(fields));
         }
+        AgentEvent::Invalid(value) => return Some(json::from_value(value)),
+        _ => return None,
+    };
+    if let Some(id) = id {
+        fields.push(("id".to_string(), json::from_value(id)));
     }
+    if let Some(method) = method {
+        fields.push(("method".to_string(), J::Str(method.clone())));
+    }
+    if !params.is_null() {
+        fields.push(("params".to_string(), json::from_value(params)));
+    }
+    Some(J::Obj(fields))
 }
 
 /// Dispatch one ACP v2 JSON-RPC batch. Each valid entry runs as if it had
@@ -4453,11 +4445,7 @@ fn valid_batch_entry(entry: &J) -> bool {
 /// (only notifications or client responses) gets no reply. Stable ACP v1
 /// frames one message per line and has no batches, so a v1 batch is refused
 /// as a whole instead of being dropped without a word.
-fn dispatch_batch(stdout: &StdoutShared, entries: &[J], mut dispatch: impl FnMut(&J)) {
-    if entries.is_empty() {
-        acp::send_error(stdout, &None, -32600, "invalid request: empty batch");
-        return;
-    }
+fn dispatch_batch(stdout: &StdoutShared, batch: &acp_lite::Batch, mut dispatch: impl FnMut(&J)) {
     if negotiated_ver() != 2 {
         acp::send_error(
             stdout,
@@ -4467,24 +4455,15 @@ fn dispatch_batch(stdout: &StdoutShared, entries: &[J], mut dispatch: impl FnMut
         );
         return;
     }
-    let requests = entries
-        .iter()
-        .filter(|entry| valid_batch_entry(entry) && entry.get("method").is_some())
-        .filter_map(|entry| entry.get("id"))
-        .map(j_to_string)
-        .collect();
-    acp::begin_batch(requests);
-    for entry in entries {
-        if valid_batch_entry(entry) {
-            dispatch(entry);
-        } else {
-            acp::batch_error(
-                -32600,
-                "invalid request: batch entry is not a JSON-RPC message",
-            );
+    let held = stdout.hold(batch);
+    for entry in &batch.entries {
+        if let Some(message) = acp_message(entry) {
+            dispatch(&message);
         }
     }
-    acp::finish_batch(stdout);
+    if held.finish().is_err() {
+        shutdown::disconnect();
+    }
 }
 
 /// The catalog's default model, but only when the client asked for AIR
@@ -11141,7 +11120,7 @@ fn drill_down_subagent_child(
     // updates and the session/prompt result. A blocking read here hung whole
     // turns (#1007).
     let host = Arc::clone(host);
-    let stdout = Arc::clone(stdout);
+    let stdout = stdout.clone();
     let sessions = Arc::clone(sessions);
     let acp_sid = acp_sid.to_string();
     let child = child.to_string();

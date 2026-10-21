@@ -1,8 +1,6 @@
 //! Connection-wide escape hatch for shutdown, including a blocked ACP loop.
 //! Normal cleanup runs first. The deadline thread never waits on I/O or locks;
 //! terminal responses and diagnostics get a short, best-effort drain window.
-use std::collections::HashMap;
-use std::io::Write;
 use std::sync::{
     Arc, Mutex, OnceLock, Weak,
     atomic::{AtomicBool, Ordering},
@@ -10,14 +8,9 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use crate::{
-    acp::StdoutShared,
-    json::{J, esc, j_to_string},
-    msp::MspHost,
-};
+use crate::{acp::StdoutShared, msp::MspHost};
 
 static OUTPUT: OnceLock<StdoutShared> = OnceLock::new();
-static REQUESTS: OnceLock<Mutex<HashMap<String, J>>> = OnceLock::new();
 static HOSTS: OnceLock<Mutex<Vec<Weak<MspHost>>>> = OnceLock::new();
 static DISCONNECTED: AtomicBool = AtomicBool::new(false);
 static EXPIRING: AtomicBool = AtomicBool::new(false);
@@ -38,29 +31,6 @@ pub fn register_host(host: &Arc<MspHost>) {
     drop(hosts);
     if expiring() {
         host.force_stop();
-    }
-}
-
-pub fn register_request(msg: &J) {
-    if msg.get("method").and_then(J::as_str).is_some()
-        && let Some(id) = msg.get("id")
-    {
-        REQUESTS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(j_to_string(id), id.clone());
-    }
-}
-
-pub fn completed(id: &Option<J>) {
-    if let Some(id) = id
-        && let Some(requests) = REQUESTS.get()
-    {
-        requests
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(&j_to_string(id));
     }
 }
 
@@ -116,8 +86,12 @@ pub fn disconnect() {
     }
 }
 
-/// Settle requests the main loop has not handled yet as well as active prompts.
-/// Callers must keep a deadline armed: even a diagnostic pipe can be blocked.
+/// Settle requests the main loop has not handled yet as well as active prompts:
+/// the connection answers every request that has no response yet with an
+/// error, then takes no more writes. A held batch is sent first, so a
+/// `shutdown` dispatched inside a batch does not strand its siblings'
+/// answers. Callers must keep a deadline armed: even a diagnostic pipe can
+/// be blocked.
 pub fn settle(stdout: &StdoutShared, message: &str) {
     let _deadline = deadline("pending request settlement");
     let message = if expiring() {
@@ -125,28 +99,7 @@ pub fn settle(stdout: &StdoutShared, message: &str) {
     } else {
         message
     };
-    // A `shutdown` dispatched inside a batch must not strand the answers its
-    // siblings already produced.
-    crate::acp::finish_batch(stdout);
-    let mut out = stdout.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(requests) = REQUESTS.get() else {
-        return;
-    };
-    let pending: Vec<_> = requests
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .drain()
-        .map(|(_, id)| id)
-        .collect();
-    for id in pending {
-        let _ = writeln!(
-            out,
-            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"error\":{{\"code\":-32603,\"message\":{}}}}}",
-            j_to_string(&id),
-            esc(message)
-        );
-    }
-    let _ = out.flush();
+    stdout.fail_unanswered(-32603, message);
 }
 
 fn expire(context: &'static str) -> ! {

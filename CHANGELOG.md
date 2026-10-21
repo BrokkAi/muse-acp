@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- `muse-acp` now reads and writes ACP through `acp-lite`'s agent side. The
+  stdin reader, line framing, JSON-RPC batch handling, the request registry
+  that fails unanswered requests at shutdown, and the response writers moved
+  to the library. ACP behavior is unchanged: the full black-box suite, the
+  live loopback suite, and the ACP TCK give the same results. The binary now
+  depends on `serde_json`, plus `acp-lite`'s own `serde`. Parse-error messages
+  for frames that are not JSON now carry serde_json's wording.
+
 - Give `acp-lite` an agent side. `AgentConnection` reads a client's requests
   on one thread and writes from any thread. It answers each request exactly
   once, answers JSON-RPC batches together, rejects frames that are not JSON

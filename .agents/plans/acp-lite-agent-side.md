@@ -31,7 +31,7 @@ The work lands in three pull requests, one per milestone. The behavior of `muse-
 - [x] (2026-10-21 12:25Z) Read the current transport (`main` stdin pump and loop, `dispatch_batch`, `acp::send_*`, the batch capture, `shutdown::register_request`/`completed`/`settle`) and the `acp-lite` client core (`client.rs` reader and writer threads, the pending map, `read_frame`).
 - [x] (2026-10-21 12:35Z) Wrote this plan.
 - [x] (2026-10-21 13:05Z) Milestone 1: `acp_lite::agent` (`crates/acp-lite/src/agent.rs`, with `read_frame` moved to `src/frame.rs`), 10 unit tests, the round-trip test `crates/acp-lite/tests/agent_round_trip.rs`, `examples/echo_agent.rs`, and README docs. PR 1.
-- [ ] Milestone 2: `muse-acp` reads and writes ACP through `acp_lite::agent`. That replaces the stdin pump, framing, batches, the `acp::send_*` write path, and the shutdown request registry. `serde`/`serde_json` become dependencies of the binary. PR 2.
+- [x] (2026-10-21 13:17Z) Milestone 2: `StdoutShared` is now `acp_lite::AgentConnection`. The stdin pump is `AgentConnection::stdio`, the loop takes `LoopMsg::Acp(AgentEvent)`, and `acp_message` rebuilds the `J` object `handle_acp` reads. `dispatch_batch` uses `hold`, `acp::send_*` write through the connection, and `shutdown::settle` is `fail_unanswered`. `register_request`/`completed`, the batch capture, `valid_batch_entry`, and `LoopMsg::AcpLine`/`AcpInvalidUtf8`/`AcpEof` are gone. `json::to_value`/`from_value` convert at the boundary. Workspace tests (423 black-box), the live suite (51), TCK v1 (CONFORMANT, 63 passed), and TCK v2 (23/23 mandatory; the same two baseline failures, FORK-201 host bug and advisory STATE-204) all match master. PR 2.
 - [ ] Milestone 3: `muse-acp`'s requests to the client (permission, permission feedback, feedback form, elicitation, device-login form, editor bridge) use the agent connection's correlation, and the chain of `complete_*` id matchers is removed. PR 3.
 
 
@@ -40,6 +40,11 @@ The work lands in three pull requests, one per milestone. The behavior of `muse-
 
 - Observation: `acp-lite` already exported `IncomingRequest` for requests an agent sends to a client, so the agent side names its types from the agent's point of view: `ClientRequest`, `ClientNotification`, `ClientResponse`.
   Evidence: `crates/acp-lite/src/handler.rs` `pub struct IncomingRequest`.
+
+- Observation: with `arbitrary_precision`, `serde_json` keeps a number's digits but normalizes exponent notation (`1e400` becomes `1e+400`). Ids round-trip consistently because both sides of the connection compute an id's key from the same `serde_json` value; the doc comment on `json::to_value` says so.
+  Evidence: the conversion unit test first failed with `1e+400` versus `1e400`.
+
+- Observation: the old stdin pump read frames of any size. The connection is given `max_frame_bytes(usize::MAX)` to keep that, because inline base64 images in a prompt can be large.
 
 - Observation: `muse-acp` will still write some requests to the client as raw text until milestone 3, so answers the connection did not send must reach the application. They arrive as `AgentEvent::Response` with `tag: None`, and so do late answers to withdrawn requests, instead of being dropped.
 
@@ -253,3 +258,5 @@ Each milestone is one PR that leaves everything working. If milestone 2 or 3 reg
     }
 
 Revision note (2026-10-21): milestone 1 is done. The agent-side types are named `ClientRequest`/`ClientNotification`/`ClientResponse` to avoid the client side's `IncomingRequest`, and answers the connection did not send surface with `tag: None` for milestone 2's sake.
+
+Revision note (2026-10-21, later): milestone 2 is done; progress and two discoveries (exponent normalization, unlimited frame size) recorded.

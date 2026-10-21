@@ -1,5 +1,5 @@
-//! Unprivileged Windows links for the settings view, declared here so the
-//! crate keeps zero dependencies.
+//! Unprivileged Windows links for the settings view, declared here instead
+//! of pulling in a Windows bindings crate.
 //!
 //! Symbolic links need Developer Mode or elevation. Folders are linked with
 //! directory junctions, which need neither. Files use symbolic links when
