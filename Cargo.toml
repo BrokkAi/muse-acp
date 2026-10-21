@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "muse-acp"
-version = "0.16.0"
+version = "0.17.0"
 edition = "2024"
 rust-version = "1.88"
 description = "Rust ACP-to-MSP adapter for using Muse Code in Zed and JetBrains IDEs"
@@ -21,4 +21,3 @@ muse-msp-client = { path = "crates/muse-msp-client" }
 # order.
 acp-lite = { path = "crates/acp-lite" }
 serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order", "raw_value"] }
-

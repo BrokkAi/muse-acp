@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.17.0
 
 - Send the adapter's own requests to the editor through `acp-lite`'s request
   tracking. Permission prompts, rejection-guidance and feedback forms,
