@@ -455,7 +455,8 @@ the terminal to `muse login`. The ACP Registry requires an `agent` or
 start, so registry validation and editors without Muse get the auth method
 and a per-request diagnostic instead of a dead agent. The adapter already
 negotiates `experimentalApi` for `account/read`, and uses `account/logout`
-for ACP logout (#303) and the device-code branch of `account/loginStart` for
+for ACP logout (#303), with the same cleanup available without a client as
+`muse-acp logout`, and the device-code branch of `account/loginStart` for
 an in-protocol `agent` method, `muse-device-login`, offered only to clients
 that advertise `elicitation.url` (#315): the verification page reaches the
 client as a request-scoped URL elicitation, `account/loginCompleted` closes it

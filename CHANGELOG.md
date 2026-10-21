@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Add `muse-acp logout`, which runs `muse logout` in the terminal and
+  reports its exit status, for the same OS user the adapter runs as, so
+  clearing the stored Muse login no longer needs an ACP client or knowledge
+  of Muse's CLI. Muse owns the credential, and the adapter only hands over
+  the terminal.
+
 - Run commands in ACP v1 editor terminals (#311). When the client
   advertises `terminal`, the adapter's `editor` MCP server adds
   `run_in_terminal`, which runs the command line in an editor terminal
