@@ -870,6 +870,12 @@ logout fails and says so instead of pretending. `auth/login` answers
 `-32602`: `muse-login` is a terminal method, which clients run in a terminal
 rather than through `auth/login`.
 
+To clear the login without an ACP client, `muse-acp logout` runs `muse logout`
+in your terminal and reports its exit status, for the same OS user the adapter
+runs as; `npx --yes @brokkai/muse-acp logout` does the same through the npm
+launcher. A `META_API_KEY` in the agent's environment still outranks the stored
+login, so unset it to end that access.
+
 Run the login **where the adapter runs, as the same OS user**. For SSH,
 containers, remote IDE backends, or a different OS account, a login on your
 desktop does not help; log in on the remote host. The adapter never opens a

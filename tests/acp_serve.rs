@@ -12698,6 +12698,106 @@ fn login_subcommand_hands_the_terminal_to_muse_login() {
     assert_eq!(out.status.code(), Some(2), "{out:?}");
 }
 
+#[cfg(unix)]
+#[test]
+fn logout_subcommand_hands_the_terminal_to_muse_logout() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = std::env::temp_dir().join(format!("acp-logout-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("tmpdir");
+    // One args file per script, so a leftover from an earlier run cannot make
+    // the later "which argv did Muse receive" assertions pass on their own.
+    let write = |name: &str, status: u8| {
+        let script = dir.join(name);
+        let args_file = dir.join(format!("{name}-args"));
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s' \"$*\" > '{}'\nexit {status}\n",
+                args_file.display()
+            ),
+        )
+        .expect("fake muse");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (script, args_file)
+    };
+    let (failing, failing_args) = write("muse-fail", 3);
+    let (succeeding, succeeding_args) = write("muse-ok", 0);
+
+    let out = Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
+        .arg("logout")
+        .env("MUSE_CLI", &failing)
+        .output()
+        .expect("logout");
+    assert_eq!(out.status.code(), Some(3), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(&failing_args).expect("args"),
+        "logout"
+    );
+
+    let out = Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
+        .arg("logout")
+        .env("MUSE_CLI", &succeeding)
+        .output()
+        .expect("logout");
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert_eq!(
+        std::fs::read_to_string(&succeeding_args).expect("args"),
+        "logout"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Muse logout complete"), "{stderr}");
+
+    let out = Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
+        .arg("logout")
+        .env("MUSE_CLI", "/nonexistent-muse")
+        .output()
+        .expect("logout");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(stderr.contains("Muse CLI not found"), "{stderr}");
+
+    // Without Muse anywhere, logout reports the spawn error and stops; it must
+    // not offer Muse's installer the way `muse-acp login` does.
+    let bare = dir.join("empty");
+    std::fs::create_dir_all(&bare).expect("tmpdir");
+    let out = Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
+        .arg("logout")
+        .env_remove("MUSE_CLI")
+        .env_remove("MUSE_INSTALL_DIR")
+        .env("PATH", &bare)
+        .env("HOME", &bare)
+        .env("LOCALAPPDATA", &bare)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .expect("logout");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(stderr.contains("Muse CLI not found"), "{stderr}");
+    assert!(
+        !stderr.contains("Install Muse Code now?"),
+        "logout must not offer to install Muse: {stderr}"
+    );
+
+    let out = Command::new(adapter_bin())
+        .env("XDG_STATE_HOME", fresh_state_dir())
+        .args(["logout", "extra"])
+        .output()
+        .expect("logout");
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("unexpected argument: extra"), "{stderr}");
+    assert!(
+        stderr.contains("run `muse logout` and clear the stored Muse login"),
+        "usage must list logout: {stderr}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn login_offers_to_install_missing_muse_and_declines_without_an_answer() {
     // No Muse on PATH or in the installer's default location.
@@ -13992,7 +14092,7 @@ fn declining_the_login_page_cancels_the_device_login() {
 fn logout_fails_closed_when_a_credential_remains() {
     for (scenario, needle) in [
         ("account_env_key", "META_API_KEY"),
-        ("account_logged_in", "muse logout"),
+        ("account_logged_in", "run `muse-acp logout`"),
     ] {
         let mut c = Client::spawn(scenario, &[]);
         c.initialize(2, r#","capabilities":{"auth":{"terminal":{}}}"#);

@@ -2218,8 +2218,8 @@ fn logout(host: &Arc<Hosts>, stdout: &StdoutShared, id: &Option<J>) {
                     .and_then(J::as_str)
                     == Some("experimentalRequired");
             let message = if unavailable {
-                "this Muse build cannot log out over its protocol; run `muse logout` where \
-                 muse-acp runs, then restart the agent"
+                "this Muse build cannot log out over its protocol; run `muse-acp logout` on the \
+                 machine and OS account running muse-acp, then restart the agent"
                     .to_string()
             } else {
                 format!("Muse could not log out: {}", err_message(&error))
@@ -2261,8 +2261,8 @@ fn logout(host: &Arc<Hosts>, stdout: &StdoutShared, id: &Option<J>) {
             id,
             -32603,
             &format!(
-                "Muse still reports a credential in effect ({}); run `muse logout` where muse-acp \
-                 runs",
+                "Muse still reports a credential in effect ({}); run `muse-acp logout` on the \
+                 machine and OS account running muse-acp",
                 if lane.is_empty() { "unknown" } else { lane }
             ),
         );
@@ -3053,6 +3053,30 @@ fn login() -> i32 {
                 } else {
                     ""
                 }
+            );
+            0
+        }
+        Ok(status) => status.code().filter(|code| *code != 0).unwrap_or(1),
+        Err(e) => {
+            eprintln!("[muse-acp] {}", msp::describe_spawn_error(&bin, &e));
+            1
+        }
+    }
+}
+
+/// `muse-acp logout`: clear Muse's stored login from the terminal, for the
+/// same OS user the adapter runs as. Muse owns the credential, so the adapter
+/// only hands its terminal to the configured `muse logout` and reports that
+/// exit status. It never offers Muse's installer: installing cannot remove a
+/// credential, and a missing Muse already reports the spawn error.
+fn logout_subcommand() -> i32 {
+    let bin = msp::muse_cli();
+    eprintln!("[muse-acp] running `{bin} logout`");
+    match std::process::Command::new(&bin).arg("logout").status() {
+        Ok(status) if status.success() => {
+            eprintln!(
+                "[muse-acp] Muse logout complete; run `muse-acp login` before starting a \
+                 new session, and restart the agent if it still reports a login."
             );
             0
         }
@@ -3958,6 +3982,9 @@ fn main() {
     }
     if args.as_slice() == ["login"] {
         shutdown::exit(login());
+    }
+    if args.as_slice() == ["logout"] {
+        shutdown::exit(logout_subcommand());
     }
     if let Some(exit_code) = zed::dispatch(&args) {
         shutdown::exit(exit_code);
