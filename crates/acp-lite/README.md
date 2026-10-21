@@ -1,10 +1,16 @@
 # acp-lite
 
-`acp-lite` is a synchronous Rust client for the
-[Agent Client Protocol](https://agentclientprotocol.com/) (ACP). It launches
-or connects to an ACP stdio agent, performs the v1 or v2 handshake, correlates
-JSON-RPC requests, streams session updates, and routes requests from the agent
-back to the client.
+`acp-lite` is a synchronous Rust library for both sides of the
+[Agent Client Protocol](https://agentclientprotocol.com/) (ACP).
+
+- **Client side** (`Client`): launch or connect to an ACP stdio agent, perform
+  the v1 or v2 handshake, correlate JSON-RPC requests, stream session updates,
+  and route the agent's requests back to a handler.
+- **Agent side** (`AgentConnection`, or `serve` for simple agents): read a
+  client's requests, answer each exactly once, answer JSON-RPC batches
+  together, stream notifications, ask the client for permissions, forms,
+  files, or terminals, and fail whatever is unanswered at shutdown. See
+  [Agent side](#agent-side).
 
 The crate is independent of the `muse-acp` binary and of
 `agent-client-protocol`. It uses background threads instead of an async
@@ -115,6 +121,87 @@ Requests use monotonic numeric IDs and a per-request deadline. A late response
 after a timeout is ignored. Agent cancellation through `$/cancel_request`
 settles the matching local request as `RequestCancelled`. EOF fails every
 pending request and publishes `ClientEvent::Closed`.
+
+## Agent side
+
+An agent reads the client's messages on one reader thread and writes from any
+thread. The smallest agent implements `AgentHandler` and calls `serve_stdio`;
+[`examples/echo_agent.rs`](examples/echo_agent.rs) is a complete one that
+streams each prompt back:
+
+```rust
+use acp_lite::{AgentConnection, AgentHandler, AgentOptions, ClientRequest, RpcError, serve_stdio};
+use serde_json::{Value, json};
+
+struct Echo;
+
+impl AgentHandler for Echo {
+    fn handle_request(&mut self, connection: &AgentConnection, request: ClientRequest)
+        -> Result<Value, RpcError> {
+        match request.method.as_str() {
+            "initialize" => Ok(json!({"protocolVersion": 1, "agentCapabilities": {}, "authMethods": []})),
+            "session/new" => Ok(json!({"sessionId": "s1"})),
+            "session/prompt" => {
+                connection.notify("session/update", json!({"sessionId": "s1", "update": {
+                    "sessionUpdate": "agent_message_chunk",
+                    "content": {"type": "text", "text": "hello"},
+                }})).map_err(|e| RpcError::new(-32603, e.to_string()))?;
+                Ok(json!({"stopReason": "end_turn"}))
+            }
+            other => Err(RpcError::new(-32601, format!("method not found: {other}"))),
+        }
+    }
+}
+
+fn main() -> std::io::Result<()> {
+    serve_stdio(AgentOptions::default(), Echo)
+}
+```
+
+`serve` handles one message at a time. An agent that must stay responsive
+during a long prompt, for example to handle `session/cancel`, drives the
+connection itself:
+
+```rust
+use acp_lite::{AgentConnection, AgentEvent, AgentOptions};
+
+let (connection, _reader) = AgentConnection::stdio(AgentOptions::default(), move |event| {
+    // Runs on the reader thread, in arrival order. Forward the event to your
+    // own loop, for example through a channel.
+    let _ = event;
+})?;
+```
+
+What the connection does for you:
+
+- **Requests are answered once.** Each `AgentEvent::Request` stays unanswered
+  until `respond` or `respond_error` writes its id. `unanswered()` lists the
+  rest, and `fail_unanswered(code, message)` answers them all and then refuses
+  further writes. Use it at shutdown, so the client never waits forever.
+- **Batches are answered together.** A JSON-RPC array (used by ACP v2)
+  arrives as one `AgentEvent::Batch`. `hold(&batch)` buffers the responses to
+  its requests, plus a `-32600` for each invalid entry, and sends them as one
+  array when the guard is finished or dropped. Whether batches are allowed on
+  the negotiated version is your choice.
+- **Bad frames don't stop the agent.** Invalid JSON and invalid UTF-8 get a
+  `-32700` with `id: null`, an empty array gets `-32600`, and reading goes on.
+  Other non-messages arrive as `AgentEvent::Invalid`.
+- **Requests to the client are matched with their answers.**
+  `send_request(method, params)` returns a `PendingRequest` to `wait`,
+  `wait_timeout` (in a loop that also checks for cancellation), or `cancel`.
+  `request` waits up to `AgentOptions::request_timeout` and withdraws the
+  request if it runs out. `request_routed(method, params, tag)` delivers the
+  answer later as `AgentEvent::Response` carrying your tag, which suits an
+  agent whose own event loop handles the answer. `cancel_request(id)` withdraws
+  either kind with ACP's `$/cancel_request`, and a late answer arrives as an
+  untagged `AgentEvent::Response`.
+- **Text in, text out.** `respond_raw`, `notify_raw`, `send_request_raw`, and
+  `send_raw_frame` take `serde_json::value::RawValue` for agents that already
+  build JSON as text. It is checked once, and never re-parsed into a tree.
+
+Writes are synchronous under one lock, so a client that stops reading blocks
+the writer, as a pipe would. A failed write refuses further writes with
+`AgentError::Closed`.
 
 ## Current scope
 

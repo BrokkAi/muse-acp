@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Give `acp-lite` an agent side. `AgentConnection` reads a client's requests
+  on one thread and writes from any thread. It answers each request exactly
+  once, answers JSON-RPC batches together, rejects frames that are not JSON
+  without stopping, and fails whatever is unanswered at shutdown. It also
+  matches requests sent to the client with their answers, either blocking
+  (`send_request`, `request`) or delivered to the agent's own event loop
+  (`request_routed`), with `$/cancel_request` withdrawal. `serve` runs a simple
+  `AgentHandler`, and `examples/echo_agent.rs` is a complete agent. `muse-acp`
+  does not use it yet (see `.agents/plans/acp-lite-agent-side.md`).
+
 - Rename the workspace's synchronous ACP client SDK from `muse-acp-client` to
   `acp-lite` (`crates/acp-lite`, library `acp_lite`). Nothing in it is
   Muse-specific; it works with any ACP stdio agent. Its default client name in
