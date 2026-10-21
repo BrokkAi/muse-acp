@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.16.0
 
 - Add `muse-acp logout`, which runs `muse logout` in the terminal and
   reports its exit status, for the same OS user the adapter runs as, so
