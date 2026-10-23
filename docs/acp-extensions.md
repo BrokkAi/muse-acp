@@ -174,6 +174,7 @@ Muse adds only facts with no standard ACP field:
 | Background-check card | `_meta.muse.turnId` and `blockingAgents`. |
 | Damaged session-log range card (Muse 1.4.11+) | `_meta.muse.damagedRange: {missingRecords, unreadableLines, readableBeforeAt, readableAfterAt, lastGoodTurnId}`, verbatim. `lastGoodTurnId` is the safe fork cut. |
 | Computer-use permission request (Muse 1.4.12+) | `toolCall._meta.muse.cuaCardFacts: {page, windowTitle, steps}`, verbatim, for editors that render the card natively. The same facts are always shown as the request's text `content`: the page host (with its `xn--` form when it differs), the quoted window title, and each step as `Step N: <action> <roleWord> "<label>" — <effect>`. The window title and labels are the app's own text, so in the content they are one sanitized line of at most 200 characters with Markdown metacharacters backslash-escaped; the verbatim metadata is unsanitized. |
+| Background-command completion card (Muse 1.4.12+) | `_meta.muse.backgroundTerminalCompletion: {command, output, outputTruncated, terminalStatus, toolCallId}`, verbatim, beside `_meta.muse.itemKind`. `toolCallId` is the backgrounded call's card id. |
 | Scheduled-fire card (Muse 1.4.11+) | `_meta.muse.scheduledFire: {jobId, deliveryNumber, scheduledFireAtMs, nextFireAtMs}`, verbatim epochs in milliseconds. |
 
 ### Notices

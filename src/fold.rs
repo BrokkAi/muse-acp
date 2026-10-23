@@ -1412,6 +1412,52 @@ impl SessionFold {
                 }
                 (title, content, Some(fields.join(",")))
             }
+            "backgroundTerminalCompletion" => {
+                // Muse 1.4.12: a backgrounded command finished. The five
+                // facts the host's Finished cell renders ride `_meta`
+                // verbatim; the card names the command and its outcome and
+                // shows the completion text.
+                let Some(facts @ J::Obj(_)) = item.get("backgroundTerminalCompletion") else {
+                    let text = str_field("fallbackText");
+                    return (
+                        text.to_string(),
+                        None,
+                        (!text.is_empty()).then(|| format!("\"itemKind\":{}", esc(kind))),
+                    );
+                };
+                let fact = |key: &str| facts.get(key).and_then(J::as_str).unwrap_or("");
+                let outcome = match fact("terminalStatus") {
+                    "completed" => "finished",
+                    "failed" => "failed",
+                    "cancelled" => "was cancelled",
+                    "timedOut" => "timed out",
+                    "rejected" => "was rejected",
+                    _ => "ended",
+                };
+                let command = sanitize_one_line(fact("command"));
+                let title = if command.is_empty() {
+                    format!("Background command {outcome}")
+                } else {
+                    let (command, _) = trunc(&command);
+                    format!("Background command {outcome}: {command}")
+                };
+                let mut text = fact("output").to_string();
+                if matches!(facts.get("outputTruncated"), Some(J::Bool(true))) {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    text.push_str("(output truncated by Muse)");
+                }
+                (
+                    title,
+                    (!text.is_empty()).then_some(text),
+                    Some(format!(
+                        "\"itemKind\":{},\"backgroundTerminalCompletion\":{}",
+                        esc(kind),
+                        j_to_string(facts)
+                    )),
+                )
+            }
             "damagedRange" => {
                 // Muse 1.4.11: what one damaged range of the session log
                 // cost, derived from the readable records around it. The
@@ -1589,6 +1635,43 @@ impl SessionFold {
         }
         update.push('}');
         Self::update_line(acp_sid, &update)
+    }
+
+    /// A Muse 1.4.12 `backgroundTerminalCompletion` names the backgrounded
+    /// call (`toolCallId`, the host call id the AIR task is keyed by) and its
+    /// terminal status. It settles that call's AIR async task only as a
+    /// fallback, when the call's own item terminal never did (for example
+    /// one missed across a reconnect): a state the call already reported is
+    /// never overridden, and a call this fold never announced is left alone.
+    fn settle_background_completion(
+        &mut self,
+        acp_sid: &str,
+        kind: &str,
+        item: &J,
+        out: &mut Vec<String>,
+    ) {
+        if kind != "backgroundTerminalCompletion" || !self.air_async_tasks {
+            return;
+        }
+        let Some(facts) = item.get("backgroundTerminalCompletion") else {
+            return;
+        };
+        let Some(task_id) = facts
+            .get("toolCallId")
+            .and_then(J::as_str)
+            .filter(|id| self.announced_tasks.contains(*id))
+            .map(str::to_string)
+        else {
+            return;
+        };
+        if self.async_task_states.contains_key(&task_id) {
+            return;
+        }
+        let status = facts.get("terminalStatus").cloned().unwrap_or(J::Null);
+        let terminal = J::Obj(vec![("status".to_string(), status)]);
+        if let Some(state) = Self::async_task_state(&terminal) {
+            self.async_task_state_once(acp_sid, &task_id, state, out);
+        }
     }
 
     fn async_task_state_once(
@@ -2911,6 +2994,7 @@ impl SessionFold {
                 }
             }
             _ => {
+                self.settle_background_completion(acp_sid, kind, item, out);
                 let (title, content, meta) = self.host_card_parts(kind, item);
                 let muse_fields = Self::merge_muse_fields(
                     meta.as_deref(),
@@ -3391,6 +3475,7 @@ impl SessionFold {
                 // is tracked as a Tool role) but this terminal snapshot carries
                 // no title, still settle it with a fallback title so the tool
                 // never stays in_progress (#1007).
+                self.settle_background_completion(acp_sid, kind, item, out);
                 let announced_card =
                     matches!(self.items.get(&item_id), Some(ItemRole::Tool { .. }));
                 let (tc_id, announced) = self.host_item_role(&item_id, "item-");
@@ -3808,6 +3893,117 @@ mod corpus_tests {
             assert!(fold.seed_async_task("sid", &row, &mut out), "{id}");
         }
         assert_eq!(out.len(), 3, "{out:?}");
+    }
+
+    #[test]
+    fn background_terminal_completions_render_their_facts() {
+        let fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"btc-1","kind":"backgroundTerminalCompletion","status":"completed","fallbackText":"Finished","backgroundTerminalCompletion":{"command":"npm run\nbuild","output":"built 3 files","outputTruncated":true,"terminalStatus":"failed","toolCallId":"call-bg"}}"#,
+        )
+        .unwrap();
+        let (title, content, meta) = fold.host_card_parts("backgroundTerminalCompletion", &item);
+        assert_eq!(title, "Background command failed: npm run build");
+        assert_eq!(
+            content.as_deref(),
+            Some("built 3 files\n(output truncated by Muse)")
+        );
+        assert_eq!(
+            meta.as_deref(),
+            Some(
+                r#""itemKind":"backgroundTerminalCompletion","backgroundTerminalCompletion":{"command":"npm run\nbuild","output":"built 3 files","outputTruncated":true,"terminalStatus":"failed","toolCallId":"call-bg"}"#
+            )
+        );
+
+        // Empty output is the host's "no text", not missing content; an
+        // unknown status still names the command.
+        let quiet = parse_json(
+            r#"{"itemId":"btc-2","kind":"backgroundTerminalCompletion","status":"completed","backgroundTerminalCompletion":{"command":"sleep 5","output":"","outputTruncated":false,"terminalStatus":"lost","toolCallId":"call-q"}}"#,
+        )
+        .unwrap();
+        let (title, content, _) = fold.host_card_parts("backgroundTerminalCompletion", &quiet);
+        assert_eq!(title, "Background command ended: sleep 5");
+        assert_eq!(content, None);
+
+        // Without the facts it keeps the generic fallback-text card.
+        let bare = parse_json(
+            r#"{"itemId":"btc-3","kind":"backgroundTerminalCompletion","status":"completed","fallbackText":"Background command finished"}"#,
+        )
+        .unwrap();
+        let (title, _, meta) = fold.host_card_parts("backgroundTerminalCompletion", &bare);
+        assert_eq!(title, "Background command finished");
+        assert_eq!(
+            meta.as_deref(),
+            Some(r#""itemKind":"backgroundTerminalCompletion""#)
+        );
+    }
+
+    #[test]
+    fn background_completion_settles_only_an_unsettled_announced_task() {
+        let started = |call: &str| {
+            parse_json(&format!(
+                r#"{{"itemId":"it-{call}","kind":"toolCall","callId":"{call}","status":"inProgress","revision":1,"tool":"workspace-shell","args":"{{}}","background":true}}"#
+            ))
+            .unwrap()
+        };
+        let completion = |call: &str, status: &str| {
+            parse_json(&format!(
+                r#"{{"item":{{"itemId":"btc-{call}","kind":"backgroundTerminalCompletion","status":"completed","backgroundTerminalCompletion":{{"command":"make","output":"","outputTruncated":false,"terminalStatus":"{status}","toolCallId":"{call}"}}}}}}"#
+            ))
+            .unwrap()
+        };
+        let states = |out: &[String], task: &str| -> Vec<String> {
+            out.iter()
+                .filter(|line| {
+                    line.contains("async_task_state_update")
+                        && line.contains(&format!("\"asyncTaskId\":\"{task}\""))
+                })
+                .cloned()
+                .collect()
+        };
+        let mut fold = SessionFold::new();
+        fold.air_async_tasks = true;
+        let mut out = Vec::new();
+
+        // The call's own terminal never arrived: the completion settles it.
+        fold.on_item_snapshot("sid", 2, &started("call-a"), &mut out);
+        fold.on_item_completed("sid", 2, &completion("call-a", "failed"), &mut out);
+        let settled = states(&out, "call-a");
+        assert_eq!(settled.len(), 1, "{out:?}");
+        assert!(settled[0].contains("\"state\":\"failed\""), "{settled:?}");
+
+        // A state the call already reported is never overridden.
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &started("call-b"), &mut out);
+        let own = parse_json(
+            r#"{"item":{"itemId":"it-call-b","kind":"toolCall","callId":"call-b","status":"completed","revision":2,"tool":"workspace-shell","args":"{}","background":true}}"#,
+        )
+        .unwrap();
+        fold.on_item_completed("sid", 2, &own, &mut out);
+        fold.on_item_completed("sid", 2, &completion("call-b", "failed"), &mut out);
+        let settled = states(&out, "call-b");
+        assert_eq!(settled.len(), 1, "{out:?}");
+        assert!(
+            settled[0].contains("\"state\":\"completed\""),
+            "{settled:?}"
+        );
+
+        // A call this fold never announced gets no task update, only the card.
+        let mut out = Vec::new();
+        fold.on_item_completed("sid", 2, &completion("call-x", "completed"), &mut out);
+        assert!(states(&out, "call-x").is_empty(), "{out:?}");
+        assert!(
+            out.iter()
+                .any(|line| line.contains("Background command finished: make")),
+            "{out:?}"
+        );
+
+        // Without AIR async tasks negotiated there is nothing to settle.
+        let mut plain = SessionFold::new();
+        let mut out = Vec::new();
+        plain.on_item_snapshot("sid", 2, &started("call-c"), &mut out);
+        plain.on_item_completed("sid", 2, &completion("call-c", "failed"), &mut out);
+        assert!(states(&out, "call-c").is_empty(), "{out:?}");
     }
 
     #[test]
