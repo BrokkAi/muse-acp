@@ -1924,7 +1924,7 @@ enum LoopMsg {
 /// MSP `session/delete` support (Muse 1.4.1 or 1.4.2, durable); clients
 /// must not call `session/delete` unless it is advertised.
 fn v2_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"steering":{"supported":true},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
+    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"steering":{"supported":true,"idleBehaviors":["promptRequired"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v2())
         .replace(
@@ -1942,7 +1942,7 @@ fn v2_init(session_mcp: bool, session_delete: bool) -> String {
 }
 
 fn v1_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"auth":{"logout":{}},"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true}}}"#
+    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"auth":{"logout":{}},"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}}"#
         .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
         .replace("__AUTH_METHODS__", &auth_methods_v1())
         .replace("__MCP_HTTP__", if session_mcp { "true" } else { "false" })

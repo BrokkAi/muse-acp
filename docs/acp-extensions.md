@@ -22,6 +22,7 @@ ACP v1 clients advertise capabilities under
 | `_meta.muse.capabilities: ["userShell"]` | Client to agent | Allow `_session/userShell`; AIR `asyncTasks` and a host grant are also required. |
 | `_meta.muse.computerUse: true` | Client to agent | Legacy boolean spelling accepted for computer use. |
 | `_meta.steering.supported: true` | Agent to client | Advertises the `_session/steering` convention. |
+| `_meta.steering.idleBehaviors: ["promptRequired"]` | Agent to client | Advertises that a steer sent with `idleBehavior: "promptRequired"` while no turn is running is returned as `promptRequired` instead of starting a turn. |
 | `_meta.jetbrains.air` | Both | JetBrains AIR capabilities. This namespace belongs to the AIR extension, not Muse metadata. |
 
 ACP v1 clients also advertise standard compaction support with
@@ -67,7 +68,7 @@ negotiation they fall back to synthesized tool cards.
 | `session/load`, `session/resume`, `session/new`, and `session/fork` result `_meta.mspSessionId` | Agent to client | The durable Muse session id. Modern ACP `sessionId` normally already equals it; this is primarily compatibility metadata. |
 | `session/fork` request `_meta.jetbrains.air.forkPoint` | Client to agent | AIR cut-point selector. It is resolved against host history before a fork command is sent. |
 | Prompt `_meta.jetbrains.air.agentFileChangeReportRequest` | Client to agent | Requests one AIR file-change report for the turn. |
-| `_session/steering` `_meta.steering.idleBehavior` | Client to agent | `promptRequired` holds steering until a prompt can be submitted; other values are rejected. |
+| `_session/steering` `_meta.steering.idleBehavior` | Client to agent | `promptRequired`: when no turn is running, return `{"outcome":"promptRequired","reason":"noRunningTurn"}` instead of starting a turn, so the client can send the text as a prompt. Other values are rejected. |
 
 `session/new` does not accept the Muse resume profile extension. Host
 permission profiles are separate from ACP `approvalMode`.

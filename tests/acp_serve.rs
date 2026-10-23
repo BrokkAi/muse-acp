@@ -392,14 +392,18 @@ impl Client {
                     && frame.contains("\"agentInfo\"")
                     && frame.contains("\"mcpCapabilities\":{")
                     && frame.contains("\"sessionCapabilities\":")
-                    && frame.contains("\"steering\":{\"supported\":true}"),
+                    && frame.contains(
+                        "\"steering\":{\"supported\":true,\"idleBehaviors\":[\"promptRequired\"]}"
+                    ),
                 "invalid v1 initialize shape: {frame}"
             );
         } else {
             assert!(
                 frame.contains("\"capabilities\":{")
                     && frame.contains("\"info\":")
-                    && frame.contains("\"steering\":{\"supported\":true}"),
+                    && frame.contains(
+                        "\"steering\":{\"supported\":true,\"idleBehaviors\":[\"promptRequired\"]}"
+                    ),
                 "invalid v2 initialize shape: {frame}"
             );
         }
@@ -7054,6 +7058,33 @@ fn steering_idle_policy_is_race_safe() {
     c.wait_input("\"ifBusy\": \"steer\"", Duration::from_secs(15));
     let idle = c.wait_for("\"idle\"", Duration::from_secs(15));
     assert!(idle.contains("end_turn"), "steered start completes: {idle}");
+    c.finish();
+}
+
+#[test]
+fn steering_idle_prompt_required_on_v1_connections() {
+    // ACP v1 initialize advertises `idleBehaviors: ["promptRequired"]` too, so
+    // an idle steer must come back to the client without starting a turn.
+    let mut c = Client::spawn("happy", &[]);
+    let sid = c.new_session(1, "");
+    let required_id = c.req(
+        "_session/steering",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"only if busy\"}}],\"_meta\":{{\"steering\":{{\"idleBehavior\":\"promptRequired\"}}}}}}"
+        ),
+    );
+    let required = c.wait_for(&format!("\"id\":{required_id}"), Duration::from_secs(15));
+    assert!(
+        required.contains("\"outcome\":\"promptRequired\"")
+            && required.contains("\"reason\":\"noRunningTurn\""),
+        "{required}"
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    let seen = std::fs::read_to_string(&c.fake_log).unwrap_or_default();
+    assert!(
+        !seen.lines().any(|l| l == "turn/start"),
+        "an idle promptRequired steer must not start a turn; host saw:\n{seen}"
+    );
     c.finish();
 }
 
