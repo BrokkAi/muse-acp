@@ -79,11 +79,15 @@ jobs:
             runner: ubuntu-24.04
             file: muse-x86-linux
             sha256: 6fda12a6a4f236528dafa707384cf6395fe859b1438ef77c7be26ed9d7976839
+          - version: 1.4.12-R6909.1
+            runner: ubuntu-24.04
+            file: muse-x86-linux
+            sha256: 81e8bb16289203ba8e0ca7f80c4b82e59ba35f5ee50aafef93a2a4116f2cb27f
           # macOS arm64 runs only the newest pin.
-          - version: 1.4.11-R6667.1
+          - version: 1.4.12-R6909.1
             runner: macos-15
             file: muse-aarch64-macos
-            sha256: 6c04ce1719844685153ef6f04b98113cb61b942d97f0a8b0bfb3932c343984d9
+            sha256: 7118b9ca2227a6ec1b90cc506f8abdd4a35d14d8ab6683c9164b075002a55fff
           # Windows x64 legs cover the workspace-root flows on every pinned
           # build: multi-root `session/start`, and the sticky `turn/start`
           # replacement after a mode change and a load/re-attach. These carry
@@ -130,6 +134,11 @@ jobs:
             runner: windows-2025
             file: muse-x86-windows.exe
             sha256: 8844783f7e02b2f6b21ad0d60eefb1ddda392576f11fa811ae95e1448bcfa1f8
+            tests: workspace-roots
+          - version: 1.4.12-R6909.1
+            runner: windows-2025
+            file: muse-x86-windows.exe
+            sha256: 2cdc3c73b8cb668153ee25b9b1ec03f42d02cf49f6622dd3328d625c0cc0cdc0
             tests: workspace-roots
     runs-on: ${{ matrix.muse.runner }}
     timeout-minutes: 20

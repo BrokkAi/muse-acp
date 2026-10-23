@@ -78,7 +78,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
                plus one with an empty description
   side_chat    session/sideChat opens a side session with sideFrom provenance
   task_list_seed task/list seeds async tasks after a resume whose history is
-               empty; the item terminal then settles the seeded task
+               empty (skipping a 1.4.12 foreground row); the item terminal
+               then settles the seeded task
   plugin_control plugin/list rows and the install/marketplace write receipts
   media_upload media/upload chunks reassemble into the video store
   async_task_stop       background task then a targeted task/stop terminal
@@ -2604,9 +2605,15 @@ def result_for(method, msg):
             {"taskId": "it-bg-seed", "kind": "tool.workspace-shell",
              "status": "inProgress", "tool": "workspace-shell",
              "startedAt": "2026-10-12T10:00:00Z",
-             "backgroundInitiator": "timeout"},
+             "backgroundInitiator": "timeout",
+             "executionMode": "background"},
             {"taskId": "cron-1", "kind": "cron.run",
              "status": "inProgress", "startedAt": "2026-10-12T09:00:00Z"},
+            # Muse 1.4.12 lists foreground work too; it is never an async task.
+            {"taskId": "it-fg-seed", "kind": "tool.workspace-shell",
+             "status": "inProgress", "tool": "workspace-shell",
+             "startedAt": "2026-10-12T10:01:00Z",
+             "executionMode": "foreground"},
         ]}
     if method == "computerUseSetup/read":
         params = msg.get("params", {})

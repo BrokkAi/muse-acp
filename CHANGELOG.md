@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+- Re-pin the vendored Muse SDK conformance corpus to `09d67ec` (2026-10-22,
+  "remirror: 1.4.12"), which publishes the Muse 1.4.12 stable surface. The
+  additions over 1.4.11 are additive, and the method, notification, request,
+  and error tables are unchanged: computer-use approval card facts
+  (`cuaCardFacts`), the `backgroundTerminalCompletion` and `overdueNotice`
+  item kinds, the `blockedPrompt` recall seed on `session/resume` and
+  `session/read`, the history `checkpointBoundary`, and the task-list
+  `command` and `executionMode`. The vendored bundle is byte-identical to
+  what an installed Muse 1.4.12 exports with `muse schema
+  generate-json-schema`. The pinned 1.4.12-R6909.1 build now runs in the
+  nightly live-host matrix (Linux x86-64 full suite, macOS arm64 newest pin,
+  Windows x64 workspace-root flows), so the new fingerprint classifies as
+  tested. Each addition has a ROADMAP
+  §9 field-matrix row; card facts, the new item kinds, and the recall seed
+  are tracked in #384 through #386 (#381).
+
+- Stop announcing foreground work as a background task after a resume. Muse
+  1.4.12's `task/list` also lists foreground rows, marked `executionMode:
+  "foreground"`, and the adapter seeded every row as an AIR async task.
+  Foreground rows are now skipped; background, absent (older hosts), and
+  unknown modes seed as before.
+
 - Advertise `_meta.steering.idleBehaviors: ["promptRequired"]` in the ACP v1
   and v2 `initialize` responses. `_session/steering` already honored
   `idleBehavior: "promptRequired"` when no turn was running, but clients could

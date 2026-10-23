@@ -8051,21 +8051,21 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 }
 
 #[test]
-fn sdk_manifest_fingerprint_is_the_tested_1_4_11_surface() {
-    // The vendored SDK manifest (22a8a56) publishes the Muse 1.4.11 surface,
-    // which the pinned 1.4.11-R6667.1 build in the nightly live-host matrix
+fn sdk_manifest_fingerprint_is_the_tested_1_4_12_surface() {
+    // The vendored SDK manifest (09d67ec) publishes the Muse 1.4.12 surface,
+    // which the pinned 1.4.12-R6909.1 build in the nightly live-host matrix
     // reports, so the adapter classifies it as tested.
     let mut c = Client::spawn(
         "quiet",
         &[(
             "FAKE_FINGERPRINT",
-            "sha256:f282ad16e21520d0cda68cb190149b86e2b062eef1dd282749360c05aa3d1082",
+            "sha256:cfdb6d2525601b9bac76584ccb0610ab3a5539b5e4f51141f079b99b39fcb4e0",
         )],
     );
     c.initialize(1, "");
     c.wait_stderr("status=tested", Duration::from_secs(10));
     c.wait_stderr(
-        "validated against live host 1.4.11-R6667.1; the vendored SDK manifest surface",
+        "validated against live host 1.4.12-R6909.1; the vendored SDK manifest surface",
         Duration::from_secs(10),
     );
     c.finish();
@@ -12473,6 +12473,14 @@ fn task_list_seeds_the_async_task_inventory_after_resume() {
     );
     c.wait_stderr("task/list seeded 2 async task(s)", Duration::from_secs(10));
     c.wait_log("task/list", Duration::from_secs(10));
+    assert!(
+        !c.frames
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|frame| frame.contains("it-fg-seed")),
+        "a foreground task/list row is never announced as an async task"
+    );
 
     // Stopping a seeded task sends the host's own task id.
     let rid = c.req(

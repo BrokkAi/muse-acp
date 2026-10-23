@@ -2,9 +2,10 @@
 //!
 //! Issue #224 closed the gap between the pinned 1.4.6 stable surface and the
 //! adapter by deciding, per field (later adoptions, such as #243's 1.4.7
-//! `Item.cutOff`, #272's 1.4.9 `Item.displayLabel`, and the 1.4.11 re-pin's
-//! item kinds, goal timestamps, recovery members, and skill source, join the
-//! same matrix),
+//! `Item.cutOff`, #272's 1.4.9 `Item.displayLabel`, the 1.4.11 re-pin's
+//! item kinds, goal timestamps, recovery members, and skill source, and the
+//! 1.4.12 re-pin's item kinds, approval card facts, recall seed, checkpoint
+//! boundary, and task-list members, join the same matrix),
 //! whether it earns an ACP mapping or an explicit "Intentionally ignored"
 //! disposition. This test keeps that matrix
 //! honest in two ways: every addition has exactly one disposition row in
@@ -69,6 +70,15 @@ const ADDITIONS: &[&str] = &[
     "SessionReadResult.recoveryObservation",
     "SubagentResult.drained",
     "TurnInputPart.source",
+    "ItemKind.backgroundTerminalCompletion",
+    "ItemKind.overdueNotice",
+    "Item.backgroundTerminalCompletion",
+    "ApprovalRequestParams.cuaCardFacts",
+    "SessionResumeResult.blockedPrompt",
+    "SessionReadResult.blockedPrompt",
+    "SessionHistory.checkpointBoundary",
+    "TaskListEntry.command",
+    "TaskListEntry.executionMode",
 ];
 
 fn matrix() -> String {
@@ -227,6 +237,18 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         "SessionClosedReason.leave left the stable surface"
     );
     assert!(
+        enum_has("ItemKind", "backgroundTerminalCompletion"),
+        "ItemKind.backgroundTerminalCompletion left the stable surface"
+    );
+    assert!(
+        enum_has("ItemKind", "overdueNotice"),
+        "ItemKind.overdueNotice left the stable surface"
+    );
+    assert!(
+        enum_has("TaskExecutionMode", "foreground"),
+        "TaskExecutionMode.foreground left the stable surface"
+    );
+    assert!(
         enum_has("TurnErrorKind", "mcpLinkError"),
         "TurnErrorKind.mcpLinkError left the stable surface"
     );
@@ -274,6 +296,13 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("SessionReadResult", "recoveryObservation"),
         ("SubagentResult", "drained"),
         ("TurnInputPart", "source"),
+        ("Item", "backgroundTerminalCompletion"),
+        ("ApprovalRequestParams", "cuaCardFacts"),
+        ("SessionResumeResult", "blockedPrompt"),
+        ("SessionReadResult", "blockedPrompt"),
+        ("SessionHistory", "checkpointBoundary"),
+        ("TaskListEntry", "command"),
+        ("TaskListEntry", "executionMode"),
     ] {
         assert!(
             has_property(defs, def, member),
