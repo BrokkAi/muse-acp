@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Show when a background command finishes (#384). Muse 1.4.12 reports a
+  backgrounded command's completion as a `backgroundTerminalCompletion`
+  item, which now renders as a "Background command <outcome>: <command>"
+  card with the completion output, noting when Muse truncated it. The facts
+  ride `_meta.muse.backgroundTerminalCompletion` verbatim. If the command's
+  AIR async task is still running in the editor because its own terminal
+  was missed, the completion settles it; a state already reported is never
+  changed. `overdueNotice` items keep the generic card, since the schema
+  gives them no fields of their own.
+
 - Pass Muse 1.4.12's blocked-prompt recall seed to the editor (#386). When
   a session's latest prompt was blocked, `session/resume` returns its exact
   text, and the `session/load` and `session/resume` results now carry it as
