@@ -22,10 +22,11 @@
   approval card's facts, and the permission prompt now shows them as its
   content: the page host, with its `xn--` form when it differs so a
   look-alike host stands out, the window title, and each consequential step
-  as `Step N: <action> <roleWord> "<label>" — <effect>`. The window title and
+  as `Step N: <action> <roleWord> <label> — <effect>`. The window title and
   control labels are the app's own text, which a web page can set, so they
-  are sanitized to one line, capped at 200 characters, and Markdown-escaped,
-  so an editor never renders them as links or markup. The facts are also
+  are sanitized to one line, capped at 200 characters, and shown as Markdown
+  code spans, so an editor never renders them as links (including bare URLs
+  and email addresses), images, or markup. The facts are also
   passed verbatim as `_meta.muse.cuaCardFacts`. The prompt's choices are
   unchanged.
 
