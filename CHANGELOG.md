@@ -8,8 +8,8 @@
   card with the completion output, noting when Muse truncated it. The facts
   ride `_meta.muse.backgroundTerminalCompletion` verbatim. If the command's
   AIR async task is still running in the editor because its own terminal
-  was missed, the completion settles it; a state already reported is never
-  changed. `overdueNotice` items keep the generic card, since the schema
+  was missed, the completion settles it, including after a resume restores
+  the task set from history; a state already reported is never changed. `overdueNotice` items keep the generic card, since the schema
   gives them no fields of their own.
 
 - Pass Muse 1.4.12's blocked-prompt recall seed to the editor (#386). When

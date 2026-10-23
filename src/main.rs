@@ -8743,7 +8743,10 @@ fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) 
 /// `session/resume`. This runs even when ACP did not request transcript replay:
 /// a reconnecting editor still needs controls and status for work that remains
 /// active. Terminal history is deliberately ignored; live completion events
-/// settle tasks that this connection already announced.
+/// settle tasks that this connection already announced. A Muse 1.4.12
+/// `backgroundTerminalCompletion` in the same history is the exception: it
+/// settles the task of a backgrounded call the fold still shows running, so
+/// the restored panel never keeps a task the host reports finished.
 fn reconcile_active_tasks(
     stdout: &StdoutShared,
     sess: &mut AcpSession,
@@ -8801,6 +8804,16 @@ fn reconcile_active_tasks(
             sess.fold
                 .on_item_snapshot(&sess.acp_sid, sess.ver, item, &mut out);
         }
+    }
+    // After every task is restored, so a completion listed before its call
+    // still finds it.
+    for item in items {
+        sess.fold.settle_background_completion(
+            &sess.acp_sid,
+            item.get("kind").and_then(J::as_str).unwrap_or(""),
+            item,
+            &mut out,
+        );
     }
     acp::send_fold_lines(stdout, sess, out);
 }
