@@ -8051,11 +8051,10 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 }
 
 #[test]
-fn sdk_manifest_fingerprint_is_degraded_pending_the_1_4_12_pin() {
-    // The vendored SDK manifest (09d67ec) publishes the Muse 1.4.12 surface.
-    // No pinned 1.4.12 build is in the live-host matrix yet, so the adapter
-    // degrades loudly instead of warning about an unknown surface, and keeps
-    // serving.
+fn sdk_manifest_fingerprint_is_the_tested_1_4_12_surface() {
+    // The vendored SDK manifest (09d67ec) publishes the Muse 1.4.12 surface,
+    // which the pinned 1.4.12-R6909.1 build in the nightly live-host matrix
+    // reports, so the adapter classifies it as tested.
     let mut c = Client::spawn(
         "quiet",
         &[(
@@ -8064,9 +8063,9 @@ fn sdk_manifest_fingerprint_is_degraded_pending_the_1_4_12_pin() {
         )],
     );
     c.initialize(1, "");
-    c.wait_stderr("status=degraded", Duration::from_secs(10));
+    c.wait_stderr("status=tested", Duration::from_secs(10));
     c.wait_stderr(
-        "Muse 1.4.12 surface; byte-identical to the installed 1.4.12 export, pending a pinned CI build",
+        "validated against live host 1.4.12-R6909.1; the vendored SDK manifest surface",
         Duration::from_secs(10),
     );
     c.finish();

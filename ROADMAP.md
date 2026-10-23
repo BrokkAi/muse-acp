@@ -13,8 +13,8 @@ access, and useful in real editor workflows.
   (2026-10-22; stable schema version 1, manifest fingerprint
   `sha256:cfdb6d2525601b9bac76584ccb0610ab3a5539b5e4f51141f079b99b39fcb4e0`,
   the Muse 1.4.12 stable surface,
-  byte-identical to an installed 1.4.12's own schema export; degraded
-  until a pinned 1.4.12 build joins the nightly live-host matrix)
+  byte-identical to an installed 1.4.12's own schema export; tested
+  against the pinned 1.4.12-R6909.1 build in the nightly live-host matrix)
   and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
@@ -218,8 +218,9 @@ the verdict into richer support bundles.
   `session/read`, the history `checkpointBoundary`, and the task-list
   `command` and `executionMode`. An installed Muse 1.4.12 exports a schema
   bundle byte-identical to the vendored copy while reporting this
-  fingerprint byte-for-byte; with no pinned 1.4.12 build in the live-host
-  matrix yet, it classifies as degraded
+  fingerprint byte-for-byte, and the pinned 1.4.12-R6909.1 build runs in the
+  nightly live-host matrix (Linux x86-64 full suite, macOS arm64 newest pin,
+  Windows x64 workspace-root flows), so the adapter classifies it as tested
   ([#381](https://github.com/BrokkAi/muse-acp/issues/381)). Its
   dispositions are in the §9 field matrix, with follow-ups in
   [#384](https://github.com/BrokkAi/muse-acp/issues/384) through [#386](https://github.com/BrokkAi/muse-acp/issues/386). Before 1.4.6, the
@@ -270,9 +271,9 @@ plus a deny fallback, and an env-gated `MUSE_ACP_LIVE_HOST=1` smoke test
 drives a real host handshake, session lifecycle, and close (skipped with an
 explicit message by default). The pinned 1.4.11-R6667.1 build in the
 nightly matrix makes the 1.4.11 surface tested
-([#337](https://github.com/BrokkAi/muse-acp/issues/337)); the vendored 1.4.12
-surface stays degraded until a 1.4.12 build is pinned
-([#381](https://github.com/BrokkAi/muse-acp/issues/381)), and the 1.4.9/1.4.10
+([#337](https://github.com/BrokkAi/muse-acp/issues/337)), and the pinned
+1.4.12-R6909.1 build makes the vendored 1.4.12 surface tested
+([#381](https://github.com/BrokkAi/muse-acp/issues/381)); the 1.4.9/1.4.10
 surface stays degraded, since no 1.4.9 or 1.4.10 build is pinned. The `live-host` CI job also runs
 `tests/live_loopback.rs` on every push against each pinned Muse build on
 Linux x86-64, and the newest on macOS arm64 (downloaded and

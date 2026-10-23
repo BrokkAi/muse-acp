@@ -11,8 +11,10 @@
   `session/read`, the history `checkpointBoundary`, and the task-list
   `command` and `executionMode`. The vendored bundle is byte-identical to
   what an installed Muse 1.4.12 exports with `muse schema
-  generate-json-schema`. The new fingerprint classifies as degraded until a
-  pinned 1.4.12 build joins the live-host matrix. Each addition has a ROADMAP
+  generate-json-schema`. The pinned 1.4.12-R6909.1 build now runs in the
+  nightly live-host matrix (Linux x86-64 full suite, macOS arm64 newest pin,
+  Windows x64 workspace-root flows), so the new fingerprint classifies as
+  tested. Each addition has a ROADMAP
   §9 field-matrix row; card facts, the new item kinds, and the recall seed
   are tracked in #384 through #386 (#381).
 
