@@ -5902,11 +5902,15 @@ fn handle_acp(
                             )
                         })
                         .unwrap_or_default();
+                    // Muse 1.4.12's recall seed for the latest blocked prompt
+                    // is data, never history: it rides the result metadata so
+                    // an editor can offer to refill its prompt box.
+                    let blocked_prompt = blocked_prompt_meta(&r);
                     // Both versions report current selectors; v1 also keeps the
                     // legacy mode state for clients which predate config options.
                     let result = if ver == 2 {
                         format!(
-                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
+                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}{blocked_prompt}}},\"configOptions\":{}}}",
                             esc(&sid),
                             esc(&msp_out),
                             acp::config_options(
@@ -5929,7 +5933,7 @@ fn handle_acp(
                         )
                     } else {
                         format!(
-                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{},\"modes\":{}}}",
+                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}{blocked_prompt}}},\"configOptions\":{},\"modes\":{}}}",
                             esc(&sid),
                             esc(&msp_out),
                             acp::config_options(
@@ -8799,6 +8803,22 @@ fn reconcile_active_tasks(
         }
     }
     acp::send_fold_lines(stdout, sess, out);
+}
+
+/// `_meta.muse.blockedPrompt` for a `session/load` or `session/resume`
+/// result, as a leading-comma fragment of the result's `_meta`, or empty.
+/// Muse 1.4.12 returns the latest blocked main prompt on `session/resume` as
+/// `{text}`, the exact submitted text, so a client can seed its prompt recall.
+/// The schema says it is data only and never a rendered row, so the adapter
+/// passes it through verbatim and never replays it as a user message.
+fn blocked_prompt_meta(resume_result: &J) -> String {
+    resume_result
+        .get("blockedPrompt")
+        .and_then(|prompt| prompt.get("text"))
+        .and_then(J::as_str)
+        .filter(|text| !text.is_empty())
+        .map(|text| format!(",\"muse\":{{\"blockedPrompt\":{{\"text\":{}}}}}", esc(text)))
+        .unwrap_or_default()
 }
 
 /// Seed the AIR async-task inventory from the host's authoritative

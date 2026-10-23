@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Pass Muse 1.4.12's blocked-prompt recall seed to the editor (#386). When
+  a session's latest prompt was blocked, `session/resume` returns its exact
+  text, and the `session/load` and `session/resume` results now carry it as
+  `_meta.muse.blockedPrompt: {text}`, so an editor can offer to refill its
+  prompt box. As the schema requires, it is never replayed as history.
+
 - Show what a computer-use approval would do (#385). Muse 1.4.12 sends the
   approval card's facts, and the permission prompt now shows them as its
   content: the page host, with its `xn--` form when it differs so a

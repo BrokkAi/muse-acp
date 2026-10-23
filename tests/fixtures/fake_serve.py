@@ -210,6 +210,9 @@ approval/updated without them) and `editor_approval_late_args`
 (approval/updated without rawArgs, then approval/requested with them) leave
 the turn open.
 
+Blocked-prompt recall: FAKE_BLOCKED_PROMPT=<text> adds Muse 1.4.12
+`blockedPrompt: {text}` to every session/resume result.
+
 Computer-use approvals: FAKE_APPROVAL_SUBJECT=computer-use adds Muse 1.4.12
 `cuaCardFacts` (page, window title with Markdown link syntax, one labeled
 step) to the approval.
@@ -2229,10 +2232,14 @@ def result_for(method, msg):
                 "commandId": SIDE_CHAT_CMD[0],
                 "cutCursor": "opaque-side-cut",
             }
-        return {"session": session,
-                "viewCursor": "cur-9",
-                "pendingRequests": pending,
-                "history": history}
+        result = {"session": session,
+                  "viewCursor": "cur-9",
+                  "pendingRequests": pending,
+                  "history": history}
+        # Muse 1.4.12's recall seed for the latest blocked prompt.
+        if os.environ.get("FAKE_BLOCKED_PROMPT"):
+            result["blockedPrompt"] = {"text": os.environ["FAKE_BLOCKED_PROMPT"]}
+        return result
     if method == "view/subscribe":
         params = msg.get("params", {})
         log_input(params)
