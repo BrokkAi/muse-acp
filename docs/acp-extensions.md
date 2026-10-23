@@ -80,6 +80,7 @@ permission profiles are separate from ACP `approvalMode`.
 | --- | --- | --- |
 | `session/new`, `session/load`, `session/resume`, `session/fork` result `_meta.mspSessionId` | string | Compatibility id described above. |
 | Fork result `_meta.muse.forkedFrom` | object | Host fork provenance. |
+| `session/load` and `session/resume` result `_meta.muse.blockedPrompt` | `{text}` | Muse 1.4.12+: the latest blocked main prompt, the exact submitted text, passed through verbatim. It is recall data: a client may refill its prompt box with `text`, and must not show it as history. The adapter never replays it as a message. Absent when nothing is blocked or on older hosts. |
 | Side-chat result / attached side session `_meta.muse.sideFrom` | object | Host side-chat provenance. |
 | Config option `_meta.jetbrains.air.recommendedValue` | string | AIR recommendation metadata; it never changes the selected value. |
 | Auth method `_meta["terminal-auth"]` | `{label, command, args}` | Legacy terminal-auth description used with older editors. |

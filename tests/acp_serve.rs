@@ -4499,6 +4499,51 @@ fn session_resume_without_cwd_reconnects() {
 }
 
 #[test]
+fn load_and_resume_pass_the_blocked_prompt_recall_seed_through() {
+    // Muse 1.4.12 returns the latest blocked prompt on session/resume. It is
+    // recall data, never history: it rides the result metadata verbatim on
+    // load and resume, and is never replayed as a user message.
+    let text = "Refactor the parser\n  keep \"quotes\" and  spacing ";
+    for ver in [1, 2] {
+        let mut c = Client::spawn("load", &[("FAKE_BLOCKED_PROMPT", text)]);
+        let sid = c.new_session(ver, "");
+        for method in ["session/load", "session/resume"] {
+            let rid = c.req(method, &format!("{{\"sessionId\":\"{sid}\"}}"));
+            let result = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+            assert!(
+                result.contains(&format!(
+                    "\"_meta\":{{\"mspSessionId\":{},\"muse\":{{\"blockedPrompt\":{{\"text\":{}}}}}}}",
+                    serde_json::to_string(&sid).unwrap(),
+                    serde_json::to_string(text).unwrap()
+                )),
+                "{method} carries the recall seed verbatim on v{ver}: {result}"
+            );
+        }
+        assert!(
+            !c.frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|frame| frame.contains("user_message_chunk")
+                    && frame.contains("Refactor the parser")),
+            "the recall seed is never replayed as history on v{ver}"
+        );
+        c.finish();
+    }
+
+    // Without a seed the result metadata is unchanged.
+    let mut c = Client::spawn("load", &[]);
+    let sid = c.new_session(2, "");
+    let rid = c.req("session/resume", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    let result = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    assert!(
+        result.contains(&format!("\"_meta\":{{\"mspSessionId\":\"{sid}\"}}")),
+        "{result}"
+    );
+    c.finish();
+}
+
+#[test]
 fn resume_reattaches_at_the_retained_cursor_without_duplicate_replay() {
     for ver in [1u64, 2] {
         let mut c = Client::spawn("view_subscribe_gap", &[]);
