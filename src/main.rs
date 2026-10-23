@@ -12802,6 +12802,98 @@ fn retitle_editor_permission(
     );
 }
 
+/// Longest window title or control label shown in a computer-use approval.
+const CUA_TEXT_MAX_CHARS: usize = 200;
+
+/// App-supplied text from a computer-use approval card (a window title or a
+/// control label, which a web page can set): one sanitized line, capped, with
+/// Markdown metacharacters escaped so an editor that renders tool content as
+/// Markdown still shows it as plain text, never as a link, image, or markup.
+fn cua_untrusted_text(value: &str) -> String {
+    let line = fold::sanitize_one_line(value);
+    let mut capped: String = line.chars().take(CUA_TEXT_MAX_CHARS).collect();
+    if line.chars().count() > CUA_TEXT_MAX_CHARS {
+        capped.push('…');
+    }
+    let mut out = String::with_capacity(capped.len());
+    for c in capped.chars() {
+        if matches!(
+            c,
+            '\\' | '`' | '*' | '_' | '[' | ']' | '(' | ')' | '<' | '>' | '#' | '!' | '|' | '~'
+        ) {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// The facts of a computer-use approval card (Muse 1.4.12
+/// `ApprovalRequestParams.cuaCardFacts`) as permission-prompt text, in the
+/// host's words: the page host (with its `xn--` form when it differs, so a
+/// look-alike host stands out), the quoted window title, and each
+/// consequential step as `Step N: <action> <roleWord> "<label>" — <effect>`.
+/// A key step names its chord, and only a step with a point and no label or
+/// chord reads "at x,y". `None` when the approval carries no facts.
+fn cua_card_text(params: &J) -> Option<String> {
+    let facts = params.get("cuaCardFacts")?;
+    if !matches!(facts, J::Obj(_)) {
+        return None;
+    }
+    let mut lines = Vec::new();
+    if let Some(page) = facts.get("page") {
+        let host = page.non_empty_str("host").map(fold::sanitize_one_line);
+        let ascii = page.non_empty_str("hostAscii").map(fold::sanitize_one_line);
+        match (host, ascii) {
+            (Some(host), Some(ascii)) if ascii != host => {
+                lines.push(format!("Page: {host} ({ascii})"));
+            }
+            (Some(host), _) | (None, Some(host)) => lines.push(format!("Page: {host}")),
+            (None, None) => {}
+        }
+    }
+    if let Some(title) = facts.non_empty_str("windowTitle") {
+        lines.push(format!("Window: \"{}\"", cua_untrusted_text(title)));
+    }
+    if let Some(J::Arr(steps)) = facts.get("steps") {
+        for (index, step) in steps.iter().enumerate() {
+            let number = step
+                .get("step")
+                .and_then(J::as_u64)
+                .unwrap_or(index as u64 + 1);
+            let action = step
+                .non_empty_str("action")
+                .map(fold::sanitize_one_line)
+                .unwrap_or_else(|| "act".to_string());
+            let mut line = format!("Step {number}: {action}");
+            let role = step.non_empty_str("roleWord").map(fold::sanitize_one_line);
+            if let Some(label) = step.non_empty_str("label") {
+                if let Some(role) = &role {
+                    line.push(' ');
+                    line.push_str(role);
+                }
+                line.push_str(&format!(" \"{}\"", cua_untrusted_text(label)));
+            } else if let Some(chord) = step.non_empty_str("chord") {
+                line.push(' ');
+                line.push_str(role.as_deref().unwrap_or("key"));
+                line.push(' ');
+                line.push_str(&cua_untrusted_text(chord));
+            } else if let Some(point) = step.get("point") {
+                let coord = |key| point.get(key).and_then(J::as_u64);
+                if let (Some(x), Some(y)) = (coord("x"), coord("y")) {
+                    line.push_str(&format!(" at {x},{y}"));
+                }
+            }
+            if let Some(effect) = step.non_empty_str("effect") {
+                line.push_str(" — ");
+                line.push_str(&fold::sanitize_one_line(effect));
+            }
+            lines.push(line);
+        }
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
 /// Human title and ACP tool kind shared by actionable approvals and the
 /// native-reviewing activity hint.
 fn approval_title_kind(params: &J) -> (String, &'static str) {
@@ -13214,6 +13306,17 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
     let raw_input = match &subject {
         J::Obj(_) => format!(",\"rawInput\":{}", j_to_string(&subject)),
         _ => String::new(),
+    };
+    // Muse 1.4.12 computer-use approvals carry the card's facts: shown as the
+    // prompt's content, and passed verbatim as metadata for editors that
+    // render the card natively.
+    let raw_input = match cua_card_text(params) {
+        Some(text) => format!(
+            "{raw_input},\"content\":[{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}],\"_meta\":{{\"muse\":{{\"cuaCardFacts\":{}}}}}",
+            esc(&text),
+            j_to_string(params.get("cuaCardFacts").unwrap_or(&J::Null))
+        ),
+        None => raw_input,
     };
     let (options_json, choices) = acp::perm_options(params);
     if choices.is_empty() {
@@ -16321,9 +16424,9 @@ mod tests {
         }
     }
     use super::{
-        CostRate, env_flag_enabled, friendly_terminal_error, friendly_turn_error, is_network_error,
-        model_retry_scheduled_log_line, parse_rates, quota_reset_phrase, retry_scheduled_log_line,
-        v1_init, v2_init,
+        CUA_TEXT_MAX_CHARS, CostRate, cua_card_text, env_flag_enabled, friendly_terminal_error,
+        friendly_turn_error, is_network_error, model_retry_scheduled_log_line, parse_rates,
+        quota_reset_phrase, retry_scheduled_log_line, v1_init, v2_init,
     };
     use crate::acp;
     use crate::json::{J, parse_json};
@@ -16403,6 +16506,75 @@ mod tests {
     /// through the permission mapping: choices must survive in host order
     /// with their decisions, and a deny fallback must exist for fail-closed
     /// paths.
+    #[test]
+    fn cua_card_facts_render_in_the_hosts_words() {
+        let params = parse_json(
+            r#"{"cuaCardFacts":{"page":{"host":"bücher.example","hostAscii":"xn--bcher-kva.example"},"windowTitle":"Checkout","steps":[{"step":1,"action":"click","roleWord":"button","label":"Pay now","effect":"may submit a payment","kind":"verb:submit"},{"step":2,"action":"press","roleWord":"key","chord":"cmd+enter","effect":"may send the form","kind":"verb:key"},{"step":3,"action":"click","point":{"x":512,"y":40},"effect":"may change the page","kind":"unlabeled"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cua_card_text(&params).as_deref(),
+            Some(
+                "Page: bücher.example (xn--bcher-kva.example)\n\
+                 Window: \"Checkout\"\n\
+                 Step 1: click button \"Pay now\" — may submit a payment\n\
+                 Step 2: press key cmd+enter — may send the form\n\
+                 Step 3: click at 512,40 — may change the page"
+            )
+        );
+
+        // Equal host forms are shown once; absent facts render nothing.
+        let plain = parse_json(
+            r#"{"cuaCardFacts":{"page":{"host":"example.com","hostAscii":"example.com"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(cua_card_text(&plain).as_deref(), Some("Page: example.com"));
+        assert_eq!(cua_card_text(&parse_json("{}").unwrap()), None);
+        assert_eq!(
+            cua_card_text(&parse_json(r#"{"cuaCardFacts":{}}"#).unwrap()),
+            None
+        );
+    }
+
+    #[test]
+    fn cua_card_app_text_stays_one_plain_capped_line() {
+        // A page sets the window title and labels: no line breaks, no bidi
+        // overrides, no Markdown links or markup, and a bounded length.
+        let hostile = format!(
+            "Pay\n[Allow](https://evil.example) \u{202e}<b>ok</b> `x` {}",
+            "a".repeat(400)
+        );
+        let params = J::Obj(vec![(
+            "cuaCardFacts".to_string(),
+            J::Obj(vec![
+                ("windowTitle".to_string(), J::Str(hostile.clone())),
+                (
+                    "steps".to_string(),
+                    J::Arr(vec![J::Obj(vec![
+                        ("step".to_string(), J::Num("1".to_string())),
+                        ("action".to_string(), J::Str("click".to_string())),
+                        ("roleWord".to_string(), J::Str("link".to_string())),
+                        ("label".to_string(), J::Str(hostile)),
+                        ("effect".to_string(), J::Str("may open a page".to_string())),
+                        ("kind".to_string(), J::Str("verb:open".to_string())),
+                    ])]),
+                ),
+            ]),
+        )]);
+        let text = cua_card_text(&params).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert!(lines[0].starts_with(
+            "Window: \"Pay \\[Allow\\]\\(https://evil.example\\) \\<b\\>ok\\</b\\> \\`x\\` aaa"
+        ));
+        assert!(lines[0].ends_with("…\""), "{}", lines[0]);
+        assert!(lines[1].starts_with("Step 1: click link \"Pay \\[Allow\\]"));
+        assert!(lines[1].ends_with("…\" — may open a page"), "{}", lines[1]);
+        assert!(!text.contains('\u{202e}'));
+        assert!(!text.contains("[Allow]("));
+        assert!(lines[0].chars().count() < CUA_TEXT_MAX_CHARS + 60);
+    }
+
     #[test]
     fn approval_transcripts_replay_through_the_permission_mapping() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/protocol/transcripts");

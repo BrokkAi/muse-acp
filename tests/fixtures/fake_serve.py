@@ -210,6 +210,10 @@ approval/updated without them) and `editor_approval_late_args`
 (approval/updated without rawArgs, then approval/requested with them) leave
 the turn open.
 
+Computer-use approvals: FAKE_APPROVAL_SUBJECT=computer-use adds Muse 1.4.12
+`cuaCardFacts` (page, window title with Markdown link syntax, one labeled
+step) to the approval.
+
 Editor file tools: `editor_bridge` records the adapter's `editor` server from
 session/start or session/resume config.mcpServers and, on turn/start, plays
 Muse's MCP client against it from a thread: initialize, the initialized
@@ -316,6 +320,18 @@ if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "mcp-tool":
     APPROVAL_PARAMS["itemId"] = "it-mcp"
     APPROVAL_PARAMS["subject"] = {
         "kind": "tool", "toolName": "mcp__probe__secret_word",
+    }
+if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "computer-use":
+    # Muse 1.4.12: a computer-use approval carries the card's facts. The
+    # window title and label are the app's own text, which a page can set.
+    APPROVAL_PARAMS["toolName"] = "computer"
+    APPROVAL_PARAMS["subject"] = {"kind": "tool", "toolName": "computer"}
+    APPROVAL_PARAMS["cuaCardFacts"] = {
+        "page": {"host": "shop.example", "hostAscii": "shop.example"},
+        "windowTitle": "Checkout [Allow](https://evil.example)",
+        "steps": [{"step": 1, "action": "click", "roleWord": "button",
+                   "label": "Pay now", "effect": "may submit a payment",
+                   "kind": "verb:submit"}],
     }
 if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "tool-described":
     # A tool subject with no tool name anywhere, only a description.

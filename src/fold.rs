@@ -115,10 +115,11 @@ fn fallback_card_title(kind: &str) -> String {
     }
 }
 
-/// The monitor description is model-controlled tool input. Keep a readable
-/// one-line label by replacing terminal/format controls and collapsing
-/// whitespace before it reaches a title or client metadata.
-fn sanitize_monitor_description(value: &str) -> String {
+/// Untrusted text (a model-controlled monitor description, an app's window
+/// title or control label) as one readable line: terminal and bidi format
+/// controls are replaced and whitespace collapsed before it reaches a title,
+/// prompt content, or client metadata.
+pub(crate) fn sanitize_one_line(value: &str) -> String {
     fn unsafe_format(c: char) -> bool {
         c.is_control()
             || matches!(
@@ -155,7 +156,7 @@ fn monitor_description(item: &J) -> String {
         .or_else(|| item.get("fallbackText").and_then(J::as_str))
         .unwrap_or("");
     let raw = raw.strip_prefix("Monitor event: ").unwrap_or(raw);
-    sanitize_monitor_description(raw)
+    sanitize_one_line(raw)
 }
 
 enum ItemRole {
@@ -3437,7 +3438,7 @@ pub fn stop_reason(terminal: &str) -> &'static str {
 
 #[cfg(test)]
 mod corpus_tests {
-    use super::{SessionFold, max_content, sanitize_monitor_description, trunc};
+    use super::{SessionFold, max_content, sanitize_one_line, trunc};
     use crate::json::{J, j_to_string, parse_json};
     use std::path::{Path, PathBuf};
 
@@ -3604,7 +3605,7 @@ mod corpus_tests {
     #[test]
     fn monitor_descriptions_are_sanitized_to_one_safe_line() {
         let description = " Build\twatcher \n\u{1b}[31m\u{202e}ready \u{2066}now\u{2069} ";
-        let sanitized = sanitize_monitor_description(description);
+        let sanitized = sanitize_one_line(description);
         assert_eq!(sanitized, "Build watcher [31m ready now");
         assert!(!sanitized.chars().any(char::is_control));
         assert!(!sanitized.contains('\u{202e}'));

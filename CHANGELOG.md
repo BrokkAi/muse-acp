@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Show what a computer-use approval would do (#385). Muse 1.4.12 sends the
+  approval card's facts, and the permission prompt now shows them as its
+  content: the page host, with its `xn--` form when it differs so a
+  look-alike host stands out, the window title, and each consequential step
+  as `Step N: <action> <roleWord> "<label>" — <effect>`. The window title and
+  control labels are the app's own text, which a web page can set, so they
+  are sanitized to one line, capped at 200 characters, and Markdown-escaped,
+  so an editor never renders them as links or markup. The facts are also
+  passed verbatim as `_meta.muse.cuaCardFacts`. The prompt's choices are
+  unchanged.
+
 - Re-pin the vendored Muse SDK conformance corpus to `09d67ec` (2026-10-22,
   "remirror: 1.4.12"), which publishes the Muse 1.4.12 stable surface. The
   additions over 1.4.11 are additive, and the method, notification, request,
