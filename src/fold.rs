@@ -1638,11 +1638,16 @@ impl SessionFold {
     }
 
     /// A Muse 1.4.12 `backgroundTerminalCompletion` names the backgrounded
-    /// call (`toolCallId`, the host call id the AIR task is keyed by) and its
-    /// terminal status. It settles that call's AIR async task only as a
-    /// fallback, when the call's own item terminal never did (for example
-    /// one missed across a reconnect): a state the call already reported is
-    /// never overridden, and a call this fold never announced is left alone.
+    /// call (`toolCallId`, the host call id) and its terminal status. It
+    /// settles that call's AIR async task only as a fallback, when the call's
+    /// own item terminal never did (for example one missed across a
+    /// reconnect): a state the call already reported is never overridden, and
+    /// a call this fold never announced is left alone.
+    ///
+    /// A live-announced task is keyed by the call id itself. A task seeded
+    /// from `task/list` keeps the host item id, which a `task/list` row
+    /// carries instead of the call id, so the call id is resolved through the
+    /// tool item that names it.
     fn settle_background_completion(
         &mut self,
         acp_sid: &str,
@@ -1656,13 +1661,27 @@ impl SessionFold {
         let Some(facts) = item.get("backgroundTerminalCompletion") else {
             return;
         };
-        let Some(task_id) = facts
+        let Some(call_id) = facts
             .get("toolCallId")
             .and_then(J::as_str)
-            .filter(|id| self.announced_tasks.contains(*id))
-            .map(str::to_string)
+            .filter(|id| !id.is_empty())
         else {
             return;
+        };
+        let task_id = if self.announced_tasks.contains(call_id) {
+            call_id.to_string()
+        } else {
+            let Some(item_id) = self.items.iter().find_map(|(item_id, role)| {
+                matches!(role, ItemRole::Tool { tc_id, .. } if tc_id == call_id)
+                    .then(|| item_id.clone())
+            }) else {
+                return;
+            };
+            let task_id = self.async_task_id_for(&item_id, call_id);
+            if !self.announced_tasks.contains(&task_id) {
+                return;
+            }
+            task_id
         };
         if self.async_task_states.contains_key(&task_id) {
             return;
@@ -3997,6 +4016,27 @@ mod corpus_tests {
                 .any(|line| line.contains("Background command finished: make")),
             "{out:?}"
         );
+
+        // A task seeded from task/list after a reconnect is keyed by the host
+        // item id; the completion's call id resolves to it through the tool
+        // item, and no second task is minted under the call id.
+        let mut out = Vec::new();
+        let row = parse_json(
+            r#"{"taskId":"it-seeded","kind":"tool.workspace-shell","status":"inProgress","tool":"workspace-shell"}"#,
+        )
+        .unwrap();
+        assert!(fold.seed_async_task("sid", &row, &mut out));
+        let seeded_call = parse_json(
+            r#"{"itemId":"it-seeded","kind":"toolCall","callId":"call-seeded","status":"inProgress","revision":3,"tool":"workspace-shell","args":"{}","background":true}"#,
+        )
+        .unwrap();
+        fold.on_item_snapshot("sid", 2, &seeded_call, &mut out);
+        assert!(states(&out, "it-seeded").is_empty(), "{out:?}");
+        fold.on_item_completed("sid", 2, &completion("call-seeded", "timedOut"), &mut out);
+        let settled = states(&out, "it-seeded");
+        assert_eq!(settled.len(), 1, "{out:?}");
+        assert!(settled[0].contains("\"state\":\"stopped\""), "{settled:?}");
+        assert!(states(&out, "call-seeded").is_empty(), "{out:?}");
 
         // Without AIR async tasks negotiated there is nothing to settle.
         let mut plain = SessionFold::new();
