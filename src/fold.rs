@@ -657,8 +657,17 @@ impl SessionFold {
     /// left to those events. The host task id becomes both the AIR task id
     /// and the MSP task id, so a stop and a later item terminal resolve to the
     /// same task. Returns true when the row was announced.
+    ///
+    /// Muse 1.4.12 also lists foreground work, marked `executionMode:
+    /// "foreground"`; that is the running turn's own tool call, not background
+    /// work, so it is skipped. An absent mode means background (older hosts
+    /// list background rows only), and an unknown mode is ignored as the
+    /// schema requires, which leaves the row background too.
     pub fn seed_async_task(&mut self, acp_sid: &str, row: &J, out: &mut Vec<String>) -> bool {
         if !self.air_async_tasks {
+            return false;
+        }
+        if row.get("executionMode").and_then(|v| v.as_str()) == Some("foreground") {
             return false;
         }
         let Some(task_id) = row
@@ -3769,6 +3778,35 @@ mod corpus_tests {
             update.get("title").and_then(J::as_str),
             Some("Monitor: Build watcher [31m")
         );
+    }
+
+    #[test]
+    fn foreground_task_rows_are_never_seeded_as_async_tasks() {
+        let mut fold = SessionFold::new();
+        fold.air_async_tasks = true;
+        let mut out = Vec::new();
+        let foreground = parse_json(
+            r#"{"taskId":"it-fg","kind":"tool.workspace-shell","status":"inProgress","tool":"workspace-shell","executionMode":"foreground"}"#,
+        )
+        .unwrap();
+        assert!(!fold.seed_async_task("sid", &foreground, &mut out));
+        assert!(out.is_empty(), "{out:?}");
+        assert_eq!(fold.msp_task_id("it-fg"), None);
+
+        // Explicit background, an unknown mode (ignored), and an absent mode
+        // (an older host) are all background work.
+        for (id, mode) in [
+            ("it-bg", r#","executionMode":"background""#),
+            ("it-new", r#","executionMode":"detached""#),
+            ("it-old", ""),
+        ] {
+            let row = parse_json(&format!(
+                r#"{{"taskId":"{id}","kind":"tool.workspace-shell","status":"inProgress","tool":"workspace-shell"{mode}}}"#
+            ))
+            .unwrap();
+            assert!(fold.seed_async_task("sid", &row, &mut out), "{id}");
+        }
+        assert_eq!(out.len(), 3, "{out:?}");
     }
 
     #[test]

@@ -1,19 +1,17 @@
 # Vendored Muse MSP conformance corpus
 
 - **Source:** <https://github.com/meta-models/muse-code-sdk>
-- **Upstream revision:** `22a8a56103c106009f7452c4ef5631e58cb8485c`
-  ("remirror: 1.4.11 from the internal source tree (tracked internally)",
-  2026-10-19).
-  This revision publishes the Muse 1.4.11 stable surface. The
+- **Upstream revision:** `09d67eca616b7b02a2d060271123c1fedbdb8fb7`
+  ("remirror: 1.4.12 from the internal source tree (tracked internally)",
+  2026-10-22).
+  This revision publishes the Muse 1.4.12 stable surface. The
   vendored `stable/` bundle is byte-identical to what an installed Muse
-  1.4.11 exports with `muse schema generate-json-schema`, which reports this
-  fingerprint byte-for-byte. The pinned 1.4.11-R6667.1 build in the
-  nightly live-host matrix reports it, so the adapter classifies this surface
-  as tested.
+  1.4.12 exports with `muse schema generate-json-schema`, which reports this
+  fingerprint byte-for-byte. No pinned 1.4.12 build is in the
+  live-host matrix yet, so the adapter classifies this surface as degraded.
   Only `schema/msp/` was copied, without `schema/msp/msp.d.ts`; the
   revision's `python/`, `clients/`, and `scripts/` trees are not vendored.
-  The previous pin was `ae46934` (Muse 1.4.10 carrying the 1.4.9 surface,
-  2026-10-16).
+  The previous pin was `22a8a56` (Muse 1.4.11, 2026-10-19).
 - **License:** MIT — see `LICENSE.muse-code-sdk`
 - **Contents:**
   - `stable/manifest.json` — schema version + stable-surface fingerprint

@@ -9,12 +9,12 @@ access, and useful in real editor workflows.
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
-- **Reference snapshots used for this revision:** Muse SDK `22a8a56`
-  (2026-10-19; stable schema version 1, manifest fingerprint
-  `sha256:f282ad16e21520d0cda68cb190149b86e2b062eef1dd282749360c05aa3d1082`,
-  the Muse 1.4.11 stable surface,
-  byte-identical to an installed 1.4.11's own schema export; tested
-  against the pinned 1.4.11-R6667.1 build in the nightly live-host matrix)
+- **Reference snapshots used for this revision:** Muse SDK `09d67ec`
+  (2026-10-22; stable schema version 1, manifest fingerprint
+  `sha256:cfdb6d2525601b9bac76584ccb0610ab3a5539b5e4f51141f079b99b39fcb4e0`,
+  the Muse 1.4.12 stable surface,
+  byte-identical to an installed 1.4.12's own schema export; degraded
+  until a pinned 1.4.12 build joins the nightly live-host matrix)
   and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
@@ -98,8 +98,9 @@ the verdict into richer support bundles.
   after that published the 1.4.6 fingerprint, the `a0c8611` pin after that
   published the 1.4.7 fingerprint, the `838d36a` pin after that published
   the 1.4.8 fingerprint, the `ae46934` pin after that published the 1.4.9
-  fingerprint that Muse 1.4.10 carries unchanged, and the current `22a8a56`
-  pin publishes the 1.4.11 fingerprint. Host 1.2.1 reports
+  fingerprint that Muse 1.4.10 carries unchanged, the `22a8a56` pin after
+  that published the 1.4.11 fingerprint, and the current `09d67ec` pin
+  publishes the 1.4.12 fingerprint. Host 1.2.1 reports
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
   bundle via the binary's own `muse schema` export, plus a live 1.2.1
@@ -207,7 +208,21 @@ the verdict into richer support bundles.
   workflow-child live test names a supported effort.
   The new surfaces have their own tracking issues
   ([#329](https://github.com/BrokkAi/muse-acp/issues/329) through
-  [#336](https://github.com/BrokkAi/muse-acp/issues/336)). Before 1.4.6, the
+  [#336](https://github.com/BrokkAi/muse-acp/issues/336)). The `09d67ec`
+  pin publishes the 1.4.12 surface
+  (`sha256:cfdb6d2525601b9bac76584ccb0610ab3a5539b5e4f51141f079b99b39fcb4e0`,
+  schema version 1). Over 1.4.11 it is purely additive, with the method,
+  notification, request, and error tables unchanged: computer-use approval
+  card facts, the `backgroundTerminalCompletion` and `overdueNotice` item
+  kinds, the `blockedPrompt` recall seed on `session/resume` and
+  `session/read`, the history `checkpointBoundary`, and the task-list
+  `command` and `executionMode`. An installed Muse 1.4.12 exports a schema
+  bundle byte-identical to the vendored copy while reporting this
+  fingerprint byte-for-byte; with no pinned 1.4.12 build in the live-host
+  matrix yet, it classifies as degraded
+  ([#381](https://github.com/BrokkAi/muse-acp/issues/381)). Its
+  dispositions are in the §9 field matrix, with follow-ups in
+  [#384](https://github.com/BrokkAi/muse-acp/issues/384) through [#386](https://github.com/BrokkAi/muse-acp/issues/386). Before 1.4.6, the
   Python tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
   `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
   surface while the top-level schema stayed on 1.3.0-R3401.1. Transcript
@@ -243,7 +258,7 @@ The SDK publishes generated MSP types, a schema bundle, and recorded transcripts
 The Rust adapter should consume those artifacts as conformance inputs.
 
 Status: **emissions validated and permission paths replayed.**
-`tests/protocol/` pins SDK revision `22a8a56` (stable manifest, JSON schema
+`tests/protocol/` pins SDK revision `09d67ec` (stable manifest, JSON schema
 bundle, 52 golden transcripts) with provenance and license. CI now replays
 every server-side item event through the notification fold (unknown kinds must
 tolerate), validates every emitted ACP frame with the adapter's own parser,
@@ -254,8 +269,10 @@ approval payload through the permission mapping, requiring ordered choices
 plus a deny fallback, and an env-gated `MUSE_ACP_LIVE_HOST=1` smoke test
 drives a real host handshake, session lifecycle, and close (skipped with an
 explicit message by default). The pinned 1.4.11-R6667.1 build in the
-nightly matrix makes the vendored 1.4.11 surface tested
-([#337](https://github.com/BrokkAi/muse-acp/issues/337)); the 1.4.9/1.4.10
+nightly matrix makes the 1.4.11 surface tested
+([#337](https://github.com/BrokkAi/muse-acp/issues/337)); the vendored 1.4.12
+surface stays degraded until a 1.4.12 build is pinned
+([#381](https://github.com/BrokkAi/muse-acp/issues/381)), and the 1.4.9/1.4.10
 surface stays degraded, since no 1.4.9 or 1.4.10 build is pinned. The `live-host` CI job also runs
 `tests/live_loopback.rs` on every push against each pinned Muse build on
 Linux x86-64, and the newest on macOS arm64 (downloaded and
@@ -316,7 +333,7 @@ their first Windows evidence.
 
 **Work items**
 
-- Pin the SDK revision (currently `22a8a56`, 2026-10-19) and vendor
+- Pin the SDK revision (currently `09d67ec`, 2026-10-22) and vendor
   `schema/msp/stable/manifest.json`, `schema/msp/stable/msp.schema.json`, and
   the `schema/msp/transcripts/` corpus under `tests/protocol/`, or fetch that
   locked revision in CI. The corpus already covers approvals, cancellation,
@@ -692,11 +709,11 @@ path, preserving the fail-closed policy from §4.
 
 **Muse 1.4.x stable-surface additions**
 
-Muse 1.4.1 through 1.4.11 grew the stable surface well past 1.3.0. The adapter
+Muse 1.4.1 through 1.4.12 grew the stable surface well past 1.3.0. The adapter
 adopts the parts that fit its ACP mapping (workspace roots, reasoning tiers,
 session delete on the hosts that serve it, `feedback/submit`, and
 `session/list` filters) and records an explicit disposition below for the
-rest, with a tracking issue. The pinned `22a8a56` bundle is the authority.
+rest, with a tracking issue. The pinned `09d67ec` bundle is the authority.
 The rows below record a disposition for the 1.4.x additions the adapter does
 not drive, plus `feedback/submit`, which it does; incoming notifications with
 no adapter arm stay safe because the unknown-method path in the fold logs and
@@ -877,6 +894,15 @@ cannot drop a member without failing CI.
 | `SessionReadResult.recoveryObservation` | Intentionally ignored | The adapter reads sessions only for history (fork points, subagent drill-down), where the observation carries no decision; resumed and re-attached sessions keep their existing behavior. [#334](https://github.com/BrokkAi/muse-acp/issues/334) |
 | `SubagentResult.drained` | Mapped to ACP | The host's parent-consumed join fact (Muse 1.4.11+) rides the subagent card as `_meta.muse.subagent.drained: true` and a "Delivered to the parent agent." line, from the first update that carries it; absent until then and never cleared. Card completion still follows the item's own status: the adapter derives no join of its own, so there is nothing for the flag to disagree with. [#336](https://github.com/BrokkAi/muse-acp/issues/336) |
 | `TurnInputPart.source` | Mapped to ACP | On Muse 1.4.11+ a skill part names its picked catalog copy: the adapter keeps a `skill/list` row's `source` when it is in the closed `bundled`/`user`/`project`/`plugin` vocabulary and the catalog holds exactly one copy of that selector, and sends it with the skill part. Two copies of one selector stay ambiguous to an editor command, so they, older hosts, and rows without a valid source keep the bare `(selector)` resolution. [#335](https://github.com/BrokkAi/muse-acp/issues/335) |
+| `ItemKind.backgroundTerminalCompletion` | Mapped to ACP | A finished backgrounded command (Muse 1.4.12+) is rendered through the unknown-kind generic card path from the item's `fallbackText`, carrying `_meta.muse.itemKind`. A dedicated card and settling the matching AIR async task are tracked in [#384](https://github.com/BrokkAi/muse-acp/issues/384). |
+| `ItemKind.overdueNotice` | Mapped to ACP | Rendered through the same unknown-kind generic card path from `fallbackText` (Muse 1.4.12+); the stable schema gives the kind no fields of its own. Tracked with the completion kind in [#384](https://github.com/BrokkAi/muse-acp/issues/384). |
+| `Item.backgroundTerminalCompletion` | Unsupported pending protocol decision | The five completion facts (`command`, `output`, `outputTruncated`, `terminalStatus`, `toolCallId`) are not read; the generic card shows only `fallbackText`. [#384](https://github.com/BrokkAi/muse-acp/issues/384) |
+| `ApprovalRequestParams.cuaCardFacts` | Unsupported pending protocol decision | The computer-use card facts (page host, window title, consequential steps; Muse 1.4.12+) are not read, so a computer-use permission prompt keeps its existing title and content and its deny-safe choices. Rendering them, with the window title and labels treated as untrusted text, is tracked in [#385](https://github.com/BrokkAi/muse-acp/issues/385). |
+| `SessionResumeResult.blockedPrompt` | Unsupported pending protocol decision | The recall seed for the latest blocked prompt (Muse 1.4.12+) is not read, and it is never replayed as history, which the schema forbids. ACP has no prompt-recall surface; exposing it as metadata is tracked in [#386](https://github.com/BrokkAi/muse-acp/issues/386). |
+| `SessionReadResult.blockedPrompt` | Intentionally ignored | The adapter reads sessions only for history (fork points, subagent drill-down), where a recall seed carries no decision; the resume copy is the one tracked in [#386](https://github.com/BrokkAi/muse-acp/issues/386). |
+| `SessionHistory.checkpointBoundary` | Intentionally ignored | The checkpoint-prune boundary (Muse 1.4.12+) marks which served rows predate the selected checkpoint. The adapter has no checkpoint or rewind surface and replays every served row, and the schema makes absence a non-assertion, so nothing depends on it. |
+| `TaskListEntry.command` | Intentionally ignored | Seeded async tasks keep their name from the row's `tool` or `kind`. The raw command text (Muse 1.4.12+) is never forwarded, since the schema leaves redaction to clients. |
+| `TaskListEntry.executionMode` | Mapped to ACP | When `task/list` seeds the AIR async-task inventory after a resume or re-attach, a `foreground` row (Muse 1.4.12+) is skipped: it is the running turn's own work, not a background task. `background`, absent (older hosts list background rows only), and unknown modes, which the schema says to ignore, keep seeding. |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**
