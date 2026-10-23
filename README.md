@@ -582,7 +582,8 @@ Beyond core ACP, the adapter negotiates these extensions. Each activates
 only when the client opts in too, with the documented fallback otherwise:
 
 - `_session/steering` — exact-turn steering on ACP v1 and v2. Follows the
-  ecosystem `_session/steering` convention (`steering.supported`); the
+  ecosystem `_session/steering` convention (`steering.supported`, with
+  `steering.idleBehaviors: ["promptRequired"]`); the
   standards-track `session/inject` proposal is still unmerged — adopting it is
   future work.
 - `_session/readOutput` — opt-in reads of host-stored tool output.

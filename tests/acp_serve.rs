@@ -392,14 +392,18 @@ impl Client {
                     && frame.contains("\"agentInfo\"")
                     && frame.contains("\"mcpCapabilities\":{")
                     && frame.contains("\"sessionCapabilities\":")
-                    && frame.contains("\"steering\":{\"supported\":true}"),
+                    && frame.contains(
+                        "\"steering\":{\"supported\":true,\"idleBehaviors\":[\"promptRequired\"]}"
+                    ),
                 "invalid v1 initialize shape: {frame}"
             );
         } else {
             assert!(
                 frame.contains("\"capabilities\":{")
                     && frame.contains("\"info\":")
-                    && frame.contains("\"steering\":{\"supported\":true}"),
+                    && frame.contains(
+                        "\"steering\":{\"supported\":true,\"idleBehaviors\":[\"promptRequired\"]}"
+                    ),
                 "invalid v2 initialize shape: {frame}"
             );
         }

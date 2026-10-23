@@ -22,6 +22,7 @@ ACP v1 clients advertise capabilities under
 | `_meta.muse.capabilities: ["userShell"]` | Client to agent | Allow `_session/userShell`; AIR `asyncTasks` and a host grant are also required. |
 | `_meta.muse.computerUse: true` | Client to agent | Legacy boolean spelling accepted for computer use. |
 | `_meta.steering.supported: true` | Agent to client | Advertises the `_session/steering` convention. |
+| `_meta.steering.idleBehaviors: ["promptRequired"]` | Agent to client | Advertises that a steer sent with `idleBehavior: "promptRequired"` while no turn is running is returned as `promptRequired` instead of starting a turn. |
 | `_meta.jetbrains.air` | Both | JetBrains AIR capabilities. This namespace belongs to the AIR extension, not Muse metadata. |
 
 ACP v1 clients also advertise standard compaction support with

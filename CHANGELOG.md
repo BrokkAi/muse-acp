@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Advertise `_meta.steering.idleBehaviors: ["promptRequired"]` in the ACP v1
+  and v2 `initialize` responses. `_session/steering` already honored
+  `idleBehavior: "promptRequired"` when no turn was running, but clients could
+  not see it, so clients that must not start untracked turns held messages
+  sent during a turn until it ended instead of steering them in (#382).
+
 ## 0.17.0
 
 - Send the adapter's own requests to the editor through `acp-lite`'s request
