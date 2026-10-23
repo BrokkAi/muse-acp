@@ -210,6 +210,10 @@ approval/updated without them) and `editor_approval_late_args`
 (approval/updated without rawArgs, then approval/requested with them) leave
 the turn open.
 
+Resumed background completion: with `async_resume`,
+FAKE_RESUME_BG_COMPLETION=1 puts a Muse 1.4.12 backgroundTerminalCompletion
+for the still-running `call-bg-resumed` first in the resumed history.
+
 Blocked-prompt recall: FAKE_BLOCKED_PROMPT=<text> adds Muse 1.4.12
 `blockedPrompt: {text}` to every session/resume result.
 
@@ -2195,6 +2199,21 @@ def result_for(method, msg):
                  "status": "completed", "turnId": None,
                  "commandText": "old command", "exitCode": 0},
             ]}
+            if os.environ.get("FAKE_RESUME_BG_COMPLETION") == "1":
+                # Muse 1.4.12: the backgrounded call's completion is in the
+                # durable fold while the call itself still reads running.
+                # Listed first, so the adapter must restore the task before
+                # settling it.
+                history["items"].insert(0, {
+                    "itemId": "btc-resumed",
+                    "kind": "backgroundTerminalCompletion",
+                    "status": "completed", "turnId": None,
+                    "fallbackText": "Background command failed",
+                    "backgroundTerminalCompletion": {
+                        "command": "npm watch", "output": "exit 1",
+                        "outputTruncated": False,
+                        "terminalStatus": "failed",
+                        "toolCallId": "call-bg-resumed"}})
         elif SCENARIO == "task_list_seed":
             # The adapter must learn about running work from `task/list`;
             # nothing in this history carries it.

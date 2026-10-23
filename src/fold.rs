@@ -1648,7 +1648,7 @@ impl SessionFold {
     /// from `task/list` keeps the host item id, which a `task/list` row
     /// carries instead of the call id, so the call id is resolved through the
     /// tool item that names it.
-    fn settle_background_completion(
+    pub fn settle_background_completion(
         &mut self,
         acp_sid: &str,
         kind: &str,

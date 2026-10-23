@@ -12501,6 +12501,50 @@ fn async_tasks_reconcile_on_resume() {
 }
 
 #[test]
+fn a_resumed_background_completion_settles_its_restored_task() {
+    // Muse 1.4.12 history can hold a backgrounded call that still reads
+    // running beside its completion. The restored task is settled from the
+    // completion, with or without transcript replay, and the other active
+    // task stays running.
+    for replay in [r#","replayFrom":{"type":"start"}"#, ""] {
+        let mut c = Client::spawn("async_resume", &[("FAKE_RESUME_BG_COMPLETION", "1")]);
+        let init = c.req(
+            "initialize",
+            &initialize_params(
+                2,
+                r#","capabilities":{"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["asyncTasks"]}}}}"#,
+            ),
+        );
+        c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+        c.notify("initialized", "{}");
+        let rid = c.req(
+            "session/resume",
+            &format!("{{\"sessionId\":\"existing-session\"{replay}}}"),
+        );
+        let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+        assert!(resumed.contains("\"result\""), "resume failed: {resumed}");
+        let settled = c.wait_for(
+            "\"asyncTaskId\":\"call-bg-resumed\",\"state\":\"failed\"",
+            Duration::from_secs(15),
+        );
+        assert!(settled.contains("async_task_state_update"), "{settled}");
+        let frames = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n");
+        assert!(
+            !frames
+                .lines()
+                .any(|line| line.contains("async_task_state_update")
+                    && line.contains("shell-shell-resumed")),
+            "the other active task stays running ({replay:?}): {frames}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn async_task_stop_is_rejected_honestly() {
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
