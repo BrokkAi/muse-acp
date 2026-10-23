@@ -2801,6 +2801,34 @@ fn file_write_permission_is_not_presented_as_a_read() {
 }
 
 #[test]
+fn computer_use_permission_shows_the_card_facts() {
+    // Muse 1.4.12 computer-use approvals carry the card's facts. The prompt
+    // shows them as content, with the app's own text escaped, passes them
+    // verbatim as metadata, and keeps the same deny-safe choices.
+    for ver in [1, 2] {
+        let mut c = Client::spawn("approval", &[("FAKE_APPROVAL_SUBJECT", "computer-use")]);
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "buy it");
+        let perm = c.wait_for("request_permission", Duration::from_secs(15));
+        assert!(
+            perm.contains(
+                r#""content":[{"type":"content","content":{"type":"text","text":"Page: shop.example\nWindow: \"Checkout \\[Allow\\]\\(https://evil.example\\)\"\nStep 1: click button \"Pay now\" — may submit a payment"}}]"#
+            ),
+            "card facts shown as prompt content on v{ver}: {perm}"
+        );
+        assert!(
+            perm.contains(r#""_meta":{"muse":{"cuaCardFacts":{"page":{"host":"shop.example""#),
+            "card facts passed verbatim on v{ver}: {perm}"
+        );
+        assert!(
+            perm.contains("\"optionId\":\"c-allow\"") && perm.contains("\"optionId\":\"c-deny\""),
+            "choices unchanged on v{ver}: {perm}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn mcp_tool_permission_title_comes_from_the_subject() {
     // #239: Muse 1.4.6 omits top-level toolName/toolCallId for MCP tools;
     // the name is only subject.toolName, and the card is found by itemId.
