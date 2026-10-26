@@ -79,6 +79,14 @@ medium or high authorization; low and medium allow.
   `reviewer timed out after <duration>` rationale, resets the reviewer session,
   and starts the next queued review.
 
+  The deadline is a last resort, not the usual path. A reviewer turn whose
+  answer is finished but held open by background reminder checks
+  (`turn/foregroundCompleted`) settles as soon as its reply parses as a
+  verdict, so a complete review never waits for a terminal that may not come.
+  A provider backoff during the review (`turn/retryScheduled`,
+  `turn/modelRetryScheduled`) is logged as `auto-review reviewer turn: …`, so a
+  slow review is distinguishable from a hung one.
+
 Every decision is logged to the adapter's stderr:
 
     [muse-acp] auto-review allow ap-1: routine workspace edit

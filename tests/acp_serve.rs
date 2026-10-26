@@ -9398,6 +9398,60 @@ fn auto_review_config() -> (std::path::PathBuf, &'static str) {
 }
 
 #[test]
+fn auto_review_settles_on_the_foreground_terminal_instead_of_timing_out() {
+    // The reviewer's answer can be done while reminder agents hold its turn
+    // open, so only turn/foregroundCompleted arrives. A parsed verdict is the
+    // whole decision; waiting for a terminal that never comes denied the
+    // approval at the deadline.
+    let mut c = Client::spawn(
+        "approval_hang",
+        &[
+            ("FAKE_REVIEW_FOREGROUND", "1"),
+            ("MUSE_REVIEW_TIMEOUT_MS", "1000"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "do the thing");
+    c.wait_stderr(
+        "settled on the foreground terminal",
+        Duration::from_secs(15),
+    );
+    c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("reviewer timed out"),
+        "the foreground terminal must settle before the deadline: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn auto_review_logs_a_reviewer_turn_retry() {
+    // A provider backoff inside the review window used to be silent, so a slow
+    // review looked exactly like a hung one.
+    let mut c = Client::spawn("approval", &[("FAKE_REVIEW_RETRY", "1")]);
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "request approval");
+    c.wait_stderr("auto-review reviewer turn:", Duration::from_secs(20));
+    c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(20));
+    c.finish();
+}
+
+#[test]
 fn auto_review_falls_back_when_the_host_rejects_the_reasoning_pin() {
     // Muse before 1.4.4 has no -c/--config and exits 2 with "unknown option
     // -c"; auto-review works from 1.4.2, so a refused pin must fall back to an

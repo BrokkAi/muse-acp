@@ -10544,6 +10544,43 @@ fn handle_review_event(
                 }
             }
         }
+        "turn/foregroundCompleted" => {
+            // Non-terminal: the reviewer's answer is done, but named background
+            // reminder checks hold its turn open. A parsed verdict is the whole
+            // decision, so settle now instead of spending the deadline waiting
+            // for a terminal that may never come.
+            let turn = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+            let (job, text) = {
+                let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+                if !st.turn.is_empty() && !turn.is_empty() && st.turn != turn {
+                    return true;
+                }
+                if st.active.is_none() || reviewer::parse_assessment(&st.text).is_none() {
+                    return true;
+                }
+                st.deadline = None;
+                st.session = None;
+                (st.active.take(), std::mem::take(&mut st.text))
+            };
+            if let Some(job) = job {
+                log(&format!(
+                    "auto-review {} settled on the foreground terminal",
+                    job.approval_id
+                ));
+                finish_review(host, stdout, sessions, job, &text);
+            }
+        }
+        "turn/retryScheduled" | "turn/modelRetryScheduled" => {
+            // A provider backoff inside the review window used to be silent, so
+            // a slow review looked like a hang. Record it while the deadline
+            // runs; it never settles the review.
+            let line = if method == "turn/modelRetryScheduled" {
+                model_retry_scheduled_log_line(params)
+            } else {
+                retry_scheduled_log_line(params)
+            };
+            log(&format!("auto-review reviewer turn: {line}"));
+        }
         "approval/requested" | "approval/request" | "approval/updated" => {
             // The reviewer must not act; deny its own approval so the review
             // can continue to a decision.

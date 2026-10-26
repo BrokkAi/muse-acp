@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Settle a finished review instead of waiting for its terminal. Muse can finish
+  the reviewer's answer while background reminder checks hold its turn open,
+  reporting only `turn/foregroundCompleted`. The review now settles as soon as
+  its reply parses as a verdict, so a complete review is no longer denied as a
+  timeout. A provider backoff during a review (`turn/retryScheduled`,
+  `turn/modelRetryScheduled`) is now logged as `auto-review reviewer turn: …`,
+  so a slow review is distinguishable from a hung one.
+
 - Pin the auto-review host to the `low` reasoning tier and give reviews twice
   the budget. The reviewer inherited the session's default reasoning effort, so
   a high default (the TUI's own default) spent the entire 90-second review
