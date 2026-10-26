@@ -31,6 +31,12 @@ pub const REVIEWER_FLAGS: HostFlags = HostFlags {
     disable_write: true,
     disable_shell: true,
 };
+/// Settings the reviewer host is launched with. The review is a bounded
+/// yes/no judgement, and Codex pins its guardian reviewer to the `low` tier
+/// whenever the model serves it; the reviewer here inherited the session's
+/// default instead, so a heavy default spent the whole 90-second review
+/// deadline reasoning and every approval was denied as a timeout.
+pub const REVIEWER_ARGS: [&str; 2] = ["-c", "reasoning_effort=\"low\""];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostKind {
@@ -53,6 +59,13 @@ impl HostKind {
             HostKind::Main => HostFlags::default(),
             HostKind::ReadOnly => READ_ONLY_FLAGS,
             HostKind::Reviewer => REVIEWER_FLAGS,
+        }
+    }
+
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            HostKind::Reviewer => &REVIEWER_ARGS,
+            HostKind::Main | HostKind::ReadOnly => &[],
         }
     }
 }
@@ -327,8 +340,13 @@ fn launch_process(
     computer_use: bool,
     forward: &Forward,
 ) -> Result<(Arc<MspHost>, u64), LaunchError> {
-    let (host, events) =
-        MspHost::launch(user_input_dialogs, user_shell, computer_use, kind.flags())?;
+    let (host, events) = MspHost::launch(
+        user_input_dialogs,
+        user_shell,
+        computer_use,
+        kind.flags(),
+        kind.args(),
+    )?;
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
     forward(HostTag { kind, generation }, events);
     Ok((host, generation))

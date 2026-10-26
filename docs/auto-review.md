@@ -15,6 +15,13 @@ The reviewer runs on its own `muse serve` host launched with
 they never appear in your saved sessions and cannot change files or run
 commands. The reviewer can still read files to gather evidence.
 
+That host is pinned to the `low` reasoning tier
+(`-c reasoning_effort="low"`), as Codex pins its guardian reviewer to `low`
+whenever the model serves it. A review is a bounded yes/no judgement, so it
+must not inherit a heavy session default: the reviewer used to take the Muse
+default tier, and a high default spent the whole review deadline reasoning
+until every approval was denied as a timeout.
+
 The reviewer prompt has six parts:
 
 1. The fixed safety policy, adapted from Codex's guardian policy: evidence
@@ -58,11 +65,12 @@ medium or high authorization; low and medium allow.
 - Each review runs in a fresh reviewer session, so no review inherits an
   earlier review's history. The adapter restarts the reviewer host every 32
   reviews.
-- Reviewer timeout: a review whose turn never ends is denied after 90 seconds
-  (Codex's guardian review timeout, overridable with `MUSE_REVIEW_TIMEOUT_MS`).
-  The adapter logs the timeout, shows the timeout duration in the editor
-  transcript, denies with a `reviewer timed out after <duration>` rationale,
-  resets the reviewer session, and starts the next queued review.
+- Reviewer timeout: a review whose turn never ends is denied after 180 seconds
+  (twice Codex's 90-second guardian review timeout, overridable with
+  `MUSE_REVIEW_TIMEOUT_MS`). The adapter logs the timeout, shows the timeout
+  duration in the editor transcript, denies with a
+  `reviewer timed out after <duration>` rationale, resets the reviewer session,
+  and starts the next queued review.
 
 Every decision is logged to the adapter's stderr:
 

@@ -691,15 +691,17 @@ impl Drop for MspHost {
 }
 
 impl MspHost {
-    /// Launches `muse serve` with `MUSE_SERVE_ARGS`, then the host flags.
+    /// Launches `muse serve` with `MUSE_SERVE_ARGS`, `extra_args`, then the
+    /// host flags.
     pub fn launch(
         user_input_dialogs: bool,
         user_shell: bool,
         computer_use: bool,
         flags: HostFlags,
+        extra_args: &[&str],
     ) -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
         let bin = muse_cli();
-        let (mut config, host_config) = serve_config(&bin, flags);
+        let (mut config, host_config) = serve_config(&bin, flags, extra_args);
         config.options(client_options(user_input_dialogs, user_shell, computer_use));
         let (client, events) = MspClient::spawn(config).map_err(|error| match error {
             muse_msp_client::LaunchError::Spawn { error, .. } => {
@@ -954,6 +956,7 @@ fn handshake_info(handshake: &Handshake, user_shell: bool, computer_use: bool) -
 fn serve_config(
     bin: &str,
     flags: HostFlags,
+    extra_args: &[&str],
 ) -> (LaunchConfig, Option<crate::host_config::HostConfig>) {
     let mut config = LaunchConfig::new(bin);
     config.args(
@@ -961,6 +964,7 @@ fn serve_config(
             .unwrap_or_default()
             .split_whitespace(),
     );
+    config.args(extra_args.iter().copied());
     config.host_flags(flags);
     let host_config = crate::host_config::configure(&mut config);
     (config, host_config)
@@ -973,7 +977,7 @@ pub fn probe_serve_exit(
     timeout: std::time::Duration,
 ) -> Result<Option<ExitClassification>, String> {
     let bin = muse_cli();
-    let (config, _host_config) = serve_config(&bin, HostFlags::default());
+    let (config, _host_config) = serve_config(&bin, HostFlags::default(), &[]);
     muse_msp_client::probe_exit(&config, timeout).map_err(|error| match error {
         muse_msp_client::LaunchError::Spawn { error, .. } => describe_spawn_error(&bin, &error),
         other => other.to_string(),

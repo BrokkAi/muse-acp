@@ -9398,6 +9398,69 @@ fn auto_review_config() -> (std::path::PathBuf, &'static str) {
 }
 
 #[test]
+fn auto_review_reviewer_host_is_pinned_to_the_low_reasoning_tier() {
+    // The reviewer must not inherit the session's default tier: a heavy default
+    // spent the whole review deadline reasoning and every approval timed out.
+    let (source, _original) = auto_review_config();
+    let mut c = Client::spawn(
+        "approval",
+        &[
+            ("XDG_CONFIG_HOME", source.to_str().unwrap()),
+            ("FAKE_CHECK_HOST_CONFIG", "1"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "request approval");
+    // The review prompt on the reviewer session proves the reviewer host ran.
+    c.wait_input(
+        "You are judging one planned coding-agent action",
+        Duration::from_secs(20),
+    );
+    let log = std::fs::read_to_string(format!("{}.config", c.fake_log)).unwrap();
+    let launches: Vec<serde_json::Value> = log
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let argv = |launch: &serde_json::Value| -> Vec<String> {
+        launch["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap().to_string())
+            .collect()
+    };
+    let reviewer = launches
+        .iter()
+        .map(argv)
+        .find(|args| args.iter().any(|arg| arg == "--no-session-log"))
+        .unwrap_or_else(|| panic!("the reviewer host launched: {log}"));
+    assert!(
+        reviewer
+            .windows(2)
+            .any(|pair| pair[0] == "-c" && pair[1] == "reasoning_effort=\"low\""),
+        "the reviewer host is pinned to the low tier: {reviewer:?}"
+    );
+    for main in launches
+        .iter()
+        .map(argv)
+        .filter(|args| !args.iter().any(|arg| arg == "--no-session-log"))
+    {
+        assert!(
+            !main.iter().any(|arg| arg.contains("reasoning_effort")),
+            "the user's own host keeps the session tier: {main:?}"
+        );
+    }
+    c.finish();
+    std::fs::remove_dir_all(source).unwrap();
+}
+
+#[test]
 fn auto_review_settings_are_scoped_to_the_host_and_human_approvals_still_work() {
     let (source, original) = auto_review_config();
     let mut c = Client::spawn(
