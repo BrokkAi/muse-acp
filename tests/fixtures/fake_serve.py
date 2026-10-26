@@ -221,6 +221,11 @@ Computer-use approvals: FAKE_APPROVAL_SUBJECT=computer-use adds Muse 1.4.12
 `cuaCardFacts` (page, window title with Markdown link syntax, one labeled
 step) to the approval.
 
+Turn steering: `turn/steer` echoes `expectedTurnId` by default.
+FAKE_STEER_ABSORB_TURN=<id> answers with that turn instead, the way a host
+that finds the expected turn gone can steer into the turn it is running now
+rather than refusing the request.
+
 Editor file tools: `editor_bridge` records the adapter's `editor` server from
 session/start or session/resume config.mcpServers and, on turn/start, plays
 Muse's MCP client against it from a thread: initialize, the initialized
@@ -2874,10 +2879,14 @@ def result_for(method, msg):
     if method == "turn/steer":
         params = msg.get("params", {})
         log_input(params)
+        # A host may steer into the turn it is running now when the expected
+        # turn is gone; FAKE_STEER_ABSORB_TURN replays that ack.
+        turn = os.environ.get("FAKE_STEER_ABSORB_TURN") or params.get(
+            "expectedTurnId", "")
         return {
             "commandId": params.get("commandId", ""),
             "status": "accepted",
-            "turnId": params.get("expectedTurnId", ""),
+            "turnId": turn,
         }
     if method.startswith("subagent/"):
         params = msg.get("params", {})

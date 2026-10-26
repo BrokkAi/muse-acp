@@ -7544,16 +7544,23 @@ fn handle_acp(
                 acp::send_error(stdout, &id, -32603, "steering returned no turnId");
                 return;
             }
-            let (outcome, started_new) = if let Some(expected) = active_turn.as_deref() {
-                if turn != expected {
-                    acp::send_error(
-                        stdout,
-                        &id,
-                        -32603,
-                        "turn/steer returned a different turnId",
-                    );
-                    return;
+            // A `turn/steer` ack names the turn that absorbed the input. A
+            // host that finds the expected turn gone may steer into the turn
+            // it is running now instead of refusing the request, so a
+            // different id is still proof that the input was delivered.
+            // Failing here would tell the editor that delivery was
+            // unconfirmed and invite it to send the same text twice, so take
+            // the ack's turn as the truth.
+            let absorbed_elsewhere = match active_turn.as_deref() {
+                Some(expected) if expected != turn.as_str() => {
+                    log(&format!(
+                        "turn/steer for {sid} was absorbed by turn {turn}, not the expected {expected}; adopting the host's turn"
+                    ));
+                    true
                 }
+                _ => false,
+            };
+            let (outcome, started_new) = if active_turn.is_some() {
                 ("injected", false)
             } else {
                 match result.get("disposition").and_then(|v| v.as_str()) {
@@ -7587,12 +7594,22 @@ fn handle_acp(
             {
                 s.active_turn = Some(turn.clone());
                 s.in_flight.push(InFlight {
-                    msp_turn: turn,
+                    msp_turn: turn.clone(),
                     req_id: J::Null,
                     queued: false,
                     file_report: None,
                     declined_retract_notified: false,
                 });
+            }
+            // The host steered into another turn: later steers and Stop must
+            // target the turn it is actually running, not the stale one.
+            if absorbed_elsewhere
+                && let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&sid)
+            {
+                s.active_turn = Some(turn);
             }
             // Acknowledge the extension before emitting the synthetic echo.
             // v2 reports the synthetic user message and the running state; v1

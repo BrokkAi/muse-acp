@@ -7089,6 +7089,58 @@ fn steering_injects_into_the_exact_active_turn() {
 }
 
 #[test]
+fn steering_absorbed_by_another_turn_still_reports_delivery() {
+    // A host that finds the expected turn gone may steer into the turn it is
+    // running now and name that turn in the ack. The input was delivered, so
+    // the editor must never see an internal error: the "delivery is
+    // unconfirmed, retrying can deliver the prompt twice" notice would make it
+    // offer a retry for text that already landed.
+    let mut c = Client::spawn("quiet", &[("FAKE_STEER_ABSORB_TURN", "turn-absorbed")]);
+    let sid = c.new_session(2, "");
+    let prompt_id = c.prompt(&sid, "start");
+    c.wait_for(&format!("\"id\":{prompt_id}"), Duration::from_secs(15));
+
+    let steer_id = c.req(
+        "_session/steering",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"also check the logs\"}}]}}"
+        ),
+    );
+    let response = c.wait_for(&format!("\"id\":{steer_id}"), Duration::from_secs(15));
+    assert!(
+        !response.contains("\"error\""),
+        "delivered steering must not answer with an error: {response}"
+    );
+    assert!(response.contains("\"outcome\":\"injected\""), "{response}");
+    c.wait_input("\"expectedTurnId\": \"turn-1\"", Duration::from_secs(15));
+    // The mismatch is a diagnostic, not a user-facing failure.
+    c.wait_stderr("absorbed by turn turn-absorbed", Duration::from_secs(15));
+
+    // The steered text still echoes into the transcript.
+    let echo = c.wait_for("also check the logs", Duration::from_secs(15));
+    assert!(
+        echo.contains("\"sessionUpdate\":\"user_message\""),
+        "{echo}"
+    );
+
+    // Later steering targets the turn the host is actually running, so the
+    // next request is not stale in the same way.
+    let next_id = c.req(
+        "_session/steering",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"and the config\"}}]}}"
+        ),
+    );
+    let next = c.wait_for(&format!("\"id\":{next_id}"), Duration::from_secs(15));
+    assert!(next.contains("\"outcome\":\"injected\""), "{next}");
+    c.wait_input(
+        "\"expectedTurnId\": \"turn-absorbed\"",
+        Duration::from_secs(15),
+    );
+    c.finish();
+}
+
+#[test]
 fn steering_idle_policy_is_race_safe() {
     let mut c = Client::spawn("happy", &[]);
     let sid = c.new_session(2, "");

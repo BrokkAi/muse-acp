@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Keep a delivered steer delivered when the host names another turn. A
+  `turn/steer` ack carries the turn that absorbed the input, and a host that
+  finds the expected turn gone may steer into the turn it is running now
+  instead of refusing the request. `_session/steering` treated that ack as an
+  internal error, so the editor reported "delivery is unconfirmed" and could
+  offer a retry that sent the same text twice. The ack's turn is now adopted
+  as the session's active turn, so later steering and Stop target it.
+
 - Show when a background command finishes (#384). Muse 1.4.12 reports a
   backgrounded command's completion as a `backgroundTerminalCompletion`
   item, which now renders as a "Background command <outcome>: <command>"
