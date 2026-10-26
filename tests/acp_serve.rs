@@ -9398,6 +9398,235 @@ fn auto_review_config() -> (std::path::PathBuf, &'static str) {
 }
 
 #[test]
+fn auto_review_settles_on_the_foreground_terminal_instead_of_timing_out() {
+    // The reviewer's answer can be done while reminder agents hold its turn
+    // open, so only turn/foregroundCompleted arrives. A parsed verdict is the
+    // whole decision; waiting for a terminal that never comes denied the
+    // approval at the deadline.
+    let mut c = Client::spawn(
+        "approval_hang",
+        &[
+            ("FAKE_REVIEW_FOREGROUND", "1"),
+            ("MUSE_REVIEW_TIMEOUT_MS", "1000"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "do the thing");
+    c.wait_stderr(
+        "settled on the foreground terminal",
+        Duration::from_secs(15),
+    );
+    c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert!(
+        !frames.contains("reviewer timed out"),
+        "the foreground terminal must settle before the deadline: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn auto_review_logs_a_reviewer_turn_retry() {
+    // A provider backoff inside the review window used to be silent, so a slow
+    // review looked exactly like a hung one.
+    let mut c = Client::spawn("approval", &[("FAKE_REVIEW_RETRY", "1")]);
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "request approval");
+    c.wait_stderr("auto-review reviewer turn:", Duration::from_secs(20));
+    c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(20));
+    c.finish();
+}
+
+#[test]
+fn auto_review_falls_back_when_the_host_rejects_the_reasoning_pin() {
+    // Muse before 1.4.4 has no -c/--config and exits 2 with "unknown option
+    // -c"; auto-review works from 1.4.2, so a refused pin must fall back to an
+    // unpinned reviewer instead of denying every approval.
+    let (source, _original) = auto_review_config();
+    let mut c = Client::spawn(
+        "approval",
+        &[
+            ("XDG_CONFIG_HOME", source.to_str().unwrap()),
+            ("FAKE_CHECK_HOST_CONFIG", "1"),
+            ("FAKE_REJECT_CONFIG_ARGS", "1"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "request approval");
+    c.wait_stderr(
+        "reviewer host refused -c (Muse before 1.4.4)",
+        Duration::from_secs(20),
+    );
+    // The review still decides the approval rather than failing closed.
+    c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(20));
+    let log = std::fs::read_to_string(format!("{}.config", c.fake_log)).unwrap();
+    let reviewer: Vec<Vec<String>> = log
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .map(|launch| {
+            launch["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| arg.as_str().unwrap().to_string())
+                .collect()
+        })
+        .filter(|args: &Vec<String>| args.iter().any(|arg| arg == "--no-session-log"))
+        .collect();
+    assert_eq!(
+        reviewer.len(),
+        2,
+        "the pin is tried, then retried without it: {log}"
+    );
+    assert!(
+        reviewer[0].iter().any(|arg| arg == "-c"),
+        "the first attempt carries the pin: {:?}",
+        reviewer[0]
+    );
+    assert!(
+        !reviewer[1].iter().any(|arg| arg == "-c"),
+        "the retry drops the refused pin: {:?}",
+        reviewer[1]
+    );
+    c.finish();
+    std::fs::remove_dir_all(source).unwrap();
+}
+
+#[test]
+fn auto_review_reviewer_host_keeps_one_reasoning_effort_setting() {
+    // `muse serve` refuses a repeated setting ("one setting, one occurrence"),
+    // so a user pin in MUSE_SERVE_ARGS must win instead of colliding with the
+    // reviewer's own default.
+    let (source, _original) = auto_review_config();
+    let mut c = Client::spawn(
+        "approval",
+        &[
+            ("XDG_CONFIG_HOME", source.to_str().unwrap()),
+            ("FAKE_CHECK_HOST_CONFIG", "1"),
+            ("MUSE_SERVE_ARGS", "-c reasoning_effort=\"high\""),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "request approval");
+    c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(20));
+    let log = std::fs::read_to_string(format!("{}.config", c.fake_log)).unwrap();
+    let reviewer = log
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|launch| {
+            launch["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|arg| arg == "--no-session-log")
+        })
+        .unwrap_or_else(|| panic!("the reviewer host launched: {log}"));
+    let args: Vec<&str> = reviewer["args"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|arg| arg.as_str().unwrap())
+        .collect();
+    let pins: Vec<&str> = args
+        .iter()
+        .copied()
+        .filter(|arg| arg.starts_with("reasoning_effort"))
+        .collect();
+    assert_eq!(pins, ["reasoning_effort=\"high\""], "one setting: {args:?}");
+    c.finish();
+    std::fs::remove_dir_all(source).unwrap();
+}
+
+#[test]
+fn auto_review_reviewer_host_is_pinned_to_the_low_reasoning_tier() {
+    // The reviewer must not inherit the session's default tier: a heavy default
+    // spent the whole review deadline reasoning and every approval timed out.
+    let (source, _original) = auto_review_config();
+    let mut c = Client::spawn(
+        "approval",
+        &[
+            ("XDG_CONFIG_HOME", source.to_str().unwrap()),
+            ("FAKE_CHECK_HOST_CONFIG", "1"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "request approval");
+    // The review prompt on the reviewer session proves the reviewer host ran.
+    c.wait_input(
+        "You are judging one planned coding-agent action",
+        Duration::from_secs(20),
+    );
+    let log = std::fs::read_to_string(format!("{}.config", c.fake_log)).unwrap();
+    let launches: Vec<serde_json::Value> = log
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let argv = |launch: &serde_json::Value| -> Vec<String> {
+        launch["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap().to_string())
+            .collect()
+    };
+    let reviewer = launches
+        .iter()
+        .map(argv)
+        .find(|args| args.iter().any(|arg| arg == "--no-session-log"))
+        .unwrap_or_else(|| panic!("the reviewer host launched: {log}"));
+    assert!(
+        reviewer
+            .windows(2)
+            .any(|pair| pair[0] == "-c" && pair[1] == "reasoning_effort=\"low\""),
+        "the reviewer host is pinned to the low tier: {reviewer:?}"
+    );
+    for main in launches
+        .iter()
+        .map(argv)
+        .filter(|args| !args.iter().any(|arg| arg == "--no-session-log"))
+    {
+        assert!(
+            !main.iter().any(|arg| arg.contains("reasoning_effort")),
+            "the user's own host keeps the session tier: {main:?}"
+        );
+    }
+    c.finish();
+    std::fs::remove_dir_all(source).unwrap();
+}
+
+#[test]
 fn auto_review_settings_are_scoped_to_the_host_and_human_approvals_still_work() {
     let (source, original) = auto_review_config();
     let mut c = Client::spawn(

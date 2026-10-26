@@ -3038,6 +3038,13 @@ def main():
                     json.dumps({"root": root, "settings": settings, "args": sys.argv[1:]}))
         if settings.get("permissions", {}).get("default_profile") == ":auto-review":
             os.environ["FAKE_START_ERROR"] = "profile"
+    if (os.environ.get("FAKE_REJECT_CONFIG_ARGS") == "1"
+            and any(arg in ("-c", "--config") for arg in sys.argv[1:])):
+        # Muse before 1.4.4 has no -c/--config flag and refuses the command
+        # line, so the adapter must retry the reviewer without it.
+        sys.stderr.write("muse serve: unknown option -c\n")
+        sys.stderr.flush()
+        os._exit(2)
     if SCENARIO == "support_exit":
         message = os.environ.get("FAKE_HOST_STDERR", "serve diagnostic")
         sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))
@@ -3469,6 +3476,25 @@ def main():
                         "sessionId": review_sid,
                         "item": {"itemId": "review-msg", "kind": "agentMessage",
                                  "status": "completed", "text": text}})
+                    if os.environ.get("FAKE_REVIEW_RETRY"):
+                        # A provider backoff inside the review window: the
+                        # review still finishes, but the retry must be visible.
+                        notify("turn/retryScheduled", {
+                            "sessionId": review_sid, "turnId": "review-turn-1",
+                            "attempt": 1, "nextAttempt": 2, "maxAttempts": 3,
+                            "retryDelayMs": 1500})
+                        notify("turn/modelRetryScheduled", {
+                            "sessionId": review_sid, "turnId": "review-turn-1",
+                            "attempt": 1, "nextAttempt": 2, "maxAttempts": 3,
+                            "retryDelayMs": 1500})
+                    if os.environ.get("FAKE_REVIEW_FOREGROUND"):
+                        # The answer is done while reminder agents hold the
+                        # turn open: only a non-terminal foreground notice
+                        # arrives, never turn/completed.
+                        notify("turn/foregroundCompleted", {
+                            "sessionId": review_sid, "turnId": "review-turn-1",
+                            "blockingAgents": ["verify-reminder"]})
+                        continue
                     notify("turn/completed", {
                         "sessionId": review_sid, "turnId": "review-turn-1",
                         "terminal": "completed"})

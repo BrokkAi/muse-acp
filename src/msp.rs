@@ -691,15 +691,17 @@ impl Drop for MspHost {
 }
 
 impl MspHost {
-    /// Launches `muse serve` with `MUSE_SERVE_ARGS`, then the host flags.
+    /// Launches `muse serve` with `MUSE_SERVE_ARGS`, `extra_args`, then the
+    /// host flags.
     pub fn launch(
         user_input_dialogs: bool,
         user_shell: bool,
         computer_use: bool,
         flags: HostFlags,
+        extra_args: &[&str],
     ) -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
         let bin = muse_cli();
-        let (mut config, host_config) = serve_config(&bin, flags);
+        let (mut config, host_config) = serve_config(&bin, flags, extra_args);
         config.options(client_options(user_input_dialogs, user_shell, computer_use));
         let (client, events) = MspClient::spawn(config).map_err(|error| match error {
             muse_msp_client::LaunchError::Spawn { error, .. } => {
@@ -954,16 +956,92 @@ fn handshake_info(handshake: &Handshake, user_shell: bool, computer_use: bool) -
 fn serve_config(
     bin: &str,
     flags: HostFlags,
+    extra_args: &[&str],
 ) -> (LaunchConfig, Option<crate::host_config::HostConfig>) {
     let mut config = LaunchConfig::new(bin);
-    config.args(
-        std::env::var("MUSE_SERVE_ARGS")
-            .unwrap_or_default()
-            .split_whitespace(),
-    );
+    let env_args: Vec<String> = std::env::var("MUSE_SERVE_ARGS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    // A setting may appear once: `muse serve` refuses a repeated key
+    // ("one setting, one occurrence") and exits 2, so a caller's own
+    // `MUSE_SERVE_ARGS` value wins over a pinned default instead of colliding
+    // with it.
+    let extra = without_duplicate_config_args(&env_args, extra_args);
+    config.args(env_args);
+    config.args(extra);
     config.host_flags(flags);
     let host_config = crate::host_config::configure(&mut config);
     (config, host_config)
+}
+
+/// Drop each `-c KEY=…` / `--config=KEY=…` pair from `later` whose key
+/// `earlier` already sets, so concatenating two argument lists never repeats a
+/// setting.
+fn without_duplicate_config_args<'a>(earlier: &[String], later: &[&'a str]) -> Vec<&'a str> {
+    let keys = config_keys(earlier.iter().map(String::as_str));
+    let mut kept = Vec::new();
+    let mut index = 0;
+    while index < later.len() {
+        if let Some(key) = config_arg(later, index).map(|(_, key)| key)
+            && keys.contains(&key)
+        {
+            index += config_arg_width(later[index]);
+            continue;
+        }
+        let width = config_arg_width(later[index]);
+        kept.extend(later[index..index + width].iter().copied());
+        index += width;
+    }
+    kept
+}
+
+/// The settings an argument list sets, in either spelling.
+fn config_keys<'a>(args: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let args: Vec<&str> = args.collect();
+    let mut keys = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if let Some(key) = config_arg(&args, index).map(|(_, key)| key) {
+            keys.push(key);
+        }
+        index += config_arg_width(args[index]);
+    }
+    keys
+}
+
+/// How many arguments the config spelling at `arg` occupies: two for the
+/// separate `-c KEY=…` form, one for the combined `--config=KEY=…` form that
+/// Muse also accepts.
+fn config_arg_width(arg: &str) -> usize {
+    if is_config_flag(arg) { 2 } else { 1 }
+}
+
+/// The setting named by the config argument at `index`, and the index of the
+/// argument carrying its `KEY=VALUE`.
+fn config_arg<'a>(args: &[&'a str], index: usize) -> Option<(usize, &'a str)> {
+    let arg = *args.get(index)?;
+    if is_config_flag(arg) {
+        return config_key(args.get(index + 1)?).map(|key| (index + 1, key));
+    }
+    let (flag, value) = arg.split_once('=')?;
+    if flag != "-c" && flag != "--config" {
+        return None;
+    }
+    config_key(value).map(|key| (index, key))
+}
+
+fn is_config_flag(arg: &str) -> bool {
+    arg == "-c" || arg == "--config"
+}
+
+/// The setting name in a `KEY=VALUE` argument.
+fn config_key(value: &str) -> Option<&str> {
+    value
+        .split_once('=')
+        .map(|(key, _)| key.trim())
+        .filter(|key| !key.is_empty())
 }
 
 /// Run a bounded, stdin-EOF-only serve probe for `--support`. The probe does
@@ -973,7 +1051,7 @@ pub fn probe_serve_exit(
     timeout: std::time::Duration,
 ) -> Result<Option<ExitClassification>, String> {
     let bin = muse_cli();
-    let (config, _host_config) = serve_config(&bin, HostFlags::default());
+    let (config, _host_config) = serve_config(&bin, HostFlags::default(), &[]);
     muse_msp_client::probe_exit(&config, timeout).map_err(|error| match error {
         muse_msp_client::LaunchError::Spawn { error, .. } => describe_spawn_error(&bin, &error),
         other => other.to_string(),
@@ -1076,10 +1154,79 @@ mod tests {
     use super::{
         ExitKind, ExitMessage, HANDLED_SERVER_REQUESTS, command_timeout,
         is_session_configuration_conflict, rejection_reason, session_profile_hint, session_suffix,
+        without_duplicate_config_args,
     };
     use crate::json::parse_json;
     use muse_msp_client::classify_exit_parts;
     use std::time::Duration;
+
+    #[test]
+    fn a_setting_already_in_the_environment_arguments_is_not_repeated() {
+        // muse serve refuses a repeated setting ("one setting, one occurrence")
+        // and exits 2, so a caller's pin must replace a pinned default.
+        let env =
+            |raw: &str| -> Vec<String> { raw.split_whitespace().map(str::to_string).collect() };
+        let reviewer = ["-c", "reasoning_effort=\"low\""];
+        assert_eq!(
+            without_duplicate_config_args(&env("-c reasoning_effort=\"high\""), &reviewer),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            without_duplicate_config_args(&env("--trust-workspace"), &reviewer),
+            reviewer.to_vec()
+        );
+        // A different key is not a duplicate, and other arguments survive.
+        assert_eq!(
+            without_duplicate_config_args(&env("--config model=\"x\""), &reviewer),
+            reviewer.to_vec()
+        );
+        let mixed = ["--disable-write", "-c", "reasoning_effort=\"low\""];
+        assert_eq!(
+            without_duplicate_config_args(&env("-c reasoning_effort=\"high\""), &mixed),
+            vec!["--disable-write"]
+        );
+        // The long spelling of the flag counts too.
+        assert_eq!(
+            without_duplicate_config_args(&env("--config reasoning_effort=\"high\""), &reviewer),
+            Vec::<&str>::new()
+        );
+        // Muse also accepts the combined spelling, so it must be recognized
+        // in both lists: otherwise the pin survives and the host exits 2.
+        for combined in [
+            "--config=reasoning_effort=\"high\"",
+            "-c=reasoning_effort=\"high\"",
+        ] {
+            assert_eq!(
+                without_duplicate_config_args(&env(combined), &reviewer),
+                Vec::<&str>::new(),
+                "{combined} sets the same key"
+            );
+        }
+        assert_eq!(
+            without_duplicate_config_args(
+                &env("-c reasoning_effort=\"high\""),
+                &["--config=reasoning_effort=\"low\""]
+            ),
+            Vec::<&str>::new(),
+            "the combined spelling in the later list is dropped too"
+        );
+        assert_eq!(
+            without_duplicate_config_args(
+                &env("--config=model=\"x\""),
+                &["--config=reasoning_effort=\"low\""]
+            ),
+            vec!["--config=reasoning_effort=\"low\""],
+            "a different key is not a duplicate"
+        );
+        // A flag-looking value is not mistaken for the flag itself.
+        assert_eq!(
+            without_duplicate_config_args(
+                &env("-c reasoning_effort=\"high\""),
+                &["--trust-workspace"]
+            ),
+            vec!["--trust-workspace"]
+        );
+    }
 
     #[test]
     fn serve_exit_codes_are_classified_without_consulting_stderr() {

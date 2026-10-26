@@ -15,7 +15,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 
 use crate::json::{J, parse_json};
-use crate::msp::{HandshakeInfo, HostFlags, LaunchError, MspEvent, MspHost, mk_err};
+use crate::msp::{ExitKind, HandshakeInfo, HostFlags, LaunchError, MspEvent, MspHost, mk_err};
 
 /// Flags that make Muse refuse workspace writes and shell commands
 /// (`--disable-write --disable-shell`).
@@ -31,6 +31,16 @@ pub const REVIEWER_FLAGS: HostFlags = HostFlags {
     disable_write: true,
     disable_shell: true,
 };
+/// Settings the reviewer host is launched with. The review is a bounded
+/// yes/no judgement, and Codex pins its guardian reviewer to the `low` tier
+/// whenever the model serves it; the reviewer here inherited the session's
+/// default instead, so a heavy default spent the whole 90-second review
+/// deadline reasoning and every approval was denied as a timeout.
+///
+/// `muse serve` only grew `-c/--config` in Muse 1.4.4, while auto-review works
+/// from 1.4.2, so [`Hosts::reviewer_host`] drops these when an older host
+/// refuses the command line.
+pub const REVIEWER_ARGS: [&str; 2] = ["-c", "reasoning_effort=\"low\""];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostKind {
@@ -53,6 +63,13 @@ impl HostKind {
             HostKind::Main => HostFlags::default(),
             HostKind::ReadOnly => READ_ONLY_FLAGS,
             HostKind::Reviewer => REVIEWER_FLAGS,
+        }
+    }
+
+    fn args(self) -> &'static [&'static str] {
+        match self {
+            HostKind::Reviewer => &REVIEWER_ARGS,
+            HostKind::Main | HostKind::ReadOnly => &[],
         }
     }
 }
@@ -101,6 +118,7 @@ impl Hosts {
             user_input_dialogs,
             user_shell,
             computer_use,
+            HostKind::Main.args(),
             &forward,
         )?;
         Ok(Arc::new(Hosts {
@@ -119,11 +137,22 @@ impl Hosts {
     /// Launches a new process of this kind, forwarding its events, without
     /// making it current; see [`Hosts::replace`].
     pub fn launch_kind(&self, kind: HostKind) -> Result<(Arc<MspHost>, u64), LaunchError> {
+        self.launch_kind_with(kind, kind.args())
+    }
+
+    /// Launches a new process of this kind with an explicit argument list, so
+    /// a caller can retry a launch without arguments the host refused.
+    fn launch_kind_with(
+        &self,
+        kind: HostKind,
+        args: &[&str],
+    ) -> Result<(Arc<MspHost>, u64), LaunchError> {
         launch_process(
             kind,
             self.user_input_dialogs,
             self.user_shell,
             self.computer_use,
+            args,
             &self.forward,
         )
     }
@@ -188,9 +217,22 @@ impl Hosts {
         if let Some(host) = self.host(HostKind::Reviewer) {
             return Ok(host);
         }
-        let (host, generation) = self
-            .launch_kind(HostKind::Reviewer)
-            .map_err(|e| format!("could not start the reviewer Muse host: {e}"))?;
+        let launched = self.launch_kind(HostKind::Reviewer).or_else(|error| {
+            // Muse before 1.4.4 has no `-c/--config` and exits 2 with
+            // "unknown option -c", which would deny every review. The tier pin
+            // is an optimization, so such a host still gets a reviewer, just at
+            // whatever tier it defaults to.
+            if args_rejected(&error) {
+                crate::msp::log(
+                    "reviewer host refused -c (Muse before 1.4.4); starting it at its own default reasoning tier",
+                );
+                self.launch_kind_with(HostKind::Reviewer, &[])
+            } else {
+                Err(error)
+            }
+        });
+        let (host, generation) =
+            launched.map_err(|e| format!("could not start the reviewer Muse host: {e}"))?;
         crate::msp::log(
             "reviewer Muse host started (--no-session-log --disable-write --disable-shell)",
         );
@@ -325,13 +367,26 @@ fn launch_process(
     user_input_dialogs: bool,
     user_shell: bool,
     computer_use: bool,
+    args: &[&str],
     forward: &Forward,
 ) -> Result<(Arc<MspHost>, u64), LaunchError> {
-    let (host, events) =
-        MspHost::launch(user_input_dialogs, user_shell, computer_use, kind.flags())?;
+    let (host, events) = MspHost::launch(
+        user_input_dialogs,
+        user_shell,
+        computer_use,
+        kind.flags(),
+        args,
+    )?;
     let generation = GENERATION.fetch_add(1, Ordering::Relaxed);
     forward(HostTag { kind, generation }, events);
     Ok((host, generation))
+}
+
+/// Whether a launch failed because the host refused its command line. That is
+/// the only launch failure a shorter argument list can fix: an unknown flag or
+/// a rejected setting exits with [`ExitKind::UsageError`].
+fn args_rejected(error: &LaunchError) -> bool {
+    matches!(error, LaunchError::HostExit(exit) if exit.kind == ExitKind::UsageError)
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {

@@ -8,9 +8,11 @@
 
 use std::time::Duration;
 
-/// Bound a hung reviewer turn, following Codex's guardian review timeout:
-/// Codex allows each review `REVIEW_TIMEOUT` before timing out the approval.
-pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(90);
+/// Bound a hung reviewer turn. Codex allows each guardian review
+/// `REVIEW_TIMEOUT` (90 s) before timing out the approval; this budget is
+/// deliberately twice that, because the review here is one model turn over a
+/// cold prompt on the reviewer host rather than Codex's warm pooled reviewer.
+pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Recycle the reviewer host after this many review sessions. Each review runs
 /// in a fresh session so no review inherits an earlier review's history, and
@@ -18,7 +20,7 @@ pub const REVIEW_TIMEOUT: Duration = Duration::from_secs(90);
 pub const SESSIONS_PER_HOST: usize = 32;
 
 /// Resolve a review timeout from an optional environment override
-/// (`MUSE_REVIEW_TIMEOUT_MS`, milliseconds) and the Codex default.
+/// (`MUSE_REVIEW_TIMEOUT_MS`, milliseconds) and the built-in default.
 pub fn resolve_review_timeout(env_override: Option<&str>) -> Duration {
     if let Some(raw) = env_override
         && let Ok(ms) = raw.trim().parse::<u64>()
@@ -354,8 +356,8 @@ mod tests {
     }
 
     #[test]
-    fn review_timeout_defaults_to_the_codex_timeout() {
-        assert_eq!(REVIEW_TIMEOUT, Duration::from_secs(90));
+    fn review_timeout_defaults_to_the_built_in_budget() {
+        assert_eq!(REVIEW_TIMEOUT, Duration::from_secs(180));
         assert_eq!(resolve_review_timeout(None), REVIEW_TIMEOUT);
         assert_eq!(resolve_review_timeout(Some("1000")), Duration::from_secs(1));
         // Absurd and unparsable overrides fall back instead of hanging

@@ -2,6 +2,30 @@
 
 ## Unreleased
 
+- Settle a finished review instead of waiting for its terminal. Muse can finish
+  the reviewer's answer while background reminder checks hold its turn open,
+  reporting only `turn/foregroundCompleted`. The review now settles as soon as
+  its reply parses as a verdict, so a complete review is no longer denied as a
+  timeout. A provider backoff during a review (`turn/retryScheduled`,
+  `turn/modelRetryScheduled`) is now logged as `auto-review reviewer turn: …`,
+  so a slow review is distinguishable from a hung one.
+
+- Pin the auto-review host to the `low` reasoning tier and give reviews twice
+  the budget. The reviewer inherited the session's default reasoning effort, so
+  a high default (the TUI's own default) spent the entire 90-second review
+  deadline reasoning and every approval was denied as `reviewer timed out after
+  90s` — Muse reported it to the model as a rejection. The reviewer host now
+  launches with `-c reasoning_effort="low"`, the tier Codex pins guardian to
+  whenever the model serves it, and the review deadline defaults to 180 seconds
+  (`MUSE_REVIEW_TIMEOUT_MS` still overrides it). The deadline is a hang
+  detector again instead of the usual decision path. Because `muse serve` only
+  grew `-c/--config` in Muse 1.4.4 while auto-review works from 1.4.2, a host
+  that refuses the command line is retried once without the pin, so it still
+  reviews at its own default tier instead of denying every approval; and a
+  `reasoning_effort` already set through `MUSE_SERVE_ARGS` is never repeated, in
+  either the `-c KEY=VALUE` or the `--config=KEY=VALUE` spelling, since Muse
+  refuses a setting given twice.
+
 - Re-pin the vendored Muse SDK conformance corpus to `3dce908` (2026-10-24,
   "remirror: 1.4.13"), which publishes the Muse 1.4.13 stable surface. The
   additions over 1.4.12 are additive, and the method, notification, request,
