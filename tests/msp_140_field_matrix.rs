@@ -3,9 +3,10 @@
 //! Issue #224 closed the gap between the pinned 1.4.6 stable surface and the
 //! adapter by deciding, per field (later adoptions, such as #243's 1.4.7
 //! `Item.cutOff`, #272's 1.4.9 `Item.displayLabel`, the 1.4.11 re-pin's
-//! item kinds, goal timestamps, recovery members, and skill source, and the
+//! item kinds, goal timestamps, recovery members, and skill source, the
 //! 1.4.12 re-pin's item kinds, approval card facts, recall seed, checkpoint
-//! boundary, and task-list members, join the same matrix),
+//! boundary, and task-list members, and the 1.4.13 re-pin's approval data
+//! facts, replay hints, work id, and queued inputs, join the same matrix),
 //! whether it earns an ACP mapping or an explicit "Intentionally ignored"
 //! disposition. This test keeps that matrix
 //! honest in two ways: every addition has exactly one disposition row in
@@ -79,6 +80,11 @@ const ADDITIONS: &[&str] = &[
     "SessionHistory.checkpointBoundary",
     "TaskListEntry.command",
     "TaskListEntry.executionMode",
+    "ApprovalCuaCardFacts.data",
+    "Item.replayHint",
+    "Item.terminalRowAfterItemId",
+    "Item.workId",
+    "SessionReadResult.queuedInputs",
 ];
 
 fn matrix() -> String {
@@ -303,10 +309,51 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("SessionHistory", "checkpointBoundary"),
         ("TaskListEntry", "command"),
         ("TaskListEntry", "executionMode"),
+        ("ApprovalCuaCardFacts", "data"),
+        ("Item", "replayHint"),
+        ("Item", "terminalRowAfterItemId"),
+        ("Item", "workId"),
+        ("SessionReadResult", "queuedInputs"),
     ] {
         assert!(
             has_property(defs, def, member),
             "{def}.{member} left the stable surface"
+        );
+    }
+}
+
+#[test]
+fn one_4_13_definitions_stay_in_the_vendored_bundle() {
+    let schema = schema();
+    let defs = schema.get("$defs").expect("$defs");
+    for def in [
+        "ApprovalCuaDataFact",
+        "ApprovalCuaMask",
+        "QueuedInput",
+        "ReplayHint",
+    ] {
+        assert!(defs.get(def).is_some(), "{def} left the stable surface");
+    }
+    let requires = |def: &str, member: &str| {
+        defs.get(def)
+            .and_then(|d| d.get("required"))
+            .and_then(|r| r.as_array())
+            .is_some_and(|members| members.iter().any(|m| m == member))
+    };
+    assert!(
+        requires("ApprovalCuaDataFact", "kind"),
+        "ApprovalCuaDataFact.kind left the stable surface"
+    );
+    for member in ["afterItemId", "rowKinds"] {
+        assert!(
+            requires("ReplayHint", member),
+            "ReplayHint.{member} left the stable surface"
+        );
+    }
+    for member in ["sequence", "text"] {
+        assert!(
+            requires("QueuedInput", member),
+            "QueuedInput.{member} left the stable surface"
         );
     }
 }

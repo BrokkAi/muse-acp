@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Re-pin the vendored Muse SDK conformance corpus to `3dce908` (2026-10-24,
+  "remirror: 1.4.13"), which publishes the Muse 1.4.13 stable surface. The
+  additions over 1.4.12 are additive, and the method, notification, request,
+  error, and capability tables are unchanged, so no notification row changed
+  in `docs/event-compatibility.md`: computer-use approval data facts
+  (`cuaCardFacts.data` and its `mask`), the monitor tool-call `replayHint`
+  and `terminalRowAfterItemId`, the ManagedBash `Item.workId`, the
+  `queuedInputs` a `session/read` still holds, and a clarified resume
+  permission-profile reset over a declared lost record. No installed Muse
+  1.4.13 was available to diff against, and no 1.4.13 build runs in the
+  nightly live-host matrix yet, so the new fingerprint classifies as degraded
+  until one is pinned (#399). Each addition has a ROADMAP §9 field-matrix
+  row: the approval data facts, the replay hints, and the work id are tracked
+  in #395 through #397, the lost-record check in #398, and the queued inputs
+  are recorded as intentionally ignored.
+
 - Keep a delivered steer delivered when the host names another turn. A
   `turn/steer` ack carries the turn that absorbed the input, and a host that
   finds the expected turn gone may steer into the turn it is running now
