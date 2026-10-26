@@ -22,8 +22,9 @@
   grew `-c/--config` in Muse 1.4.4 while auto-review works from 1.4.2, a host
   that refuses the command line is retried once without the pin, so it still
   reviews at its own default tier instead of denying every approval; and a
-  `reasoning_effort` already set through `MUSE_SERVE_ARGS` is never repeated,
-  since Muse refuses a setting given twice.
+  `reasoning_effort` already set through `MUSE_SERVE_ARGS` is never repeated, in
+  either the `-c KEY=VALUE` or the `--config=KEY=VALUE` spelling, since Muse
+  refuses a setting given twice.
 
 - Re-pin the vendored Muse SDK conformance corpus to `3dce908` (2026-10-24,
   "remirror: 1.4.13"), which publishes the Muse 1.4.13 stable surface. The

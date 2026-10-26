@@ -976,38 +976,60 @@ fn serve_config(
     (config, host_config)
 }
 
-/// Drop each `-c KEY=…` pair from `later` whose key `earlier` already sets, so
-/// concatenating two argument lists never repeats a setting.
+/// Drop each `-c KEY=…` / `--config=KEY=…` pair from `later` whose key
+/// `earlier` already sets, so concatenating two argument lists never repeats a
+/// setting.
 fn without_duplicate_config_args<'a>(earlier: &[String], later: &[&'a str]) -> Vec<&'a str> {
-    let mut keys: Vec<&str> = Vec::new();
-    let mut index = 0;
-    while index < earlier.len() {
-        if is_config_flag(&earlier[index])
-            && let Some(key) = earlier.get(index + 1).and_then(|value| config_key(value))
-        {
-            keys.push(key);
-        }
-        index += 1;
-    }
+    let keys = config_keys(earlier.iter().map(String::as_str));
     let mut kept = Vec::new();
     let mut index = 0;
     while index < later.len() {
-        if is_config_flag(later[index])
-            && let Some(value) = later.get(index + 1)
+        if let Some(key) = config_arg(later, index).map(|(_, key)| key)
+            && keys.contains(&key)
         {
-            if config_key(value).is_some_and(|key| keys.contains(&key)) {
-                index += 2;
-                continue;
-            }
-            kept.push(later[index]);
-            kept.push(value);
-            index += 2;
+            index += config_arg_width(later[index]);
             continue;
         }
-        kept.push(later[index]);
-        index += 1;
+        let width = config_arg_width(later[index]);
+        kept.extend(later[index..index + width].iter().copied());
+        index += width;
     }
     kept
+}
+
+/// The settings an argument list sets, in either spelling.
+fn config_keys<'a>(args: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let args: Vec<&str> = args.collect();
+    let mut keys = Vec::new();
+    let mut index = 0;
+    while index < args.len() {
+        if let Some(key) = config_arg(&args, index).map(|(_, key)| key) {
+            keys.push(key);
+        }
+        index += config_arg_width(args[index]);
+    }
+    keys
+}
+
+/// How many arguments the config spelling at `arg` occupies: two for the
+/// separate `-c KEY=…` form, one for the combined `--config=KEY=…` form that
+/// Muse also accepts.
+fn config_arg_width(arg: &str) -> usize {
+    if is_config_flag(arg) { 2 } else { 1 }
+}
+
+/// The setting named by the config argument at `index`, and the index of the
+/// argument carrying its `KEY=VALUE`.
+fn config_arg<'a>(args: &[&'a str], index: usize) -> Option<(usize, &'a str)> {
+    let arg = *args.get(index)?;
+    if is_config_flag(arg) {
+        return config_key(args.get(index + 1)?).map(|key| (index + 1, key));
+    }
+    let (flag, value) = arg.split_once('=')?;
+    if flag != "-c" && flag != "--config" {
+        return None;
+    }
+    config_key(value).map(|key| (index, key))
 }
 
 fn is_config_flag(arg: &str) -> bool {
@@ -1167,6 +1189,42 @@ mod tests {
         assert_eq!(
             without_duplicate_config_args(&env("--config reasoning_effort=\"high\""), &reviewer),
             Vec::<&str>::new()
+        );
+        // Muse also accepts the combined spelling, so it must be recognized
+        // in both lists: otherwise the pin survives and the host exits 2.
+        for combined in [
+            "--config=reasoning_effort=\"high\"",
+            "-c=reasoning_effort=\"high\"",
+        ] {
+            assert_eq!(
+                without_duplicate_config_args(&env(combined), &reviewer),
+                Vec::<&str>::new(),
+                "{combined} sets the same key"
+            );
+        }
+        assert_eq!(
+            without_duplicate_config_args(
+                &env("-c reasoning_effort=\"high\""),
+                &["--config=reasoning_effort=\"low\""]
+            ),
+            Vec::<&str>::new(),
+            "the combined spelling in the later list is dropped too"
+        );
+        assert_eq!(
+            without_duplicate_config_args(
+                &env("--config=model=\"x\""),
+                &["--config=reasoning_effort=\"low\""]
+            ),
+            vec!["--config=reasoning_effort=\"low\""],
+            "a different key is not a duplicate"
+        );
+        // A flag-looking value is not mistaken for the flag itself.
+        assert_eq!(
+            without_duplicate_config_args(
+                &env("-c reasoning_effort=\"high\""),
+                &["--trust-workspace"]
+            ),
+            vec!["--trust-workspace"]
         );
     }
 

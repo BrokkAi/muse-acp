@@ -27,7 +27,8 @@ works from 1.4.2. A host that refuses the command line (exit 2, `unknown option
 -c`) is retried once without the pin and logged as `reviewer host refused -c
 (Muse before 1.4.4)`, so such a host still reviews, at its own default tier.
 The pin is never repeated: a `reasoning_effort` a user already set through
-`MUSE_SERVE_ARGS` wins, because `muse serve` refuses a setting given twice.
+`MUSE_SERVE_ARGS` wins, in either the `-c KEY=VALUE` or the `--config=KEY=VALUE`
+spelling, because `muse serve` refuses a setting given twice.
 
 The reviewer prompt has six parts:
 
