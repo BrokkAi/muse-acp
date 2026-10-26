@@ -3038,6 +3038,13 @@ def main():
                     json.dumps({"root": root, "settings": settings, "args": sys.argv[1:]}))
         if settings.get("permissions", {}).get("default_profile") == ":auto-review":
             os.environ["FAKE_START_ERROR"] = "profile"
+    if (os.environ.get("FAKE_REJECT_CONFIG_ARGS") == "1"
+            and any(arg in ("-c", "--config") for arg in sys.argv[1:])):
+        # Muse before 1.4.4 has no -c/--config flag and refuses the command
+        # line, so the adapter must retry the reviewer without it.
+        sys.stderr.write("muse serve: unknown option -c\n")
+        sys.stderr.flush()
+        os._exit(2)
     if SCENARIO == "support_exit":
         message = os.environ.get("FAKE_HOST_STDERR", "serve diagnostic")
         sys.stderr.write(message + ("" if message.endswith("\n") else "\n"))

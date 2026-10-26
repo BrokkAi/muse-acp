@@ -959,15 +959,67 @@ fn serve_config(
     extra_args: &[&str],
 ) -> (LaunchConfig, Option<crate::host_config::HostConfig>) {
     let mut config = LaunchConfig::new(bin);
-    config.args(
-        std::env::var("MUSE_SERVE_ARGS")
-            .unwrap_or_default()
-            .split_whitespace(),
-    );
-    config.args(extra_args.iter().copied());
+    let env_args: Vec<String> = std::env::var("MUSE_SERVE_ARGS")
+        .unwrap_or_default()
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    // A setting may appear once: `muse serve` refuses a repeated key
+    // ("one setting, one occurrence") and exits 2, so a caller's own
+    // `MUSE_SERVE_ARGS` value wins over a pinned default instead of colliding
+    // with it.
+    let extra = without_duplicate_config_args(&env_args, extra_args);
+    config.args(env_args);
+    config.args(extra);
     config.host_flags(flags);
     let host_config = crate::host_config::configure(&mut config);
     (config, host_config)
+}
+
+/// Drop each `-c KEY=…` pair from `later` whose key `earlier` already sets, so
+/// concatenating two argument lists never repeats a setting.
+fn without_duplicate_config_args<'a>(earlier: &[String], later: &[&'a str]) -> Vec<&'a str> {
+    let mut keys: Vec<&str> = Vec::new();
+    let mut index = 0;
+    while index < earlier.len() {
+        if is_config_flag(&earlier[index])
+            && let Some(key) = earlier.get(index + 1).and_then(|value| config_key(value))
+        {
+            keys.push(key);
+        }
+        index += 1;
+    }
+    let mut kept = Vec::new();
+    let mut index = 0;
+    while index < later.len() {
+        if is_config_flag(later[index])
+            && let Some(value) = later.get(index + 1)
+        {
+            if config_key(value).is_some_and(|key| keys.contains(&key)) {
+                index += 2;
+                continue;
+            }
+            kept.push(later[index]);
+            kept.push(value);
+            index += 2;
+            continue;
+        }
+        kept.push(later[index]);
+        index += 1;
+    }
+    kept
+}
+
+fn is_config_flag(arg: &str) -> bool {
+    arg == "-c" || arg == "--config"
+}
+
+/// The setting name in a `KEY=VALUE` argument.
+fn config_key(value: &str) -> Option<&str> {
+    value
+        .split_once('=')
+        .map(|(key, _)| key.trim())
+        .filter(|key| !key.is_empty())
 }
 
 /// Run a bounded, stdin-EOF-only serve probe for `--support`. The probe does
@@ -1080,10 +1132,43 @@ mod tests {
     use super::{
         ExitKind, ExitMessage, HANDLED_SERVER_REQUESTS, command_timeout,
         is_session_configuration_conflict, rejection_reason, session_profile_hint, session_suffix,
+        without_duplicate_config_args,
     };
     use crate::json::parse_json;
     use muse_msp_client::classify_exit_parts;
     use std::time::Duration;
+
+    #[test]
+    fn a_setting_already_in_the_environment_arguments_is_not_repeated() {
+        // muse serve refuses a repeated setting ("one setting, one occurrence")
+        // and exits 2, so a caller's pin must replace a pinned default.
+        let env =
+            |raw: &str| -> Vec<String> { raw.split_whitespace().map(str::to_string).collect() };
+        let reviewer = ["-c", "reasoning_effort=\"low\""];
+        assert_eq!(
+            without_duplicate_config_args(&env("-c reasoning_effort=\"high\""), &reviewer),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            without_duplicate_config_args(&env("--trust-workspace"), &reviewer),
+            reviewer.to_vec()
+        );
+        // A different key is not a duplicate, and other arguments survive.
+        assert_eq!(
+            without_duplicate_config_args(&env("--config model=\"x\""), &reviewer),
+            reviewer.to_vec()
+        );
+        let mixed = ["--disable-write", "-c", "reasoning_effort=\"low\""];
+        assert_eq!(
+            without_duplicate_config_args(&env("-c reasoning_effort=\"high\""), &mixed),
+            vec!["--disable-write"]
+        );
+        // The long spelling of the flag counts too.
+        assert_eq!(
+            without_duplicate_config_args(&env("--config reasoning_effort=\"high\""), &reviewer),
+            Vec::<&str>::new()
+        );
+    }
 
     #[test]
     fn serve_exit_codes_are_classified_without_consulting_stderr() {

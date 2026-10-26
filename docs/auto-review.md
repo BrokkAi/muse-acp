@@ -22,6 +22,13 @@ must not inherit a heavy session default: the reviewer used to take the Muse
 default tier, and a high default spent the whole review deadline reasoning
 until every approval was denied as a timeout.
 
+`muse serve` only grew the `-c/--config` flag in Muse 1.4.4, while Auto-review
+works from 1.4.2. A host that refuses the command line (exit 2, `unknown option
+-c`) is retried once without the pin and logged as `reviewer host refused -c
+(Muse before 1.4.4)`, so such a host still reviews, at its own default tier.
+The pin is never repeated: a `reasoning_effort` a user already set through
+`MUSE_SERVE_ARGS` wins, because `muse serve` refuses a setting given twice.
+
 The reviewer prompt has six parts:
 
 1. The fixed safety policy, adapted from Codex's guardian policy: evidence
