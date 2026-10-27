@@ -3196,7 +3196,9 @@ fn resume_permission_pick_over_an_unrestorable_record_is_refused() {
     }
     let mut saw_record_refusal = false;
     for pick in [Some(":ask-me"), None] {
-        let (host, session) = unreadable_record(test);
+        let Some((host, session)) = unreadable_record(test) else {
+            return;
+        };
         let mut adapter = Adapter::launch(&host);
         let meta = match pick {
             Some(profile) => json!({"muse": {"permissionProfile": profile}}),
@@ -3238,14 +3240,13 @@ fn resume_permission_pick_over_an_unrestorable_record_is_refused() {
 }
 
 /// A host whose newest session keeps its directory but holds no readable
-/// durable record, so the host cannot restore retained authority.
-fn unreadable_record(test: &str) -> (Host, String) {
+/// durable record, so the host cannot restore retained authority. `None` when
+/// the pinned host predates the resume permission pick.
+fn unreadable_record(test: &str) -> Option<(Host, String)> {
     let host = Host::start(json!({"hello": {"text": "hello"}}), Some(":ask-me"));
     let adapter = Adapter::launch(&host);
     let (release, _) = adapter_host_release(&adapter);
-    let Some(mut adapter) = require_release(adapter, release, (1, 4, 8), test) else {
-        panic!("{test} needs Muse 1.4.8 or newer for the resume permission pick");
-    };
+    let mut adapter = require_release(adapter, release, (1, 4, 8), test)?;
     let session = adapter.new_session(&host, json!([]));
     adapter.finish();
     let sessions = host.dir.join("home/.local/share/muse/sessions");
@@ -3257,7 +3258,7 @@ fn unreadable_record(test: &str) -> (Host, String) {
         }
     }
     assert!(truncated, "the host kept no retained record to damage");
-    (host, session)
+    Some((host, session))
 }
 
 fn walk(p: &std::path::Path) -> Vec<std::path::PathBuf> {
