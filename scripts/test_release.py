@@ -1,8 +1,10 @@
+import io
 import json
 from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+import zipfile
 
 import release
 
@@ -143,20 +145,83 @@ class TagOnlyRelease(unittest.TestCase):
                       'conclusion': 'success'} for n, w in [(1, 'ci'), (2, 'release')]]
         ci_detail = {'headSha': release.SHA, 'conclusion': 'success',
                      'jobs': [{'name': 'check', 'conclusion': 'success'}]}
-        jobs = [{'name': f'build ({t})', 'conclusion': 'success'} for t in release.TARGETS]
-        jobs.append({'name': 'publisher', 'conclusion': 'success', 'steps': [
-            {'name': 'Check publisher authorization', 'conclusion': 'success'},
-            {'name': 'Validate version and all staged assets', 'conclusion': 'success'}]})
-        release_detail = {'headSha': release.SHA, 'conclusion': 'success', 'jobs': jobs}
         with patch.object(release, 'metadata'), patch.object(
             release, 'gh', side_effect=[json.dumps(push_runs).encode(),
                                         json.dumps(ci_detail).encode(),
-                                        json.dumps(release_detail).encode()]) as gh:
+                                        json.dumps(self.release_detail()).encode()]) as gh:
             release.evidence('commit')
         # The run list and its two details: no Actions artifact lookup, so a
         # branch artifact that expired before the tag was pushed cannot block
         # publication.
         self.assertEqual(gh.call_count, 3)
+
+    def release_detail(self):
+        jobs = [{'name': f'build ({t})', 'conclusion': 'success'} for t in release.TARGETS]
+        jobs.append({'name': 'publisher', 'conclusion': 'success', 'steps': [
+            {'name': 'Check publisher authorization', 'conclusion': 'success'},
+            {'name': 'Validate version and all staged assets', 'conclusion': 'success'}]})
+        return {'headSha': release.SHA, 'conclusion': 'success', 'jobs': jobs}
+
+    def push_runs_and_ci(self):
+        runs = [{'databaseId': n, 'workflowName': w, 'headSha': release.SHA,
+                 'headBranch': 'master', 'event': 'push', 'status': 'completed',
+                 'conclusion': 'success'} for n, w in [(1, 'ci'), (2, 'release')]]
+        ci = {'headSha': release.SHA, 'conclusion': 'success',
+              'jobs': [{'name': 'check', 'conclusion': 'success'}]}
+        return runs, ci
+
+    def artifact_fetch(self, corrupt=None):
+        """A stand-in for one preflight run's six Actions artifacts."""
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        staged = Path(temp.name)
+        original = Path.read_bytes
+        def read(path):
+            return b'branch preflight binary' if str(path).startswith('target/') else original(path)
+        with patch.object(release, 'metadata'), patch.object(release, 'selftest'), patch.object(Path, 'read_bytes', read):
+            for target in release.TARGETS:
+                release.package(target, staged)
+        for installer in release.INSTALLERS:
+            (staged / installer).write_bytes(release.source_bytes(installer))
+        zips, listing = {}, []
+        for asset_id, target in enumerate(release.TARGETS, 1):
+            name = release.archive_name(target)
+            buffer = io.BytesIO()
+            with zipfile.ZipFile(buffer, 'w') as z:
+                for member in [name, name + '.sha256']:
+                    data = (staged / member).read_bytes()
+                    if (name, member) == corrupt:
+                        data += b'corrupt'
+                    z.writestr(member, data)
+            zips[str(asset_id)] = buffer.getvalue()
+            listing.append({'id': asset_id, 'name': 'release-' + target, 'expired': False})
+        def gh(*args, **kwargs):
+            command = ' '.join(args)
+            if command.startswith('run list'):
+                return json.dumps(self.push_runs_and_ci()[0]).encode()
+            if command.startswith('run view'):
+                return json.dumps(self.push_runs_and_ci()[1] if args[2] == '1'
+                                  else self.release_detail()).encode()
+            if 'artifacts?per_page' in command:
+                return json.dumps({'artifacts': listing}).encode()
+            if command.endswith('/zip'):
+                return zips[command.rsplit('/', 2)[1]]
+            raise RuntimeError('unexpected gh call: ' + command)
+        return gh
+
+    def test_build_evidence_validates_branch_artifact_contents(self):
+        # The documented local pre-tag check must still verify what the branch
+        # run actually packaged, not merely that six artifacts exist.
+        with patch.object(release, 'metadata'), patch.object(release, 'gh', side_effect=self.artifact_fetch()) as gh:
+            release.evidence('build')
+        self.assertGreater(gh.call_count, 3)
+
+    def test_build_evidence_rejects_a_corrupt_branch_artifact(self):
+        target = release.TARGETS[0]
+        corrupt = (release.archive_name(target), release.archive_name(target))
+        with patch.object(release, 'metadata'), patch.object(release, 'gh', side_effect=self.artifact_fetch(corrupt)):
+            with self.assertRaisesRegex(RuntimeError, 'checksum'):
+                release.evidence('build')
 
 
 class DraftRecovery(unittest.TestCase):
@@ -255,6 +320,21 @@ class PublishedReleaseAudit(unittest.TestCase):
         with patch.object(release, 'gh', side_effect=lambda *args: by_id[args[-1].rsplit('/', 1)[-1]]):
             with self.assertRaisesRegex(RuntimeError, 'checksum'):
                 release.audit_release({'draft': True, 'assets': assets})
+
+    def test_conflicting_asset_names_fail_before_any_download(self):
+        # Two assets with one name would collide on disk and hide one of them.
+        assets = [{'name': 'install.sh', 'id': 1}, {'name': 'install.sh', 'id': 2}]
+        with patch.object(release, 'gh') as gh:
+            with self.assertRaisesRegex(RuntimeError, 'Conflicting remote assets'):
+                release.audit_release({'draft': False, 'assets': assets})
+        gh.assert_not_called()
+
+    def test_asset_name_with_a_path_component_fails_before_any_download(self):
+        assets = [{'name': '../install.sh', 'id': 1}]
+        with patch.object(release, 'gh') as gh:
+            with self.assertRaisesRegex(RuntimeError, 'Conflicting remote assets'):
+                release.audit_release({'draft': True, 'assets': assets})
+        gh.assert_not_called()
 
 
 if __name__ == '__main__':

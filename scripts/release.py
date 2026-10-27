@@ -210,6 +210,11 @@ def release_state():
 
 
 def download(release, directory):
+    # Check the name set before writing any bytes: an unexpected or duplicate
+    # asset name must fail closed, and a name with a path component would
+    # otherwise be written outside the staging directory.
+    names = [a['name'] for a in release['assets']]
+    require(len(names) == len(set(names)) and set(names) <= expected_names(), 'Conflicting remote assets')
     for a in release['assets']:
         data = gh('api', '--hostname', 'github.com', '-H', 'Accept: application/octet-stream',
                   f'repos/{REPO}/releases/assets/{a["id"]}')
@@ -225,8 +230,7 @@ def audit_release(release):
     with tempfile.TemporaryDirectory() as d:
         directory = Path(d)
         download(release, directory)
-        names = {p.name for p in directory.iterdir()}
-        require(names <= expected_names(), 'Conflicting remote assets')
+        names = {a['name'] for a in release['assets']}
         if release['draft']:
             for target in TARGETS:
                 name = archive_name(target)
@@ -239,7 +243,6 @@ def audit_release(release):
 def compare_remote(release, staged, complete, resume=False):
     assets = release['assets']
     names = [a['name'] for a in assets]
-    require(len(names) == len(set(names)) and set(names) <= expected_names(), 'Conflicting remote assets')
     if complete:
         require(set(names) == expected_names(), 'Incomplete published release')
     with tempfile.TemporaryDirectory() as d:
@@ -295,10 +298,11 @@ def evidence(kind):
 
     'commit' is the provenance a tag push needs: successful exact-commit `ci`
     and `release` push runs, including the publisher's own authorization and
-    staging steps. 'build' also lists that run's Actions artifacts.
-    'publication-inputs' rebuilds the comparison for a manual drift audit:
-    a runner or toolchain change that alters the packaged bytes. 'version' and
-    'published' audit the remote release against its own manifests.
+    staging steps. It reads no artifacts, so an expired artifact cannot block
+    publication. 'build' also downloads that run's artifacts and validates
+    every packaged payload. 'publication-inputs' adds the drift comparison
+    with a fresh build of the same commit. 'version' and 'published' audit the
+    remote release against its own manifests.
     """
     metadata()
     runs = json.loads(gh('run', 'list', '--repo', 'github.com/' + REPO, '--commit', SHA, '--limit', '100',
@@ -323,19 +327,18 @@ def evidence(kind):
             if kind in ['build', 'publication-inputs']:
                 artifacts = api(f'actions/runs/{run["databaseId"]}/artifacts?per_page=100')['artifacts']
                 require({a['name'] for a in artifacts if not a['expired']} == {'release-' + t for t in TARGETS}, 'Missing build artifacts')
-                if kind == 'publication-inputs':
-                    with tempfile.TemporaryDirectory() as d:
-                        for a in artifacts:
-                            raw = gh('api', '--hostname', 'github.com', f'repos/{REPO}/actions/artifacts/{a["id"]}/zip')
-                            with zipfile.ZipFile(io.BytesIO(raw)) as z:
-                                for n in z.namelist():
-                                    require('/' not in n and n in expected_names(), 'Invalid Actions artifact')
-                                    Path(d, n).write_bytes(z.read(n))
-                        for installer in INSTALLERS:
-                            Path(d, installer).write_bytes(source_bytes(installer))
-                        staged = Path(d)
-                        validate(staged)
-                        require(validate(staged) == validate(Path('dist')), 'Rebuilt payload differs from the branch preflight (runner or toolchain drift)')
+                with tempfile.TemporaryDirectory() as d:
+                    for a in artifacts:
+                        raw = gh('api', '--hostname', 'github.com', f'repos/{REPO}/actions/artifacts/{a["id"]}/zip')
+                        with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                            for n in z.namelist():
+                                require('/' not in n and n in expected_names(), 'Invalid Actions artifact')
+                                Path(d, n).write_bytes(z.read(n))
+                    for installer in INSTALLERS:
+                        Path(d, installer).write_bytes(source_bytes(installer))
+                    staged = validate(Path(d))
+                    if kind == 'publication-inputs':
+                        require(staged == validate(Path('dist')), 'Rebuilt payload differs from the branch preflight (runner or toolchain drift)')
     if kind in ['version', 'published']:
         release = release_state()
         require(kind != 'published' or (release and not release['draft']), 'Release is not published')
