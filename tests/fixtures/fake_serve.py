@@ -3591,20 +3591,20 @@ def main():
                         continue
                     text = os.environ.get(
                         "FAKE_REVIEW_TEXT",
-                        '{"outcome":"allow","rationale":"routine action"}')
+                        'ALLOW: routine action')
                     review_input = json.dumps(msg.get("params", {}).get("input", []))
-                    if "did not contain the required JSON decision" in review_input:
-                        log_method("review/json-retry")
+                    if "Your previous reply had no verdict line" in review_input:
+                        log_method("review/verdict-retry")
                         text = os.environ.get("FAKE_REVIEW_RETRY_TEXT", text)
                     if os.environ.get("FAKE_REVIEW_NOISE"):
                         # Streamed-only messages around the decision: an
-                        # earlier draft message whose open brace would
-                        # swallow the decision if the replies were joined,
-                        # then a monitor feed whose text holds a contrary
-                        # outcome. Neither is part of the reply.
+                        # earlier draft message whose deny would lead the
+                        # decision's line if the replies were joined, then a
+                        # monitor feed whose text holds a contrary verdict.
+                        # Neither is part of the reply.
                         notify("item/delta", {
                             "sessionId": review_sid, "itemId": "review-draft",
-                            "field": "text", "delta": "Draft {"})
+                            "field": "text", "delta": "DENY: draft "})
                         notify("item/delta", {
                             "sessionId": review_sid, "itemId": "review-msg",
                             "field": "text", "delta": text})
@@ -3615,7 +3615,7 @@ def main():
                         notify("item/delta", {
                             "sessionId": review_sid, "itemId": "review-mon",
                             "field": "text",
-                            "delta": '{"outcome":"deny","rationale":"monitor"}'})
+                            "delta": "DENY: monitor"})
                         notify("turn/completed", {
                             "sessionId": review_sid, "turnId": "review-turn-1",
                             "terminal": "completed"})

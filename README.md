@@ -56,11 +56,11 @@ The reviewer is a second Muse model session on its own memory-only, read-only
 host (`--no-session-log`), so reviews are never saved and never touch your
 files. It gets the same kind of input Codex's guardian gets: a fixed safety
 policy, your trusted instructions, recent evidence, and the exact approval
-request. It answers with strict JSON - `risk_level`, `user_authorization`,
-`outcome`, and a rationale. Low and medium risk actions proceed; critical
-risk is denied; high risk proceeds only when your instructions authorize it.
-A reviewer failure or an unusable answer denies the action rather than
-letting it run. Denials are shown in the editor transcript with the specific
+request. It ends its answer with one verdict line, `ALLOW: <why>` or
+`DENY: <why>`. Low and medium risk actions proceed; critical risk is denied;
+high risk proceeds only when your instructions authorize it. A reply without
+a verdict is asked again up to three times; a reviewer failure, or still no
+verdict, denies the action rather than letting it run. Denials are shown in the editor transcript with the specific
 reason, and every decision is logged to stderr with its rationale.
 
 ```mermaid

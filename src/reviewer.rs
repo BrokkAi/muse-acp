@@ -3,8 +3,11 @@
 //!
 //! The reviewer runs in a separate, memory-only, read-only Muse session. It
 //! sees a fixed policy, the trusted user instructions, bounded transcript
-//! evidence, and the exact approval request. It answers with strict JSON:
-//! `{"outcome":"allow"|"deny","risk_level":...,"user_authorization":...,"rationale":...}`.
+//! evidence, and the exact approval request. It ends its reply with one
+//! verdict line, `ALLOW: <reason>` or `DENY: <reason>`. A plain line is much
+//! harder for a model to get wrong than a JSON object, and the verdict and
+//! reason are all the adapter acts on. A Codex-style JSON decision is still
+//! accepted as a fallback.
 
 use std::time::Duration;
 
@@ -75,25 +78,24 @@ user's authorization, and the policy below.
 # Your restrictions
 You are running in a read-only session. You may inspect files and search the
 workspace to gather evidence. You cannot write, run shell commands, or use the
-network. Never ask for approval; decide.
+network. Never ask for approval.
 
-# Investigation
-- Prefer the evidence already in this prompt.
-- Use read-only checks only when local state would change your decision.
-- If important context is missing and cannot be verified, lean conservative
-  and explain the uncertainty in the rationale.
+# You always decide
+- You judge the planned action from its text. You are never expected to run
+  it, or any other command, to reach a verdict. A shell command you cannot
+  run yourself is still a command you can read and assess.
+- Being unable to verify something is never a reason to withhold a verdict.
+  Fold the uncertainty into the risk you assign and decide anyway.
+- Prefer the evidence already in this prompt. Use read-only checks only when
+  local state would change your decision.
 "#;
 
-pub const OUTPUT_CONTRACT: &str = r#"When you are ready to answer, your final message must be strict JSON.
-For a low-risk action with no other facts to report, answer exactly:
-{"outcome":"allow"}
-Otherwise answer:
-{
-  "risk_level": "low" | "medium" | "high" | "critical",
-  "user_authorization": "unknown" | "low" | "medium" | "high",
-  "outcome": "allow" | "deny",
-  "rationale": "one concise sentence"
-}"#;
+pub const OUTPUT_CONTRACT: &str = "# Your answer
+End your reply with exactly one verdict line, on its own line:
+ALLOW: <one concise sentence why>
+or
+DENY: <one concise sentence why>
+The verdict line is required. Nothing may follow it.";
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct Assessment {
@@ -147,15 +149,74 @@ pub fn build_prompt(
 
 /// The follow-up sent once, in the same reviewer session, when a reply holds
 /// no usable decision: a model that answered in prose usually complies.
-pub const JSON_RETRY_PROMPT: &str = "Your previous reply did not contain the required JSON decision. Do not investigate further. Reply now with only the JSON object described in the output contract, and nothing else.";
+pub const VERDICT_RETRY_PROMPT: &str = "Your previous reply had no verdict line. Do not investigate further and do not run anything. Judge the planned action from its text and reply now with only one line: `ALLOW: <one sentence why>` or `DENY: <one sentence why>`.";
 
-/// Parse the reviewer's final message. Accepts strict JSON plus the
-/// prose-wrapped form Codex tolerates, including prose or code fences that
-/// themselves contain braces: the last top-level balanced object carrying a
-/// valid `outcome` wins. Objects nested inside another balanced object are
-/// never considered, so an `outcome` quoted inside the decision (or inside an
-/// echoed payload) cannot override it. Anything else is a review failure.
+/// Follow-ups sent, in the same reviewer session, for a reply without a
+/// verdict before the approval is denied.
+pub const VERDICT_RETRIES: u8 = 3;
+
+/// Parse the reviewer's reply: the last verdict line wins, else a JSON
+/// decision. Anything else is a review failure.
 pub fn parse_assessment(text: &str) -> Option<Assessment> {
+    parse_verdict_line(text).or_else(|| parse_json_assessment(text))
+}
+
+/// The last line reading `ALLOW` or `DENY`, case-insensitively, optionally
+/// followed by `:`, `-`, `—`, or whitespace and a reason. Markdown emphasis,
+/// headings, quotes, list bullets, and code spans around it are ignored, so
+/// `**DENY:** reason` and `` `ALLOW` `` count. A word merely starting with
+/// the verdict (`Allowed`, `Denying`) does not.
+fn parse_verdict_line(text: &str) -> Option<Assessment> {
+    text.lines().rev().find_map(|line| {
+        let line = line.trim_start_matches(|c: char| {
+            c.is_whitespace() || matches!(c, '*' | '_' | '#' | '>' | '`' | '-' | '•')
+        });
+        let (outcome, rest) = [("allow", Outcome::Allow), ("deny", Outcome::Deny)]
+            .into_iter()
+            .find_map(|(word, outcome)| {
+                let head = line.get(..word.len())?;
+                head.eq_ignore_ascii_case(word)
+                    .then(|| (outcome, &line[word.len()..]))
+            })?;
+        let rest = rest.trim_start_matches(['*', '_', '`']);
+        if !(rest.is_empty() || rest.starts_with([':', '-', '—', ' ', '\t', '.'])) {
+            return None;
+        }
+        let reason = rest
+            .trim_start_matches([':', '-', '—', '.'])
+            .trim()
+            .trim_matches(['*', '_', '`'])
+            .trim();
+        Some(Assessment {
+            outcome,
+            // A plain verdict names no risk; the reviewer applied the policy.
+            risk: match outcome {
+                Outcome::Allow => Risk::Low,
+                Outcome::Deny => Risk::High,
+            },
+            authorization: Authorization::Unknown,
+            rationale: if reason.is_empty() {
+                default_rationale(outcome)
+            } else {
+                reason.to_string()
+            },
+        })
+    })
+}
+
+fn default_rationale(outcome: Outcome) -> String {
+    match outcome {
+        Outcome::Allow => "Auto-review allowed a low-risk action.".to_string(),
+        Outcome::Deny => "Auto-review denied the action without a rationale.".to_string(),
+    }
+}
+
+/// The JSON fallback: the last top-level balanced object carrying a valid
+/// `outcome` wins, including in prose or code fences that themselves contain
+/// braces. Objects nested inside another balanced object are never
+/// considered, so an `outcome` quoted inside the decision (or inside an
+/// echoed payload) cannot override it.
+fn parse_json_assessment(text: &str) -> Option<Assessment> {
     let mut found = None;
     let mut from = 0;
     while let Some(offset) = text[from..].find('{') {
@@ -233,10 +294,7 @@ fn assessment_from(parsed: &crate::json::J) -> Option<Assessment> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_string)
-        .unwrap_or_else(|| match outcome {
-            Outcome::Allow => "Auto-review allowed a low-risk action.".to_string(),
-            Outcome::Deny => "Auto-review denied the action without a rationale.".to_string(),
-        });
+        .unwrap_or_else(|| default_rationale(outcome));
     Some(Assessment {
         outcome,
         risk,
@@ -280,8 +338,19 @@ pub fn unusable_reply_rationale(text: &str) -> &'static str {
     if text.trim().is_empty() {
         "auto-review returned no usable decision: the reviewer reply was empty"
     } else {
-        "auto-review returned no usable decision: the reviewer reply was not a JSON decision"
+        "auto-review returned no usable decision: the reviewer reply had no verdict"
     }
+}
+
+/// The whole reviewer reply for the stderr log, on one line, so an unusable
+/// reply can be diagnosed. Bounded only against a runaway reply.
+pub fn full_reply(text: &str) -> String {
+    const MAX_CHARS: usize = 8_000;
+    let mut out: String = text.chars().take(MAX_CHARS).collect();
+    if text.chars().count() > MAX_CHARS {
+        out.push('…');
+    }
+    out
 }
 
 /// A short, single-line excerpt of reviewer text for the stderr log.
@@ -352,6 +421,35 @@ mod tests {
     }
 
     #[test]
+    fn verdict_lines_decide() {
+        let parsed = parse_assessment("Checked the command.\nALLOW: read-only git show.")
+            .expect("plain allow");
+        assert_eq!(parsed.outcome, Outcome::Allow);
+        assert_eq!(parsed.rationale, "read-only git show.");
+
+        let parsed = parse_assessment("**DENY:** pushes to an unknown remote").expect("bold");
+        assert_eq!(effective_outcome(&parsed), Outcome::Deny);
+        assert_eq!(parsed.rationale, "pushes to an unknown remote");
+
+        for text in [
+            "`ALLOW`",
+            "allow",
+            "- Allow - routine",
+            "## DENY — risky",
+            "ALLOW.",
+        ] {
+            assert!(parse_assessment(text).is_some(), "{text:?}");
+        }
+        // The last verdict line wins over an earlier draft.
+        let parsed = parse_assessment("ALLOW: maybe\nOn reflection:\nDENY: deletes data")
+            .expect("last line");
+        assert_eq!(parsed.outcome, Outcome::Deny);
+        // Words that merely start with a verdict are not one.
+        assert!(parse_assessment("Allowed commands are listed.\nDenying is safer.").is_none());
+        assert!(parse_assessment("I cannot run git show here.").is_none());
+    }
+
+    #[test]
     fn assessment_survives_braces_and_objects_around_the_decision() {
         // Prose quoting code with braces before the decision used to make the
         // first-`{`..last-`}` span unparsable.
@@ -414,7 +512,9 @@ mod tests {
     #[test]
     fn unusable_replies_say_whether_the_reviewer_answered() {
         assert!(unusable_reply_rationale("  \n").ends_with("the reviewer reply was empty"));
-        assert!(unusable_reply_rationale("I need approval").ends_with("not a JSON decision"));
+        assert!(unusable_reply_rationale("I need approval").ends_with("had no verdict"));
+        assert_eq!(full_reply("a\nb"), "a\nb");
+        assert_eq!(full_reply(&"x".repeat(9_000)).chars().count(), 8_001);
         assert_eq!(excerpt("a\n  b\tc"), "a b c");
         let long = "x".repeat(500);
         assert_eq!(excerpt(&long).chars().count(), 241);
