@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+- Show the data a computer-use approval would send. Muse 1.4.13 adds
+  `cuaCardFacts.data`: the rows naming what the call would actually send, such
+  as a token or a password. The permission prompt showed only the page, window,
+  and steps, so a secret the call was about to transmit was invisible at the
+  moment the user approved it. The prompt now renders one `Data: …` line per
+  row, worded from the host's mask and never with the value, which the schema
+  never sends: a known scanner tag reads `GitHub token`, a named value keeps
+  its own `password=` prefix, and each mask contributes `ghp_…3f9a`,
+  `password=… (12 chars)`, or the length alone. An `other` row, an unknown
+  `kind`, or an unknown `secretKind` degrades to a generic `Data: a value` or
+  `Data: a secret` row instead of vanishing. The mask is app-derived text, so
+  it is sanitized and quoted as one code span like the window title, and the
+  verbatim facts still ride `_meta.muse.cuaCardFacts` for editors that render
+  the card natively (#395).
+
 - Replay every host card on history replay. A session reloaded with
   `session/load`, resumed with `replayFrom: {"type": "start"}`, forked, or
   drilled into showed only messages, tool calls, subagents, and compactions:

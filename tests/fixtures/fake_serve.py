@@ -345,6 +345,26 @@ if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "computer-use":
                    "label": "Pay now", "effect": "may submit a payment",
                    "kind": "verb:submit"}],
     }
+if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "computer-use-data":
+    # Muse 1.4.13 adds `data`: the data the call would send. The mask never
+    # carries the value. One row per shape the prompt must word, plus an
+    # unknown `kind` and an unknown `secretKind`.
+    APPROVAL_PARAMS["toolName"] = "computer"
+    APPROVAL_PARAMS["subject"] = {"kind": "tool", "toolName": "computer"}
+    APPROVAL_PARAMS["cuaCardFacts"] = {
+        "windowTitle": "Sign in",
+        "data": [
+            {"kind": "secret", "secretKind": "github_token",
+             "mask": {"prefix": "ghp_", "last4": "3f9a", "chars": 40}},
+            {"kind": "secret", "secretKind": "secret_named_value",
+             "mask": {"prefix": "password=", "chars": 12}},
+            {"kind": "secret", "secretKind": "secret_named_value",
+             "mask": {"chars": 6}},
+            {"kind": "other"},
+            {"kind": "future_kind", "secretKind": "future_scanner",
+             "mask": {"prefix": "sk-", "last4": "abcd"}},
+        ],
+    }
 if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "tool-described":
     # A tool subject with no tool name anywhere, only a description.
     APPROVAL_PARAMS.pop("toolName", None)

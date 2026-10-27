@@ -2829,6 +2829,60 @@ fn computer_use_permission_shows_the_card_facts() {
 }
 
 #[test]
+fn computer_use_permission_names_the_data_the_call_would_send() {
+    // #395: Muse 1.4.13 adds `cuaCardFacts.data`. A secret the call would
+    // send must be visible in the prompt, worded from the host's mask and
+    // never with the value, which the schema never sends.
+    for ver in [1, 2] {
+        let mut c = Client::spawn(
+            "approval",
+            &[("FAKE_APPROVAL_SUBJECT", "computer-use-data")],
+        );
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "sign in");
+        let perm = c.wait_for("request_permission", Duration::from_secs(15));
+        // The prompt text alone: after `"text":"` and before the content
+        // array closes. `_meta` deliberately keeps the verbatim facts, so
+        // asserting against the whole frame would test the wrong thing.
+        let body = perm
+            .split("\"text\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split("\"}}]").next())
+            .unwrap_or_default()
+            .replace("\\n", "\n");
+        for row in [
+            "Data: GitHub token `ghp_…3f9a (40 chars)`",
+            "Data: `password=… (12 chars)`",
+            "Data: a secret `… (6 chars)`",
+            "Data: a value",
+            "Data: a value `sk-…abcd`",
+        ] {
+            assert!(
+                body.contains(row),
+                "v{ver} prompt is missing the {row:?} row: {perm}"
+            );
+        }
+        // No value ever reaches the prompt: the schema sends only the mask.
+        for leaked in ["\"chars\":40", "ghp_3f9a", "secretKind", "password=hunter"] {
+            assert!(
+                !body.contains(leaked),
+                "v{ver} prompt must not carry {leaked:?}: {perm}"
+            );
+        }
+        // The verbatim facts still ride the metadata for a native renderer.
+        assert!(
+            perm.contains(r#""secretKind":"github_token""#),
+            "v{ver} verbatim facts stay in _meta: {perm}"
+        );
+        assert!(
+            perm.contains("\"optionId\":\"c-allow\"") && perm.contains("\"optionId\":\"c-deny\""),
+            "a card with data keeps the deny-safe choices on v{ver}: {perm}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn mcp_tool_permission_title_comes_from_the_subject() {
     // #239: Muse 1.4.6 omits top-level toolName/toolCallId for MCP tools;
     // the name is only subject.toolName, and the card is found by itemId.
