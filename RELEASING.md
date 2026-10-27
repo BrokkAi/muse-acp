@@ -58,15 +58,16 @@ paths; Unix archives retain the installer's versioned parent directory.
    python3 scripts/release.py version
    ```
 
-   Replace `vX.Y.Z` with the proposed version's tag. They require successful
-   exact-SHA `ci` and `release` push runs, inspect the publisher steps and
-   unexpired Actions artifacts, validate all packaged metadata, and check the
-   tag/release namespace and any existing assets. Authentication, network
-   errors, missing/expired evidence, skipped jobs, and conflicting versions
-   fail closed. Artifact retention is 30 days; rerun the unchanged commit's
-   non-publishing workflow if `build` evidence expires. `version` audits the
-   release namespace and any existing assets against their own manifests, so
-   it does not depend on artifacts from another run.
+   Replace `vX.Y.Z` with the proposed version's tag. Both require successful
+   exact-SHA `ci` and `release` push runs and inspect the publisher steps.
+   `build` also downloads that run's artifacts and validates every packaged
+   payload — checksums, embedded manifests, permissions, documentation and
+   installers — while `version` checks the tag/release namespace and audits any
+   existing assets against their own manifests, so it needs no artifacts from
+   another run. Authentication, network errors, missing/expired evidence,
+   skipped jobs, and conflicting versions fail closed. Artifact retention is 30
+   days; rerun the unchanged commit's non-publishing workflow if `build`
+   evidence expires.
 
 ## Publication (separate authorization/phase)
 
