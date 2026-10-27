@@ -4481,6 +4481,91 @@ fn session_load_replays_history() {
 }
 
 #[test]
+fn load_and_resume_replay_host_cards_without_live_side_effects() {
+    // #393: every host card kind must survive history replay on both ACP
+    // versions, while finished shells open no terminal and finished
+    // background work announces no Async Tasks entry.
+    for (ver, method, params, cap) in [
+        (
+            1,
+            "session/load",
+            "{\"sessionId\":\"existing-session\"}",
+            "clientCapabilities",
+        ),
+        (
+            2,
+            "session/resume",
+            "{\"sessionId\":\"existing-session\",\"replayFrom\":{\"type\":\"start\"}}",
+            "capabilities",
+        ),
+    ] {
+        let mut c = Client::spawn("cards_load", &[]);
+        let init = c.req(
+            "initialize",
+            &initialize_params(
+                ver,
+                &format!(
+                    ",\"{}\":{{\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}}}}}",
+                    cap
+                ),
+            ),
+        );
+        c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+        c.notify("initialized", "{}");
+        let rid = c.req(method, params);
+        let done = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+        assert!(done.contains("\"result\""), "v{ver} {method} ok: {done}");
+        c.wait_for("async_task_spawned", Duration::from_secs(15));
+        let frames = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n");
+        for title in [
+            "Searched the web for fixtures",
+            "Hook pre-commit",
+            "Workflow nightly",
+            "Background command finished",
+            "cargo test",
+            "Damaged session log range",
+            "Scheduled job nightly fired",
+            "A future card",
+            "Monitor: Cards monitor",
+        ] {
+            assert!(
+                frames.contains(title),
+                "v{ver} replayed card missing: {title}\n{frames}"
+            );
+        }
+        assert!(
+            frames.contains("\"itemKind\":\"webSearch\""),
+            "v{ver} card _meta names the kind: {frames}"
+        );
+        assert!(
+            !frames.contains("\"terminal_update\""),
+            "v{ver} a finished shell must not open a terminal: {frames}"
+        );
+        assert_eq!(
+            frames.matches("async_task_spawned").count(),
+            1,
+            "v{ver} only the still-running call announces a task: {frames}"
+        );
+        assert!(
+            frames.contains("call-card-active"),
+            "v{ver} the running call is the restored task: {frames}"
+        );
+        assert!(
+            frames
+                .lines()
+                .filter(|line| line.contains("async_task_spawned"))
+                .all(|line| !line.contains("call-card-bg") && !line.contains("wfr-cards")),
+            "v{ver} finished background work announces nothing: {frames}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn session_resume_without_cwd_reconnects() {
     // Real clients load existing threads with just a sessionId (no cwd);
     // that must not be rejected as "params.cwd must be an absolute path".

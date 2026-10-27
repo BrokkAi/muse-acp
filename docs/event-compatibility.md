@@ -118,3 +118,28 @@ through `/workflow-child skip|retry <childId>`. `workflow/pause` and
 `workflow/resume` are reached through `/workflow pause|resume [<runId>]`: a
 single live run may be implied, the ids come from the folded workflow items
 and are never guessed, and a bare `/workflow` lists the live runs.
+
+## History replay policy
+
+When an editor reconnects, the adapter seeds the transcript from the served
+history (`session/load`, `session/resume` with `replayFrom: {"type":
+"start"}`, and `session/fork`; subagent drill-down follows the same rule for
+the child transcript). Every history item — regardless of kind — funnels
+through the same fold handlers as live events, so a card that renders live
+renders identically (title, content, `_meta.muse`) after replay, on every
+path. Kinds that stay silent live (for example `reminderChild` with reminders
+off) stay silent on replay.
+
+Replay is history, not traffic, so two side effects of the live handlers are
+suppressed while a batch replays:
+
+- A finished `userShell` or shell `toolCall` renders as a text card; it opens
+  or closes no agent-owned terminal.
+- A finished backgrounded `toolCall`, `userShell`, or `workflow` announces no
+  Async Tasks entry. Reconciliation after replay (`reconcile_active_tasks`)
+  owns the restored task inventory and announces still-active work exactly
+  once; in-flight items replayed from history register as active so
+  reconciliation never duplicates them.
+
+Downgraded history (`history.mode != "inline"`) serves no items, so replay
+simply does not run and the adapter logs the downgrade.

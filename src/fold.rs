@@ -335,6 +335,11 @@ pub struct SessionFold {
     /// but carry no editor-facing content, so they stay out of the transcript
     /// and only their agent ids reach the stderr diagnostics.
     pub show_reminders: bool,
+    /// True only while a history replay (load/resume, fork, or subagent
+    /// drill-down) feeds items through `replay_item`. Live-only side effects
+    /// in `on_item_completed` (opening terminals, announcing AIR async tasks)
+    /// are suppressed while this is set; card rendering is unchanged.
+    replaying: bool,
     /// The session's workspace root, which resolves relative tool paths
     /// into the absolute `locations` ACP follow-along needs.
     pub workspace_root: String,
@@ -449,6 +454,7 @@ impl SessionFold {
             backgrounded_cards: std::collections::HashSet::new(),
             reminder_cards: HashMap::new(),
             show_reminders: false,
+            replaying: false,
             monitor_cards: std::collections::HashSet::new(),
             monitor_inbox: HashMap::new(),
             background_checks: None,
@@ -2506,6 +2512,26 @@ impl SessionFold {
         )
     }
 
+    /// Replay a whole history batch with one policy. Every path that seeds a
+    /// fold from history (load/resume, fork, subagent drill-down) calls this
+    /// helper so a kind handled here can never be dropped by one path and
+    /// kept by another. Sets `replaying` for the duration so
+    /// `on_item_completed` renders cards but skips live-only side effects
+    /// (terminals, AIR async-task announcements).
+    pub fn replay_history_items(
+        &mut self,
+        acp_sid: &str,
+        ver: u8,
+        items: &[J],
+        out: &mut Vec<String>,
+    ) {
+        self.replaying = true;
+        for item in items {
+            self.replay_item(acp_sid, ver, item, out);
+        }
+        self.replaying = false;
+    }
+
     /// Seed the fold from one history item without turning an in-flight item
     /// into a settled item. Snapshot items are the latest state at the
     /// history cursor, so the live stream may still deliver their deltas and
@@ -2552,7 +2578,12 @@ impl SessionFold {
                         ));
                     }
                 }
-                _ => {}
+                _ => {
+                    // Any other in-flight kind: register and start-render it
+                    // exactly as a live item/started would, so active host
+                    // cards (userShell, webSearch, ...) survive replay too.
+                    self.on_item_snapshot(acp_sid, ver, item, out)
+                }
             }
             return;
         }
@@ -2583,7 +2614,13 @@ impl SessionFold {
                     }
                 }
             }
-            _ => {}
+            _ => {
+                // Any other settled kind (host cards, unknown future kinds):
+                // settle it through the live handler so the replayed card is
+                // byte-identical to the live one.
+                let wrap = J::Obj(vec![("item".to_string(), item.clone())]);
+                self.on_item_completed(acp_sid, ver, &wrap, out);
+            }
         }
     }
 
@@ -3228,12 +3265,17 @@ impl SessionFold {
                     .filter(|text| !text.is_empty())
                     .unwrap_or("");
                 // An ACP v2 shell call shows its output in an agent-owned
-                // terminal instead of a text block.
-                self.note_shell(ver, &item_id, &tc_id, item);
+                // terminal instead of a text block. History replay renders
+                // the text card instead: a finished command must not open
+                // or close a terminal for the editor (#393).
+                let terminal = if self.replaying {
+                    None
+                } else {
+                    self.note_shell(ver, &item_id, &tc_id, item);
+                    self.finish_terminal(acp_sid, &item_id, item, status, out)
+                }
+                .or_else(|| self.editor_terminals.remove(&item_id));
                 self.editor_calls.retain(|(id, ..)| *id != item_id);
-                let terminal = self
-                    .finish_terminal(acp_sid, &item_id, item, status, out)
-                    .or_else(|| self.editor_terminals.remove(&item_id));
                 let content = if text.is_empty() || terminal.is_some() {
                     None
                 } else {
@@ -3271,7 +3313,10 @@ impl SessionFold {
                     .is_some_and(|v| matches!(v, J::Bool(true)))
                     || self.announced_tasks.contains(&tc_id)
                     || self.backgrounded_cards.contains(&tc_id);
-                if backgrounded && self.air_async_tasks {
+                if backgrounded && self.air_async_tasks && !self.replaying {
+                    // Reconciliation, not replay, owns the restored task
+                    // inventory; a finished background call from history
+                    // must not announce an Async Tasks entry (#393).
                     let task_id = self.async_task_id_for(&item_id, &tc_id);
                     if self.backgrounded_cards.insert(tc_id.clone()) {
                         out.push(Self::backgrounded_tool_line(acp_sid, ver, &tc_id));
@@ -3404,8 +3449,10 @@ impl SessionFold {
                     meta.as_deref(),
                     Self::item_muse_fields(item).as_deref(),
                 );
-                // An ACP v2 user shell that ran settles in its terminal.
-                let terminal = if kind == "userShell" {
+                // An ACP v2 user shell that ran settles in its terminal. History
+                // replay keeps the text card instead: the finished command
+                // must not open or close a terminal for the editor (#393).
+                let terminal = if kind == "userShell" && !self.replaying {
                     self.note_shell(ver, &item_id, &tc_id, item);
                     self.finish_terminal(acp_sid, &item_id, item, status, out)
                 } else {
@@ -3436,7 +3483,9 @@ impl SessionFold {
                         ),
                     ));
                 }
-                if kind == "userShell" && self.air_async_tasks {
+                if kind == "userShell" && self.air_async_tasks && !self.replaying {
+                    // Reconciliation owns the restored task inventory; a
+                    // finished shell from history must not announce one (#393).
                     let task_id = self.async_task_id_for(&item_id, &tc_id);
                     self.announce_async_task(
                         acp_sid,
@@ -3450,6 +3499,7 @@ impl SessionFold {
                 }
                 if kind == "workflow"
                     && self.air_async_tasks
+                    && !self.replaying
                     && let Some(run_id) = item
                         .get("workflowRunId")
                         .and_then(|v| v.as_str())
@@ -5790,6 +5840,254 @@ mod corpus_tests {
                 .unwrap()
                 .as_str(),
             Some("failed")
+        );
+    }
+}
+
+#[cfg(test)]
+mod replay_tests {
+    use super::SessionFold;
+    use crate::json::{J, j_to_string, parse_json};
+
+    /// One settled item per host card kind, each carrying the fields
+    /// `host_card_parts` needs for a non-empty title.
+    fn host_card_items() -> Vec<J> {
+        [
+            r#"{"itemId":"it-web","kind":"webSearch","status":"completed","fallbackText":"Searched the web"}"#,
+            r#"{"itemId":"it-hook","kind":"hookRun","status":"completed","label":"pre-commit","runStatus":"failed","reason":"exited 1"}"#,
+            r#"{"itemId":"it-wf","kind":"workflow","status":"completed","entryId":"nightly","workflowRunId":"wfr-9"}"#,
+            r#"{"itemId":"it-shell","kind":"userShell","status":"completed","commandText":"cargo test","visibleOutput":"ok","exitCode":0}"#,
+            r#"{"itemId":"it-dmg","kind":"damagedRange","status":"completed","damagedRange":{"missingRecords":2,"unreadableLines":5}}"#
+            ,
+            r#"{"itemId":"it-cron","kind":"scheduledFire","status":"completed","jobId":"nightly","deliveryNumber":3}"#,
+            r#"{"itemId":"it-btc","kind":"backgroundTerminalCompletion","status":"completed","backgroundTerminalCompletion":{"toolCallId":"call-bg","terminalStatus":"completed","command":"make docs","output":"done"}}"#,
+            r#"{"itemId":"it-od","kind":"overdueNotice","status":"completed","fallbackText":"Schedule overdue"}"#,
+            r#"{"itemId":"it-sc","kind":"sideChat","status":"completed","fallbackText":"Side chat opened"}"#,
+            r#"{"itemId":"it-fut","kind":"futureKind","status":"completed","fallbackText":"Future card"}"#,
+            r#"{"itemId":"it-mon","kind":"monitorFeed","status":"completed","monitorId":"mon-1","monitorDescription":"Build watcher","text":"done"}"#,
+        ]
+        .iter()
+        .map(|raw| parse_json(raw).unwrap())
+        .collect()
+    }
+
+    /// The created tool-call cards in an output batch, as (title, _meta).
+    fn cards(out: &[String]) -> Vec<(String, String)> {
+        out.iter()
+            .filter_map(|line| {
+                let frame = parse_json(line).ok()?;
+                let update = frame.get("params")?.get("update")?;
+                if !matches!(
+                    update.get("sessionUpdate").and_then(J::as_str),
+                    Some("tool_call" | "tool_call_update")
+                ) {
+                    return None;
+                }
+                let title = update
+                    .get("title")
+                    .and_then(J::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                if title.is_empty() {
+                    return None;
+                }
+                let meta = update.get("_meta").map(j_to_string).unwrap_or_default();
+                Some((title, meta))
+            })
+            .collect()
+    }
+
+    fn wrap(item: &J) -> J {
+        J::Obj(vec![("item".to_string(), item.clone())])
+    }
+
+    #[test]
+    fn replay_renders_host_cards_like_live() {
+        let items = host_card_items();
+        let mut live_fold = SessionFold::new();
+        live_fold.air_async_tasks = true;
+        let mut live = Vec::new();
+        for item in &items {
+            live_fold.on_item_completed("sid", 2, &wrap(item), &mut live);
+        }
+        let mut replay_fold = SessionFold::new();
+        replay_fold.air_async_tasks = true;
+        let mut replay = Vec::new();
+        replay_fold.replay_history_items("sid", 2, &items, &mut replay);
+        let live_cards = cards(&live);
+        let replay_cards = cards(&replay);
+        assert_eq!(live_cards.len(), items.len(), "live cards: {live_cards:?}");
+        assert_eq!(
+            live_cards, replay_cards,
+            "replayed host cards must match live title and _meta"
+        );
+    }
+
+    #[test]
+    fn replay_of_finished_shell_opens_no_terminal() {
+        let shell = parse_json(
+            r#"{"itemId":"it-shell","kind":"userShell","status":"completed","commandText":"cargo test","visibleOutput":"ok","exitCode":0}"#,
+        )
+        .unwrap();
+        let mut live_fold = SessionFold::new();
+        let mut live = Vec::new();
+        live_fold.on_item_completed("sid", 2, &wrap(&shell), &mut live);
+        assert!(
+            live.iter().any(|l| l.contains("\"terminal_update\"")),
+            "live shell settles in a terminal: {live:?}"
+        );
+        let mut replay_fold = SessionFold::new();
+        let mut replay = Vec::new();
+        replay_fold.replay_history_items("sid", 2, &[shell], &mut replay);
+        assert!(
+            !replay.iter().any(|l| l.contains("\"terminal_update\"")),
+            "a finished command must not open a terminal on replay: {replay:?}"
+        );
+        assert_eq!(cards(&live), cards(&replay));
+    }
+
+    #[test]
+    fn replay_of_finished_shell_tool_call_opens_no_terminal() {
+        let call = parse_json(
+            r#"{"itemId":"it-call","kind":"toolCall","status":"completed","tool":"bash","callId":"call-1","args":{"command":"cargo test"},"visibleOutput":"ok"}"#,
+        )
+        .unwrap();
+        let mut live_fold = SessionFold::new();
+        let mut live = Vec::new();
+        live_fold.on_item_completed("sid", 2, &wrap(&call), &mut live);
+        assert!(
+            live.iter().any(|l| l.contains("\"terminal_update\"")),
+            "live shell call settles in a terminal: {live:?}"
+        );
+        let mut replay_fold = SessionFold::new();
+        let mut replay = Vec::new();
+        replay_fold.replay_history_items("sid", 2, &[call], &mut replay);
+        assert!(
+            !replay.iter().any(|l| l.contains("\"terminal_update\"")),
+            "a finished call must not open a terminal on replay: {replay:?}"
+        );
+    }
+
+    #[test]
+    fn replay_announces_no_async_tasks_for_finished_work() {
+        let items: Vec<J> = [
+            r#"{"itemId":"it-bg","kind":"toolCall","status":"completed","tool":"bash","callId":"call-bg","args":{"command":"make"},"background":true,"visibleOutput":"done"}"#,
+            r#"{"itemId":"it-shell","kind":"userShell","status":"completed","commandText":"cargo test","visibleOutput":"ok","exitCode":0}"#,
+            r#"{"itemId":"it-wf","kind":"workflow","status":"completed","entryId":"nightly","workflowRunId":"wfr-9"}"#,
+        ]
+        .iter()
+        .map(|raw| parse_json(raw).unwrap())
+        .collect();
+        let mut live_fold = SessionFold::new();
+        live_fold.air_async_tasks = true;
+        let mut live = Vec::new();
+        for item in &items {
+            live_fold.on_item_completed("sid", 2, &wrap(item), &mut live);
+        }
+        assert_eq!(
+            live.iter()
+                .filter(|l| l.contains("\"async_task_spawned\""))
+                .count(),
+            3,
+            "live finished work announces its tasks: {live:?}"
+        );
+        let mut replay_fold = SessionFold::new();
+        replay_fold.air_async_tasks = true;
+        let mut replay = Vec::new();
+        replay_fold.replay_history_items("sid", 2, &items, &mut replay);
+        assert!(
+            !replay.iter().any(|l| l.contains("\"async_task_spawned\"")),
+            "finished history must not flood the Async Tasks panel: {replay:?}"
+        );
+    }
+
+    #[test]
+    fn replay_of_in_flight_item_registers_active() {
+        let shell = parse_json(
+            r#"{"itemId":"it-run-shell","kind":"userShell","status":"inProgress","commandText":"cargo build"}"#,
+        )
+        .unwrap();
+        let call = parse_json(
+            r#"{"itemId":"it-run-bg","kind":"toolCall","status":"inProgress","tool":"bash","callId":"call-run-bg","args":{"command":"make"},"background":true}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        fold.air_async_tasks = true;
+        let mut out = Vec::new();
+        fold.replay_history_items("sid", 2, &[shell, call], &mut out);
+        assert!(
+            fold.has_active_item("it-run-shell"),
+            "the running shell stays open for live completion"
+        );
+        assert!(
+            fold.has_active_item("it-run-bg"),
+            "the running background call stays open for live completion"
+        );
+        assert!(
+            out.iter().any(|l| l.contains("\"in_progress\"")),
+            "active work renders its start card: {out:?}"
+        );
+    }
+
+    #[test]
+    fn replay_keeps_silent_kinds_silent() {
+        let settled = parse_json(
+            r#"{"itemId":"it-rem","kind":"reminderChild","status":"completed","reminderAgentId":"agent-1"}"#,
+        )
+        .unwrap();
+        let in_flight = parse_json(
+            r#"{"itemId":"it-rem-2","kind":"reminderChild","status":"inProgress","reminderAgentId":"agent-1"}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.replay_history_items("sid", 2, &[settled, in_flight], &mut out);
+        assert!(
+            cards(&out).is_empty(),
+            "reminderChild stays out of the transcript: {out:?}"
+        );
+    }
+
+    #[test]
+    fn replay_flag_clears_after_the_batch() {
+        let replayed: J = parse_json(
+            r#"{"itemId":"it-old-bg","kind":"toolCall","status":"completed","tool":"bash","callId":"call-old","args":{"command":"make"},"background":true,"visibleOutput":"done"}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        fold.air_async_tasks = true;
+        let mut out = Vec::new();
+        fold.replay_history_items("sid", 2, &[replayed], &mut out);
+        assert!(
+            !out.iter().any(|l| l.contains("\"async_task_spawned\"")),
+            "replay announces nothing: {out:?}"
+        );
+        let live: J = parse_json(
+            r#"{"itemId":"it-new-bg","kind":"toolCall","status":"completed","tool":"bash","callId":"call-new","args":{"command":"make docs"},"background":true,"visibleOutput":"done"}"#,
+        )
+        .unwrap();
+        let mut live_out = Vec::new();
+        fold.on_item_completed("sid", 2, &wrap(&live), &mut live_out);
+        assert!(
+            live_out
+                .iter()
+                .any(|l| l.contains("\"async_task_spawned\"")),
+            "live traffic after the batch announces normally: {live_out:?}"
+        );
+    }
+
+    #[test]
+    fn replaying_history_twice_deduplicates() {
+        let items = host_card_items();
+        let mut fold = SessionFold::new();
+        let mut first = Vec::new();
+        fold.replay_history_items("sid", 2, &items, &mut first);
+        assert_eq!(cards(&first).len(), items.len());
+        let mut second = Vec::new();
+        fold.replay_history_items("sid", 2, &items, &mut second);
+        assert!(
+            cards(&second).is_empty(),
+            "a second replay of the same history adds nothing: {second:?}"
         );
     }
 }
