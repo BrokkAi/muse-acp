@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 
 use muse_msp_client::json::{J, esc, j_to_string};
 use muse_msp_client::{
-    Capabilities, ClientInfo, ClientOptions, ExitKind, LaunchConfig, MspClient, MspError, MspEvent,
-    Params, ServerRequestMode,
+    Capabilities, ClientInfo, ClientOptions, ExitKind, LaunchConfig, MspClient, MspEvent, Params,
+    ServerRequestMode,
 };
 
 const WAIT: Duration = Duration::from_secs(60);
@@ -227,16 +227,14 @@ fn the_client_alone_drives_a_real_host_through_a_session() {
         .expect("session id")
         .to_string();
 
-    // Cancel one pending request: the waiter settles at once, and the late
-    // ack is dropped without disturbing the next request.
-    let pending = client
-        .start_request("model/list", Params::empty(), WAIT)
-        .expect("model/list written");
-    assert!(pending.handle().cancel(), "the request was still pending");
-    assert!(matches!(
-        pending.wait(),
-        Err(MspError::Cancelled { ref method, .. }) if method == "model/list"
-    ));
+    // The cancel path is covered deterministically by
+    // `client::tests::a_cancelled_request_settles_once_and_ignores_its_late_response`
+    // against a scripted peer: settle-once, the late ack dropped as an unknown
+    // id, and a second cancel being a no-op. Doing it here instead asserted
+    // that the host had not already answered `model/list`, which is a race the
+    // test cannot win on a descheduled runner and which proved nothing a real
+    // host does differently. `model/list` itself still belongs here: it shows
+    // the connection is healthy before the turn below.
     let models = client
         .request("model/list", Params::empty())
         .expect("model/list");
