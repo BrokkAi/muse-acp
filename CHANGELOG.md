@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.18.0
 
 - Ask the auto-reviewer for a one-line verdict instead of JSON. The reviewer
   now ends its reply with `ALLOW: <why>` or `DENY: <why>`, and the adapter
