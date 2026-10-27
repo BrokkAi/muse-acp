@@ -2528,7 +2528,10 @@ impl SessionFold {
     /// helper so a kind handled here can never be dropped by one path and
     /// kept by another. Sets `replaying` for the duration so
     /// `on_item_completed` renders cards but skips live-only side effects
-    /// (terminals, AIR async-task announcements).
+    /// (terminals, AIR async-task announcements). The batch is the whole
+    /// history the fold sees before going live, so it ends by flushing any
+    /// row still held for an anchor the batch does not contain — the replay
+    /// counterpart of the live path's flush at the turn's end.
     pub fn replay_history_items(
         &mut self,
         acp_sid: &str,
@@ -2543,6 +2546,9 @@ impl SessionFold {
         for item in items {
             self.replay_item(acp_sid, ver, item, out);
         }
+        // Flush while `replaying` is still set so a held row renders exactly
+        // as it would have in the batch: as a replayed card, not a live one.
+        self.flush_awaiting_anchor(acp_sid, ver, out);
         self.replaying = was_replaying;
     }
 
@@ -6396,5 +6402,39 @@ mod anchor_tests {
             "{}",
             j_to_string(&plain)
         );
+    }
+
+    #[test]
+    fn a_replayed_row_renders_after_its_anchor() {
+        // Replay preserves the host's rendering order: the anchor's rows are
+        // replayed before the anchored monitor's even though the monitor's
+        // span opened first.
+        let mut fold = SessionFold::new();
+        fold.show_reminders = true;
+        let mut out = Vec::new();
+        fold.replay_history_items("sid", 1, &[monitor(), reminder()], &mut out);
+        assert_eq!(
+            order(&out),
+            vec!["reminder-rem".to_string(), "c1".to_string()],
+            "the anchored row renders after its anchor's rows: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_replayed_row_whose_anchor_is_missing_still_renders() {
+        // History can keep an anchored item while dropping its anchor (a
+        // truncated fold, a host that omits the anchor's kind). The batch's
+        // end is the fold's last chance before going live — flush there, as
+        // the live path does at turn/completed.
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.replay_history_items("sid", 1, &[monitor()], &mut out);
+        assert_eq!(
+            order(&out),
+            vec!["c1".to_string()],
+            "the replay batch's end renders the held row: {out:?}"
+        );
+        // And the row keeps its content, not just its identity.
+        assert!(out[0].contains("tick-one"), "{}", out[0]);
     }
 }
