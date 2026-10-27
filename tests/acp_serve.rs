@@ -2371,12 +2371,19 @@ fn auto_review_denies_on_unusable_reviewer_output() {
     let _pid = c.prompt(&sid, "do the thing");
     c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
     c.wait_stderr(
-        "auto-review deny ap-1: auto-review returned no usable decision: the reviewer reply was not a JSON decision",
+        "auto-review deny ap-1: auto-review returned no usable decision: the reviewer reply had no verdict. The reviewer said: not json",
         Duration::from_secs(15),
     );
     c.wait_stderr("was unusable: \"not json\"", Duration::from_secs(15));
+    // Every follow-up is spent before the deny, and no more.
+    c.wait_stderr("asking again (3/3)", Duration::from_secs(15));
+    let log = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        !log.contains("asking again (4/"),
+        "at most three follow-ups: {log}"
+    );
     let notice = c.wait_for(
-        "Permission denied: reviewer failed: auto-review returned no usable decision: the reviewer reply was not a JSON decision.",
+        "Permission denied: reviewer failed: auto-review returned no usable decision: the reviewer reply had no verdict. The reviewer said: not json.",
         Duration::from_secs(15),
     );
     assert!(
@@ -2387,7 +2394,7 @@ fn auto_review_denies_on_unusable_reviewer_output() {
 }
 
 #[test]
-fn auto_review_asks_once_more_for_json_before_denying() {
+fn auto_review_asks_again_for_a_verdict_before_denying() {
     let mut c = Client::spawn(
         "approval_hang",
         &[
@@ -2395,10 +2402,7 @@ fn auto_review_asks_once_more_for_json_before_denying() {
                 "FAKE_REVIEW_TEXT",
                 "I could not run git show here, so I cannot verify.",
             ),
-            (
-                "FAKE_REVIEW_RETRY_TEXT",
-                "{\"outcome\":\"allow\",\"rationale\":\"Read-only inspection.\"}",
-            ),
+            ("FAKE_REVIEW_RETRY_TEXT", "ALLOW: Read-only inspection."),
         ],
     );
     let sid = c.new_session(1, "");
@@ -2408,7 +2412,7 @@ fn auto_review_asks_once_more_for_json_before_denying() {
     );
     let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
     let _pid = c.prompt(&sid, "inspect agent.rs on master");
-    c.wait_stderr("asking once more for JSON", Duration::from_secs(15));
+    c.wait_stderr("asking again (1/3)", Duration::from_secs(15));
     c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(15));
     c.wait_stderr(
         "auto-review allow ap-1: Read-only inspection.",
@@ -2419,16 +2423,13 @@ fn auto_review_asks_once_more_for_json_before_denying() {
 
 #[test]
 fn auto_review_reply_is_the_latest_agent_message_only() {
-    // The trailing brace closes the draft's `{` if the messages were joined,
-    // and the monitor feed's deny would win if its text counted.
+    // The draft's deny would lead the verdict line if the messages were
+    // joined, and the monitor feed's deny would win if its text counted.
     let mut c = Client::spawn(
         "approval_hang",
         &[
             ("FAKE_REVIEW_NOISE", "1"),
-            (
-                "FAKE_REVIEW_TEXT",
-                "{\"outcome\":\"allow\",\"rationale\":\"Routine.\"} }",
-            ),
+            ("FAKE_REVIEW_TEXT", "ALLOW: Routine."),
         ],
     );
     let sid = c.new_session(1, "");
@@ -2443,7 +2444,7 @@ fn auto_review_reply_is_the_latest_agent_message_only() {
     assert!(
         !std::fs::read_to_string(&c.stderr_log)
             .unwrap_or_default()
-            .contains("asking once more for JSON"),
+            .contains("asking again"),
         "a usable latest message needs no follow-up"
     );
     c.finish();

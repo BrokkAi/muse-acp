@@ -39,22 +39,23 @@ The reviewer prompt has six parts:
 4. The review environment: workspace roots and the current approval mode.
 5. The exact approval request: subject, tool, raw arguments, flags, and
    available choices.
-6. The output contract: strict JSON.
+6. The output contract: one verdict line.
 
-The reply must be:
+The policy tells the reviewer to judge the action from its text, never to run
+it, and to fold anything it cannot verify into the risk rather than withhold
+a verdict. The reply must end with one line:
 
-```json
-{
-  "risk_level": "low | medium | high | critical",
-  "user_authorization": "unknown | low | medium | high",
-  "outcome": "allow | deny",
-  "rationale": "one concise sentence"
-}
+```text
+ALLOW: <one concise sentence why>
+DENY: <one concise sentence why>
 ```
 
-`outcome` is re-derived from the thresholds so a model that allows a critical
-action cannot override the policy: critical denies; high allows only with
-medium or high authorization; low and medium allow.
+The adapter takes the last line that starts with `ALLOW` or `DENY`
+(case-insensitive, ignoring leading markdown such as `**` or a bullet); the
+rest of the line is the rationale. Nothing else is parsed. A Codex-style JSON
+decision (`outcome`, `risk_level`, `user_authorization`, `rationale`) is still
+accepted as a fallback, and its `outcome` is re-derived from the thresholds so
+a model that allows a critical action cannot override the policy.
 
 ## Decisions
 
@@ -63,19 +64,18 @@ medium or high authorization; low and medium allow.
 - Deny: the adapter answers with the host's reject choice, shows
   `Permission denied by Auto-review: <rationale>` in the editor transcript,
   and passes the rationale as feedback when the host accepts feedback.
-- Unusable output gets one second chance: when a completed reviewer reply
-  holds no JSON decision, the adapter asks once more, in the same reviewer
-  session, for only the JSON. The original review timeout covers both
-  attempts. The decision is the last top-level JSON object with a valid
-  `outcome`; objects nested inside another object never count, so prose,
-  code fences, or a quoted payload around the decision do not break it.
-- Reviewer failure or unusable output after that retry: deny. The action
-  does not run, the transcript identifies the reviewer failure, and the
-  detailed reason is logged. A reviewer turn that fails denies with the host's error, for
-  example `reviewer turn failed: contextWindowExceeded: prompt is too long`.
-  An unusable reply says whether the reply was empty and logs a short
-  excerpt. Either way the adapter resets the reviewer host before the next
-  review.
+- A reply without a verdict is asked again: when a completed reviewer reply
+  has no verdict line, the adapter asks up to three more times, in the same
+  reviewer session, for only the verdict line. The original review timeout
+  covers every attempt. Only the reviewer's latest message counts as its
+  reply.
+- Reviewer failure, or still no verdict after the follow-ups: deny. The
+  action does not run and the transcript identifies the reviewer failure.
+  A reviewer turn that fails denies with the host's error, for example
+  `reviewer turn failed: contextWindowExceeded: prompt is too long`. A reply
+  without a verdict quotes what the reviewer said in the notice, and the
+  whole reply is logged to stderr. Either way the adapter resets the
+  reviewer host before the next review.
 - Each review runs in a fresh reviewer session, so no review inherits an
   earlier review's history. The adapter restarts the reviewer host every 32
   reviews.
@@ -128,7 +128,7 @@ becomes an editor decision.
   it.
 - The reviewer is a model; it can make mistakes. The sandbox, approval mode,
   and host policy remain the enforcement layer.
-- Reviews cost an extra model call per permission request, and a second
-  call when the first reply holds no usable decision.
+- Reviews cost an extra model call per permission request, and up to three
+  more when the reviewer's reply has no verdict.
 - The reviewer can read the workspace but cannot write, run commands, or use
   the network.

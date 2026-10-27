@@ -9989,8 +9989,8 @@ struct ReviewState {
     /// Items of the active turn that are not agent messages (monitor feeds,
     /// tool cards). Their `text` deltas are not part of the reply.
     other_items: std::collections::HashSet<String>,
-    /// Whether the active review already asked once for a JSON-only reply.
-    retried: bool,
+    /// Verdict-only follow-ups the active review has sent so far.
+    retries: u8,
     /// Reviewer turn id, so stale events cannot settle a later review.
     turn: String,
     /// When the active review expires: a reviewer turn that never ends must
@@ -10230,7 +10230,7 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
             st.text.clear();
             st.text_item.clear();
             st.other_items.clear();
-            st.retried = false;
+            st.retries = 0;
             st.turn = turn;
             let timeout = reviewer::review_timeout();
             st.deadline = Some(std::time::Instant::now() + timeout);
@@ -10245,10 +10245,10 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
     }
 }
 
-/// Ask the reviewer, in its own session, for the JSON decision it failed to
-/// give. Returns false when the follow-up could not start, so the caller
-/// settles the review on the reply it has.
-fn retry_review_for_json(host: &Arc<Hosts>, review_sid: &str, approval_id: &str) -> bool {
+/// Ask the reviewer, in its own session, for the verdict it failed to give.
+/// Returns false when the follow-up could not start, so the caller settles
+/// the review on the reply it has.
+fn retry_review_for_verdict(host: &Arc<Hosts>, review_sid: &str, approval_id: &str) -> bool {
     let Some(reviewer) = host.host(HostKind::Reviewer) else {
         return false;
     };
@@ -10257,7 +10257,7 @@ fn retry_review_for_json(host: &Arc<Hosts>, review_sid: &str, approval_id: &str)
         "{{\"commandId\":{},\"sessionId\":{},\"input\":[{{\"type\":\"text\",\"text\":{}}}]}}",
         esc(&cmd),
         esc(review_sid),
-        esc(reviewer::JSON_RETRY_PROMPT)
+        esc(reviewer::VERDICT_RETRY_PROMPT)
     );
     match reviewer.command("turn/start", &params) {
         Ok(result) => {
@@ -10274,7 +10274,7 @@ fn retry_review_for_json(host: &Arc<Hosts>, review_sid: &str, approval_id: &str)
         }
         Err(error) => {
             log(&format!(
-                "auto-review JSON follow-up for {approval_id} failed to start: {}",
+                "auto-review verdict follow-up for {approval_id} failed to start: {}",
                 err_message(&error)
             ));
             false
@@ -10450,16 +10450,23 @@ fn finish_review(
             log(&format!(
                 "auto-review reply for {} was unusable: {:?}",
                 job.approval_id,
-                reviewer::excerpt(text)
+                reviewer::full_reply(text)
             ));
-            let rationale = reviewer::unusable_reply_rationale(text);
+            // Show what the reviewer actually said, not only that it failed.
+            let rationale = match reviewer::excerpt(text) {
+                said if said.is_empty() => reviewer::unusable_reply_rationale(text).to_string(),
+                said => format!(
+                    "{}. The reviewer said: {said}",
+                    reviewer::unusable_reply_rationale(text)
+                ),
+            };
             deny_review_job(
                 host,
                 stdout,
                 sessions,
                 job,
                 ReviewDeny::ReviewerFailed,
-                rationale,
+                &rationale,
             );
             reset_reviewer_host(host);
         }
@@ -10600,26 +10607,32 @@ fn handle_review_event(
                 }
                 let unusable = terminal == "completed"
                     && st.active.is_some()
-                    && !st.retried
+                    && st.retries < reviewer::VERDICT_RETRIES
                     && reviewer::parse_assessment(&st.text).is_none();
                 match st.session.clone() {
                     Some(review_sid) if unusable => {
-                        st.retried = true;
+                        st.retries += 1;
                         // The follow-up's own turn id is unknown until the
                         // host answers; accept its events meanwhile.
                         st.turn.clear();
                         let job_id = st.active.as_ref().map(|job| job.approval_id.clone());
-                        Some((review_sid, job_id.unwrap_or_default(), st.text.clone()))
+                        Some((
+                            review_sid,
+                            job_id.unwrap_or_default(),
+                            st.text.clone(),
+                            st.retries,
+                        ))
                     }
                     _ => None,
                 }
             };
-            if let Some((review_sid, approval_id, text)) = retry {
+            if let Some((review_sid, approval_id, text, attempt)) = retry {
                 log(&format!(
-                    "auto-review reply for {approval_id} was unusable, asking once more for JSON: {:?}",
-                    reviewer::excerpt(&text)
+                    "auto-review reply for {approval_id} had no verdict, asking again ({attempt}/{}): {:?}",
+                    reviewer::VERDICT_RETRIES,
+                    reviewer::full_reply(&text)
                 ));
-                if retry_review_for_json(host, &review_sid, &approval_id) {
+                if retry_review_for_verdict(host, &review_sid, &approval_id) {
                     return true;
                 }
             }

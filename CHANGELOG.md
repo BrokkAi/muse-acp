@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Ask the auto-reviewer for a one-line verdict instead of JSON. The reviewer
+  now ends its reply with `ALLOW: <why>` or `DENY: <why>`, and the adapter
+  only reads the last line starting with one of those words; JSON decisions
+  are still accepted as a fallback. The policy now says outright that the
+  reviewer judges an action from its text and never needs to run it, so a
+  shell command it cannot execute read-only is no longer a reason to answer
+  without a verdict. A reply with no verdict is asked again up to three
+  times, not once, before the approval is denied; the deny notice quotes what
+  the reviewer said, and the whole reply is logged to stderr instead of a
+  240-character excerpt.
+
 - Stop denying auto-reviews whose reviewer reply only looked unusable. The
   decision parser took everything from the first `{` to the last `}`, so any
   brace in the reviewer's prose (quoted code, an echoed action) made a valid
