@@ -11782,6 +11782,9 @@ fn handle_msp(
                     );
                     s.fold
                         .clear_model_retry(&acp_sid, Some(turn_id), &mut checks);
+                    // The turn is ending, so no further item can arrive to
+                    // carry a row that is still waiting on an anchor.
+                    s.fold.flush_awaiting_anchor(&acp_sid, s.ver, &mut checks);
                     acp::send_fold_lines(stdout, s, checks);
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id);
                     let ver = s.ver;

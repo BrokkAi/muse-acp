@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Place a host card's row where the host says it belongs. Muse 1.4.13 names the
+  item a terminal row follows (`Item.terminalRowAfterItemId`) because a card's
+  log span can open long before its output is observed: a monitor is armed at
+  seq 49 but finishes at seq 105, with a reminder check landing at seq 103 in
+  between. The adapter created one card at the start of the span and only ever
+  updated it in place, so its output could appear before items that actually
+  ran first. A row anchored to an item the adapter has not seen yet now waits
+  for that item's rows; an anchor already seen is emitted immediately, and the
+  turn's end flushes anything still waiting, so a hint can never lose a row.
+  Hosts that send no anchor — every release before 1.4.13 — behave exactly as
+  before (#397).
+
 - Show the data a computer-use approval would send. Muse 1.4.13 adds
   `cuaCardFacts.data`: the rows naming what the call would actually send, such
   as a token or a password. The permission prompt showed only the page, window,
