@@ -6246,9 +6246,12 @@ fn handle_acp(
                     };
                     let mut fork_fold = fresh_fold(&restored_cwd);
                     let mut replay_lines = Vec::new();
-                    for item in &history_items {
-                        fork_fold.replay_item(&new_msp, ver, item, &mut replay_lines);
-                    }
+                    fork_fold.replay_history_items(
+                        &new_msp,
+                        ver,
+                        &history_items,
+                        &mut replay_lines,
+                    );
                     let provenance = session_provenance_meta(Some(&new_session))
                         .map(|muse| format!(",\"muse\":{muse}"))
                         .unwrap_or_default();
@@ -8744,15 +8747,9 @@ fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) 
         return;
     };
     let mut out = Vec::new();
-    for it in &items {
-        let kind = it.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-        match kind {
-            "subagent" | "toolCall" | "userMessage" | "agentMessage" | "compaction" => {
-                sess.fold.replay_item(&sess.acp_sid, sess.ver, it, &mut out)
-            }
-            _ => {}
-        }
-    }
+    let (acp_sid, ver) = (sess.acp_sid.clone(), sess.ver);
+    sess.fold
+        .replay_history_items(&acp_sid, ver, &items, &mut out);
     acp::send_fold_lines(stdout, sess, out);
 }
 
@@ -11252,17 +11249,7 @@ fn drill_down_subagent_child(
                         && let Some(fold) = s.child_folds.get_mut(&child)
                         && let Some(items) = replay_items(&r)
                     {
-                        for it in items {
-                            if matches!(
-                                it.get("kind").and_then(J::as_str),
-                                Some("toolCall" | "subagent" | "agentMessage" | "userMessage")
-                            ) {
-                                fold.replay_item(&child, ver, &it, &mut out);
-                            } else {
-                                let wrap = J::Obj(vec![("item".to_string(), it)]);
-                                fold.on_item_completed(&child, ver, &wrap, &mut out);
-                            }
-                        }
+                        fold.replay_history_items(&child, ver, &items, &mut out);
                     }
                 }
                 send_fold_output(&stdout, &sessions, &child, out);

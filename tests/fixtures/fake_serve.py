@@ -2223,6 +2223,53 @@ def result_for(method, msg):
             # The adapter must learn about running work from `task/list`;
             # nothing in this history carries it.
             history = {"mode": "inline", "items": [], "snapshot": None}
+        elif SCENARIO == "cards_load":
+            # Every host card kind in one inline history, plus one finished
+            # backgrounded call beside its durable completion and one
+            # still-running backgrounded call (for #393 replay parity).
+            history = {"mode": "inline", "snapshot": None, "items": [
+                {"itemId": "card-web", "kind": "webSearch", "status": "completed",
+                 "turnId": None, "fallbackText": "Searched the web for fixtures"},
+                {"itemId": "card-hook", "kind": "hookRun", "status": "completed",
+                 "turnId": None, "label": "pre-commit", "runStatus": "failed",
+                 "reason": "exited 1"},
+                {"itemId": "card-wf", "kind": "workflow", "status": "completed",
+                 "turnId": None, "workflowRunId": "wfr-cards",
+                 "entryId": "nightly"},
+                {"itemId": "card-bg", "kind": "toolCall",
+                 "callId": "call-card-bg", "status": "completed",
+                 "tool": "workspace-shell", "args": {"command": "npm run build"},
+                 "background": True, "visibleOutput": "build done"},
+                {"itemId": "card-btc", "kind": "backgroundTerminalCompletion",
+                 "status": "completed", "turnId": None,
+                 "backgroundTerminalCompletion": {
+                     "command": "npm run build", "output": "build done",
+                     "outputTruncated": False, "terminalStatus": "completed",
+                     "toolCallId": "call-card-bg"}},
+                {"itemId": "card-shell", "kind": "userShell", "status": "completed",
+                 "turnId": None, "commandText": "cargo test",
+                 "visibleOutput": "test ok", "exitCode": 0},
+                {"itemId": "card-dmg", "kind": "damagedRange", "status": "completed",
+                 "turnId": None,
+                 "damagedRange": {"missingRecords": 2, "unreadableLines": 5}},
+                {"itemId": "card-cron", "kind": "scheduledFire",
+                 "status": "completed", "turnId": None, "jobId": "nightly",
+                 "deliveryNumber": 3},
+                {"itemId": "card-future", "kind": "futureCardKind",
+                 "status": "completed", "turnId": None,
+                 "fallbackText": "A future card"},
+                {"itemId": "card-mon", "kind": "monitorFeed", "status": "completed",
+                 "turnId": None, "monitorId": "mon-cards",
+                 "monitorDescription": "Cards monitor", "text": "done"},
+                {"itemId": "card-active", "kind": "toolCall",
+                 "callId": "call-card-active", "status": "inProgress",
+                 "tool": "workspace-shell", "args": {"command": "npm watch"},
+                 "background": True},
+            ]}
+        elif SCENARIO == "task_list_seed":
+            # The adapter must learn about running work from `task/list`;
+            # nothing in this history carries it.
+            history = {"mode": "inline", "items": [], "snapshot": None}
         elif SCENARIO in ("usage_inline", "questions_resume") and snapshot_rung:
             history = usage_snapshot_history(cumulative=(300, 60))
         else:
