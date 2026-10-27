@@ -244,6 +244,15 @@ fn timeout_override(env_override: Option<&str>) -> Option<std::time::Duration> {
 /// other profile refusals still need an actionable diagnostic. Returns
 /// None for unrelated errors; the caller keeps the host text either way.
 pub fn session_profile_hint(host_message: &str) -> Option<String> {
+    // A retained-session refusal also *composes* a permission profile, but its
+    // cause is the lost durable record, not the settings: the profile was
+    // never consulted. Pointing at `permissions.default_profile` would send
+    // the user to the wrong place, so those refusals get no hint.
+    if host_message.contains("retained session refused")
+        || host_message.contains("retained durable session")
+    {
+        return None;
+    }
     if !host_message.contains("permission profile") {
         return None;
     }
@@ -1318,6 +1327,27 @@ mod tests {
         ] {
             assert!(session_profile_hint(msg).is_none(), "{msg:?} must not hint");
         }
+    }
+
+    #[test]
+    fn a_lost_record_refusal_does_not_blame_the_settings() {
+        // Muse 1.4.13, captured verbatim from a live host whose durable
+        // record held no committed permission authority. The refusal merely
+        // composes a permission profile while restoring, so a settings hint
+        // would misdirect: `permissions.default_profile` is not the problem
+        // and the profile was never consulted.
+        let host = "retained session refused (class c): compose session permission profile: \
+                    retained durable session has no committed permission authority; start a new \
+                    session [/state/sessions/2026/10/27/01a17cba/session.jsonl]; remedy: retry \
+                    with a compatible host that can read the retained permission frame, or start \
+                    a new session";
+        assert!(session_profile_hint(host).is_none(), "{host}");
+        // Either half of the marker is enough on its own.
+        assert!(session_profile_hint("retained session refused (class c)").is_none());
+        assert!(
+            session_profile_hint("the retained durable session has no permission profile")
+                .is_none()
+        );
     }
 
     #[test]
