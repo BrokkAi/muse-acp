@@ -9522,14 +9522,18 @@ fn host_121_fingerprint_is_tested() {
 }
 
 fn auto_review_config() -> (std::path::PathBuf, &'static str) {
+    // A counter, not the clock: macOS reports time in whole microseconds, so
+    // two tests starting together got the same directory and one test's
+    // cleanup deleted the other's files mid-run.
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let source = std::env::temp_dir().join(format!(
         "muse-acp-profile-test-{}-{}",
         std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        NEXT.fetch_add(1, Ordering::Relaxed)
     ));
+    // A recycled process id can meet a directory an earlier, failed run left
+    // behind; its markers and config logs would pass for this run's.
+    let _ = std::fs::remove_dir_all(&source);
     std::fs::create_dir_all(source.join("muse")).unwrap();
     let original = r#"{"schema_version":1,"model":"chosen","reasoning_effort":"xhigh","permissions":{"schema_version":1,"default_profile":":auto-review"}}"#;
     std::fs::write(source.join("muse/settings.json"), original).unwrap();
