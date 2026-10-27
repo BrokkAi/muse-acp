@@ -3183,24 +3183,71 @@ fn plan_mode_survives_an_adapter_restart() {
 /// Two adapter contracts matter and neither is about the pick being applied:
 /// the resume fails instead of fabricating success, and the failure is
 /// reported as the record problem it is rather than as bad profile settings.
+///
+/// Each variant runs against its own damaged record. A refused load can
+/// dispose of the record it touched, so one session cannot serve both: doing
+/// that made the second variant answer `session not found` on CI while both
+/// answered the record refusal locally.
 #[test]
 fn resume_permission_pick_over_an_unrestorable_record_is_refused() {
     let test = "resume_permission_pick_over_an_unrestorable_record_is_refused";
     if !enabled(test) {
         return;
     }
+    let mut saw_record_refusal = false;
+    for pick in [Some(":ask-me"), None] {
+        let (host, session) = unreadable_record(test);
+        let mut adapter = Adapter::launch(&host);
+        let meta = match pick {
+            Some(profile) => json!({"muse": {"permissionProfile": profile}}),
+            None => json!({}),
+        };
+        let id = adapter.request("session/load", json!({"sessionId": session, "_meta": meta}));
+        let response = adapter.response(id);
+        let message = response["error"]["message"].as_str().unwrap_or_else(|| {
+            panic!("a pick must not resume an unrestorable record ({pick:?}): {response}")
+        });
+
+        // Never a profile admission refusal: the pick was never consulted.
+        assert!(
+            response["error"].get("data").is_none()
+                || response["error"]["data"].get("kind") != Some(&json!("commandRejected")),
+            "a lost record is not a profile admission refusal ({pick:?}): {response}"
+        );
+        // The adapter's own wording, and the half that regresses: a record
+        // problem must not be blamed on healthy profile settings.
+        assert!(
+            !message.contains("permissions.default_profile") && !message.contains("Hint:"),
+            "a lost record must not be blamed on the profile settings ({pick:?}): {response}"
+        );
+        if message.contains("retained session refused") {
+            saw_record_refusal = true;
+            assert!(
+                message.contains("session.jsonl") && message.contains("remedy:"),
+                "the refusal must keep the host's path and remedy ({pick:?}): {response}"
+            );
+        }
+        adapter.finish();
+    }
+    // Without this the whole test could pass on two `session not found`
+    // answers, which never reach the profile-composing path at all.
+    assert!(
+        saw_record_refusal,
+        "neither variant reached the host's retained-record refusal"
+    );
+}
+
+/// A host whose newest session keeps its directory but holds no readable
+/// durable record, so the host cannot restore retained authority.
+fn unreadable_record(test: &str) -> (Host, String) {
     let host = Host::start(json!({"hello": {"text": "hello"}}), Some(":ask-me"));
     let adapter = Adapter::launch(&host);
     let (release, _) = adapter_host_release(&adapter);
     let Some(mut adapter) = require_release(adapter, release, (1, 4, 8), test) else {
-        return;
+        panic!("{test} needs Muse 1.4.8 or newer for the resume permission pick");
     };
-
     let session = adapter.new_session(&host, json!([]));
     adapter.finish();
-
-    // The durable record survives but holds no committed permission
-    // authority, so the host cannot restore retained authority at all.
     let sessions = host.dir.join("home/.local/share/muse/sessions");
     let mut truncated = false;
     for path in walk(&sessions) {
@@ -3210,57 +3257,7 @@ fn resume_permission_pick_over_an_unrestorable_record_is_refused() {
         }
     }
     assert!(truncated, "the host kept no retained record to damage");
-
-    let mut adapter = Adapter::launch(&host);
-    let load = |adapter: &mut Adapter, pick: Option<&str>| {
-        let meta = match pick {
-            Some(profile) => json!({"muse": {"permissionProfile": profile}}),
-            None => json!({}),
-        };
-        let id = adapter.request("session/load", json!({"sessionId": session, "_meta": meta}));
-        adapter.response(id)
-    };
-
-    // With a pick, the host refuses before admitting it: this must be a
-    // failure, and never a profile admission refusal.
-    let with_pick = load(&mut adapter, Some(":ask-me"));
-    let message = with_pick["error"]["message"]
-        .as_str()
-        .unwrap_or_else(|| panic!("a pick must not resume a lost record: {with_pick}"));
-    assert!(
-        message.contains("retained session refused"),
-        "the refusal must be the retained-record one: {with_pick}"
-    );
-    assert!(
-        message.contains("session.jsonl") && message.contains("remedy:"),
-        "the refusal must keep the host's path and remedy: {with_pick}"
-    );
-    assert!(
-        with_pick["error"].get("data").is_none()
-            || with_pick["error"]["data"].get("kind") != Some(&json!("commandRejected")),
-        "a lost record is not a profile admission refusal: {with_pick}"
-    );
-
-    // Without a pick, the same record meets the same refusal. This is the
-    // adapter's own wording, so it is the half that regresses: the settings
-    // hint must stay off a record problem.
-    let without_pick = load(&mut adapter, None);
-    let plain = without_pick["error"]["message"]
-        .as_str()
-        .unwrap_or_else(|| panic!("a lost record must not resume: {without_pick}"));
-    assert!(
-        plain.contains("retained session refused"),
-        "the pick is not the cause of the refusal: {without_pick}"
-    );
-    assert!(
-        !plain.contains("permissions.default_profile"),
-        "a lost record must not be blamed on the profile settings: {without_pick}"
-    );
-    assert!(
-        !plain.contains("Hint:"),
-        "no settings hint belongs on a record refusal: {without_pick}"
-    );
-    adapter.finish();
+    (host, session)
 }
 
 fn walk(p: &std::path::Path) -> Vec<std::path::PathBuf> {
