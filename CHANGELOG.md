@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Stop blaming the profile settings for a lost session record. A resume over
+  a retained record that holds no committed permission authority is refused by
+  Muse as `retained session refused (class c)`, and the adapter appended its
+  "check `permissions.default_profile`" hint because that text also *composes*
+  a permission profile while restoring. The hint pointed at healthy settings
+  while the real cause — and the host's own path and remedy — said the record
+  could not be read. Those refusals now carry the host's diagnosis alone.
+  Muse 1.4.13's never-wider reset over a declared lost record remains a
+  host-internal recovery decision that the live harness cannot script, so the
+  reachable refusal is what the new live and fake-host tests pin (#398).
+
 - Pin the Muse 1.4.13 build in the nightly live-host matrix and promote its
   fingerprint to tested. The `3dce908` SDK pin already published the 1.4.13
   stable surface, but no 1.4.13 binary was pinned, so the surface classified

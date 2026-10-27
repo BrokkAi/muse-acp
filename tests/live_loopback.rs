@@ -3167,3 +3167,114 @@ fn plan_mode_survives_an_adapter_restart() {
     assert_write_refused(&second, &host, log_mark);
     second.finish();
 }
+
+/// Muse 1.4.13 spells out what a resume permission-profile pick means over a
+/// declared lost record: the host commits its never-wider reset first, then
+/// admits the pick, and a pick that cannot be admitted refuses the resume with
+/// a typed `commandRejected`.
+///
+/// That reset is a host-internal recovery decision over durable state, and this
+/// harness cannot declare a record lost: it can only damage one. Muse verifies
+/// the retained log's sequence chain and permission frames strictly, so every
+/// tampered shape meets a `resume_refused_class_c` refusal before any profile
+/// is consulted. That refusal is what this test pins, and it is the reason the
+/// reset path itself stays uncovered here (see the ROADMAP §9 row).
+///
+/// Two adapter contracts matter and neither is about the pick being applied:
+/// the resume fails instead of fabricating success, and the failure is
+/// reported as the record problem it is rather than as bad profile settings.
+#[test]
+fn resume_permission_pick_over_an_unrestorable_record_is_refused() {
+    let test = "resume_permission_pick_over_an_unrestorable_record_is_refused";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({"hello": {"text": "hello"}}), Some(":ask-me"));
+    let adapter = Adapter::launch(&host);
+    let (release, _) = adapter_host_release(&adapter);
+    let Some(mut adapter) = require_release(adapter, release, (1, 4, 8), test) else {
+        return;
+    };
+
+    let session = adapter.new_session(&host, json!([]));
+    adapter.finish();
+
+    // The durable record survives but holds no committed permission
+    // authority, so the host cannot restore retained authority at all.
+    let sessions = host.dir.join("home/.local/share/muse/sessions");
+    let mut truncated = false;
+    for path in walk(&sessions) {
+        if path.to_string_lossy().contains(&session) && path.ends_with("session.jsonl") {
+            std::fs::write(&path, "").expect("truncate the retained record");
+            truncated = true;
+        }
+    }
+    assert!(truncated, "the host kept no retained record to damage");
+
+    let mut adapter = Adapter::launch(&host);
+    let load = |adapter: &mut Adapter, pick: Option<&str>| {
+        let meta = match pick {
+            Some(profile) => json!({"muse": {"permissionProfile": profile}}),
+            None => json!({}),
+        };
+        let id = adapter.request("session/load", json!({"sessionId": session, "_meta": meta}));
+        adapter.response(id)
+    };
+
+    // With a pick, the host refuses before admitting it: this must be a
+    // failure, and never a profile admission refusal.
+    let with_pick = load(&mut adapter, Some(":ask-me"));
+    let message = with_pick["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a pick must not resume a lost record: {with_pick}"));
+    assert!(
+        message.contains("retained session refused"),
+        "the refusal must be the retained-record one: {with_pick}"
+    );
+    assert!(
+        message.contains("session.jsonl") && message.contains("remedy:"),
+        "the refusal must keep the host's path and remedy: {with_pick}"
+    );
+    assert!(
+        with_pick["error"].get("data").is_none()
+            || with_pick["error"]["data"].get("kind") != Some(&json!("commandRejected")),
+        "a lost record is not a profile admission refusal: {with_pick}"
+    );
+
+    // Without a pick, the same record meets the same refusal. This is the
+    // adapter's own wording, so it is the half that regresses: the settings
+    // hint must stay off a record problem.
+    let without_pick = load(&mut adapter, None);
+    let plain = without_pick["error"]["message"]
+        .as_str()
+        .unwrap_or_else(|| panic!("a lost record must not resume: {without_pick}"));
+    assert!(
+        plain.contains("retained session refused"),
+        "the pick is not the cause of the refusal: {without_pick}"
+    );
+    assert!(
+        !plain.contains("permissions.default_profile"),
+        "a lost record must not be blamed on the profile settings: {without_pick}"
+    );
+    assert!(
+        !plain.contains("Hint:"),
+        "no settings hint belongs on a record refusal: {without_pick}"
+    );
+    adapter.finish();
+}
+
+fn walk(p: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = std::fs::read_dir(p) else {
+        return out;
+    };
+    for e in rd.flatten() {
+        let path = e.path();
+        if path.is_dir() {
+            out.extend(walk(&path));
+        } else {
+            out.push(path);
+        }
+    }
+    out
+}

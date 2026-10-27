@@ -3293,6 +3293,34 @@ def main():
                                              "recoveryObservation": observation}}})
                     continue
                 if (method == "session/resume"
+                        and os.environ.get("FAKE_RESUME_LOST_RECORD") == "1"):
+                    # Verbatim from a Muse 1.4.13 host whose retained record
+                    # holds no committed permission authority.
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {
+                              "code": -32603,
+                              "message": (
+                                  "retained session refused (class c): compose session "
+                                  "permission profile: retained durable session has no "
+                                  "committed permission authority; start a new session "
+                                  "[/state/sessions/2026/10/27/01a17cba/session.jsonl]; "
+                                  "remedy: retry with a compatible host that can read the "
+                                  "retained permission frame, or start a new session"),
+                              "data": {
+                                  "kind": "internal",
+                                  "reason": "resume_refused_class_c",
+                                  "retryable": False,
+                                  "details": {
+                                      "refusalClass": "c",
+                                      "path": "/state/sessions/2026/10/27/01a17cba/session.jsonl",
+                                      "detail": ("compose session permission profile: retained "
+                                                 "durable session has no committed permission "
+                                                 "authority; start a new session"),
+                                      "remedy": ("retry with a compatible host that can read the "
+                                                 "retained permission frame, or start a new "
+                                                 "session")}}}})
+                    continue
+                if (method == "session/resume"
                         and os.environ.get("FAKE_RESUME_NOT_FOUND") == "1"):
                     send({"jsonrpc": "2.0", "id": ident,
                           "error": {"code": -32020, "message": "session not found",

@@ -9783,6 +9783,66 @@ fn auto_review_override_is_recreated_on_restart_and_used_by_support() {
 }
 
 #[test]
+fn a_lost_record_refusal_is_reported_without_settings_guidance() {
+    // Muse 1.4.13 refuses a resume over a retained record that holds no
+    // committed permission authority. The profile is never consulted, so the
+    // adapter must report the host's refusal — with its record path and
+    // remedy — and must not blame `permissions.default_profile`, which is
+    // healthy.
+    let mut c = Client::spawn("quiet", &[("FAKE_RESUME_LOST_RECORD", "1")]);
+    c.initialize(1, "");
+    let id = c.req(
+        "session/resume",
+        &format!(
+            "{{\"sessionId\":\"01a17cba-02e1-7bc1-8e3a-0f29dca649ac\",\"cwd\":{}}}",
+            temp_cwd_json()
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"error\""), "resume must fail: {frame}");
+    assert!(
+        frame.contains("retained session refused (class c)"),
+        "host text must be preserved: {frame}"
+    );
+    assert!(
+        frame.contains("session.jsonl") && frame.contains("remedy:"),
+        "the refusal must keep its path and remedy: {frame}"
+    );
+    assert!(
+        !frame.contains("permissions.default_profile"),
+        "a lost record must not be blamed on the profile settings: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
+fn a_lost_record_refusal_with_a_pick_is_not_a_profile_admission_error() {
+    // The pick cannot make an unrestorable record resumable, and the host
+    // refuses before admitting it: the answer stays a resume failure rather
+    // than the typed `commandRejected` a bad profile id produces.
+    let mut c = Client::spawn("quiet", &[("FAKE_RESUME_LOST_RECORD", "1")]);
+    c.initialize(1, "");
+    let id = c.req(
+        "session/resume",
+        &format!(
+            "{{\"sessionId\":\"01a17cba-02e1-7bc1-8e3a-0f29dca649ac\",\"cwd\":{},\"_meta\":{{\"muse\":{{\"permissionProfile\":\":ask-me\"}}}}}}",
+            temp_cwd_json()
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"error\""), "resume must fail: {frame}");
+    assert!(
+        !frame.contains("commandRejected") && !frame.contains("permission_profile_unknown"),
+        "a lost record is not a profile admission refusal: {frame}"
+    );
+    assert!(
+        !frame.contains("permissions.default_profile"),
+        "a pick must not add settings guidance either: {frame}"
+    );
+    c.finish();
+}
+
+#[test]
 fn unusable_permission_profile_fails_with_settings_guidance() {
     let mut c = Client::spawn("quiet", &[("FAKE_START_ERROR", "profile")]);
     c.initialize(1, "");
