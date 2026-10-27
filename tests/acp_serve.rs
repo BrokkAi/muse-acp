@@ -14981,6 +14981,58 @@ fn streamed_rows_preserve_metadata_priority_and_clear_omitted_fields() {
 }
 
 #[test]
+fn fork_replays_host_cards_without_live_side_effects() {
+    // #393 names all three replay paths. load and resume are covered by
+    // `load_and_resume_replay_host_cards_without_live_side_effects`; this is
+    // the fork path, whose items come from `collect_history` instead.
+    let mut c = Client::spawn("fork_history_cards", &[]);
+    let sid = c.new_session(1, "");
+    let cwd = std::path::Path::new(&c.fake_log)
+        .parent()
+        .expect("fake log parent")
+        .join("workspace");
+    let id = c.req(
+        "session/fork",
+        &serde_json::json!({
+            "sessionId": sid,
+            "cwd": cwd.to_str().expect("UTF-8 cwd"),
+        })
+        .to_string(),
+    );
+    let result = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(result.contains("forkedFrom"), "fork failed: {result}");
+    // A following request drains every queued notification.
+    let barrier = c.req("session/list", "{}");
+    c.wait_for(&format!("\"id\":{barrier}"), Duration::from_secs(15));
+    let frames = c.frames.lock().unwrap().clone().join("\n");
+    for title in [
+        "Fork searched the web",
+        "Hook pre-push",
+        "cargo build",
+        "Damaged session log range",
+        "Fork future card",
+    ] {
+        assert!(
+            frames.contains(title),
+            "fork replay is missing the {title:?} card:\n{frames}"
+        );
+    }
+    assert!(
+        frames.contains("fork here"),
+        "the forked message still replays: {frames}"
+    );
+    assert!(
+        !frames.contains("\"terminal_update\""),
+        "a finished shell must not open a terminal on fork replay: {frames}"
+    );
+    assert!(
+        frames.contains("\"itemKind\":\"webSearch\""),
+        "replayed fork cards carry their kind metadata: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
 fn fork_history_replays_only_the_forked_view_and_preserves_provenance() {
     for scenario in [
         "fork_history_inline",

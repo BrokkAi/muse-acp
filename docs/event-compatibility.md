@@ -126,9 +126,10 @@ history (`session/load`, `session/resume` with `replayFrom: {"type":
 "start"}`, and `session/fork`; subagent drill-down follows the same rule for
 the child transcript). Every history item — regardless of kind — funnels
 through the same fold handlers as live events, so a card that renders live
-renders identically (title, content, `_meta.muse`) after replay, on every
-path. Kinds that stay silent live (for example `reminderChild` with reminders
-off) stay silent on replay.
+replays with the same title, `_meta.muse`, and `itemKind` on every path, and
+with the same content except where the note below says otherwise. Kinds that
+stay silent live (for example `reminderChild` with reminders off) stay silent
+on replay.
 
 Replay is history, not traffic, so two side effects of the live handlers are
 suppressed while a batch replays:

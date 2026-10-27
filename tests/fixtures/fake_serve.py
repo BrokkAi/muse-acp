@@ -2625,7 +2625,31 @@ def result_for(method, msg):
             if params.get("cutPoint", {}).get("lastTurnId") != "turn-1":
                 FORK_ITEMS.append({"itemId": "msg-fork-dup", "kind": "agentMessage",
                                    "text": "second turn", "turnId": "turn-2", "status": "completed"})
-            if SCENARIO == "fork_history_inline":
+            if SCENARIO == "fork_history_cards":
+                # #393: the fork path must replay host cards exactly like the
+                # load and resume paths, including a finished shell (text card,
+                # no terminal) and a still-running backgrounded call.
+                FORK_ITEMS.extend([
+                    {"itemId": "fork-web", "kind": "webSearch", "status": "completed",
+                     "turnId": None, "fallbackText": "Fork searched the web"},
+                    {"itemId": "fork-hook", "kind": "hookRun", "status": "completed",
+                     "turnId": None, "label": "pre-push", "runStatus": "failed",
+                     "reason": "exited 2"},
+                    {"itemId": "fork-shell", "kind": "userShell", "status": "completed",
+                     "turnId": None, "commandText": "cargo build",
+                     "visibleOutput": "built", "exitCode": 0},
+                    {"itemId": "fork-dmg", "kind": "damagedRange", "status": "completed",
+                     "turnId": None,
+                     "damagedRange": {"missingRecords": 1, "unreadableLines": 3}},
+                    {"itemId": "fork-future", "kind": "futureForkKind",
+                     "status": "completed", "turnId": None,
+                     "fallbackText": "Fork future card"},
+                    {"itemId": "fork-active", "kind": "toolCall",
+                     "callId": "call-fork-active", "status": "inProgress",
+                     "tool": "workspace-shell", "args": {"command": "npm watch"},
+                     "background": True},
+                ])
+            if SCENARIO in ("fork_history_inline", "fork_history_cards"):
                 history = {"mode": "inline", "items": FORK_ITEMS, "snapshot": None}
             elif SCENARIO == "fork_history_snapshot":
                 history = {"mode": "snapshot", "items": None, "snapshot": {
@@ -2633,9 +2657,13 @@ def result_for(method, msg):
                     "state": {"items": [dict(FORK_ITEMS[0], text="partial")]}}}
             else:
                 history = {"mode": "none", "items": None, "snapshot": None}
-            # A repeated live completion at the replay boundary must not double render.
+            # A repeated live completion at the replay boundary must not double
+            # render. The cards scenario appends non-message items, so target
+            # the last message rather than the last element.
+            last_message = next(item for item in reversed(FORK_ITEMS)
+                                if item["kind"] == "agentMessage")
             notify("item/completed", {"sessionId": ACTIVE_SESSION[0],
-                                      "viewCursor": "fork-head", "item": FORK_ITEMS[-1]})
+                                      "viewCursor": "fork-head", "item": last_message})
             return {"session": forked, "history": history,
                     "viewCursor": "fork-head", "pendingRequests": []}
         return {"session": forked,

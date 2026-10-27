@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Replay every host card on history replay. A session reloaded with
+  `session/load`, resumed with `replayFrom: {"type": "start"}`, forked, or
+  drilled into showed only messages, tool calls, subagents, and compactions:
+  monitor feeds, web searches, hook runs, workflow rows, user shells, damaged
+  log ranges, scheduled-job fires, background-command completions, and any
+  future card kind were silently dropped, so a reconnected transcript had
+  holes. All three replay paths now funnel every item through the same handlers
+  that serve live traffic, so a card replays with its live title,
+  `_meta.muse`, and content. Two live-only side effects stay suppressed during
+  a replay: a finished shell renders as a text card instead of opening a
+  terminal for the editor, and finished background work announces no Async
+  Tasks entry — reconciliation still restores work that is genuinely running.
+  One behavior changes beyond the replay paths: a subagent drill-down used to
+  send non-whitelisted kinds straight to the live handler, which could
+  announce a child's finished tasks into the Async Tasks panel; it now
+  suppresses them the same way (#393).
+
 - Stop blaming the profile settings for a lost session record. A resume over
   a retained record that holds no committed permission authority is refused by
   Muse as `retained session refused (class c)`, and the adapter appended its

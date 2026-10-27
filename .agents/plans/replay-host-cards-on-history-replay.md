@@ -20,6 +20,7 @@ Tracking issue: BrokkAi/muse-acp#393.
 - [x] (2026-10-27) Fake-host scenario `cards_load` in `tests/fixtures/fake_serve.py` plus end-to-end test `load_and_resume_replay_host_cards_without_live_side_effects` in `tests/acp_serve.rs` covering ACP v1 and v2.
 - [x] (2026-10-27) Documented the replay policy in `docs/event-compatibility.md`.
 - [x] (2026-10-27) Full validation: `cargo fmt --check` and `cargo clippy --locked --workspace --all-targets -- -D warnings` pass clean; `cargo test --locked --workspace --no-fail-fast` is green across all 15 test binaries except the pre-existing environmental failure `terminal_auth_method_runs_muse_acp_login` (adapter `current_exe` resolves to the mbx build cache in this container; fails identically on the pristine tree).
+- [x] (2026-10-27) Merged as #406, then reviewed. Five accuracy/test-strength follow-ups fixed: honest wording for the shell content difference, parity test comparing content, shell tests that fail on silence, `fork_history_cards` end-to-end coverage for the third replay path, and save/restore of the `replaying` flag. Recorded under Outcomes & Retrospective.
 
 ## Surprises & Discoveries
 
@@ -53,6 +54,18 @@ Tracking issue: BrokkAi/muse-acp#393.
 ## Outcomes & Retrospective
 
 Delivered 2026-10-27. All three replay paths (load/resume, fork, subagent drill-down) now call the single `SessionFold::replay_history_items` helper, which sets `replaying` while it feeds items through `replay_item`; both of `replay_item`'s catch-all arms route to the live handlers, so every host card kind (webSearch, hookRun, workflow, userShell, monitorFeed, damagedRange, scheduledFire, backgroundTerminalCompletion, overdueNotice, sideChat, unknown kinds with `fallbackText`) renders on replay with the same title and `_meta.muse` as live. `on_item_completed` gates terminal open/close and AIR async-task announcements on `!self.replaying`, so finished shells render as text cards and finished background work produces no Async Tasks entries, while `reconcile_active_tasks` still restores still-active work exactly once (in-flight replay registers items as active, and the reconcile guard skips them). Validation: 8 new fold unit tests, a new `cards_load` fake-host scenario, and an ACP v1+v2 end-to-end test all pass; fmt/clippy clean; the full workspace suite is green except one pre-existing environmental failure unrelated to this change. The ExecPlan copy in the session plans directory is superseded by `.agents/plans/replay-host-cards-on-history-replay.md`, which carries the full decision log and discoveries.
+
+### Review follow-ups (2026-10-27)
+
+Post-merge review of #406 found no blocking defects but five accuracy and test-strength gaps, all fixed in the follow-up commit:
+
+- The "byte-identical"/"renders identically" wording was wrong for finished shells, which are the one deliberate content difference (terminal live, text card on replay). Both the `replay_item` comment and `docs/event-compatibility.md` now name that exception instead of overclaiming.
+- The parity unit test only compared `(title, _meta)`, so it could not have caught a content regression — including its own false claim. It now compares content too, skipping exactly the shell card, and a probe showed `host_card_items` does contain a `userShell`, which is what made the stricter assertion fail and forced the honest split.
+- Both shell tests asserted only the absence of `terminal_update`, which silence would satisfy. They now also require the card to render, keep its live title, and carry text content.
+- `session/fork` had no end-to-end coverage even though #393's acceptance names all three paths; its items arrive through `collect_history`, not `replay_items`. Added the `fork_history_cards` fake-host scenario and `fork_replays_host_cards_without_live_side_effects`, and confirmed it fails when the settled catch-all is restored to `_ => {}`.
+- `replaying` was cleared rather than restored, so a future nested batch (a drill-down inside a replay) would have re-enabled live side effects for the rest of the outer batch. It now saves and restores the previous value, with `a_nested_batch_does_not_reenable_live_side_effects` pinning it.
+
+Also recorded: the drill-down path previously sent non-whitelisted kinds to the live handler, which could announce a child's finished tasks into the Async Tasks panel. That behavior change went into `CHANGELOG.md` since it reaches beyond the replay paths #393 describes.
 
 Remaining: the working tree is uncommitted; commit (or PR) is the owner's next step. Live-host verification against a real pinned Muse build (rather than the fake host) can follow on the nightly matrix.
 
