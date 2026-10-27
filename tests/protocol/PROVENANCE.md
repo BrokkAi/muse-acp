@@ -5,12 +5,13 @@
   ("remirror: 1.4.13 from the internal source tree (tracked internally)",
   2026-10-24).
   This revision publishes the Muse 1.4.13 stable surface, and the vendored
-  `stable/` bundle is its own export. No installed Muse 1.4.13 was available
-  to diff against (the host in this workspace is Muse 1.4.12-R6909.1), so
-  `src/compat.rs` classifies the fingerprint as degraded until a pinned
-  1.4.13 build joins the live-host matrix. The surface is purely additive
-  over 1.4.12: the method, notification, request, error, and capability
-  tables are unchanged, and no required field was added.
+  `stable/` bundle is its own export. The pinned 1.4.13-R6996.1 build in the
+  nightly live-host matrix reports the same fingerprint, and its own
+  `muse schema generate-json-schema` export (`manifest.json` and
+  `msp.schema.json`) is byte-identical to the vendored bundle, so
+  `src/compat.rs` classifies the fingerprint as tested. The surface is purely
+  additive over 1.4.12: the method, notification, request, error, and
+  capability tables are unchanged, and no required field was added.
   Only `schema/msp/` was copied, without `schema/msp/msp.d.ts`; the
   revision's `python/`, `clients/`, and `scripts/` trees are not vendored.
   The previous pin was `09d67ec` (Muse 1.4.12, 2026-10-22).
