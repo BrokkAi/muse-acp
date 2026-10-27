@@ -9981,8 +9981,16 @@ struct ReviewState {
     active: Option<ReviewJob>,
     /// Jobs waiting for the reviewer to finish the current turn.
     queue: VecDeque<ReviewJob>,
-    /// Accumulated answer text for the active turn.
+    /// The reviewer's latest message text for the active turn. A new message
+    /// replaces it: only the final message is the decision.
     text: String,
+    /// The item whose deltas `text` holds.
+    text_item: String,
+    /// Items of the active turn that are not agent messages (monitor feeds,
+    /// tool cards). Their `text` deltas are not part of the reply.
+    other_items: std::collections::HashSet<String>,
+    /// Whether the active review already asked once for a JSON-only reply.
+    retried: bool,
     /// Reviewer turn id, so stale events cannot settle a later review.
     turn: String,
     /// When the active review expires: a reviewer turn that never ends must
@@ -10220,6 +10228,9 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
             let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
             st.active = Some(job);
             st.text.clear();
+            st.text_item.clear();
+            st.other_items.clear();
+            st.retried = false;
             st.turn = turn;
             let timeout = reviewer::review_timeout();
             st.deadline = Some(std::time::Instant::now() + timeout);
@@ -10230,6 +10241,43 @@ fn start_next_review(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessio
             deny_review_job(host, stdout, sessions, job, ReviewDeny::Plain, &rationale);
             reset_reviewer_host(host);
             start_next_review(host, stdout, sessions);
+        }
+    }
+}
+
+/// Ask the reviewer, in its own session, for the JSON decision it failed to
+/// give. Returns false when the follow-up could not start, so the caller
+/// settles the review on the reply it has.
+fn retry_review_for_json(host: &Arc<Hosts>, review_sid: &str, approval_id: &str) -> bool {
+    let Some(reviewer) = host.host(HostKind::Reviewer) else {
+        return false;
+    };
+    let cmd = reviewer.mint_cmd("cmd-");
+    let params = format!(
+        "{{\"commandId\":{},\"sessionId\":{},\"input\":[{{\"type\":\"text\",\"text\":{}}}]}}",
+        esc(&cmd),
+        esc(review_sid),
+        esc(reviewer::JSON_RETRY_PROMPT)
+    );
+    match reviewer.command("turn/start", &params) {
+        Ok(result) => {
+            let turn = result.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+            let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+            let same_job = st
+                .active
+                .as_ref()
+                .is_some_and(|job| job.approval_id == approval_id);
+            if same_job && st.turn.is_empty() {
+                st.turn = turn.to_string();
+            }
+            true
+        }
+        Err(error) => {
+            log(&format!(
+                "auto-review JSON follow-up for {approval_id} failed to start: {}",
+                err_message(&error)
+            ));
+            false
         }
     }
 }
@@ -10493,16 +10541,32 @@ fn handle_review_event(
         }
     }
     match method {
+        "item/started" | "item/updated" => {
+            let item = params.get("item").cloned().unwrap_or(J::Null);
+            if let Some(item_id) = item.get("itemId").and_then(|v| v.as_str())
+                && item.get("kind").and_then(|v| v.as_str()) != Some("agentMessage")
+            {
+                let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
+                if st.active.is_some() {
+                    st.other_items.insert(item_id.to_string());
+                }
+            }
+        }
         "item/delta" => {
             let field = params
                 .get("field")
                 .and_then(|v| v.as_str())
                 .unwrap_or("text");
+            let item_id = params.get("itemId").and_then(|v| v.as_str()).unwrap_or("");
             if field == "text"
                 && let Some(delta) = params.get("delta").and_then(|v| v.as_str())
             {
                 let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
-                if st.active.is_some() {
+                if st.active.is_some() && !st.other_items.contains(item_id) {
+                    if st.text_item != item_id {
+                        st.text_item = item_id.to_string();
+                        st.text.clear();
+                    }
                     st.text.push_str(delta);
                 }
             }
@@ -10515,6 +10579,11 @@ fn handle_review_event(
                 let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
                 if st.active.is_some() {
                     st.text = text.to_string();
+                    st.text_item = item
+                        .get("itemId")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                 }
             }
         }
@@ -10524,11 +10593,38 @@ fn handle_review_event(
                 .get("terminal")
                 .and_then(|v| v.as_str())
                 .unwrap_or("completed");
-            let (job, text) = {
+            let retry = {
                 let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
                 if !st.turn.is_empty() && !turn.is_empty() && st.turn != turn {
                     return true;
                 }
+                let unusable = terminal == "completed"
+                    && st.active.is_some()
+                    && !st.retried
+                    && reviewer::parse_assessment(&st.text).is_none();
+                match st.session.clone() {
+                    Some(review_sid) if unusable => {
+                        st.retried = true;
+                        // The follow-up's own turn id is unknown until the
+                        // host answers; accept its events meanwhile.
+                        st.turn.clear();
+                        let job_id = st.active.as_ref().map(|job| job.approval_id.clone());
+                        Some((review_sid, job_id.unwrap_or_default(), st.text.clone()))
+                    }
+                    _ => None,
+                }
+            };
+            if let Some((review_sid, approval_id, text)) = retry {
+                log(&format!(
+                    "auto-review reply for {approval_id} was unusable, asking once more for JSON: {:?}",
+                    reviewer::excerpt(&text)
+                ));
+                if retry_review_for_json(host, &review_sid, &approval_id) {
+                    return true;
+                }
+            }
+            let (job, text) = {
+                let mut st = REVIEW_STATE.lock().unwrap_or_else(|p| p.into_inner());
                 st.deadline = None;
                 st.session = None;
                 (st.active.take(), std::mem::take(&mut st.text))

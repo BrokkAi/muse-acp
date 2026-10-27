@@ -2387,6 +2387,69 @@ fn auto_review_denies_on_unusable_reviewer_output() {
 }
 
 #[test]
+fn auto_review_asks_once_more_for_json_before_denying() {
+    let mut c = Client::spawn(
+        "approval_hang",
+        &[
+            (
+                "FAKE_REVIEW_TEXT",
+                "I could not run git show here, so I cannot verify.",
+            ),
+            (
+                "FAKE_REVIEW_RETRY_TEXT",
+                "{\"outcome\":\"allow\",\"rationale\":\"Read-only inspection.\"}",
+            ),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "inspect agent.rs on master");
+    c.wait_stderr("asking once more for JSON", Duration::from_secs(15));
+    c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(15));
+    c.wait_stderr(
+        "auto-review allow ap-1: Read-only inspection.",
+        Duration::from_secs(15),
+    );
+    c.finish();
+}
+
+#[test]
+fn auto_review_reply_is_the_latest_agent_message_only() {
+    // The trailing brace closes the draft's `{` if the messages were joined,
+    // and the monitor feed's deny would win if its text counted.
+    let mut c = Client::spawn(
+        "approval_hang",
+        &[
+            ("FAKE_REVIEW_NOISE", "1"),
+            (
+                "FAKE_REVIEW_TEXT",
+                "{\"outcome\":\"allow\",\"rationale\":\"Routine.\"} }",
+            ),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    let set_id = c.req(
+        "session/set_config_option",
+        &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"),
+    );
+    let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
+    let _pid = c.prompt(&sid, "do the thing");
+    c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(15));
+    c.wait_stderr("auto-review allow ap-1: Routine.", Duration::from_secs(15));
+    assert!(
+        !std::fs::read_to_string(&c.stderr_log)
+            .unwrap_or_default()
+            .contains("asking once more for JSON"),
+        "a usable latest message needs no follow-up"
+    );
+    c.finish();
+}
+
+#[test]
 fn auto_review_names_a_failed_reviewer_turn() {
     // A provider that rejects the review prompt ends the reviewer turn
     // `failed` with no reply text. The denial must carry the host's error,

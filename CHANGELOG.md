@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Stop denying auto-reviews whose reviewer reply only looked unusable. The
+  decision parser took everything from the first `{` to the last `}`, so any
+  brace in the reviewer's prose (quoted code, an echoed action) made a valid
+  decision unparsable, and every `text` delta in the review turn, including
+  earlier messages and non-message items, was concatenated into one reply.
+  The parser now takes the last top-level balanced JSON object with a valid
+  `outcome`, never a nested one, and only the latest agent message counts as
+  the reply. A completed reply that still holds no decision gets one
+  follow-up in the same reviewer session asking for only the JSON, within the
+  same review timeout, before the approval is denied.
+
 - Place a host card's row where the host says it belongs. Muse 1.4.13 names the
   item a terminal row follows (`Item.terminalRowAfterItemId`) because a card's
   log span can open long before its output is observed: a monitor is armed at

@@ -63,9 +63,15 @@ medium or high authorization; low and medium allow.
 - Deny: the adapter answers with the host's reject choice, shows
   `Permission denied by Auto-review: <rationale>` in the editor transcript,
   and passes the rationale as feedback when the host accepts feedback.
-- Reviewer failure or unusable output: deny. The action does not run, the
-  transcript identifies the reviewer failure, and the detailed reason is
-  logged. A reviewer turn that fails denies with the host's error, for
+- Unusable output gets one second chance: when a completed reviewer reply
+  holds no JSON decision, the adapter asks once more, in the same reviewer
+  session, for only the JSON. The original review timeout covers both
+  attempts. The decision is the last top-level JSON object with a valid
+  `outcome`; objects nested inside another object never count, so prose,
+  code fences, or a quoted payload around the decision do not break it.
+- Reviewer failure or unusable output after that retry: deny. The action
+  does not run, the transcript identifies the reviewer failure, and the
+  detailed reason is logged. A reviewer turn that fails denies with the host's error, for
   example `reviewer turn failed: contextWindowExceeded: prompt is too long`.
   An unusable reply says whether the reply was empty and logs a short
   excerpt. Either way the adapter resets the reviewer host before the next
@@ -122,6 +128,7 @@ becomes an editor decision.
   it.
 - The reviewer is a model; it can make mistakes. The sandbox, approval mode,
   and host policy remain the enforcement layer.
-- Reviews cost an extra model call per permission request.
+- Reviews cost an extra model call per permission request, and a second
+  call when the first reply holds no usable decision.
 - The reviewer can read the workspace but cannot write, run commands, or use
   the network.
