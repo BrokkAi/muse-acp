@@ -209,6 +209,33 @@ def release_state():
     return release
 
 
+def download(release, directory):
+    for a in release['assets']:
+        data = gh('api', '--hostname', 'github.com', '-H', 'Accept: application/octet-stream',
+                  f'repos/{REPO}/releases/assets/{a["id"]}')
+        (directory / a['name']).write_bytes(data)
+
+
+def audit_release(release):
+    # A release is verified against its own manifests and this checkout, never
+    # against a second build of the same commit. Hosted-runner updates change
+    # MSVC PE timestamps, CodeView GUIDs and import-table hints while leaving
+    # the compiled code untouched, so byte equality between two builds of one
+    # commit is not a property of a correct release.
+    with tempfile.TemporaryDirectory() as d:
+        directory = Path(d)
+        download(release, directory)
+        names = {p.name for p in directory.iterdir()}
+        require(names <= expected_names(), 'Conflicting remote assets')
+        if release['draft']:
+            for target in TARGETS:
+                name = archive_name(target)
+                if name in names and name + '.sha256' in names:
+                    inspect_archive(directory, target)
+        else:
+            validate(directory)
+
+
 def compare_remote(release, staged, complete, resume=False):
     assets = release['assets']
     names = [a['name'] for a in assets]
@@ -217,10 +244,7 @@ def compare_remote(release, staged, complete, resume=False):
         require(set(names) == expected_names(), 'Incomplete published release')
     with tempfile.TemporaryDirectory() as d:
         directory = Path(d)
-        for a in assets:
-            data = gh('api', '--hostname', 'github.com', '-H', 'Accept: application/octet-stream',
-                      f'repos/{REPO}/releases/assets/{a["id"]}')
-            (directory / a['name']).write_bytes(data)
+        download(release, directory)
         for target in TARGETS:
             name = archive_name(target)
             if name in names:
@@ -267,9 +291,19 @@ def authorization():
 
 
 def evidence(kind):
+    """Read-only proof that the exact commit passed the branch preflight.
+
+    'commit' is the provenance a tag push needs: successful exact-commit `ci`
+    and `release` push runs, including the publisher's own authorization and
+    staging steps. 'build' also lists that run's Actions artifacts.
+    'publication-inputs' rebuilds the comparison for a manual drift audit:
+    a runner or toolchain change that alters the packaged bytes. 'version' and
+    'published' audit the remote release against its own manifests.
+    """
     metadata()
     runs = json.loads(gh('run', 'list', '--repo', 'github.com/' + REPO, '--commit', SHA, '--limit', '100',
                         '--json', 'databaseId,workflowName,headSha,headBranch,event,status,conclusion'))
+    release_run = None
     for workflow in ['ci', 'release']:
         # The automatic branch push runs are the preflight; no manual dispatch
         # is needed, so pushing the tag is the only release action.
@@ -281,32 +315,35 @@ def evidence(kind):
         require(detail['headSha'] == SHA and detail['conclusion'] == 'success', 'Wrong/failed run')
         require(all(j['conclusion'] == 'success' for j in detail['jobs']), 'Incomplete jobs')
         if workflow == 'release':
+            release_run = run['databaseId']
             require({j['name'] for j in detail['jobs']} == {'publisher'} | {f'build ({t})' for t in TARGETS}, 'Missing release jobs')
             publisher = next(j for j in detail['jobs'] if j['name'] == 'publisher')
             for name in ['Check publisher authorization', 'Validate version and all staged assets']:
                 require(any(s['name'] == name and s['conclusion'] == 'success' for s in publisher['steps']), 'Missing publisher evidence')
-            artifacts = api(f'actions/runs/{run["databaseId"]}/artifacts?per_page=100')['artifacts']
-            require({a['name'] for a in artifacts if not a['expired']} == {'release-' + t for t in TARGETS}, 'Missing build artifacts')
-            with tempfile.TemporaryDirectory() as d:
-                for a in artifacts:
-                    raw = gh('api', '--hostname', 'github.com', f'repos/{REPO}/actions/artifacts/{a["id"]}/zip')
-                    with zipfile.ZipFile(io.BytesIO(raw)) as z:
-                        for n in z.namelist():
-                            require('/' not in n and n in expected_names(), 'Invalid Actions artifact')
-                            Path(d, n).write_bytes(z.read(n))
-                for installer in INSTALLERS:
-                    Path(d, installer).write_bytes(source_bytes(installer))
-                staged = Path(d)
-                validate(staged)
+            if kind in ['build', 'publication-inputs']:
+                artifacts = api(f'actions/runs/{run["databaseId"]}/artifacts?per_page=100')['artifacts']
+                require({a['name'] for a in artifacts if not a['expired']} == {'release-' + t for t in TARGETS}, 'Missing build artifacts')
                 if kind == 'publication-inputs':
-                    require(validate(staged) == validate(Path('dist')), 'Tag build payload differs from successful preflight; refusing uploads')
-                if kind in ['version', 'published']:
-                    release = release_state()
-                    if kind == 'published':
-                        require(release and not release['draft'], 'Release is not published')
-                    if release:
-                        compare_remote(release, staged, complete=not release['draft'])
-            print(f'{kind}: exact commit {SHA}, release run {run["databaseId"]}, publisher and all platform artifacts verified')
+                    with tempfile.TemporaryDirectory() as d:
+                        for a in artifacts:
+                            raw = gh('api', '--hostname', 'github.com', f'repos/{REPO}/actions/artifacts/{a["id"]}/zip')
+                            with zipfile.ZipFile(io.BytesIO(raw)) as z:
+                                for n in z.namelist():
+                                    require('/' not in n and n in expected_names(), 'Invalid Actions artifact')
+                                    Path(d, n).write_bytes(z.read(n))
+                        for installer in INSTALLERS:
+                            Path(d, installer).write_bytes(source_bytes(installer))
+                        staged = Path(d)
+                        validate(staged)
+                        require(validate(staged) == validate(Path('dist')), 'Rebuilt payload differs from the branch preflight (runner or toolchain drift)')
+    if kind in ['version', 'published']:
+        release = release_state()
+        require(kind != 'published' or (release and not release['draft']), 'Release is not published')
+        if release:
+            audit_release(release)
+    print(f'{kind}: exact commit {SHA}, release run {release_run}; publisher evidence'
+          + (', branch artifacts' if kind in ['build', 'publication-inputs'] else '')
+          + (', release assets' if kind in ['version', 'published'] else '') + ' verified')
 
 
 def publish(staged):
@@ -356,11 +393,17 @@ if __name__ == '__main__':
             if preflight_superseded():
                 print(f'{TAG} is already released at another commit; staged assets validated, release state not compared.')
                 sys.exit(0)
-            if os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch' or (
-                os.environ.get('GITHUB_EVENT_NAME') == 'push'
-                and os.environ.get('GITHUB_REF', '').startswith('refs/tags/')
-            ):
+            if os.environ.get('GITHUB_EVENT_NAME') == 'workflow_dispatch':
+                # Optional manual audit: does a rebuild still match the branch
+                # preflight? A runner or toolchain change shows up here, away
+                # from a publication that must not fail for it.
                 evidence('publication-inputs')
+            elif (os.environ.get('GITHUB_EVENT_NAME') == 'push'
+                  and os.environ.get('GITHUB_REF', '').startswith('refs/tags/')):
+                # Provenance only, not payload equality: the tagged commit
+                # passed branch CI and a publisher preflight. This run's own
+                # build is what gets published and verified.
+                evidence('commit')
             release = release_state()
             if release:
                 compare_remote(release, Path('dist'), not release['draft'])

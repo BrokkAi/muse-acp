@@ -137,6 +137,27 @@ class TagOnlyRelease(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'release run read'):
                 release.evidence('authorization')
 
+    def test_tag_provenance_needs_no_branch_artifacts(self):
+        push_runs = [{'databaseId': n, 'workflowName': w, 'headSha': release.SHA,
+                      'headBranch': 'master', 'event': 'push', 'status': 'completed',
+                      'conclusion': 'success'} for n, w in [(1, 'ci'), (2, 'release')]]
+        ci_detail = {'headSha': release.SHA, 'conclusion': 'success',
+                     'jobs': [{'name': 'check', 'conclusion': 'success'}]}
+        jobs = [{'name': f'build ({t})', 'conclusion': 'success'} for t in release.TARGETS]
+        jobs.append({'name': 'publisher', 'conclusion': 'success', 'steps': [
+            {'name': 'Check publisher authorization', 'conclusion': 'success'},
+            {'name': 'Validate version and all staged assets', 'conclusion': 'success'}]})
+        release_detail = {'headSha': release.SHA, 'conclusion': 'success', 'jobs': jobs}
+        with patch.object(release, 'metadata'), patch.object(
+            release, 'gh', side_effect=[json.dumps(push_runs).encode(),
+                                        json.dumps(ci_detail).encode(),
+                                        json.dumps(release_detail).encode()]) as gh:
+            release.evidence('commit')
+        # The run list and its two details: no Actions artifact lookup, so a
+        # branch artifact that expired before the tag was pushed cannot block
+        # publication.
+        self.assertEqual(gh.call_count, 3)
+
 
 class DraftRecovery(unittest.TestCase):
     def test_hidden_draft_found_on_later_page_and_read_by_id(self):
@@ -184,6 +205,56 @@ class DraftRecovery(unittest.TestCase):
             finalization = api.call_args_list[2]
             self.assertEqual(finalization.args[2]['tag_name'], release.TAG)
             self.assertEqual(finalization.args[2]['target_commitish'], release.SHA)
+
+
+class PublishedReleaseAudit(unittest.TestCase):
+    """A released artifact is verified on its own terms, not against a rebuild."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.directory = Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+
+    def build(self, target, out, binary):
+        original = Path.read_bytes
+        def read(path):
+            if str(path).startswith('target/'):
+                return binary
+            return original(path)
+        out.mkdir(parents=True, exist_ok=True)
+        with patch.object(release, 'metadata'), patch.object(release, 'selftest'), patch.object(Path, 'read_bytes', read):
+            release.package(target, out)
+
+    def test_release_built_by_another_runner_audits_clean(self):
+        # Two builds of one commit with different binaries stand in for a
+        # hosted-runner update: new MSVC PE timestamps, CodeView GUIDs and
+        # import hints, same code. The published release stays valid.
+        published, rebuilt = self.directory / 'published', self.directory / 'rebuilt'
+        for target in release.TARGETS:
+            self.build(target, published, b'preflight runner binary')
+            self.build(target, rebuilt, b'tag runner binary')
+        for installer in release.INSTALLERS:
+            (published / installer).write_bytes(release.source_bytes(installer))
+        assets = [{'name': p.name, 'id': i} for i, p in enumerate(sorted(published.iterdir()), 1)]
+        by_id = {str(a['id']): (published / a['name']).read_bytes() for a in assets}
+        state = {'draft': False, 'assets': assets}
+        with patch.object(release, 'gh', side_effect=lambda *args: by_id[args[-1].rsplit('/', 1)[-1]]):
+            release.audit_release(state)
+            # Uploads are still compared with the exact bytes that produced them.
+            with self.assertRaisesRegex(RuntimeError, 'Published payload differs'):
+                release.compare_remote(state, rebuilt, True)
+
+    def test_draft_audit_rejects_an_inconsistent_archive(self):
+        draft = self.directory / 'draft'
+        for target in release.TARGETS:
+            self.build(target, draft, b'tag runner binary')
+        corrupted = release.archive_name(release.TARGETS[0])
+        (draft / corrupted).write_bytes((draft / corrupted).read_bytes() + b'corrupt')
+        assets = [{'name': p.name, 'id': i} for i, p in enumerate(sorted(draft.iterdir()), 1)]
+        by_id = {str(a['id']): (draft / a['name']).read_bytes() for a in assets}
+        with patch.object(release, 'gh', side_effect=lambda *args: by_id[args[-1].rsplit('/', 1)[-1]]):
+            with self.assertRaisesRegex(RuntimeError, 'checksum'):
+                release.audit_release({'draft': True, 'assets': assets})
 
 
 if __name__ == '__main__':

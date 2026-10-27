@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+- Gate publication on provenance instead of payload equality. The tag run
+  refused to publish when its rebuilt artifacts differed by a single byte from
+  the branch preflight at the same commit, and a hosted Windows runner update
+  is enough to do that: the v0.17.0 preflight ran on runner image
+  `20261007.264.1` and its tag build on `20261021.278.1`, which changed PE
+  timestamps, CodeView GUIDs and import-table hints while `.text`, `.data`,
+  `.pdata` and `.reloc` stayed byte-identical, so a correct release failed
+  with `Tag build payload differs from successful preflight`. The tag run now
+  requires successful exact-commit `ci` and `release` push runs (including the
+  publisher's authorization and staging evidence) without depending on that
+  run's artifacts, then publishes and verifies the bytes it built itself. The
+  comparison survives as a deliberate drift audit: a manual
+  `workflow_dispatch` still rebuilds every platform and fails if the packaged
+  bytes changed. `release.py published` verifies a release against its own
+  checksum sidecars, embedded manifests and the tag commit's documentation and
+  installers rather than against a second build.
+
 - Settle a finished review instead of waiting for its terminal. Muse can finish
   the reviewer's answer while background reminder checks hold its turn open,
   reporting only `turn/foregroundCompleted`. The review now settles as soon as

@@ -64,7 +64,9 @@ paths; Unix archives retain the installer's versioned parent directory.
    tag/release namespace and any existing assets. Authentication, network
    errors, missing/expired evidence, skipped jobs, and conflicting versions
    fail closed. Artifact retention is 30 days; rerun the unchanged commit's
-   non-publishing workflow if evidence expires.
+   non-publishing workflow if `build` evidence expires. `version` audits the
+   release namespace and any existing assets against their own manifests, so
+   it does not depend on artifacts from another run.
 
 ## Publication (separate authorization/phase)
 
@@ -73,18 +75,35 @@ release action; everything else runs in the tag workflow. Push it from an
 authorized CLI identity; do not assume tags pushed with GITHUB_TOKEN will
 trigger Actions. Never create/push tags during preflight. The publication
 workflow builds all platforms before its publisher starts. Release builds pin
-Rust 1.99.1. Both Windows targets use the MSVC `/Brepro` linker option to avoid changing
-PE timestamps and identifiers (see [LLVM's reproducible-linking notes](https://blog.llvm.org/2019/11/deterministic-builds-with-clang-and-lld.html)).
-Before uploading, the tag run must compare every unpacked payload with the
-successful branch preflight artifacts at the same commit. A runner/toolchain
-change producing different binaries is a blocking error, never an upload
-followed by a failed verification. The publisher's read-only Actions permission
-is used to retrieve that exact-commit evidence. Before the first
-release asset upload, it validates all artifacts, exact version/tag/commit,
-existing release contents, and its own fresh publishing credential. It creates
-missing draft state, uploads only missing assets, reads each new upload back
-and compares it to the exact staged bytes, verifies completeness, then makes
-the release public. No clobber or deletion of conflicting assets is permitted.
+Rust 1.99.1. Both Windows targets use the MSVC `/Brepro` linker option to keep
+PE timestamps and identifiers from varying run to run (see [LLVM's
+reproducible-linking notes](https://blog.llvm.org/2019/11/deterministic-builds-with-clang-and-lld.html)).
+
+Publication gates on provenance, not on byte equality with the branch build:
+the tagged commit must have successful exact-commit `ci` and `release` push
+runs, including a successful publisher authorization and staging step, and the
+tag run then publishes and verifies the bytes it built itself. It must not
+require two independent builds of one commit to be identical. Hosted-runner
+updates (a new Visual Studio or Windows SDK on `windows-2025`) change PE
+timestamps, CodeView GUIDs and import-table hints while leaving the compiled
+code unchanged, so an equality gate turns a runner image update into a blocked
+release. v0.17.0 failed exactly that way: the branch preflight was built on
+runner image `20261007.264.1` and the tag build on `20261021.278.1`; the
+Windows `.text`, `.data`, `.pdata` and `.reloc` sections were identical and
+only those metadata bytes differed.
+
+The payload comparison still exists as a drift audit: a manual
+`workflow_dispatch` of the release workflow rebuilds all platforms and
+compares its unpacked payloads with the newest successful same-commit push
+run, failing if a runner or toolchain change altered the packaged bytes. Run
+it when you want that answer; it never blocks a tag publication.
+
+Before the first release asset upload, the publisher validates all artifacts,
+exact version/tag/commit, existing release contents, and its own fresh
+publishing credential. It creates missing draft state, uploads only missing
+assets, reads each new upload back and compares it to the exact staged bytes,
+verifies completeness, then makes the release public. No clobber or deletion
+of conflicting assets is permitted.
 
 Recovery accepts existing immutable artifacts only after validating their own
 checksums and comparing unpacked bytes, executable permissions and commit/
@@ -97,8 +116,12 @@ Never move tags or replace assets of a completed release.
 
 After publishing, the tag run's **Verify the published release** step runs
 `python3 scripts/release.py published`. It requires a public release, the exact
-tag commit and all fourteen assets, validates every checksum and archive member,
-and compares payloads with the preflight build. The same command can be rerun
+tag commit and all fourteen assets, and verifies each archive against its own
+checksum sidecar, embedded `release.json` (commit, version, platform, member
+hashes and permissions) and the documentation and installers at the tag
+commit. It deliberately does not rebuild: a release is verified on its own
+terms, while an upload is still compared with the exact bytes that produced
+it. The same command can be rerun
 locally with `RELEASE_COMMIT` and `RELEASE_TAG` set. Both `ci.yml` and `release.yml`
 must also succeed in the tag push context; branch evidence cannot replace tag
 workflow verification. The installer consumes GitHub's latest release URL;
