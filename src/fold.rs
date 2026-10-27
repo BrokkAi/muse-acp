@@ -2534,10 +2534,13 @@ impl SessionFold {
     /// flushes them — at the end of their own turn, not the batch: a new
     /// `turnId` (null never bounds a turn) ends the previous one as
     /// `turn/completed` does live, and the batch's end ends its last turn.
-    /// An anchor that only starts in history releases its rows as soon as
-    /// its snapshot registers, because a started anchor's rows already
-    /// exist — the replay of the live path, where such an anchor was never
-    /// deferred at all.
+    /// A boundary only flushes rows whose anchor appears nowhere later in
+    /// the batch; an anchor still to come must release its rows itself, or a
+    /// boundary crossed between the row and its anchor would emit the row
+    /// first. An anchor that only starts in history releases its rows as
+    /// soon as its snapshot registers, because a started anchor's rows
+    /// already exist — the replay of the live path, where such an anchor
+    /// was never deferred at all.
     pub fn replay_history_items(
         &mut self,
         acp_sid: &str,
@@ -2549,16 +2552,34 @@ impl SessionFold {
         // replay) must not switch live side effects back on for the rest of
         // the outer batch.
         let was_replaying = std::mem::replace(&mut self.replaying, true);
+        // Every item id the batch still holds, so a boundary can tell an
+        // anchor that will register later (keep waiting for it) from one the
+        // batch never carries (flush now). Each item is consumed after its
+        // own boundary decision: an anchor may be the boundary item itself.
+        let mut upcoming: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for item in items {
+            if let Some(id) = item.get("itemId").and_then(J::as_str) {
+                *upcoming.entry(id).or_insert(0) += 1;
+            }
+        }
         let mut turn: Option<String> = None;
         for item in items {
             let item_turn = item.get("turnId").and_then(J::as_str).map(str::to_string);
             if item_turn.is_some() && item_turn != turn {
-                self.flush_awaiting_anchor(acp_sid, ver, out);
+                self.flush_awaiting_anchor_unless(acp_sid, ver, out, |anchor| {
+                    upcoming.contains_key(anchor)
+                });
                 turn = item_turn;
             }
             self.replay_item(acp_sid, ver, item, out);
             if let Some(item_id) = item.get("itemId").and_then(J::as_str) {
                 self.release_awaiting_anchor(item_id, acp_sid, ver, out);
+                if let Some(n) = upcoming.get_mut(item_id) {
+                    *n -= 1;
+                    if *n == 0 {
+                        upcoming.remove(item_id);
+                    }
+                }
             }
         }
         // Flush while `replaying` is still set so a held row renders exactly
@@ -3284,9 +3305,27 @@ impl SessionFold {
     /// when the turn settles, after which no further item can arrive to carry
     /// the row.
     pub fn flush_awaiting_anchor(&mut self, acp_sid: &str, ver: u8, out: &mut Vec<String>) {
+        self.flush_awaiting_anchor_unless(acp_sid, ver, out, |_| false);
+    }
+
+    /// Flush held rows except those whose anchor `still_coming` vindicates:
+    /// an anchor that will still register later in the batch must release its
+    /// rows itself, so the row lands after the anchor's rows rather than at
+    /// whatever boundary happened to fire first.
+    fn flush_awaiting_anchor_unless(
+        &mut self,
+        acp_sid: &str,
+        ver: u8,
+        out: &mut Vec<String>,
+        still_coming: impl Fn(&str) -> bool,
+    ) {
         let held = std::mem::take(&mut self.awaiting_anchor);
-        for (_, item) in held {
-            self.complete_item(acp_sid, ver, &item, out);
+        for (anchor, item) in held {
+            if still_coming(&anchor) {
+                self.awaiting_anchor.push((anchor, item));
+            } else {
+                self.complete_item(acp_sid, ver, &item, out);
+            }
         }
     }
 
@@ -6517,6 +6556,31 @@ mod anchor_tests {
             order(&out),
             vec!["c1".to_string(), "c2".to_string()],
             "the held row flushes at its own turn's end: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_boundary_between_a_row_and_its_anchor_does_not_flush_it_early() {
+        // A host may order history by span open, where a monitor's record
+        // sits before its anchor's, while stamping turnId by completion: the
+        // anchor then arrives as the first item of an earlier turnId. The
+        // boundary must not flush the held row past its still-coming anchor.
+        let mut fold = SessionFold::new();
+        fold.show_reminders = true;
+        let mut out = Vec::new();
+        let mon = parse_json(
+            r#"{"itemId":"mon","kind":"toolCall","tool":"monitor","callId":"c1","status":"completed","visibleOutput":"tick-one","terminalRowAfterItemId":"rem","turnId":"t2","args":{"description":"Watch the build"}}"#,
+        )
+        .unwrap();
+        let rem_start = parse_json(
+            r#"{"itemId":"rem","kind":"reminderChild","status":"inProgress","fallbackText":"Reminder child session","reminderAgentId":"a1","generationId":"g1","blocking":false,"turnId":"t1"}"#,
+        )
+        .unwrap();
+        fold.replay_history_items("sid", 1, &[mon, rem_start], &mut out);
+        assert_eq!(
+            order(&out),
+            vec!["reminder-rem".to_string(), "c1".to_string()],
+            "the anchor's rows come before the row they anchor: {out:?}"
         );
     }
 }
