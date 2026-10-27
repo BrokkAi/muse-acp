@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Pin the Muse 1.4.13 build in the nightly live-host matrix and promote its
+  fingerprint to tested. The `3dce908` SDK pin already published the 1.4.13
+  stable surface, but no 1.4.13 binary was pinned, so the surface classified
+  as degraded. The build is `1.4.13-R6996.1` (from the `muse-stable` channel
+  manifest), added as a full-suite Linux x86-64 leg, the newest-pin macOS
+  arm64 leg it takes over from 1.4.12, and a Windows x64 workspace-roots leg.
+  The build reports the vendored fingerprint
+  `sha256:7fddaf64…`, and its own `muse schema generate-json-schema` export is
+  byte-identical to the vendored `stable/` bundle, so
+  `HOST_1413_FINGERPRINT` now classifies as tested.
+
 - Gate publication on provenance instead of payload equality. The tag run
   refused to publish when its rebuilt artifacts differed by a single byte from
   the branch preflight at the same commit, and a hosted Windows runner update

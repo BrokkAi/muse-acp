@@ -8176,10 +8176,10 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 }
 
 #[test]
-fn sdk_manifest_fingerprint_is_the_1_4_13_surface_pending_a_ci_pin() {
+fn sdk_manifest_fingerprint_is_the_1_4_13_surface() {
     // The vendored SDK manifest (3dce908) publishes the Muse 1.4.13 surface,
-    // but no pinned 1.4.13 build is in the nightly live-host matrix yet, so
-    // the adapter classifies it as degraded.
+    // and the pinned 1.4.13-R6996.1 build in the nightly live-host matrix
+    // reports it, so the adapter classifies it as tested.
     let mut c = Client::spawn(
         "quiet",
         &[(
@@ -8188,9 +8188,9 @@ fn sdk_manifest_fingerprint_is_the_1_4_13_surface_pending_a_ci_pin() {
         )],
     );
     c.initialize(1, "");
-    c.wait_stderr("status=degraded", Duration::from_secs(10));
+    c.wait_stderr("status=tested", Duration::from_secs(10));
     c.wait_stderr(
-        "Muse 1.4.13 surface; the vendored SDK manifest, pending a pinned CI build",
+        "validated against live host 1.4.13-R6996.1; the vendored SDK 3dce908 surface",
         Duration::from_secs(10),
     );
     c.finish();

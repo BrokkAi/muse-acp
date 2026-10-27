@@ -12,9 +12,9 @@ access, and useful in real editor workflows.
 - **Reference snapshots used for this revision:** Muse SDK `3dce908`
   (2026-10-24; stable schema version 1, manifest fingerprint
   `sha256:7fddaf646dbc317e5fcac0785e135eb04df14fbb0db1863089dfd6da21730e5b`,
-  the Muse 1.4.13 stable surface; the SDK's own export, not yet validated
-  against an installed 1.4.13 because no 1.4.13 build is pinned in the
-  live-host matrix)
+  the Muse 1.4.13 stable surface; the SDK's own export, validated against the
+  pinned 1.4.13-R6996.1 build in the live-host matrix, whose own
+  `muse schema generate-json-schema` export is byte-identical to it)
   and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
@@ -232,8 +232,9 @@ the verdict into richer support bundles.
   computer-use approval data facts, the monitor tool-call replay hint and
   terminal-row anchor, the ManagedBash `Item.workId`, the queued inputs a
   `session/read` still holds, and a clarified resume permission-profile
-  reset over a declared lost record. No 1.4.13 build is pinned yet, so the
-  surface classifies as degraded
+  reset over a declared lost record. The pinned 1.4.13-R6996.1 build reports
+  this digest and its own schema export is byte-identical to the vendored
+  bundle, so the surface classifies as tested
   ([#399](https://github.com/BrokkAi/muse-acp/issues/399)); its
   dispositions are in the §9 field matrix, with follow-ups in
   [#395](https://github.com/BrokkAi/muse-acp/issues/395) through
@@ -288,10 +289,10 @@ explicit message by default). The pinned 1.4.11-R6667.1 build in the
 nightly matrix makes the 1.4.11 surface tested
 ([#337](https://github.com/BrokkAi/muse-acp/issues/337)), and the pinned
 1.4.12-R6909.1 build makes the previously vendored 1.4.12 surface tested
-([#381](https://github.com/BrokkAi/muse-acp/issues/381)). The vendored
-1.4.13 surface stays degraded until a 1.4.13 build is pinned
-([#399](https://github.com/BrokkAi/muse-acp/issues/399)), as does the
-1.4.9/1.4.10 surface, since no 1.4.9 or 1.4.10 build is pinned. The `live-host` CI job also runs
+([#381](https://github.com/BrokkAi/muse-acp/issues/381)). The pinned
+1.4.13-R6996.1 build makes the vendored 1.4.13 surface tested
+([#399](https://github.com/BrokkAi/muse-acp/issues/399)), while the
+1.4.9/1.4.10 surface stays degraded, since no 1.4.9 or 1.4.10 build is pinned. The `live-host` CI job also runs
 `tests/live_loopback.rs` on every push against each pinned Muse build on
 Linux x86-64, and the newest on macOS arm64 (downloaded and
 checksum-verified), with no credentials: a real `muse serve`
@@ -852,8 +853,9 @@ tool-call replay hint and terminal-row anchor (`Item.replayHint`,
 `Item.terminalRowAfterItemId`) are
 [#397](https://github.com/BrokkAi/muse-acp/issues/397); the ManagedBash
 `Item.workId` is [#396](https://github.com/BrokkAi/muse-acp/issues/396);
-and the resume permission-profile reset over a declared lost record needs a
-live 1.4.13 check ([#398](https://github.com/BrokkAi/muse-acp/issues/398)).
+and the resume permission-profile reset over a declared lost record can now
+be checked against a real 1.4.13 host
+([#398](https://github.com/BrokkAi/muse-acp/issues/398)).
 The queued inputs a `session/read` still holds are intentionally ignored:
 the adapter reads sessions only for history (fork points and subagent
 drill-down), where a delivery queue carries no decision. Each has a field
