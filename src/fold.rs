@@ -338,7 +338,10 @@ pub struct SessionFold {
     /// True only while a history replay (load/resume, fork, or subagent
     /// drill-down) feeds items through `replay_item`. Live-only side effects
     /// in `on_item_completed` (opening terminals, announcing AIR async tasks)
-    /// are suppressed while this is set; card rendering is unchanged.
+    /// are suppressed while this is set. Card titles, `_meta.muse`, and
+    /// `itemKind` are unchanged; the one intentional rendering difference is
+    /// that a finished shell renders as a text card instead of a terminal,
+    /// because replaying history must not open a terminal for the editor.
     replaying: bool,
     /// The session's workspace root, which resolves relative tool paths
     /// into the absolute `locations` ACP follow-along needs.
@@ -2525,11 +2528,14 @@ impl SessionFold {
         items: &[J],
         out: &mut Vec<String>,
     ) {
-        self.replaying = true;
+        // Restore rather than clear: a nested batch (a drill-down inside a
+        // replay) must not switch live side effects back on for the rest of
+        // the outer batch.
+        let was_replaying = std::mem::replace(&mut self.replaying, true);
         for item in items {
             self.replay_item(acp_sid, ver, item, out);
         }
-        self.replaying = false;
+        self.replaying = was_replaying;
     }
 
     /// Seed the fold from one history item without turning an in-flight item
@@ -2616,8 +2622,10 @@ impl SessionFold {
             }
             _ => {
                 // Any other settled kind (host cards, unknown future kinds):
-                // settle it through the live handler so the replayed card is
-                // byte-identical to the live one.
+                // settle it through the live handler so the replayed card
+                // keeps the live title, `_meta.muse` and `itemKind`. Content
+                // matches too except for finished shells, which render as a
+                // text card instead of a terminal (see `on_item_completed`).
                 let wrap = J::Obj(vec![("item".to_string(), item.clone())]);
                 self.on_item_completed(acp_sid, ver, &wrap, out);
             }
@@ -5873,6 +5881,15 @@ mod replay_tests {
 
     /// The created tool-call cards in an output batch, as (title, _meta).
     fn cards(out: &[String]) -> Vec<(String, String)> {
+        framed_cards(out)
+            .into_iter()
+            .map(|(title, meta, _)| (title, meta))
+            .collect()
+    }
+
+    /// The same cards, keeping `content` so a test can prove the payload
+    /// matches and not just the label.
+    fn framed_cards(out: &[String]) -> Vec<(String, String, String)> {
         out.iter()
             .filter_map(|line| {
                 let frame = parse_json(line).ok()?;
@@ -5892,7 +5909,8 @@ mod replay_tests {
                     return None;
                 }
                 let meta = update.get("_meta").map(j_to_string).unwrap_or_default();
-                Some((title, meta))
+                let content = update.get("content").map(j_to_string).unwrap_or_default();
+                Some((title, meta, content))
             })
             .collect()
     }
@@ -5903,6 +5921,10 @@ mod replay_tests {
 
     #[test]
     fn replay_renders_host_cards_like_live() {
+        // Title and `_meta.muse` match for every kind. Content matches too,
+        // with one deliberate exception: a finished shell renders a terminal
+        // live and a text card on replay, because replay must not open a
+        // terminal for the editor. The shell's own tests pin that difference.
         let items = host_card_items();
         let mut live_fold = SessionFold::new();
         live_fold.air_async_tasks = true;
@@ -5914,13 +5936,22 @@ mod replay_tests {
         replay_fold.air_async_tasks = true;
         let mut replay = Vec::new();
         replay_fold.replay_history_items("sid", 2, &items, &mut replay);
-        let live_cards = cards(&live);
-        let replay_cards = cards(&replay);
+        let live_cards = framed_cards(&live);
+        let replay_cards = framed_cards(&replay);
         assert_eq!(live_cards.len(), items.len(), "live cards: {live_cards:?}");
         assert_eq!(
-            live_cards, replay_cards,
-            "replayed host cards must match live title and _meta"
+            replay_cards.len(),
+            items.len(),
+            "replay cards: {replay_cards:?}"
         );
+        for (live_card, replay_card) in live_cards.iter().zip(replay_cards.iter()) {
+            assert_eq!(live_card.0, replay_card.0, "title");
+            assert_eq!(live_card.1, replay_card.1, "_meta for {}", live_card.0);
+            if live_card.0 == "cargo test" {
+                continue; // the shell terminal/text difference, asserted below
+            }
+            assert_eq!(live_card.2, replay_card.2, "content for {}", live_card.0);
+        }
     }
 
     #[test]
@@ -5943,7 +5974,21 @@ mod replay_tests {
             !replay.iter().any(|l| l.contains("\"terminal_update\"")),
             "a finished command must not open a terminal on replay: {replay:?}"
         );
-        assert_eq!(cards(&live), cards(&replay));
+        // Silence would satisfy the assertion above too, so require the card.
+        assert_eq!(
+            cards(&replay).len(),
+            1,
+            "the replayed shell still renders a card: {replay:?}"
+        );
+        assert_eq!(
+            cards(&live)[0].0,
+            cards(&replay)[0].0,
+            "the replayed card keeps the live title"
+        );
+        assert!(
+            replay.iter().any(|l| l.contains("\"type\":\"text\"")),
+            "a replayed shell renders its output as text: {replay:?}"
+        );
     }
 
     #[test]
@@ -5965,6 +6010,22 @@ mod replay_tests {
         assert!(
             !replay.iter().any(|l| l.contains("\"terminal_update\"")),
             "a finished call must not open a terminal on replay: {replay:?}"
+        );
+        // Silence would also satisfy the assertion above, so require the card
+        // itself: replayed shells differ from live only in content.
+        assert_eq!(
+            cards(&replay).len(),
+            1,
+            "the card must still render: {replay:?}"
+        );
+        assert_eq!(
+            cards(&live)[0].0,
+            cards(&replay)[0].0,
+            "the replayed card keeps the live title"
+        );
+        assert!(
+            replay.iter().any(|l| l.contains("\"type\":\"text\"")),
+            "a replayed shell renders its output as text: {replay:?}"
         );
     }
 
@@ -6073,6 +6134,46 @@ mod replay_tests {
                 .iter()
                 .any(|l| l.contains("\"async_task_spawned\"")),
             "live traffic after the batch announces normally: {live_out:?}"
+        );
+    }
+
+    #[test]
+    fn a_nested_batch_does_not_reenable_live_side_effects() {
+        // A drill-down inside a replay must not let the inner batch's exit
+        // clear the flag: the rest of the outer batch is still history. The
+        // test drives the field directly because nothing in the current call
+        // graph nests yet; the invariant exists so a future caller cannot
+        // reintroduce live side effects mid-batch.
+        let item: J = parse_json(
+            r#"{"itemId":"it-nested","kind":"toolCall","status":"completed","tool":"bash","callId":"call-nested","args":{"command":"make"},"background":true,"visibleOutput":"done"}"#,
+        )
+        .unwrap();
+        let mut fold = SessionFold::new();
+        fold.air_async_tasks = true;
+        fold.replaying = true; // as if an outer batch were in progress
+        let mut out = Vec::new();
+        fold.replay_history_items("sid", 2, &[item], &mut out);
+        assert!(
+            fold.replaying,
+            "the inner batch must restore the outer batch's replay state"
+        );
+        assert!(
+            !out.iter().any(|l| l.contains("\"async_task_spawned\"")),
+            "nested history announces nothing: {out:?}"
+        );
+        // Clearing it by hand (the outer batch ending) restores live behavior.
+        fold.replaying = false;
+        let live: J = parse_json(
+            r#"{"itemId":"it-live","kind":"toolCall","status":"completed","tool":"bash","callId":"call-live","args":{"command":"make all"},"background":true,"visibleOutput":"done"}"#,
+        )
+        .unwrap();
+        let mut live_out = Vec::new();
+        fold.on_item_completed("sid", 2, &wrap(&live), &mut live_out);
+        assert!(
+            live_out
+                .iter()
+                .any(|l| l.contains("\"async_task_spawned\"")),
+            "live traffic after the outer batch announces normally: {live_out:?}"
         );
     }
 
