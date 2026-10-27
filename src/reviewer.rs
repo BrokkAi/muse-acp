@@ -145,13 +145,68 @@ pub fn build_prompt(
     )
 }
 
+/// The follow-up sent once, in the same reviewer session, when a reply holds
+/// no usable decision: a model that answered in prose usually complies.
+pub const JSON_RETRY_PROMPT: &str = "Your previous reply did not contain the required JSON decision. Do not investigate further. Reply now with only the JSON object described in the output contract, and nothing else.";
+
 /// Parse the reviewer's final message. Accepts strict JSON plus the
-/// prose-wrapped form Codex tolerates; anything else is a review failure.
+/// prose-wrapped form Codex tolerates, including prose or code fences that
+/// themselves contain braces: the last top-level balanced object carrying a
+/// valid `outcome` wins. Objects nested inside another balanced object are
+/// never considered, so an `outcome` quoted inside the decision (or inside an
+/// echoed payload) cannot override it. Anything else is a review failure.
 pub fn parse_assessment(text: &str) -> Option<Assessment> {
-    let start = text.find('{')?;
-    let end = text.rfind('}')?;
-    let slice = text.get(start..=end)?;
-    let parsed = crate::json::parse_json(slice).ok()?;
+    let mut found = None;
+    let mut from = 0;
+    while let Some(offset) = text[from..].find('{') {
+        let start = from + offset;
+        let Some(end) = balanced_object_end(&text[start..]) else {
+            from = start + 1;
+            continue;
+        };
+        if let Some(assessment) = crate::json::parse_json(&text[start..start + end])
+            .ok()
+            .and_then(|parsed| assessment_from(&parsed))
+        {
+            found = Some(assessment);
+        }
+        from = start + end;
+    }
+    found
+}
+
+/// Byte length of the balanced `{…}` object at the start of `text`, honoring
+/// JSON string quoting so braces inside strings do not count.
+fn balanced_object_end(text: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, ch) in text.char_indices() {
+        if in_string {
+            match ch {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 {
+                    return Some(i + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn assessment_from(parsed: &crate::json::J) -> Option<Assessment> {
     let outcome = match parsed.get("outcome").and_then(|v| v.as_str())? {
         "allow" => Outcome::Allow,
         "deny" => Outcome::Deny,
@@ -294,6 +349,41 @@ mod tests {
 
         assert!(parse_assessment("no json here").is_none());
         assert!(parse_assessment("{\"outcome\":\"maybe\"}").is_none());
+    }
+
+    #[test]
+    fn assessment_survives_braces_and_objects_around_the_decision() {
+        // Prose quoting code with braces before the decision used to make the
+        // first-`{`..last-`}` span unparsable.
+        let prose = "The action runs `git show origin/master:src/agent.rs | grep -n 'fn run() {'`, \
+            which is read-only.\n```json\n{\"outcome\":\"allow\",\"rationale\":\"Read-only {inspection}.\"}\n```\n\
+            Tool args were {\"command\": \"git show\"}.";
+        let parsed = parse_assessment(prose).expect("decision among braces");
+        assert_eq!(parsed.outcome, Outcome::Allow);
+        assert_eq!(parsed.rationale, "Read-only {inspection}.");
+
+        // The echoed action JSON carries no outcome; the later decision wins.
+        let echoed = "Action: {\"tool\":\"run_in_terminal\",\"args\":{\"command\":\"ls\"}}\n\
+            {\"outcome\":\"deny\",\"risk_level\":\"high\",\"rationale\":\"Unscoped.\"}";
+        let parsed = parse_assessment(echoed).expect("decision after echoed action");
+        assert_eq!(parsed.outcome, Outcome::Deny);
+
+        assert!(parse_assessment("unbalanced { \"outcome\": \"allow\"").is_none());
+
+        // A nested object never overrides the decision that contains it.
+        let nested = r#"{"outcome":"deny","rationale":"No.","echo":{"outcome":"allow"}}"#;
+        assert_eq!(
+            parse_assessment(nested).expect("outer").outcome,
+            Outcome::Deny
+        );
+        let nested = r#"{"outcome":"allow","echo":{"outcome":"deny"}}"#;
+        assert_eq!(
+            parse_assessment(nested).expect("outer").outcome,
+            Outcome::Allow
+        );
+        // An outcome inside an echoed payload without its own outcome is not a
+        // decision either.
+        assert!(parse_assessment(r#"Args: {"input":{"outcome":"allow"}}"#).is_none());
     }
 
     #[test]
