@@ -2528,10 +2528,16 @@ impl SessionFold {
     /// helper so a kind handled here can never be dropped by one path and
     /// kept by another. Sets `replaying` for the duration so
     /// `on_item_completed` renders cards but skips live-only side effects
-    /// (terminals, AIR async-task announcements). The batch is the whole
-    /// history the fold sees before going live, so it ends by flushing any
-    /// row still held for an anchor the batch does not contain — the replay
-    /// counterpart of the live path's flush at the turn's end.
+    /// (terminals, AIR async-task announcements).
+    ///
+    /// Rows a held anchor never releases are flushed where the live path
+    /// flushes them — at the end of their own turn, not the batch: a new
+    /// `turnId` (null never bounds a turn) ends the previous one as
+    /// `turn/completed` does live, and the batch's end ends its last turn.
+    /// An anchor that only starts in history releases its rows as soon as
+    /// its snapshot registers, because a started anchor's rows already
+    /// exist — the replay of the live path, where such an anchor was never
+    /// deferred at all.
     pub fn replay_history_items(
         &mut self,
         acp_sid: &str,
@@ -2543,8 +2549,17 @@ impl SessionFold {
         // replay) must not switch live side effects back on for the rest of
         // the outer batch.
         let was_replaying = std::mem::replace(&mut self.replaying, true);
+        let mut turn: Option<String> = None;
         for item in items {
+            let item_turn = item.get("turnId").and_then(J::as_str).map(str::to_string);
+            if item_turn.is_some() && item_turn != turn {
+                self.flush_awaiting_anchor(acp_sid, ver, out);
+                turn = item_turn;
+            }
             self.replay_item(acp_sid, ver, item, out);
+            if let Some(item_id) = item.get("itemId").and_then(J::as_str) {
+                self.release_awaiting_anchor(item_id, acp_sid, ver, out);
+            }
         }
         // Flush while `replaying` is still set so a held row renders exactly
         // as it would have in the batch: as a replayed card, not a live one.
@@ -3299,7 +3314,18 @@ impl SessionFold {
         self.complete_item(acp_sid, ver, item, out);
         // This item's rows are out, so everything the host anchored to them can
         // follow.
-        let anchor = item_id.to_string();
+        self.release_awaiting_anchor(item_id, acp_sid, ver, out);
+    }
+
+    /// Emit the rows held for one anchor once that anchor's own rows are out
+    /// (Muse 1.4.13 `Item.terminalRowAfterItemId`).
+    fn release_awaiting_anchor(
+        &mut self,
+        anchor: &str,
+        acp_sid: &str,
+        ver: u8,
+        out: &mut Vec<String>,
+    ) {
         let ready: Vec<J> = {
             let (ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.awaiting_anchor)
                 .into_iter()
@@ -6436,5 +6462,61 @@ mod anchor_tests {
         );
         // And the row keeps its content, not just its identity.
         assert!(out[0].contains("tick-one"), "{}", out[0]);
+    }
+
+    #[test]
+    fn a_replayed_row_follows_an_anchor_that_only_starts_in_history() {
+        // An interrupted turn can leave the anchor inProgress in history
+        // while the monitor it anchors settled. Live, the row rendered right
+        // after the anchor's rows, because a started anchor already counted
+        // as seen; replay must land it there too, not after a later turn.
+        let mut fold = SessionFold::new();
+        fold.show_reminders = true;
+        let mut out = Vec::new();
+        let mon = parse_json(
+            r#"{"itemId":"mon","kind":"toolCall","tool":"monitor","callId":"c1","status":"completed","visibleOutput":"tick-one","terminalRowAfterItemId":"rem","turnId":"t1","args":{"description":"Watch the build"}}"#,
+        )
+        .unwrap();
+        let rem_start = parse_json(
+            r#"{"itemId":"rem","kind":"reminderChild","status":"inProgress","fallbackText":"Reminder child session","reminderAgentId":"a1","generationId":"g1","blocking":false,"turnId":"t1"}"#,
+        )
+        .unwrap();
+        let next_turn = parse_json(
+            r#"{"itemId":"t2c","kind":"toolCall","tool":"bash","callId":"c2","status":"completed","visibleOutput":"done-two","turnId":"t2","args":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        fold.replay_history_items("sid", 1, &[mon, rem_start, next_turn], &mut out);
+        assert_eq!(
+            order(&out),
+            vec![
+                "reminder-rem".to_string(),
+                "c1".to_string(),
+                "c2".to_string()
+            ],
+            "the held row lands with its anchor's turn, not after later turns: {out:?}"
+        );
+    }
+
+    #[test]
+    fn a_replayed_row_whose_anchor_is_missing_flushes_at_its_turns_end() {
+        // The anchor never appears in history: the row belongs at the end of
+        // its own turn, where turn/completed places it live — not after a
+        // later turn's rows.
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        let mon = parse_json(
+            r#"{"itemId":"mon","kind":"toolCall","tool":"monitor","callId":"c1","status":"completed","visibleOutput":"tick-one","terminalRowAfterItemId":"ghost","turnId":"t1","args":{"description":"Watch the build"}}"#,
+        )
+        .unwrap();
+        let next_turn = parse_json(
+            r#"{"itemId":"t2c","kind":"toolCall","tool":"bash","callId":"c2","status":"completed","visibleOutput":"done-two","turnId":"t2","args":{"command":"ls"}}"#,
+        )
+        .unwrap();
+        fold.replay_history_items("sid", 1, &[mon, next_turn], &mut out);
+        assert_eq!(
+            order(&out),
+            vec!["c1".to_string(), "c2".to_string()],
+            "the held row flushes at its own turn's end: {out:?}"
+        );
     }
 }
