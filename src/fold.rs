@@ -159,6 +159,7 @@ fn monitor_description(item: &J) -> String {
     sanitize_one_line(raw)
 }
 
+#[derive(Clone)]
 enum ItemRole {
     Message {
         msg_id: String,
@@ -372,6 +373,12 @@ pub struct SessionFold {
     /// Muse 1.4.11 monitor inbox items by inbox item id: the owning monitor
     /// task and the recorded drain and void stamps, if any.
     monitor_inbox: HashMap<String, InboxItem>,
+    /// Completed items the host anchored to another item's rows that the fold
+    /// had not seen yet, keyed by that anchor's item id. Muse 1.4.13 names the
+    /// anchor in `Item.terminalRowAfterItemId`; when the anchor is already
+    /// known the row is emitted straight away, because it is then already
+    /// after those rows. Only an anchor still ahead of us defers the row.
+    awaiting_anchor: Vec<(String, J)>,
     /// The open "background checks" card of a turn whose foreground work is
     /// done while reminder agents hold it open (`turn/foregroundCompleted`),
     /// as `(turn id, card id)`. Settled at the turn's terminal.
@@ -460,6 +467,7 @@ impl SessionFold {
             replaying: false,
             monitor_cards: std::collections::HashSet::new(),
             monitor_inbox: HashMap::new(),
+            awaiting_anchor: Vec::new(),
             background_checks: None,
             model_retry: None,
             last_message: None,
@@ -2634,6 +2642,18 @@ impl SessionFold {
 
     /// Upsert and emit the single stable card for one monitor task. The feed
     /// item id remains in metadata, while `monitorId` selects the ACP row.
+    /// The item id an item's rows belong after, when the host says its log
+    /// span is not where the row renders (`Item.terminalRowAfterItemId`,
+    /// Muse 1.4.13). A monitor's span starts when it is armed, but its output
+    /// is observed later — the host names that anchor because reminder checks
+    /// and other items can interleave in between. `None` when the host sends
+    /// no anchor, which is every item of every earlier release.
+    fn row_anchor(item: &J) -> Option<&str> {
+        item.get("terminalRowAfterItemId")
+            .and_then(J::as_str)
+            .filter(|anchor| !anchor.is_empty())
+    }
+
     fn monitor_feed_card(
         &mut self,
         acp_sid: &str,
@@ -2691,6 +2711,8 @@ impl SessionFold {
                 (text, host_truncated)
             }
         };
+        let terminal = status != "inProgress";
+        let _ = terminal;
         out.push(Self::card_line(
             acp_sid,
             ver,
@@ -2703,6 +2725,30 @@ impl SessionFold {
             muse_fields.as_deref(),
             effective_truncated,
         ));
+    }
+
+    /// Whether the host says this item's rows belong after another item's,
+    /// and that anchor is still ahead of us (Muse 1.4.13
+    /// `Item.terminalRowAfterItemId`).
+    ///
+    /// A monitor's log span opens when it is armed, but its output is only
+    /// observed when it finishes; reminder checks and other items can land in
+    /// between. The host names the anchor so the row renders after their rows.
+    /// When the fold has already seen the anchor, the row is emitted straight
+    /// away — it is already after them. Only an anchor still ahead of us
+    /// defers, so a host that never sends one (every release before 1.4.13)
+    /// behaves exactly as before.
+    fn deferring_for_anchor(&self, item: &J, item_id: &str) -> Option<String> {
+        let anchor = Self::row_anchor(item)?;
+        // "Seen" means its rows exist, which a started item already satisfies —
+        // `known` alone only knows settled items. In a live session the anchor
+        // (a reminder check) has started by the time the monitor completes, so
+        // this is the ordinary path, not the exception.
+        let seen = self.items.contains_key(anchor) || self.known(anchor);
+        if anchor == item_id || seen {
+            return None;
+        }
+        Some(anchor.to_string())
     }
 
     /// The `monitorInbox` counts for one monitor task, once it has inbox
@@ -3212,18 +3258,58 @@ impl SessionFold {
     }
 
     /// item/completed carries the authoritative final object.
+    /// Emit any row still waiting on an anchor that never arrived, so a monitor
+    /// the host anchored to an item that never completes is not lost. Called
+    /// when the turn settles, after which no further item can arrive to carry
+    /// the row.
+    pub fn flush_awaiting_anchor(&mut self, acp_sid: &str, ver: u8, out: &mut Vec<String>) {
+        let held = std::mem::take(&mut self.awaiting_anchor);
+        for (_, item) in held {
+            self.complete_item(acp_sid, ver, &item, out);
+        }
+    }
+
     pub fn on_item_completed(&mut self, acp_sid: &str, ver: u8, params: &J, out: &mut Vec<String>) {
-        if let Some(item_id) = params
-            .get("item")
-            .and_then(|item| item.get("itemId"))
-            .and_then(J::as_str)
-        {
+        let Some(item) = params.get("item") else {
+            return;
+        };
+        let Some(item_id) = item.get("itemId").and_then(J::as_str) else {
+            return;
+        };
+        self.streamed_output.remove(item_id);
+        // A row the host anchored to an item we have not seen yet must wait, or
+        // it lands before the rows it belongs after (Muse 1.4.13
+        // `Item.terminalRowAfterItemId`). Nothing changes for a host that
+        // sends no anchor, which is every release before 1.4.13.
+        if let Some(anchor) = self.deferring_for_anchor(item, item_id) {
+            let item_id = item_id.to_string();
+            if !self.awaiting_anchor.iter().any(|(a, held)| {
+                *a == anchor && held.get("itemId").and_then(J::as_str) == Some(&item_id)
+            }) {
+                self.awaiting_anchor.push((anchor, item.clone()));
+            }
+            return;
+        }
+        self.complete_item(acp_sid, ver, item, out);
+        // This item's rows are out, so everything the host anchored to them can
+        // follow.
+        let anchor = item_id.to_string();
+        let ready: Vec<J> = {
+            let (ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.awaiting_anchor)
+                .into_iter()
+                .partition(|(a, _)| *a == anchor);
+            self.awaiting_anchor = held;
+            ready.into_iter().map(|(_, item)| item).collect()
+        };
+        for held in ready {
+            self.complete_item(acp_sid, ver, &held, out);
+        }
+    }
+
+    fn complete_item(&mut self, acp_sid: &str, ver: u8, item: &J, out: &mut Vec<String>) {
+        if let Some(item_id) = item.get("itemId").and_then(J::as_str) {
             self.streamed_output.remove(item_id);
         }
-        let item = match params.get("item") {
-            Some(i) => i,
-            None => return,
-        };
         let item_id = match item.get("itemId").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => return,
@@ -6189,6 +6275,126 @@ mod replay_tests {
         assert!(
             cards(&second).is_empty(),
             "a second replay of the same history adds nothing: {second:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod anchor_tests {
+    use super::SessionFold;
+    use crate::json::{J, j_to_string, parse_json};
+
+    fn wrap(item: &J) -> J {
+        J::Obj(vec![("item".to_string(), item.clone())])
+    }
+
+    /// The tool-call ids of the emitted frames, in order.
+    fn order(out: &[String]) -> Vec<String> {
+        out.iter()
+            .filter_map(|line| {
+                let frame = parse_json(line).ok()?;
+                let update = frame.get("params")?.get("update")?;
+                update
+                    .get("toolCallId")
+                    .and_then(J::as_str)
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    fn monitor() -> J {
+        parse_json(
+            r#"{"itemId":"mon","kind":"toolCall","tool":"monitor","callId":"c1","status":"completed","visibleOutput":"tick-one","terminalRowAfterItemId":"rem","args":{"description":"Watch the build"}}"#,
+        )
+        .unwrap()
+    }
+
+    fn reminder() -> J {
+        parse_json(
+            r#"{"itemId":"rem","kind":"reminderChild","status":"completed","fallbackText":"Reminder child session","reminderAgentId":"a1","generationId":"g1","blocking":false}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn an_anchored_row_waits_for_the_item_it_belongs_after() {
+        // Muse 1.4.13: a monitor's span opens when it is armed but its output
+        // is observed later, so the host names the item its row follows.
+        // Emitting at the monitor's own position would put it before the
+        // reminder that actually ran first.
+        let mut fold = SessionFold::new();
+        fold.show_reminders = true;
+        let mut out = Vec::new();
+        fold.on_item_completed("sid", 1, &wrap(&monitor()), &mut out);
+        assert!(
+            out.is_empty(),
+            "the anchored row must not render before its anchor: {out:?}"
+        );
+        fold.on_item_completed("sid", 1, &wrap(&reminder()), &mut out);
+        assert_eq!(
+            order(&out),
+            vec!["reminder-rem".to_string(), "c1".to_string()],
+            "the monitor row renders after the anchor's rows: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_anchor_already_seen_does_not_delay_the_row() {
+        // When the anchor's rows are already out, the monitor row is already
+        // after them: deferring would gain nothing and cost a turn of latency.
+        let mut fold = SessionFold::new();
+        fold.show_reminders = true;
+        let mut out = Vec::new();
+        // A started anchor is the real shape: in a live session the reminder
+        // opens at seq 103 and the monitor completes at seq 105, so its rows
+        // are already out when the monitor's row is ready.
+        let started = parse_json(
+            r#"{"itemId":"rem","kind":"reminderChild","status":"inProgress","fallbackText":"Reminder child session","reminderAgentId":"a1","generationId":"g1","blocking":false}"#,
+        )
+        .unwrap();
+        fold.on_item_snapshot("sid", 1, &started, &mut out);
+        let before = out.len();
+        fold.on_item_completed("sid", 1, &wrap(&monitor()), &mut out);
+        assert_eq!(
+            out.len(),
+            before + 1,
+            "the row renders at once when its anchor is known: {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_anchor_that_never_arrives_still_renders_the_row() {
+        // A row must never be lost to a hint: the turn's end flushes whatever
+        // is still waiting.
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_completed("sid", 1, &wrap(&monitor()), &mut out);
+        assert!(out.is_empty(), "held while the anchor is ahead of us");
+        fold.flush_awaiting_anchor("sid", 1, &mut out);
+        assert_eq!(
+            order(&out),
+            vec!["c1".to_string()],
+            "the turn's end renders the held row: {out:?}"
+        );
+        // And the row keeps its content, not just its identity.
+        assert!(out[0].contains("tick-one"), "{}`", out[0]);
+    }
+
+    #[test]
+    fn a_row_without_an_anchor_is_unaffected() {
+        // Every release before 1.4.13 sends no anchor; nothing may change.
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        let plain = parse_json(
+            r#"{"itemId":"mon2","kind":"toolCall","tool":"monitor","callId":"c2","status":"completed","visibleOutput":"tick-two","args":{"description":"Watch"}}"#,
+        )
+        .unwrap();
+        fold.on_item_completed("sid", 1, &wrap(&plain), &mut out);
+        assert_eq!(
+            order(&out),
+            vec!["c2".to_string()],
+            "{}",
+            j_to_string(&plain)
         );
     }
 }
