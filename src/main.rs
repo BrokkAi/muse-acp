@@ -12910,9 +12910,10 @@ fn cua_untrusted_text(value: &str) -> Option<String> {
 /// The facts of a computer-use approval card (Muse 1.4.12
 /// `ApprovalRequestParams.cuaCardFacts`) as permission-prompt text, in the
 /// host's words: the page host (with its `xn--` form when it differs, so a
-/// look-alike host stands out), the window title, and each consequential
-/// step as `Step N: <action> <roleWord> <label> — <effect>`, the title and
-/// label quoted as code spans ([`cua_untrusted_text`]).
+/// look-alike host stands out), the window title, each consequential step as
+/// `Step N: <action> <roleWord> <label> — <effect>`, and each Muse 1.4.13
+/// `data` row as `Data: …`, the title, label, and mask quoted as code spans
+/// ([`cua_untrusted_text`]).
 /// A key step names its chord, and only a step with a point and no label or
 /// chord reads "at x,y". `None` when the approval carries no facts.
 fn cua_card_text(params: &J) -> Option<String> {
@@ -12937,6 +12938,11 @@ fn cua_card_text(params: &J) -> Option<String> {
         .and_then(cua_untrusted_text)
     {
         lines.push(format!("Window: {title}"));
+    }
+    if let Some(J::Arr(data)) = facts.get("data") {
+        for fact in data {
+            lines.push(cua_data_line(fact));
+        }
     }
     if let Some(J::Arr(steps)) = facts.get("steps") {
         for (index, step) in steps.iter().enumerate() {
@@ -12976,6 +12982,63 @@ fn cua_card_text(params: &J) -> Option<String> {
         }
     }
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// One `ApprovalCuaDataFact` as a `Data: …` prompt line: the words the schema
+/// gives a known `secretKind`, then the mask, which never carries the value.
+/// An unknown `kind` or `secretKind` degrades to a generic row instead of
+/// being dropped, which is what the schema asks of a client.
+fn cua_data_line(fact: &J) -> String {
+    let kind = fact.non_empty_str("kind").unwrap_or_default();
+    let secret_kind = fact.non_empty_str("secretKind").unwrap_or_default();
+    // Only `secret` rows carry a word for the scanner's tag; the schema says
+    // a client words the tags it knows and calls any other "a secret".
+    // `secret_named_value`'s own prefix names it (`password=`), so it needs no
+    // word — but only when the host actually sent that prefix.
+    let has_prefix = fact
+        .get("mask")
+        .and_then(|mask| mask.non_empty_str("prefix"))
+        .is_some();
+    let word = match (kind, secret_kind) {
+        ("secret", "github_token") => "GitHub token",
+        ("secret", "secret_named_value") if has_prefix => "",
+        ("secret", _) => "a secret",
+        _ => "a value",
+    };
+    let mask = cua_mask_text(fact.get("mask"));
+    match (word.is_empty(), mask.is_empty()) {
+        (true, true) => "Data: a secret".to_string(),
+        (true, false) => format!("Data: {mask}"),
+        (false, true) => format!("Data: {word}"),
+        (false, false) => format!("Data: {word} {mask}"),
+    }
+}
+
+/// An `ApprovalCuaMask` as `ghp_…3f9a` or `password=… (12 chars)`, quoted as
+/// one code span. Every part is derived from the app's data, so the whole
+/// mask is sanitized and quoted like the window title and labels; the value
+/// itself is never present in the schema, so nothing here can reveal it.
+fn cua_mask_text(mask: Option<&J>) -> String {
+    let Some(mask) = mask else {
+        return String::new();
+    };
+    let prefix = mask.non_empty_str("prefix").unwrap_or_default();
+    let last4 = mask.non_empty_str("last4").unwrap_or_default();
+    let chars = mask.get("chars").and_then(J::as_u64);
+    let mut shown = String::new();
+    if !prefix.is_empty() || !last4.is_empty() || chars.is_some() {
+        shown.push_str(prefix);
+        shown.push('…');
+        shown.push_str(last4);
+        if let Some(chars) = chars.filter(|chars| *chars > 0) {
+            let noun = if chars == 1 { "char" } else { "chars" };
+            shown.push_str(&format!(" ({chars} {noun})"));
+        }
+    }
+    if shown.is_empty() {
+        return String::new();
+    }
+    cua_untrusted_text(&shown).unwrap_or_default()
 }
 
 /// Human title and ACP tool kind shared by actionable approvals and the
@@ -16619,6 +16682,102 @@ mod tests {
             cua_card_text(&parse_json(r#"{"cuaCardFacts":{}}"#).unwrap()),
             None
         );
+    }
+
+    #[test]
+    fn cua_card_data_rows_name_the_data_without_the_value() {
+        // Muse 1.4.13 `cuaCardFacts.data`. Each row names what the call would
+        // send; the mask never carries the value, because the schema never
+        // sends it.
+        let cases = [
+            // A vendor token: the scanner's tag is worded, then prefix and
+            // last 4 characters.
+            (
+                r#"{"kind":"secret","secretKind":"github_token","mask":{"prefix":"ghp_","last4":"3f9a","chars":40}}"#,
+                "Data: GitHub token `ghp_…3f9a (40 chars)`",
+            ),
+            // A named value: its own prefix names it, so no tag word is added.
+            (
+                r#"{"kind":"secret","secretKind":"secret_named_value","mask":{"prefix":"password=","chars":12}}"#,
+                "Data: `password=… (12 chars)`",
+            ),
+            // Length alone.
+            (
+                r#"{"kind":"secret","secretKind":"github_token","mask":{"chars":40}}"#,
+                "Data: GitHub token `… (40 chars)`",
+            ),
+            // A mask with nothing in it, and no mask at all.
+            (
+                r#"{"kind":"secret","secretKind":"github_token","mask":{}}"#,
+                "Data: GitHub token",
+            ),
+            (
+                r#"{"kind":"secret","secretKind":"github_token"}"#,
+                "Data: GitHub token",
+            ),
+            // An unknown scanner tag degrades to "a secret", never the tag.
+            (
+                r#"{"kind":"secret","secretKind":"some_new_scanner","mask":{"prefix":"sk-","last4":"abcd"}}"#,
+                "Data: a secret `sk-…abcd`",
+            ),
+            // An unknown kind, and the host's own `other`, are generic rows.
+            (r#"{"kind":"other"}"#, "Data: a value"),
+            (
+                r#"{"kind":"future_kind","mask":{"chars":8}}"#,
+                "Data: a value `… (8 chars)`",
+            ),
+            // A single character reads as one char, not "1 chars".
+            (
+                r#"{"kind":"secret","secretKind":"secret_named_value","mask":{"prefix":"pin=","chars":1}}"#,
+                "Data: `pin=… (1 char)`",
+            ),
+        ];
+        for (raw, want) in cases {
+            let params = J::Obj(vec![(
+                "cuaCardFacts".to_string(),
+                J::Obj(vec![(
+                    "data".to_string(),
+                    J::Arr(vec![parse_json(raw).unwrap()]),
+                )]),
+            )]);
+            assert_eq!(cua_card_text(&params).as_deref(), Some(want), "{raw}");
+        }
+    }
+
+    #[test]
+    fn cua_card_data_rows_stay_one_quoted_line_and_keep_order() {
+        // Prefix and last4 come from the app's data, so they are sanitized and
+        // quoted like the window title: no Markdown link, no line break.
+        let params = parse_json(
+            r#"{"cuaCardFacts":{"data":[
+                {"kind":"secret","secretKind":"secret_named_value","mask":{"prefix":"a=`[x](https://evil.example)\n","chars":9}},
+                {"kind":"other"},
+                {"kind":"secret","secretKind":"github_token","mask":{"prefix":"ghp_","last4":"3f9a"}}]}}"#,
+        )
+        .unwrap();
+        let text = cua_card_text(&params).unwrap();
+        assert_eq!(
+            text,
+            // The prefix holds a backtick, so the span's fence is longer than
+            // any backtick run in it and the span stays literal.
+            "Data: ``a=`[x](https://evil.example) … (9 chars)``\n\
+             Data: a value\n\
+             Data: GitHub token `ghp_…3f9a`"
+        );
+        assert!(!text.contains("\n\n"), "each fact is its own line: {text}");
+    }
+
+    #[test]
+    fn cua_card_without_facts_still_renders_nothing() {
+        // Empty collections are omitted, never null, so an empty data list
+        // must not fabricate a row or a card.
+        for raw in [
+            r#"{"cuaCardFacts":{}}"#,
+            r#"{"cuaCardFacts":{"data":[]}}"#,
+            r#"{"cuaCardFacts":{"data":[],"steps":[]}}"#,
+        ] {
+            assert_eq!(cua_card_text(&parse_json(raw).unwrap()), None, "{raw}");
+        }
     }
 
     #[test]

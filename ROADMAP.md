@@ -846,14 +846,14 @@ kinds render their own cards with their facts in `_meta.muse` (#331, #332),
 and the remaining field additions carry explicit dispositions in the field
 matrix below.
 
-The 1.4.13 additions are tracked, not adopted. Computer-use approval data
-facts (the `cuaCardFacts.data` rows with their never-the-value masks) are
-[#395](https://github.com/BrokkAi/muse-acp/issues/395); the monitor
-tool-call replay hint and terminal-row anchor (`Item.replayHint`,
-`Item.terminalRowAfterItemId`) are
-[#397](https://github.com/BrokkAi/muse-acp/issues/397); the ManagedBash
-`Item.workId` is [#396](https://github.com/BrokkAi/muse-acp/issues/396);
-and the resume permission-profile reset over a declared lost record can now
+The 1.4.13 additions are mostly tracked, not adopted. Computer-use approval
+data facts are adopted: the prompt now names the data the call would send
+([#395](https://github.com/BrokkAi/muse-acp/issues/395)). Still tracked are
+the monitor tool-call replay hint and terminal-row anchor (`Item.replayHint`,
+`Item.terminalRowAfterItemId`) in
+[#397](https://github.com/BrokkAi/muse-acp/issues/397), the ManagedBash
+`Item.workId` in [#396](https://github.com/BrokkAi/muse-acp/issues/396), and
+the resume permission-profile reset over a declared lost record, which can now
 be checked against a real 1.4.13 host
 ([#398](https://github.com/BrokkAi/muse-acp/issues/398)).
 The queued inputs a `session/read` still holds are intentionally ignored:
@@ -938,7 +938,7 @@ cannot drop a member without failing CI.
 | `SessionHistory.checkpointBoundary` | Intentionally ignored | The checkpoint-prune boundary (Muse 1.4.12+) marks which served rows predate the selected checkpoint. The adapter has no checkpoint or rewind surface and replays every served row, and the schema makes absence a non-assertion, so nothing depends on it. |
 | `TaskListEntry.command` | Intentionally ignored | Seeded async tasks keep their name from the row's `tool` or `kind`. The raw command text (Muse 1.4.12+) is never forwarded, since the schema leaves redaction to clients. |
 | `TaskListEntry.executionMode` | Mapped to ACP | When `task/list` seeds the AIR async-task inventory after a resume or re-attach, a `foreground` row (Muse 1.4.12+) is skipped: it is the running turn's own work, not a background task. `background`, absent (older hosts list background rows only), and unknown modes, which the schema says to ignore, keep seeding. |
-| `ApprovalCuaCardFacts.data` | Unsupported pending protocol decision | Muse 1.4.13 lists the data an approved computer-use call would send as `ApprovalCuaDataFact` rows: an open `kind`, the scanner's open `secretKind` tag, and an `ApprovalCuaMask` (`prefix`, `last4`, `chars`) that never carries the value. The permission prompt does not show them yet, so a secret the call would send stays invisible; the verbatim facts still ride `_meta.muse.cuaCardFacts`. A card with any data offers only one-shot choices, which the existing deny-safe choices already are. [#395](https://github.com/BrokkAi/muse-acp/issues/395) |
+| `ApprovalCuaCardFacts.data` | Mapped to ACP | Muse 1.4.13 lists the data an approved computer-use call would send as `ApprovalCuaDataFact` rows: an open `kind`, the scanner's open `secretKind` tag, and an `ApprovalCuaMask` (`prefix`, `last4`, `chars`) that never carries the value. The permission prompt shows one `Data: …` line per row, worded from the host's mask and never with the value: a known `secretKind` is worded (`GitHub token`) and given its mask (`ghp_…3f9a`, `password=… (12 chars)`, or the length alone), while `other` and any unknown `kind` or `secretKind` degrade to a generic row (`Data: a value`, `Data: a secret`) instead of being dropped, as the schema requires. The mask is app-derived, so it is sanitized and quoted as one code span like the window title; the verbatim facts still ride `_meta.muse.cuaCardFacts`. A card with any data offers only one-shot choices, which the existing deny-safe choices already are. [#395](https://github.com/BrokkAi/muse-acp/issues/395) |
 | `Item.replayHint` | Unsupported pending protocol decision | Muse 1.4.13 attaches the D26 replay hint to a monitor `toolCall`: a `ReplayHint` whose required `afterItemId` names the item after whose rows it renders and whose required `rowKinds` is an open lowercase vocabulary. The fold does not read it, so monitor cards keep the order the host sends. [#397](https://github.com/BrokkAi/muse-acp/issues/397) |
 | `Item.terminalRowAfterItemId` | Unsupported pending protocol decision | Muse 1.4.13 names the item after whose rows a terminal `toolCall` row renders (ADR 56496 D2/D3). The fold does not read it; replay and live rows render in host order. [#397](https://github.com/BrokkAi/muse-acp/issues/397) |
 | `Item.workId` | Unsupported pending protocol decision | Muse 1.4.13 carries a tool task's registered ManagedBash Work ID verbatim (`work.v2.managed_bash.sha256.…`) when the task registered one, and the schema says absence keeps the client's v1 derivation. The adapter never reads it, so tool cards and AIR async tasks keep their existing ids. [#396](https://github.com/BrokkAi/muse-acp/issues/396) |
