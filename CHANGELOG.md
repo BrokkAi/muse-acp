@@ -7,8 +7,9 @@
   progress until the owner reads or closes it, and the adapter only sent
   `subagent_state_update` on `item/completed`, so a client never saw children
   that nobody explicitly waited on finish. A `resultReady` snapshot now sends
-  `completed` for the child session, and each state is sent once per child
-  even when later snapshots or the item's completion repeat it.
+  `completed` for the child session, or `failed` when the result carries an
+  `errorKind`, matching how the host later closes it. Each state is sent once
+  per child even when later snapshots or the item's completion repeat it.
 
 ## 0.18.0
 

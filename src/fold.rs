@@ -1850,8 +1850,16 @@ impl SessionFold {
             _ => match control {
                 // The child finished its task and holds a result. The item
                 // stays in progress until the owner reads or closes it, and
-                // neither is guaranteed to happen (#430).
-                "resultReady" => "completed",
+                // neither is guaranteed to happen (#430). The host closes a
+                // result with `errorKind` as failed, so settle it the same way.
+                "resultReady" => {
+                    let error = item
+                        .get("result")
+                        .and_then(|r| r.get("errorKind"))
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !s.is_empty());
+                    if error { "failed" } else { "completed" }
+                }
                 "recoveryPending" | "manualReconciliation" => "disconnected",
                 _ => return None, // still running: no state update
             },

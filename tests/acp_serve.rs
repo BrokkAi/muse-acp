@@ -12687,9 +12687,10 @@ fn native_subagent_sessions_spawn_state_and_replay_the_child() {
 fn native_subagent_result_ready_settles_the_child_once() {
     // #430: a child that reaches resultReady holds its result while its item
     // stays in progress, and nothing obliges the owner to read or close it.
+    // A result with an errorKind settles failed, as the host later closes it.
     let mut c = Client::spawn("subagent_result_ready", &[("FAKE_CAPS", "subagents")]);
     let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
-    let pid = c.prompt(&sid, "delegate two");
+    let pid = c.prompt(&sid, "delegate three");
     c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
     let frames = c
         .frames
@@ -12700,15 +12701,19 @@ fn native_subagent_result_ready_settles_the_child_once() {
         .lines()
         .filter(|l| l.contains("subagent_state_update"))
         .collect();
-    for child in ["child-sess-ready-a", "child-sess-ready-b"] {
+    for (child, state) in [
+        ("child-sess-ready-a", "completed"),
+        ("child-sess-ready-b", "completed"),
+        ("child-sess-ready-c", "failed"),
+    ] {
         let settled: Vec<&&str> = states
             .iter()
             .filter(|l| l.contains(&format!("\"subagentSessionId\":\"{child}\"")))
             .collect();
         assert_eq!(settled.len(), 1, "{child} must settle once: {frames}");
         assert!(
-            settled[0].contains("\"state\":\"completed\""),
-            "{child} result readiness is completion: {frames}"
+            settled[0].contains(&format!("\"state\":\"{state}\"")),
+            "{child} must settle {state}: {frames}"
         );
     }
     c.finish();

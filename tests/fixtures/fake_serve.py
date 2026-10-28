@@ -1561,26 +1561,33 @@ def on_turn_start(params):
                        "evidenceRefs": [], "artifactRefs": []}}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "subagent_result_ready":
-        # Two control-tool children reach resultReady while their items stay
-        # in progress. Only the second is later closed (#430).
-        for n, child in (("a", "child-sess-ready-a"), ("b", "child-sess-ready-b")):
+        # Three control-tool children reach resultReady while their items
+        # stay in progress. Only b and c are later closed; c's result carries
+        # an errorKind, which the host closes as failed (#430).
+        children = {"a": {}, "b": {}, "c": {"errorKind": "provider_error"}}
+        for n, err in children.items():
+            result = {"summary": f"task {n} done", "evidenceRefs": [],
+                      "artifactRefs": [], **err}
             item = {"itemId": f"it-ready-{n}", "kind": "subagent",
                     "status": "inProgress", "subagentId": f"subagent-{n}",
                     "agentPath": "researcher", "depth": 1,
-                    "objective": f"task {n}", "childSessionId": child}
+                    "objective": f"task {n}",
+                    "childSessionId": f"child-sess-ready-{n}"}
             notify("item/started", {**base, "item": {
                 **item, "revision": 1, "controlStatus": "running"}})
             notify("item/updated", {**base, "item": {
                 **item, "revision": 2, "controlStatus": "running"}})
             notify("item/updated", {**base, "item": {
-                **item, "revision": 3, "controlStatus": "resultReady"}})
+                **item, "revision": 3, "controlStatus": "resultReady",
+                "result": result}})
             notify("item/updated", {**base, "item": {
-                **item, "revision": 4, "controlStatus": "resultReady"}})
-        notify("item/completed", {**base, "item": {
-            "itemId": "it-ready-b", "kind": "subagent", "status": "completed",
-            "revision": 5, "subagentId": "subagent-b",
-            "agentPath": "researcher", "depth": 1, "objective": "task b",
-            "childSessionId": "child-sess-ready-b", "controlStatus": "closed"}})
+                **item, "revision": 4, "controlStatus": "resultReady",
+                "result": result}})
+            if n != "a":
+                notify("item/completed", {**base, "item": {
+                    **item, "revision": 5, "controlStatus": "closed",
+                    "status": "failed" if err else "completed",
+                    "result": result}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "subagent_control":
         control = os.environ.get("FAKE_SUBAGENT_CONTROL_STATUS", "running")
