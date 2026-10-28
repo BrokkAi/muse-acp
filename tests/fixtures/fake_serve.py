@@ -1560,6 +1560,28 @@ def on_turn_start(params):
             "result": {"summary": "native child finished",
                        "evidenceRefs": [], "artifactRefs": []}}})
         notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "subagent_result_ready":
+        # Two control-tool children reach resultReady while their items stay
+        # in progress. Only the second is later closed (#430).
+        for n, child in (("a", "child-sess-ready-a"), ("b", "child-sess-ready-b")):
+            item = {"itemId": f"it-ready-{n}", "kind": "subagent",
+                    "status": "inProgress", "subagentId": f"subagent-{n}",
+                    "agentPath": "researcher", "depth": 1,
+                    "objective": f"task {n}", "childSessionId": child}
+            notify("item/started", {**base, "item": {
+                **item, "revision": 1, "controlStatus": "running"}})
+            notify("item/updated", {**base, "item": {
+                **item, "revision": 2, "controlStatus": "running"}})
+            notify("item/updated", {**base, "item": {
+                **item, "revision": 3, "controlStatus": "resultReady"}})
+            notify("item/updated", {**base, "item": {
+                **item, "revision": 4, "controlStatus": "resultReady"}})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-ready-b", "kind": "subagent", "status": "completed",
+            "revision": 5, "subagentId": "subagent-b",
+            "agentPath": "researcher", "depth": 1, "objective": "task b",
+            "childSessionId": "child-sess-ready-b", "controlStatus": "closed"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "subagent_control":
         control = os.environ.get("FAKE_SUBAGENT_CONTROL_STATUS", "running")
         item_status = os.environ.get("FAKE_SUBAGENT_ITEM_STATUS", "inProgress")

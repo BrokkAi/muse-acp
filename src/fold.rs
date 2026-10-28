@@ -297,6 +297,9 @@ pub struct SessionFold {
     pub native_subagents: bool,
     /// Child session ids already announced to this client (idempotent spawn).
     pub spawned_subagents: std::collections::HashSet<String>,
+    /// Last `subagent_state_update` sent per child session id, so a terminal
+    /// state reaches the client once however many snapshots repeat it.
+    subagent_states: HashMap<String, &'static str>,
     /// Whether the client negotiated the AIR async-tasks extension.
     pub air_async_tasks: bool,
     /// ACP v2 always supports standard compaction; ACP v1 must opt in.
@@ -452,6 +455,7 @@ impl SessionFold {
             idc: AtomicU64::new(1),
             native_subagents: false,
             spawned_subagents: std::collections::HashSet::new(),
+            subagent_states: HashMap::new(),
             air_async_tasks: false,
             compaction_supported: false,
             announced_tasks: std::collections::HashSet::new(),
@@ -1844,11 +1848,27 @@ impl SessionFold {
             "failed" | "rejected" => "failed",
             "cancelled" | "timedOut" => "cancelled",
             _ => match control {
+                // The child finished its task and holds a result. The item
+                // stays in progress until the owner reads or closes it, and
+                // neither is guaranteed to happen (#430).
+                "resultReady" => "completed",
                 "recoveryPending" | "manualReconciliation" => "disconnected",
                 _ => return None, // still running: no state update
             },
         };
         Some(state)
+    }
+
+    /// Send the child's state when it changed since the last one sent.
+    fn settle_subagent(&mut self, acp_sid: &str, child: &str, item: &J, out: &mut Vec<String>) {
+        let Some(state) = Self::subagent_state(item) else {
+            return;
+        };
+        if self.subagent_states.get(child) == Some(&state) {
+            return;
+        }
+        self.subagent_states.insert(child.to_string(), state);
+        out.push(Self::subagent_state_line(acp_sid, child, state));
     }
 
     /// Stable synthetic toolCall id + first-announcement flag for host cards.
@@ -3026,40 +3046,39 @@ impl SessionFold {
             "subagent" if self.native_subagents => {
                 if let Some(child) = item.get("childSessionId").and_then(|v| v.as_str())
                     && !child.is_empty()
-                    && !self.spawned_subagents.contains(child)
                 {
-                    self.spawned_subagents.insert(child.to_string());
-                    let name = item
-                        .get("agentPath")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("subagent");
-                    let task = item
-                        .get("objective")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .unwrap_or("Delegated task");
-                    let fields = [
-                        ("subagentId", item.get("subagentId")),
-                        ("depth", item.get("depth")),
-                        ("controlStatus", item.get("controlStatus")),
-                    ];
-                    let parts: Vec<String> = fields
-                        .into_iter()
-                        .filter(|(_, v)| matches!(v, Some(J::Num(_)) | Some(J::Str(_))))
-                        .map(|(k, v)| format!("\"{k}\":{}", j_to_string(v.unwrap())))
-                        .collect();
-                    let fields = (!parts.is_empty()).then(|| parts.join(","));
-                    out.push(Self::subagent_spawned_line(
-                        acp_sid,
-                        child,
-                        name,
-                        task,
-                        fields.as_deref(),
-                    ));
-                    if let Some(state) = Self::subagent_state(item) {
-                        out.push(Self::subagent_state_line(acp_sid, child, state));
+                    if !self.spawned_subagents.contains(child) {
+                        self.spawned_subagents.insert(child.to_string());
+                        let name = item
+                            .get("agentPath")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("subagent");
+                        let task = item
+                            .get("objective")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or("Delegated task");
+                        let fields = [
+                            ("subagentId", item.get("subagentId")),
+                            ("depth", item.get("depth")),
+                            ("controlStatus", item.get("controlStatus")),
+                        ];
+                        let parts: Vec<String> = fields
+                            .into_iter()
+                            .filter(|(_, v)| matches!(v, Some(J::Num(_)) | Some(J::Str(_))))
+                            .map(|(k, v)| format!("\"{k}\":{}", j_to_string(v.unwrap())))
+                            .collect();
+                        let fields = (!parts.is_empty()).then(|| parts.join(","));
+                        out.push(Self::subagent_spawned_line(
+                            acp_sid,
+                            child,
+                            name,
+                            task,
+                            fields.as_deref(),
+                        ));
                     }
+                    self.settle_subagent(acp_sid, child, item, out);
                 }
             }
             "subagent" | "workflow" | "userShell" | "hookRun" => {
@@ -3601,9 +3620,7 @@ impl SessionFold {
                             acp_sid, child, name, task, None,
                         ));
                     }
-                    if let Some(state) = Self::subagent_state(item) {
-                        out.push(Self::subagent_state_line(acp_sid, child, state));
-                    }
+                    self.settle_subagent(acp_sid, child, item, out);
                 }
                 self.items.remove(&item_id);
             }

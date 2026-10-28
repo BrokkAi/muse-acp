@@ -12684,6 +12684,37 @@ fn native_subagent_sessions_spawn_state_and_replay_the_child() {
 }
 
 #[test]
+fn native_subagent_result_ready_settles_the_child_once() {
+    // #430: a child that reaches resultReady holds its result while its item
+    // stays in progress, and nothing obliges the owner to read or close it.
+    let mut c = Client::spawn("subagent_result_ready", &[("FAKE_CAPS", "subagents")]);
+    let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let pid = c.prompt(&sid, "delegate two");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    let states: Vec<&str> = frames
+        .lines()
+        .filter(|l| l.contains("subagent_state_update"))
+        .collect();
+    for child in ["child-sess-ready-a", "child-sess-ready-b"] {
+        let settled: Vec<&&str> = states
+            .iter()
+            .filter(|l| l.contains(&format!("\"subagentSessionId\":\"{child}\"")))
+            .collect();
+        assert_eq!(settled.len(), 1, "{child} must settle once: {frames}");
+        assert!(
+            settled[0].contains("\"state\":\"completed\""),
+            "{child} result readiness is completion: {frames}"
+        );
+    }
+    c.finish();
+}
+
+#[test]
 fn native_subagent_controls_forward_owner_scope_and_client_command_ids() {
     let mut c = Client::spawn("subagent_control", &[("FAKE_CAPS", "subagents")]);
     let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
