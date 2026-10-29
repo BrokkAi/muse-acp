@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.18.1
 
 - Settle native subagents when their result is ready (#430). A child started
   through the control tools reaches `resultReady` while its item stays in
@@ -10,6 +10,20 @@
   `completed` for the child session, or `failed` when the result carries an
   `errorKind`, matching how the host later closes it. Each state is sent once
   per child even when later snapshots or the item's completion repeat it.
+
+- Never let auto-review create a durable permission grant. Auto-review now
+  accepts only an approving choice scoped to one action; if a host offers only
+  session or local-persistent grants, the action is denied instead of silently
+  creating a standing rule.
+
+- Reject dangling symbolic links in editor filesystem and terminal paths. A
+  link whose target is missing is no longer mistaken for a new path, keeping
+  editor operations confined to the session roots.
+
+- Preserve permissions when atomically replacing Zed settings on Unix. A new
+  settings file is owner-only (`0600`), while an existing file keeps its mode,
+  so agent environment values do not become more broadly readable during an
+  update.
 
 ## 0.18.0
 
