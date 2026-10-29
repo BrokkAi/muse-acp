@@ -95,7 +95,7 @@ pub const HOST_146_FINGERPRINT: &str =
 /// byte-for-byte by a live `muse serve` 1.4.7. The SDK's retired `a0c8611`
 /// pin published the same surface, so the pinned 1.4.7 build in the
 /// live-host matrix (`tests/live_loopback.rs`) validates it; the vendored
-/// corpus has since moved to the 1.4.13 surface.
+/// corpus has since moved to the 1.4.14 surface.
 pub const HOST_147_FINGERPRINT: &str =
     "sha256:6de32db08bbbe0deb478d2bfcaba001e9fb490986bc80db3aceb4d996abf7df9";
 
@@ -105,7 +105,7 @@ pub const HOST_147_FINGERPRINT: &str =
 /// generate-json-schema` export is byte-identical to the then-vendored
 /// `838d36a` bundle, so the pinned 1.4.8 build in the live-host matrix
 /// (`tests/live_loopback.rs`) validated that corpus; the corpus has since
-/// moved to the 1.4.13 surface. Over
+/// moved to the 1.4.14 surface. Over
 /// 1.4.7 the surface is purely additive (`turn/modelRetryScheduled`, the
 /// computer-use app and app-patch vocabulary, `Item.messagePhase` and the
 /// `monitorFeed` fields, `Session.generatedName`, `permissionProfile` on
@@ -138,7 +138,7 @@ pub const HOST_149_FINGERPRINT: &str =
 /// modes, and the skill-invocation source), with nothing removed or newly
 /// required. The pinned 1.4.11-R6667.1 build in the nightly live-host matrix
 /// reports this digest, so it classifies as tested; the vendored corpus has
-/// since moved to the 1.4.13 surface.
+/// since moved to the 1.4.14 surface.
 pub const HOST_1411_FINGERPRINT: &str =
     "sha256:f282ad16e21520d0cda68cb190149b86e2b062eef1dd282749360c05aa3d1082";
 
@@ -153,7 +153,7 @@ pub const HOST_1411_FINGERPRINT: &str =
 /// `checkpointBoundary`, and the task-list `command` and `executionMode`),
 /// with nothing removed or newly required. The pinned 1.4.12-R6909.1 build in
 /// the nightly live-host matrix reports this digest, so it classifies as
-/// tested; the vendored corpus has since moved to the 1.4.13 surface.
+/// tested; the vendored corpus has since moved to the 1.4.14 surface.
 pub const HOST_1412_FINGERPRINT: &str =
     "sha256:cfdb6d2525601b9bac76584ccb0610ab3a5539b5e4f51141f079b99b39fcb4e0";
 
@@ -169,17 +169,27 @@ pub const HOST_1412_FINGERPRINT: &str =
 /// (`SessionReadResult.queuedInputs`), with nothing removed or newly
 /// required. The pinned 1.4.13-R6996.1 build in the nightly live-host matrix
 /// reports this digest, and its `muse schema generate-json-schema` output is
-/// byte-identical to the vendored bundle, so it classifies as tested.
+/// byte-identical to the bundle vendored at the time. The corpus has since
+/// moved to the 1.4.14 surface.
 pub const HOST_1413_FINGERPRINT: &str =
     "sha256:7fddaf646dbc317e5fcac0785e135eb04df14fbb0db1863089dfd6da21730e5b";
 
+/// Stable-surface fingerprint of the Muse 1.4.14 surface (schema version 1).
+/// The SDK's `a45cb67` pin (2026-10-29, "remirror: 1.4.14") publishes this
+/// surface. Over 1.4.13 it is purely additive, with the method,
+/// notification, request, error, and capability tables unchanged. The stable
+/// 1.4.14-R7309.1 build exports this exact bundle and reports this digest;
+/// both adapter and standalone MSP live suites pass against it.
+pub const HOST_1414_FINGERPRINT: &str =
+    "sha256:c94c3d1f2f51e6424074b9ec43eac3eedcf532d3dcd77351ec1383a87d3049c6";
+
 /// Fingerprint published by the vendored Muse SDK manifest at revision
-/// `3dce908` (schema version 1), which describes the Muse 1.4.13 stable
+/// `a45cb67` (schema version 1), which describes the Muse 1.4.14 stable
 /// surface. The vendored bundle is the SDK's own stable export for that
-/// release, so the constant aliases [`HOST_1413_FINGERPRINT`]: one table
+/// release, so the constant aliases [`HOST_1414_FINGERPRINT`]: one table
 /// entry and one match arm cover both the manifest check in `corpus_tests`
 /// and the `sdk-manifest` row in [`selftest_lines`].
-pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_1413_FINGERPRINT;
+pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_1414_FINGERPRINT;
 
 /// Fingerprint embedded in the SDK conformance-transcript fixtures. It is
 /// deliberately distinct from every host fingerprint and must never be
@@ -273,7 +283,11 @@ fn table_entry(fingerprint: &str) -> Option<(Status, &'static str)> {
         ),
         HOST_1413_FINGERPRINT => (
             Status::Tested,
-            "validated against live host 1.4.13-R6996.1; the vendored SDK 3dce908 surface",
+            "validated against live host 1.4.13-R6996.1; the previously vendored SDK 3dce908 surface",
+        ),
+        HOST_1414_FINGERPRINT => (
+            Status::Tested,
+            "validated against live host 1.4.14-R7309.1; the vendored SDK a45cb67 surface",
         ),
         TRANSCRIPT_FIXTURE_FINGERPRINT => (
             Status::Fixture,
@@ -344,6 +358,7 @@ pub fn selftest_lines(adapter_version: &str) -> Vec<String> {
         (HOST_1411_FINGERPRINT, "host-1.4.11"),
         (HOST_1412_FINGERPRINT, "host-1.4.12"),
         (HOST_1413_FINGERPRINT, "host-1.4.13"),
+        (HOST_1414_FINGERPRINT, "host-1.4.14"),
         (TRANSCRIPT_FIXTURE_FINGERPRINT, "transcript-fixture"),
     ] {
         let c = classify(Some(SUPPORTED_SCHEMA_VERSION), fp);
@@ -369,16 +384,16 @@ mod tests {
     }
 
     #[test]
-    fn sdk_manifest_surface_is_the_1_4_13_surface() {
-        // The vendored SDK manifest (3dce908) publishes the Muse 1.4.13
-        // surface, and the pinned 1.4.13-R6996.1 build in the live-host
+    fn sdk_manifest_surface_is_the_1_4_14_surface() {
+        // The vendored SDK manifest (a45cb67) publishes the Muse 1.4.14
+        // surface, and the stable 1.4.14-R7309.1 build in the live-host
         // matrix reports this digest, so the surface classifies as tested.
         assert_eq!(
             SDK_MANIFEST_FINGERPRINT,
-            "sha256:7fddaf646dbc317e5fcac0785e135eb04df14fbb0db1863089dfd6da21730e5b"
+            "sha256:c94c3d1f2f51e6424074b9ec43eac3eedcf532d3dcd77351ec1383a87d3049c6"
         );
-        assert_eq!(SDK_MANIFEST_FINGERPRINT, HOST_1413_FINGERPRINT);
-        assert_ne!(SDK_MANIFEST_FINGERPRINT, HOST_1412_FINGERPRINT);
+        assert_eq!(SDK_MANIFEST_FINGERPRINT, HOST_1414_FINGERPRINT);
+        assert_ne!(SDK_MANIFEST_FINGERPRINT, HOST_1413_FINGERPRINT);
         let c = classify(Some(1), SDK_MANIFEST_FINGERPRINT);
         assert_eq!(c.status, Status::Tested);
         assert!(!c.is_fatal());
@@ -503,7 +518,18 @@ mod tests {
         assert_eq!(c.status, Status::Tested);
         assert_eq!(
             c.detail,
-            "validated against live host 1.4.13-R6996.1; the vendored SDK 3dce908 surface"
+            "validated against live host 1.4.13-R6996.1; the previously vendored SDK 3dce908 surface"
+        );
+        assert!(!c.is_fatal());
+    }
+
+    #[test]
+    fn host_1414_fingerprint_is_tested() {
+        let c = classify(Some(1), HOST_1414_FINGERPRINT);
+        assert_eq!(c.status, Status::Tested);
+        assert_eq!(
+            c.detail,
+            "validated against live host 1.4.14-R7309.1; the vendored SDK a45cb67 surface"
         );
         assert!(!c.is_fatal());
     }
@@ -551,7 +577,7 @@ mod tests {
         let lines = selftest_lines("0.2.5");
         assert!(lines[0].contains("adapter=0.2.5"));
         assert!(lines[0].contains("host=offline"));
-        assert_eq!(lines.len(), 18);
+        assert_eq!(lines.len(), 19);
         assert!(lines.iter().any(|l| l.contains("kind=sdk-manifest")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.2.1")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.3.0")));
@@ -567,6 +593,7 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.11")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.12")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.13")));
+        assert!(lines.iter().any(|l| l.contains("kind=host-1.4.14")));
         assert!(lines.iter().any(|l| l.contains("kind=transcript-fixture")));
     }
 }

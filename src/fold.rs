@@ -378,7 +378,8 @@ pub struct SessionFold {
     monitor_inbox: HashMap<String, InboxItem>,
     /// Completed items the host anchored to another item's rows that the fold
     /// had not seen yet, keyed by that anchor's item id. Muse 1.4.13 names the
-    /// anchor in `Item.terminalRowAfterItemId`; when the anchor is already
+    /// anchor in `Item.terminalRowAfterItemId` or a monitor's `Item.replayHint`;
+    /// when the anchor is already
     /// known the row is emitted straight away, because it is then already
     /// after those rows. Only an anchor still ahead of us defers the row.
     awaiting_anchor: Vec<(String, J)>,
@@ -396,6 +397,10 @@ pub struct SessionFold {
     /// Agent messages already marked cut off. The host never clears the
     /// flag, so the mark is sent once.
     cut_off: std::collections::HashSet<String>,
+    /// Tool items currently held before execution. A release is represented
+    /// by absence in MSP, so retain the prior state to send an explicit clear
+    /// through ACP `_meta`.
+    held_items: std::collections::HashSet<String>,
 }
 
 /// One child of a running workflow, as the latest workflow item reported it.
@@ -476,6 +481,7 @@ impl SessionFold {
             model_retry: None,
             last_message: None,
             cut_off: std::collections::HashSet::new(),
+            held_items: std::collections::HashSet::new(),
         }
     }
 
@@ -725,7 +731,7 @@ impl SessionFold {
             .insert(task_id.to_string(), task_id.to_string());
         self.announced_tasks.insert(task_id.to_string());
         out.push(Self::async_task_spawned_line(
-            acp_sid, task_id, &name, task_type, true, None,
+            acp_sid, task_id, &name, task_type, None, true, None,
         ));
         true
     }
@@ -852,7 +858,7 @@ impl SessionFold {
     /// phase, plus the cut-off mark when the host committed a partial reply.
     /// Ready to append to an update object. `None` on both sides means the
     /// update carries no mark at all.
-    fn message_meta(phase: Option<&str>, cut_off: Option<&str>) -> Option<String> {
+    fn message_meta(phase: Option<&str>, cut_off: Option<&str>, item: &J) -> Option<String> {
         let mut fields = String::new();
         if let Some(phase) = phase {
             fields.push_str(&format!("\"messagePhase\":{}", esc(phase)));
@@ -862,6 +868,18 @@ impl SessionFold {
                 fields.push(',');
             }
             fields.push_str(&format!("\"cutOff\":true,\"itemId\":{}", esc(item_id)));
+        }
+        if item.get("kind").and_then(J::as_str) == Some("agentMessage")
+            && let Some(sources @ J::Arr(values)) = item.get("wakeSourceDescriptions")
+            && values.iter().any(|value| value.as_str().is_some())
+        {
+            if !fields.is_empty() {
+                fields.push(',');
+            }
+            fields.push_str(&format!(
+                "\"wakeSourceDescriptions\":{}",
+                j_to_string(sources)
+            ));
         }
         (!fields.is_empty()).then(|| format!(",\"_meta\":{{\"muse\":{{{fields}}}}}"))
     }
@@ -909,7 +927,7 @@ impl SessionFold {
         // already emitted it, and on an in-flight item the model has not
         // committed one yet — inferring `finalAnswer` here would contradict
         // the completion's later declaration.
-        let meta = Self::message_meta(None, Some(item_id))
+        let meta = Self::message_meta(None, Some(item_id), item)
             .expect("a cut-off mark always carries its cut-off");
         out.push(Self::marked_chunk(acp_sid, ver, &msg_id, "", &meta));
     }
@@ -1001,6 +1019,8 @@ impl SessionFold {
             ("outputRef", item.get("outputRef")),
             ("patchRef", item.get("patchRef")),
             ("patchSummary", item.get("patchSummary")),
+            ("workId", item.get("workId")),
+            ("replayHint", item.get("replayHint")),
         ];
         let parts: Vec<String> = fields
             .into_iter()
@@ -1025,6 +1045,31 @@ impl SessionFold {
             fields.push_str(base);
         }
         (!fields.is_empty()).then_some(fields)
+    }
+
+    /// Tool-call hold state. `held` is only true while the host holds the
+    /// call; a release is represented by absence, so remember a prior hold
+    /// and send explicit false/null to clients that merge `_meta` updates.
+    fn tool_muse_fields(&mut self, item_id: &str, item: &J) -> Option<String> {
+        let held = matches!(item.get("held"), Some(J::Bool(true)));
+        let held_fields = if held {
+            self.held_items.insert(item_id.to_string());
+            let held_for = item
+                .get("heldFor")
+                .and_then(J::as_str)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!(",\"heldFor\":{}", esc(value)))
+                .unwrap_or_default();
+            Some(format!("\"held\":true{held_for}"))
+        } else if self.held_items.remove(item_id) {
+            Some("\"held\":false,\"heldFor\":null".to_string())
+        } else {
+            None
+        };
+        Self::merge_muse_fields(
+            held_fields.as_deref(),
+            Self::item_muse_fields(item).as_deref(),
+        )
     }
 
     fn compaction_status(item: &J) -> &'static str {
@@ -1479,6 +1524,43 @@ impl SessionFold {
                     )),
                 )
             }
+            "earlierHistory" => {
+                // Muse 1.4.14 serves a checkpoint-pruned transcript tail in
+                // place of the missing prefix. ACP has no pruned-prefix item,
+                // so keep it as one clearly synthetic card rather than
+                // pretending the stored messages are new conversation turns.
+                let Some(history @ J::Obj(_)) = item.get("earlierHistory") else {
+                    let text = str_field("fallbackText");
+                    return (
+                        text.to_string(),
+                        None,
+                        (!text.is_empty()).then(|| format!("\"itemKind\":{}", esc(kind))),
+                    );
+                };
+                let mut lines = Vec::new();
+                if let Some(J::Arr(messages)) = history.get("messages") {
+                    for message in messages {
+                        let role = message.get("role").and_then(J::as_str).unwrap_or("");
+                        let text = message.get("text").and_then(J::as_str).unwrap_or("");
+                        let label = match role {
+                            "user" => "User",
+                            "assistant" => "Assistant",
+                            _ => continue,
+                        };
+                        if !text.is_empty() {
+                            lines.push(format!("{label}: {text}"));
+                        }
+                    }
+                }
+                (
+                    "Earlier conversation".to_string(),
+                    (!lines.is_empty()).then(|| lines.join("\n\n")),
+                    Some(format!(
+                        "\"itemKind\":\"earlierHistory\",\"earlierHistory\":{}",
+                        j_to_string(history)
+                    )),
+                )
+            }
             "damagedRange" => {
                 // Muse 1.4.11: what one damaged range of the session log
                 // cost, derived from the readable records around it. The
@@ -1641,6 +1723,7 @@ impl SessionFold {
         task_id: &str,
         name: &str,
         task_type: &str,
+        work_id: Option<&str>,
         can_stop: bool,
         tool_call_id: Option<&str>,
     ) -> String {
@@ -1653,6 +1736,12 @@ impl SessionFold {
         );
         if let Some(tc) = tool_call_id {
             update.push_str(&format!(",\"toolCallId\":{}", esc(tc)));
+        }
+        if let Some(work_id) = work_id {
+            update.push_str(&format!(
+                ",\"_meta\":{{\"muse\":{{\"workId\":{}}}}}",
+                esc(work_id)
+            ));
         }
         update.push('}');
         Self::update_line(acp_sid, &update)
@@ -1762,12 +1851,14 @@ impl SessionFold {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn announce_async_task(
         &mut self,
         acp_sid: &str,
         item_id: &str,
         task_id: &str,
         name: &str,
+        work_id: Option<&str>,
         tool_call_id: Option<&str>,
         out: &mut Vec<String>,
     ) {
@@ -1780,6 +1871,7 @@ impl SessionFold {
                 task_id,
                 name,
                 "shell",
+                work_id,
                 true,
                 tool_call_id,
             ));
@@ -2467,26 +2559,47 @@ impl SessionFold {
 
     fn tool_title(item: &J) -> (String, String) {
         let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("tool");
-        if let Some(label) = Self::tool_display_label(item) {
-            return (label.to_string(), tool.to_string());
+        let mut title = if let Some(label) = Self::tool_display_label(item) {
+            label.to_string()
+        } else {
+            let top = item
+                .get("commandText")
+                .or_else(|| item.get("displayText"))
+                .or_else(|| item.get("summary"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let detail = if !top.is_empty() {
+                top.to_string()
+            } else {
+                Self::args_detail(item).unwrap_or_default()
+            };
+            if detail.is_empty() {
+                tool.to_string()
+            } else {
+                format!("{tool}: {detail}")
+            }
+        };
+        if matches!(item.get("held"), Some(J::Bool(true))) {
+            title.push_str(match item.get("heldFor").and_then(J::as_str) {
+                Some("approval") => " (waiting for approval)",
+                Some("hook") => " (waiting for hook)",
+                _ => " (waiting before execution)",
+            });
         }
-        let top = item
-            .get("commandText")
-            .or_else(|| item.get("displayText"))
-            .or_else(|| item.get("summary"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let detail = if !top.is_empty() {
-            top.to_string()
-        } else {
-            Self::args_detail(item).unwrap_or_default()
-        };
-        let title = if detail.is_empty() {
-            tool.to_string()
-        } else {
-            format!("{tool}: {detail}")
-        };
         (title, tool.to_string())
+    }
+
+    fn tool_status(item: &J, status: &str) -> &'static str {
+        if matches!(item.get("held"), Some(J::Bool(true)))
+            && !matches!(
+                status,
+                "completed" | "failed" | "cancelled" | "rejected" | "timedOut"
+            )
+        {
+            "pending"
+        } else {
+            msp_status(status)
+        }
     }
 
     /// A replayed message's text. A user message shows the prompt as the
@@ -2505,6 +2618,7 @@ impl SessionFold {
     /// mark, and `phase` carries its declared message phase; both ride the
     /// message itself. A settled agent-message replay carries its phase; an
     /// in-flight prefix records none yet, and user messages carry neither.
+    #[allow(clippy::too_many_arguments)]
     fn replay_message_line(
         acp_sid: &str,
         ver: u8,
@@ -2513,6 +2627,7 @@ impl SessionFold {
         text: &str,
         cut_off: Option<&str>,
         phase: Option<&str>,
+        item: &J,
     ) -> String {
         let content = format!("[{{\"type\":\"text\",\"text\":{}}}]", esc(text));
         let mut update = match (kind, ver) {
@@ -2538,7 +2653,7 @@ impl SessionFold {
             ),
             _ => unreachable!("replay_message_line called for {kind}"),
         };
-        if let Some(meta) = Self::message_meta(phase, cut_off) {
+        if let Some(meta) = Self::message_meta(phase, cut_off, item) {
             update.insert_str(update.len() - 1, &meta);
         }
         Self::update_line(acp_sid, &update)
@@ -2659,6 +2774,7 @@ impl SessionFold {
                             text,
                             mark.then_some(item_id.as_str()),
                             None,
+                            item,
                         ));
                     }
                 }
@@ -2692,6 +2808,7 @@ impl SessionFold {
                         text,
                         mark.then_some(item_id.as_str()),
                         phase,
+                        item,
                     ));
                     if kind == "agentMessage" {
                         self.last_message = Some((item_id, msg_id));
@@ -2713,8 +2830,8 @@ impl SessionFold {
     /// Upsert and emit the single stable card for one monitor task. The feed
     /// item id remains in metadata, while `monitorId` selects the ACP row.
     /// The item id an item's rows belong after, when the host says its log
-    /// span is not where the row renders (`Item.terminalRowAfterItemId`,
-    /// Muse 1.4.13). A monitor's span starts when it is armed, but its output
+    /// span is not where the row renders (`Item.terminalRowAfterItemId` or a
+    /// monitor `Item.replayHint`, Muse 1.4.13). A monitor's span starts when it is armed, but its output
     /// is observed later — the host names that anchor because reminder checks
     /// and other items can interleave in between. `None` when the host sends
     /// no anchor, which is every item of every earlier release.
@@ -2722,6 +2839,12 @@ impl SessionFold {
         item.get("terminalRowAfterItemId")
             .and_then(J::as_str)
             .filter(|anchor| !anchor.is_empty())
+            .or_else(|| {
+                item.get("replayHint")
+                    .and_then(|hint| hint.get("afterItemId"))
+                    .and_then(J::as_str)
+                    .filter(|anchor| !anchor.is_empty())
+            })
     }
 
     fn monitor_feed_card(
@@ -2799,7 +2922,7 @@ impl SessionFold {
 
     /// Whether the host says this item's rows belong after another item's,
     /// and that anchor is still ahead of us (Muse 1.4.13
-    /// `Item.terminalRowAfterItemId`).
+    /// `Item.terminalRowAfterItemId` or `Item.replayHint`).
     ///
     /// A monitor's log span opens when it is armed, but its output is only
     /// observed when it finishes; reminder checks and other items can land in
@@ -2952,7 +3075,7 @@ impl SessionFold {
                     .get("args")
                     .map(j_to_string)
                     .unwrap_or_else(|| "{}".to_string());
-                let item_fields = Self::item_muse_fields(item);
+                let item_fields = self.tool_muse_fields(&item_id, item);
                 let locations = self.tool_locations(item);
                 out.push(Self::tool_line(
                     acp_sid,
@@ -2966,7 +3089,7 @@ impl SessionFold {
                             .filter(|name| !name.is_empty()),
                         title: &title,
                         kind: tool_kind(&tool),
-                        status: msp_status(status),
+                        status: Self::tool_status(item, status),
                         content_text: None,
                         raw_input: Some(&raw),
                         locations: locations.as_deref(),
@@ -2991,6 +3114,7 @@ impl SessionFold {
                         &item_id,
                         &task_id,
                         &title,
+                        item.get("workId").and_then(J::as_str),
                         Some(&tc_id),
                         out,
                     );
@@ -3128,6 +3252,7 @@ impl SessionFold {
                         &item_id,
                         &task_id,
                         &title,
+                        None,
                         Some(&tc_id),
                         out,
                     );
@@ -3149,6 +3274,7 @@ impl SessionFold {
                             run_id,
                             &title,
                             "workflow",
+                            None,
                             true,
                             Some(&tc_id),
                         ));
@@ -3474,7 +3600,7 @@ impl SessionFold {
                     Some(text)
                 };
                 let raw = item.get("args").map(j_to_string);
-                let item_fields = Self::item_muse_fields(item);
+                let item_fields = self.tool_muse_fields(&item_id, item);
                 let locations = self.tool_locations(item);
                 let diff = self.patch_diffs.remove(&item_id).or(terminal);
                 out.push(Self::tool_line(
@@ -3489,7 +3615,7 @@ impl SessionFold {
                             .filter(|name| !name.is_empty()),
                         title: &title,
                         kind: tool_kind(&tool),
-                        status: msp_status(status),
+                        status: Self::tool_status(item, status),
                         content_text: content,
                         raw_input: raw.as_deref(),
                         locations: locations.as_deref(),
@@ -3518,6 +3644,7 @@ impl SessionFold {
                         &item_id,
                         &task_id,
                         &title,
+                        item.get("workId").and_then(J::as_str),
                         Some(&tc_id),
                         out,
                     );
@@ -3547,7 +3674,7 @@ impl SessionFold {
                     let cut = self
                         .claim_cut_off(item, &item_id)
                         .then_some(item_id.as_str());
-                    let meta = Self::message_meta(Some(phase), cut)
+                    let meta = Self::message_meta(Some(phase), cut, item)
                         .expect("a completion always declares its phase");
                     out.push(Self::marked_chunk(acp_sid, ver, &msg_id, text, &meta));
                     self.last_message = Some((item_id.clone(), msg_id));
@@ -3682,6 +3809,7 @@ impl SessionFold {
                         &item_id,
                         &task_id,
                         &title,
+                        None,
                         Some(&tc_id),
                         out,
                     );
@@ -3705,6 +3833,7 @@ impl SessionFold {
                             run_id,
                             &title,
                             "workflow",
+                            None,
                             true,
                             Some(&tc_id),
                         ));
@@ -6627,6 +6756,183 @@ mod anchor_tests {
             order(&out),
             vec!["reminder-rem".to_string(), "c1".to_string()],
             "the anchor's rows come before the row they anchor: {out:?}"
+        );
+    }
+
+    #[test]
+    fn managed_bash_work_id_reaches_the_card_and_async_task() {
+        let mut fold = SessionFold::new();
+        fold.air_async_tasks = true;
+        let item = parse_json(
+            r#"{"itemId":"work-item","kind":"toolCall","tool":"workspace-shell","callId":"call-work","status":"inProgress","background":true,"workId":"work.v2.managed_bash.sha256.abc","args":{"command":"make test"}}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 1, &item, &mut out);
+        let joined = out.join("\n");
+        assert_eq!(
+            joined
+                .matches("\"workId\":\"work.v2.managed_bash.sha256.abc\"")
+                .count(),
+            2,
+            "tool card and async task publication both carry the work id: {joined}"
+        );
+        assert!(
+            joined.contains("\"asyncTaskId\":\"call-work\""),
+            "the work id does not re-key the existing async task: {joined}"
+        );
+
+        let mut without = SessionFold::new();
+        without.air_async_tasks = true;
+        let item = parse_json(
+            r#"{"itemId":"plain-item","kind":"toolCall","tool":"workspace-shell","callId":"call-plain","status":"inProgress","background":true,"args":{"command":"make test"}}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        without.on_item_snapshot("sid", 1, &item, &mut out);
+        assert!(!out.join("\n").contains("\"workId\""), "{out:?}");
+    }
+
+    #[test]
+    fn monitor_replay_hint_anchors_the_row_and_preserves_open_row_kinds() {
+        let mut fold = SessionFold::new();
+        let monitor = parse_json(
+            r#"{"itemId":"mon","kind":"toolCall","tool":"monitor","callId":"call-mon","status":"completed","visibleOutput":"tick","turnId":"t1","replayHint":{"afterItemId":"anchor","rowKinds":["reminderCheck","futureRow"]},"args":{"description":"Watch the build"}}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_completed(
+            "sid",
+            1,
+            &parse_json(&format!(r#"{{"item":{}}}"#, j_to_string(&monitor))).unwrap(),
+            &mut out,
+        );
+        assert!(out.is_empty(), "the monitor waits for its replay anchor");
+
+        let anchor = parse_json(
+            r#"{"itemId":"anchor","kind":"toolCall","tool":"bash","callId":"call-anchor","status":"completed","visibleOutput":"done","args":{"command":"true"}}"#,
+        )
+        .unwrap();
+        fold.on_item_completed(
+            "sid",
+            1,
+            &parse_json(&format!(r#"{{"item":{}}}"#, j_to_string(&anchor))).unwrap(),
+            &mut out,
+        );
+        assert_eq!(
+            order(&out),
+            vec!["call-anchor".to_string(), "call-mon".to_string()],
+            "the monitor follows its anchor: {out:?}"
+        );
+        let monitor_line = out.last().unwrap();
+        assert!(monitor_line.contains("\"afterItemId\":\"anchor\""));
+        assert!(monitor_line.contains("\"rowKinds\":[\"reminderCheck\",\"futureRow\"]"));
+    }
+
+    #[test]
+    fn held_tool_calls_are_pending_until_release_clears_metadata() {
+        let mut fold = SessionFold::new();
+        let held = parse_json(
+            r#"{"itemId":"held","kind":"toolCall","tool":"bash","callId":"call-held","status":"inProgress","held":true,"heldFor":"approval","args":{"command":"rm -rf build"}}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 1, &held, &mut out);
+        let update = parse_json(&out[0]).unwrap();
+        let update = update.get("params").and_then(|p| p.get("update")).unwrap();
+        assert_eq!(update.get("status").and_then(J::as_str), Some("pending"));
+        assert!(
+            update
+                .get("title")
+                .and_then(J::as_str)
+                .unwrap()
+                .contains("waiting for approval")
+        );
+        assert_eq!(
+            update
+                .get("_meta")
+                .and_then(|m| m.get("muse"))
+                .and_then(|m| m.get("heldFor"))
+                .and_then(J::as_str),
+            Some("approval")
+        );
+
+        let released = parse_json(
+            r#"{"itemId":"held","kind":"toolCall","tool":"bash","callId":"call-held","status":"inProgress","revision":2,"args":{"command":"rm -rf build"}}"#,
+        )
+        .unwrap();
+        out.clear();
+        fold.on_item_snapshot("sid", 1, &released, &mut out);
+        let update = parse_json(&out[0]).unwrap();
+        let update = update.get("params").and_then(|p| p.get("update")).unwrap();
+        assert_eq!(
+            update.get("status").and_then(J::as_str),
+            Some("in_progress")
+        );
+        assert!(
+            !update
+                .get("title")
+                .and_then(J::as_str)
+                .unwrap()
+                .contains("waiting")
+        );
+        let muse = update.get("_meta").and_then(|m| m.get("muse")).unwrap();
+        assert!(matches!(muse.get("held"), Some(J::Bool(false))));
+        assert!(matches!(muse.get("heldFor"), Some(J::Null)));
+    }
+
+    #[test]
+    fn earlier_history_is_one_role_labelled_card() {
+        let mut fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"earlier","kind":"earlierHistory","status":"completed","turnId":null,"earlierHistory":{"messages":[{"role":"user","text":"first question"},{"role":"assistant","text":"first answer"},{"role":"futureRole","text":"skip me"}]}}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_completed(
+            "sid",
+            1,
+            &parse_json(&format!(r#"{{"item":{}}}"#, j_to_string(&item))).unwrap(),
+            &mut out,
+        );
+        let update = parse_json(&out[0]).unwrap();
+        let update = update.get("params").and_then(|p| p.get("update")).unwrap();
+        assert_eq!(
+            update.get("title").and_then(J::as_str),
+            Some("Earlier conversation")
+        );
+        let Some(J::Arr(content)) = update.get("content") else {
+            panic!("earlier-history content is an array: {update:?}");
+        };
+        let content = content[0]
+            .get("content")
+            .and_then(|c| c.get("text"))
+            .and_then(J::as_str)
+            .unwrap();
+        assert!(content.contains("User: first question"));
+        assert!(content.contains("Assistant: first answer"));
+        assert!(!content.contains("skip me"));
+        assert!(out[0].contains("\"earlierHistory\":{\"messages\""));
+    }
+
+    #[test]
+    fn wake_source_descriptions_ride_the_agent_message_metadata() {
+        let mut fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"wake","kind":"agentMessage","status":"completed","text":"Build completed.","wakeSourceDescriptions":["Build watcher","Test watcher"]}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_completed(
+            "sid",
+            1,
+            &parse_json(&format!(r#"{{"item":{}}}"#, j_to_string(&item))).unwrap(),
+            &mut out,
+        );
+        assert!(out[0].contains("\"text\":\"Build completed.\""), "{out:?}");
+        assert!(
+            out[0].contains("\"wakeSourceDescriptions\":[\"Build watcher\",\"Test watcher\"]"),
+            "{out:?}"
         );
     }
 }

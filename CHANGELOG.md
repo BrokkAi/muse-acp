@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Re-pin the Muse Code SDK corpus to `a45cb67` and the stable Muse
+  1.4.14-R7309.1 surface. ManagedBash work IDs now ride tool cards and AIR
+  tasks (#396); monitor replay hints use their host anchor while retaining the
+  open row-kind vocabulary (#397); held calls, earlier-history cards, wake
+  sources, and reviewer reasons have ACP representations; session provenance
+  and resume model overrides are forwarded; provider-refusal detail reaches
+  the editor. Every 1.4.14 definition and field has an explicit disposition,
+  and Linux, macOS, and Windows 1.4.14 artifacts join the nightly matrix.
+
 - Harden auto-review against prompt injection. Only typed prompt text is
   trusted for user authorization, attached resources and their URIs are
   omitted, and untrusted transcript entries are rendered as escaped

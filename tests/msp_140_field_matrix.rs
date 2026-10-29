@@ -5,8 +5,9 @@
 //! `Item.cutOff`, #272's 1.4.9 `Item.displayLabel`, the 1.4.11 re-pin's
 //! item kinds, goal timestamps, recovery members, and skill source, the
 //! 1.4.12 re-pin's item kinds, approval card facts, recall seed, checkpoint
-//! boundary, and task-list members, and the 1.4.13 re-pin's approval data
-//! facts, replay hints, work id, and queued inputs, join the same matrix),
+//! boundary, and task-list members, the 1.4.13 re-pin's approval data facts,
+//! replay hints, work id, and queued inputs, and the 1.4.14 re-pin's item,
+//! approval, session, resume, and error additions join the same matrix),
 //! whether it earns an ACP mapping or an explicit "Intentionally ignored"
 //! disposition. This test keeps that matrix
 //! honest in two ways: every addition has exactly one disposition row in
@@ -85,6 +86,23 @@ const ADDITIONS: &[&str] = &[
     "Item.terminalRowAfterItemId",
     "Item.workId",
     "SessionReadResult.queuedInputs",
+    "ApprovalRequestParams.reviewerReason",
+    "ItemKind.earlierHistory",
+    "Item.earlierHistory",
+    "Item.held",
+    "Item.heldFor",
+    "Item.wakeSourceDescriptions",
+    "Session.driveHolder",
+    "Session.itemCount",
+    "Session.logBytes",
+    "Session.resumedByClient",
+    "Session.spawnedBy",
+    "SessionReadResult.worktree",
+    "SessionResumeParams.modelId",
+    "SessionStartParams.previousSessionId",
+    "SessionStartParams.spawnedBy",
+    "TurnError.requestDenied",
+    "ViewPageParams.maxBytes",
 ];
 
 fn matrix() -> String {
@@ -251,6 +269,10 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         "ItemKind.overdueNotice left the stable surface"
     );
     assert!(
+        enum_has("ItemKind", "earlierHistory"),
+        "ItemKind.earlierHistory left the stable surface"
+    );
+    assert!(
         enum_has("TaskExecutionMode", "foreground"),
         "TaskExecutionMode.foreground left the stable surface"
     );
@@ -314,6 +336,22 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("Item", "terminalRowAfterItemId"),
         ("Item", "workId"),
         ("SessionReadResult", "queuedInputs"),
+        ("ApprovalRequestParams", "reviewerReason"),
+        ("Item", "earlierHistory"),
+        ("Item", "held"),
+        ("Item", "heldFor"),
+        ("Item", "wakeSourceDescriptions"),
+        ("Session", "driveHolder"),
+        ("Session", "itemCount"),
+        ("Session", "logBytes"),
+        ("Session", "resumedByClient"),
+        ("Session", "spawnedBy"),
+        ("SessionReadResult", "worktree"),
+        ("SessionResumeParams", "modelId"),
+        ("SessionStartParams", "previousSessionId"),
+        ("SessionStartParams", "spawnedBy"),
+        ("TurnError", "requestDenied"),
+        ("ViewPageParams", "maxBytes"),
     ] {
         assert!(
             has_property(defs, def, member),
@@ -354,6 +392,70 @@ fn one_4_13_definitions_stay_in_the_vendored_bundle() {
         assert!(
             requires("QueuedInput", member),
             "QueuedInput.{member} left the stable surface"
+        );
+    }
+}
+
+#[test]
+fn one_4_14_definitions_stay_in_the_vendored_bundle() {
+    let schema = schema();
+    let defs = schema.get("$defs").expect("$defs");
+    for def in [
+        "EarlierHistory",
+        "EarlierHistoryMessage",
+        "HeldFor",
+        "RuntimeWorktree",
+        "RuntimeWorktreeCleanupPolicy",
+        "RuntimeWorktreeCleanupState",
+        "RuntimeWorktreeOwnership",
+        "SessionSpawnedBy",
+    ] {
+        assert!(defs.get(def).is_some(), "{def} left the stable surface");
+    }
+    let requires = |def: &str, member: &str| {
+        defs.get(def)
+            .and_then(|d| d.get("required"))
+            .and_then(|r| r.as_array())
+            .is_some_and(|members| members.iter().any(|m| m == member))
+    };
+    assert!(
+        requires("EarlierHistory", "messages"),
+        "EarlierHistory.messages left the stable surface"
+    );
+    for member in ["role", "text"] {
+        assert!(
+            requires("EarlierHistoryMessage", member),
+            "EarlierHistoryMessage.{member} left the stable surface"
+        );
+    }
+    assert!(
+        requires("SessionSpawnedBy", "parentSessionId"),
+        "SessionSpawnedBy.parentSessionId left the stable surface"
+    );
+    for member in [
+        "baseCommit",
+        "cleanupPolicy",
+        "cleanupState",
+        "headCommit",
+        "ownership",
+        "parentDirtyExcluded",
+        "worktreeRoot",
+    ] {
+        assert!(
+            requires("RuntimeWorktree", member),
+            "RuntimeWorktree.{member} left the stable surface"
+        );
+    }
+    let enum_has = |def: &str, value: &str| {
+        defs.get(def)
+            .and_then(|d| d.get("enum"))
+            .and_then(|e| e.as_array())
+            .is_some_and(|values| values.iter().any(|v| v == value))
+    };
+    for value in ["approval", "hook"] {
+        assert!(
+            enum_has("HeldFor", value),
+            "HeldFor.{value} left the stable surface"
         );
     }
 }

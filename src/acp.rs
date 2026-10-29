@@ -236,13 +236,17 @@ impl SessionMeta {
     }
 
     fn json(&self) -> Option<String> {
-        (!self.0.is_empty()).then(|| {
-            self.0
-                .iter()
-                .map(|(key, value)| format!("{}:{value}", esc(key)))
-                .collect::<Vec<_>>()
-                .join(",")
-        })
+        self.json_for_keys(None)
+    }
+
+    fn json_for_keys(&self, keys: Option<&[&str]>) -> Option<String> {
+        let values: Vec<String> = self
+            .0
+            .iter()
+            .filter(|(key, _)| keys.is_none_or(|keys| keys.iter().any(|allowed| allowed == key)))
+            .map(|(key, value)| format!("{}:{value}", esc(key)))
+            .collect();
+        (!values.is_empty()).then(|| values.join(","))
     }
 }
 
@@ -406,8 +410,17 @@ impl AcpSession {
         self.session_meta.absorb(patch);
     }
 
-    fn session_meta_json(&self) -> Option<String> {
+    pub(crate) fn session_meta_json(&self) -> Option<String> {
         self.session_meta.json()
+    }
+
+    pub(crate) fn session_list_meta_json(&self) -> Option<String> {
+        self.session_meta.json_for_keys(Some(&[
+            "branch",
+            "attention",
+            "resumedByClient",
+            "spawnedBy",
+        ]))
     }
 }
 
