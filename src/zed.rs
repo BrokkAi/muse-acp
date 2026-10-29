@@ -779,9 +779,24 @@ fn backup_path(path: &std::path::Path) -> std::path::PathBuf {
     path.with_file_name(name)
 }
 
+fn write_atomic_temp(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    use std::io::Write as _;
+    file.write_all(contents.as_bytes())
+}
+
 /// Write via a same-directory temp file plus rename, so readers (and a crash
-/// mid-write) can never observe a truncated settings file. The temp file is
-/// best-effort cleaned on failure.
+/// mid-write) can never observe a truncated settings file. On Unix, a new
+/// settings file is owner-only (0600), while replacing an existing file
+/// preserves its permissions so agent environment values do not become more
+/// broadly readable. The temp file is best-effort cleaned on failure.
 fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     let mut tmp = dir.join(format!(
@@ -791,7 +806,7 @@ fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
     ));
     let mut n = 0u32;
     loop {
-        match std::fs::write(&tmp, contents) {
+        match write_atomic_temp(&tmp, contents) {
             Ok(()) => break,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && n < 8 => {
                 n += 1;
@@ -801,7 +816,24 @@ fn write_atomic(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
                     std::process::id()
                 ));
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        }
+    }
+    #[cfg(unix)]
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            if let Err(e) = std::fs::set_permissions(&tmp, metadata.permissions()) {
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e);
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
         }
     }
     match std::fs::rename(&tmp, path) {
@@ -1131,6 +1163,44 @@ mod tests {
             leftovers.is_empty(),
             "atomic write leaked temp files: {leftovers:?}"
         );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_private_settings_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_settings_path("private");
+        std::fs::write(&path, "{\"theme\":\"x\"}").expect("seed settings");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .expect("make settings private");
+
+        write_atomic(&path, "{\"theme\":\"y\"}").expect("atomic write");
+
+        let mode = std::fs::metadata(&path)
+            .expect("settings metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "atomic write changed settings permissions");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_new_settings_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_settings_path("new-private");
+        write_atomic(&path, "{\"theme\":\"x\"}").expect("atomic write");
+
+        let mode = std::fs::metadata(&path)
+            .expect("settings metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "new settings are not owner-only");
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
