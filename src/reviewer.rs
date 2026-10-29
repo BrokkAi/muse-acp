@@ -382,16 +382,12 @@ pub fn effective_outcome(assessment: &Assessment) -> Outcome {
     }
 }
 
-/// The choice to send for an allow: prefer a once-scoped approving choice,
-/// then any approving choice the host offers. A deny always uses the host's
-/// own reject-style choice.
+/// The choice to send for an allow: only a once-scoped approving choice is
+/// acceptable. Session and local-persistent grants would create a standing
+/// rule without the user seeing a prompt. A deny always uses the host's own
+/// reject-style choice.
 pub fn allow_choice(choices: &[crate::acp::PermChoice]) -> Option<String> {
-    crate::acp::approve_once_choice(choices).or_else(|| {
-        choices
-            .iter()
-            .find(|choice| choice.decision.to_lowercase().starts_with("approv"))
-            .map(|choice| choice.id.clone())
-    })
+    crate::acp::approve_once_choice(choices)
 }
 
 pub fn deny_choice(choices: &[crate::acp::PermChoice]) -> Option<String> {
@@ -543,6 +539,29 @@ mod tests {
             rationale: String::new(),
         };
         assert_eq!(effective_outcome(&high_authorized), Outcome::Allow);
+    }
+
+    #[test]
+    fn auto_review_never_selects_a_durable_approval_grant() {
+        let choice = |id: &str, decision: &str, scope: &str| crate::acp::PermChoice {
+            id: id.to_string(),
+            decision: decision.to_string(),
+            scope: scope.to_string(),
+            accepts_feedback: false,
+        };
+
+        let durable_only = [
+            choice("session", "approvedForSession", "session"),
+            choice("persistent", "approvedForSession", "localPersistent"),
+        ];
+        assert_eq!(allow_choice(&durable_only), None);
+
+        let with_once = [
+            choice("session", "approvedForSession", "session"),
+            choice("once", "approved", "once"),
+            choice("persistent", "approvedForSession", "localPersistent"),
+        ];
+        assert_eq!(allow_choice(&with_once), Some("once".to_string()));
     }
 
     #[test]
