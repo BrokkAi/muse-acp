@@ -1278,9 +1278,11 @@ fn diff_content(path: &str, old: Option<&str>, new: &str) -> Option<String> {
 /// The absolute path for a tool's `path` argument, confined to the session's
 /// roots. A relative path resolves against `cwd`, and `.` and `..` resolve
 /// lexically. Containment is checked on the deepest part of the path that
-/// exists, with symlinks resolved, so a link cannot lead out of the roots;
-/// the rest does not exist yet and cannot be a link. Returns the lexical
-/// path, which is the one the editor knows.
+/// exists, with symlinks resolved, so a link cannot lead out of the roots.
+/// A canonicalization failure is treated as a missing suffix only when
+/// metadata confirms the component does not exist; dangling symlinks are
+/// refused rather than treated as new paths. Returns the lexical path, which
+/// is the one the editor knows.
 fn resolve_path(raw: &str, cwd: &str, roots: &[String]) -> Result<String, String> {
     if raw.trim().is_empty() {
         return Err("path must not be empty".to_string());
@@ -1316,13 +1318,24 @@ fn resolve_path(raw: &str, cwd: &str, roots: &[String]) -> Result<String, String
     let canonical = loop {
         match std::fs::canonicalize(existing) {
             Ok(canonical) => break canonical,
-            Err(_) => {
-                let (Some(name), Some(parent)) = (existing.file_name(), existing.parent()) else {
-                    return Err(format!("cannot resolve {}", lexical.display()));
-                };
-                missing.push(name);
-                existing = parent;
-            }
+            Err(_) => match std::fs::symlink_metadata(existing) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {
+                    return Err(format!(
+                        "{} is a symbolic link that cannot be resolved safely",
+                        existing.display()
+                    ));
+                }
+                Ok(_) => return Err(format!("cannot resolve {}", existing.display())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let (Some(name), Some(parent)) = (existing.file_name(), existing.parent())
+                    else {
+                        return Err(format!("cannot resolve {}", lexical.display()));
+                    };
+                    missing.push(name);
+                    existing = parent;
+                }
+                Err(_) => return Err(format!("cannot resolve {}", existing.display())),
+            },
         }
     };
     let canonical = missing
@@ -1515,6 +1528,34 @@ mod tests {
             )
             .unwrap_err();
             assert!(error.contains("outside"), "{path}: {error}");
+        }
+        assert!(editor.methods().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn dangling_symlinks_never_count_as_missing_paths() {
+        let dir = workspace("dangling-symlink");
+        std::os::unix::fs::symlink(dir.join("outside/missing.txt"), dir.join("ws/leaf-link"))
+            .unwrap();
+        std::os::unix::fs::symlink(
+            dir.join("outside/missing-directory"),
+            dir.join("ws/intermediate-link"),
+        )
+        .unwrap();
+
+        let editor = Editor::new(&[]);
+        let ctx = context(&dir, "default");
+        for (name, args) in [
+            ("read_text_file", r#"{"path":"leaf-link"}"#),
+            (
+                "write_text_file",
+                r#"{"path":"intermediate-link/new.txt","content":"x"}"#,
+            ),
+            ("run_in_terminal", r#"{"command":"true","cwd":"leaf-link"}"#),
+        ] {
+            let error = run(&editor, &ctx, name, args).unwrap_err();
+            assert!(error.contains("symbolic link"), "{name}: {error}");
         }
         assert!(editor.methods().is_empty());
     }
