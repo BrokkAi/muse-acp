@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.19.0
 
 - Re-pin the Muse Code SDK corpus to `a45cb67` and the stable Muse
   1.4.14-R7309.1 surface. ManagedBash work IDs now ride tool cards and AIR
