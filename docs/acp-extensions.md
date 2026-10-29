@@ -64,6 +64,7 @@ negotiation they fall back to synthesized tool cards.
 | Location | Direction | Shape and behavior |
 | --- | --- | --- |
 | `session/load` or `session/resume` `params._meta.muse.permissionProfile` | Client to agent | Non-empty host-catalog profile id. Forwarded to Muse `session/resume`; unknown/unavailable ids keep the host's typed `commandRejected`. `session/fork` never forwards it. |
+| `session/load` or `session/resume` `params._meta.muse.modelId` | Client to agent | Non-empty Muse model id for Muse 1.4.14+ `session/resume.modelId`. It changes the model inside the retained provider and is forwarded on the MCP-conflict retry. Explicit null, empty, and non-string values fail locally with invalid params. |
 | `session/load` or `session/resume` `params._meta.mspSessionId` | Client to agent | Legacy recovery id for a session stored under an adapter-generated ACP id. Omit for normal modern sessions. |
 | `session/load`, `session/resume`, `session/new`, and `session/fork` result `_meta.mspSessionId` | Agent to client | The durable Muse session id. Modern ACP `sessionId` normally already equals it; this is primarily compatibility metadata. |
 | `session/fork` request `_meta.jetbrains.air.forkPoint` | Client to agent | AIR cut-point selector. It is resolved against host history before a fork command is sent. |
@@ -104,14 +105,18 @@ the value from the latest frame.
 | `_meta.muse.generatedName` | string or `null` | Host-generated short title. `null` withdraws a previously published value. |
 | `_meta.muse.sideFrom` | object | Side-chat parent provenance. |
 | `_meta.muse.forkedFrom` | object | Fork provenance. |
+| `_meta.muse.resumedByClient` | object | Muse 1.4.14+: the `{name,version}` provenance of the connection whose wire resume most recently loaded the session. Absence retains the known fact; explicit null clears it. |
+| `_meta.muse.spawnedBy` | object | Muse 1.4.14+: `{parentSessionId,project?,thread?}` naming the exact session that opened this one. Provenance only; absence retains and null clears. |
 | `_meta.muse.approvalReviewing` | array or `null` | Native reviewer activity rows. `null` clears the prior rows when none remain. |
 | `_meta.muse.foregroundCompleted` | object or `null` | `turnId` and `blockingAgents` while foreground work is done but background checks hold the prompt open. `null` clears the hint at the terminal. |
 | `_meta.muse.modelRetry` | object or `null` | Current model-attempt backoff details. `null` clears the hint at the turn terminal. |
 | `_meta.muse.subscriptionUsage` | object or `null` | Host subscription observation, separate from billing and ACP context usage. `null` clears a prior value. The legacy `_meta.museSubscriptionUsage` alias is also emitted. |
 
 The complete `muse` object can contain any combination of the keys above.
-`session/list` rows may also carry `_meta.muse.branch` and
-`_meta.muse.attention`; list rows are pull-only snapshots, not patch targets.
+`session/list` rows carry the same retained `_meta.muse` snapshot, including
+branch, attention, and Muse 1.4.14 provenance. List rows are pull-only
+snapshots, not patch targets. The read-only sizing and live drive-holder facts
+(`itemCount`, `logBytes`, `driveHolder`) are intentionally not exposed.
 
 
 ## Commands, messages, and tool cards
@@ -163,8 +168,13 @@ Muse adds only facts with no standard ACP field:
 | Skill command | `_meta.muse.title`: declared or host display name. The command's `name` remains the selector. |
 | Agent-message update | `_meta.muse.messagePhase`: `commentary` or `finalAnswer`. |
 | Agent-message update | `_meta.muse.cutOff: true` plus `_meta.muse.itemId` when the host committed a partial reply after a provider-stream failure. |
+| Agent-message update | `_meta.muse.wakeSourceDescriptions`: Muse 1.4.14+ ordered Monitor source descriptions for a wake turn's first answer. The text is unchanged. |
 | Tool/host card | `_meta.muse.itemId`, `outputRef`, `patchRef`, `patchSummary`, and `truncated`. |
+| Tool card | `_meta.muse.workId`: Muse 1.4.13+ ManagedBash Work ID, also present on the live AIR `async_task_spawned` update when the call registers one. It is a join key; the AIR `asyncTaskId` keeps its existing derivation. |
+| Tool card | `_meta.muse.replayHint: {afterItemId,rowKinds}` on a Muse 1.4.13+ monitor call. The row waits for `afterItemId` when it is still ahead, and `rowKinds` is passed verbatim as an open vocabulary. |
+| Tool card | `_meta.muse.held` and `heldFor` (Muse 1.4.14+) while a call is held before execution. Non-terminal held calls use ACP status `pending` and a visible waiting title suffix; release sends `held:false` and `heldFor:null`. |
 | Unknown or synthetic host item | `_meta.muse.itemKind`. |
+| Earlier-history card (Muse 1.4.14+) | `_meta.muse.itemKind: "earlierHistory"` plus the complete `_meta.muse.earlierHistory: {messages}`. The card shows only known `user` and `assistant` roles as role-labelled stored transcript text; it never pretends they are new turns. |
 | Monitor card | `_meta.muse.monitorId`, `monitorDescription`, and `truncated`. On Muse 1.4.11+, `monitorInbox: {pending, drained, voided}` counts the monitor's inbox items: admitted and not yet settled, drained to the agent, and voided by a missed wake (a drain and a void of one item settle latest-wins on their recorded stamps). |
 | Subagent card | `_meta.muse.subagent: {subagentId, childSessionId, controlStatus, depth, drained}`. `drained: true` (Muse 1.4.11+) is the host's fact that the parent consumed the result, also stated in the card text; it is absent until then and never cleared. |
 | Workflow card | `_meta.muse.workflow: {workflowRunId, entryId, scriptId, triggerSource, paused, resumeFromRunId}`. |
@@ -174,6 +184,7 @@ Muse adds only facts with no standard ACP field:
 | Background-check card | `_meta.muse.turnId` and `blockingAgents`. |
 | Damaged session-log range card (Muse 1.4.11+) | `_meta.muse.damagedRange: {missingRecords, unreadableLines, readableBeforeAt, readableAfterAt, lastGoodTurnId}`, verbatim. `lastGoodTurnId` is the safe fork cut. |
 | Computer-use permission request (Muse 1.4.12+) | `toolCall._meta.muse.cuaCardFacts: {page, windowTitle, data, steps}`, verbatim, for editors that render the card natively. The same facts are always shown as the request's text `content`: the page host (with its `xn--` form when it differs), the window title, each data row as `Data: …`, and each step as `Step N: <action> <roleWord> <label> — <effect>`. Muse 1.4.13's `data` rows name the data the call would send, worded from the host's mask and never with the value, which the schema does not send: a known `secretKind` is worded (a GitHub token) and given its mask (`ghp_…3f9a`, `password=… (12 chars)`, or the length alone), while `other` and any unknown `kind` or `secretKind` degrade to a generic row (`Data: a secret`, `Data: a value`) rather than being dropped. A card with data offers only one-shot choices, which the adapter's deny-safe set already is. The window title, labels, chords, and masks are the app's own data, so in the content each is one sanitized line of at most 200 characters inside a Markdown code span (the fence is longer than any backtick run in the text), so no link, autolink, image, or markup can form; the verbatim metadata is unsanitized. |
+| Permission request (Muse 1.4.14+) | `toolCall._meta.muse.reviewerReason`: bounded host reviewer-escalation reason, verbatim. It is also shown as one sanitized `Reviewer concern:` line whose reason is literal code-span content. It is a display hint only and never changes the title or choices. |
 | Background-command completion card (Muse 1.4.12+) | `_meta.muse.backgroundTerminalCompletion: {command, output, outputTruncated, terminalStatus, toolCallId}`, verbatim, beside `_meta.muse.itemKind`. `toolCallId` is the backgrounded call's card id. |
 | Scheduled-fire card (Muse 1.4.11+) | `_meta.muse.scheduledFire: {jobId, deliveryNumber, scheduledFireAtMs, nextFireAtMs}`, verbatim epochs in milliseconds. |
 
@@ -227,6 +238,11 @@ observation also has `data.recoveryObservation` with the construction's
 `effectiveSource`, and `qualification`, verbatim. It describes whether
 recovery was available for that construction; it is never an acceptance
 receipt for the failed request. An incomplete observation is dropped.
+
+A live failed `turn/completed` error with Muse 1.4.14
+`requestDenied: true` adds a plain `The provider refused this request`
+sentence to the editor-facing failure text. Absence is not an assertion that
+the provider accepted the request, so no inverse sentence is emitted.
 
 
 ## Usage metadata

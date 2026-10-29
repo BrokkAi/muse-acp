@@ -650,6 +650,12 @@ fn friendly_terminal_error(terminal: &str, params: &J) -> String {
     {
         out.push_str(&format!(". {}", quota_reset_phrase(quota, now_ms())));
     }
+    if matches!(
+        err.and_then(|e| e.get("requestDenied")),
+        Some(J::Bool(true))
+    ) {
+        out.push_str(". The provider refused this request");
+    }
     let combined = format!("{kind} {message} {reason}");
     if is_network_error(&combined) {
         out.push_str(
@@ -826,6 +832,15 @@ fn attention_projection(value: Option<&J>, session_id: &str) -> Option<Vec<Strin
 /// protocol says additive-optional attention is not an assertion that nothing
 /// is pending.
 fn adopt_session_projection(s: &mut AcpSession, session: &J) {
+    for key in ["resumedByClient", "spawnedBy"] {
+        if let Some(value) = session.get(key) {
+            if matches!(value, J::Null) {
+                s.remove_session_meta(key);
+            } else {
+                s.set_session_meta(key, j_to_string(value));
+            }
+        }
+    }
     if session.get("status").is_some() {
         s.session_status =
             session_status_projection(session.get("status").and_then(|v| v.as_str()));
@@ -843,6 +858,8 @@ fn adopt_session_projection(s: &mut AcpSession, session: &J) {
                 .collect::<Vec<_>>()
                 .join(",");
             s.set_session_meta("attention", format!("[{values}]"));
+        } else if let Some(attention) = s.attention_meta.as_deref() {
+            s.set_session_meta("attention", attention.to_string());
         }
     }
 }
@@ -2439,6 +2456,21 @@ fn resume_permission_profile(params: Option<&J>) -> Result<Option<String>, Strin
     }
 }
 
+/// Muse 1.4.14's request-scoped model override for an ACP resume.
+fn resume_model_override(params: Option<&J>) -> Result<Option<String>, String> {
+    let Some(value) = params
+        .and_then(|params| params.get("_meta"))
+        .and_then(|meta| meta.get("muse"))
+        .and_then(|muse| muse.get("modelId"))
+    else {
+        return Ok(None);
+    };
+    match value {
+        J::Str(model) if !model.trim().is_empty() => Ok(Some(model.clone())),
+        _ => Err("_meta.muse.modelId must be a non-empty string".to_string()),
+    }
+}
+
 /// Whether an ACP v2 `session/resume` asks for history replay. Omitted and
 /// `null` mean no replay; `{"type":"start"}` replays all retained history,
 /// the only cursor this adapter supports. The schema admits custom and
@@ -2693,16 +2725,20 @@ fn resume_session(
     msp_sid: &str,
     mcp_servers: Option<&str>,
     permission_profile: Option<&str>,
+    model_id: Option<&str>,
 ) -> Result<J, J> {
     let send = |servers: Option<&str>| {
         let cmd = host.mint_cmd("cmd-");
         let profile = permission_profile
             .map(|profile| format!(",\"permissionProfile\":{}", esc(profile)))
             .unwrap_or_default();
+        let model = model_id
+            .map(|model| format!(",\"modelId\":{}", esc(model)))
+            .unwrap_or_default();
         host.command(
             "session/resume",
             &format!(
-                "{{\"commandId\":{},\"sessionId\":{},\"history\":\"inline\"{}{profile}}}",
+                "{{\"commandId\":{},\"sessionId\":{},\"history\":\"inline\"{}{profile}{model}}}",
                 esc(&cmd),
                 esc(msp_sid),
                 mcp_config_field(servers)
@@ -2737,7 +2773,7 @@ fn reattach_session(
 ) -> Result<(J, bool), J> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let resumed = loop {
-        let attempt = resume_session(hosts, msp_sid, mcp_servers, None);
+        let attempt = resume_session(hosts, msp_sid, mcp_servers, None, None);
         let held = attempt.as_ref().err().is_some_and(|e| {
             err_code(e) == -32021 || msp::rejection_reason(e) == Some("runtime_busy")
         });
@@ -5503,6 +5539,13 @@ fn handle_acp(
                     return;
                 }
             };
+            let model_override = match resume_model_override(params.as_ref()) {
+                Ok(model) => model,
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
             // ACP v2 resume replays only for a supported cursor; an
             // unsupported or malformed one is refused before the host is
             // touched. v1 session/load always replays, and v1
@@ -5591,6 +5634,7 @@ fn handle_acp(
                 &msp_sid,
                 mcp_servers.as_deref(),
                 permission_profile.as_deref(),
+                model_override.as_deref(),
             ) {
                 Ok(r) => {
                     // Pending questions/approvals survive reconnects; the host
@@ -8093,6 +8137,8 @@ fn handle_acp(
                                     item.get("updatedAt").and_then(J::as_str),
                                     raw_host_fact(Some(item), "branch").as_deref(),
                                     raw_host_fact(Some(item), "attention").as_deref(),
+                                    raw_host_fact(Some(item), "resumedByClient").as_deref(),
+                                    raw_host_fact(Some(item), "spawnedBy").as_deref(),
                                 ));
                             }
                         }
@@ -10981,6 +11027,7 @@ fn update_host_session_facts(
     HostTitleUpdate::after(&before, &session.title_facts)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn session_info_row(
     session_id: &str,
     cwd: &str,
@@ -10988,6 +11035,8 @@ fn session_info_row(
     updated_at: Option<&str>,
     branch: Option<&str>,
     attention: Option<&str>,
+    resumed_by_client: Option<&str>,
+    spawned_by: Option<&str>,
 ) -> String {
     let mut parts = vec![
         format!("\"sessionId\":{}", esc(session_id)),
@@ -11006,6 +11055,12 @@ fn session_info_row(
     if let Some(attention) = attention {
         muse.push(format!("\"attention\":{attention}"));
     }
+    if let Some(resumed) = resumed_by_client {
+        muse.push(format!("\"resumedByClient\":{resumed}"));
+    }
+    if let Some(spawned) = spawned_by {
+        muse.push(format!("\"spawnedBy\":{spawned}"));
+    }
     if !muse.is_empty() {
         parts.push(format!("\"_meta\":{{\"muse\":{{{}}}}}", muse.join(",")));
     }
@@ -11019,17 +11074,21 @@ fn session_matches_filter(session: &AcpSession, root: &str, additional: &[String
 }
 
 fn owned_session_row(session: &AcpSession, updated_at: Option<&str>) -> String {
-    let mut row = session_info_row(
-        &session.msp_sid,
-        &session.cwd,
-        session.title_facts.selected(),
-        updated_at,
-        session.branch_meta.as_deref(),
-        session.attention_meta.as_deref(),
-    );
-    row.pop();
-    row.push_str(&format!(
-        ",\"additionalDirectories\":[{}]}}",
+    let mut parts = vec![
+        format!("\"sessionId\":{}", esc(&session.msp_sid)),
+        format!("\"cwd\":{}", esc(&session.cwd)),
+    ];
+    if let Some(title) = session.title_facts.selected() {
+        parts.push(format!("\"title\":{}", esc(title)));
+    }
+    if let Some(updated_at) = updated_at {
+        parts.push(format!("\"updatedAt\":{}", esc(updated_at)));
+    }
+    if let Some(meta) = session.session_list_meta_json() {
+        parts.push(format!("\"_meta\":{{\"muse\":{{{meta}}}}}"));
+    }
+    parts.push(format!(
+        "\"additionalDirectories\":[{}]",
         session
             .roots
             .iter()
@@ -11038,7 +11097,7 @@ fn owned_session_row(session: &AcpSession, updated_at: Option<&str>) -> String {
             .collect::<Vec<_>>()
             .join(",")
     ));
-    row
+    format!("{{{}}}", parts.join(","))
 }
 
 /// Whether a session id can exist on an MSP host at all: a non-nil UUID in
@@ -13582,21 +13641,55 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
         .unwrap_or_else(|| format!("approval-{approval_id}"));
     let (title, kind) = approval_title_kind(params);
     let subject = params.get("subject").cloned().unwrap_or(J::Null);
-    let raw_input = match &subject {
+    let mut raw_input = match &subject {
         J::Obj(_) => format!(",\"rawInput\":{}", j_to_string(&subject)),
         _ => String::new(),
     };
-    // Muse 1.4.12 computer-use approvals carry the card's facts: shown as the
-    // prompt's content, and passed verbatim as metadata for editors that
-    // render the card natively.
-    let raw_input = match cua_card_text(params) {
-        Some(text) => format!(
-            "{raw_input},\"content\":[{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}],\"_meta\":{{\"muse\":{{\"cuaCardFacts\":{}}}}}",
-            esc(&text),
-            j_to_string(params.get("cuaCardFacts").unwrap_or(&J::Null))
-        ),
-        None => raw_input,
-    };
+    // Muse 1.4.12 computer-use facts and Muse 1.4.14's bounded reviewer
+    // escalation reason are display hints. Show them as text content and keep
+    // the raw facts beside the permission for editors that render natively.
+    let mut content = Vec::new();
+    if let Some(text) = cua_card_text(params) {
+        content.push(text);
+    }
+    if let Some(reason) = params
+        .non_empty_str("reviewerReason")
+        .and_then(cua_untrusted_text)
+    {
+        content.push(format!("Reviewer concern: {reason}"));
+    }
+    if !content.is_empty() {
+        raw_input.push_str(",\"content\":[");
+        raw_input.push_str(
+            &content
+                .iter()
+                .map(|text| {
+                    format!(
+                        "{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}",
+                        esc(text)
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        raw_input.push(']');
+    }
+    let facts: Vec<String> = ["cuaCardFacts", "reviewerReason"]
+        .into_iter()
+        .filter_map(|key| {
+            params
+                .get(key)
+                .filter(|value| match value {
+                    J::Null => false,
+                    J::Str(text) => !text.trim().is_empty(),
+                    _ => true,
+                })
+                .map(|value| format!("\"{key}\":{}", j_to_string(value)))
+        })
+        .collect();
+    if !facts.is_empty() {
+        raw_input.push_str(&format!(",\"_meta\":{{\"muse\":{{{}}}}}", facts.join(",")));
+    }
     let (options_json, choices) = acp::perm_options(params);
     if choices.is_empty() {
         // Nothing the client could answer: fail closed by cancelling the
@@ -17086,6 +17179,24 @@ mod tests {
         assert!(
             !out.contains("network/offline"),
             "no offline hint for plain failure: {out}"
+        );
+    }
+
+    #[test]
+    fn provider_refusal_is_named_once_when_the_host_marks_it() {
+        let params = parse_json(
+            r#"{"terminal":"failed","error":{"kind":"providerError","message":"request refused","retryable":false,"requestDenied":true}}"#,
+        )
+        .unwrap();
+        let out = friendly_terminal_error("failed", &params);
+        assert_eq!(out.matches("provider refused").count(), 1, "{out}");
+        let unmarked = parse_json(
+            r#"{"terminal":"failed","error":{"kind":"providerError","message":"request refused","retryable":false}}"#,
+        )
+        .unwrap();
+        assert!(
+            !friendly_terminal_error("failed", &unmarked).contains("provider refused"),
+            "absence is not a refusal assertion"
         );
     }
 

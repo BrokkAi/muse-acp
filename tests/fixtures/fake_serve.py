@@ -386,6 +386,8 @@ if os.environ.get("FAKE_APPROVAL", "") == "all-approve":
     ]
 if os.environ.get("FAKE_APPROVAL_CHOICES", "") == "empty":
     APPROVAL_PARAMS["availableChoices"] = []
+if os.environ.get("FAKE_APPROVAL_REVIEWER_REASON", ""):
+    APPROVAL_PARAMS["reviewerReason"] = os.environ["FAKE_APPROVAL_REVIEWER_REASON"]
 if os.environ.get("FAKE_APPROVAL_FEEDBACK", "") == "deny":
     for choice in APPROVAL_PARAMS["availableChoices"]:
         if choice.get("decision") == "denied":
@@ -725,6 +727,13 @@ def session_obj(session_id=None, workspace_root=None):
                 "branch": {"branch": "feat/metadata", "vcs": "git",
                             "workspaceRoot": workspace_root},
                 "attention": "needs-review",
+                "resumedByClient": {"name": "resuming-editor",
+                                    "version": "2.0"},
+                "spawnedBy": {"parentSessionId": "parent-session",
+                              "project": "project-a", "thread": "thread-7"},
+                "driveHolder": {"name": "holder", "version": "1.0"},
+                "itemCount": 9,
+                "logBytes": 12345,
             })
         elif session_id == "msp-sess-old":
             session.update({
@@ -1674,11 +1683,14 @@ def on_turn_start(params):
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "async_task":
         # A backgrounded toolCall plus a user-shell item: both are async work.
-        notify("item/updated", {**base, "item": {
+        work_item = {
             "itemId": "it-bg1", "kind": "toolCall", "callId": "call-bg1",
             "status": "inProgress", "revision": 2, "tool": "workspace-shell",
             "args": {"command": "npm watch"}, "background": True,
-            "backgroundInitiator": "user"}})
+            "backgroundInitiator": "user"}
+        if os.environ.get("FAKE_WORK_ID", ""):
+            work_item["workId"] = os.environ["FAKE_WORK_ID"]
+        notify("item/updated", {**base, "item": work_item})
         notify("item/started", {"sessionId": MSP_SID, "item": {
             "itemId": "it-sh2", "kind": "userShell", "status": "inProgress",
             "revision": 1, "turnId": None, "commandText": "cargo watch"},
@@ -2304,12 +2316,28 @@ def result_for(method, msg):
                 {"itemId": "card-cron", "kind": "scheduledFire",
                  "status": "completed", "turnId": None, "jobId": "nightly",
                  "deliveryNumber": 3},
+                {"itemId": "card-earlier", "kind": "earlierHistory",
+                 "status": "completed", "turnId": None,
+                 "earlierHistory": {"messages": [
+                     {"role": "user", "text": "earlier question"},
+                     {"role": "assistant", "text": "earlier answer"},
+                     {"role": "futureRole", "text": "hidden"}]}},
                 {"itemId": "card-future", "kind": "futureCardKind",
                  "status": "completed", "turnId": None,
                  "fallbackText": "A future card"},
                 {"itemId": "card-mon", "kind": "monitorFeed", "status": "completed",
                  "turnId": None, "monitorId": "mon-cards",
                  "monitorDescription": "Cards monitor", "text": "done"},
+                {"itemId": "card-monitor-tool", "kind": "toolCall",
+                 "callId": "call-monitor-tool", "status": "completed",
+                 "tool": "monitor", "visibleOutput": "watched",
+                 "replayHint": {"afterItemId": "card-marker",
+                                "rowKinds": ["reminderCheck", "futureRow"]},
+                 "args": {"description": "Watched monitor"}},
+                {"itemId": "card-marker", "kind": "toolCall",
+                 "callId": "call-marker", "status": "completed",
+                 "tool": "bash", "visibleOutput": "marker",
+                 "args": {"command": "true"}},
                 {"itemId": "card-active", "kind": "toolCall",
                  "callId": "call-card-active", "status": "inProgress",
                  "tool": "workspace-shell", "args": {"command": "npm watch"},

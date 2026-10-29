@@ -933,6 +933,12 @@ compatibility table, and reports whether the configured Muse CLI can be invoked
 (`cli-ready` or `cli-unready`). It exits `0` even when Muse is not installed, so
 you can collect output on a machine that is still being set up.
 
+The current vendored SDK surface is Muse 1.4.14
+(`sha256:c94c3d1f2f51e6424074b9ec43eac3eedcf532d3dcd77351ec1383a87d3049c6`).
+The adapter and standalone MSP client live suites pass against
+`1.4.14-R7309.1`, and the 1.4.14 Linux, macOS, and Windows artifacts are pinned
+in the nightly matrix.
+
 At startup the adapter logs whether the host can enforce its sandbox, as
 reported by Muse 1.4.7+ on `initialize`:
 `host-sandbox server=<host> availability=available|unavailable|unknown

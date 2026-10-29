@@ -2960,6 +2960,40 @@ fn computer_use_permission_names_the_data_the_call_would_send() {
 }
 
 #[test]
+fn reviewer_reason_is_visible_and_preserved_as_permission_metadata() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn(
+            "approval",
+            &[(
+                "FAKE_APPROVAL_REVIEWER_REASON",
+                "Escalated by policy\nsecond line\u{202e}",
+            )],
+        );
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "run the command");
+        let perm = c.wait_for("request_permission", Duration::from_secs(15));
+        let reply: serde_json::Value = serde_json::from_str(&perm).expect("permission JSON");
+        let params = &reply["params"];
+        let tool_call = if params["subject"]["toolCall"].is_object() {
+            &params["subject"]["toolCall"]
+        } else {
+            &params["toolCall"]
+        };
+        assert_eq!(
+            tool_call["content"][0]["content"]["text"],
+            "Reviewer concern: `Escalated by policy second line`",
+            "the reason is one literal line on v{ver}: {perm}"
+        );
+        assert_eq!(
+            tool_call["_meta"]["muse"]["reviewerReason"],
+            "Escalated by policy\nsecond line\u{202e}",
+            "the raw reason stays in metadata on v{ver}: {perm}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn mcp_tool_permission_title_comes_from_the_subject() {
     // #239: Muse 1.4.6 omits top-level toolName/toolCallId for MCP tools;
     // the name is only subject.toolName, and the card is found by itemId.
@@ -4660,6 +4694,7 @@ fn load_and_resume_replay_host_cards_without_live_side_effects() {
             "cargo test",
             "Damaged session log range",
             "Scheduled job nightly fired",
+            "Earlier conversation",
             "A future card",
             "Monitor: Cards monitor",
         ] {
@@ -4671,6 +4706,33 @@ fn load_and_resume_replay_host_cards_without_live_side_effects() {
         assert!(
             frames.contains("\"itemKind\":\"webSearch\""),
             "v{ver} card _meta names the kind: {frames}"
+        );
+        let earlier = frames
+            .lines()
+            .find(|line| line.contains("item-card-earlier"))
+            .expect("earlier-history card");
+        let visible = earlier.split("\"_meta\"").next().unwrap_or_default();
+        assert!(
+            visible.contains("User: earlier question")
+                && visible.contains("Assistant: earlier answer")
+                && !visible.contains("hidden"),
+            "v{ver} earlier history renders known roles only: {earlier}"
+        );
+        assert!(
+            earlier.contains("\"role\":\"futureRole\",\"text\":\"hidden\""),
+            "v{ver} verbatim earlier-history facts stay in metadata: {earlier}"
+        );
+        let marker = frames.find("call-marker").expect("anchor tool card");
+        let hinted = frames.find("call-monitor-tool").expect("monitor tool card");
+        assert!(
+            marker < hinted,
+            "v{ver} replayHint places the monitor after its anchor: {frames}"
+        );
+        assert!(
+            frames.contains(
+                "\"replayHint\":{\"afterItemId\":\"card-marker\",\"rowKinds\":[\"reminderCheck\",\"futureRow\"]}"
+            ),
+            "v{ver} the open row-kind vocabulary is preserved: {frames}"
         );
         assert!(
             !frames.contains("\"terminal_update\""),
@@ -5131,12 +5193,25 @@ fn host_session_metadata_populates_rows_and_live_title_updates() {
         "rows without host metadata stay untitled: {listed}"
     );
     assert!(
-        listed.contains("\"muse\":{\"branch\":{\"branch\":\"feat/metadata\""),
+        listed.contains("\"branch\":{\"branch\":\"feat/metadata\""),
         "branch metadata is preserved on the row: {listed}"
     );
     assert!(
         listed.contains("\"attention\":\"needs-review\""),
         "attention metadata is preserved on the row: {listed}"
+    );
+    assert!(
+        listed.contains("\"resumedByClient\":{\"name\":\"resuming-editor\",\"version\":\"2.0\"}")
+            && listed.contains(
+                "\"spawnedBy\":{\"parentSessionId\":\"parent-session\",\"project\":\"project-a\",\"thread\":\"thread-7\"}"
+            ),
+        "Muse 1.4.14 provenance is preserved on the row: {listed}"
+    );
+    assert!(
+        !listed.contains("\"driveHolder\"")
+            && !listed.contains("\"itemCount\"")
+            && !listed.contains("\"logBytes\""),
+        "metadata-only session sizing and drive-holder facts stay out of ACP rows: {listed}"
     );
 
     let _pid = c.prompt(&sid, "transcript text must not become a title");
@@ -5640,7 +5715,7 @@ fn load_resends_client_mcp_servers_and_survives_a_configuration_conflict() {
     let load = |c: &mut Client| {
         let id = c.req(
             "session/load",
-            r#"{"sessionId":"msp-sess-old","mcpServers":[{"name":"intellij","command":"idea"}],"_meta":{"muse":{"permissionProfile":"team-safe"}}}"#,
+            r#"{"sessionId":"msp-sess-old","mcpServers":[{"name":"intellij","command":"idea"}],"_meta":{"muse":{"permissionProfile":"team-safe","modelId":"model-explicit"}}}"#,
         );
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
         assert!(frame.contains("\"result\""), "load failed: {frame}");
@@ -5668,8 +5743,10 @@ fn load_resends_client_mcp_servers_and_survives_a_configuration_conflict() {
     assert_eq!(resumes.len(), 2, "{resumes:?}");
     assert_eq!(resumes[0]["config"], config);
     assert_eq!(resumes[0]["permissionProfile"], "team-safe");
+    assert_eq!(resumes[0]["modelId"], "model-explicit");
     assert!(resumes[1].get("config").is_none(), "{:?}", resumes[1]);
     assert_eq!(resumes[1]["permissionProfile"], "team-safe");
+    assert_eq!(resumes[1]["modelId"], "model-explicit");
     assert_ne!(resumes[0]["commandId"], resumes[1]["commandId"]);
 
     // Without a conflict the configuration is sent once and accepted.
@@ -5762,6 +5839,58 @@ fn resume_permission_profile_is_request_scoped_and_typed() {
                 "{method} {profile} keeps the typed refusal: {frame}"
             );
         }
+        c.finish();
+    }
+}
+
+#[test]
+fn resume_model_override_is_request_scoped_and_typed() {
+    for (ver, method) in [(1, "session/load"), (2, "session/resume")] {
+        let mut c = Client::spawn("quiet", &[]);
+        let sid = c.new_session(ver, "");
+        let id = c.req(
+            method,
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"muse\":{{\"modelId\":\"model-explicit\"}}}}}}"
+            ),
+        );
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\""), "{method} failed: {frame}");
+        let selected = host_requests(&c, "session/resume")
+            .into_iter()
+            .find(|params| params["modelId"] == "model-explicit")
+            .unwrap_or_else(|| panic!("{method} must forward the model override"));
+        assert_eq!(selected["history"], "inline", "{selected}");
+
+        let id = c.req(method, &format!("{{\"sessionId\":\"{sid}\"}}"));
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\""), "{method} failed: {frame}");
+        let plain = host_requests(&c, "session/resume")
+            .into_iter()
+            .rev()
+            .find(|params| params["history"] == "inline")
+            .expect("plain resume request");
+        assert!(plain.get("modelId").is_none(), "{plain}");
+
+        let before = host_requests(&c, "session/resume").len();
+        for model in ["null", "7", "\"\"", "\"   \""] {
+            let id = c.req(
+                method,
+                &format!(
+                    "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"muse\":{{\"modelId\":{model}}}}}}}"
+                ),
+            );
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            assert!(
+                frame.contains("\"code\":-32602") && frame.contains("_meta.muse.modelId"),
+                "{method} malformed model {model}: {frame}"
+            );
+        }
+        assert_eq!(
+            host_requests(&c, "session/resume").len(),
+            before,
+            "{method} malformed models must not reach the host"
+        );
         c.finish();
     }
 }
@@ -8409,21 +8538,21 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 }
 
 #[test]
-fn sdk_manifest_fingerprint_is_the_1_4_13_surface() {
-    // The vendored SDK manifest (3dce908) publishes the Muse 1.4.13 surface,
-    // and the pinned 1.4.13-R6996.1 build in the nightly live-host matrix
+fn sdk_manifest_fingerprint_is_the_1_4_14_surface() {
+    // The vendored SDK manifest (a45cb67) publishes the Muse 1.4.14 surface,
+    // and the stable 1.4.14-R7309.1 build in the nightly live-host matrix
     // reports it, so the adapter classifies it as tested.
     let mut c = Client::spawn(
         "quiet",
         &[(
             "FAKE_FINGERPRINT",
-            "sha256:7fddaf646dbc317e5fcac0785e135eb04df14fbb0db1863089dfd6da21730e5b",
+            "sha256:c94c3d1f2f51e6424074b9ec43eac3eedcf532d3dcd77351ec1383a87d3049c6",
         )],
     );
     c.initialize(1, "");
     c.wait_stderr("status=tested", Duration::from_secs(10));
     c.wait_stderr(
-        "validated against live host 1.4.13-R6996.1; the vendored SDK 3dce908 surface",
+        "validated against live host 1.4.14-R7309.1; the vendored SDK a45cb67 surface",
         Duration::from_secs(10),
     );
     c.finish();
@@ -13046,6 +13175,36 @@ fn async_task_updates_follow_negotiation() {
         frames.matches("async_task_spawned").count(),
         2,
         "exactly one spawn per task: {frames}"
+    );
+    c.finish();
+}
+
+#[test]
+fn managed_bash_work_id_is_published_on_the_card_and_air_task() {
+    let work_id = "work.v2.managed_bash.sha256.50caae";
+    let mut c = Client::spawn("async_task", &[("FAKE_WORK_ID", work_id)]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
+    let _pid = c.prompt(&sid, "run in background");
+    c.wait_for(
+        "\"sessionUpdate\":\"async_task_spawned\"",
+        Duration::from_secs(15),
+    );
+    let frames = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    assert_eq!(
+        frames.matches(&format!("\"workId\":\"{work_id}\"")).count(),
+        2,
+        "the tool card and AIR task both carry the ManagedBash work id: {frames}"
+    );
+    assert!(
+        frames.contains("\"asyncTaskId\":\"call-bg1\""),
+        "existing AIR task identity is unchanged: {frames}"
     );
     c.finish();
 }
