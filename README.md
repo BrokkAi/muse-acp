@@ -286,7 +286,12 @@ run on a second `muse serve` that `muse-acp` starts with `--disable-write
 --disable-shell` the first time it is needed. Through Muse 1.4.2, Muse
 answers a write with "tool policy denied filesystem write"; from 1.4.3 it
 does not offer write or shell tools in those sessions at all. MCP tools are
-not covered by those flags; their calls still go through approvals.
+not covered by those flags. Client-supplied MCP servers remain available in
+Read-only and Plan, and those servers can write files, run commands, or use
+the network. Read-only and Plan are therefore not a sandbox for MCP tools and
+do not guarantee that no external tool has side effects. Their calls still go
+through the host's approval policy, so use `promptUnmatched` or
+`denyUnmatched` when that approval boundary must be enforced.
 
 Muse lets only one host hold a session, and releases it only when that host
 exits. Changing the mode of an open session therefore restarts the host that
@@ -303,6 +308,14 @@ resume later comes back in the same mode. A fork keeps its source's mode.
 The approval policy has its own **Approval Mode** selector (`approval_mode`).
 Clients that still send an approval mode such as `promptUnmatched` to the
 `mode` selector, or to `session/set_mode`, keep setting the approval mode.
+
+If `MUSE_APPROVAL_MODE` is unset, the adapter inherits the host's saved
+default and logs a warning when that effective mode is `allowAll`. In
+`allowAll`, Muse runs shell commands, file writes, network access, and MCP
+tools without a permission request, so neither the editor prompt nor
+Auto-review sees the action. That posture is appropriate only when the session
+should have unrestricted host access. Harness deployments should set
+`MUSE_APPROVAL_MODE=promptUnmatched` (or `denyUnmatched`) explicitly.
 
 ### Approval-profile compatibility
 

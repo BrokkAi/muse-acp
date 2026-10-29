@@ -25,6 +25,10 @@ use crate::process::{POLL, StderrDone, StderrTail, drain_stderr, kill_and_reap, 
 
 /// Default admission-ack budget for methods the table does not name.
 const DEFAULT_TIMEOUT_MS: u64 = 60_000;
+/// The largest stdout line accepted from the host. ACP applies the same bound
+/// to client frames; without one, a broken or malicious host can exhaust the
+/// adapter process memory with a newline-free stream.
+const MAX_STDOUT_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 /// Method-aware admission-ack budgets. Acks are admission-only, not outcomes:
 /// a turn may legitimately run for minutes after `turn/start` accepts.
@@ -954,17 +958,52 @@ fn write_loop<W: Write>(mut writer: W, requests: Receiver<WriteRequest>) {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum FrameRead {
+    Eof,
+    Complete,
+    TooLarge,
+}
+
+fn read_frame<R: BufRead>(
+    reader: &mut R,
+    frame: &mut Vec<u8>,
+    max: usize,
+) -> io::Result<FrameRead> {
+    frame.clear();
+    let n = reader
+        .by_ref()
+        .take(max.saturating_add(1) as u64)
+        .read_until(b'\n', frame)?;
+    if n == 0 {
+        Ok(FrameRead::Eof)
+    } else if frame.len() > max {
+        Ok(FrameRead::TooLarge)
+    } else {
+        Ok(FrameRead::Complete)
+    }
+}
+
 fn reader_loop<R: Read>(core: Arc<Core>, stdout: R, events: Sender<MspEvent>) {
     let mut reader = BufReader::new(stdout);
     let mut frame = Vec::new();
     loop {
-        frame.clear();
-        match reader.read_until(b'\n', &mut frame) {
-            Ok(0) => {
+        match read_frame(&mut reader, &mut frame, MAX_STDOUT_FRAME_BYTES) {
+            Ok(FrameRead::Eof) => {
                 core.host_closed(&events, "serve host stdout closed");
                 break;
             }
-            Ok(_) => {}
+            Ok(FrameRead::Complete) => {}
+            Ok(FrameRead::TooLarge) => {
+                core.diagnose(Diagnostic::StdoutFrameTooLarge {
+                    max_bytes: MAX_STDOUT_FRAME_BYTES,
+                });
+                core.host_closed(
+                    &events,
+                    &format!("serve stdout frame exceeds {MAX_STDOUT_FRAME_BYTES} bytes"),
+                );
+                break;
+            }
             Err(e) => {
                 core.host_closed(&events, &format!("serve stdout error: {e}"));
                 break;

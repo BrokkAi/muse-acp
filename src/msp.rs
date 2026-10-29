@@ -300,20 +300,7 @@ pub fn muse_cli() -> String {
         return find_windows_launcher(path_dirs.into_iter().chain(install_dir), "muse")
             .unwrap_or_else(|| "muse".to_string());
     }
-    // A bare name keeps symlinked installs (Homebrew, cargo) working across
-    // upgrades, so the installer path is only used when PATH has no `muse`.
-    let on_path = path_dirs
-        .iter()
-        .any(|dir| dir.is_absolute() && dir.join("muse").is_file());
-    if !on_path
-        && let Some(bin) = install_dir
-            .map(|dir| dir.join("muse"))
-            .filter(|bin| bin.is_file())
-            .and_then(|bin| bin.into_os_string().into_string().ok())
-    {
-        return bin;
-    }
-    "muse".to_string()
+    find_unix_launcher(path_dirs.into_iter(), install_dir.as_deref(), "muse")
 }
 
 /// Where Muse's official installer puts `muse`: `MUSE_INSTALL_DIR` when set,
@@ -345,6 +332,30 @@ fn find_windows_launcher(
         .flat_map(|dir| ["exe", "cmd", "bat"].map(|ext| dir.join(format!("{stem}.{ext}"))))
         .find(|candidate| candidate.is_file())
         .and_then(|candidate| candidate.into_os_string().into_string().ok())
+}
+
+/// First absolute PATH entry containing `stem`, as a full path. A bare command
+/// name would make the operating system search relative PATH entries against
+/// the current directory, which is often an untrusted workspace. The
+/// installer path is the fallback, and a full path there is returned even when
+/// absent so spawning cannot fall back to a relative search.
+fn find_unix_launcher(
+    dirs: impl Iterator<Item = std::path::PathBuf>,
+    install_dir: Option<&std::path::Path>,
+    stem: &str,
+) -> String {
+    let found = dirs
+        .filter(|dir| dir.is_absolute())
+        .map(|dir| dir.join(stem))
+        .find(|candidate| candidate.is_file());
+    let fallback = install_dir.map(|dir| dir.join(stem)).unwrap_or_else(|| {
+        std::path::PathBuf::from("/").join(format!("muse-acp-no-{stem}-on-path"))
+    });
+    found
+        .unwrap_or(fallback)
+        .into_os_string()
+        .into_string()
+        .unwrap_or_else(|_| "/muse-acp-non-utf8-path".to_string())
 }
 
 /// Turn a host spawn failure into the next user action. The readiness
@@ -1266,11 +1277,12 @@ mod tests {
     }
 
     #[test]
-    fn support_lines_include_exit_code_and_stderr_tail() {
+    fn support_lines_include_exit_code_without_stderr_contents() {
         let exit = classify_exit_parts(Some(5), None, "serve gate is off".into());
         let lines = exit.support_lines("support");
         assert!(lines[0].contains("exit-code=5"));
-        assert!(lines.iter().any(|line| line.contains("serve gate is off")));
+        assert!(lines[1].contains("stderr-bytes=17"));
+        assert!(!lines.iter().any(|line| line.contains("serve gate is off")));
     }
 
     #[test]
@@ -1766,6 +1778,44 @@ mod authentication_tests {
             first.join("muse.cmd").to_str()
         );
         assert_eq!(find_windows_launcher(dirs(), "absent"), None);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&relative);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_launcher_search_never_uses_relative_path_entries() {
+        let root =
+            std::env::temp_dir().join(format!("muse-acp-unix-launcher-{}", std::process::id()));
+        let absolute = root.join("bin");
+        let relative = std::path::PathBuf::from(format!(
+            "target/muse-acp-unix-launcher-rel-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&absolute).unwrap();
+        std::fs::create_dir_all(&relative).unwrap();
+        std::fs::write(absolute.join("muse"), "").unwrap();
+        std::fs::write(relative.join("muse"), "").unwrap();
+        assert_eq!(
+            find_unix_launcher(
+                vec![
+                    std::path::PathBuf::new(),
+                    relative.clone(),
+                    absolute.clone()
+                ]
+                .into_iter(),
+                None,
+                "muse",
+            ),
+            absolute.join("muse").to_str().unwrap()
+        );
+
+        let install = root.join("install");
+        std::fs::create_dir_all(&install).unwrap();
+        assert_eq!(
+            find_unix_launcher(vec![relative.clone()].into_iter(), Some(&install), "muse",),
+            install.join("muse").to_str().unwrap()
+        );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&relative);
     }

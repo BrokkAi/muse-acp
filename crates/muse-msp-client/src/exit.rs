@@ -56,8 +56,10 @@ impl ExitClassification {
         }
     }
 
-    /// Machine-readable support lines: one classification line, then the
-    /// stderr tail line by line under the same prefix.
+    /// Machine-readable support lines: classification plus the amount of
+    /// stderr captured. The stderr text stays in `stderr_tail` for a caller
+    /// that deliberately handles it; automatic logs must not copy arbitrary
+    /// host output, which can contain credentials or workspace text.
     pub fn support_lines(&self, prefix: &str) -> Vec<String> {
         let exit = self
             .exit_code
@@ -67,21 +69,19 @@ impl ExitClassification {
             .signal
             .map(|value| value.to_string())
             .unwrap_or_else(|| "none".to_string());
-        let mut lines = vec![format!(
-            "{prefix} kind={} exit-code={} signal={} retry={}",
-            self.kind_name(),
-            exit,
-            signal,
-            self.retry_advice()
-        )];
-        if self.stderr_tail.is_empty() {
-            lines.push(format!("{prefix} stderr-tail=(empty)"));
-        } else {
-            for line in self.stderr_tail.lines() {
-                lines.push(format!("{prefix} stderr-tail {line}"));
-            }
-        }
-        lines
+        vec![
+            format!(
+                "{prefix} kind={} exit-code={} signal={} retry={}",
+                self.kind_name(),
+                exit,
+                signal,
+                self.retry_advice()
+            ),
+            format!(
+                "{prefix} stderr-bytes={} contents=omitted",
+                self.stderr_tail.len()
+            ),
+        ]
     }
 }
 
@@ -184,16 +184,16 @@ mod tests {
     }
 
     #[test]
-    fn support_lines_include_exit_code_and_stderr_tail() {
+    fn support_lines_include_exit_code_without_stderr_contents() {
         let exit = classify_exit_parts(Some(5), None, "serve gate is off\nsecond".into());
         let lines = exit.support_lines("support");
         assert_eq!(
             lines[0],
             "support kind=sdkSurfaceUnavailable exit-code=5 signal=none retry=never"
         );
-        assert_eq!(lines[1], "support stderr-tail serve gate is off");
-        assert_eq!(lines[2], "support stderr-tail second");
+        assert_eq!(lines[1], "support stderr-bytes=24 contents=omitted");
+        assert!(!lines.iter().any(|line| line.contains("serve gate")));
         let quiet = classify_exit_parts(Some(0), None, String::new()).support_lines("p");
-        assert_eq!(quiet[1], "p stderr-tail=(empty)");
+        assert_eq!(quiet[1], "p stderr-bytes=0 contents=omitted");
     }
 }

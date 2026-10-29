@@ -73,9 +73,10 @@ a model that allows a critical action cannot override the policy.
   action does not run and the transcript identifies the reviewer failure.
   A reviewer turn that fails denies with the host's error, for example
   `reviewer turn failed: contextWindowExceeded: prompt is too long`. A reply
-  without a verdict quotes what the reviewer said in the notice, and the
-  whole reply is logged to stderr. Either way the adapter resets the
-  reviewer host before the next review.
+  without a verdict quotes a bounded excerpt in the editor notice. Stderr
+  records only the failure and reply length, never the reviewer text, which
+  may contain sensitive or injected content. Either way the adapter resets
+  the reviewer host before the next review.
 - Each review runs in a fresh reviewer session, so no review inherits an
   earlier review's history. The adapter restarts the reviewer host every 32
   reviews.
@@ -121,6 +122,11 @@ becomes an editor decision.
 
 ## Limits
 
+- **Auto-review needs an approval request.** If the effective host approval
+  mode is `allowAll`, Muse runs matching actions without requesting
+  permission, so the editor prompt and Auto-review are both bypassed. Set
+  `MUSE_APPROVAL_MODE=promptUnmatched` when every permission request must be
+  reviewed.
 - **Muse 1.4.2 or newer.** On Muse 1.3.0 and 1.4.1 the reviewer host's own
   background reminder checks hold the review turn open, so the review never
   finishes and the approval is denied when the review timeout expires.
