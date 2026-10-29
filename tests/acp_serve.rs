@@ -2356,6 +2356,11 @@ fn auto_review_denies_when_the_reviewer_denies() {
         !frames.contains("session/request_permission"),
         "a reviewed denial must not prompt: {frames}"
     );
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        !stderr.contains("Credential exfiltration."),
+        "reviewer rationale must not enter stderr: {stderr}"
+    );
     c.finish();
 }
 
@@ -2417,9 +2422,11 @@ fn auto_review_asks_again_for_a_verdict_before_denying() {
     let _pid = c.prompt(&sid, "inspect agent.rs on master");
     c.wait_stderr("asking again (1/3)", Duration::from_secs(15));
     c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(15));
-    c.wait_stderr(
-        "auto-review allow ap-1: Read-only inspection.",
-        Duration::from_secs(15),
+    c.wait_stderr("auto-review allow ap-1", Duration::from_secs(15));
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        !stderr.contains("Read-only inspection."),
+        "reviewer rationale must not enter stderr: {stderr}"
     );
     c.finish();
 }
@@ -2443,11 +2450,14 @@ fn auto_review_reply_is_the_latest_agent_message_only() {
     let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
     let _pid = c.prompt(&sid, "do the thing");
     c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(15));
-    c.wait_stderr("auto-review allow ap-1: Routine.", Duration::from_secs(15));
+    c.wait_stderr("auto-review allow ap-1", Duration::from_secs(15));
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
     assert!(
-        !std::fs::read_to_string(&c.stderr_log)
-            .unwrap_or_default()
-            .contains("asking again"),
+        !stderr.contains("Routine."),
+        "reviewer rationale must not enter stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("asking again"),
         "a usable latest message needs no follow-up"
     );
     c.finish();

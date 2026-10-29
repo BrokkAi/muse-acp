@@ -3,11 +3,11 @@
 ## Unreleased
 
 - Harden auto-review against prompt injection. Only typed prompt text is
-  trusted for user authorization, attached resources are named without their
-  contents, and untrusted transcript entries are rendered as escaped
+  trusted for user authorization, attached resources and their URIs are
+  omitted, and untrusted transcript entries are rendered as escaped
   single-line evidence. Auto-review also rejects a bare JSON allow without
-  risk, authorization, and rationale evidence, and no longer writes reviewer
-  replies or host stderr text to automatic logs (#434, #441).
+  valid risk, authorization, and rationale evidence, and no longer writes
+  reviewer replies or host stderr text to automatic logs (#434, #441).
 
 - Show hidden characters in permission and tool-card titles. Newlines,
   terminal controls, bidi controls, and zero-width characters are rendered as

@@ -28,6 +28,7 @@ This plan addresses GitHub issues #434, #435, #436, #437, #439, and #440, plus f
 - [x] (2026-10-29 01:20Z) Hardened default Unix CLI resolution, bounded MSP stdout frames at 16 MiB, required explicit deny decisions for fallback cancellation, rejected bare JSON allows, and removed host/reviewer text from automatic stderr logs.
 - [x] (2026-10-29 01:45Z) Ran formatting, linting, focused tests, the full workspace suite, selftest, npm, installer, and script checks.
 - [x] (2026-10-29 01:50Z) Updated this plan's outcome and prepared a concise handoff naming issues intentionally left open.
+- [x] (2026-10-29 02:20Z) Review found and fixed remaining trusted attachment metadata, Unicode line-separator evidence, unknown JSON risk defaults, and free-form assessment rationale in stderr. Re-ran the full workspace and MSRV suites plus Clippy.
 
 
 ## Surprises & Discoveries
@@ -60,6 +61,9 @@ This plan addresses GitHub issues #434, #435, #436, #437, #439, and #440, plus f
 - Observation: The deny fallback treated every decision not starting with `approv` as a rejection, including a future host decision named `allow`.
   Evidence: `fallback_deny` selected the first choice whose decision failed the approval prefix test.
 
+- Observation: A review of the first fixup found three residual boundaries: resource URIs still appeared under trusted instructions, Unicode line separators were not escaped in evidence, and unknown JSON risk values could fall back to low risk. Successful assessment rationales were also still written to stderr.
+  Evidence: The initial tests covered only newline evidence and missing JSON fields; the source still included attachment URIs, treated non-control Unicode whitespace as ordinary evidence, and logged `assessment.rationale`.
+
 
 ## Decision Log
 
@@ -68,8 +72,8 @@ This plan addresses GitHub issues #434, #435, #436, #437, #439, and #440, plus f
   Rationale: This is the repository's previously recorded design. Removing editor MCP servers would silently remove user-configured capabilities, and automatically implying sandboxing of external processes would be inaccurate. A visible limitation is preferable to a hidden semantic change.
   Date/Author: 2026-10-29, Codex.
 
-- Decision: Treat only ACP `text` blocks as typed user instructions for auto-review. Name attached resources in the trusted section without copying their contents.
-  Rationale: A filename or URI can help the reviewer understand context, but file contents are attacker-controlled workspace data. Their absence from the trusted section prevents a planted attachment from claiming user authorization.
+- Decision: Treat only ACP `text` blocks as typed user instructions for auto-review. Omit attached resources, resource links, their contents, and their URIs from the trusted section.
+  Rationale: File contents and filenames are workspace-controlled. Keeping even attachment metadata out of the trusted section prevents a planted file or URI from claiming user authorization.
   Date/Author: 2026-10-29, Codex.
 
 - Decision: Render each untrusted transcript entry as one bullet line and show line breaks and control characters as visible escapes.
@@ -114,7 +118,7 @@ This plan addresses GitHub issues #434, #435, #436, #437, #439, and #440, plus f
 
 The delivered change closes the six targeted issues and the directly related low findings from #441. Auto-review now separates typed instructions from attached content, escapes transcript evidence, rejects evidence-free JSON allows, and keeps arbitrary reviewer text out of stderr. Permission and synthetic tool-card titles show hidden characters as escapes. The editor bridge authenticates from headers before body allocation, enforces body and connection bounds, and uses a scoped permit for every connection thread. Release/fuzz actions are pinned, and the inherited `allowAll` posture is visible in logs and documentation. Read-only and Plan retain their existing MCP policy, now with an explicit warning that those external tools are not sandboxed.
 
-The full workspace suite passed, including 442 adapter integration tests and the `muse-msp-client` process tests. Clippy with warnings denied, formatting, selftest, Node launcher tests, 43 Python release-script tests with 6 platform skips, shell syntax, and the npm smoke test also passed. The Node launcher test required running outside the filesystem sandbox because the sandbox blocked execution of its copied Node fixture with `EPERM`; the repository code was unchanged by that environment workaround.
+The full workspace suite passed on Rust 1.99.1 and the 1.88.0 minimum, including 442 adapter integration tests and the `muse-msp-client` process tests. Clippy with warnings denied, formatting, selftest, Node launcher tests, 43 Python release-script tests with 6 platform skips, shell syntax, and the npm smoke test also passed. The Node launcher test required running outside the filesystem sandbox because the sandbox blocked execution of its copied Node fixture with `EPERM`; the repository code was unchanged by that environment workaround.
 
 Issue #441 remains open for findings not addressed here: TOCTOU-safe path confinement (L6), signed release/build provenance (I1), TLS 1.3 negotiation in the Windows installer (I2), bearer-token persistence in session logs (I3), and broader architectural review of prompt injection. Issues #316, #317, #318, #396, #397, and #375 remain separate feature/release work.
 
@@ -138,7 +142,7 @@ The test suite uses `tests/fixtures/fake_serve.py` as a scripted Muse host. `tes
 ## Plan of Work
 
 
-First, harden auto-review. In `src/reviewer.rs`, add a public function that parses an ACP content array and returns only typed `text` blocks, representing resource and resource-link blocks by URI without copying their contents. Add a private evidence renderer that prefixes each transcript entry with `- ` and escapes carriage returns, newlines, tabs, and other control characters. Use that renderer in `build_prompt`. Add unit tests proving an attached README cannot contribute trusted authorization and a fake `# Trusted user instructions` heading remains inside one escaped bullet. In `src/main.rs`, change the prompt-history call to store `reviewer::trusted_prompt_text(&acp_content)` rather than the raw content array.
+First, harden auto-review. In `src/reviewer.rs`, add a public function that parses an ACP content array and returns only typed `text` blocks, omitting resources, resource links, their contents, and their URIs. Add a private evidence renderer that prefixes each transcript entry with `- ` and escapes carriage returns, newlines, other whitespace separators, and control characters. Use that renderer in `build_prompt`. Add unit tests proving an attached README cannot contribute trusted authorization and a fake `# Trusted user instructions` heading remains inside one escaped bullet. In `src/main.rs`, change the prompt-history call to store `reviewer::trusted_prompt_text(&acp_content)` rather than the raw content array.
 
 Second, make titles visually complete. Add a function in `src/acp.rs` that scans Unicode characters and escapes line breaks, tab, controls, Unicode bidi embeddings and isolates, zero-width format characters, and the byte-order mark. Normal Unicode letters remain unchanged. Add unit tests for commands with hidden newlines, terminal escape sequences, and bidi overrides. Apply it to the final title from `approval_title_kind` and to the final tool-card title from `SessionFold::tool_title`. Keep the machine-readable raw input and `_meta` unchanged.
 
@@ -190,7 +194,7 @@ The final successful workspace run reported 255 adapter unit tests and 442 adapt
 ## Validation and Acceptance
 
 
-For prompt hardening, a unit test supplies a typed text block plus a resource block whose text says the user authorizes credential upload. The trusted extraction contains the typed text and the resource URI, but not the planted authorization. A second test supplies an evidence entry beginning with real newlines and a fake trusted-instructions heading; `build_prompt` contains exactly one real trusted heading and renders the forged text after literal `\\n` escapes.
+For prompt hardening, a unit test supplies a typed text block plus a resource block whose text says the user authorizes credential upload. The trusted extraction contains only the typed text, not the resource URI or planted authorization. A second test supplies evidence containing real newlines and a Unicode line separator before fake trusted-instructions headings; `build_prompt` contains exactly one real trusted heading and renders both separators as literal escapes.
 
 For title hardening, unit tests pass commands containing newline-separated destructive tails, terminal escape sequences, a right-to-left override, and zero-width characters. The returned title contains visible `\\n` or `\\u{...}` sequences, retains ordinary accented text, and places no raw control or bidi-format character in editor-visible title text.
 
@@ -251,3 +255,5 @@ No new external crate is required. The implementation uses the existing standard
 2026-10-29: Created the plan after reading all open issue bodies and the referenced fork fixes. Scoped the batch to the actionable security issues and recorded why the existing client-MCP policy is retained with clearer documentation.
 
 2026-10-29: Added low findings L2, L3, L5, L7, and I4 from #441 because their fixes stayed within the same security boundaries. Recorded the choice to keep raw stderr and unusable reviewer text out of automatic logs, and documented the managed-toolchain test workaround.
+
+2026-10-29: PR review tightened the trusted boundary further: only literal text blocks are now included, with attachment metadata omitted entirely. Evidence rendering now escapes all non-space whitespace separators, malformed or unknown JSON risk/auth fields cannot default to an allow, and all assessment rationale remains out of stderr. Full workspace tests passed on both the active and minimum Rust toolchains.

@@ -61,7 +61,8 @@ request. It ends its answer with one verdict line, `ALLOW: <why>` or
 high risk proceeds only when your instructions authorize it. A reply without
 a verdict is asked again up to three times; a reviewer failure, or still no
 verdict, denies the action rather than letting it run. Denials are shown in the editor transcript with the specific
-reason, and every decision is logged to stderr with its rationale.
+reason. Stderr logs the stable approval id and outcome; reviewer rationale is
+kept in the editor transcript rather than copied into routine logs.
 
 ```mermaid
 flowchart TD

@@ -10374,7 +10374,7 @@ fn deny_review_job(
 ) {
     let notice = kind.notice(rationale);
     let log_reason = match kind {
-        ReviewDeny::Assessment => format!("auto-review deny {}: {rationale}", job.approval_id),
+        ReviewDeny::Assessment => format!("auto-review deny {}: reviewer denied", job.approval_id),
         ReviewDeny::ReviewerFailed => {
             format!("auto-review deny {}: reviewer failed", job.approval_id)
         }
@@ -10431,10 +10431,7 @@ fn finish_review(
         Some(assessment) => match reviewer::effective_outcome(&assessment) {
             reviewer::Outcome::Allow => match reviewer::allow_choice(&job.choices) {
                 Some(choice) => {
-                    log(&format!(
-                        "auto-review allow {}: {}",
-                        job.approval_id, assessment.rationale
-                    ));
+                    log(&format!("auto-review allow {}", job.approval_id));
                     send_permission_decision(
                         host,
                         stdout,

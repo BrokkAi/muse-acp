@@ -95,10 +95,13 @@ a model that allows a critical action cannot override the policy.
   `turn/modelRetryScheduled`) is logged as `auto-review reviewer turn: …`, so a
   slow review is distinguishable from a hung one.
 
-Every decision is logged to the adapter's stderr:
+Every decision is logged to the adapter's stderr by approval id and outcome:
 
-    [muse-acp] auto-review allow ap-1: routine workspace edit
-    [muse-acp] auto-review deny ap-2: credential exfiltration to an untrusted host
+    [muse-acp] auto-review allow ap-1
+    [muse-acp] auto-review deny ap-2: reviewer denied
+
+Reviewer rationale is not copied into routine stderr because it can contain
+workspace or prompt text; the editor transcript carries the rationale.
 
 ## Enabling it
 
