@@ -29,7 +29,8 @@ This plan deliberately does not include the unstable ACP features in #316, #317,
 - [x] (2026-10-29 21:35Z) Added fold and fake-host coverage for work IDs, replay hints, held tool calls, earlier history, wake sources, reviewer reasons, session provenance, resume model selection, and request denial.
 - [x] (2026-10-29 21:45Z) Updated `README.md`, `docs/acp-extensions.md`, `ROADMAP.md`, `CHANGELOG.md`, and the existing Muse 1.4.x adoption plan.
 - [x] (2026-10-29 22:00Z) Ran formatting, Clippy, full workspace tests on 1.99.1 and 1.88.0, selftest, both live loopback suites, npm, Python, shell, and smoke checks.
-- [ ] (2026-10-29 22:05Z) Committed, pushed, and opened PR #446. Remaining: review CI and the diff, fix findings, and merge when the required checks are green.
+- [x] (2026-10-29 22:05Z) Committed, pushed, and opened PR #446.
+- [x] (2026-10-29 22:15Z) Reviewed the final diff, corrected the living-plan state and reviewer-reason rendering, and confirmed the required CI checks are green.
 
 
 ## Surprises & Discoveries
@@ -123,7 +124,7 @@ The Muse-version backlog is implemented locally. Work IDs and replay hints/ancho
 
 Validation passed on Rust 1.99.1 and the 1.88.0 minimum: 262 adapter unit tests, 445 adapter integration tests, all `acp-lite` and `muse-msp-client` suites, 8 field-matrix tests, Clippy with warnings denied, formatting, and selftest. Selftest now prints tested `sdk-manifest` and `host-1.4.14` rows for fingerprint `c94c...`. Both real-host loopback suites pass against `1.4.14-R7309.1` (52 adapter tests and 1 client test), along with 4 Node launcher tests, 43 Python tests with 6 platform skips, shell syntax, and npm smoke.
 
-The branch is committed and pushed as `2013af4`, and [PR #446](https://github.com/BrokkAi/muse-acp/pull/446) tracks review and merge. At the time of this handoff the required GitHub checks are still running.
+The branch is committed and pushed as `2013af4` with review follow-up `b12de03`, and [PR #446](https://github.com/BrokkAi/muse-acp/pull/446) tracks merge. The full diff was reviewed, findings were fixed, and the required CI checks are green.
 
 
 ## Context and Orientation
