@@ -12851,6 +12851,22 @@ fn native_subagent_result_ready_settles_the_child_once() {
     let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
     let pid = c.prompt(&sid, "delegate three");
     c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    for child in [
+        "child-sess-ready-a",
+        "child-sess-ready-b",
+        "child-sess-ready-c",
+    ] {
+        // The prompt response and the final host notifications can race on
+        // slower runners, so wait for the observed settlement before checking
+        // that each child settled exactly once.
+        c.wait_for_all(
+            &[
+                "\"sessionUpdate\":\"subagent_state_update\"",
+                &format!("\"subagentSessionId\":\"{child}\""),
+            ],
+            Duration::from_secs(15),
+        );
+    }
     let frames = c
         .frames
         .lock()
