@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased
+
+- Harden auto-review against prompt injection. Only typed prompt text is
+  trusted for user authorization, attached resources and their URIs are
+  omitted, and untrusted transcript entries are rendered as escaped
+  single-line evidence. Auto-review also rejects a bare JSON allow without
+  valid risk, authorization, and rationale evidence, and no longer writes
+  reviewer replies or host stderr text to automatic logs (#434, #441).
+
+- Show hidden characters in permission and tool-card titles. Newlines,
+  terminal controls, bidi controls, and zero-width characters are rendered as
+  visible escapes so an approval cannot hide the command or path it would run
+  (#435).
+
+- Authenticate editor-bridge requests from their headers before reading a
+  body, and bound the bridge to 32 active connections with a 60-second idle
+  timeout. The MSP client also caps each host stdout frame at 16 MiB (#436,
+  #441).
+
+- Pin the remaining release and fuzz GitHub Actions to full commit SHAs
+  (#437).
+
+- Document that Read-only and Plan do not sandbox client MCP tools, and warn
+  when the effective host approval mode is `allowAll`, which bypasses both
+  editor prompts and Auto-review. `MUSE_APPROVAL_MODE=promptUnmatched` is the
+  documented setting for harnesses that require an approval boundary (#439,
+  #440).
+
+- Resolve the default Unix Muse executable to a full path from an absolute
+  PATH entry or the installer location, and select only explicitly
+  reject-like approval decisions when cancellation fails closed (#441).
+
 ## 0.18.1
 
 - Settle native subagents when their result is ready (#430). A child started

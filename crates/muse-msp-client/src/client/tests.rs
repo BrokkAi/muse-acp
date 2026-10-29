@@ -8,6 +8,26 @@ use std::sync::mpsc::TryRecvError;
 
 const WAIT: Duration = Duration::from_secs(5);
 
+#[test]
+fn stdout_frames_are_bounded_before_parsing() {
+    let mut frame = Vec::new();
+    let mut ok = io::Cursor::new(b"1234567\n".to_vec());
+    assert_eq!(
+        read_frame(&mut ok, &mut frame, 8).unwrap(),
+        FrameRead::Complete
+    );
+    assert_eq!(frame, b"1234567\n");
+
+    let mut too_large = io::Cursor::new(b"12345678\n".to_vec());
+    assert_eq!(
+        read_frame(&mut too_large, &mut frame, 8).unwrap(),
+        FrameRead::TooLarge
+    );
+
+    let mut eof = io::Cursor::new(Vec::<u8>::new());
+    assert_eq!(read_frame(&mut eof, &mut frame, 8).unwrap(), FrameRead::Eof);
+}
+
 /// The host side of an in-memory transport: bytes it sends arrive on the
 /// client's reader, and every frame the client flushes arrives here.
 struct Peer {

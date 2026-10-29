@@ -2356,6 +2356,11 @@ fn auto_review_denies_when_the_reviewer_denies() {
         !frames.contains("session/request_permission"),
         "a reviewed denial must not prompt: {frames}"
     );
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        !stderr.contains("Credential exfiltration."),
+        "reviewer rationale must not enter stderr: {stderr}"
+    );
     c.finish();
 }
 
@@ -2371,16 +2376,19 @@ fn auto_review_denies_on_unusable_reviewer_output() {
     let _pid = c.prompt(&sid, "do the thing");
     c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
     c.wait_stderr(
-        "auto-review deny ap-1: auto-review returned no usable decision: the reviewer reply had no verdict. The reviewer said: not json",
+        "auto-review deny ap-1: reviewer failed",
         Duration::from_secs(15),
     );
-    c.wait_stderr("was unusable: \"not json\"", Duration::from_secs(15));
     // Every follow-up is spent before the deny, and no more.
     c.wait_stderr("asking again (3/3)", Duration::from_secs(15));
     let log = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
     assert!(
         !log.contains("asking again (4/"),
         "at most three follow-ups: {log}"
+    );
+    assert!(
+        !log.contains("not json"),
+        "unusable model text must not enter stderr: {log}"
     );
     let notice = c.wait_for(
         "Permission denied: reviewer failed: auto-review returned no usable decision: the reviewer reply had no verdict. The reviewer said: not json.",
@@ -2414,9 +2422,11 @@ fn auto_review_asks_again_for_a_verdict_before_denying() {
     let _pid = c.prompt(&sid, "inspect agent.rs on master");
     c.wait_stderr("asking again (1/3)", Duration::from_secs(15));
     c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(15));
-    c.wait_stderr(
-        "auto-review allow ap-1: Read-only inspection.",
-        Duration::from_secs(15),
+    c.wait_stderr("auto-review allow ap-1", Duration::from_secs(15));
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        !stderr.contains("Read-only inspection."),
+        "reviewer rationale must not enter stderr: {stderr}"
     );
     c.finish();
 }
@@ -2440,11 +2450,14 @@ fn auto_review_reply_is_the_latest_agent_message_only() {
     let _ = c.wait_for(&format!("\"id\":{set_id}"), Duration::from_secs(15));
     let _pid = c.prompt(&sid, "do the thing");
     c.wait_input("\"choiceId\": \"c-allow\"", Duration::from_secs(15));
-    c.wait_stderr("auto-review allow ap-1: Routine.", Duration::from_secs(15));
+    c.wait_stderr("auto-review allow ap-1", Duration::from_secs(15));
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
     assert!(
-        !std::fs::read_to_string(&c.stderr_log)
-            .unwrap_or_default()
-            .contains("asking again"),
+        !stderr.contains("Routine."),
+        "reviewer rationale must not enter stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("asking again"),
         "a usable latest message needs no follow-up"
     );
     c.finish();
@@ -2465,7 +2478,7 @@ fn auto_review_names_a_failed_reviewer_turn() {
     let _pid = c.prompt(&sid, "open an issue");
     c.wait_input("\"choiceId\": \"c-deny\"", Duration::from_secs(15));
     c.wait_stderr(
-        "auto-review deny ap-1: reviewer turn failed: contextWindowExceeded: prompt is too long",
+        "auto-review deny ap-1: reviewer unavailable",
         Duration::from_secs(15),
     );
     let stderr = std::fs::read_to_string(&c.stderr_log).unwrap();
@@ -5253,6 +5266,11 @@ fn session_load_rejects_invalid_roots_and_tolerates_mcp() {
 fn host_default_mode_is_reflected() {
     let mut c = Client::spawn("quiet", &[("FAKE_MODE", "allowAll")]);
     let _sid = c.new_session(2, "");
+    c.wait_stderr("uses approval mode allowAll", Duration::from_secs(15));
+    c.wait_stderr(
+        "MUSE_APPROVAL_MODE=promptUnmatched",
+        Duration::from_secs(15),
+    );
     let log = c
         .frames
         .lock()
@@ -5266,6 +5284,18 @@ fn host_default_mode_is_reflected() {
     assert!(
         cfg.contains("\"currentValue\":\"allowAll\""),
         "host allowAll is reported verbatim: {cfg}"
+    );
+    c.finish();
+}
+
+#[test]
+fn prompting_host_default_does_not_warn() {
+    let mut c = Client::spawn("quiet", &[("FAKE_MODE", "promptUnmatched")]);
+    let _sid = c.new_session(2, "");
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        !stderr.contains("uses approval mode allowAll"),
+        "safe host default must not warn: {stderr}"
     );
     c.finish();
 }
@@ -13801,9 +13831,11 @@ fn host_exit_codes_are_actionable_and_clean_shutdown_is_not_a_crash() {
         let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
         assert!(done.contains(remedy), "exit {code} remedy missing: {done}");
         c.wait_stderr(&format!("exit-code={code}"), Duration::from_secs(15));
-        c.wait_stderr(
-            "serve-exit stderr-tail host diagnostic tail",
-            Duration::from_secs(15),
+        c.wait_stderr("serve-exit stderr-bytes=", Duration::from_secs(15));
+        let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+        assert!(
+            !stderr.contains("host diagnostic tail"),
+            "automatic diagnostics must not log host stderr: {stderr}"
         );
         let status = c
             .child
@@ -14362,8 +14394,12 @@ fn support_bundle_redacts_unknown_muse_env_values() {
         "serve exit classification missing: {text}"
     );
     assert!(
-        text.contains("stderr-tail serve gate disabled"),
-        "serve stderr evidence missing: {text}"
+        text.contains("stderr-bytes=") && text.contains("contents=omitted"),
+        "serve stderr summary missing: {text}"
+    );
+    assert!(
+        !text.contains("support-serve-exit stderr-tail"),
+        "support bundle must not include host stderr: {text}"
     );
     assert!(
         text.contains("MUSE_TOOL_OUTPUT_LIMIT=1234"),
@@ -14660,12 +14696,14 @@ fn terminal_auth_method_runs_muse_acp_login() {
         );
         if version == 1 {
             let legacy = &method["_meta"]["terminal-auth"];
-            // Compare as paths: Cargo may spell the target dir with `/` on Windows.
-            assert_eq!(
-                std::path::Path::new(legacy["command"].as_str().unwrap_or_default()),
-                std::path::Path::new(&adapter_bin()),
-                "{frame}"
-            );
+            // Compare the files Cargo actually launched: a managed target
+            // cache may expose the same executable through another path.
+            let command = legacy["command"].as_str().unwrap_or_default();
+            let command = std::fs::canonicalize(command)
+                .unwrap_or_else(|_| std::path::PathBuf::from(command));
+            let expected = std::fs::canonicalize(adapter_bin())
+                .unwrap_or_else(|_| std::path::PathBuf::from(adapter_bin()));
+            assert_eq!(command, expected, "{frame}");
             assert_eq!(legacy["args"], serde_json::json!(["login"]), "{frame}");
         }
 

@@ -172,6 +172,8 @@ success.
   `HostClosed` instead of waiting for its deadline.
 - Malformed or non-UTF-8 frames are skipped and reported as diagnostics; the
   connection keeps working.
+- A stdout frame larger than 16 MiB closes the connection with a typed
+  diagnostic instead of growing the reader buffer without bound.
 - Host stderr is kept in a tail of at most 100 lines and 8 KiB
   (`stderr_tail()`), attached to the exit classification, and never parsed
   as protocol input.
@@ -190,7 +192,10 @@ unhandled error, 2 a usage error, 3 a configuration error, 4 an unavailable
 session lease, 5 a disabled SDK surface, and anything else (or a signal) a
 crash. `retryable()`, `retry_advice()`, and `support_lines()` turn it into a
 decision or a diagnostic. `probe_exit` runs the configured host with stdin
-closed and classifies how it ends, without sending any frame.
+closed and classifies how it ends, without sending any frame. `support_lines()`
+reports the captured stderr byte count but omits its contents; a caller that
+deliberately handles potentially sensitive host output can read `stderr_tail`
+directly.
 
 ## Embedding hooks
 

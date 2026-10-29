@@ -202,6 +202,8 @@ impl std::error::Error for LaunchError {
 pub enum Diagnostic<'a> {
     /// A frame that is not UTF-8 was skipped.
     InvalidUtf8Frame,
+    /// A stdout frame exceeded the reader's memory bound.
+    StdoutFrameTooLarge { max_bytes: usize },
     /// A frame that is not valid JSON was skipped.
     MalformedFrame { error: &'a str },
     /// A server request for a method without a configured
@@ -228,6 +230,12 @@ impl fmt::Display for Diagnostic<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Diagnostic::InvalidUtf8Frame => f.write_str("serve parse error: invalid UTF-8 frame"),
+            Diagnostic::StdoutFrameTooLarge { max_bytes } => {
+                write!(
+                    f,
+                    "serve protocol error: stdout frame exceeds {max_bytes} bytes"
+                )
+            }
             Diagnostic::MalformedFrame { error } => write!(f, "serve parse error: {error}"),
             Diagnostic::UnsupportedServerRequest { method, id } => write!(
                 f,

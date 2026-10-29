@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -39,6 +39,8 @@ const ENDPOINT: &str = "/mcp";
 const MAX_HEAD_BYTES: usize = 64 * 1024;
 const MAX_HEADERS: usize = 100;
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+const MAX_CONNECTIONS: usize = 32;
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// The most file text one read returns to the model.
 const MAX_READ_BYTES: usize = 256 * 1024;
 /// The largest old plus new text a diff card carries.
@@ -66,6 +68,7 @@ static RUNNING: LazyLock<Mutex<HashMap<CallKey, Arc<AtomicBool>>>> =
     LazyLock::new(Default::default);
 /// Card content waiting for its tool card to complete.
 static CARDS: LazyLock<Mutex<Vec<Card>>> = LazyLock::new(Default::default);
+static ACTIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|p| p.into_inner())
@@ -148,6 +151,30 @@ pub fn approval_title(tool_name: &str, raw_args: Option<&str>) -> Option<String>
     Some(format!("{tool_name}: {detail}{cwd}"))
 }
 
+struct ConnectionSlot<'a> {
+    active: &'a AtomicUsize,
+}
+
+impl Drop for ConnectionSlot<'_> {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn try_connection_slot(active: &AtomicUsize, limit: usize) -> Option<ConnectionSlot<'_>> {
+    let mut current = active.load(Ordering::SeqCst);
+    loop {
+        if current >= limit {
+            return None;
+        }
+        match active.compare_exchange_weak(current, current + 1, Ordering::SeqCst, Ordering::SeqCst)
+        {
+            Ok(_) => return Some(ConnectionSlot { active }),
+            Err(next) => current = next,
+        }
+    }
+}
+
 /// Start the listener once and return its port.
 pub fn start(stdout: &StdoutShared, sessions: &Sessions) -> Option<u16> {
     *SERVER.get_or_init(|| {
@@ -174,10 +201,19 @@ pub fn start(stdout: &StdoutShared, sessions: &Sessions) -> Option<u16> {
             .spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { continue };
+                    let Some(slot) = try_connection_slot(&ACTIVE_CONNECTIONS, MAX_CONNECTIONS)
+                    else {
+                        // Do not add a thread for an excess idle socket.
+                        drop(stream);
+                        continue;
+                    };
                     let shared = shared.clone();
                     let _ = std::thread::Builder::new()
                         .name("editor-tools-conn".into())
-                        .spawn(move || serve_connection(stream, &shared));
+                        .spawn(move || {
+                            let _slot = slot;
+                            serve_connection(stream, &shared);
+                        });
                 }
             });
         if let Err(e) = spawned {
@@ -361,16 +397,16 @@ impl Response {
 
 fn serve_connection(stream: TcpStream, shared: &Shared) {
     let _ = stream.set_nodelay(true);
-    // Muse keeps the connection between calls; one idle for five minutes is
+    // Muse keeps the connection between calls; one idle for a minute is
     // dropped, and Muse opens a new one.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(300)));
+    let _ = stream.set_read_timeout(Some(IDLE_TIMEOUT));
     let Ok(read_half) = stream.try_clone() else {
         return;
     };
     let mut reader = BufReader::new(read_half);
     let mut writer = stream;
     loop {
-        let request = match read_request(&mut reader) {
+        let request = match read_request_admitting(&mut reader, &admitted) {
             Ok(request) => request,
             Err(ReadError::Closed) => return,
             Err(ReadError::Bad(status, _)) => {
@@ -413,7 +449,32 @@ fn read_line(reader: &mut impl BufRead, budget: &mut usize) -> Result<Option<Str
         .map_err(|_| ReadError::Bad(400, "request head is not UTF-8"))
 }
 
+/// Whether a request head may have its body read: a POST to the MCP endpoint,
+/// no browser `Origin`, and the bearer token of a known session. `route`
+/// applies the same identity checks when it answers; this one prevents an
+/// unauthenticated peer from making the adapter buffer a body.
+fn admitted(request: &Request) -> bool {
+    request.method == "POST"
+        && request.target.split('?').next() == Some(ENDPOINT)
+        && request.header("origin").is_none()
+        && known_bearer_token(request).is_some()
+}
+
+#[cfg(test)]
 fn read_request(reader: &mut impl BufRead) -> Result<Request, ReadError> {
+    read_request_admitting(reader, &|_| true)
+}
+
+/// Decides from a request head whether to read its body.
+type Admit<'a> = dyn Fn(&Request) -> bool + 'a;
+
+/// Read one request. A head that `admit` refuses gets no body read: the
+/// request comes back with an empty body and `close` set, so `route` answers
+/// it from its headers and the connection ends.
+fn read_request_admitting(
+    reader: &mut impl BufRead,
+    admit: &Admit<'_>,
+) -> Result<Request, ReadError> {
     let mut budget = MAX_HEAD_BYTES;
     // A blank line before the request line is allowed (RFC 9112 2.2).
     let request_line = loop {
@@ -464,6 +525,10 @@ fn read_request(reader: &mut impl BufRead) -> Result<Request, ReadError> {
     } else {
         connection.contains("close")
     };
+    if !admit(&request) {
+        request.close = true;
+        return Ok(request);
+    }
     let chunked = request
         .header("transfer-encoding")
         .is_some_and(|te| te.to_ascii_lowercase().contains("chunked"));
@@ -564,6 +629,15 @@ fn write_response(out: &mut impl Write, response: &Response, close: bool) -> std
 /// Answers one JSON-RPC request: caller's token, method, id, params.
 type Handler<'a> = dyn Fn(&str, &str, &J, Option<&J>) -> String + 'a;
 
+fn bearer_token(request: &Request) -> Option<&str> {
+    let (scheme, token) = request.header("authorization")?.split_once(' ')?;
+    scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
+}
+
+fn known_bearer_token(request: &Request) -> Option<&str> {
+    bearer_token(request).filter(|token| lock(&TOKENS).contains_key(*token))
+}
+
 fn route(request: &Request, handle: &Handler<'_>) -> Response {
     // A browser always sends Origin; Muse never does. Refusing it keeps web
     // pages (DNS rebinding included) away from the editor's files.
@@ -573,13 +647,7 @@ fn route(request: &Request, handle: &Handler<'_>) -> Response {
     if request.target.split('?').next() != Some(ENDPOINT) {
         return Response::status(404);
     }
-    let token = request
-        .header("authorization")
-        .and_then(|value| {
-            let (scheme, token) = value.split_once(' ')?;
-            scheme.eq_ignore_ascii_case("bearer").then(|| token.trim())
-        })
-        .filter(|token| lock(&TOKENS).contains_key(*token));
+    let token = known_bearer_token(request);
     let Some(token) = token else {
         let mut response = Response::status(401);
         response.headers.push(("www-authenticate", "Bearer"));
@@ -1785,6 +1853,69 @@ mod tests {
             MAX_BODY_BYTES + 1
         );
         assert!(matches!(request(&big), Err(ReadError::Bad(413, _))));
+    }
+
+    #[test]
+    fn an_unauthenticated_head_gets_no_body_read() {
+        let raw = format!("POST /mcp HTTP/1.1\r\nContent-Length: {}\r\n\r\nabcd", 4);
+        let r = read_request_admitting(&mut BufReader::new(raw.as_bytes()), &|_| false).unwrap();
+        assert!(r.body.is_empty());
+        assert!(r.close);
+
+        let token = session_token(Some("admit-test-session"));
+        let valid = http(
+            "POST",
+            "/mcp",
+            &[("authorization", &format!("Bearer {token}"))],
+            "{}",
+        );
+        assert!(admitted(&valid));
+        assert!(!admitted(&http("POST", "/mcp", &[], "{}")));
+        assert!(!admitted(&http(
+            "POST",
+            "/mcp",
+            &[("authorization", "Bearer not-a-session-token")],
+            "{}"
+        )));
+        assert!(!admitted(&http(
+            "POST",
+            "/mcp",
+            &[
+                ("authorization", &format!("Bearer {token}")),
+                ("origin", "https://evil.example"),
+            ],
+            "{}"
+        )));
+        assert!(!admitted(&http(
+            "GET",
+            "/mcp",
+            &[("authorization", &format!("Bearer {token}"))],
+            ""
+        )));
+
+        let oversized = format!(
+            "POST /mcp HTTP/1.1\r\nAuthorization: Bearer {token}\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        assert!(matches!(
+            read_request_admitting(&mut BufReader::new(oversized.as_bytes()), &admitted),
+            Err(ReadError::Bad(413, _))
+        ));
+    }
+
+    #[test]
+    fn connection_slots_are_bounded_and_released_on_drop() {
+        let active = AtomicUsize::new(0);
+        let first = try_connection_slot(&active, 2).expect("first slot");
+        let second = try_connection_slot(&active, 2).expect("second slot");
+        assert!(try_connection_slot(&active, 2).is_none());
+        assert_eq!(active.load(Ordering::SeqCst), 2);
+        drop(first);
+        assert_eq!(active.load(Ordering::SeqCst), 1);
+        let replacement = try_connection_slot(&active, 2).expect("released slot");
+        drop(replacement);
+        drop(second);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     fn http(method: &str, target: &str, headers: &[(&str, &str)], body: &str) -> Request {
