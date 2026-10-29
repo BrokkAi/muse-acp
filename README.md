@@ -177,6 +177,10 @@ Both commands are safe to re-run: they preserve existing agent entries, write a
 `.bak` backup, and replace the settings file atomically. Use `--dry-run` to
 preview an edit.
 
+On Unix, a newly created settings file is owner-only (`0600`). When an existing
+file is replaced, its permissions are preserved so values such as `--env`
+secrets do not become more broadly readable.
+
 Any other ACP client can launch `muse-acp` directly over stdio.
 
 ## Editor setup
