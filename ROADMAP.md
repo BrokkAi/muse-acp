@@ -305,9 +305,9 @@ nightly matrix makes the 1.4.11 surface tested
 vendored 1.4.14 surface tested, and its Linux, macOS, and Windows artifacts
 now pin the nightly matrix. The
 1.4.9/1.4.10 surface stays degraded, since no 1.4.9 or 1.4.10 build is pinned. The `live-host` CI job also runs
-`tests/live_loopback.rs` on every push against each pinned Muse build on
-Linux x86-64, and the newest on macOS arm64 (downloaded and
-checksum-verified), with no credentials: a real `muse serve`
+`tests/live_loopback.rs` nightly against each supported pinned Muse build from
+1.4.11 through 1.4.14 on Linux x86-64 and Windows x64, and the newest on macOS
+arm64 (downloaded and checksum-verified), with no credentials: a real `muse serve`
 whose model calls go to a scripted loopback provider. It covers prompt to
 `end_turn`, shell approval allow and deny, a piped command whose approval
 carries both stages, cancel during a streaming model step, reload after an

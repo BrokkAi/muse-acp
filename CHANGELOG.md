@@ -22,6 +22,10 @@
   the editor. Every 1.4.14 definition and field has an explicit disposition,
   and Linux, macOS, and Windows 1.4.14 artifacts join the nightly matrix.
 
+- Set the nightly live-host support floor at Muse 1.4.11, removing 15 recurring
+  pre-1.4.11 Linux and Windows jobs while retaining their fingerprints as
+  historical compatibility evidence.
+
 - Harden auto-review against prompt injection. Only typed prompt text is
   trusted for user authorization, attached resources and their URIs are
   omitted, and untrusted transcript entries are rendered as escaped
