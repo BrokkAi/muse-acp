@@ -61,7 +61,18 @@ def pack(assets, output):
         directory = Path(temp) / 'package'
         manifest = stage(assets, directory)
         result = json.loads(npm('pack', '--json', '--ignore-scripts', '--pack-destination',
-                                str(output.resolve()), cwd=directory))[0]
+                                str(output.resolve()), cwd=directory))
+        # npm 12 keys results by package name; earlier versions return a list.
+        if isinstance(result, dict):
+            release.require(set(result) == {manifest['name']}, 'unexpected npm pack package names')
+            result = result[manifest['name']]
+        else:
+            release.require(isinstance(result, list) and len(result) == 1,
+                            'expected one npm pack result')
+            result = result[0]
+        release.require(result.get('name') == manifest['name']
+                        and result.get('version') == manifest['version'],
+                        'npm pack package identity mismatch')
     archive = output / result['filename']
     integrity = 'sha512-' + base64.b64encode(hashlib.sha512(archive.read_bytes()).digest()).decode()
     release.require(integrity == result['integrity'], 'npm tarball integrity mismatch')

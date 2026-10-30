@@ -10090,6 +10090,79 @@ fn remember_review_line(buf: &mut VecDeque<String>, line: String) {
     }
 }
 
+/// Match only a complete, unambiguous single shell stage from the pinned MSP
+/// schema. Raw command text, titles and suggested prefixes are never authority.
+fn command_prefix_choice(params: &J) -> Option<String> {
+    static PREFIXES: LazyLock<Vec<Vec<String>>> = LazyLock::new(|| {
+        let Ok(raw) = std::env::var("MUSE_ACP_ALLOW_COMMAND_PREFIXES") else {
+            return Vec::new();
+        };
+        match serde_json::from_str::<Vec<Vec<String>>>(&raw) {
+            Ok(prefixes)
+                if prefixes
+                    .iter()
+                    .all(|p| !p.is_empty() && p.iter().all(|w| !w.is_empty())) =>
+            {
+                prefixes
+            }
+            _ => {
+                log("invalid MUSE_ACP_ALLOW_COMMAND_PREFIXES; command prefix approval disabled");
+                Vec::new()
+            }
+        }
+    });
+    if PREFIXES.is_empty() || params.non_empty_str("toolName") != Some("workspace-shell") {
+        return None;
+    }
+    let subject = params.get("subject")?;
+    if subject.non_empty_str("kind") != Some("shell") {
+        return None;
+    }
+    let J::Arr(stages) = subject.get("stages")? else {
+        return None;
+    };
+    let [stage] = stages.as_slice() else {
+        return None;
+    };
+    let requirement = params.get("currentRequirementId")?;
+    if requirement.non_empty_str("approvalId") != params.non_empty_str("approvalId")
+        || requirement.get("sourceIndex").map(j_to_string).as_deref() != Some("0")
+        || stage.get("requirementId").map(j_to_string) != Some(j_to_string(requirement))
+        || stage.get("position").map(j_to_string).as_deref() != Some("1")
+        || stage.get("totalStages").map(j_to_string).as_deref() != Some("1")
+        || !matches!(stage.get("argvComplete"), Some(J::Bool(true)))
+        || stage.get("resolution")?.non_empty_str("kind") != Some("unresolved")
+    {
+        return None;
+    }
+    let J::Arr(words) = stage.get("argv")? else {
+        return None;
+    };
+    let argv: Option<Vec<&str>> = words.iter().map(J::as_str).collect();
+    let argv = argv?;
+    if !PREFIXES
+        .iter()
+        .any(|p| argv.len() >= p.len() && argv.iter().zip(p).all(|(a, b)| *a == b))
+    {
+        return None;
+    }
+    // Require an explicitly offered once grant; perm_options tolerates missing
+    // scopes for interactive compatibility, which is too broad for policy.
+    let J::Arr(offered) = params.get("availableChoices")? else {
+        return None;
+    };
+    let (_, choices) = acp::perm_options(params);
+    let choice = acp::approve_once_choice(&choices)?;
+    offered
+        .iter()
+        .any(|c| {
+            c.non_empty_str("choiceId") == Some(choice.as_str())
+                && c.non_empty_str("scope") == Some("once")
+                && c.non_empty_str("decision") == Some("approved")
+        })
+        .then_some(choice)
+}
+
 /// Hand an approval to the reviewer instead of the editor. Returns false when
 /// auto-review is off or the approval cannot be described well enough to try.
 fn enqueue_review(
@@ -13553,6 +13626,34 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
     );
     // Adapter policy answers eligible approvals before the editor sees them.
     // Ineligible or ambiguous requests fall through to the ordinary prompt.
+    if let Some(choice) = command_prefix_choice(params) {
+        let ver = {
+            let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(s) = map.get_mut(&acp_sid) else {
+                return;
+            };
+            if !s.approval_seen.insert(approval_key) {
+                return;
+            }
+            s.ver
+        };
+        send_permission_decision(
+            host,
+            stdout,
+            sessions,
+            &acp_sid,
+            PermissionDecision {
+                msp_sid: msp_sid.to_string(),
+                ver,
+                approval_id,
+                requirement,
+                choice,
+                feedback: None,
+                deny_notice: None,
+            },
+        );
+        return;
+    }
     if enqueue_review(host, stdout, sessions, &acp_sid, &owner_msp_sid, params) {
         return;
     }
