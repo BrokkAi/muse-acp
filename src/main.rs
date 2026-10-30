@@ -10111,7 +10111,7 @@ fn command_prefix_choice(params: &J) -> Option<String> {
             }
         }
     });
-    if PREFIXES.is_empty() || params.non_empty_str("toolName") != Some("workspace-shell") {
+    if PREFIXES.is_empty() || params.non_empty_str("toolName") != Some("bash") {
         return None;
     }
     let subject = params.get("subject")?;

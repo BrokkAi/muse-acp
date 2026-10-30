@@ -1014,7 +1014,7 @@ an offered **allow once** choice before automatic review or an ACP permission
 prompt. The value is a JSON array of nonempty argv prefixes, matched exactly
 against the host's complete structured argv. Invalid values disable this policy
 and emit a diagnostic. Unset or `[]` leaves normal approval handling in place.
-Only a single unresolved shell stage with matching requirement IDs and consistent
-single-stage boundaries qualifies. Compound commands, wrappers, incomplete argv,
-other tools and persistent grants continue through normal review. This grants no
+Only Muse's `bash` tool with a single unresolved shell stage, matching requirement
+IDs and consistent single-stage boundaries qualifies. Compound commands, wrappers,
+incomplete argv, other tools and persistent grants continue through normal review. This grants no
 standing Muse policy rule; every matching approval is decided separately.
