@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.20.0
+
+- Add opt-in native command prefix approval through
+  `MUSE_ACP_ALLOW_COMMAND_PREFIXES`. Exact structured argv prefixes can approve
+  an explicitly offered allow-once choice before Auto-review or ACP prompts.
+  Only complete, unambiguous single-stage shell commands qualify; other
+  approvals retain normal handling. No persistent Muse grants are created.
+
+- Accept npm 12 package-name-keyed `npm pack --json` results as well as the
+  list format emitted by earlier npm versions when preparing release packages.
+
 ## 0.19.0
 
 - Re-pin the Muse Code SDK corpus to `a45cb67` and the stable Muse

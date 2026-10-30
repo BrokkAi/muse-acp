@@ -1006,3 +1006,15 @@ never in a public issue.
 
 Copyright 2026 Brokk.ai. Licensed under the Apache License, Version 2.0. See
 [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+### Command prefix approval (opt in)
+
+`MUSE_ACP_ALLOW_COMMAND_PREFIXES='[["gh"]]'` lets the native adapter approve
+an offered **allow once** choice before automatic review or an ACP permission
+prompt. The value is a JSON array of nonempty argv prefixes, matched exactly
+against the host's complete structured argv. Invalid values disable this policy
+and emit a diagnostic. Unset or `[]` leaves normal approval handling in place.
+Only Muse's `bash` tool with a single unresolved shell stage, matching requirement
+IDs and consistent single-stage boundaries qualifies. Compound commands, wrappers,
+incomplete argv, other tools and persistent grants continue through normal review. This grants no
+standing Muse policy rule; every matching approval is decided separately.

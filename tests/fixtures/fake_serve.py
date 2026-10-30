@@ -313,6 +313,8 @@ APPROVAL_PARAMS = {
          "decision": "denied", "scope": "once"},
     ],
 }
+if os.environ.get("FAKE_PREFIX_APPROVAL"):
+    APPROVAL_PARAMS.update(json.loads(os.environ["FAKE_PREFIX_APPROVAL"]))
 if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "file-write":
     APPROVAL_PARAMS["toolName"] = "workspace-files"
     APPROVAL_PARAMS["subject"] = {

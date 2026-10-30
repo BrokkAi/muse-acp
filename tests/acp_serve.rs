@@ -16925,3 +16925,106 @@ fn an_editor_terminal_approval_names_the_command_it_would_run() {
     drop(frames);
     c.finish();
 }
+
+// Hard-won: aea2ff0: real Muse shell approvals identify the tool as bash.
+#[test]
+fn command_prefix_policy_precedes_review_and_preserves_ambiguous_approvals() {
+    use serde_json::json;
+    for case in [
+        "gh",
+        "unmatched",
+        "compound",
+        "incomplete",
+        "other",
+        "other_tool",
+        "conflict",
+        "wrapper",
+        "persistent",
+        "disabled",
+    ] {
+        let requirement = json!({"approvalId":"ap-1", "sourceIndex":0});
+        // Captured from Muse 1.4.14-R7309.1 for gh --version; IDs and paths normalized.
+        let mut approval = json!({"approvalId":"ap-1", "toolName":"bash",
+            "currentRequirementId":requirement,
+            "rawArgs":"{\"command\":\"gh --version\",\"description\":\"Print GitHub CLI version\"}",
+            "availableChoices":[
+                {"choiceId":"allow_once","decision":"approved","label":"Allow once","scope":"once"},
+                {"choiceId":"allow_local_prefix","decision":"approvedPolicyAmendment",
+                    "label":"Always allow in this workspace: gh ...","scope":"localPersistent"},
+                {"choiceId":"abort","decision":"abort","label":"Reject","scope":"once","acceptsFeedback":true}],
+            "subject":{"kind":"shell", "command":"gh --version", "workspaceRoot":"/workspace",
+                "stages":[{"argv":["gh","--version"],"argvComplete":true,
+                    "position":1,"totalStages":1,"requirementId":requirement,
+                    "resolution":{"kind":"unresolved"},
+                    "suggestedPrefix":{"argvPrefix":["gh"],"label":"Always allow in this workspace: gh ..."}}]}});
+        match case {
+            "unmatched" => approval["subject"]["stages"][0]["argv"] = json!(["git", "status"]),
+            "wrapper" => {
+                approval["subject"]["stages"][0]["argv"] = json!(["sh", "-c", "gh issue view"])
+            }
+            "compound" => {
+                approval["subject"]["stages"][0]["totalStages"] = json!(2);
+                let mut second = approval["subject"]["stages"][0].clone();
+                second["argv"] = json!(["rm", "file"]);
+                approval["subject"]["stages"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(second);
+            }
+            "incomplete" => approval["subject"]["stages"][0]["argvComplete"] = json!(false),
+            "other_tool" => approval["toolName"] = json!("workspace-shell"),
+            "other" => approval["subject"]["kind"] = json!("tool"),
+            "conflict" => {
+                approval["subject"]["stages"][0]["requirementId"]["sourceIndex"] = json!(1)
+            }
+            "persistent" => {
+                approval["availableChoices"] =
+                    json!([{"choiceId":"forever","decision":"approved","scope":"localPersistent"}])
+            }
+            _ => {}
+        }
+        let raw = approval.to_string();
+        let prefixes = if case == "disabled" {
+            "[]"
+        } else {
+            r#"[["gh"]]"#
+        };
+        let mut c = Client::spawn(
+            "approval_hang",
+            &[
+                ("FAKE_PREFIX_APPROVAL", &raw),
+                ("MUSE_ACP_ALLOW_COMMAND_PREFIXES", prefixes),
+            ],
+        );
+        let sid = c.new_session(1, "");
+        if case == "gh" {
+            let set = c.req(
+                "session/set_config_option",
+                &format!(
+                    "{{\"sessionId\":\"{sid}\",\"configId\":\"auto_review\",\"value\":\"on\"}}"
+                ),
+            );
+            c.wait_for(&format!("\"id\":{set}"), Duration::from_secs(15));
+        }
+        let _prompt = c.prompt(&sid, "run command");
+        if case == "gh" {
+            c.wait_input("\"choiceId\": \"allow_once\"", Duration::from_secs(15));
+            let decisions = host_requests(&c, "approval/decide");
+            assert_eq!(decisions.len(), 1, "{decisions:?}");
+            assert_eq!(decisions[0]["requirementId"], requirement);
+            assert_eq!(decisions[0]["choiceId"], "allow_once");
+            assert_eq!(host_requests(&c, "turn/start").len(), 1, "no reviewer turn");
+            assert!(
+                !c.frames
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|f| f.contains("session/request_permission"))
+            );
+        } else {
+            c.wait_for("request_permission", Duration::from_secs(15));
+            assert!(host_requests(&c, "approval/decide").is_empty(), "{case}");
+        }
+        c.finish();
+    }
+}
