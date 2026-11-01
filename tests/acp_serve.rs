@@ -6345,6 +6345,36 @@ fn skill_import_renders_the_host_receipt() {
 }
 
 #[test]
+fn prompt_takes_back_a_drive_another_client_took() {
+    let mut c = Client::spawn("drive_taken", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(done.contains("\"stopReason\""), "the prompt runs: {done}");
+    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
+    let calls: Vec<&str> = calls
+        .lines()
+        .filter(|m| matches!(*m, "turn/start" | "session/requestDrive"))
+        .collect();
+    assert_eq!(calls, ["turn/start", "session/requestDrive", "turn/start"]);
+    c.finish();
+}
+
+#[test]
+fn prompt_keeps_the_refusal_when_the_drive_is_not_granted() {
+    let mut c = Client::spawn("drive_busy", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let error = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        error.contains("already in use"),
+        "the host refusal: {error}"
+    );
+    c.wait_log("session/requestDrive", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
 fn unknown_native_skill_preserves_typed_host_error() {
     let mut c = Client::spawn("skill_not_found", &[]);
     let sid = c.new_session(2, "");
