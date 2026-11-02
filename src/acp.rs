@@ -604,9 +604,8 @@ fn written<E>(outcome: Result<(), E>) {
     }
 }
 
-/// Answer an extension method (a `_`-prefixed method, `session/set_model`,
-/// `shutdown`) whose result no ACP schema defines; `result_json` is the
-/// result object as JSON text.
+/// Answer a `_`-prefixed extension method, whose result no ACP schema
+/// defines; `result_json` is the result object as JSON text.
 pub fn send_ext_result(stdout: &StdoutShared, id: &Option<RequestId>, result_json: &str) {
     let Some(id) = id else {
         return;

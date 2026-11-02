@@ -39,35 +39,12 @@ pub type V2Dispatch = v2::Dispatch<v2::schema::ClientRequest, v2::schema::Client
 /// The SDK's error type, which every response error is built from.
 pub use agent_client_protocol::Error;
 
-/// Methods the adapter serves that no ACP schema defines. The SDK's typed
-/// request enums answer an unknown method that does not start with `_`
-/// with method-not-found, so these are claimed first, as untyped messages.
-const NON_STANDARD_METHODS: &[&str] = &[
-    // The legacy unstable `SetSessionModelRequest`; see docs/acp-extensions.md.
-    "session/set_model",
-    // Muse native-subagent controls, passed through to MSP.
-    "subagent/sendMessage",
-    "subagent/followupTask",
-    "subagent/interrupt",
-    "subagent/stop",
-    "subagent/resume",
-    "subagent/reopen",
-    "subagent/close",
-    "subagent/readResult",
-    // Process lifecycle requests some clients send.
-    "shutdown",
-    "exit",
-];
-
-/// Methods one protocol version defines that clients of the other version
-/// also call. They are served under both versions, as before the SDK.
-const V1_ONLY_METHODS: &[&str] = &["session/load", "session/set_mode", "authenticate", "logout"];
-const V2_ONLY_METHODS: &[&str] = &["auth/login", "auth/logout"];
-
 /// Standard methods whose requests carry an extension member at the top
 /// level of their params, which the schema type would drop. ACP v2
 /// `session/fork` takes JetBrains AIR's `replayFrom`, as `session/resume`
-/// does, to replay the fork's history.
+/// does, to replay the fork's history. Every other method is read with its
+/// version's schema type: one the version does not define, or one that does
+/// not start with `_` and no schema defines, gets method-not-found.
 const V2_EXTENDED_METHODS: &[&str] = &["session/fork"];
 
 /// What the connection hands the main loop.
@@ -256,7 +233,6 @@ impl Editor {
         impl sdk::RunWithConnectionTo<Client> + use<>,
         impl sdk::HandleConnectionClose<Client> + use<>,
     > {
-        let untyped = editor.clone();
         let cancels = editor.clone();
         let typed = editor.clone();
         let closed = editor.clone();
@@ -271,20 +247,6 @@ impl Editor {
                     Ok(())
                 },
                 sdk::on_receive_notification!(),
-            )
-            .on_receive_dispatch(
-                async move |dispatch: v1::Dispatch, cx: v1::ConnectionTo<Client>| {
-                    untyped.connected(Connection::V1(cx));
-                    Ok(untyped
-                        .claim_untyped(1, dispatch.into_raw(), V2_ONLY_METHODS)
-                        .map(|dispatch| dispatch.into_protocol())
-                        .transpose()?
-                        .map_or(Handled::Yes, |message| Handled::No {
-                            message,
-                            retry: false,
-                        }))
-                },
-                sdk::on_receive_dispatch!(),
             )
             .on_receive_dispatch(
                 async move |dispatch: V1Dispatch, cx: v1::ConnectionTo<Client>| {
@@ -350,11 +312,7 @@ impl Editor {
                 async move |dispatch: v2::Dispatch, cx: v2::ConnectionTo<Client>| {
                     untyped.connected(Connection::V2(cx));
                     Ok(untyped
-                        .claim_untyped(
-                            2,
-                            dispatch.into_raw(),
-                            &[V1_ONLY_METHODS, V2_EXTENDED_METHODS].concat(),
-                        )
+                        .claim_untyped(2, dispatch.into_raw(), V2_EXTENDED_METHODS)
                         .map(|dispatch| dispatch.into_protocol())
                         .transpose()?
                         .map_or(Handled::Yes, |message| Handled::No {
@@ -406,18 +364,10 @@ impl Editor {
         }
     }
 
-    /// Forward a message whose method the adapter serves without a schema
-    /// type for this version, and give back every other message.
-    fn claim_untyped(
-        &self,
-        ver: u8,
-        dispatch: Dispatch,
-        other_version: &[&str],
-    ) -> Option<Dispatch> {
-        let method = dispatch.method().to_string();
-        let claimed = NON_STANDARD_METHODS.contains(&method.as_str())
-            || other_version.contains(&method.as_str());
-        if !claimed {
+    /// Forward a message whose method is in `claimed`, to be read beside its
+    /// schema type, and give back every other message.
+    fn claim_untyped(&self, ver: u8, dispatch: Dispatch, claimed: &[&str]) -> Option<Dispatch> {
+        if !claimed.contains(&dispatch.method()) {
             return Some(dispatch);
         }
         match dispatch {

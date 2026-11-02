@@ -55,11 +55,16 @@ calling one.
 | `_session/async_task/stop` | AIR `asyncTasks` | Stop one background task. Without it, `session/cancel` maps to host stop-all behavior. |
 | `_session/hooks`, `_session/plugins`, and other reads | Their listed opt-ins | When unavailable, use ordinary prompt commands only where the README documents them; otherwise the surface stays absent. |
 
-### Compatibility methods
+### Methods outside the schema
 
-| Method | Status | Behavior |
-| --- | --- | --- |
-| `session/set_model` | Non-standard. The legacy unstable `SetSessionModelRequest` (ACP v0.10), absent from every current v1 and v2 schema. | Accepts `{sessionId, modelId}`, forwards the id to Muse `session/setModel`, and answers `{"model": modelId}`; Muse's `session/modelChanged` then moves the standard `model` selector through `config_option_update`. New clients should use `session/set_config_option` with the `model` option instead. The adapter never returns the legacy `models` session state, so clients that follow that unstable feature do not call it; it remains for older clients and scripts. |
+Each protocol version serves only the methods its schema defines, and every
+Muse method starts with `_`, as ACP requires of extensions. Any other method
+gets `-32601`, and as a notification it is ignored. So ACP v2 clients resume
+with `session/resume` (with `replayFrom` to replay history; there is no
+`session/load`) and log out with `auth/logout`; ACP v1 clients use
+`authenticate` and `logout`. The model is set through the `model` config
+option; the legacy unstable `session/set_model` is not served. Closing stdin
+ends the session; there is no `shutdown` or `exit` method.
 
 ### Native subagents
 
@@ -73,12 +78,12 @@ child's transcript is sent under the child's session id:
 | JetBrains AIR `nativeSubagentSessions` (an ACP v1 client without the standard capability, or any v2 client) | AIR's `subagent_spawned` (`subagentSessionId`, `name`, `task`, `capabilities: {}`, `_meta.muse`) and `subagent_state_update` (`completed`, `failed`, `cancelled`, `disconnected`). |
 | Anything else | Synthesized `subagent` tool cards. |
 
-With native subagents the non-standard `subagent/sendMessage`,
-`subagent/followupTask`, `subagent/interrupt`, `subagent/stop`,
-`subagent/resume`, `subagent/reopen`, `subagent/close`, and
-`subagent/readResult` requests (`{sessionId, commandId, subagentId, ...}`)
-forward to the Muse commands of the same names when the child's lifecycle
-allows them; without native subagents they are refused.
+With native subagents the extension requests `_subagent/sendMessage`,
+`_subagent/followupTask`, `_subagent/interrupt`, `_subagent/stop`,
+`_subagent/resume`, `_subagent/reopen`, `_subagent/close`, and
+`_subagent/readResult` (`{sessionId, commandId, subagentId, ...}`) forward
+to the Muse commands `subagent/<name>` when the child's lifecycle allows
+them; without native subagents they are refused.
 
 
 ## Lifecycle request metadata

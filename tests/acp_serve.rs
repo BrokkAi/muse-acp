@@ -4853,7 +4853,13 @@ fn load_and_resume_pass_the_blocked_prompt_recall_seed_through() {
     for ver in [1, 2] {
         let mut c = Client::spawn("load", &[("FAKE_BLOCKED_PROMPT", text)]);
         let sid = c.new_session(ver, "");
-        for method in ["session/load", "session/resume"] {
+        // ACP v2 has no `session/load`.
+        let methods: &[&str] = if ver == 1 {
+            &["session/load", "session/resume"]
+        } else {
+            &["session/resume"]
+        };
+        for method in methods {
             let rid = c.req(method, &format!("{{\"sessionId\":\"{sid}\"}}"));
             let result = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
             assert!(
@@ -5506,52 +5512,68 @@ fn v1_advertises_config_options_and_slash_commands() {
 }
 
 #[test]
-fn legacy_set_model_accepts_model_id_and_forwards_to_msp() {
-    let mut c = Client::spawn("quiet", &[]);
-    let sid = c.new_session(1, "");
-    let model_id = c.req(
-        "session/set_model",
-        &format!("{{\"sessionId\":\"{sid}\",\"modelId\":\"fake-model\"}}"),
-    );
-    let model_done = c.wait_for(&format!("\"id\":{model_id}"), Duration::from_secs(15));
-    assert!(
-        model_done.contains("\"result\":{\"model\":\"fake-model\"}"),
-        "legacy modelId is accepted: {model_done}"
-    );
-    c.wait_log("session/setModel", Duration::from_secs(15));
-    let frames = std::fs::read_to_string(format!("{}.frames", c.fake_log)).expect("host frames");
-    assert!(
-        frames.lines().any(|line| {
-            line.contains("\"method\": \"session/setModel\"")
-                && line.contains("\"modelId\": \"fake-model\"")
-        }),
-        "MSP setModel receives the requested modelId: {frames}"
-    );
-    // The standard selector follows the legacy change.
-    let answered = frame_index(&c, &format!("\"id\":{model_id}"));
-    let start = Instant::now();
-    loop {
-        let followed = c
-            .frames
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+fn methods_outside_the_negotiated_schema_are_not_found() {
+    // Custom methods must start with `_`, and each version serves only its
+    // own schema's methods.
+    let not_standard = [
+        (
+            "session/set_model",
+            r#"{"sessionId":"SID","modelId":"fake-model"}"#,
+        ),
+        (
+            "subagent/sendMessage",
+            r#"{"sessionId":"SID","commandId":"c1","subagentId":"s1","message":"hi"}"#,
+        ),
+        ("shutdown", "null"),
+        ("exit", "null"),
+    ];
+    let v1_only = [
+        (
+            "session/set_mode",
+            r#"{"sessionId":"SID","modeId":"default"}"#,
+        ),
+        ("authenticate", r#"{"methodId":"muse-login"}"#),
+        ("logout", "{}"),
+    ];
+    let v2_only = [
+        ("auth/login", r#"{"methodId":"muse-login"}"#),
+        ("auth/logout", "{}"),
+    ];
+    for ver in [1, 2] {
+        let mut c = Client::spawn("quiet", &[]);
+        let sid = c.new_session(ver, "");
+        let other_version: &[(&str, &str)] = if ver == 1 { &v2_only } else { &v1_only };
+        let mut methods: Vec<(&str, String)> = not_standard
             .iter()
-            .skip(answered + 1)
-            .any(|f| {
-                f.contains("\"config_option_update\"")
-                    && f.contains(&sid)
-                    && f.contains("\"currentValue\":\"fake-model\"")
-            });
-        if followed {
-            break;
+            .chain(other_version)
+            .map(|(method, params)| (*method, params.replace("SID", &sid)))
+            .collect();
+        if ver == 2 {
+            // ACP v2 resumes with `session/resume`; it has no `session/load`.
+            methods.push((
+                "session/load",
+                format!(r#"{{"sessionId":"{sid}","cwd":{}}}"#, temp_cwd_json()),
+            ));
         }
+        for (method, params) in methods {
+            let id = c.req(method, &params);
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
+            assert!(
+                frame.contains("\"code\":-32601"),
+                "v{ver} {method} must be method-not-found: {frame}"
+            );
+        }
+        // Still serving.
+        let id = c.req("session/list", "{}");
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
+        assert!(frame.contains("\"result\""), "v{ver}: {frame}");
+        let frames = std::fs::read_to_string(format!("{}.frames", c.fake_log)).unwrap_or_default();
         assert!(
-            start.elapsed() < Duration::from_secs(15),
-            "no config_option_update after session/set_model"
+            !frames.contains("session/setModel"),
+            "v{ver}: a refused method reached Muse: {frames}"
         );
-        std::thread::sleep(Duration::from_millis(20));
+        c.finish();
     }
-    c.finish();
 }
 
 #[test]
@@ -6065,6 +6087,10 @@ fn model_catalog_refreshes_after_initial_partial_snapshot() {
             "session/resume",
             "session/set_config_option",
         ] {
+            if ver == 2 && method == "session/load" {
+                // ACP v2 has no `session/load`.
+                continue;
+            }
             let mut c = Client::spawn("catalog_grows", &[]);
             let sid = c.new_session(ver, "");
             let initial = c
@@ -13122,7 +13148,7 @@ fn native_subagent_controls_forward_owner_scope_and_client_command_ids() {
     c.wait_for("subagent_spawned", Duration::from_secs(15));
 
     let send = c.req(
-        "subagent/sendMessage",
+        "_subagent/sendMessage",
         &format!(
             "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-send\",\"subagentId\":\"sub-control\",\"body\":\"  focus on ✓  \"}}"
         ),
@@ -13135,7 +13161,7 @@ fn native_subagent_controls_forward_owner_scope_and_client_command_ids() {
     c.wait_input("\"body\": \"focus on", Duration::from_secs(15));
 
     let stop = c.req(
-        "subagent/stop",
+        "_subagent/stop",
         &format!(
             "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-stop\",\"subagentId\":\"sub-control\",\"reason\":\"operator asked\"}}"
         ),
@@ -13149,7 +13175,7 @@ fn native_subagent_controls_forward_owner_scope_and_client_command_ids() {
     // A replay retains the caller's idempotency key. The adapter does not
     // mint a second command id or turn the replay into a second message.
     let replay = c.req(
-        "subagent/stop",
+        "_subagent/stop",
         &format!(
             "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-stop\",\"subagentId\":\"sub-control\",\"reason\":\"operator asked\"}}"
         ),
@@ -13183,7 +13209,7 @@ fn subagent_controls_are_gated_by_negotiation_and_item_terminal_status() {
     let _pid = legacy.prompt(&legacy_sid, "hold child");
     legacy.wait_for("subagent-it-sub-control", Duration::from_secs(15));
     let legacy_stop = legacy.req(
-        "subagent/stop",
+        "_subagent/stop",
         &format!(
             "{{\"sessionId\":\"{legacy_sid}\",\"commandId\":\"cmd-legacy\",\"subagentId\":\"sub-control\"}}"
         ),
@@ -13213,7 +13239,7 @@ fn subagent_controls_are_gated_by_negotiation_and_item_terminal_status() {
     let _pid = terminal.prompt(&terminal_sid, "finished child");
     terminal.wait_for("subagent_spawned", Duration::from_secs(15));
     let terminal_stop = terminal.req(
-        "subagent/stop",
+        "_subagent/stop",
         &format!(
             "{{\"sessionId\":\"{terminal_sid}\",\"commandId\":\"cmd-terminal\",\"subagentId\":\"sub-control\"}}"
         ),
@@ -13288,7 +13314,7 @@ fn subagent_control_lifecycle_states_and_rejections_are_single_shot() {
         let _pid = c.prompt(&sid, "lifecycle child");
         c.wait_for("subagent_spawned", Duration::from_secs(15));
         let req = c.req(
-            method,
+            &format!("_{method}"),
             &format!(
                 "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-{index}\",\"subagentId\":\"sub-control\"{}}}",
                 if matches!(method, "subagent/sendMessage" | "subagent/followupTask") {
@@ -13323,7 +13349,7 @@ fn subagent_control_lifecycle_states_and_rejections_are_single_shot() {
     let _pid = rejected.prompt(&sid, "rejected result");
     rejected.wait_for("subagent_spawned", Duration::from_secs(15));
     let req = rejected.req(
-        "subagent/readResult",
+        "_subagent/readResult",
         &format!(
             "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-reject\",\"subagentId\":\"sub-control\"}}"
         ),
@@ -13874,15 +13900,8 @@ fn missing_cli_still_completes_the_handshake_and_names_the_next_action() {
     );
     let log = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
     assert!(log.contains("host unavailable"), "{log}");
-    let id = c.req("shutdown", "{}");
-    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
-    assert!(frame.contains("\"result\":null"), "{frame}");
-    let status = c
-        .child
-        .wait_timeout(Duration::from_secs(10))
-        .expect("wait")
-        .expect("adapter exited");
-    assert!(status.success(), "shutdown must stay clean: {status}");
+    // Closing stdin ends the session cleanly even without a host.
+    c.finish();
 }
 
 #[cfg(unix)]
@@ -14755,21 +14774,23 @@ fn closed_host_stdout_reaps_the_child_without_waiting_for_process_exit() {
 }
 
 #[test]
-fn shutdown_and_exit_notifications_stop_the_adapter_cleanly() {
+fn shutdown_and_exit_notifications_are_ignored() {
+    // ACP defines no `shutdown` or `exit`, and an extension notification
+    // starts with `_`; only the request forms stop the adapter.
     for (ver, method) in [(1, "exit"), (2, "exit"), (1, "shutdown"), (2, "shutdown")] {
-        let mut c = Client::spawn("quiet", &[("MUSE_SHUTDOWN_TIMEOUT_MS", "10000")]);
+        let mut c = Client::spawn("quiet", &[("MUSE_SHUTDOWN_TIMEOUT_MS", "500")]);
         c.new_session(ver, "");
         c.notify(method, "null");
-        // Well inside the shutdown deadline, which would exit with 1.
-        let status = c
-            .child
-            .wait_timeout(Duration::from_secs(5))
-            .expect("wait")
-            .unwrap_or_else(|| panic!("a v{ver} {method} notification left the adapter running"));
+        // Past the shutdown deadline a disconnect would have armed.
+        std::thread::sleep(Duration::from_millis(1500));
         assert!(
-            status.success(),
-            "a v{ver} {method} notification must stop cleanly: {status}"
+            c.child.try_wait().expect("wait").is_none(),
+            "a v{ver} {method} notification stopped the adapter"
         );
+        let id = c.req("session/list", "{}");
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
+        assert!(frame.contains("\"result\""), "v{ver} {method}: {frame}");
+        c.finish();
     }
 }
 
@@ -15189,15 +15210,19 @@ fn terminal_auth_method_runs_muse_acp_login() {
             assert_eq!(legacy["args"], serde_json::json!(["login"]), "{frame}");
         }
 
-        let id = c.req("authenticate", r#"{"methodId":"muse-login"}"#);
-        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
-        assert!(frame.contains("\"result\":{}"), "v{version}: {frame}");
-        let id = c.req("authenticate", r#"{"methodId":"login"}"#);
-        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
-        assert!(
-            frame.contains("\"code\":-32602") && frame.contains("muse-login"),
-            "v{version}: {frame}"
-        );
+        if version == 1 {
+            let id = c.req("authenticate", r#"{"methodId":"muse-login"}"#);
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            assert!(frame.contains("\"result\":{}"), "v{version}: {frame}");
+            let id = c.req("authenticate", r#"{"methodId":"login"}"#);
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            assert!(
+                frame.contains("\"code\":-32602") && frame.contains("muse-login"),
+                "v{version}: {frame}"
+            );
+            c.finish();
+            continue;
+        }
         // The terminal method is never an auth/login method.
         let id = c.req("auth/login", r#"{"methodId":"muse-login"}"#);
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));

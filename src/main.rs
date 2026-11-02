@@ -2027,9 +2027,9 @@ fn send_initialize(
     acp::send_value(stdout, id, response);
 }
 
-/// Answer ACP after `muse serve` failed to launch. Only the handshake and
-/// shutdown succeed; every other request reports why the host is missing,
-/// using the auth-required code when that is the cause.
+/// Answer ACP after `muse serve` failed to launch. Only the handshake
+/// succeeds; every other request reports why the host is missing, using the
+/// auth-required code when that is the cause.
 fn serve_without_host(
     stdout: &StdoutShared,
     id: &Option<RequestId>,
@@ -2038,13 +2038,6 @@ fn serve_without_host(
 ) {
     match request.method() {
         "initialize" => send_initialize(stdout, id, false, false),
-        method @ ("shutdown" | "exit") => {
-            if method == "shutdown" {
-                acp::send_ext_result(stdout, id, "null");
-            }
-            shutdown::settle(stdout, "adapter shutting down");
-            shutdown::exit(0);
-        }
         // Auth-required, so clients show the button that installs Muse.
         _ if id.is_some() && MUSE_NOT_INSTALLED.load(Ordering::SeqCst) => {
             let message = if login_method_offered() {
@@ -4565,14 +4558,10 @@ fn complete_client_request(
     }
 }
 
-/// Whether `incoming` ends the editor connection: the end of input, or a
-/// `shutdown`/`exit` message.
+/// Whether `incoming` ends the editor connection: the end of input. ACP
+/// defines no shutdown method; closing stdin ends the session.
 fn ends_connection(incoming: &Incoming) -> bool {
-    match incoming {
-        Incoming::Closed | Incoming::Ended { .. } => true,
-        Incoming::Untyped { message, .. } => matches!(message.method(), "shutdown" | "exit"),
-        _ => false,
-    }
+    matches!(incoming, Incoming::Closed | Incoming::Ended { .. })
 }
 
 /// The request an editor message carries, with its id (none for a
@@ -4587,10 +4576,9 @@ fn read_request(
         Incoming::V1(message) => request::v1(message).map(|(id, request)| (1, id, request)),
         Incoming::V2(message) => request::v2(message).map(|(id, request)| (2, id, request)),
         Incoming::Untyped { ver, id, message } => match request::untyped(ver, message) {
-            // A notification of a standard method the adapter serves as a
-            // request has nothing to answer. An extension method (including
-            // `shutdown` and `exit`) still runs, without an answer.
-            Ok(request) if id.is_none() && !matches!(request, Request::Extension { .. }) => None,
+            // ACP defines none of these methods as a notification, and
+            // extension notifications start with `_`: ignore it.
+            Ok(_) if id.is_none() => None,
             Ok(request) => Some((ver, id, request)),
             Err(error) => {
                 if let Some(id) = id
@@ -7362,18 +7350,20 @@ fn handle_acp(
             params: ref ext, ..
         } if matches!(
             method.as_str(),
-            "subagent/sendMessage"
-                | "subagent/followupTask"
-                | "subagent/interrupt"
-                | "subagent/stop"
-                | "subagent/resume"
-                | "subagent/reopen"
-                | "subagent/close"
-                | "subagent/readResult"
+            "_subagent/sendMessage"
+                | "_subagent/followupTask"
+                | "_subagent/interrupt"
+                | "_subagent/stop"
+                | "_subagent/resume"
+                | "_subagent/reopen"
+                | "_subagent/close"
+                | "_subagent/readResult"
         ) =>
         {
+            // The ACP extension method `_subagent/<x>` drives the Muse
+            // command `subagent/<x>`.
             let params = Some(json::from_value(ext));
-            subagent_control(host, stdout, sessions, &id, &method, params.as_ref());
+            subagent_control(host, stdout, sessions, &id, &method[1..], params.as_ref());
         }
         Request::Extension {
             params: ref ext, ..
@@ -8390,72 +8380,6 @@ fn handle_acp(
                 ),
             }
         }
-        // Not in any current ACP schema: the legacy unstable
-        // `SetSessionModelRequest` (ACP v0.10). Kept as a documented
-        // compatibility method with the same effect as the `model`
-        // config option; see docs/acp-extensions.md.
-        Request::Extension {
-            params: ref ext, ..
-        } if method == "session/set_model" => {
-            let params = Some(json::from_value(ext));
-            let sid = params
-                .as_ref()
-                .and_then(|p| p.get("sessionId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let value = params
-                .as_ref()
-                .and_then(|p| p.get("modelId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if value.is_empty() {
-                acp::send_error(
-                    stdout,
-                    &id,
-                    -32602,
-                    "session/set_model requires params.modelId",
-                );
-                return;
-            }
-            let msp_sid = match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
-                Some(s) => s.msp_sid.clone(),
-                None => {
-                    acp::send_error(stdout, &id, -32602, "unknown sessionId");
-                    return;
-                }
-            };
-            let cmd = host.mint_cmd("cmd-");
-            match host.command(
-                "session/setModel",
-                &format!(
-                    "{{\"commandId\":{},\"sessionId\":{},\"model\":{{\"modelId\":{}}}}}",
-                    esc(&cmd),
-                    esc(&msp_sid),
-                    esc(&value)
-                ),
-            ) {
-                Ok(_) => {
-                    if let Some(s) = sessions
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .get_mut(&sid)
-                    {
-                        s.model_value = value.clone();
-                    }
-                    // Muse's `session/modelChanged` then moves the standard
-                    // `model` selector, as for `session/set_config_option`.
-                    acp::send_ext_result(stdout, &id, &format!("{{\"model\":{}}}", esc(&value)))
-                }
-                Err(e) => acp::send_error(
-                    stdout,
-                    &id,
-                    msp::acp_error_code(&e, -32603),
-                    &format!("set failed: {}", err_message(&e)),
-                ),
-            }
-        }
         Request::Authenticate { method_id } => {
             // The terminal-auth login already ran outside ACP. Muse checks
             // its credentials on the next turn, and a still-unauthenticated
@@ -8495,15 +8419,6 @@ fn handle_acp(
             acp::send_error(stdout, &id, -32602, &message);
         }
         Request::Logout => logout(host, stdout, &id),
-        Request::Extension { .. } if matches!(method.as_str(), "shutdown" | "exit") => {
-            if method == "shutdown" {
-                acp::send_ext_result(stdout, &id, "null");
-            }
-            fail_all_with_message(stdout, sessions, "adapter shutting down");
-            shutdown::settle(stdout, "adapter shutting down");
-            host.shutdown();
-            shutdown::exit(0);
-        }
         Request::Extension { .. } | Request::Unsupported { .. } => {
             if id.is_some() {
                 acp::send_error(stdout, &id, -32601, "method not found");

@@ -632,61 +632,13 @@ pub fn prompt_blocks(ver: u8, prompt: Option<&Value>) -> Result<Vec<Block>, Stri
     }
 }
 
-/// A message the editor claimed without its version's schema type: an
-/// extension method, or a method of the other protocol version that clients
-/// of this one also call. A standard method is still parsed with the SDK's
+/// A message the editor claimed to read beside its version's schema type:
+/// JetBrains AIR's ACP v2 `session/fork`, whose top-level `replayFrom` the
+/// schema type drops. Its standard fields are still parsed with the SDK's
 /// schema type; an error is the SDK's own `-32602`.
 pub fn untyped(ver: u8, message: UntypedMessage) -> Result<Request, Error> {
     let (method, params) = message.into_parts();
     let request = match method.as_str() {
-        // ACP v2 has no `session/load`; its v2 clients send the fields of v2
-        // `session/resume` (optional `mcpServers`, v2 MCP entries), so they
-        // are read with that type. History always replays on load, so a
-        // `replayFrom` there means nothing.
-        "session/load" if ver == 2 => {
-            let r: v2::schema::ResumeSessionRequest =
-                agent_client_protocol::util::json_cast_params(&params)?;
-            Request::LoadSession(Setup {
-                session_id: r.session_id.to_string(),
-                cwd: path(&r.cwd.0),
-                additional_directories: r
-                    .additional_directories
-                    .iter()
-                    .map(|p| path(&p.0))
-                    .collect(),
-                mcp_servers: r.mcp_servers.into_iter().map(v2_mcp).collect(),
-                replay_from: None,
-                meta: meta(r.meta),
-            })
-        }
-        "session/load" => Request::LoadSession(v1_load(
-            v1::schema::LoadSessionRequest::parse_message(&method, &params)?,
-        )),
-        "session/set_mode" => {
-            let r = v1::schema::SetSessionModeRequest::parse_message(&method, &params)?;
-            Request::SetMode {
-                session_id: r.session_id.to_string(),
-                mode_id: r.mode_id.to_string(),
-            }
-        }
-        "authenticate" => Request::Authenticate {
-            method_id: v1::schema::AuthenticateRequest::parse_message(&method, &params)?
-                .method_id
-                .to_string(),
-        },
-        "logout" => {
-            v1::schema::LogoutRequest::parse_message(&method, &params)?;
-            Request::Logout
-        }
-        "auth/login" => Request::LoginAuth {
-            method_id: v2::schema::LoginAuthRequest::parse_message(&method, &params)?
-                .method_id
-                .to_string(),
-        },
-        "auth/logout" => {
-            v2::schema::LogoutAuthRequest::parse_message(&method, &params)?;
-            Request::Logout
-        }
         "session/fork" if ver == 2 => {
             // JetBrains AIR asks a v2 fork to replay its history with the
             // `replayFrom` that v2 `session/resume` defines; the schema type
@@ -712,7 +664,7 @@ pub fn untyped(ver: u8, message: UntypedMessage) -> Result<Request, Error> {
                 meta: meta(r.meta),
             })
         }
-        _ => Request::Extension { method, params },
+        _ => Request::Unsupported { method },
     };
     Ok(request)
 }

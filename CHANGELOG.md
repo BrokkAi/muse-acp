@@ -9,9 +9,28 @@
   response, `session/update`, permission prompt, form, file and terminal
   request the adapter sends, and the `$/cancel_request` withdrawal of the
   adapter's own requests. Only Muse and JetBrains AIR extensions that no ACP
-  schema defines (`_session/*` methods, `session/set_model`, the legacy
-  `subagent/*` controls, `_meta` members, AIR updates) remain the adapter's
-  own JSON. What clients see change:
+  schema defines (`_session/*` and `_subagent/*` methods, `_meta` members,
+  AIR updates) remain the adapter's own JSON. What clients see change:
+  - Each protocol version serves only its own schema's methods, and Muse's
+    own methods all start with `_`, as ACP requires of extensions. Anything
+    else gets `-32601`; sent as a notification, it is ignored:
+    - ACP v2 clients no longer get v1's `session/load` (use
+      `session/resume`, with `replayFrom` to replay history),
+      `session/set_mode`, `authenticate` or `logout` (use `auth/logout`),
+      and ACP v1 clients no longer get v2's `auth/login` or `auth/logout`.
+    - The legacy `session/set_model` is removed; set the `model` config
+      option with `session/set_config_option` instead.
+    - The native-subagent controls are renamed from `subagent/<name>` to
+      `_subagent/<name>` (`sendMessage`, `followupTask`, `interrupt`,
+      `stop`, `resume`, `reopen`, `close`, `readResult`), with the same
+      params and results.
+    - `shutdown` and `exit` are removed: closing stdin ends the session, as
+      ACP defines.
+    - `_session/*` and `_subagent/*` sent as notifications run, without an
+      answer.
+  - JetBrains AIR's own shapes are kept as before: `replayFrom` on ACP v2
+    `session/fork`, AIR's subagent and async-task updates, and the
+    `subagents` member of the initialize capabilities.
   - JSON-RPC batches are refused in both versions with one `-32600`
     (`id: null`), and none of their entries run. ACP v2 batches were
     previously answered entry by entry.
@@ -28,7 +47,7 @@
     of blocks, an image without `mimeType`, a `resource_link` without
     `name`, and an embedded `resource` with neither `text` nor `blob` refuse
     the prompt, where they were read leniently before. An ACP v2
-    `session/set_config_option` value needs its `type`, and the legacy
+    `session/set_config_option` value needs its `type`, and ACP v1
     `session/set_mode` no longer accepts `mode` for `modeId`.
     `session/cancel` works only as the notification ACP defines; sent as a
     request it gets `-32601`.
@@ -45,7 +64,7 @@
   - Optional result fields that are empty or unset are left out rather than
     sent as `null` or `[]` (for example `nextCursor` on the last
     `session/list` page, an empty `authMethods` or `additionalDirectories`).
-  - The legacy `session/set_mode` answers with the schema's empty
+  - ACP v1 `session/set_mode` answers with the schema's empty
     `SetSessionModeResponse`, carrying the mode Muse applied in
     `_meta.muse.mode` instead of a top-level `mode`.
   - `session/list` filters by `cwd` only; the non-standard
@@ -57,8 +76,8 @@
     with the child's title, description and state instead of the earlier
     draft's `subagent_spawned` and `subagent_state_update`. The state
     mirrors the child's: a settled child that is messaged again and runs is
-    shown running again. JetBrains AIR
-    clients that negotiate `nativeSubagentSessions` keep AIR's updates.
+    shown running again. JetBrains AIR clients that negotiate
+    `nativeSubagentSessions` keep AIR's updates.
   - The adapter's own request ids are the SDK's, and malformed-frame errors
     carry the SDK's messages. An invalid UTF-8 line still gets `-32700` and
     reading goes on.

@@ -46,7 +46,7 @@ Observable result: an editor sees the same ACP behavior as before, except where 
 - Observation: neither schema's `session/load` or `session/resume` result has a `sessionId`; the old adapter repeated the client's id there. Two live tests read it and now read `_meta.mspSessionId`.
 
 
-- Observation (review, 2026-11-02): three regressions against the pre-SDK adapter surfaced in review. Extension methods sent as notifications (`shutdown`, `exit`, `_session/*`, `subagent/*`, `session/set_model`) were dropped, so an `exit` notification no longer stopped the adapter until the shutdown deadline expired with status 1. ACP v2 `session/load` was read with the v1 schema, which requires `mcpServers`; the test harness masked it by adding `mcpServers` for every version. On the RFD path, a settled child that ran again was never shown running. All three are fixed with regression tests, and the harness now adds `mcpServers` for v1 only.
+- Observation (review, 2026-11-02): the test harness added `mcpServers` to every `session/load`, `session/resume` and `session/fork`, which hid that ACP v2 `session/load` was read with the v1 schema. The harness now adds it for v1 only, as v2 makes it optional. On the RFD path, a settled child that ran again was never shown running; fixed with a regression test. `_`-prefixed extension notifications were dropped; they run again.
 
 
 ## Decision Log
@@ -79,10 +79,14 @@ Observable result: an editor sees the same ACP behavior as before, except where 
   Rationale: the adapter's 17,000-line main loop is synchronous and blocks on MSP commands; the SDK is runtime-neutral and needs no tokio. Forwarding keeps message order and lets the SDK keep reading while the main loop is busy.
   Date/Author: 2026-11-02 / agent.
 
+- Decision: conform to the negotiated schema everywhere Muse owns the surface. Each version serves only its own schema's methods (no v1 `session/load`, `session/set_mode`, `authenticate`, `logout` on v2; no v2 `auth/login`, `auth/logout` on v1). Muse's own methods start with `_`: the subagent controls become `_subagent/*`, and `session/set_model`, `shutdown` and `exit` are removed. A method outside the schema gets `-32601`, and its notification is ignored. JetBrains AIR's shapes stay as AIR defines them: `replayFrom` on v2 `session/fork`, AIR's updates, and the `subagents` initialize member.
+  Rationale: the user asked that anything not conforming to the ACP spec change; AIR's shapes are AIR's to define and changing them would break AIR.
+  Date/Author: 2026-11-02 / user decision.
+
 
 ## Outcomes & Retrospective
 
-(2026-11-02) Done. `acp-lite` and every hand-built ACP frame are gone. The SDK reads every request into its typed schema, and every response, notification and request the adapter sends is an SDK schema value. What stays the adapter's own JSON is what no ACP schema defines: `_meta` members, the results of extension methods (`_session/*`, `session/set_model`, `subagent/*`, `shutdown`), JetBrains AIR updates (sent as the v2 `Other` update or, in v1, an `UntypedMessage`), and AIR's `subagents` member of the initialize response. JSON-RPC batches are refused as the SDK refuses them.
+(2026-11-02) Done. `acp-lite` and every hand-built ACP frame are gone. The SDK reads every request into its typed schema, and every response, notification and request the adapter sends is an SDK schema value. What stays the adapter's own JSON is what no ACP schema defines: `_meta` members, the results of extension methods (`_session/*`, `_subagent/*`), JetBrains AIR updates (sent as the v2 `Other` update or, in v1, an `UntypedMessage`), and AIR's `subagents` member of the initialize response. JSON-RPC batches are refused as the SDK refuses them.
 
 Behavior that changed for clients is listed in `CHANGELOG.md` under Unreleased. All workspace tests pass (`acp_serve` 451, unit 270), and the live loopback suite passes against Muse 1.4.14 (52 of 52).
 
