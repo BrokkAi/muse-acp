@@ -13103,7 +13103,7 @@ fn native_subagent_controls_forward_owner_scope_and_client_command_ids() {
 #[test]
 fn subagent_controls_are_gated_by_negotiation_and_item_terminal_status() {
     let mut legacy = Client::spawn("subagent_control", &[]);
-    let legacy_sid = legacy.new_session(2, "");
+    let legacy_sid = legacy.new_session(1, "");
     let _pid = legacy.prompt(&legacy_sid, "hold child");
     legacy.wait_for("subagent-it-sub-control", Duration::from_secs(15));
     let legacy_stop = legacy.req(
@@ -13268,8 +13268,9 @@ fn subagent_control_lifecycle_states_and_rejections_are_single_shot() {
 
 #[test]
 fn subagent_cards_stay_legacy_without_negotiation() {
+    // ACP v1 needs `clientCapabilities.subagents`; v2 needs no capability.
     let mut c = Client::spawn("subagent", &[]);
-    let sid = c.new_session(2, "");
+    let sid = c.new_session(1, "");
     let _pid = c.prompt(&sid, "delegate legacy");
     let card = c.wait_for("subagent-it-sub1", Duration::from_secs(15));
     assert!(
@@ -13282,10 +13283,76 @@ fn subagent_cards_stay_legacy_without_negotiation() {
         .unwrap_or_else(|p| p.into_inner())
         .join("\n");
     assert!(
-        !frames.contains("subagent_spawned"),
+        !frames.contains("subagent_spawned") && !frames.contains("subagent_update"),
         "native updates must not leak without negotiation: {frames}"
     );
     c.finish();
+}
+
+/// The ACP subagents RFD: v1 clients that advertise
+/// `clientCapabilities.subagents`, and every v2 client, get the SDK's typed
+/// `subagent_update` instead of JetBrains AIR's updates.
+#[test]
+fn standard_subagent_updates_announce_and_settle_the_child() {
+    for (ver, init) in [(1, ",\"clientCapabilities\":{\"subagents\":{}}"), (2, "")] {
+        let mut c = Client::spawn("subagent_native", &[("FAKE_CAPS", "subagents")]);
+        let sid = c.new_session(ver, init);
+        c.wait_stderr(
+            "client negotiated native subagent sessions",
+            Duration::from_secs(10),
+        );
+        let _pid = c.prompt(&sid, "delegate natively");
+        let announced = c.wait_for(
+            "\"sessionUpdate\":\"subagent_update\"",
+            Duration::from_secs(15),
+        );
+        let frame: serde_json::Value = serde_json::from_str(&announced).expect("JSON frame");
+        let update = &frame["params"]["update"];
+        assert_eq!(
+            frame["params"]["sessionId"],
+            sid.as_str(),
+            "v{ver}: {announced}"
+        );
+        assert_eq!(
+            update["sessionId"], "child-sess-native",
+            "v{ver}: {announced}"
+        );
+        assert_eq!(update["title"], "researcher", "v{ver}: {announced}");
+        assert_eq!(
+            update["description"], "survey failing tests",
+            "v{ver}: {announced}"
+        );
+        assert_eq!(
+            update["_meta"]["muse"]["subagentId"], "sub-n1",
+            "v{ver}: {announced}"
+        );
+        assert!(
+            update.get("capabilities").is_none(),
+            "v{ver}: no client mutations: {announced}"
+        );
+
+        let settled = c.wait_for("\"stopReason\":\"end_turn\"", Duration::from_secs(15));
+        let frame: serde_json::Value = serde_json::from_str(&settled).expect("JSON frame");
+        assert_eq!(
+            frame["params"]["update"]["sessionUpdate"],
+            "subagent_update"
+        );
+        assert_eq!(
+            frame["params"]["update"]["state"],
+            serde_json::json!({"state": "idle", "stopReason": "end_turn"}),
+            "v{ver}: {settled}"
+        );
+        let frames = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n");
+        assert!(
+            !frames.contains("subagent_spawned") && !frames.contains("subagent_state_update"),
+            "v{ver}: AIR updates without AIR: {frames}"
+        );
+        c.finish();
+    }
 }
 
 #[test]

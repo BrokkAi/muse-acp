@@ -471,6 +471,81 @@ pub fn compaction(
     Note::v1(acp_sid, s1::SessionUpdate::CompactionUpdate(update))
 }
 
+/// A child session's foreground state, as the ACP subagents RFD reports it
+/// on the parent.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ChildState {
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+    /// The host lost track of the child: the RFD's `unknown` state.
+    Disconnected,
+}
+
+/// One `subagent_update`: fields left `None` are unchanged.
+#[derive(Debug, Clone)]
+pub struct Subagent {
+    pub session_id: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub state: Option<ChildState>,
+    pub meta: Option<Meta>,
+}
+
+/// The ACP subagents RFD's `subagent_update` on the parent session. The
+/// child's capabilities stay unset: the client may not mutate it.
+pub fn subagent_update(acp_sid: &str, ver: u8, subagent: Subagent) -> Note {
+    if ver == 2 {
+        let mut update = s2::SubagentUpdate::new(subagent.session_id);
+        if let Some(title) = subagent.title {
+            update = update.title(title);
+        }
+        if let Some(description) = subagent.description {
+            update = update.description(description);
+        }
+        if let Some(state) = subagent.state {
+            let idle = |stop: s2::StopReason| {
+                s2::StateUpdate::Idle(s2::IdleStateUpdate::new().stop_reason(stop))
+            };
+            update = update.state(match state {
+                ChildState::Running => s2::StateUpdate::Running(s2::RunningStateUpdate::new()),
+                ChildState::Completed => idle(s2::StopReason::EndTurn),
+                ChildState::Failed => idle(s2::StopReason::Error(s2::ErrorStopReason::new())),
+                ChildState::Cancelled => idle(s2::StopReason::Cancelled),
+                ChildState::Disconnected => s2::StateUpdate::Unknown(s2::UnknownStateUpdate::new()),
+            });
+        }
+        if let Some(meta) = subagent.meta {
+            update = update.meta(meta);
+        }
+        return Note::v2(acp_sid, s2::SessionUpdate::SubagentUpdate(update));
+    }
+    let mut update = s1::SubagentUpdate::new(subagent.session_id);
+    if let Some(title) = subagent.title {
+        update = update.title(title);
+    }
+    if let Some(description) = subagent.description {
+        update = update.description(description);
+    }
+    if let Some(state) = subagent.state {
+        let idle = |stop: s1::IdleStopReason| {
+            s1::StateUpdate::Idle(s1::IdleStateUpdate::new().stop_reason(stop))
+        };
+        update = update.state(match state {
+            ChildState::Running => s1::StateUpdate::Running(s1::RunningStateUpdate::new()),
+            ChildState::Completed => idle(s1::IdleStopReason::EndTurn),
+            ChildState::Failed => idle(s1::IdleStopReason::Error(s1::ErrorStopReason::new())),
+            ChildState::Cancelled => idle(s1::IdleStopReason::Cancelled),
+            ChildState::Disconnected => s1::StateUpdate::Unknown(s1::UnknownStateUpdate::new()),
+        });
+    }
+    if let Some(meta) = subagent.meta {
+        update = update.meta(meta);
+    }
+    Note::v1(acp_sid, s1::SessionUpdate::SubagentUpdate(update))
+}
+
 /// A JetBrains AIR update no ACP schema of the version defines
 /// (`subagent_spawned`, `subagent_state_update`, `async_task_spawned`,
 /// `async_task_state_update`). ACP v2 carries it as its typed `Other`

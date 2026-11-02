@@ -299,6 +299,9 @@ pub struct SessionFold {
     /// set, `subagent` items map to spawned/state updates on the parent and a
     /// per-child fold; otherwise they render as legacy tool cards.
     pub native_subagents: bool,
+    /// Native subagents use JetBrains AIR's updates rather than the ACP
+    /// subagents RFD's `subagent_update`.
+    pub air_subagents: bool,
     /// Child session ids already announced to this client (idempotent spawn).
     pub spawned_subagents: std::collections::HashSet<String>,
     /// Last `subagent_state_update` sent per child session id, so a terminal
@@ -464,6 +467,7 @@ impl SessionFold {
             done: std::collections::HashSet::new(),
             idc: AtomicU64::new(1),
             native_subagents: false,
+            air_subagents: false,
             spawned_subagents: std::collections::HashSet::new(),
             subagent_states: HashMap::new(),
             air_async_tasks: false,
@@ -1618,15 +1622,33 @@ impl SessionFold {
         }
     }
 
-    /// Draft ACP subagent extension: announce a child session on the parent.
+    /// Announce a child session on the parent: the ACP subagents RFD's
+    /// `subagent_update`, or JetBrains AIR's `subagent_spawned`. A child the
+    /// fold sees running reports its state.
+    #[allow(clippy::too_many_arguments)]
     fn subagent_spawned_line(
+        &self,
         acp_sid: &str,
         ver: u8,
         subagent_session_id: &str,
         name: &str,
         task: &str,
+        running: bool,
         muse_fields: Option<&str>,
     ) -> Note {
+        if !self.air_subagents {
+            return out::subagent_update(
+                acp_sid,
+                ver,
+                out::Subagent {
+                    session_id: subagent_session_id.to_string(),
+                    title: Some(name.to_string()),
+                    description: Some(task.to_string()),
+                    state: running.then_some(out::ChildState::Running),
+                    meta: muse_fields.and_then(out::muse_meta),
+                },
+            );
+        }
         let mut update = serde_json::json!({
             "sessionUpdate": "subagent_spawned",
             "subagentSessionId": subagent_session_id,
@@ -1640,10 +1662,35 @@ impl SessionFold {
         out::air(acp_sid, ver, update)
     }
 
-    /// Draft ACP subagent extension: terminal state on the parent. MSP's
-    /// generic item status is the terminal authority; recovery-pending
-    /// control states map to `disconnected` rather than a guess.
-    fn subagent_state_line(acp_sid: &str, ver: u8, subagent_session_id: &str, state: &str) -> Note {
+    /// A child's terminal state on the parent. MSP's generic item status is
+    /// the terminal authority; recovery-pending control states map to
+    /// `disconnected` (the RFD's `unknown` state) rather than a guess.
+    fn subagent_state_line(
+        &self,
+        acp_sid: &str,
+        ver: u8,
+        subagent_session_id: &str,
+        state: &str,
+    ) -> Note {
+        if !self.air_subagents {
+            let state = match state {
+                "completed" => out::ChildState::Completed,
+                "failed" => out::ChildState::Failed,
+                "cancelled" => out::ChildState::Cancelled,
+                _ => out::ChildState::Disconnected,
+            };
+            return out::subagent_update(
+                acp_sid,
+                ver,
+                out::Subagent {
+                    session_id: subagent_session_id.to_string(),
+                    title: None,
+                    description: None,
+                    state: Some(state),
+                    meta: None,
+                },
+            );
+        }
         out::air(
             acp_sid,
             ver,
@@ -1911,7 +1958,7 @@ impl SessionFold {
             return;
         }
         self.subagent_states.insert(child.to_string(), state);
-        out.push(Self::subagent_state_line(acp_sid, self.ver, child, state));
+        out.push(self.subagent_state_line(acp_sid, self.ver, child, state));
     }
 
     /// Stable synthetic toolCall id + first-announcement flag for host cards.
@@ -3087,12 +3134,13 @@ impl SessionFold {
                             .map(|(k, v)| format!("\"{k}\":{}", j_to_string(v.unwrap())))
                             .collect();
                         let fields = (!parts.is_empty()).then(|| parts.join(","));
-                        out.push(Self::subagent_spawned_line(
+                        out.push(self.subagent_spawned_line(
                             acp_sid,
                             self.ver,
                             child,
                             name,
                             task,
+                            Self::subagent_state(item).is_none(),
                             fields.as_deref(),
                         ));
                     }
@@ -3628,8 +3676,8 @@ impl SessionFold {
                             .and_then(|v| v.as_str())
                             .filter(|s| !s.is_empty())
                             .unwrap_or("Delegated task");
-                        out.push(Self::subagent_spawned_line(
-                            acp_sid, self.ver, child, name, task, None,
+                        out.push(self.subagent_spawned_line(
+                            acp_sid, self.ver, child, name, task, false, None,
                         ));
                     }
                     self.settle_subagent(acp_sid, child, item, out);

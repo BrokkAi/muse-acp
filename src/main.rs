@@ -50,7 +50,12 @@ static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static VER: AtomicU64 = AtomicU64::new(0); // negotiated ACP version for the connection
 static ELICIT_FORM: AtomicU64 = AtomicU64::new(0); // 1 when the client advertises elicitation.form
 static ELICIT_URL: AtomicBool = AtomicBool::new(false); // the client advertises elicitation.url
-static NATIVE_SUBAGENTS: AtomicU64 = AtomicU64::new(0); // 1 when subagent sessions are negotiated
+/// Native subagent sessions: 0 off, [`SUBAGENTS_ACP`] or [`SUBAGENTS_AIR`].
+static NATIVE_SUBAGENTS: AtomicU64 = AtomicU64::new(0);
+/// The ACP subagents RFD's typed `subagent_update`.
+const SUBAGENTS_ACP: u64 = 1;
+/// JetBrains AIR's `subagent_spawned` and `subagent_state_update`.
+const SUBAGENTS_AIR: u64 = 2;
 static AIR_ASYNC_TASKS: AtomicU64 = AtomicU64::new(0); // 1 when the client wants async-task updates
 static AIR_RECOMMENDED: AtomicU64 = AtomicU64::new(0); // 1 when the client wants recommendedValue metadata
 static COMPACTION: AtomicU64 = AtomicU64::new(0); // 1 when standard ACP compaction is available
@@ -148,11 +153,21 @@ fn client_supports_air(meta: &request::Meta, key: &str) -> bool {
     version_ok && supported
 }
 
-/// Native subagent sessions: the ACP v1 subagent capability
-/// (`clientCapabilities.subagents`), or JetBrains AIR's
-/// `nativeSubagentSessions` key in either version.
-fn client_supports_subagents(capabilities: &request::ClientCapabilities) -> bool {
-    capabilities.subagents || client_supports_air(&capabilities.meta, "nativeSubagentSessions")
+/// Which native subagent protocol the client reads, if any. ACP v1 clients
+/// opt in to the subagents RFD with `clientCapabilities.subagents`; in ACP v2
+/// the RFD's `subagent_update` is a baseline requirement that needs no
+/// capability. JetBrains AIR's `nativeSubagentSessions` selects AIR's own
+/// updates, unless a v1 client also advertised the standard capability.
+fn subagent_protocol(ver: u8, capabilities: &request::ClientCapabilities) -> u64 {
+    if capabilities.subagents {
+        SUBAGENTS_ACP
+    } else if client_supports_air(&capabilities.meta, "nativeSubagentSessions") {
+        SUBAGENTS_AIR
+    } else if ver == 2 {
+        SUBAGENTS_ACP
+    } else {
+        0
+    }
 }
 
 /// Adapter extensions require explicit `capabilities._meta.muse` opt-in.
@@ -4663,7 +4678,9 @@ fn fresh_fold(workspace_root: &str) -> SessionFold {
     let mut fold = SessionFold::new();
     fold.ver = negotiated_ver();
     fold.workspace_root = workspace_root.to_string();
-    fold.native_subagents = NATIVE_SUBAGENTS.load(Ordering::SeqCst) == 1;
+    let subagents = NATIVE_SUBAGENTS.load(Ordering::SeqCst);
+    fold.native_subagents = subagents != 0;
+    fold.air_subagents = subagents == SUBAGENTS_AIR;
     fold.air_async_tasks = AIR_ASYNC_TASKS.load(Ordering::SeqCst) == 1;
     fold.compaction_supported = COMPACTION.load(Ordering::SeqCst) == 1;
     fold.show_reminders = show_reminders();
@@ -5006,8 +5023,9 @@ fn negotiate_acp(v: u8, capabilities: &request::ClientCapabilities) -> bool {
     if !terminal_auth {
         log("client did not advertise terminal auth; no typed terminal login method is offered");
     }
-    let subagents = client_supports_subagents(capabilities);
-    NATIVE_SUBAGENTS.store(u64::from(subagents), Ordering::SeqCst);
+    let subagent_updates = subagent_protocol(v, capabilities);
+    NATIVE_SUBAGENTS.store(subagent_updates, Ordering::SeqCst);
+    let subagents = subagent_updates != 0;
     let compaction = capabilities.compaction;
     COMPACTION.store(u64::from(compaction), Ordering::SeqCst);
     let capabilities = &capabilities.meta;
