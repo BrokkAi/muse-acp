@@ -2861,6 +2861,13 @@ fn a_fork_starts_from_the_source_history_and_continues_on_its_own() {
     };
     let fork = forked["sessionId"].as_str().unwrap().to_string();
     assert_ne!(fork, session);
+    // ACP and AIR define no replay on fork; loading the fork replays the
+    // history it copied.
+    let load = adapter.request(
+        "session/load",
+        json!({"sessionId": fork, "cwd": host.workspace(), "mcpServers": []}),
+    );
+    adapter.result(load);
     adapter.wait("the fork's copy of the first prompt", |frame| {
         frame["params"]["sessionId"] == fork.as_str()
             && frame["params"]["update"]["sessionUpdate"] == "user_message_chunk"

@@ -79,6 +79,10 @@ Observable result: an editor sees the same ACP behavior as before, except where 
   Rationale: the adapter's 17,000-line main loop is synchronous and blocks on MSP commands; the SDK is runtime-neutral and needs no tokio. Forwarding keeps message order and lets the SDK keep reading while the main loop is busy.
   Date/Author: 2026-11-02 / agent.
 
+- Decision: follow JetBrains AIR's specification as strictly as ACP's. The written contract is `docs/air-extensions.md` of `agentclientprotocol/claude-agent-acp` (fetched at d2ef490, 2026-10-30); the reference implementations are `@agentclientprotocol/claude-agent-acp` 0.99.0 and `@brokkai/codex-acp` 1.15.0 (the only AIR v2 reference). AIR keys go to AIR clients only, with the agent side in the initialize response's top-level `_meta`. AIR clients get AIR's subagent updates for either subagent signal. ACP v2 uses AIR's `_`-prefixed tags. The fork point is `_meta.jetbrains.air.fork`. Forks replay nothing. `_session/async_task/stop` answers `{stopped}`. File reports carry `unavailable` reasons. `recommendedValue` replaces the default reasoning row.
+  Rationale: the user stated that AIR is a spec the adapter adheres to, like ACP.
+  Date/Author: 2026-11-02 / user decision.
+
 - Decision: conform to the negotiated schema everywhere Muse owns the surface. Each version serves only its own schema's methods (no v1 `session/load`, `session/set_mode`, `authenticate`, `logout` on v2; no v2 `auth/login`, `auth/logout` on v1). Muse's own methods start with `_`: the subagent controls become `_subagent/*`, and `session/set_model`, `shutdown` and `exit` are removed. A method outside the schema gets `-32601`, and its notification is ignored. JetBrains AIR's shapes stay as AIR defines them: `replayFrom` on v2 `session/fork`, AIR's updates, and the `subagents` initialize member.
   Rationale: the user asked that anything not conforming to the ACP spec change; AIR's shapes are AIR's to define and changing them would break AIR.
   Date/Author: 2026-11-02 / user decision.
@@ -89,6 +93,8 @@ Observable result: an editor sees the same ACP behavior as before, except where 
 (2026-11-02) Done. `acp-lite` and every hand-built ACP frame are gone. The SDK reads every request into its typed schema, and every response, notification and request the adapter sends is an SDK schema value. What stays the adapter's own JSON is what no ACP schema defines: `_meta` members, the results of extension methods (`_session/*`, `_subagent/*`), JetBrains AIR updates (sent as the v2 `Other` update or, in v1, an `UntypedMessage`), and AIR's `subagents` member of the initialize response. JSON-RPC batches are refused as the SDK refuses them.
 
 Behavior that changed for clients is listed in `CHANGELOG.md` under Unreleased. All workspace tests pass (`acp_serve` 451, unit 270), and the live loopback suite passes against Muse 1.4.14 (52 of 52).
+
+Not done yet, AIR: a settled AIR child that runs again is not reopened as a new generation (`<id>:generation:<n>` with a new `subagent_spawned`), and updates addressed to a settled AIR child are not dropped. Only its later state updates are. Child routing is spread across the MSP event handlers, so this needs its own change.
 
 Not done here because the adapter never did it, by hand or otherwise: the unstable ACP methods the SDK can parse but the adapter does not serve (`session/set_title`, `session/archive`, `session/status`, `auth/status`, `providers/*`) and the v2 `state_update.background` work list.
 

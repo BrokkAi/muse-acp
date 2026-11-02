@@ -758,6 +758,11 @@ impl SessionFold {
     }
 
     /// Resolve the adapter-facing AIR task id to MSP's durable item id.
+    /// Whether an AIR async task already reported its terminal state.
+    pub fn async_task_settled(&self, async_task_id: &str) -> bool {
+        self.async_task_states.contains_key(async_task_id)
+    }
+
     pub fn msp_task_id(&self, async_task_id: &str) -> Option<&str> {
         self.async_task_msp_ids
             .get(async_task_id)
@@ -1721,6 +1726,9 @@ impl SessionFold {
             "asyncTaskId": task_id,
             "name": name,
             "taskType": task_type,
+            // AIR requires a description; the task's label is the only one
+            // Muse gives.
+            "description": name,
             "showInTranscript": false,
             "canStop": can_stop,
         });
@@ -1962,6 +1970,11 @@ impl SessionFold {
             }
             return;
         };
+        // AIR ends a child at its first terminal state: no later state is
+        // sent for it.
+        if self.air_subagents && self.subagent_states.contains_key(child) {
+            return;
+        }
         if self.subagent_states.get(child) == Some(&state) {
             return;
         }

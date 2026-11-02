@@ -1969,6 +1969,108 @@ fn shell_tools_carry_no_guessed_location() {
 }
 
 #[test]
+fn a_cancelled_turn_reports_its_file_changes_unavailable_and_request_ids_are_single_use() {
+    let caps = ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}";
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, caps);
+    let prompt = |c: &mut Client| {
+        c.req(
+            "session/prompt",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"change files\"}}],\"_meta\":{{\"jetbrains\":{{\"air\":{{\"agentFileChangeReportRequest\":{{\"version\":1,\"requestId\":\"report-cancel\"}}}}}}}}}}"
+            ),
+        )
+    };
+    for _ in 0..2 {
+        let pid = prompt(&mut c);
+        c.wait_log("turn/start", Duration::from_secs(15));
+        c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+        let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(done.contains("cancelled"), "{done}");
+    }
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let reports: Vec<&String> = frames
+        .iter()
+        .filter(|frame| frame.contains("\"agentFileChangeReport\":{"))
+        .collect();
+    // One report for the first prompt; the repeated request id is ignored.
+    assert_eq!(reports.len(), 1, "{frames:#?}");
+    let report: serde_json::Value = serde_json::from_str(reports[0]).unwrap();
+    assert_eq!(
+        report["params"]["update"]["_meta"]["jetbrains"]["air"]["agentFileChangeReport"],
+        serde_json::json!({
+            "version": 1,
+            "requestId": "report-cancel",
+            "status": "unavailable",
+            "reason": "cancelled",
+        }),
+        "{report}"
+    );
+    let first_answer = frames
+        .iter()
+        .position(|frame| frame.contains("\"stopReason\":\"cancelled\""))
+        .unwrap();
+    let report_at = frames.iter().position(|frame| frame == reports[0]).unwrap();
+    assert!(
+        report_at < first_answer,
+        "the report precedes the prompt answer"
+    );
+    drop(frames);
+    c.finish();
+}
+
+#[test]
+fn air_keys_reach_only_air_clients() {
+    // AIR: the agent side of the extension goes in the initialize response's
+    // top-level `_meta`, for an AIR client only, and only an ACP v1 AIR
+    // client gets the draft `sessionCapabilities.subagents`.
+    for ver in [1u64, 2] {
+        for air in [false, true] {
+            let caps_key = if ver == 1 {
+                "clientCapabilities"
+            } else {
+                "capabilities"
+            };
+            let extra = if air {
+                format!(
+                    r#","{caps_key}":{{"_meta":{{"jetbrains":{{"air":{{"version":1,"capabilities":[]}}}}}}}}"#
+                )
+            } else {
+                String::new()
+            };
+            let mut c = Client::spawn("quiet", &[]);
+            let id = c.req("initialize", &initialize_params(ver, &extra));
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            let result = &serde_json::from_str::<serde_json::Value>(&frame).unwrap()["result"];
+            let (capabilities, session) = if ver == 1 {
+                (
+                    &result["agentCapabilities"],
+                    &result["agentCapabilities"]["sessionCapabilities"],
+                )
+            } else {
+                (&result["capabilities"], &result["capabilities"]["session"])
+            };
+            assert!(
+                capabilities["_meta"].get("jetbrains").is_none(),
+                "v{ver}: AIR keys go in the top-level _meta: {frame}"
+            );
+            assert_eq!(
+                result["_meta"]["jetbrains"]["air"]["capabilities"].is_array(),
+                air,
+                "v{ver} air={air}: {frame}"
+            );
+            assert_eq!(
+                session.get("subagents").is_some(),
+                air && ver == 1,
+                "v{ver} air={air}: {frame}"
+            );
+            assert_eq!(result["_meta"]["steering"]["supported"], true, "{frame}");
+            c.finish();
+        }
+    }
+}
+
+#[test]
 fn negotiated_file_change_report_uses_successful_host_tool_paths_once() {
     let caps = ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}";
     let mut c = Client::spawn("file_changes", &[]);
@@ -7471,6 +7573,16 @@ fn air_recommended_reasoning_falls_back_to_the_model_default() {
         Some("medium"),
         "{frame}"
     );
+    // AIR replaces the ambiguous "Muse default" row with the concrete tier it
+    // resolves to, shown as current while the session keeps Muse's default.
+    let values: Vec<&str> = option["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|o| o["value"].as_str())
+        .collect();
+    assert!(!values.contains(&"default"), "{frame}");
+    assert_eq!(option["currentValue"], "medium", "{frame}");
     // Switching models moves the recommendation to the new model's default.
     let switch = c.req(
         "session/set_config_option",
@@ -11650,10 +11762,9 @@ fn workflow_async_task_stop_admits_cancel_and_waits_for_view_terminal() {
         &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"wfr-control\"}}"),
     );
     let ack = c.wait_for(&format!("\"id\":{stop_id}"), Duration::from_secs(15));
-    assert!(
-        ack.contains("\"status\":\"accepted\""),
-        "cancel is admission-only: {ack}"
-    );
+    // AIR's stop result; the cancel is admission only, and the workflow's
+    // own terminal settles the task.
+    assert!(ack.contains("\"result\":{\"stopped\":true}"), "{ack}");
     c.wait_log("workflow/cancel", Duration::from_secs(15));
     let stopped = c.wait_for("\"state\":\"stopped\"", Duration::from_secs(15));
     assert!(
@@ -11787,7 +11898,7 @@ fn session_fork_resolves_a_message_id_cut_point() {
     let fid = c.req(
         "session/fork",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageId\":\"msg-fork\"}}}}}}}}}}"
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"msg-fork\"}}}}}}}}}}"
         ),
     );
     let frame = c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
@@ -11807,40 +11918,53 @@ fn session_fork_resolves_a_message_id_cut_point() {
 }
 
 #[test]
-fn session_fork_rejects_unresolvable_and_fingerprint_cut_points() {
+fn session_fork_rejects_an_unmatched_point_and_ignores_a_malformed_one() {
+    // AIR: a fork point that matches no message fails with invalid params
+    // before any fork reaches the host.
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(1, "");
-
     let missing = c.req(
         "session/fork",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageId\":\"no-such-message\"}}}}}}}}}}"
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"no-such-message\"}}}}}}}}}}"
         ),
     );
     let frame = c.wait_for(&format!("\"id\":{missing}"), Duration::from_secs(15));
     assert!(
-        frame.contains("not found in session history"),
+        frame.contains("\"code\":-32602") && frame.contains("not found in session history"),
         "unresolved point must fail closed: {frame}"
     );
-
-    let fp = c.req(
-        "session/fork",
-        &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"abc\",\"messageOccurrence\":1}}}}}}}}}}"
-        ),
-    );
-    let frame = c.wait_for(&format!("\"id\":{fp}"), Duration::from_secs(15));
-    assert!(
-        frame.contains("sha256:<64 hex chars>"),
-        "malformed fingerprint must be explicit: {frame}"
-    );
-
     let seen = std::fs::read_to_string(&c.fake_log).expect("fake log");
     assert!(
         !seen.lines().any(|l| l == "session/fork"),
-        "no fork command may reach the host on invalid points: {seen}"
+        "no fork command may reach the host on an unmatched point: {seen}"
     );
     c.finish();
+
+    // AIR ignores a fork object without version 1 or a non-blank messageId,
+    // and forks the whole session.
+    for fork in [
+        r#"{"messageFingerprint":"abc","messageOccurrence":1}"#,
+        r#"{"version":2,"messageId":"msg-fork"}"#,
+        r#"{"version":1,"messageId":"  "}"#,
+    ] {
+        let mut c = Client::spawn("quiet", &[]);
+        let sid = c.new_session(1, "");
+        let id = c.req(
+            "session/fork",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{fork}}}}}}}}}"
+            ),
+        );
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\""), "{fork}: {frame}");
+        let fork_params = &host_requests(&c, "session/fork")[0];
+        assert!(
+            fork_params.get("cutPoint").is_none(),
+            "{fork}: {fork_params}"
+        );
+        c.finish();
+    }
 }
 
 #[test]
@@ -12967,6 +13091,46 @@ fn hook_inventory_labels_hook_run_items() {
 }
 
 #[test]
+fn air_clients_get_air_subagent_updates_for_either_signal() {
+    // AIR: an AIR client gets AIR's updates when it declares the standard
+    // `clientCapabilities.subagents` or AIR's `nativeSubagentSessions`, never
+    // the RFD's `subagent_update`, and subagent tool cards without either.
+    let air_only = r#""_meta":{"jetbrains":{"air":{"version":1,"capabilities":[]}}}"#;
+    for (ver, caps, native) in [
+        (1, format!(r#","clientCapabilities":{{"subagents":{{}},{air_only}}}"#), true),
+        (
+            1,
+            r#","clientCapabilities":{"subagents":{},"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["nativeSubagentSessions"]}}}}"#.to_string(),
+            true,
+        ),
+        (2, format!(r#","capabilities":{{{air_only}}}"#), false),
+    ] {
+        let mut c = Client::spawn("subagent_native", &[("FAKE_CAPS", "subagents")]);
+        let sid = c.new_session(ver, &caps);
+        let pid = c.prompt(&sid, "delegate natively");
+        c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        if native {
+            c.wait_for("\"sessionUpdate\":\"subagent_state_update\"", Duration::from_secs(15));
+        } else {
+            c.wait_for("subagent-it-subn", Duration::from_secs(15));
+        }
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).join("\n");
+        assert!(!frames.contains("\"subagent_update\""), "v{ver} {caps}: {frames}");
+        assert_eq!(
+            frames.contains("\"sessionUpdate\":\"subagent_spawned\""),
+            native,
+            "v{ver} {caps}: {frames}"
+        );
+        assert_eq!(
+            frames.contains("subagent-it-subn"),
+            !native,
+            "v{ver} {caps}: {frames}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn native_subagent_sessions_spawn_state_and_replay_the_child() {
     let mut c = Client::spawn("subagent_native", &[("FAKE_CAPS", "subagents")]);
     let sid = c
@@ -12979,7 +13143,10 @@ fn native_subagent_sessions_spawn_state_and_replay_the_child() {
     let _pid = c.prompt(&sid, "delegate natively");
 
     // Spawn announcement on the parent, exactly once, with provenance.
-    let spawned = c.wait_for("subagent_spawned", Duration::from_secs(15));
+    let spawned = c.wait_for_all(
+        &["\"sessionUpdate\":\"_subagent_update\"", "\"task\""],
+        Duration::from_secs(15),
+    );
     assert!(
         spawned.contains("\"subagentSessionId\":\"child-sess-native\""),
         "child session id missing: {spawned}"
@@ -13013,7 +13180,10 @@ fn native_subagent_sessions_spawn_state_and_replay_the_child() {
     );
 
     // Terminal state lands on the parent.
-    let state = c.wait_for("subagent_state_update", Duration::from_secs(15));
+    let state = c.wait_for_all(
+        &["\"sessionUpdate\":\"_subagent_update\"", "\"state\""],
+        Duration::from_secs(15),
+    );
     assert!(
         state.contains("\"state\":\"completed\""),
         "state missing: {state}"
@@ -13030,7 +13200,10 @@ fn native_subagent_sessions_spawn_state_and_replay_the_child() {
         "legacy card must not appear when native is negotiated: {frames}"
     );
     assert_eq!(
-        frames.matches("subagent_spawned").count(),
+        frames
+            .lines()
+            .filter(|l| l.contains("\"_subagent_update\"") && l.contains("\"task\""))
+            .count(),
         1,
         "spawn must be idempotent across started+completed: {frames}"
     );
@@ -13089,6 +13262,36 @@ fn a_settled_subagent_that_runs_again_is_shown_running() {
 }
 
 #[test]
+fn an_air_child_ends_at_its_first_terminal_state() {
+    // AIR ends a child for good: a later, different outcome of the same child
+    // sends no second terminal.
+    let mut c = Client::spawn(
+        "subagent_result_ready",
+        &[
+            ("FAKE_CAPS", "subagents"),
+            ("FAKE_SUBAGENT_RERUN", "1"),
+            ("FAKE_SUBAGENT_RERUN_FAILS", "1"),
+        ],
+    );
+    let sid = c.new_session(1, r#","clientCapabilities":{"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["nativeSubagentSessions"]}}}}"#);
+    let pid = c.prompt(&sid, "delegate three");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    c.wait_for_all(
+        &["child-sess-ready-c", "\"state\":\"failed\""],
+        Duration::from_secs(15),
+    );
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let states: Vec<&String> = frames
+        .iter()
+        .filter(|f| f.contains("subagent_state_update") && f.contains("child-sess-ready-a"))
+        .collect();
+    assert_eq!(states.len(), 1, "{states:#?}");
+    assert!(states[0].contains("\"state\":\"completed\""), "{states:#?}");
+    drop(frames);
+    c.finish();
+}
+
+#[test]
 fn native_subagent_result_ready_settles_the_child_once() {
     // #430: a child that reaches resultReady holds its result while its item
     // stays in progress, and nothing obliges the owner to read or close it.
@@ -13107,7 +13310,8 @@ fn native_subagent_result_ready_settles_the_child_once() {
         // that each child settled exactly once.
         c.wait_for_all(
             &[
-                "\"sessionUpdate\":\"subagent_state_update\"",
+                "\"sessionUpdate\":\"_subagent_update\"",
+                "\"state\"",
                 &format!("\"subagentSessionId\":\"{child}\""),
             ],
             Duration::from_secs(15),
@@ -13120,7 +13324,7 @@ fn native_subagent_result_ready_settles_the_child_once() {
         .join("\n");
     let states: Vec<&str> = frames
         .lines()
-        .filter(|l| l.contains("subagent_state_update"))
+        .filter(|l| l.contains("\"_subagent_update\"") && l.contains("\"state\""))
         .collect();
     for (child, state) in [
         ("child-sess-ready-a", "completed"),
@@ -13145,7 +13349,7 @@ fn native_subagent_controls_forward_owner_scope_and_client_command_ids() {
     let mut c = Client::spawn("subagent_control", &[("FAKE_CAPS", "subagents")]);
     let sid = c.new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}");
     let _pid = c.prompt(&sid, "hold child");
-    c.wait_for("subagent_spawned", Duration::from_secs(15));
+    c.wait_for("\"_subagent_update\"", Duration::from_secs(15));
 
     let send = c.req(
         "_subagent/sendMessage",
@@ -13237,7 +13441,7 @@ fn subagent_controls_are_gated_by_negotiation_and_item_terminal_status() {
     );
     let terminal_sid = terminal.new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}");
     let _pid = terminal.prompt(&terminal_sid, "finished child");
-    terminal.wait_for("subagent_spawned", Duration::from_secs(15));
+    terminal.wait_for("\"_subagent_update\"", Duration::from_secs(15));
     let terminal_stop = terminal.req(
         "_subagent/stop",
         &format!(
@@ -13312,7 +13516,7 @@ fn subagent_control_lifecycle_states_and_rejections_are_single_shot() {
         );
         let sid = c.new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}");
         let _pid = c.prompt(&sid, "lifecycle child");
-        c.wait_for("subagent_spawned", Duration::from_secs(15));
+        c.wait_for("\"_subagent_update\"", Duration::from_secs(15));
         let req = c.req(
             &format!("_{method}"),
             &format!(
@@ -13347,7 +13551,7 @@ fn subagent_control_lifecycle_states_and_rejections_are_single_shot() {
     );
     let sid = rejected.new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}");
     let _pid = rejected.prompt(&sid, "rejected result");
-    rejected.wait_for("subagent_spawned", Duration::from_secs(15));
+    rejected.wait_for("\"_subagent_update\"", Duration::from_secs(15));
     let req = rejected.req(
         "_subagent/readResult",
         &format!(
@@ -13517,10 +13721,16 @@ fn managed_bash_work_id_is_published_on_the_card_and_air_task() {
         ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
     );
     let _pid = c.prompt(&sid, "run in background");
-    c.wait_for(
-        "\"sessionUpdate\":\"async_task_spawned\"",
+    // ACP v2 carries AIR's update under its `_`-prefixed tag; AIR's spawn
+    // has a description.
+    let spawned = c.wait_for(
+        "\"sessionUpdate\":\"_async_task_spawned\"",
         Duration::from_secs(15),
     );
+    let spawned: serde_json::Value = serde_json::from_str(&spawned).unwrap();
+    let update = &spawned["params"]["update"];
+    assert!(update["description"].is_string(), "{spawned}");
+    assert_eq!(update["description"], update["name"], "{spawned}");
     let frames = c
         .frames
         .lock()
@@ -13647,18 +13857,35 @@ fn a_resumed_background_completion_settles_its_restored_task() {
 }
 
 #[test]
-fn async_task_stop_is_rejected_honestly() {
+fn async_task_stop_of_a_task_it_cannot_stop_answers_not_stopped() {
+    // AIR answers `{"stopped": false}`, not an error, for a task the agent
+    // cannot stop: without negotiation, an unknown session, an unknown task.
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
+    for (session, task) in [(sid.as_str(), "task-1"), ("no-such-session", "task-1")] {
+        let rid = c.req(
+            "_session/async_task/stop",
+            &format!("{{\"sessionId\":\"{session}\",\"asyncTaskId\":\"{task}\"}}"),
+        );
+        let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"result\":{\"stopped\":false}"),
+            "{session}/{task}: {frame}"
+        );
+    }
+    c.finish();
+
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
     let rid = c.req(
         "_session/async_task/stop",
-        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"task-1\"}}"),
+        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\" no-such-task \"}}"),
     );
     let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
-    assert!(
-        frame.contains("not supported by the Muse host"),
-        "stop must fail explicitly: {frame}"
-    );
+    assert!(frame.contains("\"result\":{\"stopped\":false}"), "{frame}");
     c.finish();
 }
 
@@ -14501,7 +14728,7 @@ fn emitted_frames_conform_to_the_vendored_schema() {
     c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
     let fid = c.req(
         "session/fork",
-        &format!("{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageId\":\"msg-fork\"}}}}}}}}}}"),
+        &format!("{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"msg-fork\"}}}}}}}}}}"),
     );
     c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
     let cid = c.prompt(&sid, "/compact");
@@ -14606,7 +14833,7 @@ fn session_fork_resolves_fingerprint_occurrences() {
     let first = c.req(
         "session/fork",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"{fp}\",\"messageOccurrence\":1}}}}}}}}}}"
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"msg-unknown\",\"messageFingerprint\":\"{fp}\",\"messageOccurrence\":1}}}}}}}}}}"
         ),
     );
     let frame = c.wait_for(&format!("\"id\":{first}"), Duration::from_secs(15));
@@ -14628,7 +14855,7 @@ fn session_fork_resolves_fingerprint_occurrences() {
     let second = c.req(
         "session/fork",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"{fp}\",\"messageOccurrence\":2}}}}}}}}}}"
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"msg-unknown\",\"messageFingerprint\":\"{fp}\",\"messageOccurrence\":2}}}}}}}}}}"
         ),
     );
     let frame = c.wait_for(&format!("\"id\":{second}"), Duration::from_secs(15));
@@ -14658,7 +14885,7 @@ fn session_fork_rejects_unmatched_and_malformed_fingerprints() {
     let rid = c.req(
         "session/fork",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"{unmatched}\"}}}}}}}}}}"
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"msg-unknown\",\"messageFingerprint\":\"{unmatched}\"}}}}}}}}}}"
         ),
     );
     let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
@@ -14670,13 +14897,14 @@ fn session_fork_rejects_unmatched_and_malformed_fingerprints() {
     let bad = c.req(
         "session/fork",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"not-a-digest\"}}}}}}}}}}"
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"msg-unknown\",\"messageFingerprint\":\"not-a-digest\"}}}}}}}}}}"
         ),
     );
     let frame = c.wait_for(&format!("\"id\":{bad}"), Duration::from_secs(15));
+    // A malformed fingerprint is not used, so only the id is looked up.
     assert!(
-        frame.contains("sha256:<64 hex chars>"),
-        "malformed fingerprint must be explicit: {frame}"
+        frame.contains("\"code\":-32602") && frame.contains("not found in session history"),
+        "malformed fingerprint: {frame}"
     );
 
     let seen = std::fs::read_to_string(&c.fake_log).expect("fake log");
@@ -15690,10 +15918,10 @@ fn streamed_rows_preserve_metadata_priority_and_clear_omitted_fields() {
 }
 
 #[test]
-fn fork_replays_host_cards_without_live_side_effects() {
-    // #393 names all three replay paths. load and resume are covered by
-    // `load_and_resume_replay_host_cards_without_live_side_effects`; this is
-    // the fork path, whose items come from `collect_history` instead.
+fn fork_sends_no_history_replay() {
+    // ACP and AIR define no replay on `session/fork`: the client replays a
+    // fork with a later load or resume. The fork's history still reaches the
+    // adapter (#393), and seeds the fork's fold.
     let mut c = Client::spawn("fork_history_cards", &[]);
     let sid = c.new_session(1, "");
     let cwd = std::path::Path::new(&c.fake_log)
@@ -15720,48 +15948,66 @@ fn fork_replays_host_cards_without_live_side_effects() {
         "cargo build",
         "Damaged session log range",
         "Fork future card",
+        "fork here",
     ] {
         assert!(
-            frames.contains(title),
-            "fork replay is missing the {title:?} card:\n{frames}"
+            !frames.contains(title),
+            "a fork must not replay its history ({title:?}):\n{frames}"
         );
     }
-    assert!(
-        frames.contains("fork here"),
-        "the forked message still replays: {frames}"
-    );
-    assert!(
-        !frames.contains("\"terminal_update\""),
-        "a finished shell must not open a terminal on fork replay: {frames}"
-    );
-    assert!(
-        frames.contains("\"itemKind\":\"webSearch\""),
-        "replayed fork cards carry their kind metadata: {frames}"
-    );
     c.finish();
 }
 
 #[test]
-fn fork_history_replays_only_the_forked_view_and_preserves_provenance() {
+fn loading_a_fork_replays_the_history_it_copied() {
+    // The fork sent nothing; a load replays the whole conversation, also what
+    // the adapter's fold of the fork already holds.
+    let mut c = Client::spawn("fork_history_inline", &[]);
+    let sid = c.new_session(1, "");
+    let id = c.req(
+        "session/fork",
+        &serde_json::json!({"sessionId": sid}).to_string(),
+    );
+    let result = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    let fork: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let fork = fork["result"]["sessionId"].as_str().unwrap().to_string();
+    let load = c.req(
+        "session/load",
+        &serde_json::json!({"sessionId": fork}).to_string(),
+    );
+    c.wait_for(&format!("\"id\":{load}"), Duration::from_secs(15));
+    let frames = c.frames.lock().unwrap().clone();
+    let replayed = frames
+        .iter()
+        .filter(|f| f.contains(&fork) && f.contains("agent_message") && f.contains("fork here"))
+        .count();
+    assert_eq!(replayed, 1, "{frames:#?}");
+    drop(frames);
+    c.finish();
+}
+
+#[test]
+fn fork_reads_only_the_forked_view_and_preserves_provenance() {
+    // Every history shape the host returns for the fork seeds its fold, so
+    // the live events that repeat that history are not sent either.
     for scenario in [
         "fork_history_inline",
         "fork_history_paged",
         "fork_history_snapshot",
     ] {
-        for (ver, cut, second) in [
-            (1, serde_json::json!({"messageId":"msg-fork"}), false),
+        for (ver, cut) in [
+            (1, serde_json::json!({"version":1,"messageId":"msg-fork"})),
             (
                 2,
-                serde_json::json!({"messageFingerprint":"sha256:e2bab1be910abb02f77bcbfaf13466c19100b8f0db25b9a2b4f9c80164556eab", "messageOccurrence":2}),
-                true,
+                serde_json::json!({"version":1,"messageId":"msg-unknown","messageFingerprint":"sha256:e2bab1be910abb02f77bcbfaf13466c19100b8f0db25b9a2b4f9c80164556eab", "messageOccurrence":2}),
             ),
-            (2, serde_json::Value::Null, true),
+            (2, serde_json::Value::Null),
         ] {
             let mut c = Client::spawn(scenario, &[]);
             let sid = c.new_session(ver, "");
-            let mut params = serde_json::json!({"sessionId":sid, "replayFrom":{"type":"start"}});
+            let mut params = serde_json::json!({"sessionId":sid});
             if !cut.is_null() {
-                params["_meta"] = serde_json::json!({"jetbrains":{"air":{"forkPoint":cut}}});
+                params["_meta"] = serde_json::json!({"jetbrains":{"air":{"fork":cut}}});
             }
             let id = c.req("session/fork", &params.to_string());
             let result = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
@@ -15777,25 +16023,7 @@ fn fork_history_replays_only_the_forked_view_and_preserves_provenance() {
                 .iter()
                 .filter(|f| f.contains("msp-sess-forked") && f.contains("agent_message"))
                 .collect();
-            assert_eq!(
-                messages.iter().filter(|f| f.contains("fork here")).count(),
-                1,
-                "{scenario}: {messages:?}"
-            );
-            assert_eq!(
-                messages
-                    .iter()
-                    .filter(|f| f.contains("second turn"))
-                    .count(),
-                usize::from(second),
-                "{messages:?}"
-            );
-            assert!(
-                !messages
-                    .iter()
-                    .any(|f| f.contains("must not replay") || f.contains("partial")),
-                "{messages:?}"
-            );
+            assert!(messages.is_empty(), "{scenario} v{ver}: {messages:?}");
             c.finish();
         }
     }

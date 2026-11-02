@@ -8,10 +8,10 @@
 //! read from the SDK's structs, and only `_meta` (whose members ACP leaves to
 //! extensions) and the params of extension methods stay JSON.
 
-use agent_client_protocol::{JsonRpcMessage, UntypedMessage, v1, v2};
+use agent_client_protocol::{v1, v2};
 use serde_json::{Map, Value};
 
-use crate::editor::{Error, RequestId, V1Message, V2Message};
+use crate::editor::{RequestId, V1Message, V2Message};
 
 /// A request's `_meta`: ACP reserves it for extensions.
 pub type Meta = Map<String, Value>;
@@ -484,6 +484,18 @@ pub fn v2(message: V2Message) -> Option<(Option<RequestId>, Request)> {
                     replay_from: r.replay_from.map(v2_replay),
                     meta: meta(r.meta),
                 }),
+                R::ForkSessionRequest(r) => Request::ForkSession(Setup {
+                    session_id: r.session_id.to_string(),
+                    cwd: path(&r.cwd.0),
+                    additional_directories: r
+                        .additional_directories
+                        .iter()
+                        .map(|p| path(&p.0))
+                        .collect(),
+                    mcp_servers: r.mcp_servers.into_iter().map(v2_mcp).collect(),
+                    replay_from: None,
+                    meta: meta(r.meta),
+                }),
                 R::PromptRequest(r) => Request::Prompt(Prompt {
                     session_id: r.session_id.to_string(),
                     blocks: r.prompt.iter().map(v2_block).collect(),
@@ -630,43 +642,6 @@ pub fn prompt_blocks(ver: u8, prompt: Option<&Value>) -> Result<Vec<Block>, Stri
             serde_json::from_value(prompt.clone()).map_err(invalid)?;
         Ok(blocks.iter().map(v1_block).collect())
     }
-}
-
-/// A message the editor claimed to read beside its version's schema type:
-/// JetBrains AIR's ACP v2 `session/fork`, whose top-level `replayFrom` the
-/// schema type drops. Its standard fields are still parsed with the SDK's
-/// schema type; an error is the SDK's own `-32602`.
-pub fn untyped(ver: u8, message: UntypedMessage) -> Result<Request, Error> {
-    let (method, params) = message.into_parts();
-    let request = match method.as_str() {
-        "session/fork" if ver == 2 => {
-            // JetBrains AIR asks a v2 fork to replay its history with the
-            // `replayFrom` that v2 `session/resume` defines; the schema type
-            // has no such member, so it is read beside it, with its type.
-            let replay_from = match params.get("replayFrom") {
-                None | Some(Value::Null) => None,
-                Some(replay) => Some(v2_replay(
-                    serde_json::from_value(replay.clone())
-                        .map_err(|error| Error::invalid_params().data(error.to_string()))?,
-                )),
-            };
-            let r = v2::schema::ForkSessionRequest::parse_message(&method, &params)?;
-            Request::ForkSession(Setup {
-                session_id: r.session_id.to_string(),
-                cwd: path(&r.cwd.0),
-                additional_directories: r
-                    .additional_directories
-                    .iter()
-                    .map(|p| path(&p.0))
-                    .collect(),
-                mcp_servers: r.mcp_servers.into_iter().map(v2_mcp).collect(),
-                replay_from,
-                meta: meta(r.meta),
-            })
-        }
-        _ => Request::Unsupported { method },
-    };
-    Ok(request)
 }
 
 /// The client's answer to a request the adapter sent, read from the

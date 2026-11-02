@@ -26,7 +26,7 @@ use std::time::Duration;
 
 use agent_client_protocol::{
     self as sdk, Agent, AgentProtocolRouter, Client, ConnectTo, Dispatch, DynConnectTo, Handled,
-    Lines, RequestCancellationHandle, Responder, UntypedMessage, v1, v2,
+    Lines, RequestCancellationHandle, Responder, v1, v2,
 };
 use futures::{AsyncBufReadExt, AsyncWriteExt};
 use serde_json::Value;
@@ -39,14 +39,6 @@ pub type V2Dispatch = v2::Dispatch<v2::schema::ClientRequest, v2::schema::Client
 /// The SDK's error type, which every response error is built from.
 pub use agent_client_protocol::Error;
 
-/// Standard methods whose requests carry an extension member at the top
-/// level of their params, which the schema type would drop. ACP v2
-/// `session/fork` takes JetBrains AIR's `replayFrom`, as `session/resume`
-/// does, to replay the fork's history. Every other method is read with its
-/// version's schema type: one the version does not define, or one that does
-/// not start with `_` and no schema defines, gets method-not-found.
-const V2_EXTENDED_METHODS: &[&str] = &["session/fork"];
-
 /// What the connection hands the main loop.
 pub enum Incoming {
     /// A typed ACP v1 request (its `Responder` waits in the editor's table)
@@ -54,13 +46,6 @@ pub enum Incoming {
     V1(V1Message),
     /// A typed ACP v2 request or notification.
     V2(V2Message),
-    /// A method no schema of the negotiated version types. `ver` is the
-    /// negotiated version.
-    Untyped {
-        ver: u8,
-        id: Option<RequestId>,
-        message: UntypedMessage,
-    },
     /// The client asked, with `$/cancel_request`, to cancel one of its
     /// requests. The SDK has already marked that request's cancellation.
     CancelRequest { id: RequestId },
@@ -292,7 +277,6 @@ impl Editor {
         impl sdk::RunWithConnectionTo<Client> + use<>,
         impl sdk::HandleConnectionClose<Client> + use<>,
     > {
-        let untyped = editor.clone();
         let cancels = editor.clone();
         let typed = editor.clone();
         let closed = editor.clone();
@@ -307,20 +291,6 @@ impl Editor {
                     Ok(())
                 },
                 sdk::on_receive_notification!(),
-            )
-            .on_receive_dispatch(
-                async move |dispatch: v2::Dispatch, cx: v2::ConnectionTo<Client>| {
-                    untyped.connected(Connection::V2(cx));
-                    Ok(untyped
-                        .claim_untyped(2, dispatch.into_raw(), V2_EXTENDED_METHODS)
-                        .map(|dispatch| dispatch.into_protocol())
-                        .transpose()?
-                        .map_or(Handled::Yes, |message| Handled::No {
-                            message,
-                            retry: false,
-                        }))
-                },
-                sdk::on_receive_dispatch!(),
             )
             .on_receive_dispatch(
                 async move |dispatch: V2Dispatch, cx: v2::ConnectionTo<Client>| {
@@ -361,34 +331,6 @@ impl Editor {
         let mut current = lock(&self.shared.connection);
         if current.is_none() {
             *current = Some(connection);
-        }
-    }
-
-    /// Forward a message whose method is in `claimed`, to be read beside its
-    /// schema type, and give back every other message.
-    fn claim_untyped(&self, ver: u8, dispatch: Dispatch, claimed: &[&str]) -> Option<Dispatch> {
-        if !claimed.contains(&dispatch.method()) {
-            return Some(dispatch);
-        }
-        match dispatch {
-            Dispatch::Request(message, responder) => {
-                let id = self.hold(responder);
-                (self.shared.sink)(Incoming::Untyped {
-                    ver,
-                    id: Some(id),
-                    message,
-                });
-                None
-            }
-            Dispatch::Notification(message) => {
-                (self.shared.sink)(Incoming::Untyped {
-                    ver,
-                    id: None,
-                    message,
-                });
-                None
-            }
-            response @ Dispatch::Response(..) => Some(response),
         }
     }
 

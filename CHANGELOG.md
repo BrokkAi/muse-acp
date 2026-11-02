@@ -28,9 +28,44 @@
       ACP defines.
     - `_session/*` and `_subagent/*` sent as notifications run, without an
       answer.
-  - JetBrains AIR's own shapes are kept as before: `replayFrom` on ACP v2
-    `session/fork`, AIR's subagent and async-task updates, and the
-    `subagents` member of the initialize capabilities.
+  - JetBrains AIR's extension follows AIR's specification:
+    - Only a client that declares `_meta.jetbrains.air` gets AIR keys. The
+      agent side moves to the initialize response's top-level
+      `_meta.jetbrains.air` (it was under ACP v1 `agentCapabilities._meta`),
+      and the draft `sessionCapabilities.subagents` goes to ACP v1 AIR
+      clients only. Other clients, Zed among them, get neither.
+    - An AIR client gets AIR's `subagent_spawned` and
+      `subagent_state_update` when it declares either the standard
+      `clientCapabilities.subagents` or `nativeSubagentSessions`, never the
+      RFD's `subagent_update`, and subagent tool cards without either. A
+      child ends at its first terminal state.
+    - ACP v2 carries AIR's updates under AIR's v2 tags: `_subagent_update`
+      for both subagent updates, `_async_task_spawned` and
+      `_async_task_state_update`. `async_task_spawned` now has its
+      `description`.
+    - The fork point is read from AIR's `_meta.jetbrains.air.fork`
+      (`{version: 1, messageId, messageFingerprint?, messageOccurrence?}`)
+      instead of `forkPoint`. A malformed object forks the whole session;
+      the fingerprint is used only when no message has the id; a point that
+      matches nothing is refused with `-32602`.
+    - `session/fork` replays no history in either version (ACP v1 forks
+      replayed it, and ACP v2 forks did with `replayFrom`, which neither
+      ACP nor AIR defines on a fork); a later load or resume replays it.
+      A load now replays the whole conversation also for a session this
+      connection already shows, as ACP v1 `session/load` requires, where it
+      left out what the adapter had already sent.
+    - `_session/async_task/stop` answers `{"stopped": false}` for an unknown
+      session or task, a finished one, one Muse would not stop, or without
+      `asyncTasks`, instead of an error, and `{"stopped": true}` for a
+      workflow task instead of Muse's raw result.
+    - A file-change report for a cancelled or failed turn is
+      `status: "unavailable"` with `reason` `cancelled` or `providerError`,
+      and every prompt that asked for one gets one, including turns that
+      end by reconciliation or disconnect. A repeated `requestId` is
+      ignored.
+    - With `recommendedValue`, the reasoning selector replaces its
+      "Muse default" row with the recommended tier, shown as current while
+      the session keeps Muse's default.
   - JSON-RPC batches are refused in both versions with one `-32600`
     (`id: null`), and none of their entries run. ACP v2 batches were
     previously answered entry by entry.
@@ -76,8 +111,8 @@
     with the child's title, description and state instead of the earlier
     draft's `subagent_spawned` and `subagent_state_update`. The state
     mirrors the child's: a settled child that is messaged again and runs is
-    shown running again. JetBrains AIR clients that negotiate
-    `nativeSubagentSessions` keep AIR's updates.
+    shown running again. JetBrains AIR clients get AIR's updates (see
+    above).
   - The adapter's own request ids are the SDK's, and malformed-frame errors
     carry the SDK's messages. An invalid UTF-8 line still gets `-32700` and
     reading goes on.

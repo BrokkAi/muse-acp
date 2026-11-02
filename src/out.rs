@@ -550,14 +550,20 @@ pub fn subagent_update(acp_sid: &str, ver: u8, subagent: Subagent) -> Note {
 
 /// A JetBrains AIR update no ACP schema of the version defines
 /// (`subagent_spawned`, `subagent_state_update`, `async_task_spawned`,
-/// `async_task_state_update`). ACP v2 carries it as its typed `Other`
-/// update; v1 has no such variant, so it goes out untyped. `update` is the
-/// update object with its `sessionUpdate` discriminator.
+/// `async_task_state_update`). `update` is the update object with its v1
+/// `sessionUpdate` discriminator, which v1 sends untyped, as AIR defines it.
+/// ACP v2 carries it as its typed `Other` update under AIR's v2 tag: an
+/// implementation-specific update must start with `_`, and AIR's v2 form
+/// folds both subagent updates into `_subagent_update`.
 pub fn air(acp_sid: &str, ver: u8, update: Value) -> Note {
     if ver == 2
         && let Value::Object(fields) = &update
         && let Some(kind) = fields.get("sessionUpdate").and_then(Value::as_str)
     {
+        let kind = match kind {
+            "subagent_spawned" | "subagent_state_update" => "_subagent_update".to_string(),
+            other => format!("_{other}"),
+        };
         let fields = fields
             .iter()
             .filter(|(key, _)| key.as_str() != "sessionUpdate")

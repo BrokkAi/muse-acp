@@ -66,6 +66,9 @@ static SIDE_CHAT: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates
 static PLUGINS: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates plugin reads
 static COMPUTER_USE: AtomicU64 = AtomicU64::new(0); // 1 when the client negotiates computer-use setup
 static AIR_FILE_REPORT: AtomicU64 = AtomicU64::new(0); // 1 when per-turn file reports are negotiated
+/// Whether the client is JetBrains AIR: it declared `_meta.jetbrains.air` on
+/// `initialize`. Only an AIR client gets AIR keys (docs/acp-extensions.md).
+static AIR_CLIENT: AtomicBool = AtomicBool::new(false);
 static MUSE_NOT_INSTALLED: AtomicBool = AtomicBool::new(false); // host launch found no Muse executable
 static AUTH_TERMINAL: AtomicBool = AtomicBool::new(false); // the client advertises terminal auth
 static BOOLEAN_CONFIG: AtomicBool = AtomicBool::new(false); // boolean config options may be offered
@@ -136,16 +139,26 @@ fn cache_session_row(lists: &SessionLists, row: &J) -> Option<(Option<String>, O
     Some((previous_title, title))
 }
 
-/// True when the client's `capabilities._meta.jetbrains.air.capabilities`
-/// advertises a key.
+/// Whether the client declared the AIR extension: `_meta.jetbrains.air` is
+/// an object. Such a client is AIR even when its declaration enables no
+/// capability.
+fn client_is_air(meta: &request::Meta) -> bool {
+    meta.get("jetbrains")
+        .and_then(|j| j.get("air"))
+        .is_some_and(serde_json::Value::is_object)
+}
+
+/// True when the client's `_meta.jetbrains.air` declaration is well formed
+/// (an integer `version` of at least 1 and a `capabilities` array) and lists
+/// `key`. A malformed declaration enables no capability.
 fn client_supports_air(meta: &request::Meta, key: &str) -> bool {
     let Some(air) = meta.get("jetbrains").and_then(|j| j.get("air")) else {
         return false;
     };
     let version_ok = air
         .get("version")
-        .and_then(serde_json::Value::as_u64)
-        .is_some_and(|v| v >= 1);
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|v| v.is_finite() && v.fract() == 0.0 && v >= 1.0);
     let supported = air
         .get("capabilities")
         .and_then(serde_json::Value::as_array)
@@ -153,17 +166,24 @@ fn client_supports_air(meta: &request::Meta, key: &str) -> bool {
     version_ok && supported
 }
 
-/// Which native subagent protocol the client reads, if any. ACP v1 clients
-/// opt in to the subagents RFD with `clientCapabilities.subagents`; in ACP v2
-/// the RFD's `subagent_update` is a baseline requirement that needs no
-/// capability. JetBrains AIR's `nativeSubagentSessions` selects AIR's own
-/// updates, unless a v1 client also advertised the standard capability.
+/// Which native subagent protocol the client reads, if any.
+///
+/// An AIR client gets AIR's own updates when it declares either the standard
+/// `clientCapabilities.subagents` or AIR's `nativeSubagentSessions`, and
+/// subagent tool cards without either. Any other client gets the subagents
+/// RFD's `subagent_update`: ACP v1 clients opt in with
+/// `clientCapabilities.subagents`, and in ACP v2 it is a baseline
+/// requirement that needs no capability.
 fn subagent_protocol(ver: u8, capabilities: &request::ClientCapabilities) -> u64 {
-    if capabilities.subagents {
-        SUBAGENTS_ACP
-    } else if client_supports_air(&capabilities.meta, "nativeSubagentSessions") {
-        SUBAGENTS_AIR
-    } else if ver == 2 {
+    if client_is_air(&capabilities.meta) {
+        if capabilities.subagents
+            || client_supports_air(&capabilities.meta, "nativeSubagentSessions")
+        {
+            SUBAGENTS_AIR
+        } else {
+            0
+        }
+    } else if capabilities.subagents || ver == 2 {
         SUBAGENTS_ACP
     } else {
         0
@@ -213,8 +233,18 @@ fn file_report_request(meta: &request::Meta) -> Option<String> {
     {
         return None;
     }
-    Some(id.to_string())
+    // AIR ignores a repeated request id.
+    let fresh = FILE_REPORT_IDS
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(id.to_string());
+    fresh.then(|| id.to_string())
 }
+
+/// Every AIR file-change report request id seen on this connection.
+static FILE_REPORT_IDS: std::sync::OnceLock<Mutex<std::collections::HashSet<String>>> =
+    std::sync::OnceLock::new();
 
 fn new_file_report(request_id: String) -> FileChangeReport {
     FileChangeReport {
@@ -443,15 +473,44 @@ fn tool_patch_diff(host: &Arc<Hosts>, msp_sid: &str, item: &J) -> Option<out::Ca
     diff.map(out::CardContent::Diff)
 }
 
-fn send_file_report(stdout: &StdoutShared, acp_sid: &str, ver: u8, report: FileChangeReport) {
-    let report = serde_json::json!({
-        "version": 1,
-        "requestId": report.request_id,
-        "status": "reported",
-        "paths": report.paths,
-        "declaredComplete": report.declared_complete,
-        "truncated": report.truncated,
-    });
+/// Why an AIR file-change report has no file list: AIR's `reason` values.
+#[derive(Clone, Copy)]
+enum ReportUnavailable {
+    /// The prompt was cancelled.
+    Cancelled,
+    /// The turn failed.
+    ProviderError,
+}
+
+/// Send the AIR file-change report of a finished prompt, before its
+/// response: the file list when the turn completed (`unavailable: None`),
+/// else `status: "unavailable"` with the reason.
+fn send_file_report(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    ver: u8,
+    report: FileChangeReport,
+    unavailable: Option<ReportUnavailable>,
+) {
+    let report = match unavailable {
+        None => serde_json::json!({
+            "version": 1,
+            "requestId": report.request_id,
+            "status": "reported",
+            "paths": report.paths,
+            "declaredComplete": report.declared_complete,
+            "truncated": report.truncated,
+        }),
+        Some(reason) => serde_json::json!({
+            "version": 1,
+            "requestId": report.request_id,
+            "status": "unavailable",
+            "reason": match reason {
+                ReportUnavailable::Cancelled => "cancelled",
+                ReportUnavailable::ProviderError => "providerError",
+            },
+        }),
+    };
     let meta =
         serde_json::json!({"jetbrains": {"air": {"version": 1, "agentFileChangeReport": report}}});
     acp::send_note(
@@ -1950,13 +2009,8 @@ fn v2_init(session_mcp: bool, session_delete: bool) -> serde_json::Value {
     let response = s2::InitializeResponse::new(ProtocolVersion::V2, info)
         .capabilities(s2::AgentCapabilities::new().session(session))
         .auth_methods(auth_methods_v2())
-        .meta(out::meta(
-            r#"{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"steering":{"supported":true,"idleBehaviors":["promptRequired"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}"#,
-        ));
-    with_air_subagents(
-        serde_json::to_value(response).expect("an initialize response serializes"),
-        &["capabilities", "session"],
-    )
+        .meta(initialize_meta(Some(MUSE_CAPABILITIES)));
+    serde_json::to_value(response).expect("an initialize response serializes")
 }
 
 fn v1_init(session_mcp: bool, session_delete: bool) -> serde_json::Value {
@@ -1981,36 +2035,42 @@ fn v1_init(session_mcp: bool, session_delete: bool) -> serde_json::Value {
         .mcp_capabilities(s1::McpCapabilities::new().http(session_mcp).sse(false))
         .auth(s1::AgentAuthCapabilities::new().logout(s1::LogoutCapabilities::new()))
         .session_capabilities(session)
-        .meta(out::meta(
-            r#"{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}"#,
-        ));
+        .meta(out::meta(&format!("{{{MUSE_CAPABILITIES}}}")));
     let info = s1::Implementation::new("muse-acp", env!("CARGO_PKG_VERSION")).title("Muse ACP");
     let response = s1::InitializeResponse::new(ProtocolVersion::V1)
         .auth_methods(auth_methods_v1())
         .agent_capabilities(capabilities)
         .agent_info(info)
-        .meta(out::meta(
-            r#"{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}"#,
-        ));
-    with_air_subagents(
-        serde_json::to_value(response).expect("an initialize response serializes"),
-        &["agentCapabilities", "sessionCapabilities"],
-    )
-}
-
-/// JetBrains AIR reads native subagent support from a `subagents` member of
-/// the agent's session capabilities, which neither ACP schema defines. It is
-/// added to the SDK's serialized response, as the AIR TypeScript adapters
-/// add it to theirs.
-fn with_air_subagents(mut response: serde_json::Value, path: &[&str]) -> serde_json::Value {
-    let mut target = &mut response;
-    for key in path {
-        target = &mut target[*key];
-    }
-    if let serde_json::Value::Object(session) = target {
+        .meta(initialize_meta(None));
+    let mut response = serde_json::to_value(response).expect("an initialize response serializes");
+    // AIR reads native subagent support from the earlier subagents draft's
+    // agent capability, which the v1 schema no longer defines; only AIR
+    // gets it.
+    if AIR_CLIENT.load(Ordering::SeqCst)
+        && let Some(session) = response
+            .pointer_mut("/agentCapabilities/sessionCapabilities")
+            .and_then(serde_json::Value::as_object_mut)
+    {
         session.insert("subagents".to_string(), serde_json::json!({}));
     }
     response
+}
+
+/// The Muse extension capabilities, as a `_meta` member.
+const MUSE_CAPABILITIES: &str = r#""muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]}"#;
+
+/// The `initialize` response's top-level `_meta`: the steering extension,
+/// `muse` when given, and, for an AIR client only, the agent side of the AIR
+/// extension.
+fn initialize_meta(muse: Option<&str>) -> Option<out::Meta> {
+    let mut members: Vec<&str> = muse.into_iter().collect();
+    members.push(r#""steering":{"supported":true,"idleBehaviors":["promptRequired"]}"#);
+    if AIR_CLIENT.load(Ordering::SeqCst) {
+        members.push(
+            r#""jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}"#,
+        );
+    }
+    out::meta(&format!("{{{}}}", members.join(",")))
 }
 
 fn send_initialize(
@@ -3008,44 +3068,53 @@ fn validate_session_roots(
     true
 }
 
-/// Resolve an ACP fork point (`_meta.jetbrains.air.forkPoint`) to an MSP
-/// `cutPoint.lastTurnId`. `Ok(None)` means "all completed turns".
+/// Resolve AIR's fork point (`_meta.jetbrains.air.fork`) to an MSP
+/// `cutPoint.lastTurnId`. `Ok(None)` forks the whole session.
 ///
-/// Message ids and SHA-256 fingerprints (with a 1-based occurrence) resolve
-/// against host history. An unresolved point must fail closed.
+/// AIR's object is `{version: 1, messageId, messageFingerprint?,
+/// messageOccurrence?}`. It counts only with `version` 1 and a non-blank
+/// `messageId`; otherwise it is ignored. The id names an agent message; an id
+/// with a `:segment:<n>` suffix also matches the message without it. When no
+/// message has the id, a `sha256:<hex>` `messageFingerprint` of the message
+/// text picks one: the only match, or the `messageOccurrence`-th (1-based) of
+/// equal messages. A point that matches nothing fails with invalid params.
 fn resolve_fork_cut_point(
     host: &Arc<Hosts>,
     msp_sid: &str,
     meta: &request::Meta,
 ) -> Result<Option<String>, String> {
-    let fork_point = meta
+    let Some(fork) = meta
         .get("jetbrains")
         .and_then(|j| j.get("air"))
-        .and_then(|a| a.get("forkPoint"))
-        .map(json::from_value);
-    let Some(fork_point) = fork_point else {
+        .and_then(|a| a.get("fork"))
+    else {
         return Ok(None);
     };
-    let message_id = fork_point
+    let version_one = fork
+        .get("version")
+        .and_then(serde_json::Value::as_f64)
+        .is_some_and(|v| v == 1.0);
+    let message_id = fork
         .get("messageId")
-        .and_then(|v| v.as_str())
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
         .unwrap_or("");
-    let fingerprint = fork_point
+    if !version_one || message_id.is_empty() {
+        return Ok(None);
+    }
+    let fingerprint = fork
         .get("messageFingerprint")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if message_id.is_empty() && fingerprint.is_empty() {
-        return Err("fork point needs a messageId or messageFingerprint".to_string());
-    }
-    let well_formed = fingerprint.starts_with("sha256:") && {
-        let hex = &fingerprint["sha256:".len()..];
-        hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit())
-    };
-    if !fingerprint.is_empty() && !well_formed {
-        return Err(format!(
-            "fork point fingerprint must be sha256:<64 hex chars>: {fingerprint}"
-        ));
-    }
+        .and_then(serde_json::Value::as_str)
+        .filter(|fingerprint| {
+            fingerprint
+                .strip_prefix("sha256:")
+                .is_some_and(|hex| hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        });
+    let occurrence = fork
+        .get("messageOccurrence")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|n| *n > 0)
+        .and_then(|n| usize::try_from(n).ok());
     let read = host
         .command(
             "session/read",
@@ -3053,34 +3122,36 @@ fn resolve_fork_cut_point(
         )
         .map_err(|e| format!("fork point history read failed: {}", err_message(&e)))?;
     let (items, _) = collect_history(host, msp_sid, &read)?;
-    if !message_id.is_empty() {
-        let turn = items
-            .iter()
-            .find(|item| item.get("itemId").and_then(|v| v.as_str()) == Some(message_id))
-            .and_then(|item| item.get("turnId").cloned());
-        return match turn {
-            Some(J::Str(turn)) if !turn.is_empty() => Ok(Some(turn)),
-            // userShell items carry turnId: null; they cannot bound a turn.
-            Some(_) => Err(format!(
-                "fork point message {message_id} is not turn-scoped"
-            )),
-            None => Err(format!(
-                "fork point message {message_id} not found in session history"
-            )),
-        };
-    }
-
-    // Fingerprint mode (AIR): match agent-authored message text, then pick the
-    // 1-based occurrence among duplicates. Only agentMessage items count.
-    let occurrence = match fork_point.get("messageOccurrence") {
-        None => 1,
-        Some(value) => value
-            .as_u64()
-            .filter(|n| *n > 0)
-            .and_then(|n| usize::try_from(n).ok())
-            .ok_or("fork point messageOccurrence must be a positive integer")?,
+    let turn_of = |item: &J| {
+        item.get("turnId")
+            .and_then(|v| v.as_str())
+            .filter(|turn| !turn.is_empty())
+            .map(str::to_string)
     };
-    let matches: Vec<&str> = items
+    let unsegmented = message_id
+        .rsplit_once(":segment:")
+        .filter(|(_, n)| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+        .map(|(id, _)| id);
+    let by_id = [Some(message_id), unsegmented]
+        .into_iter()
+        .flatten()
+        .find_map(|id| {
+            items
+                .iter()
+                .find(|item| item.get("itemId").and_then(|v| v.as_str()) == Some(id))
+        });
+    if let Some(item) = by_id {
+        // userShell items carry turnId: null; they cannot bound a turn.
+        return turn_of(item)
+            .map(Some)
+            .ok_or_else(|| format!("fork point message {message_id} is not turn-scoped"));
+    }
+    let Some(fingerprint) = fingerprint else {
+        return Err(format!(
+            "fork point message {message_id} not found in session history"
+        ));
+    };
+    let matches: Vec<String> = items
         .iter()
         .filter(|item| item.get("kind").and_then(|v| v.as_str()) == Some("agentMessage"))
         .filter(|item| {
@@ -3088,34 +3159,36 @@ fn resolve_fork_cut_point(
                 .and_then(|v| v.as_str())
                 .is_some_and(|text| sha256::air_fingerprint(text) == fingerprint)
         })
-        .filter_map(|item| item.get("turnId").and_then(|v| v.as_str()))
-        .filter(|turn| !turn.is_empty())
+        .filter_map(turn_of)
         .collect();
-    match matches.get(occurrence - 1) {
-        Some(turn) => Ok(Some(turn.to_string())),
-        None if matches.is_empty() => {
-            Err("fork point fingerprint matched no agent message in session history".to_string())
-        }
-        None => Err(format!(
-            "fork point occurrence {occurrence} exceeds the {} matching message(s)",
-            matches.len()
-        )),
-    }
+    let picked = if matches.len() == 1 {
+        matches.first()
+    } else {
+        matches.get(occurrence.unwrap_or(1) - 1)
+    };
+    picked.cloned().map(Some).ok_or_else(|| {
+        format!("fork point message {message_id} matched no agent message in session history")
+    })
 }
 
 fn selftest() -> i32 {
-    // Every initialize response, with the AIR member the adapter adds, must
-    // still read back as its version's schema type.
-    for (v2, session_mcp, session_delete) in [
-        (true, true, true),
-        (true, true, false),
-        (true, false, true),
-        (true, false, false),
-        (false, true, true),
-        (false, true, false),
-        (false, false, true),
-        (false, false, false),
-    ] {
+    // Every initialize response, for AIR clients with the AIR members too,
+    // must still read back as its version's schema type.
+    let shapes = [false, true].into_iter().flat_map(|air| {
+        [
+            (true, true, true),
+            (true, true, false),
+            (true, false, true),
+            (true, false, false),
+            (false, true, true),
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+        ]
+        .map(|(v2, mcp, delete)| (air, v2, mcp, delete))
+    });
+    for (air, v2, session_mcp, session_delete) in shapes {
+        AIR_CLIENT.store(air, Ordering::SeqCst);
         let (response, parsed) = if v2 {
             let response = v2_init(session_mcp, session_delete);
             let parsed = serde_json::from_value::<
@@ -3136,6 +3209,7 @@ fn selftest() -> i32 {
             return 1;
         }
     }
+    AIR_CLIENT.store(false, Ordering::SeqCst);
     println!("[muse-acp] selftest: static literals OK");
     for line in compat::selftest_lines(env!("CARGO_PKG_VERSION")) {
         println!("[muse-acp] {line}");
@@ -3464,11 +3538,20 @@ fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
             None => (Vec::new(), 0, 1),
         }
     };
-    for f in settled {
+    for mut f in settled {
         log(&format!(
             "reattach reconciliation: turn {} absent from the folded state; prompt settled as cancelled",
             f.msp_turn
         ));
+        if let Some(report) = f.file_report.take() {
+            send_file_report(
+                stdout,
+                acp_sid,
+                ver,
+                report,
+                Some(ReportUnavailable::Cancelled),
+            );
+        }
         if ver == 2 {
             if rest == 0 {
                 acp::send_state(stdout, acp_sid, "idle", Some("cancelled"));
@@ -4245,7 +4328,7 @@ fn main() {
                 shutdown::exit(0);
             }
             LoopMsg::Acp(incoming) => {
-                let Some((ver, id, request)) = read_request(&stdout, incoming) else {
+                let Some((ver, id, request)) = read_request(incoming) else {
                     continue;
                 };
                 if let Some(reason) = host_unavailable.as_deref() {
@@ -4565,30 +4648,11 @@ fn ends_connection(incoming: &Incoming) -> bool {
 }
 
 /// The request an editor message carries, with its id (none for a
-/// notification) and the protocol version it arrived on. A method claimed
-/// without its version's schema type is still parsed with the SDK's type;
-/// when that fails, the SDK's error answers the request here.
-fn read_request(
-    stdout: &StdoutShared,
-    incoming: Incoming,
-) -> Option<(u8, Option<RequestId>, Request)> {
+/// notification) and the protocol version it arrived on.
+fn read_request(incoming: Incoming) -> Option<(u8, Option<RequestId>, Request)> {
     match incoming {
         Incoming::V1(message) => request::v1(message).map(|(id, request)| (1, id, request)),
         Incoming::V2(message) => request::v2(message).map(|(id, request)| (2, id, request)),
-        Incoming::Untyped { ver, id, message } => match request::untyped(ver, message) {
-            // ACP defines none of these methods as a notification, and
-            // extension notifications start with `_`: ignore it.
-            Ok(_) if id.is_none() => None,
-            Ok(request) => Some((ver, id, request)),
-            Err(error) => {
-                if let Some(id) = id
-                    && stdout.respond_error(&id, error).is_err()
-                {
-                    shutdown::disconnect();
-                }
-                None
-            }
-        },
         Incoming::CancelRequest { id } => Some((
             negotiated_ver(),
             None,
@@ -5012,6 +5076,7 @@ fn negotiate_acp(v: u8, capabilities: &request::ClientCapabilities) -> bool {
     if !terminal_auth {
         log("client did not advertise terminal auth; no typed terminal login method is offered");
     }
+    AIR_CLIENT.store(client_is_air(&capabilities.meta), Ordering::SeqCst);
     let subagent_updates = subagent_protocol(v, capabilities);
     NATIVE_SUBAGENTS.store(subagent_updates, Ordering::SeqCst);
     let subagents = subagent_updates != 0;
@@ -5786,6 +5851,13 @@ fn handle_acp(
                             );
                         }
                         if replay {
+                            // A load replays the whole conversation (ACP v1
+                            // `session/load`, AIR for a live session too),
+                            // also what this connection's fold already saw,
+                            // such as a fork's copied history: replay
+                            // through a fresh fold.
+                            let root = entry.fold.workspace_root.clone();
+                            entry.fold = fresh_fold(&root);
                             replay_history(stdout, entry, &r);
                         }
                         reconcile_active_tasks(stdout, entry, &r, replay);
@@ -6178,14 +6250,12 @@ fn handle_acp(
                             return;
                         }
                     };
+                    // ACP and AIR define no history replay on fork: the
+                    // client replays it with a later load or resume. The
+                    // history still seeds the fork's fold, so the live events
+                    // that follow are deduplicated against it.
                     let mut fork_fold = fresh_fold(&restored_cwd);
-                    let mut replay_lines = Vec::new();
-                    fork_fold.replay_history_items(
-                        &new_msp,
-                        ver,
-                        &history_items,
-                        &mut replay_lines,
-                    );
+                    fork_fold.replay_history_items(&new_msp, ver, &history_items, &mut Vec::new());
                     let provenance = session_provenance_meta(Some(&new_session))
                         .map(|muse| format!(",\"muse\":{muse}"))
                         .unwrap_or_default();
@@ -6334,9 +6404,6 @@ fn handle_acp(
                         "{{\"mspSessionId\":{}{provenance}}}",
                         esc(&new_msp)
                     ));
-                    if ver == 1 || setup.replay_from.is_some() {
-                        send_fold_output(stdout, sessions, &new_msp, replay_lines);
-                    }
                     acp::send_setup_response(
                         stdout,
                         &id,
@@ -11747,7 +11814,14 @@ fn handle_msp(
                 let failed =
                     terminal != "completed" && terminal != "cancelled" && !deferred_start_failure;
                 if let Some(report) = file_report {
-                    send_file_report(stdout, &acp_sid, ver, report);
+                    let unavailable = if failed {
+                        Some(ReportUnavailable::ProviderError)
+                    } else if stop == "cancelled" {
+                        Some(ReportUnavailable::Cancelled)
+                    } else {
+                        None
+                    };
+                    send_file_report(stdout, &acp_sid, ver, report, unavailable);
                 }
                 if ver == 2 {
                     // A failed terminal otherwise surfaces as a bare idle
@@ -11803,9 +11877,24 @@ fn handle_msp(
                 .map(|s| {
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id)?;
                     let ver = s.ver;
-                    Some((s.in_flight.remove(pos).req_id, ver, s.in_flight.len()))
+                    let finished = s.in_flight.remove(pos);
+                    Some((
+                        finished.req_id,
+                        ver,
+                        s.in_flight.len(),
+                        finished.file_report,
+                    ))
                 });
-            if let Some((req_id, ver, rest)) = settled.flatten() {
+            if let Some((req_id, ver, rest, file_report)) = settled.flatten() {
+                if let Some(report) = file_report {
+                    send_file_report(
+                        stdout,
+                        &acp_sid,
+                        ver,
+                        report,
+                        Some(ReportUnavailable::Cancelled),
+                    );
+                }
                 if ver == 2 {
                     if rest == 0 {
                         acp::send_state(stdout, &acp_sid, "idle", Some("cancelled"));
@@ -12075,9 +12164,24 @@ fn handle_msp(
                     acp::send_fold_lines(stdout, s, checks);
                     let pos = s.in_flight.iter().position(|f| f.msp_turn == turn_id)?;
                     let ver = s.ver;
-                    Some((s.in_flight.remove(pos).req_id, ver, s.in_flight.len()))
+                    let finished = s.in_flight.remove(pos);
+                    Some((
+                        finished.req_id,
+                        ver,
+                        s.in_flight.len(),
+                        finished.file_report,
+                    ))
                 });
-            if let Some((req_id, ver, rest)) = settled.flatten() {
+            if let Some((req_id, ver, rest, file_report)) = settled.flatten() {
+                if let Some(report) = file_report {
+                    send_file_report(
+                        stdout,
+                        &acp_sid,
+                        ver,
+                        report,
+                        Some(ReportUnavailable::Cancelled),
+                    );
+                }
                 if ver == 2 {
                     if rest == 0 {
                         acp::send_state(stdout, &acp_sid, "idle", Some("cancelled"));
@@ -14023,12 +14127,12 @@ fn stop_async_task(
     let sid = params
         .and_then(|p| p.get("sessionId"))
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .map(str::trim)
         .unwrap_or("");
     let async_task_id = params
         .and_then(|p| p.get("asyncTaskId"))
         .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
+        .map(str::trim)
         .unwrap_or("");
     if sid.is_empty() || async_task_id.is_empty() {
         acp::send_error(
@@ -14039,6 +14143,10 @@ fn stop_async_task(
         );
         return;
     }
+    // AIR answers `{"stopped": false}` for a task it cannot stop: an unknown
+    // session or task, one already finished, or a session without AIR async
+    // tasks. Only a failed stop is an error.
+    let not_stopped = || acp::send_ext_result(stdout, id, "{\"stopped\":false}");
 
     let target = sessions
         .lock()
@@ -14047,23 +14155,18 @@ fn stop_async_task(
         .map(|s| {
             (
                 s.fold.air_async_tasks,
+                s.fold.async_task_settled(async_task_id),
                 s.msp_sid.clone(),
                 s.fold.msp_task_id(async_task_id).map(str::to_string),
                 s.fold.workflow_run_id_for_task(async_task_id),
             )
         });
-    let Some((negotiated, msp_sid, msp_task_id, workflow_run_id)) = target else {
-        acp::send_error(stdout, id, -32602, "unknown sessionId");
+    let Some((negotiated, settled, msp_sid, msp_task_id, workflow_run_id)) = target else {
+        not_stopped();
         return;
     };
-    if !negotiated {
-        log("async-task stop rejected: AIR async tasks were not negotiated");
-        acp::send_error(
-            stdout,
-            id,
-            -32601,
-            "background task stop is not supported by the Muse host",
-        );
+    if !negotiated || settled {
+        not_stopped();
         return;
     }
     if let Some(workflow_run_id) = workflow_run_id {
@@ -14077,7 +14180,8 @@ fn stop_async_task(
                 esc(&workflow_run_id)
             ),
         ) {
-            Ok(result) => acp::send_ext_result(stdout, id, &j_to_string(&result)),
+            // The workflow's own events settle the task.
+            Ok(_) => acp::send_ext_result(stdout, id, "{\"stopped\":true}"),
             Err(e) => acp::send_error(
                 stdout,
                 id,
@@ -14088,7 +14192,7 @@ fn stop_async_task(
         return;
     }
     let Some(msp_task_id) = msp_task_id else {
-        acp::send_error(stdout, id, -32602, "unknown or non-stoppable asyncTaskId");
+        not_stopped();
         return;
     };
 
@@ -14109,16 +14213,16 @@ fn stop_async_task(
             acp::send_ext_result(stdout, id, "{\"stopped\":true}");
         }
         Ok(ack) => {
+            // The host did not take the stop (the task is already ending, for
+            // example): nothing was stopped.
             let status = ack
                 .get("status")
                 .and_then(|v| v.as_str())
                 .unwrap_or("missing");
-            acp::send_error(
-                stdout,
-                id,
-                -32603,
-                &format!("background task stop was not accepted by the Muse host: {status}"),
-            );
+            log(&format!(
+                "background task stop was not accepted by the Muse host: {status}"
+            ));
+            acp::send_ext_result(stdout, id, "{\"stopped\":false}");
         }
         Err(e) => {
             acp::send_error(
@@ -14286,6 +14390,17 @@ fn fail_in_flight(stdout: &StdoutShared, s: &mut AcpSession, message: &str) {
     acp::send_fold_lines(stdout, s, checks);
     if s.in_flight.is_empty() {
         return;
+    }
+    for f in &mut s.in_flight {
+        if let Some(report) = f.file_report.take() {
+            send_file_report(
+                stdout,
+                &s.acp_sid,
+                s.ver,
+                report,
+                Some(ReportUnavailable::ProviderError),
+            );
+        }
     }
     if s.ver == 2 {
         send_agent_text(stdout, &s.acp_sid, 2, message);

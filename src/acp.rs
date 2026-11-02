@@ -1376,10 +1376,21 @@ pub fn config_options(
     let model_meta = recommended_model
         .filter(|model| models.iter().any(|row| row.id == *model))
         .and_then(recommended);
+    // AIR's recommendedValue replaces the ambiguous "Muse default" row with
+    // the concrete tier it resolves to: the recommended one, shown as
+    // current while the session keeps Muse's default.
+    let recommended_tier = reasoning_meta
+        .as_ref()
+        .and(recommended_reasoning)
+        .filter(|tier| *tier != REASONING_DEFAULT);
+    let reasoning_current = match recommended_tier {
+        Some(tier) if options.reasoning_effort == REASONING_DEFAULT => tier,
+        _ => options.reasoning_effort,
+    };
     // MSP cannot clear a standing session default, so "Muse default" is only
     // offered while no host default is in force.
     let mut reasoning_choices = Vec::new();
-    if options.offer_muse_default {
+    if options.offer_muse_default && recommended_tier.is_none() {
         reasoning_choices.push(("default".to_string(), "Muse default".to_string(), None));
     }
     reasoning_choices.extend(reasoning_options.iter().map(|(tier, description)| {
@@ -1483,7 +1494,7 @@ pub fn config_options(
                 ),
                 category: Some("thought_level".to_string()),
                 kind: ConfigKind::Select {
-                    current: options.reasoning_effort.to_string(),
+                    current: reasoning_current.to_string(),
                     choices: reasoning_choices,
                 },
                 meta: reasoning_meta,

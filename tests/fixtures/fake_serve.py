@@ -1617,9 +1617,12 @@ def on_turn_start(params):
                 # holds a new result.
                 notify("item/updated", {**base, "item": {
                     **item, "revision": 5, "controlStatus": "running"}})
+                rerun = result
+                if os.environ.get("FAKE_SUBAGENT_RERUN_FAILS") == "1":
+                    rerun = {**result, "errorKind": "provider_error"}
                 notify("item/updated", {**base, "item": {
                     **item, "revision": 6, "controlStatus": "resultReady",
-                    "result": result}})
+                    "result": rerun}})
             if n != "a":
                 notify("item/completed", {**base, "item": {
                     **item, "revision": 5, "controlStatus": "closed",
@@ -2253,7 +2256,11 @@ def result_for(method, msg):
         # Only the explicitly requested snapshot rung can carry occupancy;
         # the default `auto` rung resolves to inline on the real host.
         snapshot_rung = params.get("history") == "snapshot"
-        if SCENARIO == "usage_resume":
+        if (SCENARIO.startswith("fork_history") and FORK_ITEMS
+                and params.get("sessionId") == "msp-sess-forked"):
+            # The fork keeps the history it copied.
+            history = {"mode": "inline", "items": FORK_ITEMS, "snapshot": None}
+        elif SCENARIO == "usage_resume":
             history = usage_snapshot_history()
         elif SCENARIO == "reasoning_resume":
             history = reasoning_snapshot_history()
