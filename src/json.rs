@@ -1,7 +1,7 @@
 //! JSON for the adapter. The value type, parser, and serializer live in the
 //! `muse-msp-client` crate (std only); this module re-exports them and adds
 //! the adapter's own helpers. ACP frames travel as `serde_json` values through
-//! `acp-lite`, and `to_value`/`from_value` convert at that one boundary.
+//! the ACP SDK, and `to_value`/`from_value` convert at that one boundary.
 
 pub use muse_msp_client::json::*;
 
@@ -40,10 +40,10 @@ pub fn mint_id(prefix: &str, counter: &std::sync::atomic::AtomicU64) -> String {
     format!("{prefix}{n}-{hex}")
 }
 
-/// `j` as a `serde_json` value, for the ACP connection. Numbers keep their
-/// digits (`arbitrary_precision`; only exponent notation is normalized, as
-/// `1e400` to `1e+400`) and objects their key order (`preserve_order`), so
-/// converting back gives the same `J`.
+/// `j` as a `serde_json` value, for the ACP connection. Objects keep their
+/// key order (`preserve_order`). Numbers become 64-bit integers or floats,
+/// as the SDK's messages carry them; a number outside that range (which no
+/// ACP field holds) becomes the nearest float, or `null` if it has none.
 pub fn to_value(j: &J) -> serde_json::Value {
     use serde_json::Value;
     match j {
@@ -86,14 +86,22 @@ mod conversion_tests {
     use super::*;
 
     #[test]
-    fn values_round_trip_with_number_text_and_key_order() {
-        let text = r#"{"z":1,"a":[1.50,-0,12345678901234567890123,1e+400],"m":{"b":null,"a":true},"s":"é\n\u2028"}"#;
+    fn values_round_trip_with_key_order() {
+        let text = r#"{"z":1,"a":[1.5,-3,18446744073709551615,-9223372036854775808],"m":{"b":null,"a":true},"s":"é\n\u2028"}"#;
         let j = parse_json(text).unwrap();
         let value = to_value(&j);
-        assert_eq!(value.to_string(), j_to_string(&j));
         assert_eq!(j_to_string(&from_value(&value)), j_to_string(&j));
         let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
         assert_eq!(keys, ["z", "a", "m", "s"]);
+    }
+
+    #[test]
+    fn numbers_outside_64_bits_become_floats_or_null() {
+        let j = parse_json("[12345678901234567890123,1e400]").unwrap();
+        assert_eq!(
+            to_value(&j),
+            serde_json::json!([1.2345678901234568e22, null])
+        );
     }
 }
 

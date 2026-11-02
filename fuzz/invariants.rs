@@ -22,10 +22,16 @@ fn check_frame(text: &str) {
         let encoded = crate::json::j_to_string(&value);
         let reparsed = crate::json::parse_json(&encoded).expect("serializer produced invalid JSON");
         assert_eq!(encoded, crate::json::j_to_string(&reparsed));
-        // Independent strict parser oracle (arbitrary_precision preserves the
-        // unbounded numeric lexemes that the adapter deliberately supports).
-        let reference: serde_json::Value =
-            serde_json::from_str(text).expect("accepted invalid JSON");
+        // Independent strict parser oracle. The fuzz crate builds serde_json
+        // with `arbitrary_precision`, which keeps the unbounded numeric lexemes
+        // the MSP parser deliberately supports. The adapter's own tests build
+        // it without (the ACP SDK needs 64-bit numbers), so there a number
+        // beyond `f64` is out of the oracle's range and the frame is skipped.
+        let reference: serde_json::Value = match serde_json::from_str(text) {
+            Ok(reference) => reference,
+            Err(error) if error.to_string().starts_with("number out of range") => return,
+            Err(error) => panic!("accepted invalid JSON: {error}"),
+        };
         let roundtrip: serde_json::Value = serde_json::from_str(&encoded).unwrap();
         assert_eq!(reference, roundtrip);
     }

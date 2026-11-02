@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/acp-lite", "crates/muse-msp-client"]
+members = ["crates/muse-msp-client"]
 resolver = "3"
 
 [package]
@@ -16,8 +16,16 @@ publish = false
 [dependencies]
 # The workspace's own MSP client, which has no dependencies of its own.
 muse-msp-client = { path = "crates/muse-msp-client" }
-# ACP goes through acp-lite's agent side. The adapter converts its own JSON
-# values to and from serde_json at that boundary, keeping number text and key
-# order.
-acp-lite = { path = "crates/acp-lite" }
-serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order", "raw_value"] }
+# ACP goes through the official SDK. The exact pin matters: the SDK's
+# `unstable_*` features, including protocol v2, may change in a minor release.
+agent-client-protocol = { version = "=5.0.0", features = [
+    "unstable_protocol_v2",
+    "unstable_session_fork",
+    "unstable_subagents",
+] }
+# The SDK is runtime-neutral: its connection runs on one thread under the
+# `futures` executor, with stdin and stdout made async by `blocking`.
+blocking = "1"
+futures = "0.3"
+serde = "1"
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }

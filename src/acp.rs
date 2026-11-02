@@ -6,17 +6,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use acp_lite::{AgentError, RequestId, RpcError};
-use serde_json::value::RawValue;
+use crate::editor::{Editor, Error, RequestId};
 
 use crate::fold::SessionFold;
 use crate::json::{J, esc, j_to_string, parse_json};
 
-/// The editor connection. Every ACP frame goes out through `acp-lite`'s
-/// agent side, which writes to stdout, tracks which requests are still
-/// unanswered, and holds batch responses. The name predates that: it was a
-/// shared stdout handle.
-pub type StdoutShared = acp_lite::AgentConnection;
+/// The editor connection, on the ACP SDK (see `crate::editor`). The name
+/// predates it: it was a shared stdout handle.
+pub type StdoutShared = Editor;
 
 pub struct InFlight {
     pub msp_turn: String,
@@ -589,15 +586,30 @@ pub fn take_turn_usage(s: &mut AcpSession, turn_id: &str) -> Option<TurnUsage> {
     Some(s.turn_usage.remove(pos))
 }
 
+/// Send one notification frame the adapter built as JSON text.
 pub fn send_raw(stdout: &StdoutShared, line: &str) {
-    match RawValue::from_string(line.to_string()) {
-        Ok(frame) => written(stdout.send_raw_frame(&frame)),
+    let message = serde_json::from_str::<serde_json::Value>(line)
+        .map_err(|error| error.to_string())
+        .and_then(|frame| {
+            let method = frame
+                .get("method")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("no method")?;
+            let params = frame
+                .get("params")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            agent_client_protocol::UntypedMessage::new(method, params)
+                .map_err(|error| error.to_string())
+        });
+    match message {
+        Ok(message) => written(stdout.notify(message)),
         Err(error) => crate::msp::log(&format!("internal: dropped an invalid ACP frame: {error}")),
     }
 }
 
 /// A failed write means the editor is gone: start the shutdown deadline.
-fn written(outcome: Result<(), AgentError>) {
+fn written<E>(outcome: Result<(), E>) {
     if outcome.is_err() {
         crate::shutdown::disconnect();
     }
@@ -612,7 +624,12 @@ pub fn id_json(id: &Option<J>) -> String {
 
 /// The connection's id for a request id the adapter holds as `J`.
 pub fn request_id(id: &J) -> RequestId {
-    RequestId::new(crate::json::to_value(id))
+    RequestId::of_value(&crate::json::to_value(id))
+}
+
+/// The adapter's `J` for a connection request id.
+pub fn id_j(id: &RequestId) -> J {
+    crate::json::from_value(&id.value())
 }
 
 pub fn send_result(stdout: &StdoutShared, id: &Option<J>, result_json: &str) {
@@ -622,8 +639,8 @@ pub fn send_result(stdout: &StdoutShared, id: &Option<J>, result_json: &str) {
     if crate::shutdown::expiring() {
         return;
     }
-    match RawValue::from_string(result_json.to_string()) {
-        Ok(result) => written(stdout.respond_raw(&request_id(id), &result)),
+    match serde_json::from_str::<serde_json::Value>(result_json) {
+        Ok(result) => written(stdout.respond(&request_id(id), result)),
         Err(error) => {
             crate::msp::log(&format!("internal: invalid ACP result JSON: {error}"));
             send_error(
@@ -636,16 +653,17 @@ pub fn send_result(stdout: &StdoutShared, id: &Option<J>, result_json: &str) {
     }
 }
 
-fn send_rpc_error(stdout: &StdoutShared, id: &Option<J>, error: RpcError) {
+fn send_rpc_error(stdout: &StdoutShared, id: &Option<J>, error: Error) {
     if crate::shutdown::expiring() {
         return;
     }
-    let id = id.as_ref().map(request_id);
-    written(stdout.respond_error(id.as_ref(), error));
+    if let Some(id) = id {
+        written(stdout.respond_error(&request_id(id), error));
+    }
 }
 
 pub fn send_error(stdout: &StdoutShared, id: &Option<J>, code: i64, message: &str) {
-    send_rpc_error(stdout, id, RpcError::new(code, message));
+    send_rpc_error(stdout, id, Error::new(code as i32, message));
 }
 
 /// The flows that send requests to the client. The connection tags each
@@ -658,7 +676,7 @@ pub const TAG_ELICITATION: &str = "elicitation";
 pub const TAG_DEVICE_LOGIN: &str = "device-login";
 
 /// Send a request to the client. Its answer comes back to the main loop as an
-/// `AgentEvent::Response` carrying `tag`. Returns the request's id, for the
+/// `Incoming::Answer` carrying `tag`. Returns the request's id, for the
 /// flow's state and for `send_cancel_request`, or `None` when it could not be
 /// written (the editor is gone, and the shutdown deadline is running).
 pub fn send_request(
@@ -667,15 +685,21 @@ pub fn send_request(
     params_json: &str,
     tag: &str,
 ) -> Option<J> {
-    let params = match RawValue::from_string(params_json.to_string()) {
-        Ok(params) => params,
+    let message = serde_json::from_str::<serde_json::Value>(params_json)
+        .map_err(|error| error.to_string())
+        .and_then(|params| {
+            agent_client_protocol::UntypedMessage::new(method, params)
+                .map_err(|error| error.to_string())
+        });
+    let message = match message {
+        Ok(message) => message,
         Err(error) => {
             crate::msp::log(&format!("internal: invalid {method} params: {error}"));
             return None;
         }
     };
-    match stdout.request_routed_raw(method, &params, tag) {
-        Ok(id) => Some(crate::json::from_value(id.value())),
+    match stdout.request(message, tag) {
+        Ok(id) => Some(id_j(&id)),
         Err(_) => {
             crate::shutdown::disconnect();
             None
@@ -687,9 +711,9 @@ pub fn send_request(
 /// or form). ACP cancels an outgoing request with `$/cancel_request`; a
 /// JSON-RPC error with our own id would be a response to a request the
 /// client never made. The client may still answer the original id; that late
-/// answer arrives untagged and is ignored.
+/// answer reaches its flow, which no longer waits for it.
 pub fn send_cancel_request(stdout: &StdoutShared, request_id: &J) {
-    written(stdout.cancel_request(&self::request_id(request_id)));
+    stdout.cancel(&self::request_id(request_id));
 }
 
 /// Send an ACP error while retaining structured data supplied by MSP.
@@ -700,9 +724,9 @@ pub fn send_error_with_data(
     message: &str,
     data_json: &str,
 ) {
-    let mut error = RpcError::new(code, message);
-    match serde_json::from_str(data_json) {
-        Ok(data) => error = error.with_data(data),
+    let mut error = Error::new(code as i32, message);
+    match serde_json::from_str::<serde_json::Value>(data_json) {
+        Ok(data) => error = error.data(data),
         Err(problem) => crate::msp::log(&format!("internal: invalid ACP error data: {problem}")),
     }
     send_rpc_error(stdout, id, error);

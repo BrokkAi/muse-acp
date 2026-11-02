@@ -8,6 +8,7 @@ mod acp;
 mod bridge;
 mod compat;
 mod diff;
+mod editor;
 mod efforts;
 mod fold;
 mod host_config;
@@ -34,7 +35,7 @@ use std::sync::{
 use acp::{
     AcpSession, FileChangeReport, HostTitleFacts, InFlight, PendingPerm, Sessions, StdoutShared,
 };
-use acp_lite::{AgentConnection, AgentEvent, AgentOptions};
+use editor::{Editor, Incoming};
 use fold::SessionFold;
 use hosts::{HostKind, HostTag, Hosts};
 use json::{J, esc, j_to_string, mint_id, parse_json};
@@ -1937,8 +1938,8 @@ fn recovery_observation_line(observation: &J) -> String {
 }
 
 enum LoopMsg {
-    /// A message from the editor, as `acp-lite`'s agent side read it.
-    Acp(AgentEvent),
+    /// A message from the editor, as the ACP SDK delivered it.
+    Acp(Incoming),
     Msp(HostTag, MspEvent),
 }
 
@@ -1991,10 +1992,7 @@ fn send_initialize(stdout: &StdoutShared, id: &Option<J>, session_mcp: bool, ses
 fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
     let id = msg.get("id").cloned();
     match msg.get("method").and_then(J::as_str) {
-        Some("initialize") => match negotiate_acp(msg) {
-            Ok(_) => send_initialize(stdout, &id, false, false),
-            Err(error) => send_acp_initialize_error(stdout, &id, error),
-        },
+        Some("initialize") => send_initialize(stdout, &id, false, false),
         Some(method @ ("shutdown" | "exit")) => {
             if method == "shutdown" {
                 acp::send_result(stdout, &id, "null");
@@ -4141,23 +4139,18 @@ fn main() {
     let lists: SessionLists = Arc::new(Mutex::new(SessionListCache::default()));
     let (tx, rx) = mpsc::channel::<LoopMsg>();
 
-    // The ACP reader thread. A `shutdown` or `exit` message, and the end of
-    // input, start the shutdown deadline before the loop sees them, so a loop
-    // stuck on a host command still exits. EOF ends the adapter: the client
-    // is gone, and the serve host (our child) dies with us. The connection
-    // answers frames that are not JSON itself.
+    // The ACP connection thread. A `shutdown` or `exit` message, and the end
+    // of input, start the shutdown deadline before the loop sees them, so a
+    // loop stuck on a host command still exits. EOF ends the adapter: the
+    // client is gone, and the serve host (our child) dies with us. The SDK
+    // answers frames that are not JSON-RPC messages itself.
     let acp_tx = tx.clone();
-    let (stdout, _acp_reader) = AgentConnection::stdio(
-        // The adapter never capped a frame: an inline image prompt can be
-        // large.
-        AgentOptions::default().max_frame_bytes(usize::MAX),
-        move |event| {
-            if ends_connection(&event) {
-                shutdown::disconnect();
-            }
-            let _ = acp_tx.send(LoopMsg::Acp(event));
-        },
-    )
+    let stdout = Editor::start(move |incoming| {
+        if ends_connection(&incoming) {
+            shutdown::disconnect();
+        }
+        let _ = acp_tx.send(LoopMsg::Acp(incoming));
+    })
     .unwrap_or_else(|error| {
         eprintln!("[muse-acp] cannot read ACP from stdin: {error}");
         shutdown::exit(1)
@@ -4211,35 +4204,16 @@ fn main() {
             shutdown::exit(1);
         }
         match msg {
-            LoopMsg::Acp(AgentEvent::Batch(batch)) => {
-                if let Some(reason) = host_unavailable.as_deref() {
-                    dispatch_batch(&stdout, &batch, |msg| {
-                        serve_without_host(&stdout, msg, reason)
-                    });
-                } else if let Some(host) = host.as_ref() {
-                    dispatch_batch(&stdout, &batch, |msg| {
-                        handle_acp(host, &stdout, &sessions, &lists, msg)
-                    });
-                } else {
-                    // Before initialize no ACP version is negotiated, and
-                    // initialize must not travel in a batch.
-                    acp::send_error(
-                        &stdout,
-                        &None,
-                        -32600,
-                        "initialize must be the first ACP request",
-                    );
-                }
-            }
-            LoopMsg::Acp(AgentEvent::Response(response)) => {
-                // An untagged answer is a late one to a withdrawn request.
-                if let (Some(host), Some(tag)) = (host.as_ref(), response.tag.clone())
-                    && let Some(msg) = acp_message(&AgentEvent::Response(response))
-                {
+            LoopMsg::Acp(Incoming::Answer { tag, id, result }) => {
+                if let Some(host) = host.as_ref() {
+                    let msg = answer_message(&id, result);
                     complete_client_request(host, &stdout, &sessions, &tag, &msg);
                 }
             }
-            LoopMsg::Acp(AgentEvent::Closed { .. }) => {
+            LoopMsg::Acp(closed @ (Incoming::Closed | Incoming::Ended { .. })) => {
+                if let Incoming::Ended { reason } = closed {
+                    log(&reason);
+                }
                 fail_all_with_message(&stdout, &sessions, "editor disconnected");
                 shutdown::settle(&stdout, "editor disconnected");
                 if let Some(host) = host.as_ref() {
@@ -4247,8 +4221,8 @@ fn main() {
                 }
                 shutdown::exit(0);
             }
-            LoopMsg::Acp(event) => {
-                let Some(v) = acp_message(&event) else {
+            LoopMsg::Acp(incoming) => {
+                let Some((ver, v)) = acp_message(incoming) else {
                     continue;
                 };
                 if let Some(reason) = host_unavailable.as_deref() {
@@ -4256,25 +4230,12 @@ fn main() {
                     continue;
                 }
                 if host.is_none() {
-                    let is_initialize =
-                        v.get("method").and_then(|m| m.as_str()) == Some("initialize");
-                    if !is_initialize {
-                        let id = v.get("id").cloned();
-                        acp::send_error(
-                            &stdout,
-                            &id,
-                            -32600,
-                            "initialize must be the first ACP request",
-                        );
+                    // The SDK refuses every other request until `initialize`
+                    // has been answered; a notification has nothing to do yet.
+                    if v.get("method").and_then(|m| m.as_str()) != Some("initialize") {
                         continue;
                     }
-                    let user_input_dialogs = match negotiate_acp(&v) {
-                        Ok(form) => form,
-                        Err(error) => {
-                            send_acp_initialize_error(&stdout, &v.get("id").cloned(), error);
-                            continue;
-                        }
-                    };
+                    let user_input_dialogs = negotiate_acp(ver, &v);
                     let forward_tx = tx.clone();
                     let forward: hosts::Forward = Box::new(move |tag, events| {
                         let tx = forward_tx.clone();
@@ -4571,82 +4532,81 @@ fn complete_client_request(
     }
 }
 
-/// Whether `event` ends the editor connection: the end of input, or a
-/// `shutdown`/`exit` message, alone or in a batch.
-fn ends_connection(event: &AgentEvent) -> bool {
-    match event {
-        AgentEvent::Closed { .. } => true,
-        AgentEvent::Request(request) => matches!(request.method.as_str(), "shutdown" | "exit"),
-        AgentEvent::Notification(note) => matches!(note.method.as_str(), "shutdown" | "exit"),
-        AgentEvent::Batch(batch) => batch.entries.iter().any(ends_connection),
+/// Whether `incoming` ends the editor connection: the end of input, or a
+/// `shutdown`/`exit` message.
+fn ends_connection(incoming: &Incoming) -> bool {
+    match incoming {
+        Incoming::Closed | Incoming::Ended { .. } => true,
+        Incoming::Untyped { message, .. } => matches!(message.method(), "shutdown" | "exit"),
         _ => false,
     }
 }
 
-/// An editor message as the `J` object `handle_acp` reads: `id`, `method`,
-/// and `params` for requests and notifications, `id` and `result` or `error`
-/// for the client's answers. A value that is not a message stays as it was.
-fn acp_message(event: &AgentEvent) -> Option<J> {
-    let mut fields = vec![("jsonrpc".to_string(), J::Str("2.0".to_string()))];
-    let (id, method, params) = match event {
-        AgentEvent::Request(request) => (
-            Some(request.id.value()),
-            Some(&request.method),
-            &request.params,
-        ),
-        AgentEvent::Notification(note) => (None, Some(&note.method), &note.params),
-        AgentEvent::Response(response) => {
-            fields.push(("id".to_string(), json::from_value(response.id.value())));
-            match &response.outcome {
-                Ok(result) => fields.push(("result".to_string(), json::from_value(result))),
-                Err(error) => fields.push((
-                    "error".to_string(),
-                    json::from_value(&serde_json::to_value(error).ok()?),
-                )),
-            }
-            return Some(J::Obj(fields));
+/// An editor message as the `J` object `handle_acp` reads (`id`, `method`,
+/// and `params`), with the protocol version it arrived on.
+fn acp_message(incoming: Incoming) -> Option<(u8, J)> {
+    use agent_client_protocol::JsonRpcMessage;
+    use editor::{V1Message, V2Message};
+    let (ver, id, message) = match incoming {
+        Incoming::V1(V1Message::Request(id, request)) => {
+            (1, Some(id), request.to_untyped_message().ok()?)
         }
-        AgentEvent::Invalid(value) => return Some(json::from_value(value)),
-        _ => return None,
+        Incoming::V1(V1Message::Notification(note)) => (1, None, note.to_untyped_message().ok()?),
+        Incoming::V2(V2Message::Request(id, request)) => {
+            (2, Some(id), request.to_untyped_message().ok()?)
+        }
+        Incoming::V2(V2Message::Notification(note)) => (2, None, note.to_untyped_message().ok()?),
+        Incoming::Untyped { ver, id, message } => (ver, id, message),
+        Incoming::CancelRequest { id } => {
+            return Some((
+                negotiated_ver(),
+                J::Obj(vec![
+                    ("jsonrpc".to_string(), J::Str("2.0".to_string())),
+                    ("method".to_string(), J::Str("$/cancel_request".to_string())),
+                    (
+                        "params".to_string(),
+                        J::Obj(vec![("requestId".to_string(), acp::id_j(&id))]),
+                    ),
+                ]),
+            ));
+        }
+        Incoming::Answer { .. } | Incoming::Closed | Incoming::Ended { .. } => return None,
     };
+    let mut fields = vec![("jsonrpc".to_string(), J::Str("2.0".to_string()))];
     if let Some(id) = id {
-        fields.push(("id".to_string(), json::from_value(id)));
+        fields.push(("id".to_string(), acp::id_j(&id)));
     }
-    if let Some(method) = method {
-        fields.push(("method".to_string(), J::Str(method.clone())));
+    fields.push(("method".to_string(), J::Str(message.method().to_string())));
+    if !message.params().is_null() {
+        fields.push(("params".to_string(), json::from_value(message.params())));
     }
-    if !params.is_null() {
-        fields.push(("params".to_string(), json::from_value(params)));
-    }
-    Some(J::Obj(fields))
+    Some((ver, J::Obj(fields)))
 }
 
-/// Dispatch one ACP v2 JSON-RPC batch. Each valid entry runs as if it had
-/// arrived alone; invalid entries get their own `-32600` with `id: null`
-/// without failing their siblings. Responses produced while the batch is
-/// dispatched leave together as one array, and a batch with nothing to answer
-/// (only notifications or client responses) gets no reply. Stable ACP v1
-/// frames one message per line and has no batches, so a v1 batch is refused
-/// as a whole instead of being dropped without a word.
-fn dispatch_batch(stdout: &StdoutShared, batch: &acp_lite::Batch, mut dispatch: impl FnMut(&J)) {
-    if negotiated_ver() != 2 {
-        acp::send_error(
-            stdout,
-            &None,
-            -32600,
-            "invalid request: JSON-RPC batches need ACP v2",
-        );
-        return;
-    }
-    let held = stdout.hold(batch);
-    for entry in &batch.entries {
-        if let Some(message) = acp_message(entry) {
-            dispatch(&message);
+/// The client's answer to one of the adapter's requests as the `J` object the
+/// `complete_*` flows read: `id`, and `result` or `error`.
+fn answer_message(id: &editor::RequestId, result: Result<serde_json::Value, editor::Error>) -> J {
+    let mut fields = vec![
+        ("jsonrpc".to_string(), J::Str("2.0".to_string())),
+        ("id".to_string(), acp::id_j(id)),
+    ];
+    match result {
+        Ok(result) => fields.push(("result".to_string(), json::from_value(&result))),
+        Err(error) => {
+            let mut error_fields = vec![
+                (
+                    "code".to_string(),
+                    J::Num(i32::from(error.code).to_string()),
+                ),
+                ("message".to_string(), J::Str(error.message)),
+            ];
+            if let Some(data) = error.data {
+                error_fields.push(("data".to_string(), json::from_value(&data)));
+            }
+            fields.push(("error".to_string(), J::Obj(error_fields)));
         }
     }
-    if held.finish().is_err() {
-        shutdown::disconnect();
-    }
+    J::Obj(fields)
 }
 
 /// The catalog's default model, but only when the client asked for AIR
@@ -5059,64 +5019,21 @@ fn subagent_control(
     }
 }
 
-/// A rejected ACP `initialize` request before any connection posture is set.
-#[derive(Debug, PartialEq, Eq)]
-enum AcpInitializeError {
-    InvalidParams(&'static str),
-    UnsupportedVersion(u16),
-}
-
-/// Validate the required members of ACP v2's client `Implementation` object.
-fn valid_client_info(info: Option<&J>) -> bool {
-    let Some(info) = info else {
-        return false;
-    };
-    info.get("name").and_then(J::as_str).is_some()
-        && info.get("version").and_then(J::as_str).is_some()
-        && matches!(info.get("title"), None | Some(J::Null) | Some(J::Str(_)))
-}
-
 /// Record the ACP connection posture before starting the MSP connection.
 ///
 /// MSP's `userInputDialogs` capability is connection-scoped, so it must be
-/// derived from ACP `initialize` before the host's own handshake is sent.
-fn negotiate_acp(msg: &J) -> Result<bool, AcpInitializeError> {
-    let Some(params) = msg.get("params") else {
-        return Err(AcpInitializeError::InvalidParams(
-            "initialize params must be an object with protocolVersion",
-        ));
-    };
-    if !matches!(params, J::Obj(_)) {
-        return Err(AcpInitializeError::InvalidParams(
-            "initialize params must be an object with protocolVersion",
-        ));
-    }
-    let requested = match params.get("protocolVersion") {
-        Some(J::Num(raw)) => raw.parse::<u16>().map_err(|_| {
-            AcpInitializeError::InvalidParams(
-                "protocolVersion must be an integer from 0 through 65535",
-            )
-        })?,
-        _ => {
-            return Err(AcpInitializeError::InvalidParams(
-                "protocolVersion must be an integer from 0 through 65535",
-            ));
-        }
-    };
-    if requested == 0 {
-        return Err(AcpInitializeError::UnsupportedVersion(requested));
-    }
-    let v = if requested >= 2 { 2 } else { 1 };
-    if v == 2 && !valid_client_info(params.get("info")) {
-        return Err(AcpInitializeError::InvalidParams(
-            "ACP v2 initialize requires info.name and info.version strings",
-        ));
-    }
+/// derived from ACP `initialize` before the host's own handshake is sent. The
+/// SDK has already selected protocol version `v` and validated the request.
+fn negotiate_acp(v: u8, msg: &J) -> bool {
+    let v = u64::from(v);
     VER.store(v, Ordering::SeqCst);
-    let capabilities = params.get(if v == 1 {
-        "clientCapabilities"
-    } else {
-        "capabilities"
+    let params = msg.get("params");
+    let capabilities = params.and_then(|params| {
+        params.get(if v == 1 {
+            "clientCapabilities"
+        } else {
+            "capabilities"
+        })
     });
     // Both ACP versions can advertise the form elicitation extension.
     let form = capabilities
@@ -5195,24 +5112,7 @@ fn negotiate_acp(msg: &J) -> Result<bool, AcpInitializeError> {
     if compaction {
         log("client negotiated standard ACP compaction");
     }
-    Ok(form)
-}
-
-fn send_acp_initialize_error(stdout: &StdoutShared, id: &Option<J>, error: AcpInitializeError) {
-    match error {
-        AcpInitializeError::InvalidParams(message) => {
-            acp::send_error(stdout, id, -32602, message);
-        }
-        AcpInitializeError::UnsupportedVersion(requested) => {
-            acp::send_error_with_data(
-                stdout,
-                id,
-                -32022,
-                "Unsupported protocol version",
-                &format!(r#"{{"requested":{requested},"supported":[1,2]}}"#),
-            );
-        }
-    }
+    form
 }
 
 fn handle_acp(
@@ -5801,6 +5701,10 @@ fn handle_acp(
                         );
                         return;
                     }
+                    // A session Muse holds without a workspace (a side chat)
+                    // refuses `workspaceRoots` with `workspace_not_composed`,
+                    // so its roots stay with the host.
+                    let host_composed = !host_cwd.is_empty();
                     let restored_cwd = if resume_cwd.is_empty() {
                         host_cwd
                     } else {
@@ -5880,7 +5784,7 @@ fn handle_acp(
                         entry.resolved_history_unread = true;
                         // The next user turn replaces the host's sticky root
                         // set, even when the request activated no extras.
-                        entry.host_roots_pending = supports_host_roots;
+                        entry.host_roots_pending = supports_host_roots && host_composed;
                         // The client's latest set, even when a conflict kept
                         // the loaded one: a restarted host loads this.
                         entry.mcp_servers = mcp_servers;

@@ -25,9 +25,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use acp_lite::AgentError;
-use serde_json::value::RawValue;
-
 use crate::acp::{self, Sessions, StdoutShared};
 use crate::json::{J, esc, j_to_string, parse_json};
 use crate::msp::log;
@@ -928,36 +925,28 @@ fn client_request(
     wait: Wait,
     abort: &dyn Fn() -> bool,
 ) -> Result<J, ClientError> {
-    let params = RawValue::from_string(params.to_string()).map_err(|error| {
-        ClientError::Failed(format!("internal: invalid {method} params: {error}"))
-    })?;
+    let message = serde_json::from_str::<serde_json::Value>(params)
+        .map_err(|error| error.to_string())
+        .and_then(|params| {
+            agent_client_protocol::UntypedMessage::new(method, params)
+                .map_err(|error| error.to_string())
+        })
+        .map_err(|error| {
+            ClientError::Failed(format!("internal: invalid {method} params: {error}"))
+        })?;
     crate::msp::trace_method("acp->client", method);
-    let mut pending = stdout.send_request_raw(method, &params).map_err(|_| {
-        crate::shutdown::disconnect();
-        ClientError::Failed("the editor did not answer".into())
-    })?;
-    let deadline = Instant::now() + wait.timeout;
-    loop {
-        if let Some(outcome) = pending.wait_timeout(Duration::from_millis(200)) {
-            return match outcome {
-                Ok(result) => Ok(crate::json::from_value(&result)),
-                Err(AgentError::Rpc(error)) if !error.message.is_empty() => {
-                    Err(ClientError::Failed(error.message))
-                }
-                Err(AgentError::Rpc(_)) => Err(ClientError::Failed("request failed".into())),
-                Err(_) => Err(ClientError::Failed("the editor did not answer".into())),
-            };
+    let abort = || wait.abortable && abort();
+    match stdout.request_blocking(message, wait.timeout, &abort) {
+        Ok(Ok(result)) => Ok(crate::json::from_value(&result)),
+        Ok(Err(error)) if !error.message.is_empty() => Err(ClientError::Failed(error.message)),
+        Ok(Err(_)) => Err(ClientError::Failed("request failed".into())),
+        // A withdrawn request's late answer is ignored.
+        Err(crate::editor::Blocked::Aborted) => Err(ClientError::Cancelled),
+        Err(crate::editor::Blocked::TimedOut) => Err(ClientError::TimedOut),
+        Err(crate::editor::Blocked::Gone) => {
+            crate::shutdown::disconnect();
+            Err(ClientError::Failed("the editor did not answer".into()))
         }
-        let stop = if wait.abortable && abort() {
-            ClientError::Cancelled
-        } else if Instant::now() >= deadline {
-            ClientError::TimedOut
-        } else {
-            continue;
-        };
-        // Withdraw it with `$/cancel_request`; a late answer is ignored.
-        let _ = pending.cancel();
-        return Err(stop);
     }
 }
 
