@@ -450,6 +450,15 @@ impl Editor {
         id
     }
 
+    /// The negotiated protocol version, once `initialize` arrived.
+    pub fn version(&self) -> Option<u8> {
+        match &*lock(&self.shared.connection) {
+            Some(Connection::V1(_)) => Some(1),
+            Some(Connection::V2(_)) => Some(2),
+            None => None,
+        }
+    }
+
     fn connection(&self) -> Result<Connection, Gone> {
         if self.shared.sealed.load(Ordering::SeqCst) {
             return Err(Gone);

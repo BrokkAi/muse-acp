@@ -93,14 +93,6 @@ impl Note {
         })
         .to_string()
     }
-
-    /// The update's `sessionUpdate` discriminator.
-    pub fn kind(&self) -> String {
-        self.params()["update"]["sessionUpdate"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string()
-    }
 }
 
 impl std::fmt::Display for Note {
@@ -133,13 +125,11 @@ pub fn text_v2(text: &str) -> s2::ContentBlock {
     s2::ContentBlock::from(text.to_string())
 }
 
-/// An `agent_message_chunk`, `agent_thought_chunk` or `user_message_chunk`
-/// of text. ACP v2 chunks name their message.
+/// An `agent_message_chunk` or `agent_thought_chunk` of text. ACP v2 chunks name their message.
 #[derive(Clone, Copy)]
 pub enum Chunk {
     Agent,
     Thought,
-    User,
 }
 
 pub fn chunk(
@@ -157,7 +147,6 @@ pub fn chunk(
             match which {
                 Chunk::Agent => s2::SessionUpdate::AgentMessageChunk(chunk),
                 Chunk::Thought => s2::SessionUpdate::AgentThoughtChunk(chunk),
-                Chunk::User => s2::SessionUpdate::UserMessageChunk(chunk),
             },
         )
     } else {
@@ -167,7 +156,6 @@ pub fn chunk(
             match which {
                 Chunk::Agent => s1::SessionUpdate::AgentMessageChunk(chunk),
                 Chunk::Thought => s1::SessionUpdate::AgentThoughtChunk(chunk),
-                Chunk::User => s1::SessionUpdate::UserMessageChunk(chunk),
             },
         )
     }
@@ -789,6 +777,7 @@ impl ConfigOptions {
     }
 
     /// The `configOptions` array as the SDK serializes it.
+    #[cfg(test)]
     pub fn json(&self) -> Value {
         match self {
             ConfigOptions::V1(options) => serde_json::to_value(options),
@@ -823,5 +812,241 @@ pub fn mode_state(current: &str, modes: &[(&str, &str, &str)]) -> s1::SessionMod
                     .description(description.to_string())
             })
             .collect(),
+    )
+}
+
+/// A `usage_update`: context occupancy and size, the session's cost when
+/// known (`amount`, `currency`, and the cost's `_meta`), and `_meta`.
+pub fn usage(
+    acp_sid: &str,
+    ver: u8,
+    used: u64,
+    size: u64,
+    cost: Option<(f64, String, Option<Meta>)>,
+    meta: Option<Meta>,
+) -> Note {
+    if ver == 2 {
+        let mut update = s2::UsageUpdate::new(used, size).meta(meta);
+        if let Some((amount, currency, cost_meta)) = cost {
+            update = update.cost(s2::Cost::new(amount, currency).meta(cost_meta));
+        }
+        return Note::v2(acp_sid, s2::SessionUpdate::UsageUpdate(update));
+    }
+    let cost =
+        cost.map(|(amount, currency, cost_meta)| s1::Cost::new(amount, currency).meta(cost_meta));
+    Note::v1(
+        acp_sid,
+        s1::SessionUpdate::UsageUpdate(s1::UsageUpdate::new(used, size).cost(cost).meta(meta)),
+    )
+}
+
+/// ACP v2 `state_update`: `running`, `requires_action`, or `idle` with why
+/// the foreground work stopped (an ACP stop reason, or the adapter's
+/// `_`-prefixed extension reason).
+pub fn state(acp_sid: &str, state: &str, stop: Option<&str>) -> Note {
+    let update = match state {
+        "running" => s2::StateUpdate::Running(s2::RunningStateUpdate::new()),
+        "requires_action" => s2::StateUpdate::RequiresAction(s2::RequiresActionStateUpdate::new()),
+        _ => s2::StateUpdate::Idle(s2::IdleStateUpdate::new().stop_reason(stop.map(
+            |stop| match stop {
+                "end_turn" => s2::StopReason::EndTurn,
+                "max_tokens" => s2::StopReason::MaxTokens,
+                "max_turn_requests" => s2::StopReason::MaxTurnRequests,
+                "refusal" => s2::StopReason::Refusal,
+                "cancelled" => s2::StopReason::Cancelled,
+                other => s2::StopReason::Other(s2::OtherStopReason::new(other, Default::default())),
+            },
+        ))),
+    };
+    Note::v2(acp_sid, s2::SessionUpdate::StateUpdate(update))
+}
+
+/// One todo item of a session plan: its text and ACP entry status
+/// (`pending`, `in_progress`, `completed`), at medium priority.
+pub type PlanEntry = (String, &'static str);
+
+/// The session's plan. ACP v1 has one implicit plan per session, cleared
+/// with an empty `plan` update. ACP v2 names plans: a snapshot is a
+/// `plan_update` with an `items` checklist, and an empty list is
+/// `plan_removed`.
+pub fn plan(acp_sid: &str, ver: u8, plan_id: &str, entries: Vec<PlanEntry>) -> Note {
+    if ver == 2 {
+        if entries.is_empty() {
+            return Note::v2(
+                acp_sid,
+                s2::SessionUpdate::PlanRemoved(s2::PlanRemoved::new(plan_id.to_string())),
+            );
+        }
+        let entries = entries
+            .into_iter()
+            .map(|(content, status)| {
+                let status = match status {
+                    "in_progress" => s2::PlanEntryStatus::InProgress,
+                    "completed" => s2::PlanEntryStatus::Completed,
+                    _ => s2::PlanEntryStatus::Pending,
+                };
+                s2::PlanEntry::new(content, s2::PlanEntryPriority::Medium, status)
+            })
+            .collect();
+        return Note::v2(
+            acp_sid,
+            s2::SessionUpdate::PlanUpdate(s2::PlanUpdate::new(s2::PlanUpdateContent::Items(
+                s2::PlanItems::new(plan_id.to_string(), entries),
+            ))),
+        );
+    }
+    let entries = entries
+        .into_iter()
+        .map(|(content, status)| {
+            let status = match status {
+                "in_progress" => s1::PlanEntryStatus::InProgress,
+                "completed" => s1::PlanEntryStatus::Completed,
+                _ => s1::PlanEntryStatus::Pending,
+            };
+            s1::PlanEntry::new(content, s1::PlanEntryPriority::Medium, status)
+        })
+        .collect();
+    Note::v1(acp_sid, s1::SessionUpdate::Plan(s1::Plan::new(entries)))
+}
+
+/// The content blocks of an accepted prompt, as the client sent them, for
+/// echoing the user's message into the transcript.
+#[derive(Debug, Clone)]
+pub enum Echo {
+    V1(Vec<s1::ContentBlock>),
+    V2(Vec<s2::ContentBlock>),
+}
+
+impl Default for Echo {
+    fn default() -> Echo {
+        Echo::V1(Vec::new())
+    }
+}
+
+impl Echo {
+    /// Whether the prompt had no blocks.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Echo::V1(blocks) => blocks.is_empty(),
+            Echo::V2(blocks) => blocks.is_empty(),
+        }
+    }
+
+    /// The text blocks, as the user typed them.
+    pub fn text(&self) -> String {
+        let texts: Vec<&str> = match self {
+            Echo::V1(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    s1::ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+            Echo::V2(blocks) => blocks
+                .iter()
+                .filter_map(|block| match block {
+                    s2::ContentBlock::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect(),
+        };
+        texts.join("\n")
+    }
+
+    /// The echo as updates: ACP v2's whole `user_message`, or one ACP v1
+    /// `user_message_chunk` per block, all naming `msg_id`.
+    pub fn notes(&self, acp_sid: &str, msg_id: &str) -> Vec<Note> {
+        match self {
+            Echo::V2(blocks) => vec![Note::v2(
+                acp_sid,
+                s2::SessionUpdate::UserMessage(
+                    s2::UserMessage::new(msg_id.to_string()).content(blocks.clone()),
+                ),
+            )],
+            Echo::V1(blocks) => blocks
+                .iter()
+                .map(|block| {
+                    Note::v1(
+                        acp_sid,
+                        s1::SessionUpdate::UserMessageChunk(
+                            s1::ContentChunk::new(block.clone())
+                                .message_id(s1::MessageId::new(msg_id)),
+                        ),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
+/// A prompt block of either version, kept for its echo.
+#[derive(Debug, Clone)]
+pub enum EchoBlock {
+    V1(s1::ContentBlock),
+    V2(s2::ContentBlock),
+}
+
+impl Echo {
+    /// Collect accepted blocks; a block of the other version is skipped
+    /// (a prompt's blocks all share its connection's version).
+    pub fn from_blocks(ver: u8, blocks: Vec<EchoBlock>) -> Echo {
+        if ver == 2 {
+            Echo::V2(
+                blocks
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        EchoBlock::V2(b) => Some(b),
+                        EchoBlock::V1(_) => None,
+                    })
+                    .collect(),
+            )
+        } else {
+            Echo::V1(
+                blocks
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        EchoBlock::V1(b) => Some(b),
+                        EchoBlock::V2(_) => None,
+                    })
+                    .collect(),
+            )
+        }
+    }
+}
+
+/// A `notice`: information for the user that is not session history.
+/// `severity` is `info`, `warning` or `error`.
+pub fn notice(acp_sid: &str, ver: u8, severity: &str, title: &str, description: &str) -> Note {
+    if ver == 2 {
+        let severity = match severity {
+            "warning" => s2::NoticeSeverity::Warning,
+            "error" => s2::NoticeSeverity::Error,
+            _ => s2::NoticeSeverity::Info,
+        };
+        return Note::v2(
+            acp_sid,
+            s2::SessionUpdate::Notice(
+                s2::Notice::new(severity, title.to_string()).description(description.to_string()),
+            ),
+        );
+    }
+    let severity = match severity {
+        "warning" => s1::NoticeSeverity::Warning,
+        "error" => s1::NoticeSeverity::Error,
+        _ => s1::NoticeSeverity::Info,
+    };
+    Note::v1(
+        acp_sid,
+        s1::SessionUpdate::Notice(
+            s1::Notice::new(severity, title.to_string()).description(description.to_string()),
+        ),
+    )
+}
+
+/// ACP v1 `current_mode_update`, for clients of the legacy session modes.
+pub fn current_mode(acp_sid: &str, mode: &str) -> Note {
+    Note::v1(
+        acp_sid,
+        s1::SessionUpdate::CurrentModeUpdate(s1::CurrentModeUpdate::new(mode.to_string())),
     )
 }

@@ -156,7 +156,7 @@ pub struct PendingFeedbackForm {
     /// The `session/prompt` request that ran `/feedback`.
     pub prompt_req: Option<RequestId>,
     /// The prompt's ACP content blocks, echoed when the turn settles.
-    pub prompt_content: String,
+    pub prompt_content: out::Echo,
     pub ver: u8,
 }
 
@@ -587,28 +587,6 @@ pub fn take_turn_usage(s: &mut AcpSession, turn_id: &str) -> Option<TurnUsage> {
     Some(s.turn_usage.remove(pos))
 }
 
-/// Send one notification frame the adapter built as JSON text.
-pub fn send_raw(stdout: &StdoutShared, line: &str) {
-    let message = serde_json::from_str::<serde_json::Value>(line)
-        .map_err(|error| error.to_string())
-        .and_then(|frame| {
-            let method = frame
-                .get("method")
-                .and_then(serde_json::Value::as_str)
-                .ok_or("no method")?;
-            let params = frame
-                .get("params")
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            agent_client_protocol::UntypedMessage::new(method, params)
-                .map_err(|error| error.to_string())
-        });
-    match message {
-        Ok(message) => written(stdout.notify(message)),
-        Err(error) => crate::msp::log(&format!("internal: dropped an invalid ACP frame: {error}")),
-    }
-}
-
 /// A failed write means the editor is gone: start the shutdown deadline.
 fn written<E>(outcome: Result<(), E>) {
     if outcome.is_err() {
@@ -880,32 +858,41 @@ pub fn send_usage(
         canonical.push(format!("\"subscriptionUsage\":{subscription}"));
         legacy.push(format!("\"museSubscriptionUsage\":{subscription}"));
     }
-    let meta = format!("\"muse\":{{{}}},{}", canonical.join(","), legacy.join(","));
-    // `amount` must be a JSON number: Rust's Display prints `inf`/`NaN`
-    // verbatim, which would corrupt the whole frame. ACP's `Cost` allows only
-    // `amount`, `currency`, and `_meta`, so the provenance lives in `_meta`.
-    let cost_f = if host_reports_cost {
+    let meta = out::meta(&format!(
+        "{{\"muse\":{{{}}},{}}}",
+        canonical.join(","),
+        legacy.join(",")
+    ));
+    // `amount` must be a finite number: JSON has no `inf` or `NaN`. ACP's
+    // `Cost` allows only `amount`, `currency`, and `_meta`, so the provenance
+    // lives in `_meta`.
+    let cost = if host_reports_cost {
         match &s.host_cost {
-            Some((amount, partial)) if amount.is_finite() => format!(
-                ",\"cost\":{{\"amount\":{amount},\"currency\":\"USD\",\"_meta\":{{\"muse\":{{\"source\":\"muse-host\",\"estimate\":true,\"partial\":{partial}}}}}}}"
-            ),
-            _ => String::new(),
+            Some((amount, partial)) if amount.is_finite() => Some((
+                *amount,
+                "USD".to_string(),
+                out::meta(
+                    &serde_json::json!({"muse": {"source": "muse-host", "estimate": true, "partial": partial}})
+                        .to_string(),
+                ),
+            )),
+            _ => None,
         }
     } else {
         match &s.cost_amount {
-            Some((amount, currency)) if amount.is_finite() => format!(
-                ",\"cost\":{{\"amount\":{amount},\"currency\":{},\"_meta\":{{\"muse\":{{\"source\":\"adapter-estimate\",\"basis\":\"catalog-list-price\",\"billing\":false}}}}}}",
-                esc(currency)
-            ),
-            _ => String::new(),
+            Some((amount, currency)) if amount.is_finite() => Some((
+                *amount,
+                currency.clone(),
+                out::meta(
+                    r#"{"muse":{"source":"adapter-estimate","basis":"catalog-list-price","billing":false}}"#,
+                ),
+            )),
+            _ => None,
         }
     };
-    send_raw(
+    send_note(
         stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"usage_update\",\"used\":{used},\"size\":{size}{cost_f},\"_meta\":{{{meta}}}}}}}}}",
-            esc(&s.acp_sid),
-        ),
+        out::usage(&s.acp_sid, s.ver, used, size, cost, meta),
     );
 }
 
@@ -927,7 +914,7 @@ pub fn send_subscription_usage(stdout: &StdoutShared, s: &mut AcpSession, clear:
     send_session_info_with_extra(
         stdout,
         s,
-        None,
+        out::Title::Keep,
         None,
         Some(&format!("\"museSubscriptionUsage\":{subscription}")),
     );
@@ -935,16 +922,7 @@ pub fn send_subscription_usage(stdout: &StdoutShared, s: &mut AcpSession, clear:
 
 /// v2 `state_update`. v1 callers use the prompt response instead.
 pub fn send_state(stdout: &StdoutShared, acp_sid: &str, state: &str, stop: Option<&str>) {
-    let stop_f = stop
-        .map(|s| format!(",\"stopReason\":{}", esc(s)))
-        .unwrap_or_default();
-    send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"state_update\",\"state\":\"{state}\"{stop_f}}}}}}}",
-            esc(acp_sid),
-        ),
-    );
+    send_note(stdout, out::state(acp_sid, state, stop));
 }
 
 /// Reflect a host-side configuration change in the client's selector. ACP
@@ -1545,7 +1523,7 @@ pub fn send_available_commands(
 /// MSP statuses are a superset (`cancelled` and open values): anything that is
 /// not `inProgress`/`completed` stays `pending` so an unknown state can never
 /// be presented as finished work.
-fn todo_entry(item: &J) -> Option<String> {
+fn todo_entry(item: &J) -> Option<out::PlanEntry> {
     let text = item.get("text").and_then(|v| v.as_str())?;
     if text.trim().is_empty() {
         return None;
@@ -1555,10 +1533,7 @@ fn todo_entry(item: &J) -> Option<String> {
         "completed" => "completed",
         _ => "pending",
     };
-    Some(format!(
-        "{{\"content\":{},\"priority\":\"medium\",\"status\":\"{status}\"}}",
-        esc(text)
-    ))
+    Some((text.to_string(), status))
 }
 
 /// ACP v2 identifies plans by id; MSP keeps exactly one todo list per session
@@ -1569,11 +1544,6 @@ const TODO_PLAN_ID: &str = "muse-todo";
 /// Emit an ACP plan update from an MSP todo list. The whole list is replaced
 /// on every event (and an empty list is a cleared plan, not a no-op), matching
 /// both protocols' replace-wholesale semantics.
-///
-/// ACP v1 has one implicit plan per session and clears it with an empty
-/// `entries` array. ACP v2 names plans and splits the shapes: a snapshot
-/// becomes `plan_update` whose `plan` is an `items` checklist, and an empty
-/// list becomes `plan_removed` for the known plan id.
 pub fn send_plan(stdout: &StdoutShared, acp_sid: &str, ver: u8, items: Option<&J>) {
     let entries = match items {
         Some(J::Arr(values)) => values.iter().filter_map(todo_entry).collect::<Vec<_>>(),
@@ -1581,50 +1551,28 @@ pub fn send_plan(stdout: &StdoutShared, acp_sid: &str, ver: u8, items: Option<&J
         // last plan rather than clearing on garbage.
         _ => return,
     };
-    let update = if ver == 2 {
-        if entries.is_empty() {
-            format!("{{\"sessionUpdate\":\"plan_removed\",\"planId\":\"{TODO_PLAN_ID}\"}}")
-        } else {
-            format!(
-                "{{\"sessionUpdate\":\"plan_update\",\"plan\":{{\"type\":\"items\",\"planId\":\"{TODO_PLAN_ID}\",\"entries\":[{}]}}}}",
-                entries.join(",")
-            )
-        }
-    } else {
-        format!(
-            "{{\"sessionUpdate\":\"plan\",\"entries\":[{}]}}",
-            entries.join(",")
-        )
-    };
-    send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{update}}}}}",
-            esc(acp_sid)
-        ),
-    );
+    send_note(stdout, out::plan(acp_sid, ver, TODO_PLAN_ID, entries));
 }
 
 fn send_session_info_snapshot(
     stdout: &StdoutShared,
     s: &AcpSession,
-    title: Option<&str>,
+    title: out::Title,
     goal: Option<&str>,
 ) {
     send_session_info_with_extra(stdout, s, title, goal, None);
 }
 
+/// A `session_info_update` with the session's complete `_meta.muse`
+/// snapshot. `goal` is the provider-neutral `_meta.goal` JSON, and
+/// `extra_meta` more `_meta` members as `"key":value` JSON.
 fn send_session_info_with_extra(
     stdout: &StdoutShared,
     s: &AcpSession,
-    title: Option<&str>,
+    title: out::Title,
     goal: Option<&str>,
     extra_meta: Option<&str>,
 ) {
-    let mut fields = vec!["\"sessionUpdate\":\"session_info_update\"".to_string()];
-    if let Some(title) = title {
-        fields.push(format!("\"title\":{title}"));
-    }
     let mut meta = Vec::new();
     if let Some(goal) = goal {
         meta.push(format!("\"goal\":{goal}"));
@@ -1635,19 +1583,13 @@ fn send_session_info_with_extra(
     if let Some(extra) = extra_meta {
         meta.push(extra.to_string());
     }
-    if !meta.is_empty() {
-        fields.push(format!("\"_meta\":{{{}}}", meta.join(",")));
-    }
-    if fields.len() == 1 {
+    if meta.is_empty() && matches!(title, out::Title::Keep) {
         return;
     }
-    send_raw(
+    let meta = out::meta(&format!("{{{}}}", meta.join(",")));
+    send_note(
         stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{{}}}}}}}",
-            esc(&s.acp_sid),
-            fields.join(",")
-        ),
+        out::session_info(&s.acp_sid, s.ver, title, None, meta),
     );
 }
 
@@ -1663,7 +1605,7 @@ pub fn send_session_meta(
     if let Some(branch) = branch {
         s.set_session_meta("branch", branch.to_string());
     }
-    send_session_info_snapshot(stdout, s, None, goal);
+    send_session_info_snapshot(stdout, s, out::Title::Keep, goal);
 }
 
 /// Publish the host's session provenance (`sideFrom` or `forkedFrom`) while
@@ -1672,18 +1614,21 @@ pub fn send_session_provenance(stdout: &StdoutShared, s: &mut AcpSession, muse: 
     if let Ok(patch) = parse_json(muse) {
         s.absorb_session_meta_patch(&patch);
     }
-    send_session_info_snapshot(stdout, s, None, None);
+    send_session_info_snapshot(stdout, s, out::Title::Keep, None);
 }
 
 /// A side-chat result can name provenance before the client attaches the new
 /// session. No per-session metadata store exists yet, so this one-off update
 /// carries the patch itself; attach republishes it through the full snapshot.
-pub fn send_session_provenance_only(stdout: &StdoutShared, acp_sid: &str, muse: &str) {
-    send_raw(
+pub fn send_session_provenance_only(stdout: &StdoutShared, acp_sid: &str, ver: u8, muse: &str) {
+    send_note(
         stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"muse\":{muse}}}}}}}}}",
-            esc(acp_sid)
+        out::session_info(
+            acp_sid,
+            ver,
+            out::Title::Keep,
+            None,
+            out::meta(&format!("{{\"muse\":{muse}}}")),
         ),
     );
 }
@@ -1711,7 +1656,7 @@ pub fn send_session_status(
             .join(",");
         s.set_session_meta("attention", format!("[{values}]"));
     }
-    send_session_info_snapshot(stdout, s, None, None);
+    send_session_info_snapshot(stdout, s, out::Title::Keep, None);
 }
 
 /// Publish approvals currently held by Muse's native reviewer. An empty list
@@ -1739,7 +1684,7 @@ pub fn send_approval_reviewing(
             .join(",");
         s.set_session_meta("approvalReviewing", format!("[{rows}]"));
     }
-    send_session_info_snapshot(stdout, s, None, None);
+    send_session_info_snapshot(stdout, s, out::Title::Keep, None);
 }
 
 /// How a title update represents the optional generated short title.
@@ -1790,11 +1735,24 @@ pub fn send_session_title(
         GeneratedName::Value(name) => s.set_session_meta("generatedName", esc(name)),
     }
     let title = match title {
-        TitleUpdate::Omit => None,
-        TitleUpdate::Clear => Some("null".to_string()),
-        TitleUpdate::Value(title) => Some(esc(title)),
+        TitleUpdate::Omit => out::Title::Keep,
+        TitleUpdate::Clear => out::Title::Clear,
+        TitleUpdate::Value(title) => out::Title::Set(title.to_string()),
     };
-    send_session_info_snapshot(stdout, s, title.as_deref(), None);
+    send_session_info_snapshot(stdout, s, title, None);
+}
+
+/// `elicitation/complete`: the URL elicitation `elicitation_id` has finished.
+pub fn send_elicitation_complete(stdout: &StdoutShared, elicitation_id: &str) {
+    use agent_client_protocol::{v1::schema as s1, v2::schema as s2};
+    written(match stdout.version() {
+        Some(2) => stdout.notify(s2::CompleteElicitationNotification::new(
+            elicitation_id.to_string(),
+        )),
+        _ => stdout.notify(s1::CompleteElicitationNotification::new(
+            elicitation_id.to_string(),
+        )),
+    });
 }
 
 /// Send one typed notification.

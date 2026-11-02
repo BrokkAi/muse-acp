@@ -75,11 +75,11 @@ pub struct Prompt {
     pub meta: Meta,
 }
 
-/// One prompt content block, with the block as the client sent it, in its
-/// version's schema serialization, for echoing it back in the transcript.
+/// One prompt content block, with the block as the client sent it, for
+/// echoing it back in the transcript.
 pub struct Block {
     pub content: Content,
-    pub echo: Value,
+    pub echo: crate::out::EchoBlock,
 }
 
 pub enum Content {
@@ -95,6 +95,7 @@ pub enum Content {
         mime_type: Option<String>,
     },
     TextResource {
+        uri: String,
         text: String,
     },
     BlobResource {
@@ -228,10 +229,6 @@ fn meta(meta: Option<Map<String, Value>>) -> Meta {
 
 fn path(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
-}
-
-fn echo<T: serde::Serialize>(block: &T) -> Value {
-    serde_json::to_value(block).unwrap_or(Value::Null)
 }
 
 /// A typed v1 message, with its request id. `None` for a notification the
@@ -407,6 +404,7 @@ fn v1_block(block: &v1::schema::ContentBlock) -> Block {
         },
         C::Resource(r) => match &r.resource {
             E::TextResourceContents(t) => Content::TextResource {
+                uri: t.uri.clone(),
                 text: t.text.clone(),
             },
             E::BlobResourceContents(b) => Content::BlobResource {
@@ -420,7 +418,7 @@ fn v1_block(block: &v1::schema::ContentBlock) -> Block {
     };
     Block {
         content,
-        echo: echo(block),
+        echo: crate::out::EchoBlock::V1(block.clone()),
     }
 }
 
@@ -583,6 +581,7 @@ fn v2_block(block: &v2::schema::ContentBlock) -> Block {
         },
         C::Resource(r) => match &r.resource {
             E::TextResourceContents(t) => Content::TextResource {
+                uri: t.uri.clone(),
                 text: t.text.clone(),
             },
             E::BlobResourceContents(b) => Content::BlobResource {
@@ -597,7 +596,7 @@ fn v2_block(block: &v2::schema::ContentBlock) -> Block {
     };
     Block {
         content,
-        echo: echo(block),
+        echo: crate::out::EchoBlock::V2(block.clone()),
     }
 }
 
