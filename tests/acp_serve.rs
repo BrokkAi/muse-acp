@@ -14039,9 +14039,10 @@ fn host_restart_settles_orphaned_turns_of_a_legacy_session_id() {
         "{\"sessionId\":\"sess-legacy-1\",\"_meta\":{\"mspSessionId\":\"msp-sess-1\"}}",
     );
     let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    // A resume result names no session (the client named it); the prompt
+    // below proves the legacy id stays the ACP key.
     assert!(
-        resumed.contains("\"sessionId\":\"sess-legacy-1\"")
-            && resumed.contains("\"mspSessionId\":\"msp-sess-1\""),
+        resumed.contains("\"result\"") && resumed.contains("\"mspSessionId\":\"msp-sess-1\""),
         "legacy id stays the ACP key: {resumed}"
     );
     let pid = c.prompt("sess-legacy-1", "in flight when we crash");
@@ -15221,9 +15222,15 @@ fn terminal_auth_is_offered_only_to_clients_that_support_it() {
         let id = c.req("initialize", &initialize_params(version, capabilities));
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
         let reply: serde_json::Value = serde_json::from_str(&frame).expect("initialize json");
-        let methods = reply["result"]["authMethods"]
-            .as_array()
-            .unwrap_or_else(|| panic!("v{version} {capabilities}: {frame}"));
+        // The SDK leaves out an empty `authMethods`, which ACP v2 defaults to
+        // the empty list.
+        let methods = match &reply["result"]["authMethods"] {
+            serde_json::Value::Null if version == 2 => Vec::new(),
+            methods => methods
+                .as_array()
+                .cloned()
+                .unwrap_or_else(|| panic!("v{version} {capabilities}: {frame}")),
+        };
         assert!(
             methods.iter().all(|method| method["type"] != "terminal"),
             "v{version} {capabilities}: {frame}"

@@ -628,3 +628,200 @@ pub fn message(
         },
     )
 }
+
+/// One slash command the session offers.
+#[derive(Debug, Clone)]
+pub struct Command {
+    pub name: String,
+    pub description: String,
+    /// The input hint, for a command that takes text after its name.
+    pub hint: Option<String>,
+    /// The command's human-readable name, in `_meta.muse.title`: ACP's
+    /// `name` is the slash token.
+    pub title: Option<String>,
+}
+
+/// An `available_commands_update`.
+pub fn available_commands(acp_sid: &str, ver: u8, commands: Vec<Command>) -> Note {
+    let meta = |title: Option<String>| {
+        title.and_then(|title| meta(&serde_json::json!({"muse": {"title": title}}).to_string()))
+    };
+    if ver == 2 {
+        let commands = commands
+            .into_iter()
+            .map(|c| {
+                s2::AvailableCommand::Command(
+                    s2::Command::new(c.name, c.description)
+                        .input(c.hint.map(|hint| {
+                            s2::AvailableCommandInput::Text(s2::TextCommandInput::new(hint))
+                        }))
+                        .meta(meta(c.title)),
+                )
+            })
+            .collect();
+        return Note::v2(
+            acp_sid,
+            s2::SessionUpdate::AvailableCommandsUpdate(s2::AvailableCommandsUpdate::new(commands)),
+        );
+    }
+    let commands = commands
+        .into_iter()
+        .map(|c| {
+            s1::AvailableCommand::new(c.name, c.description)
+                .input(c.hint.map(|hint| {
+                    s1::AvailableCommandInput::Unstructured(s1::UnstructuredCommandInput::new(hint))
+                }))
+                .meta(meta(c.title))
+        })
+        .collect();
+    Note::v1(
+        acp_sid,
+        s1::SessionUpdate::AvailableCommandsUpdate(s1::AvailableCommandsUpdate::new(commands)),
+    )
+}
+
+/// One session configuration option (a selector or a toggle).
+#[derive(Debug, Clone)]
+pub struct ConfigOption {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    /// An ACP option category (`mode`, `model`, `thought_level`).
+    pub category: Option<String>,
+    pub kind: ConfigKind,
+    pub meta: Option<Meta>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ConfigKind {
+    /// A selector: its current value, and `(value, name, description)` per
+    /// choice.
+    Select {
+        current: String,
+        choices: Vec<(String, String, Option<String>)>,
+    },
+    Boolean(bool),
+}
+
+/// A session's complete `configOptions`, in its version's schema types.
+#[derive(Debug, Clone)]
+pub enum ConfigOptions {
+    V1(Vec<s1::SessionConfigOption>),
+    V2(Vec<s2::SessionConfigOption>),
+}
+
+fn category_v1(category: &str) -> s1::SessionConfigOptionCategory {
+    match category {
+        "mode" => s1::SessionConfigOptionCategory::Mode,
+        "model" => s1::SessionConfigOptionCategory::Model,
+        "model_config" => s1::SessionConfigOptionCategory::ModelConfig,
+        "thought_level" => s1::SessionConfigOptionCategory::ThoughtLevel,
+        other => s1::SessionConfigOptionCategory::Other(other.to_string()),
+    }
+}
+
+fn category_v2(category: &str) -> s2::SessionConfigOptionCategory {
+    match category {
+        "mode" => s2::SessionConfigOptionCategory::Mode,
+        "model" => s2::SessionConfigOptionCategory::Model,
+        "model_config" => s2::SessionConfigOptionCategory::ModelConfig,
+        "thought_level" => s2::SessionConfigOptionCategory::ThoughtLevel,
+        other => s2::SessionConfigOptionCategory::Other(other.to_string()),
+    }
+}
+
+impl ConfigOptions {
+    pub fn new(ver: u8, options: Vec<ConfigOption>) -> ConfigOptions {
+        if ver == 2 {
+            return ConfigOptions::V2(
+                options
+                    .into_iter()
+                    .map(|o| {
+                        let option = match o.kind {
+                            ConfigKind::Select { current, choices } => {
+                                let choices: Vec<s2::SessionConfigSelectOption> = choices
+                                    .into_iter()
+                                    .map(|(value, name, description)| {
+                                        s2::SessionConfigSelectOption::new(value, name)
+                                            .description(description)
+                                    })
+                                    .collect();
+                                s2::SessionConfigOption::select(o.id, o.name, current, choices)
+                            }
+                            ConfigKind::Boolean(on) => {
+                                s2::SessionConfigOption::boolean(o.id, o.name, on)
+                            }
+                        };
+                        option
+                            .description(o.description)
+                            .category(o.category.as_deref().map(category_v2))
+                            .meta(o.meta)
+                    })
+                    .collect(),
+            );
+        }
+        ConfigOptions::V1(
+            options
+                .into_iter()
+                .map(|o| {
+                    let option = match o.kind {
+                        ConfigKind::Select { current, choices } => {
+                            let choices: Vec<s1::SessionConfigSelectOption> = choices
+                                .into_iter()
+                                .map(|(value, name, description)| {
+                                    s1::SessionConfigSelectOption::new(value, name)
+                                        .description(description)
+                                })
+                                .collect();
+                            s1::SessionConfigOption::select(o.id, o.name, current, choices)
+                        }
+                        ConfigKind::Boolean(on) => {
+                            s1::SessionConfigOption::boolean(o.id, o.name, on)
+                        }
+                    };
+                    option
+                        .description(o.description)
+                        .category(o.category.as_deref().map(category_v1))
+                        .meta(o.meta)
+                })
+                .collect(),
+        )
+    }
+
+    /// The `configOptions` array as the SDK serializes it.
+    pub fn json(&self) -> Value {
+        match self {
+            ConfigOptions::V1(options) => serde_json::to_value(options),
+            ConfigOptions::V2(options) => serde_json::to_value(options),
+        }
+        .unwrap_or(Value::Null)
+    }
+
+    /// A `config_option_update` carrying the complete list.
+    pub fn update(self, acp_sid: &str) -> Note {
+        match self {
+            ConfigOptions::V1(options) => Note::v1(
+                acp_sid,
+                s1::SessionUpdate::ConfigOptionUpdate(s1::ConfigOptionUpdate::new(options)),
+            ),
+            ConfigOptions::V2(options) => Note::v2(
+                acp_sid,
+                s2::SessionUpdate::ConfigOptionUpdate(s2::ConfigOptionUpdate::new(options)),
+            ),
+        }
+    }
+}
+
+/// ACP v1's legacy session mode state: the current mode and the choices.
+pub fn mode_state(current: &str, modes: &[(&str, &str, &str)]) -> s1::SessionModeState {
+    s1::SessionModeState::new(
+        current.to_string(),
+        modes
+            .iter()
+            .map(|(id, name, description)| {
+                s1::SessionMode::new(id.to_string(), name.to_string())
+                    .description(description.to_string())
+            })
+            .collect(),
+    )
+}

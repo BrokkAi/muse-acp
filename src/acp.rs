@@ -643,6 +643,121 @@ pub fn send_result(stdout: &StdoutShared, id: &Option<RequestId>, result_json: &
     }
 }
 
+/// Answer request `id` with a typed response.
+pub fn send_response<T: agent_client_protocol::JsonRpcResponse>(
+    stdout: &StdoutShared,
+    id: &Option<RequestId>,
+    response: T,
+) {
+    let Some(id) = id else {
+        return;
+    };
+    if crate::shutdown::expiring() {
+        return;
+    }
+    written(stdout.respond_typed(id, response));
+}
+
+/// The session setup method a response answers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Setup {
+    New,
+    Load,
+    Resume,
+    Fork,
+}
+
+/// Answer `session/new`, `session/load`, `session/resume` or `session/fork`:
+/// the session's selectors, ACP v1's legacy mode state, and the adapter's
+/// `_meta`. `session_id` names the new session of `new` and `fork`.
+pub fn send_setup_response(
+    stdout: &StdoutShared,
+    id: &Option<RequestId>,
+    method: Setup,
+    session_id: &str,
+    options: out::ConfigOptions,
+    session_mode: &str,
+    meta: Option<out::Meta>,
+) {
+    use agent_client_protocol::{v1::schema as s1, v2::schema as s2};
+    match options {
+        out::ConfigOptions::V1(options) => {
+            let modes = session_modes(session_mode);
+            match method {
+                Setup::New => send_response(
+                    stdout,
+                    id,
+                    s1::NewSessionResponse::new(session_id.to_string())
+                        .modes(modes)
+                        .config_options(options)
+                        .meta(meta),
+                ),
+                Setup::Load => send_response(
+                    stdout,
+                    id,
+                    s1::LoadSessionResponse::new()
+                        .modes(modes)
+                        .config_options(options)
+                        .meta(meta),
+                ),
+                Setup::Resume => send_response(
+                    stdout,
+                    id,
+                    s1::ResumeSessionResponse::new()
+                        .modes(modes)
+                        .config_options(options)
+                        .meta(meta),
+                ),
+                Setup::Fork => send_response(
+                    stdout,
+                    id,
+                    s1::ForkSessionResponse::new(session_id.to_string())
+                        .modes(modes)
+                        .config_options(options)
+                        .meta(meta),
+                ),
+            }
+        }
+        out::ConfigOptions::V2(options) => match method {
+            Setup::New => send_response(
+                stdout,
+                id,
+                s2::NewSessionResponse::new(session_id.to_string())
+                    .config_options(options)
+                    .meta(meta),
+            ),
+            // ACP v2 has no `session/load`; a v2 client calling it gets the
+            // response of `session/resume`, which it otherwise matches.
+            Setup::Load | Setup::Resume => send_response(
+                stdout,
+                id,
+                s2::ResumeSessionResponse::new()
+                    .config_options(options)
+                    .meta(meta),
+            ),
+            Setup::Fork => send_response(
+                stdout,
+                id,
+                s2::ForkSessionResponse::new(session_id.to_string())
+                    .config_options(options)
+                    .meta(meta),
+            ),
+        },
+    }
+}
+
+/// Answer request `id` with a result no schema type holds: an extension
+/// method's result, or a schema response the adapter extended.
+pub fn send_value(stdout: &StdoutShared, id: &Option<RequestId>, result: serde_json::Value) {
+    let Some(id) = id else {
+        return;
+    };
+    if crate::shutdown::expiring() {
+        return;
+    }
+    written(stdout.respond(id, result));
+}
+
 fn send_rpc_error(stdout: &StdoutShared, id: &Option<RequestId>, error: Error) {
     if crate::shutdown::expiring() {
         return;
@@ -833,16 +948,13 @@ pub fn send_state(stdout: &StdoutShared, acp_sid: &str, state: &str, stop: Optio
 }
 
 /// Reflect a host-side configuration change in the client's selector. ACP
-/// requires the complete `configOptions` list, not the changed selector, so
-/// callers pass the same JSON the selector result uses.
-pub fn send_config_options_update(stdout: &StdoutShared, acp_sid: &str, config_options_json: &str) {
-    send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"config_option_update\",\"configOptions\":{config_options_json}}}}}}}",
-            esc(acp_sid),
-        ),
-    );
+/// requires the complete `configOptions` list, not the changed selector.
+pub fn send_config_options_update(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    options: out::ConfigOptions,
+) {
+    send_note(stdout, options.update(acp_sid));
 }
 
 fn perm_kind(decision: &str, scope: &str) -> &'static str {
@@ -1055,21 +1167,6 @@ pub fn is_read_only_mode(mode: &str) -> bool {
     mode == READ_ONLY_MODE || mode == PLAN_MODE
 }
 
-fn mode_options_json(key: &str, modes: &[(&str, &str, &str)]) -> String {
-    modes
-        .iter()
-        .map(|(id, name, desc)| {
-            format!(
-                "{{\"{key}\":{},\"name\":{},\"description\":{}}}",
-                esc(id),
-                esc(name),
-                esc(desc)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 /// Selector value for "no tier chosen here": Muse applies its own configured
 /// default and the adapter sends no per-turn override. It is not an MSP
 /// `ReasoningEffort` and is never sent to the host.
@@ -1158,16 +1255,12 @@ pub struct ConfigOptions<'a> {
 /// `configId` (the setter still uses `configId` in both versions).
 /// Auto-review is adapter policy: see [`AUTO_REVIEW_OFF`] and
 /// [`AUTO_REVIEW_WORKSPACE`].
-pub fn config_options(ver: u8, options: ConfigOptions<'_>, models: &[CatalogModel]) -> String {
-    let mut model_opts = Vec::new();
-    for model in models {
-        model_opts.push(format!(
-            "{{\"value\":{},\"name\":{}}}",
-            esc(&model.id),
-            esc(&model.label)
-        ));
-    }
-    let id_key = if ver == 1 { "id" } else { "configId" };
+pub fn config_options(
+    ver: u8,
+    options: ConfigOptions<'_>,
+    models: &[CatalogModel],
+) -> out::ConfigOptions {
+    use out::{ConfigKind, ConfigOption};
     // The reasoning selector offers exactly the tiers the current model
     // serves, with the catalog's own descriptions. A model whose row does not
     // publish tiers keeps today's fixed list. The current value always stays
@@ -1201,81 +1294,141 @@ pub fn config_options(ver: u8, options: ConfigOptions<'_>, models: &[CatalogMode
             tier_description(options.reasoning_effort),
         ));
     }
-    let reasoning_options_json = reasoning_options
-        .iter()
-        .map(|(tier, description)| match description {
-            Some(description) if !description.is_empty() => format!(
-                "{{\"value\":{},\"name\":{},\"description\":{}}}",
-                esc(tier),
-                esc(reasoning_tier_name(tier)),
-                esc(description)
-            ),
-            _ => format!(
-                "{{\"value\":{},\"name\":{}}}",
-                esc(tier),
-                esc(reasoning_tier_name(tier))
-            ),
-        })
-        .collect::<Vec<_>>()
-        .join(",");
     // AIR recommendedValue is additive metadata: emit it only when the client
     // negotiated it and the value is present among this selector's options.
     let (recommended_model, recommended_reasoning) = options.recommendations;
+    let recommended = |value: &str| {
+        out::meta(
+            &serde_json::json!({"jetbrains": {"air": {"version": 1, "recommendedValue": value}}})
+                .to_string(),
+        )
+    };
     let reasoning_meta = recommended_reasoning
         .filter(|value| reasoning_options.iter().any(|(tier, _)| tier == value))
-        .map(|value| format!(",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}", esc(value)))
-        .unwrap_or_default();
-    let recommended_meta = match recommended_model {
-        Some(model) if models.iter().any(|row| row.id == model) => format!(
-            ",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}",
-            esc(model)
-        ),
-        _ => String::new(),
-    };
+        .and_then(recommended);
+    let model_meta = recommended_model
+        .filter(|model| models.iter().any(|row| row.id == *model))
+        .and_then(recommended);
     // MSP cannot clear a standing session default, so "Muse default" is only
     // offered while no host default is in force.
-    let muse_default = if options.offer_muse_default {
-        "{\"value\":\"default\",\"name\":\"Muse default\"},"
-    } else {
-        ""
+    let mut reasoning_choices = Vec::new();
+    if options.offer_muse_default {
+        reasoning_choices.push(("default".to_string(), "Muse default".to_string(), None));
+    }
+    reasoning_choices.extend(reasoning_options.iter().map(|(tier, description)| {
+        (
+            tier.clone(),
+            reasoning_tier_name(tier).to_string(),
+            description
+                .clone()
+                .filter(|description| !description.is_empty()),
+        )
+    }));
+    let choices = |modes: &[(&str, &str, &str)]| {
+        modes
+            .iter()
+            .map(|(id, name, description)| {
+                (
+                    id.to_string(),
+                    name.to_string(),
+                    Some(description.to_string()),
+                )
+            })
+            .collect()
     };
     // A client that accepts boolean options gets a toggle; others keep the
     // off/on selector.
-    let auto_review_shape = if options.boolean_toggles {
-        format!(
-            "\"type\":\"boolean\",\"currentValue\":{}",
-            options.auto_review
-        )
+    let auto_review = if options.boolean_toggles {
+        ConfigKind::Boolean(options.auto_review)
     } else {
-        format!(
-            "\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"off\",\"name\":\"Off\"}},{{\"value\":\"on\",\"name\":\"On\"}}]",
-            esc(if options.auto_review {
+        ConfigKind::Select {
+            current: if options.auto_review {
                 AUTO_REVIEW_ON
             } else {
                 AUTO_REVIEW_OFF
-            })
-        )
+            }
+            .to_string(),
+            choices: vec![
+                ("off".to_string(), "Off".to_string(), None),
+                ("on".to_string(), "On".to_string(), None),
+            ],
+        }
     };
-    format!(
-        "[{{\"{id_key}\":\"mode\",\"name\":\"Mode\",\"description\":\"Read-only and Plan block Muse's file and shell tools; client MCP tools remain available\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"approval_mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"auto_review\",\"name\":\"Auto-review\",\"description\":\"Dangerous: send every permission request to an auto-review agent that can approve or deny it without asking you\",{auto_review_shape}}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{reasoning_options_json}]{reasoning_meta}}}]",
-        esc(options.session_mode),
-        mode_options_json("value", &SESSION_MODES),
-        esc(options.approval_mode),
-        mode_options_json("value", &APPROVAL_MODES),
-        esc(options.model),
-        model_opts.join(","),
-        esc(options.reasoning_effort)
+    out::ConfigOptions::new(
+        ver,
+        vec![
+            ConfigOption {
+                id: "mode".to_string(),
+                name: "Mode".to_string(),
+                description: Some(
+                    "Read-only and Plan block Muse's file and shell tools; client MCP tools remain available"
+                        .to_string(),
+                ),
+                category: Some("mode".to_string()),
+                kind: ConfigKind::Select {
+                    current: options.session_mode.to_string(),
+                    choices: choices(&SESSION_MODES),
+                },
+                meta: None,
+            },
+            ConfigOption {
+                id: "approval_mode".to_string(),
+                name: "Approval Mode".to_string(),
+                description: Some("Muse approval enforcement mode for tool actions".to_string()),
+                category: None,
+                kind: ConfigKind::Select {
+                    current: options.approval_mode.to_string(),
+                    choices: choices(&APPROVAL_MODES),
+                },
+                meta: None,
+            },
+            ConfigOption {
+                id: "auto_review".to_string(),
+                name: "Auto-review".to_string(),
+                description: Some(
+                    "Dangerous: send every permission request to an auto-review agent that can approve or deny it without asking you"
+                        .to_string(),
+                ),
+                category: None,
+                kind: auto_review,
+                meta: None,
+            },
+            ConfigOption {
+                id: "model".to_string(),
+                name: "Model".to_string(),
+                description: None,
+                category: Some("model".to_string()),
+                kind: ConfigKind::Select {
+                    current: options.model.to_string(),
+                    choices: models
+                        .iter()
+                        .map(|model| (model.id.clone(), model.label.clone(), None))
+                        .collect(),
+                },
+                meta: model_meta,
+            },
+            ConfigOption {
+                id: "reasoning_effort".to_string(),
+                name: "Reasoning Effort".to_string(),
+                description: Some(
+                    "Muse reasoning effort for this session; Muse default keeps the tier configured in Muse"
+                        .to_string(),
+                ),
+                category: Some("thought_level".to_string()),
+                kind: ConfigKind::Select {
+                    current: options.reasoning_effort.to_string(),
+                    choices: reasoning_choices,
+                },
+                meta: reasoning_meta,
+            },
+        ],
     )
 }
 
 /// Legacy v1 mode state for clients which predate `configOptions`: the
 /// session modes.
-pub fn session_modes(session_mode: &str) -> String {
-    format!(
-        "{{\"currentModeId\":{},\"availableModes\":[{}]}}",
-        esc(session_mode),
-        mode_options_json("id", &SESSION_MODES)
-    )
+pub fn session_modes(session_mode: &str) -> agent_client_protocol::v1::schema::SessionModeState {
+    out::mode_state(session_mode, &SESSION_MODES)
 }
 
 /// Build the editor command palette from the host's current skill catalog.
@@ -1288,52 +1441,54 @@ pub fn session_modes(session_mode: &str) -> String {
 /// Catalog
 /// rows with a local command's name are deduplicated below so each local
 /// command is advertised exactly once.
-fn available_commands_json(ver: u8, skills: &[CatalogSkill], feedback: bool) -> String {
-    let input = |hint: &str| {
-        if ver == 1 {
-            format!("{{\"hint\":{}}}", esc(hint))
-        } else {
-            format!("{{\"type\":\"text\",\"hint\":{}}}", esc(hint))
-        }
+fn available_commands(skills: &[CatalogSkill], feedback: bool) -> Vec<out::Command> {
+    let command = |name: &str, description: &str, hint: Option<&str>| out::Command {
+        name: name.to_string(),
+        description: description.to_string(),
+        hint: hint.map(str::to_string),
+        title: None,
     };
     let goal_hint = "[<objective>|edit <objective>|clear|pause|resume]";
     let mut items = vec![
-        "{\"name\":\"compact\",\"description\":\"Compact the session context\"}".to_string(),
-        format!(
-            "{{\"name\":\"goal\",\"description\":\"Start or manage continuous work toward a goal\",\"input\":{}}}",
-            input(goal_hint)
+        command("compact", "Compact the session context", None),
+        command(
+            "goal",
+            "Start or manage continuous work toward a goal",
+            Some(goal_hint),
         ),
-        format!(
-            "{{\"name\":\"rename\",\"description\":\"Rename this session\",\"input\":{}}}",
-            input("<name>")
+        command("rename", "Rename this session", Some("<name>")),
+        command(
+            "cua",
+            "Computer-use setup and settings",
+            Some(
+                "[status|apps|host [status|check]|on|set <capability> <choice>|app <bundleId> <choice>|block|unblock <bundleId>]",
+            ),
         ),
-        format!(
-            "{{\"name\":\"cua\",\"description\":\"Computer-use setup and settings\",\"input\":{}}}",
-            input(
-                "[status|apps|host [status|check]|on|set <capability> <choice>|app <bundleId> <choice>|block|unblock <bundleId>]"
-            )
+        command(
+            "plugin",
+            "Install plugins and manage marketplaces",
+            Some("install <marketplace> <name> | marketplace add|remove|update <name>"),
         ),
-        format!(
-            "{{\"name\":\"plugin\",\"description\":\"Install plugins and manage marketplaces\",\"input\":{}}}",
-            input("install <marketplace> <name> | marketplace add|remove|update <name>")
+        command("recap", "Summarize what happened while you were away", None),
+        command(
+            "skill-activation",
+            "Turn one skill on or off",
+            Some("<selector> on|userInvocableOnly|off [scope]"),
         ),
-        "{\"name\":\"recap\",\"description\":\"Summarize what happened while you were away\"}"
-            .to_string(),
-        format!(
-            "{{\"name\":\"skill-activation\",\"description\":\"Turn one skill on or off\",\"input\":{}}}",
-            input("<selector> on|userInvocableOnly|off [scope]")
+        command(
+            "skill-import",
+            "Import skills from Claude Code or Codex",
+            Some("<claude|codex> [dry-run] [force]"),
         ),
-        format!(
-            "{{\"name\":\"skill-import\",\"description\":\"Import skills from Claude Code or Codex\",\"input\":{}}}",
-            input("<claude|codex> [dry-run] [force]")
+        command(
+            "workflow",
+            "Pause or resume a running workflow",
+            Some("pause|resume [<runId>]"),
         ),
-        format!(
-            "{{\"name\":\"workflow\",\"description\":\"Pause or resume a running workflow\",\"input\":{}}}",
-            input("pause|resume [<runId>]")
-        ),
-        format!(
-            "{{\"name\":\"workflow-child\",\"description\":\"Skip or retry a running workflow child\",\"input\":{}}}",
-            input("skip|retry <childId>")
+        command(
+            "workflow-child",
+            "Skip or retry a running workflow child",
+            Some("skip|retry <childId>"),
         ),
     ];
     items.extend(
@@ -1353,33 +1508,23 @@ fn available_commands_json(ver: u8, skills: &[CatalogSkill], feedback: bool) -> 
                         | "workflow-child"
                 ) && !(feedback && skill.selector == "feedback")
             })
-            .map(|skill| {
-                let input = skill
-                    .argument_hint
-                    .as_deref()
-                    .map(|hint| format!(",\"input\":{}", input(hint)))
-                    .unwrap_or_default();
+            .map(|skill| out::Command {
+                name: skill.selector.clone(),
+                description: skill.description.clone(),
+                hint: skill.argument_hint.clone(),
                 // ACP commands have no human-readable name field (`name` is
                 // the slash token), so the skill's name rides in `_meta`.
-                let meta = skill
-                    .title
-                    .as_deref()
-                    .map(|title| format!(",\"_meta\":{{\"muse\":{{\"title\":{}}}}}", esc(title)))
-                    .unwrap_or_default();
-                format!(
-                    "{{\"name\":{},\"description\":{}{input}{meta}}}",
-                    esc(&skill.selector),
-                    esc(&skill.description),
-                )
+                title: skill.title.clone(),
             }),
     );
     if feedback {
-        items.push(format!(
-            "{{\"name\":\"feedback\",\"description\":\"Send feedback about Muse\",\"input\":{}}}",
-            input("[bug|bad|good|other] <note>")
+        items.push(command(
+            "feedback",
+            "Send feedback about Muse",
+            Some("[bug|bad|good|other] <note>"),
         ));
     }
-    format!("[{}]", items.join(","))
+    items
 }
 
 pub fn send_available_commands(
@@ -1389,13 +1534,9 @@ pub fn send_available_commands(
     skills: &[CatalogSkill],
     feedback: bool,
 ) {
-    send_raw(
+    send_note(
         stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":{}}}}}}}",
-            esc(acp_sid),
-            available_commands_json(ver, skills, feedback)
-        ),
+        out::available_commands(acp_sid, ver, available_commands(skills, feedback)),
     );
 }
 
@@ -1831,7 +1972,9 @@ mod tests {
                     recommendations: (None, None),
                 },
                 &models,
-            );
+            )
+            .json()
+            .to_string();
             let parsed = crate::json::parse_json(&options).expect("config options JSON");
             let J::Arr(items) = parsed else {
                 panic!("config options must be an array");
@@ -1866,7 +2009,9 @@ mod tests {
                 skill("rename", "Host rename skill", None, None),
                 skill("feedback", "Host feedback skill", None, None),
             ];
-            let commands = available_commands_json(ver, &skills, true);
+            let commands = out::available_commands("s", ver, available_commands(&skills, true))
+                .params()["update"]["availableCommands"]
+                .to_string();
             assert!(
                 commands.contains("\"name\":\"feedback\""),
                 "a granted feedback capability must be advertised: {commands}"
@@ -1905,7 +2050,7 @@ mod tests {
             assert!(commands.contains("\"name\":\"workflow-child\""));
             assert!(!commands.contains("Host rename skill"));
         }
-        assert!(crate::json::parse_json(&session_modes("default")).is_ok());
+        assert_eq!(session_modes("default").available_modes.len(), 3);
     }
 
     #[test]
@@ -1935,7 +2080,9 @@ mod tests {
                 recommendations: (None, None),
             },
             &models,
-        );
+        )
+        .json()
+        .to_string();
         crate::json::parse_json(&options).expect("config options JSON");
         assert!(
             options.contains("\"value\":\"max\""),
@@ -1964,7 +2111,9 @@ mod tests {
                         recommendations: (None, None),
                     },
                     &[],
-                );
+                )
+                .json()
+                .to_string();
                 let J::Arr(items) = crate::json::parse_json(&options).expect("JSON") else {
                     panic!("config options must be an array");
                 };

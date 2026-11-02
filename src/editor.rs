@@ -473,6 +473,18 @@ impl Editor {
         }
     }
 
+    /// Answer request `id` with a typed response.
+    pub fn respond_typed<T: sdk::JsonRpcResponse>(
+        &self,
+        id: &RequestId,
+        response: T,
+    ) -> Result<(), Gone> {
+        match self.take_responder(id) {
+            Some(responder) => responder.cast::<T>().respond(response).map_err(|_| Gone),
+            None => Ok(()),
+        }
+    }
+
     /// Answer request `id` with `error`.
     pub fn respond_error(&self, id: &RequestId, error: Error) -> Result<(), Gone> {
         match self.take_responder(id) {

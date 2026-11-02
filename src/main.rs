@@ -1914,33 +1914,91 @@ enum LoopMsg {
 /// implies, and client servers are dropped. `session_delete` is the host's
 /// MSP `session/delete` support (Muse 1.4.1 or 1.4.2, durable); clients
 /// must not call `session/delete` unless it is advertised.
-fn v2_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":2,"capabilities":{"session":{"prompt":{"image":{},"embeddedContext":{}},__DELETE____MCP__"fork":{},"subagents":{},"additionalDirectories":{}}},"info":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"authMethods":__AUTH_METHODS__,"_meta":{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"steering":{"supported":true,"idleBehaviors":["promptRequired"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}}"#
-        .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
-        .replace("__AUTH_METHODS__", &auth_methods_v2())
-        .replace(
-            "__DELETE__",
-            if session_delete { r#""delete":{},"# } else { "" },
+fn v2_init(session_mcp: bool, session_delete: bool) -> serde_json::Value {
+    use agent_client_protocol::{schema::ProtocolVersion, v2::schema as s2};
+    let mut session = s2::SessionCapabilities::new()
+        .prompt(
+            s2::PromptCapabilities::new()
+                .image(s2::PromptImageCapabilities::new())
+                .embedded_context(s2::PromptEmbeddedContextCapabilities::new()),
         )
-        .replace(
-            "__MCP__",
-            if session_mcp {
-                r#""mcp":{"stdio":{},"http":{}},"#
-            } else {
-                ""
-            },
-        )
+        .fork(s2::SessionForkCapabilities::new())
+        .additional_directories(s2::SessionAdditionalDirectoriesCapabilities::new());
+    if session_delete {
+        session = session.delete(s2::SessionDeleteCapabilities::new());
+    }
+    if session_mcp {
+        session = session.mcp(
+            s2::McpCapabilities::new()
+                .stdio(s2::McpStdioCapabilities::new())
+                .http(s2::McpHttpCapabilities::new()),
+        );
+    }
+    let info = s2::Implementation::new("muse-acp", env!("CARGO_PKG_VERSION")).title("Muse ACP");
+    let response = s2::InitializeResponse::new(ProtocolVersion::V2, info)
+        .capabilities(s2::AgentCapabilities::new().session(session))
+        .auth_methods(auth_methods_v2())
+        .meta(out::meta(
+            r#"{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"steering":{"supported":true,"idleBehaviors":["promptRequired"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}"#,
+        ));
+    with_air_subagents(
+        serde_json::to_value(response).expect("an initialize response serializes"),
+        &["capabilities", "session"],
+    )
 }
 
-fn v1_init(session_mcp: bool, session_delete: bool) -> String {
-    r#"{"protocolVersion":1,"authMethods":__AUTH_METHODS__,"agentCapabilities":{"promptCapabilities":{"text":true,"image":true,"audio":false,"embeddedContext":true},"mcpCapabilities":{"http":__MCP_HTTP__,"sse":false},"loadSession":true,"auth":{"logout":{}},"sessionCapabilities":{"list":{},"resume":{},"close":{},"fork":{},"subagents":{},"additionalDirectories":{}__DELETE__},"_meta":{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}},"agentInfo":{"name":"muse-acp","title":"Muse ACP","version":__VERSION__},"_meta":{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}}"#
-        .replace("__VERSION__", &crate::json::esc(env!("CARGO_PKG_VERSION")))
-        .replace("__AUTH_METHODS__", &auth_methods_v1())
-        .replace("__MCP_HTTP__", if session_mcp { "true" } else { "false" })
-        .replace(
-            "__DELETE__",
-            if session_delete { r#","delete":{}"# } else { "" },
+fn v1_init(session_mcp: bool, session_delete: bool) -> serde_json::Value {
+    use agent_client_protocol::{schema::ProtocolVersion, v1::schema as s1};
+    let mut session = s1::SessionCapabilities::new()
+        .list(s1::SessionListCapabilities::new())
+        .resume(s1::SessionResumeCapabilities::new())
+        .close(s1::SessionCloseCapabilities::new())
+        .fork(s1::SessionForkCapabilities::new())
+        .additional_directories(s1::SessionAdditionalDirectoriesCapabilities::new());
+    if session_delete {
+        session = session.delete(s1::SessionDeleteCapabilities::new());
+    }
+    let capabilities = s1::AgentCapabilities::new()
+        .load_session(true)
+        .prompt_capabilities(
+            s1::PromptCapabilities::new()
+                .image(true)
+                .audio(false)
+                .embedded_context(true),
         )
+        .mcp_capabilities(s1::McpCapabilities::new().http(session_mcp).sse(false))
+        .auth(s1::AgentAuthCapabilities::new().logout(s1::LogoutCapabilities::new()))
+        .session_capabilities(session)
+        .meta(out::meta(
+            r#"{"muse":{"capabilities":["computerUse","hooks","plugins","readOutput","sideChat","userShell"]},"jetbrains":{"air":{"version":1,"capabilities":["agentFileChangeReport","nativeSubagentSessions","asyncTasks","recommendedValue"]}}}"#,
+        ));
+    let info = s1::Implementation::new("muse-acp", env!("CARGO_PKG_VERSION")).title("Muse ACP");
+    let response = s1::InitializeResponse::new(ProtocolVersion::V1)
+        .auth_methods(auth_methods_v1())
+        .agent_capabilities(capabilities)
+        .agent_info(info)
+        .meta(out::meta(
+            r#"{"steering":{"supported":true,"idleBehaviors":["promptRequired"]}}"#,
+        ));
+    with_air_subagents(
+        serde_json::to_value(response).expect("an initialize response serializes"),
+        &["agentCapabilities", "sessionCapabilities"],
+    )
+}
+
+/// JetBrains AIR reads native subagent support from a `subagents` member of
+/// the agent's session capabilities, which neither ACP schema defines. It is
+/// added to the SDK's serialized response, as the AIR TypeScript adapters
+/// add it to theirs.
+fn with_air_subagents(mut response: serde_json::Value, path: &[&str]) -> serde_json::Value {
+    let mut target = &mut response;
+    for key in path {
+        target = &mut target[*key];
+    }
+    if let serde_json::Value::Object(session) = target {
+        session.insert("subagents".to_string(), serde_json::json!({}));
+    }
+    response
 }
 
 fn send_initialize(
@@ -1949,11 +2007,12 @@ fn send_initialize(
     session_mcp: bool,
     session_delete: bool,
 ) {
-    if negotiated_ver() == 2 {
-        acp::send_result(stdout, id, &v2_init(session_mcp, session_delete));
+    let response = if negotiated_ver() == 2 {
+        v2_init(session_mcp, session_delete)
     } else {
-        acp::send_result(stdout, id, &v1_init(session_mcp, session_delete));
-    }
+        v1_init(session_mcp, session_delete)
+    };
+    acp::send_value(stdout, id, response);
 }
 
 /// Answer ACP after `muse serve` failed to launch. Only the handshake and
@@ -2303,74 +2362,78 @@ fn auth_method_label() -> (&'static str, &'static str) {
 /// `clientCapabilities.auth.terminal: true`, or ACP v2's
 /// `capabilities.auth.terminal` object. Absent, `null`, or any other shape
 /// advertises nothing.
-fn auth_methods_v1() -> String {
+fn auth_methods_v1() -> Vec<agent_client_protocol::v1::schema::AuthMethod> {
+    use agent_client_protocol::v1::schema as s1;
     let (name, description) = auth_method_label();
     // Clients predating the typed method read the `_meta` terminal-auth
     // convention, which needs an explicit executable.
     let legacy = std::env::current_exe()
         .ok()
         .and_then(|path| path.to_str().map(str::to_string))
-        .map(|exe| {
-            format!(
-                r#","_meta":{{"terminal-auth":{{"label":{},"command":{},"args":["login"]}}}}"#,
-                esc(name),
-                esc(&exe)
+        .and_then(|exe| {
+            out::meta(
+                &serde_json::json!({"terminal-auth": {"label": name, "command": exe, "args": ["login"]}})
+                    .to_string(),
             )
-        })
-        .unwrap_or_default();
+        });
     // The typed terminal method is reserved for clients that advertise
     // terminal auth. Others keep only the legacy description, which is how
     // clients (and the ACP Registry check) that predate the typed method
     // find the login.
-    let typed = if AUTH_TERMINAL.load(Ordering::SeqCst) {
-        r#","type":"terminal","args":["login"]"#
+    let login = if AUTH_TERMINAL.load(Ordering::SeqCst) {
+        s1::AuthMethod::Terminal(
+            s1::AuthMethodTerminal::new(AUTH_METHOD_ID, name)
+                .description(description)
+                .args(vec!["login".to_string()])
+                .meta(legacy),
+        )
     } else {
-        ""
+        s1::AuthMethod::Agent(
+            s1::AuthMethodAgent::new(AUTH_METHOD_ID, name)
+                .description(description)
+                .meta(legacy),
+        )
     };
-    format!(
-        r#"[{{"id":{},"name":{},"description":{}{typed}{legacy}}}{}]"#,
-        esc(AUTH_METHOD_ID),
-        esc(name),
-        esc(description),
-        device_login_method("id")
-    )
+    let mut methods = vec![login];
+    if device_login_offered() {
+        methods.push(s1::AuthMethod::Agent(
+            s1::AuthMethodAgent::new(DEVICE_LOGIN_ID, DEVICE_LOGIN_NAME)
+                .description(DEVICE_LOGIN_DESCRIPTION),
+        ));
+    }
+    methods
 }
 
 /// The device-login method entry (with a leading comma), when the client can
 /// open a URL elicitation and Muse is installed; empty otherwise.
-fn device_login_method(id_key: &str) -> String {
-    if !ELICIT_URL.load(Ordering::SeqCst) || MUSE_NOT_INSTALLED.load(Ordering::SeqCst) {
-        return String::new();
-    }
-    let typed = if id_key == "methodId" {
-        r#","type":"agent""#
-    } else {
-        ""
-    };
-    format!(
-        r#",{{"{id_key}":{},"name":{},"description":{}{typed}}}"#,
-        esc(DEVICE_LOGIN_ID),
-        esc(DEVICE_LOGIN_NAME),
-        esc(DEVICE_LOGIN_DESCRIPTION)
-    )
+/// Whether the device-code login is offered: it needs a client that opens
+/// URL elicitations, and an installed Muse.
+fn device_login_offered() -> bool {
+    ELICIT_URL.load(Ordering::SeqCst) && !MUSE_NOT_INSTALLED.load(Ordering::SeqCst)
 }
 
 /// ACP v2 has no legacy terminal-auth convention, and an agent may advertise
 /// a terminal method only to a client that supports terminal auth. Without
 /// it there is no login the client could start, so none is advertised and
 /// auth-required errors explain `muse login` instead.
-fn auth_methods_v2() -> String {
-    let device = device_login_method("methodId");
-    if !AUTH_TERMINAL.load(Ordering::SeqCst) {
-        return format!("[{}]", device.trim_start_matches(','));
+fn auth_methods_v2() -> Vec<agent_client_protocol::v2::schema::AuthMethod> {
+    use agent_client_protocol::v2::schema as s2;
+    let mut methods = Vec::new();
+    if AUTH_TERMINAL.load(Ordering::SeqCst) {
+        let (name, description) = auth_method_label();
+        methods.push(s2::AuthMethod::Terminal(
+            s2::AuthMethodTerminal::new(AUTH_METHOD_ID, name)
+                .description(description)
+                .args(vec!["login".to_string()]),
+        ));
     }
-    let (name, description) = auth_method_label();
-    format!(
-        r#"[{{"methodId":{},"name":{},"description":{},"type":"terminal","args":["login"]}}{device}]"#,
-        esc(AUTH_METHOD_ID),
-        esc(name),
-        esc(description)
-    )
+    if device_login_offered() {
+        methods.push(s2::AuthMethod::Agent(
+            s2::AuthMethodAgent::new(DEVICE_LOGIN_ID, DEVICE_LOGIN_NAME)
+                .description(DEVICE_LOGIN_DESCRIPTION),
+        ));
+    }
+    methods
 }
 
 /// Validate and assemble ACP's ordered effective workspace root set. `cwd`
@@ -3052,20 +3115,35 @@ fn resolve_fork_cut_point(
 }
 
 fn selftest() -> i32 {
-    // Validate every static emitted literal with our own parser, so a
-    // misplaced brace fails here instead of at a live client.
-    for lit in [
-        v2_init(true, true),
-        v2_init(true, false),
-        v2_init(false, true),
-        v2_init(false, false),
-        v1_init(true, true),
-        v1_init(true, false),
-        v1_init(false, true),
-        v1_init(false, false),
+    // Every initialize response, with the AIR member the adapter adds, must
+    // still read back as its version's schema type.
+    for (v2, session_mcp, session_delete) in [
+        (true, true, true),
+        (true, true, false),
+        (true, false, true),
+        (true, false, false),
+        (false, true, true),
+        (false, true, false),
+        (false, false, true),
+        (false, false, false),
     ] {
-        if let Err(e) = parse_json(&lit) {
-            eprintln!("[muse-acp] selftest FAIL: {e} in {lit}");
+        let (response, parsed) = if v2 {
+            let response = v2_init(session_mcp, session_delete);
+            let parsed = serde_json::from_value::<
+                agent_client_protocol::v2::schema::InitializeResponse,
+            >(response.clone())
+            .map(|_| ());
+            (response, parsed)
+        } else {
+            let response = v1_init(session_mcp, session_delete);
+            let parsed = serde_json::from_value::<
+                agent_client_protocol::v1::schema::InitializeResponse,
+            >(response.clone())
+            .map(|_| ());
+            (response, parsed)
+        };
+        if let Err(e) = parsed {
+            eprintln!("[muse-acp] selftest FAIL: {e} in {response}");
             return 1;
         }
     }
@@ -3889,7 +3967,11 @@ fn adopt_reattached(
 }
 
 /// The session's full selector set as raw `configOptions` JSON.
-fn config_options_json(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) -> Option<String> {
+fn config_options_json(
+    host: &Arc<Hosts>,
+    sessions: &Sessions,
+    acp_sid: &str,
+) -> Option<out::ConfigOptions> {
     let models = catalog(host);
     config_options_with_models(sessions, acp_sid, &models)
 }
@@ -3900,7 +3982,7 @@ fn config_options_with_models(
     sessions: &Sessions,
     acp_sid: &str,
     models: &[acp::CatalogModel],
-) -> Option<String> {
+) -> Option<out::ConfigOptions> {
     let map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     let s = map.get(acp_sid)?;
     Some(acp::config_options(
@@ -3931,10 +4013,25 @@ fn catalog_cached() -> Vec<acp::CatalogModel> {
         .clone()
 }
 
-/// The session's full selector set, as a `session/set_config_option` result.
-fn config_options_result(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) -> Option<String> {
-    config_options_json(host, sessions, acp_sid)
-        .map(|options| format!("{{\"configOptions\":{options}}}"))
+/// Answer `session/set_config_option` with the session's full selector set,
+/// or `None` for an unknown session.
+fn send_config_options_result(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    id: &Option<RequestId>,
+    acp_sid: &str,
+) -> Option<()> {
+    use agent_client_protocol::{v1::schema as s1, v2::schema as s2};
+    match config_options_json(host, sessions, acp_sid)? {
+        out::ConfigOptions::V1(options) => {
+            acp::send_response(stdout, id, s1::SetSessionConfigOptionResponse::new(options))
+        }
+        out::ConfigOptions::V2(options) => {
+            acp::send_response(stdout, id, s2::SetSessionConfigOptionResponse::new(options))
+        }
+    }
+    Some(())
 }
 
 /// Publish the complete selector list after a state change the host just
@@ -3944,7 +4041,7 @@ fn config_options_result(host: &Arc<Hosts>, sessions: &Sessions, acp_sid: &str) 
 fn publish_config_options(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) {
     let models = catalog_cached();
     if let Some(options) = config_options_with_models(sessions, acp_sid, &models) {
-        acp::send_config_options_update(stdout, acp_sid, &options);
+        acp::send_config_options_update(stdout, acp_sid, options);
     }
 }
 
@@ -5317,60 +5414,36 @@ fn handle_acp(
                             )
                         })
                         .unwrap_or((acp::REASONING_DEFAULT.to_string(), true));
-                    let result = if ver == 2 {
-                        format!(
-                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{}}}",
-                            esc(&sid),
-                            esc(&msp_sid),
-                            acp::config_options(
-                                ver,
-                                acp::ConfigOptions {
-                                    session_mode: acp::DEFAULT_MODE,
-                                    approval_mode: acp::mode_from_msp(&cur_mode),
-                                    model: &cur_model,
-                                    reasoning_effort: &reasoning_new,
-                                    offer_muse_default: offer_default_new,
-                                    auto_review: false,
-                                    boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
-                                    recommendations: (
-                                        recommended_model(&models).as_deref(),
-                                        recommended_reasoning_for(&cur_model, None, &models)
-                                            .as_deref(),
-                                    ),
-                                },
-                                &models,
-                            )
-                        )
-                    } else {
-                        format!(
-                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}}},\"configOptions\":{},\"modes\":{}}}",
-                            esc(&sid),
-                            esc(&msp_sid),
-                            acp::config_options(
-                                ver,
-                                acp::ConfigOptions {
-                                    session_mode: acp::DEFAULT_MODE,
-                                    approval_mode: acp::mode_from_msp(&cur_mode),
-                                    model: &cur_model,
-                                    reasoning_effort: &reasoning_new,
-                                    offer_muse_default: offer_default_new,
-                                    auto_review: false,
-                                    boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
-                                    recommendations: (
-                                        recommended_model(&models).as_deref(),
-                                        recommended_reasoning_for(&cur_model, None, &models)
-                                            .as_deref(),
-                                    ),
-                                },
-                                &models,
+                    let options = acp::config_options(
+                        ver,
+                        acp::ConfigOptions {
+                            session_mode: acp::DEFAULT_MODE,
+                            approval_mode: acp::mode_from_msp(&cur_mode),
+                            model: &cur_model,
+                            reasoning_effort: &reasoning_new,
+                            offer_muse_default: offer_default_new,
+                            auto_review: false,
+                            boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
+                            recommendations: (
+                                recommended_model(&models).as_deref(),
+                                recommended_reasoning_for(&cur_model, None, &models).as_deref(),
                             ),
-                            acp::session_modes(acp::DEFAULT_MODE)
-                        )
-                    };
+                        },
+                        &models,
+                    );
+                    let meta = out::meta(&format!("{{\"mspSessionId\":{}}}", esc(&msp_sid)));
                     let skills = skill_catalog(host, &msp_sid);
                     adopt_skill_catalog(sessions, &sid, skills.as_deref());
                     let skills = skills.unwrap_or_default();
-                    acp::send_result(stdout, &id, &result);
+                    acp::send_setup_response(
+                        stdout,
+                        &id,
+                        acp::Setup::New,
+                        &sid,
+                        options,
+                        acp::DEFAULT_MODE,
+                        meta,
+                    );
                     let (status, attention) = sessions
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -5868,54 +5941,27 @@ fn handle_acp(
                     let blocked_prompt = blocked_prompt_meta(&r);
                     // Both versions report current selectors; v1 also keeps the
                     // legacy mode state for clients which predate config options.
-                    let result = if ver == 2 {
-                        format!(
-                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}{blocked_prompt}}},\"configOptions\":{}}}",
-                            esc(&sid),
-                            esc(&msp_out),
-                            acp::config_options(
-                                ver,
-                                acp::ConfigOptions {
-                                    session_mode: &session_mode_v,
-                                    approval_mode: &mode_v,
-                                    model: &model_v,
-                                    reasoning_effort: &reasoning_v,
-                                    offer_muse_default: offer_default_v,
-                                    auto_review: auto_review_v,
-                                    boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
-                                    recommendations: (
-                                        recommended_model(&models).as_deref(),
-                                        recommended_v.as_deref(),
-                                    ),
-                                },
-                                &models,
-                            )
-                        )
-                    } else {
-                        format!(
-                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}{blocked_prompt}}},\"configOptions\":{},\"modes\":{}}}",
-                            esc(&sid),
-                            esc(&msp_out),
-                            acp::config_options(
-                                ver,
-                                acp::ConfigOptions {
-                                    session_mode: &session_mode_v,
-                                    approval_mode: &mode_v,
-                                    model: &model_v,
-                                    reasoning_effort: &reasoning_v,
-                                    offer_muse_default: offer_default_v,
-                                    auto_review: auto_review_v,
-                                    boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
-                                    recommendations: (
-                                        recommended_model(&models).as_deref(),
-                                        recommended_v.as_deref(),
-                                    ),
-                                },
-                                &models,
+                    let options = acp::config_options(
+                        ver,
+                        acp::ConfigOptions {
+                            session_mode: &session_mode_v,
+                            approval_mode: &mode_v,
+                            model: &model_v,
+                            reasoning_effort: &reasoning_v,
+                            offer_muse_default: offer_default_v,
+                            auto_review: auto_review_v,
+                            boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
+                            recommendations: (
+                                recommended_model(&models).as_deref(),
+                                recommended_v.as_deref(),
                             ),
-                            acp::session_modes(&session_mode_v)
-                        )
-                    };
+                        },
+                        &models,
+                    );
+                    let meta = out::meta(&format!(
+                        "{{\"mspSessionId\":{}{blocked_prompt}}}",
+                        esc(&msp_out)
+                    ));
                     let skills = skill_catalog(host, &msp_out);
                     adopt_skill_catalog(sessions, &sid, skills.as_deref());
                     let skills = skills.unwrap_or_default();
@@ -5932,7 +5978,19 @@ fn handle_acp(
                             acp::send_state(stdout, &sid, state, None);
                         }
                     }
-                    acp::send_result(stdout, &id, &result);
+                    acp::send_setup_response(
+                        stdout,
+                        &id,
+                        if method == "session/load" {
+                            acp::Setup::Load
+                        } else {
+                            acp::Setup::Resume
+                        },
+                        &sid,
+                        options,
+                        &session_mode_v,
+                        meta,
+                    );
                     acp::send_available_commands(
                         stdout,
                         &sid,
@@ -6327,58 +6385,39 @@ fn handle_acp(
                             )
                         })
                         .unwrap_or_default();
-                    let result = if ver == 2 {
-                        format!(
-                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}{provenance}}},\"configOptions\":{}}}",
-                            esc(&new_msp),
-                            esc(&new_msp),
-                            acp::config_options(
-                                ver,
-                                acp::ConfigOptions {
-                                    session_mode: &session_mode_out,
-                                    approval_mode: &mode_out,
-                                    model: &model_out,
-                                    reasoning_effort: &reasoning_out,
-                                    offer_muse_default: offer_default_out,
-                                    auto_review: auto_review_out,
-                                    boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
-                                    recommendations: (
-                                        recommended_model(&models).as_deref(),
-                                        recommended_out.as_deref(),
-                                    ),
-                                },
-                                &models,
-                            )
-                        )
-                    } else {
-                        format!(
-                            "{{\"sessionId\":{},\"_meta\":{{\"mspSessionId\":{}{provenance}}},\"configOptions\":{},\"modes\":{}}}",
-                            esc(&new_msp),
-                            esc(&new_msp),
-                            acp::config_options(
-                                ver,
-                                acp::ConfigOptions {
-                                    session_mode: &session_mode_out,
-                                    approval_mode: &mode_out,
-                                    model: &model_out,
-                                    reasoning_effort: &reasoning_out,
-                                    offer_muse_default: offer_default_out,
-                                    auto_review: auto_review_out,
-                                    boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
-                                    recommendations: (
-                                        recommended_model(&models).as_deref(),
-                                        recommended_out.as_deref(),
-                                    ),
-                                },
-                                &models,
+                    let options = acp::config_options(
+                        ver,
+                        acp::ConfigOptions {
+                            session_mode: &session_mode_out,
+                            approval_mode: &mode_out,
+                            model: &model_out,
+                            reasoning_effort: &reasoning_out,
+                            offer_muse_default: offer_default_out,
+                            auto_review: auto_review_out,
+                            boolean_toggles: BOOLEAN_CONFIG.load(Ordering::SeqCst),
+                            recommendations: (
+                                recommended_model(&models).as_deref(),
+                                recommended_out.as_deref(),
                             ),
-                            acp::session_modes(&session_mode_out)
-                        )
-                    };
+                        },
+                        &models,
+                    );
+                    let meta = out::meta(&format!(
+                        "{{\"mspSessionId\":{}{provenance}}}",
+                        esc(&new_msp)
+                    ));
                     if ver == 1 || setup.replay_from.is_some() {
                         send_fold_output(stdout, sessions, &new_msp, replay_lines);
                     }
-                    acp::send_result(stdout, &id, &result);
+                    acp::send_setup_response(
+                        stdout,
+                        &id,
+                        acp::Setup::Fork,
+                        &new_msp,
+                        options,
+                        &session_mode_out,
+                        meta,
+                    );
                     let (status, attention) = sessions
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
@@ -8159,10 +8198,11 @@ fn handle_acp(
                     return;
                 };
                 match switch_session_mode(host, stdout, sessions, &sid, target) {
-                    Ok(()) => match config_options_result(host, sessions, &sid) {
-                        Some(result) => acp::send_result(stdout, &id, &result),
-                        None => acp::send_error(stdout, &id, -32602, "unknown sessionId"),
-                    },
+                    Ok(()) => {
+                        if send_config_options_result(host, stdout, sessions, &id, &sid).is_none() {
+                            acp::send_error(stdout, &id, -32602, "unknown sessionId");
+                        }
+                    }
                     Err(e) => {
                         acp::send_error(stdout, &id, -32603, &format!("mode change failed: {e}"))
                     }
@@ -8328,10 +8368,19 @@ fn handle_acp(
                         ));
                     }
                     match config_options_with_models(sessions, &sid, &models) {
-                        Some(options) => acp::send_result(
+                        Some(out::ConfigOptions::V1(options)) => acp::send_response(
                             stdout,
                             &id,
-                            &format!("{{\"configOptions\":{options}}}"),
+                            agent_client_protocol::v1::schema::SetSessionConfigOptionResponse::new(
+                                options,
+                            ),
+                        ),
+                        Some(out::ConfigOptions::V2(options)) => acp::send_response(
+                            stdout,
+                            &id,
+                            agent_client_protocol::v2::schema::SetSessionConfigOptionResponse::new(
+                                options,
+                            ),
                         ),
                         None => acp::send_error(stdout, &id, -32602, "unknown sessionId"),
                     }
@@ -8492,7 +8541,7 @@ fn handle_acp(
                 // A settings view may still link the old credential.
                 host.refresh_config();
                 acp::send_result(stdout, &id, "{}");
-            } else if method_id == DEVICE_LOGIN_ID && !device_login_method("id").is_empty() {
+            } else if method_id == DEVICE_LOGIN_ID && device_login_offered() {
                 start_device_login(host, stdout, &id);
             } else {
                 acp::send_error(
@@ -8508,7 +8557,7 @@ fn handle_acp(
             // in a terminal and must never pass to auth/login. Login itself
             // stays with the Muse CLI, so credentials never cross ACP.
             let method_id = method_id.as_str();
-            if method_id == DEVICE_LOGIN_ID && !device_login_method("methodId").is_empty() {
+            if method_id == DEVICE_LOGIN_ID && device_login_offered() {
                 start_device_login(host, stdout, &id);
                 return;
             }
@@ -12413,7 +12462,7 @@ fn handle_msp(
                     ));
                 }
                 if let Some(options) = config_options_with_models(sessions, &acp_sid, &models) {
-                    acp::send_config_options_update(stdout, &acp_sid, &options);
+                    acp::send_config_options_update(stdout, &acp_sid, options);
                 }
             }
         }
@@ -17455,7 +17504,7 @@ mod tests {
             v1_init(false, true),
             v1_init(false, false),
         ] {
-            let parsed = parse_json(&payload).expect("initialization payload JSON");
+            let parsed = crate::json::from_value(&payload);
             let version = ["info", "agentInfo"]
                 .iter()
                 .find_map(|key| parsed.get(key))
