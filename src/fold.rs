@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
 
 use crate::json::{J, esc, j_to_string, mint_id, parse_json};
+use crate::out::{self, Card, CardContent, Chunk, Note};
 
 const DEFAULT_MAX_CONTENT: usize = 8000;
 const MIN_MAX_CONTENT: usize = 200;
@@ -193,11 +194,12 @@ pub struct ToolUpdate<'a> {
     pub kind: &'a str,
     pub status: &'a str,
     pub content_text: Option<&'a str>,
+    /// The host's tool arguments, JSON text passed through as `rawInput`.
     pub raw_input: Option<&'a str>,
-    /// ACP `locations` (a JSON array of `{path}`), for follow-along.
-    pub locations: Option<&'a str>,
+    /// ACP `locations`, for follow-along.
+    pub locations: Option<Vec<out::Location>>,
     /// One more tool-call content item after the text, such as a `diff`.
-    pub extra_content: Option<&'a str>,
+    pub extra_content: Option<CardContent>,
     /// Host-authored item references and patch facts for the card's `_meta`.
     pub muse_fields: Option<&'a str>,
     /// The host already saturated this surface (`item.truncated`).
@@ -283,6 +285,8 @@ struct ShellCommand {
 }
 
 pub struct SessionFold {
+    /// The negotiated ACP version the fold's updates are built for.
+    pub ver: u8,
     items: HashMap<String, ItemRole>,
     /// Latest owner-side observation for each durable subagent. Controls use
     /// this index so a child session id can never become an alternate command
@@ -352,11 +356,11 @@ pub struct SessionFold {
     pub workspace_root: String,
     /// ACP v2 `diff` content fetched for a completed tool's stored patch,
     /// keyed by item id and taken once by that item's completion card.
-    pub patch_diffs: HashMap<String, String>,
+    pub patch_diffs: HashMap<String, CardContent>,
     /// ACP `terminal` content an editor tool call (bridge.rs) showed, keyed
     /// by item id and taken once by that item's completion card, which shows
     /// the terminal instead of the output text.
-    pub editor_terminals: HashMap<String, String>,
+    pub editor_terminals: HashMap<String, CardContent>,
     /// Announced, running editor tool calls in start order: item id, card
     /// id, tool, and arguments, so the bridge can find a call's card.
     editor_calls: Vec<(String, String, String, J)>,
@@ -447,6 +451,7 @@ pub struct SubagentObservation {
 impl SessionFold {
     pub fn new() -> Self {
         Self {
+            ver: 1,
             workspace_root: String::new(),
             patch_diffs: HashMap::new(),
             editor_terminals: HashMap::new(),
@@ -691,7 +696,7 @@ impl SessionFold {
     /// work, so it is skipped. An absent mode means background (older hosts
     /// list background rows only), and an unknown mode is ignored as the
     /// schema requires, which leaves the row background too.
-    pub fn seed_async_task(&mut self, acp_sid: &str, row: &J, out: &mut Vec<String>) -> bool {
+    pub fn seed_async_task(&mut self, acp_sid: &str, row: &J, out: &mut Vec<Note>) -> bool {
         if !self.air_async_tasks {
             return false;
         }
@@ -731,7 +736,7 @@ impl SessionFold {
             .insert(task_id.to_string(), task_id.to_string());
         self.announced_tasks.insert(task_id.to_string());
         out.push(Self::async_task_spawned_line(
-            acp_sid, task_id, &name, task_type, None, true, None,
+            acp_sid, self.ver, task_id, &name, task_type, None, true, None,
         ));
         true
     }
@@ -806,29 +811,8 @@ impl SessionFold {
         self.done.contains(item_id)
     }
 
-    fn update_line(acp_sid: &str, update_json: &str) -> String {
-        format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{}}}}}",
-            esc(acp_sid),
-            update_json
-        )
-    }
-
-    fn chunk(acp_sid: &str, ver: u8, msg_id: &str, text: &str) -> String {
-        let content = format!("{{\"type\":\"text\",\"text\":{}}}", esc(text));
-        let update = if ver == 2 {
-            format!(
-                "{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{}}}",
-                esc(msg_id),
-                content
-            )
-        } else {
-            format!(
-                "{{\"sessionUpdate\":\"agent_message_chunk\",\"content\":{}}}",
-                content
-            )
-        };
-        Self::update_line(acp_sid, &update)
+    fn chunk(acp_sid: &str, ver: u8, msg_id: &str, text: &str) -> Note {
+        out::chunk(acp_sid, ver, Chunk::Agent, msg_id, text, None)
     }
 
     /// `Item.cutOff`: the provider stream died mid-reply and the run failed
@@ -856,9 +840,8 @@ impl SessionFold {
 
     /// The `_meta.muse` member marking a completed agent reply: its message
     /// phase, plus the cut-off mark when the host committed a partial reply.
-    /// Ready to append to an update object. `None` on both sides means the
-    /// update carries no mark at all.
-    fn message_meta(phase: Option<&str>, cut_off: Option<&str>, item: &J) -> Option<String> {
+    /// `None` on both sides means the update carries no mark at all.
+    fn message_meta(phase: Option<&str>, cut_off: Option<&str>, item: &J) -> Option<out::Meta> {
         let mut fields = String::new();
         if let Some(phase) = phase {
             fields.push_str(&format!("\"messagePhase\":{}", esc(phase)));
@@ -881,19 +864,15 @@ impl SessionFold {
                 j_to_string(sources)
             ));
         }
-        (!fields.is_empty()).then(|| format!(",\"_meta\":{{\"muse\":{{{fields}}}}}"))
+        out::muse_meta(&fields)
     }
 
     /// An agent-message chunk carrying the completed reply's `_meta.muse`
     /// mark, so an editor can tell commentary from the final answer (and a
     /// truncated reply from a complete one). `text` is whatever the
     /// completion still has to show; empty when the deltas carried it.
-    fn marked_chunk(acp_sid: &str, ver: u8, msg_id: &str, text: &str, meta: &str) -> String {
-        let mut line = Self::chunk(acp_sid, ver, msg_id, text);
-        // The chunk is the update object followed by the two closing braces
-        // of `params` and the envelope.
-        line.insert_str(line.len() - 3, meta);
-        line
+    fn marked_chunk(acp_sid: &str, ver: u8, msg_id: &str, text: &str, meta: out::Meta) -> Note {
+        out::chunk(acp_sid, ver, Chunk::Agent, msg_id, text, Some(meta))
     }
 
     /// Claim the one-time mark for a cut-off reply about to be shown.
@@ -905,7 +884,7 @@ impl SessionFold {
     /// no text shown yet gets the mark with the text that shows it. A settled
     /// reply can only be the latest one; on ACP v1, whose chunks attach by
     /// position, only while no newer message is streaming.
-    fn mark_cut_off(&mut self, acp_sid: &str, ver: u8, item: &J, out: &mut Vec<String>) {
+    fn mark_cut_off(&mut self, acp_sid: &str, ver: u8, item: &J, out: &mut Vec<Note>) {
         let Some(item_id) = item.get("itemId").and_then(|v| v.as_str()) else {
             return;
         };
@@ -929,7 +908,7 @@ impl SessionFold {
         // the completion's later declaration.
         let meta = Self::message_meta(None, Some(item_id), item)
             .expect("a cut-off mark always carries its cut-off");
-        out.push(Self::marked_chunk(acp_sid, ver, &msg_id, "", &meta));
+        out.push(Self::marked_chunk(acp_sid, ver, &msg_id, "", meta));
     }
 
     fn message_streaming(&self) -> bool {
@@ -938,21 +917,8 @@ impl SessionFold {
             .any(|role| matches!(role, ItemRole::Message { streamed, .. } if *streamed > 0))
     }
 
-    fn thought_chunk(acp_sid: &str, ver: u8, msg_id: &str, text: &str) -> String {
-        let content = format!("{{\"type\":\"text\",\"text\":{}}}", esc(text));
-        let update = if ver == 2 {
-            format!(
-                "{{\"sessionUpdate\":\"agent_thought_chunk\",\"messageId\":{},\"content\":{}}}",
-                esc(msg_id),
-                content
-            )
-        } else {
-            format!(
-                "{{\"sessionUpdate\":\"agent_thought_chunk\",\"content\":{}}}",
-                content
-            )
-        };
-        Self::update_line(acp_sid, &update)
+    fn thought_chunk(acp_sid: &str, ver: u8, msg_id: &str, text: &str) -> Note {
+        out::chunk(acp_sid, ver, Chunk::Thought, msg_id, text, None)
     }
 
     /// A synthetic tool card for host-side work that is not a model tool
@@ -971,26 +937,15 @@ impl SessionFold {
         content_text: Option<&str>,
         muse_fields: Option<&str>,
         host_truncated: bool,
-    ) -> String {
-        let session_update = if ver == 2 || !create {
-            "tool_call_update"
-        } else {
-            "tool_call"
-        };
-        let mut f = vec![
-            format!("\"sessionUpdate\":\"{session_update}\""),
-            format!("\"toolCallId\":{}", esc(tc_id)),
-            format!("\"title\":{}", esc(&crate::acp::visible_title(title))),
-            format!("\"kind\":\"{kind}\""),
-            format!("\"status\":{}", esc(status)),
-        ];
+    ) -> Note {
+        let mut card = Card::new(tc_id);
+        card.title = Some(crate::acp::visible_title(title));
+        card.kind = Some(kind.to_string());
+        card.status = Some(status.to_string());
         let mut fields = muse_fields.unwrap_or_default().to_string();
         if let Some(t) = content_text {
             let (text, adapter_cut) = trunc(t);
-            f.push(format!(
-                "\"content\":[{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]",
-                esc(&text)
-            ));
+            card.content = Some(vec![CardContent::Text(text)]);
             if let Some(cut) = adapter_cut.filter(|_| !host_truncated) {
                 if !fields.is_empty() {
                     fields.push(',');
@@ -1004,10 +959,8 @@ impl SessionFold {
             }
             fields.push_str("\"truncated\":{\"source\":\"host\"}");
         }
-        if !fields.is_empty() {
-            f.push(format!("\"_meta\":{{\"muse\":{{{fields}}}}}"));
-        }
-        Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
+        card.meta = out::muse_meta(&fields);
+        card.note(acp_sid, ver, create)
     }
 
     /// Preserve stable host references beside the bounded editor surface.
@@ -1113,25 +1066,21 @@ impl SessionFold {
         fields.join(",")
     }
 
-    fn standard_compaction_line(acp_sid: &str, item_id: &str, item: &J) -> String {
-        let mut fields = vec![
-            "\"sessionUpdate\":\"compaction_update\"".to_string(),
-            format!("\"compactionId\":{}", esc(item_id)),
-            format!("\"status\":\"{}\"", Self::compaction_status(item)),
-        ];
-        if Self::compaction_status(item) == "failed"
-            && let Some(reason) = item
-                .get("reason")
-                .and_then(J::as_str)
-                .filter(|reason| !reason.is_empty())
-        {
-            fields.push(format!("\"error\":{}", esc(reason)));
-        }
-        fields.push(format!(
-            "\"_meta\":{{\"muse\":{{\"contextCompaction\":{{{}}}}}}}",
+    fn standard_compaction_line(acp_sid: &str, ver: u8, item_id: &str, item: &J) -> Note {
+        let status = Self::compaction_status(item);
+        let error = (status == "failed")
+            .then(|| {
+                item.get("reason")
+                    .and_then(J::as_str)
+                    .filter(|reason| !reason.is_empty())
+                    .map(str::to_string)
+            })
+            .flatten();
+        let meta = out::muse_meta(&format!(
+            "\"contextCompaction\":{{{}}}",
             Self::compaction_meta(item)
         ));
-        Self::update_line(acp_sid, &format!("{{{}}}", fields.join(",")))
+        out::compaction(acp_sid, ver, item_id, status, error, meta)
     }
 
     /// Older ACP v1 clients did not negotiate standard compaction. Present the
@@ -1142,27 +1091,14 @@ impl SessionFold {
         item_id: &str,
         status: &str,
         content_text: Option<&str>,
-    ) -> String {
-        let session_update = if ver == 2 || status != "in_progress" {
-            "tool_call_update"
-        } else {
-            "tool_call"
-        };
-        let mut f = vec![
-            format!("\"sessionUpdate\":\"{session_update}\""),
-            format!("\"toolCallId\":{}", esc(&format!("compact-{item_id}"))),
-            "\"title\":\"Compact conversation\"".to_string(),
-            "\"kind\":\"think\"".to_string(),
-            format!("\"status\":{}", esc(status)),
-        ];
-        if let Some(t) = content_text {
-            f.push(format!(
-                "\"content\":[{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}]",
-                esc(t)
-            ));
-        }
-        f.push("\"_meta\":{\"contextCompaction\":{\"version\":1}}".to_string());
-        Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
+    ) -> Note {
+        let mut card = Card::new(&format!("compact-{item_id}"));
+        card.title = Some("Compact conversation".to_string());
+        card.kind = Some("think".to_string());
+        card.status = Some(status.to_string());
+        card.content = content_text.map(|t| vec![CardContent::Text(t.to_string())]);
+        card.meta = out::meta("{\"contextCompaction\":{\"version\":1}}");
+        card.note(acp_sid, ver, status == "in_progress")
     }
 
     fn compaction_content(item: &J) -> Option<String> {
@@ -1685,66 +1621,68 @@ impl SessionFold {
     /// Draft ACP subagent extension: announce a child session on the parent.
     fn subagent_spawned_line(
         acp_sid: &str,
+        ver: u8,
         subagent_session_id: &str,
         name: &str,
         task: &str,
         muse_fields: Option<&str>,
-    ) -> String {
-        let mut update = format!(
-            "{{\"sessionUpdate\":\"subagent_spawned\",\"subagentSessionId\":{},\"name\":{},\"task\":{},\"capabilities\":{{}}",
-            esc(subagent_session_id),
-            esc(name),
-            esc(task)
-        );
-        if let Some(fields) = muse_fields {
-            update.push_str(&format!(",\"_meta\":{{\"muse\":{{{fields}}}}}"));
+    ) -> Note {
+        let mut update = serde_json::json!({
+            "sessionUpdate": "subagent_spawned",
+            "subagentSessionId": subagent_session_id,
+            "name": name,
+            "task": task,
+            "capabilities": {},
+        });
+        if let Some(meta) = muse_fields.and_then(out::muse_meta) {
+            update["_meta"] = serde_json::Value::Object(meta);
         }
-        update.push('}');
-        Self::update_line(acp_sid, &update)
+        out::air(acp_sid, ver, update)
     }
 
     /// Draft ACP subagent extension: terminal state on the parent. MSP's
     /// generic item status is the terminal authority; recovery-pending
     /// control states map to `disconnected` rather than a guess.
-    fn subagent_state_line(acp_sid: &str, subagent_session_id: &str, state: &str) -> String {
-        Self::update_line(
+    fn subagent_state_line(acp_sid: &str, ver: u8, subagent_session_id: &str, state: &str) -> Note {
+        out::air(
             acp_sid,
-            &format!(
-                "{{\"sessionUpdate\":\"subagent_state_update\",\"subagentSessionId\":{},\"state\":\"{state}\"}}",
-                esc(subagent_session_id)
-            ),
+            ver,
+            serde_json::json!({
+                "sessionUpdate": "subagent_state_update",
+                "subagentSessionId": subagent_session_id,
+                "state": state,
+            }),
         )
     }
 
     /// AIR async-task extension. MSP 1.3.0 accepts task control commands; the
     /// terminal outcome still arrives through the item view.
+    #[allow(clippy::too_many_arguments)]
     fn async_task_spawned_line(
         acp_sid: &str,
+        ver: u8,
         task_id: &str,
         name: &str,
         task_type: &str,
         work_id: Option<&str>,
         can_stop: bool,
         tool_call_id: Option<&str>,
-    ) -> String {
-        let mut update = format!(
-            "{{\"sessionUpdate\":\"async_task_spawned\",\"asyncTaskId\":{},\"name\":{},\"taskType\":{},\"showInTranscript\":false,\"canStop\":{}",
-            esc(task_id),
-            esc(name),
-            esc(task_type),
-            can_stop
-        );
+    ) -> Note {
+        let mut update = serde_json::json!({
+            "sessionUpdate": "async_task_spawned",
+            "asyncTaskId": task_id,
+            "name": name,
+            "taskType": task_type,
+            "showInTranscript": false,
+            "canStop": can_stop,
+        });
         if let Some(tc) = tool_call_id {
-            update.push_str(&format!(",\"toolCallId\":{}", esc(tc)));
+            update["toolCallId"] = tc.into();
         }
         if let Some(work_id) = work_id {
-            update.push_str(&format!(
-                ",\"_meta\":{{\"muse\":{{\"workId\":{}}}}}",
-                esc(work_id)
-            ));
+            update["_meta"] = serde_json::json!({"muse": {"workId": work_id}});
         }
-        update.push('}');
-        Self::update_line(acp_sid, &update)
+        out::air(acp_sid, ver, update)
     }
 
     /// A Muse 1.4.12 `backgroundTerminalCompletion` names the backgrounded
@@ -1763,7 +1701,7 @@ impl SessionFold {
         acp_sid: &str,
         kind: &str,
         item: &J,
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
     ) {
         if kind != "backgroundTerminalCompletion" || !self.air_async_tasks {
             return;
@@ -1808,7 +1746,7 @@ impl SessionFold {
         acp_sid: &str,
         task_id: &str,
         state: &str,
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
     ) {
         self.workflow_tasks.remove(task_id);
         if self
@@ -1820,13 +1758,15 @@ impl SessionFold {
         }
         self.async_task_states
             .insert(task_id.to_string(), state.to_string());
-        out.push(Self::async_task_state_line(acp_sid, task_id, state));
+        out.push(Self::async_task_state_line(
+            acp_sid, self.ver, task_id, state,
+        ));
     }
 
     /// A permanent transport loss cannot establish a host terminal outcome.
     /// Retire the editor's running indicator with explicit unknown-outcome
     /// metadata; durable restart reconciliation happens before this fallback.
-    pub fn disconnect_tasks(&mut self, acp_sid: &str) -> Vec<String> {
+    pub fn disconnect_tasks(&mut self, acp_sid: &str, ver: u8) -> Vec<Note> {
         let mut out = Vec::new();
         for task in self.announced_tasks.clone() {
             if self.async_task_states.contains_key(&task) {
@@ -1834,20 +1774,29 @@ impl SessionFold {
             }
             self.async_task_states
                 .insert(task.clone(), "failed".to_string());
-            out.push(Self::update_line(acp_sid, &format!(
-                "{{\"sessionUpdate\":\"async_task_state_update\",\"asyncTaskId\":{},\"state\":\"failed\",\"_meta\":{{\"muse\":{{\"terminalUnknown\":true,\"reason\":\"connection closed\"}}}}}}", esc(&task)
-            )));
+            out.push(out::air(
+                acp_sid,
+                ver,
+                serde_json::json!({
+                    "sessionUpdate": "async_task_state_update",
+                    "asyncTaskId": task,
+                    "state": "failed",
+                    "_meta": {"muse": {"terminalUnknown": true, "reason": "connection closed"}},
+                }),
+            ));
         }
         out
     }
 
-    fn async_task_state_line(acp_sid: &str, task_id: &str, state: &str) -> String {
-        Self::update_line(
+    fn async_task_state_line(acp_sid: &str, ver: u8, task_id: &str, state: &str) -> Note {
+        out::air(
             acp_sid,
-            &format!(
-                "{{\"sessionUpdate\":\"async_task_state_update\",\"asyncTaskId\":{},\"state\":\"{state}\"}}",
-                esc(task_id)
-            ),
+            ver,
+            serde_json::json!({
+                "sessionUpdate": "async_task_state_update",
+                "asyncTaskId": task_id,
+                "state": state,
+            }),
         )
     }
 
@@ -1860,7 +1809,7 @@ impl SessionFold {
         name: &str,
         work_id: Option<&str>,
         tool_call_id: Option<&str>,
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
     ) {
         self.async_task_msp_ids
             .entry(task_id.to_string())
@@ -1868,6 +1817,7 @@ impl SessionFold {
         if self.announced_tasks.insert(task_id.to_string()) {
             out.push(Self::async_task_spawned_line(
                 acp_sid,
+                self.ver,
                 task_id,
                 name,
                 "shell",
@@ -1883,7 +1833,7 @@ impl SessionFold {
         acp_sid: &str,
         task_id: &str,
         item: &J,
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
     ) {
         let Some(state) = Self::async_task_state(item) else {
             return;
@@ -1898,24 +1848,17 @@ impl SessionFold {
         }
         self.async_task_states
             .insert(task_id.to_string(), state.to_string());
-        out.push(Self::async_task_state_line(acp_sid, task_id, state));
+        out.push(Self::async_task_state_line(
+            acp_sid, self.ver, task_id, state,
+        ));
     }
 
     /// AIR marks the owning command card as backgrounded so its output stays
     /// live without duplicating the transcript.
-    fn backgrounded_tool_line(acp_sid: &str, ver: u8, tc_id: &str) -> String {
-        let session_update = if ver == 2 {
-            "tool_call_update"
-        } else {
-            "tool_call"
-        };
-        Self::update_line(
-            acp_sid,
-            &format!(
-                "{{\"sessionUpdate\":\"{session_update}\",\"toolCallId\":{},\"_meta\":{{\"jetbrains\":{{\"air\":{{\"asyncTasks\":{{\"backgrounded\":true}}}}}}}}}}",
-                esc(tc_id)
-            ),
-        )
+    fn backgrounded_tool_line(acp_sid: &str, ver: u8, tc_id: &str) -> Note {
+        let mut card = Card::new(tc_id);
+        card.meta = out::meta("{\"jetbrains\":{\"air\":{\"asyncTasks\":{\"backgrounded\":true}}}}");
+        card.note(acp_sid, ver, false)
     }
 
     fn async_task_state(item: &J) -> Option<&'static str> {
@@ -1960,7 +1903,7 @@ impl SessionFold {
     }
 
     /// Send the child's state when it changed since the last one sent.
-    fn settle_subagent(&mut self, acp_sid: &str, child: &str, item: &J, out: &mut Vec<String>) {
+    fn settle_subagent(&mut self, acp_sid: &str, child: &str, item: &J, out: &mut Vec<Note>) {
         let Some(state) = Self::subagent_state(item) else {
             return;
         };
@@ -1968,7 +1911,7 @@ impl SessionFold {
             return;
         }
         self.subagent_states.insert(child.to_string(), state);
-        out.push(Self::subagent_state_line(acp_sid, child, state));
+        out.push(Self::subagent_state_line(acp_sid, self.ver, child, state));
     }
 
     /// Stable synthetic toolCall id + first-announcement flag for host cards.
@@ -2054,7 +1997,7 @@ impl SessionFold {
         item: &J,
         status: &str,
         settle: bool,
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
     ) {
         let (title, content, meta) = self.host_card_parts("reminderChild", item);
         let announced_card = matches!(self.items.get(item_id), Some(ItemRole::Tool { .. }));
@@ -2109,16 +2052,19 @@ impl SessionFold {
         ver: u8,
         turn_id: &str,
         agents: &[&str],
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
     ) {
         self.settle_background_checks(acp_sid, None, "completed", false, out);
         let agents_json = agents.iter().map(|a| esc(a)).collect::<Vec<_>>().join(",");
-        out.push(Self::update_line(
+        out.push(out::session_info(
             acp_sid,
-            &format!(
-                "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"muse\":{{\"foregroundCompleted\":{{\"turnId\":{},\"blockingAgents\":[{agents_json}]}}}}}}}}",
+            ver,
+            out::Title::Keep,
+            None,
+            out::muse_meta(&format!(
+                "\"foregroundCompleted\":{{\"turnId\":{},\"blockingAgents\":[{agents_json}]}}",
                 esc(turn_id)
-            ),
+            )),
         ));
         if self.show_reminders {
             self.background_checks = Some((turn_id.to_string(), String::new()));
@@ -2157,7 +2103,7 @@ impl SessionFold {
         turn: Option<&str>,
         status: &str,
         clear: bool,
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
     ) {
         if turn.is_some_and(|t| {
             self.background_checks
@@ -2170,19 +2116,17 @@ impl SessionFold {
             return;
         };
         if !tc_id.is_empty() {
-            out.push(Self::update_line(
-                acp_sid,
-                &format!(
-                    "{{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":{},\"status\":{}}}",
-                    esc(&tc_id),
-                    esc(status)
-                ),
-            ));
+            let mut card = Card::new(&tc_id);
+            card.status = Some(status.to_string());
+            out.push(card.note(acp_sid, self.ver, false));
         }
         if clear {
-            out.push(Self::update_line(
+            out.push(out::session_info(
                 acp_sid,
-                "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"muse\":{\"foregroundCompleted\":null}}}",
+                self.ver,
+                out::Title::Keep,
+                None,
+                out::meta("{\"muse\":{\"foregroundCompleted\":null}}"),
             ));
         }
     }
@@ -2200,7 +2144,7 @@ impl SessionFold {
         acp_sid: &str,
         turn_id: &str,
         params: &J,
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
     ) {
         let mut fields = vec![format!("\"turnId\":{}", esc(turn_id))];
         for key in ["attempt", "nextAttempt", "maxAttempts", "retryDelayMs"] {
@@ -2216,56 +2160,44 @@ impl SessionFold {
         if let Some(status) = params.get("httpStatus").and_then(J::as_u64) {
             fields.push(format!("\"httpStatus\":{status}"));
         }
-        out.push(Self::update_line(
+        out.push(out::session_info(
             acp_sid,
-            &format!(
-                "{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"muse\":{{\"modelRetry\":{{{}}}}}}}}}",
-                fields.join(",")
-            ),
+            self.ver,
+            out::Title::Keep,
+            None,
+            out::muse_meta(&format!("\"modelRetry\":{{{}}}", fields.join(","))),
         ));
         self.model_retry = Some(turn_id.to_string());
     }
 
     /// Withdraw the `_meta.muse.modelRetry` hint at a turn's terminal. `turn`
     /// limits this to that turn; `None` clears whatever is showing.
-    pub fn clear_model_retry(&mut self, acp_sid: &str, turn: Option<&str>, out: &mut Vec<String>) {
+    pub fn clear_model_retry(&mut self, acp_sid: &str, turn: Option<&str>, out: &mut Vec<Note>) {
         if turn.is_some_and(|t| self.model_retry.as_deref().is_some_and(|open| open != t)) {
             return;
         }
         if self.model_retry.take().is_some() {
-            out.push(Self::update_line(
+            out.push(out::session_info(
                 acp_sid,
-                "{\"sessionUpdate\":\"session_info_update\",\"_meta\":{\"muse\":{\"modelRetry\":null}}}",
+                self.ver,
+                out::Title::Keep,
+                None,
+                out::meta("{\"muse\":{\"modelRetry\":null}}"),
             ));
         }
     }
 
-    fn tool_line(acp_sid: &str, ver: u8, u: &ToolUpdate<'_>) -> String {
-        let session_update = if ver == 2 || !u.create {
-            "tool_call_update"
-        } else {
-            "tool_call"
-        };
-        let mut f = vec![
-            format!("\"sessionUpdate\":\"{session_update}\""),
-            format!("\"toolCallId\":{}", esc(u.tc_id)),
-        ];
-        if let Some(name) = u.name.filter(|name| !name.is_empty()) {
-            f.push(format!("\"name\":{}", esc(name)));
-        }
-        f.extend([
-            format!("\"title\":{}", esc(&crate::acp::visible_title(u.title))),
-            format!("\"kind\":\"{}\"", u.kind),
-            format!("\"status\":{}", esc(u.status)),
-        ]);
+    fn tool_line(acp_sid: &str, ver: u8, u: ToolUpdate<'_>) -> Note {
+        let mut card = Card::new(u.tc_id);
+        card.name = u.name.filter(|name| !name.is_empty()).map(str::to_string);
+        card.title = Some(crate::acp::visible_title(u.title));
+        card.kind = Some(u.kind.to_string());
+        card.status = Some(u.status.to_string());
         let mut muse_fields = u.muse_fields.unwrap_or_default().to_string();
         let mut content = Vec::new();
         if let Some(t) = u.content_text {
             let (text, adapter_cut) = trunc(t);
-            content.push(format!(
-                "{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}",
-                esc(&text)
-            ));
+            content.push(CardContent::Text(text));
             let truncation = if u.host_truncated {
                 Some("\"source\":\"host\"".to_string())
             } else {
@@ -2278,20 +2210,14 @@ impl SessionFold {
                 muse_fields.push_str(&format!("\"truncated\":{{{cut}}}"));
             }
         }
-        content.extend(u.extra_content.map(str::to_string));
+        content.extend(u.extra_content);
         if !content.is_empty() {
-            f.push(format!("\"content\":[{}]", content.join(",")));
+            card.content = Some(content);
         }
-        if let Some(r) = u.raw_input {
-            f.push(format!("\"rawInput\":{r}"));
-        }
-        if let Some(locations) = u.locations {
-            f.push(format!("\"locations\":{locations}"));
-        }
-        if !muse_fields.is_empty() {
-            f.push(format!("\"_meta\":{{\"muse\":{{{muse_fields}}}}}"));
-        }
-        Self::update_line(acp_sid, &format!("{{{}}}", f.join(",")))
+        card.raw_input = u.raw_input.map(out::json);
+        card.locations = u.locations;
+        card.meta = out::muse_meta(&muse_fields);
+        card.note(acp_sid, ver, u.create)
     }
 
     /// The command (and an explicit working directory, resolved absolute)
@@ -2348,44 +2274,25 @@ impl SessionFold {
         &mut self,
         acp_sid: &str,
         item_id: &str,
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
     ) -> Option<String> {
         if let Some((terminal_id, _)) = self.terminals.get(item_id) {
             return Some(terminal_id.clone());
         }
         let shell = self.shell_commands.get(item_id)?;
         let terminal_id = format!("term-{item_id}");
-        let cwd = shell
-            .cwd
-            .as_deref()
-            .map(|cwd| format!(",\"cwd\":{}", esc(cwd)))
-            .unwrap_or_default();
-        out.push(Self::update_line(
+        out.push(out::terminal_opened(
             acp_sid,
-            &format!(
-                "{{\"sessionUpdate\":\"terminal_update\",\"terminalId\":{},\"command\":{}{cwd}}}",
-                esc(&terminal_id),
-                esc(&shell.command)
-            ),
+            &terminal_id,
+            &shell.command,
+            shell.cwd.as_deref(),
         ));
-        out.push(Self::update_line(
-            acp_sid,
-            &format!(
-                "{{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":{},\"content\":[{}]}}",
-                esc(&shell.tc_id),
-                Self::terminal_content(&terminal_id)
-            ),
-        ));
+        let mut card = Card::new(&shell.tc_id);
+        card.content = Some(vec![CardContent::Terminal(terminal_id.clone())]);
+        out.push(card.note(acp_sid, 2, false));
         self.terminals
             .insert(item_id.to_string(), (terminal_id.clone(), 0));
         Some(terminal_id)
-    }
-
-    fn terminal_content(terminal_id: &str) -> String {
-        format!(
-            "{{\"type\":\"terminal\",\"terminalId\":{}}}",
-            esc(terminal_id)
-        )
     }
 
     /// Settle a shell card's terminal at the item's terminal state, opening
@@ -2402,8 +2309,8 @@ impl SessionFold {
         item_id: &str,
         item: &J,
         status: &str,
-        out: &mut Vec<String>,
-    ) -> Option<String> {
+        out: &mut Vec<Note>,
+    ) -> Option<CardContent> {
         let output = item.get("visibleOutput").and_then(J::as_str).unwrap_or("");
         let ran = self.terminals.contains_key(item_id)
             || status == "completed"
@@ -2424,28 +2331,24 @@ impl SessionFold {
         } else {
             adapter_cut
         };
-        let mut exit = Vec::new();
-        if let Some(code) = item.get("exitCode").and_then(J::as_u64) {
-            exit.push(format!("\"exitCode\":{code}"));
-        }
-        if let Some(signal) = item.get("exitSignal").and_then(J::as_u64) {
-            exit.push(format!(
-                "\"_meta\":{{\"muse\":{{\"exitSignal\":{signal}}}}}"
-            ));
-        }
-        let meta = truncation
-            .map(|cut| format!(",\"_meta\":{{\"muse\":{{\"truncated\":{{{cut}}}}}}}"))
-            .unwrap_or_default();
-        out.push(Self::update_line(
+        let exit_code = item
+            .get("exitCode")
+            .and_then(J::as_u64)
+            .and_then(|code| i64::try_from(code).ok());
+        let exit_meta = item
+            .get("exitSignal")
+            .and_then(J::as_u64)
+            .and_then(|signal| out::muse_meta(&format!("\"exitSignal\":{signal}")));
+        let meta = truncation.and_then(|cut| out::muse_meta(&format!("\"truncated\":{{{cut}}}")));
+        out.push(out::terminal_exited(
             acp_sid,
-            &format!(
-                "{{\"sessionUpdate\":\"terminal_update\",\"terminalId\":{},\"output\":{{\"data\":{}}},\"exitStatus\":{{{}}}{meta}}}",
-                esc(&terminal_id),
-                esc(&crate::json::b64(shown.as_bytes())),
-                exit.join(",")
-            ),
+            &terminal_id,
+            crate::json::b64(shown.as_bytes()),
+            exit_code,
+            exit_meta,
+            meta,
         ));
-        Some(Self::terminal_content(&terminal_id))
+        Some(CardContent::Terminal(terminal_id))
     }
 
     /// ACP `locations` for a native file tool, from its explicit path
@@ -2455,7 +2358,7 @@ impl SessionFold {
     /// search, MCP, and unknown tools get no location, because a path in a
     /// command line or in tool output is a guess. Relative paths resolve
     /// against the workspace root; `..` is resolved lexically.
-    fn tool_locations(&self, item: &J) -> Option<String> {
+    fn tool_locations(&self, item: &J) -> Option<Vec<out::Location>> {
         let tool = item.get("tool").and_then(J::as_str)?.to_ascii_lowercase();
         let keys: &[&str] = match tool.as_str() {
             "read_file" | "write_file" | "edit_file" | "create_file" | "delete_file"
@@ -2493,11 +2396,12 @@ impl SessionFold {
         if paths.is_empty() {
             return None;
         }
-        let entries: Vec<String> = paths
-            .iter()
-            .map(|path| format!("{{\"path\":{}}}", esc(path)))
-            .collect();
-        Some(format!("[{}]", entries.join(",")))
+        Some(
+            paths
+                .into_iter()
+                .map(|path| out::Location { path, line: None })
+                .collect(),
+        )
     }
 
     fn args_detail(item: &J) -> Option<String> {
@@ -2628,35 +2532,20 @@ impl SessionFold {
         cut_off: Option<&str>,
         phase: Option<&str>,
         item: &J,
-    ) -> String {
-        let content = format!("[{{\"type\":\"text\",\"text\":{}}}]", esc(text));
-        let mut update = match (kind, ver) {
-            ("userMessage", 2) => format!(
-                "{{\"sessionUpdate\":\"user_message\",\"messageId\":{},\"content\":{}}}",
-                esc(msg_id),
-                content
-            ),
-            ("agentMessage", 2) => format!(
-                "{{\"sessionUpdate\":\"agent_message\",\"messageId\":{},\"content\":{}}}",
-                esc(msg_id),
-                content
-            ),
-            ("userMessage", _) => format!(
-                "{{\"sessionUpdate\":\"user_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}",
-                esc(msg_id),
-                esc(text)
-            ),
-            ("agentMessage", _) => format!(
-                "{{\"sessionUpdate\":\"agent_message_chunk\",\"messageId\":{},\"content\":{{\"type\":\"text\",\"text\":{}}}}}",
-                esc(msg_id),
-                esc(text)
-            ),
+    ) -> Note {
+        let user = match kind {
+            "userMessage" => true,
+            "agentMessage" => false,
             _ => unreachable!("replay_message_line called for {kind}"),
         };
-        if let Some(meta) = Self::message_meta(phase, cut_off, item) {
-            update.insert_str(update.len() - 1, &meta);
-        }
-        Self::update_line(acp_sid, &update)
+        out::message(
+            acp_sid,
+            ver,
+            user,
+            msg_id,
+            text,
+            Self::message_meta(phase, cut_off, item),
+        )
     }
 
     fn replay_is_in_flight(item: &J) -> bool {
@@ -2689,7 +2578,7 @@ impl SessionFold {
         acp_sid: &str,
         ver: u8,
         items: &[J],
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
     ) {
         // Restore rather than clear: a nested batch (a drill-down inside a
         // replay) must not switch live side effects back on for the rest of
@@ -2735,7 +2624,7 @@ impl SessionFold {
     /// into a settled item. Snapshot items are the latest state at the
     /// history cursor, so the live stream may still deliver their deltas and
     /// terminal completion after attach.
-    pub fn replay_item(&mut self, acp_sid: &str, ver: u8, item: &J, out: &mut Vec<String>) {
+    pub fn replay_item(&mut self, acp_sid: &str, ver: u8, item: &J, out: &mut Vec<Note>) {
         let item_id = match item.get("itemId").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => return,
@@ -2854,7 +2743,7 @@ impl SessionFold {
         item_id: &str,
         item: &J,
         status: &str,
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
     ) {
         let (title, content, meta) = self.host_card_parts("monitorFeed", item);
         let muse_fields =
@@ -2980,7 +2869,7 @@ impl SessionFold {
         acp_sid: &str,
         method: &str,
         params: &J,
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
     ) {
         let Some(item_id) = params.get("itemId").and_then(J::as_str) else {
             return;
@@ -3020,17 +2909,13 @@ impl SessionFold {
         ) else {
             return;
         };
-        out.push(Self::update_line(
-            acp_sid,
-            &format!(
-                "{{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":{},\"_meta\":{{\"muse\":{{{fields}}}}}}}",
-                esc(&tc_id)
-            ),
-        ));
+        let mut card = Card::new(&tc_id);
+        card.meta = out::muse_meta(&fields);
+        out.push(card.note(acp_sid, self.ver, false));
     }
 
     /// item/started and item/updated share snapshotting.
-    pub fn on_item_snapshot(&mut self, acp_sid: &str, ver: u8, item: &J, out: &mut Vec<String>) {
+    pub fn on_item_snapshot(&mut self, acp_sid: &str, ver: u8, item: &J, out: &mut Vec<Note>) {
         let item_id = match item.get("itemId").and_then(|v| v.as_str()) {
             Some(s) => s.to_string(),
             None => return,
@@ -3080,7 +2965,7 @@ impl SessionFold {
                 out.push(Self::tool_line(
                     acp_sid,
                     ver,
-                    &ToolUpdate {
+                    ToolUpdate {
                         create: !announced,
                         tc_id: &tc_id,
                         name: item
@@ -3092,7 +2977,7 @@ impl SessionFold {
                         status: Self::tool_status(item, status),
                         content_text: None,
                         raw_input: Some(&raw),
-                        locations: locations.as_deref(),
+                        locations: locations.clone(),
                         extra_content: None,
                         muse_fields: item_fields.as_deref(),
                         host_truncated: false,
@@ -3163,7 +3048,7 @@ impl SessionFold {
             }
             "compaction" => {
                 if self.compaction_supported {
-                    out.push(Self::standard_compaction_line(acp_sid, &item_id, item));
+                    out.push(Self::standard_compaction_line(acp_sid, ver, &item_id, item));
                 } else {
                     let status = msp_status(status);
                     out.push(Self::legacy_compaction_line(
@@ -3204,6 +3089,7 @@ impl SessionFold {
                         let fields = (!parts.is_empty()).then(|| parts.join(","));
                         out.push(Self::subagent_spawned_line(
                             acp_sid,
+                            self.ver,
                             child,
                             name,
                             task,
@@ -3271,6 +3157,7 @@ impl SessionFold {
                         self.announced_tasks.insert(run_id.to_string());
                         out.push(Self::async_task_spawned_line(
                             acp_sid,
+                            self.ver,
                             run_id,
                             &title,
                             "workflow",
@@ -3328,7 +3215,7 @@ impl SessionFold {
 
     /// item/delta: stream message text; tool text deltas are folded into the
     /// completion snapshot instead (v1 content arrays replace wholesale).
-    pub fn on_item_delta(&mut self, acp_sid: &str, ver: u8, params: &J, out: &mut Vec<String>) {
+    pub fn on_item_delta(&mut self, acp_sid: &str, ver: u8, params: &J, out: &mut Vec<Note>) {
         let item_id = match params.get("itemId").and_then(|v| v.as_str()) {
             Some(s) => s,
             None => return,
@@ -3367,13 +3254,10 @@ impl SessionFold {
                     return;
                 }
                 *streamed += text.chars().count();
-                out.push(Self::update_line(
+                out.push(out::terminal_output(
                     acp_sid,
-                    &format!(
-                        "{{\"sessionUpdate\":\"terminal_output_chunk\",\"terminalId\":{},\"data\":{}}}",
-                        esc(&terminal_id),
-                        esc(&crate::json::b64(text.as_bytes()))
-                    ),
+                    &terminal_id,
+                    crate::json::b64(text.as_bytes()),
                 ));
                 return;
             }
@@ -3388,14 +3272,7 @@ impl SessionFold {
                 return;
             }
             *streamed += text.chars().count();
-            out.push(Self::update_line(
-                acp_sid,
-                &format!(
-                    "{{\"sessionUpdate\":\"tool_call_content_chunk\",\"toolCallId\":{},\"content\":{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}}}",
-                    esc(&tc_id),
-                    esc(&text)
-                ),
-            ));
+            out.push(out::tool_text_chunk(acp_sid, &tc_id, &text));
             return;
         }
         if field == "text" {
@@ -3457,7 +3334,7 @@ impl SessionFold {
     /// the host anchored to an item that never completes is not lost. Called
     /// when the turn settles, after which no further item can arrive to carry
     /// the row.
-    pub fn flush_awaiting_anchor(&mut self, acp_sid: &str, ver: u8, out: &mut Vec<String>) {
+    pub fn flush_awaiting_anchor(&mut self, acp_sid: &str, ver: u8, out: &mut Vec<Note>) {
         self.flush_awaiting_anchor_unless(acp_sid, ver, out, |_| false);
     }
 
@@ -3469,7 +3346,7 @@ impl SessionFold {
         &mut self,
         acp_sid: &str,
         ver: u8,
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
         still_coming: impl Fn(&str) -> bool,
     ) {
         let held = std::mem::take(&mut self.awaiting_anchor);
@@ -3482,7 +3359,7 @@ impl SessionFold {
         }
     }
 
-    pub fn on_item_completed(&mut self, acp_sid: &str, ver: u8, params: &J, out: &mut Vec<String>) {
+    pub fn on_item_completed(&mut self, acp_sid: &str, ver: u8, params: &J, out: &mut Vec<Note>) {
         let Some(item) = params.get("item") else {
             return;
         };
@@ -3516,7 +3393,7 @@ impl SessionFold {
         anchor: &str,
         acp_sid: &str,
         ver: u8,
-        out: &mut Vec<String>,
+        out: &mut Vec<Note>,
     ) {
         let ready: Vec<J> = {
             let (ready, held): (Vec<_>, Vec<_>) = std::mem::take(&mut self.awaiting_anchor)
@@ -3530,7 +3407,7 @@ impl SessionFold {
         }
     }
 
-    fn complete_item(&mut self, acp_sid: &str, ver: u8, item: &J, out: &mut Vec<String>) {
+    fn complete_item(&mut self, acp_sid: &str, ver: u8, item: &J, out: &mut Vec<Note>) {
         if let Some(item_id) = item.get("itemId").and_then(J::as_str) {
             self.streamed_output.remove(item_id);
         }
@@ -3606,7 +3483,7 @@ impl SessionFold {
                 out.push(Self::tool_line(
                     acp_sid,
                     ver,
-                    &ToolUpdate {
+                    ToolUpdate {
                         create: !announced,
                         tc_id: &tc_id,
                         name: item
@@ -3618,8 +3495,8 @@ impl SessionFold {
                         status: Self::tool_status(item, status),
                         content_text: content,
                         raw_input: raw.as_deref(),
-                        locations: locations.as_deref(),
-                        extra_content: diff.as_deref(),
+                        locations: locations.clone(),
+                        extra_content: diff,
                         muse_fields: item_fields.as_deref(),
                         host_truncated: item
                             .get("truncated")
@@ -3676,7 +3553,7 @@ impl SessionFold {
                         .then_some(item_id.as_str());
                     let meta = Self::message_meta(Some(phase), cut, item)
                         .expect("a completion always declares its phase");
-                    out.push(Self::marked_chunk(acp_sid, ver, &msg_id, text, &meta));
+                    out.push(Self::marked_chunk(acp_sid, ver, &msg_id, text, meta));
                     self.last_message = Some((item_id.clone(), msg_id));
                 }
             }
@@ -3721,7 +3598,7 @@ impl SessionFold {
             }
             "compaction" => {
                 if self.compaction_supported {
-                    out.push(Self::standard_compaction_line(acp_sid, &item_id, item));
+                    out.push(Self::standard_compaction_line(acp_sid, ver, &item_id, item));
                 } else {
                     let status = msp_status(status);
                     out.push(Self::legacy_compaction_line(
@@ -3752,7 +3629,7 @@ impl SessionFold {
                             .filter(|s| !s.is_empty())
                             .unwrap_or("Delegated task");
                         out.push(Self::subagent_spawned_line(
-                            acp_sid, child, name, task, None,
+                            acp_sid, self.ver, child, name, task, None,
                         ));
                     }
                     self.settle_subagent(acp_sid, child, item, out);
@@ -3792,13 +3669,9 @@ impl SessionFold {
                     ));
                 }
                 if let Some(terminal) = terminal {
-                    out.push(Self::update_line(
-                        acp_sid,
-                        &format!(
-                            "{{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":{},\"content\":[{terminal}]}}",
-                            esc(&tc_id)
-                        ),
-                    ));
+                    let mut card = Card::new(&tc_id);
+                    card.content = Some(vec![terminal]);
+                    out.push(card.note(acp_sid, ver, false));
                 }
                 if kind == "userShell" && self.air_async_tasks && !self.replaying {
                     // Reconciliation owns the restored task inventory; a
@@ -3830,6 +3703,7 @@ impl SessionFold {
                         self.announced_tasks.insert(run_id.to_string());
                         out.push(Self::async_task_spawned_line(
                             acp_sid,
+                            self.ver,
                             run_id,
                             &title,
                             "workflow",
@@ -3989,7 +3863,7 @@ mod corpus_tests {
                 }
             }
             for line in &out {
-                parse_json(line)
+                parse_json(&line.line())
                     .unwrap_or_else(|e| panic!("{scenario}: emitted invalid JSON {line}: {e}"));
                 emitted += 1;
             }
@@ -4114,7 +3988,7 @@ mod corpus_tests {
         )
         .unwrap();
         fold.on_item_snapshot("sid", 1, &started, &mut out);
-        let initial = parse_json(&out[0]).unwrap();
+        let initial = parse_json(&out[0].line()).unwrap();
         let update = initial.get("params").and_then(|p| p.get("update")).unwrap();
         assert_eq!(
             update.get("sessionUpdate").and_then(J::as_str),
@@ -4149,7 +4023,7 @@ mod corpus_tests {
         let delta =
             parse_json(r#"{"itemId":"feed-1","field":"text","delta":"event one\n"}"#).unwrap();
         fold.on_item_delta("sid", 1, &delta, &mut out);
-        let streamed = parse_json(&out[1]).unwrap();
+        let streamed = parse_json(&out[1].line()).unwrap();
         let update = streamed
             .get("params")
             .and_then(|p| p.get("update"))
@@ -4176,7 +4050,7 @@ mod corpus_tests {
         .unwrap();
         let mut revised = Vec::new();
         fold.on_item_snapshot("sid", 1, &updated, &mut revised);
-        let revised = parse_json(&revised[0]).unwrap();
+        let revised = parse_json(&revised[0].line()).unwrap();
         let update = revised.get("params").and_then(|p| p.get("update")).unwrap();
         assert!(
             update
@@ -4195,7 +4069,7 @@ mod corpus_tests {
         let completed = J::Obj(vec![("item".to_string(), completed_item.clone())]);
         let mut terminal = Vec::new();
         fold.on_item_completed("sid", 1, &completed, &mut terminal);
-        let completed = parse_json(&terminal[0]).unwrap();
+        let completed = parse_json(&terminal[0].line()).unwrap();
         let update = completed
             .get("params")
             .and_then(|p| p.get("update"))
@@ -4226,7 +4100,7 @@ mod corpus_tests {
         .unwrap();
         let mut reused = Vec::new();
         fold.on_item_snapshot("sid", 1, &second, &mut reused);
-        let reused = parse_json(&reused[0]).unwrap();
+        let reused = parse_json(&reused[0].line()).unwrap();
         let update = reused.get("params").and_then(|p| p.get("update")).unwrap();
         assert_eq!(
             update.get("sessionUpdate").and_then(J::as_str),
@@ -4241,7 +4115,7 @@ mod corpus_tests {
         let mut replayed = SessionFold::new();
         let mut replay = Vec::new();
         replayed.replay_item("sid", 1, &completed_item, &mut replay);
-        let replay = parse_json(&replay[0]).unwrap();
+        let replay = parse_json(&replay[0].line()).unwrap();
         let update = replay.get("params").and_then(|p| p.get("update")).unwrap();
         assert_eq!(update.get("status").and_then(J::as_str), Some("completed"));
         assert_eq!(
@@ -4340,13 +4214,13 @@ mod corpus_tests {
             ))
             .unwrap()
         };
-        let states = |out: &[String], task: &str| -> Vec<String> {
+        let states = |out: &[crate::out::Note], task: &str| -> Vec<String> {
             out.iter()
+                .map(crate::out::Note::line)
                 .filter(|line| {
                     line.contains("async_task_state_update")
                         && line.contains(&format!("\"asyncTaskId\":\"{task}\""))
                 })
-                .cloned()
                 .collect()
         };
         let mut fold = SessionFold::new();
@@ -4429,7 +4303,7 @@ mod corpus_tests {
             !fold.seed_async_task("sid", &row, &mut out),
             "a known row is never announced twice"
         );
-        let spawned = out.join("\n");
+        let spawned = crate::out::joined(&out);
         assert!(
             spawned.contains("\"asyncTaskId\":\"it-bg\"")
                 && spawned.contains("\"name\":\"workspace-shell\"")
@@ -4445,7 +4319,7 @@ mod corpus_tests {
         )
         .unwrap();
         fold.on_item_completed("sid", 2, &wrapped, &mut out);
-        let settled = out.join("\n");
+        let settled = crate::out::joined(&out);
         assert!(
             settled.contains("async_task_state_update")
                 && settled.contains("\"asyncTaskId\":\"it-bg\"")
@@ -4473,7 +4347,7 @@ mod corpus_tests {
         );
         let mut out = Vec::new();
         fold.on_item_snapshot("sid", 2, &item, &mut out);
-        let card = out.join("\n");
+        let card = crate::out::joined(&out);
         assert!(card.contains("Hook Format on save"), "{card}");
         assert!(card.contains("\"handlerKind\":\"project\""), "{card}");
         assert!(card.contains("\"enabled\":true"), "{card}");
@@ -4485,7 +4359,7 @@ mod corpus_tests {
         let mut bare = SessionFold::new();
         let mut out = Vec::new();
         bare.on_item_snapshot("sid", 2, &item, &mut out);
-        let card = out.join("\n");
+        let card = crate::out::joined(&out);
         assert!(card.contains("Hook Format on save"), "{card}");
         assert!(!card.contains("handlerKind"), "{card}");
     }
@@ -4585,20 +4459,23 @@ mod corpus_tests {
             ))
             .unwrap()
         };
+        let at = |path: &str| {
+            Some(vec![crate::out::Location {
+                path: path.to_string(),
+                line: None,
+            }])
+        };
         assert_eq!(
-            fold.tool_locations(&item("read_file", r#"{"path":"src/a.rs","offset":3}"#))
-                .as_deref(),
-            Some(r#"[{"path":"/ws/src/a.rs"}]"#)
+            fold.tool_locations(&item("read_file", r#"{"path":"src/a.rs","offset":3}"#)),
+            at("/ws/src/a.rs")
         );
         assert_eq!(
-            fold.tool_locations(&item("write_file", r#"{"path":"/abs/./b/../c.txt"}"#))
-                .as_deref(),
-            Some(r#"[{"path":"/abs/c.txt"}]"#)
+            fold.tool_locations(&item("write_file", r#"{"path":"/abs/./b/../c.txt"}"#)),
+            at("/abs/c.txt")
         );
         assert_eq!(
-            fold.tool_locations(&item("move_file", r#"{"from":"a","to":"a"}"#))
-                .as_deref(),
-            Some(r#"[{"path":"/ws/a"}]"#)
+            fold.tool_locations(&item("move_file", r#"{"from":"a","to":"a"}"#)),
+            at("/ws/a")
         );
         for (tool, args) in [
             ("bash", r#"{"command":"cat src/a.rs > out.txt"}"#),
@@ -4654,7 +4531,7 @@ mod corpus_tests {
                 continue;
             }
             assert_eq!(out.len(), 2, "{out:?}");
-            let chunk = parse_json(&out[0]).unwrap();
+            let chunk = parse_json(&out[0].line()).unwrap();
             let update = chunk.get("params").and_then(|p| p.get("update")).unwrap();
             assert_eq!(
                 update.get("sessionUpdate").and_then(J::as_str),
@@ -4690,10 +4567,10 @@ mod corpus_tests {
         }
     }
 
-    fn updates(out: &[String]) -> Vec<J> {
+    fn updates(out: &[crate::out::Note]) -> Vec<J> {
         out.iter()
             .map(|line| {
-                parse_json(line)
+                parse_json(&line.line())
                     .unwrap()
                     .get("params")
                     .and_then(|p| p.get("update"))
@@ -4858,7 +4735,7 @@ mod corpus_tests {
         fold.on_item_delta("sid", 2, &delta, &mut out);
         fold.on_item_delta("sid", 2, &delta, &mut out);
         assert_eq!(out.len(), 1, "appends stop at the budget");
-        let chunk = parse_json(&out[0]).unwrap();
+        let chunk = parse_json(&out[0].line()).unwrap();
         let text = chunk
             .get("params")
             .and_then(|p| p.get("update"))
@@ -4891,7 +4768,7 @@ mod corpus_tests {
             &parse_json(&format!(r#"{{"item":{item}}}"#)).unwrap(),
             &mut out,
         );
-        parse_json(&out[0])
+        parse_json(&out[0].line())
             .unwrap()
             .get("params")
             .and_then(|p| p.get("update"))
@@ -5018,9 +4895,10 @@ mod corpus_tests {
             &mut out,
         );
         out.clear();
-        let event = |method: &str, body: &str, fold: &mut SessionFold, out: &mut Vec<String>| {
-            fold.on_monitor_inbox("sid", method, &parse_json(body).unwrap(), out);
-        };
+        let event =
+            |method: &str, body: &str, fold: &mut SessionFold, out: &mut Vec<crate::out::Note>| {
+                fold.on_monitor_inbox("sid", method, &parse_json(body).unwrap(), out);
+            };
         for id in ["in-1", "in-2", "in-3"] {
             event(
                 "monitor/inboxItemAdmitted",
@@ -5090,7 +4968,7 @@ mod corpus_tests {
         let mut fold = SessionFold::new();
         let mut out = Vec::new();
         fold.on_item_snapshot("sid", 2, &item, &mut out);
-        let frame = parse_json(&out[0]).unwrap();
+        let frame = parse_json(&out[0].line()).unwrap();
         let update = frame.get("params").and_then(|p| p.get("update")).unwrap();
         assert_eq!(update.get("name").and_then(J::as_str), Some("bash"));
         assert_eq!(update.get("title").and_then(J::as_str), Some("bash: pwd"));
@@ -5106,7 +4984,7 @@ mod corpus_tests {
         fold.compaction_supported = true;
         let mut out = Vec::new();
         fold.on_item_snapshot("sid", 2, &item, &mut out);
-        let frame = parse_json(&out[0]).unwrap();
+        let frame = parse_json(&out[0].line()).unwrap();
         let update = frame.get("params").and_then(|p| p.get("update")).unwrap();
         assert_eq!(
             update.get("sessionUpdate").and_then(J::as_str),
@@ -5142,7 +5020,7 @@ mod corpus_tests {
         let mut fold = SessionFold::new();
         let mut out = Vec::new();
         fold.on_item_snapshot("sid", 1, &item, &mut out);
-        let frame = parse_json(&out[0]).unwrap();
+        let frame = parse_json(&out[0].line()).unwrap();
         let update = frame.get("params").and_then(|p| p.get("update")).unwrap();
         assert_eq!(
             update.get("sessionUpdate").and_then(J::as_str),
@@ -5257,7 +5135,7 @@ mod corpus_tests {
         let mut out = Vec::new();
         fold.on_item_snapshot("sid", 1, &item, &mut out);
         assert_eq!(out.len(), 1);
-        let frame = parse_json(&out[0]).expect("tool card JSON");
+        let frame = parse_json(&out[0].line()).expect("tool card JSON");
         assert_eq!(
             frame
                 .get("params")
@@ -5488,6 +5366,7 @@ mod corpus_tests {
             "a streaming reply is not marked"
         );
         let msg_id = out[0]
+            .line()
             .split("\"messageId\":\"")
             .nth(1)
             .and_then(|rest| rest.split('"').next())
@@ -5606,7 +5485,8 @@ mod corpus_tests {
             1,
             "the later revision marks the reply: {late:?}"
         );
-        let msg_id = out[0].split("\"messageId\":").nth(1).unwrap();
+        let first = out[0].line();
+        let msg_id = first.split("\"messageId\":").nth(1).unwrap();
         let msg_id = &msg_id[..msg_id.find(',').unwrap()];
         assert!(
             late[0].contains("\"cutOff\":true") && late[0].contains(msg_id),
@@ -5740,6 +5620,7 @@ mod corpus_tests {
         fold.on_item_delta("sid", 2, &delta, &mut out);
         assert_eq!(out.len(), 1);
         let msg_id = out[0]
+            .line()
             .split("\"messageId\":\"")
             .nth(1)
             .and_then(|rest| rest.split('"').next())
@@ -5806,7 +5687,7 @@ mod corpus_tests {
             let mut replay = Vec::new();
             fold.replay_item("sid", ver, &item, &mut replay);
             assert_eq!(replay.len(), 1, "the mark rides the message: {replay:?}");
-            let parsed = parse_json(&replay[0]).unwrap();
+            let parsed = parse_json(&replay[0].line()).unwrap();
             let update = parsed.get("params").and_then(|p| p.get("update")).unwrap();
             assert!(
                 update.get("messageId").is_some()
@@ -6088,7 +5969,7 @@ mod corpus_tests {
         let mut fold = SessionFold::new();
         let mut out = Vec::new();
         fold.on_foreground_completed("sid", 2, "t1", &["goal-reminder"], &mut out);
-        let first = parse_json(&out[1]).unwrap();
+        let first = parse_json(&out[1].line()).unwrap();
         let first_id = first
             .get("params")
             .and_then(|p| p.get("update"))
@@ -6168,7 +6049,7 @@ mod corpus_tests {
             None,
             false,
         );
-        let parsed = parse_json(&line).unwrap();
+        let parsed = parse_json(&line.line()).unwrap();
         assert!(line.contains("final failure"));
         assert_eq!(
             parsed
@@ -6212,7 +6093,7 @@ mod replay_tests {
     }
 
     /// The created tool-call cards in an output batch, as (title, _meta).
-    fn cards(out: &[String]) -> Vec<(String, String)> {
+    fn cards(out: &[crate::out::Note]) -> Vec<(String, String)> {
         framed_cards(out)
             .into_iter()
             .map(|(title, meta, _)| (title, meta))
@@ -6221,10 +6102,10 @@ mod replay_tests {
 
     /// The same cards, keeping `content` so a test can prove the payload
     /// matches and not just the label.
-    fn framed_cards(out: &[String]) -> Vec<(String, String, String)> {
+    fn framed_cards(out: &[crate::out::Note]) -> Vec<(String, String, String)> {
         out.iter()
             .filter_map(|line| {
-                let frame = parse_json(line).ok()?;
+                let frame = parse_json(&line.line()).ok()?;
                 let update = frame.get("params")?.get("update")?;
                 if !matches!(
                     update.get("sessionUpdate").and_then(J::as_str),
@@ -6535,10 +6416,10 @@ mod anchor_tests {
     }
 
     /// The tool-call ids of the emitted frames, in order.
-    fn order(out: &[String]) -> Vec<String> {
+    fn order(out: &[crate::out::Note]) -> Vec<String> {
         out.iter()
             .filter_map(|line| {
-                let frame = parse_json(line).ok()?;
+                let frame = parse_json(&line.line()).ok()?;
                 let update = frame.get("params")?.get("update")?;
                 update
                     .get("toolCallId")
@@ -6769,7 +6650,7 @@ mod anchor_tests {
         .unwrap();
         let mut out = Vec::new();
         fold.on_item_snapshot("sid", 1, &item, &mut out);
-        let joined = out.join("\n");
+        let joined = crate::out::joined(&out);
         assert_eq!(
             joined
                 .matches("\"workId\":\"work.v2.managed_bash.sha256.abc\"")
@@ -6790,7 +6671,7 @@ mod anchor_tests {
         .unwrap();
         let mut out = Vec::new();
         without.on_item_snapshot("sid", 1, &item, &mut out);
-        assert!(!out.join("\n").contains("\"workId\""), "{out:?}");
+        assert!(!crate::out::joined(&out).contains("\"workId\""), "{out:?}");
     }
 
     #[test]
@@ -6838,9 +6719,14 @@ mod anchor_tests {
         .unwrap();
         let mut out = Vec::new();
         fold.on_item_snapshot("sid", 1, &held, &mut out);
-        let update = parse_json(&out[0]).unwrap();
+        let update = parse_json(&out[0].line()).unwrap();
         let update = update.get("params").and_then(|p| p.get("update")).unwrap();
-        assert_eq!(update.get("status").and_then(J::as_str), Some("pending"));
+        // A new ACP v1 `tool_call` leaves out `pending`, its default status.
+        assert_eq!(
+            update.get("sessionUpdate").and_then(J::as_str),
+            Some("tool_call")
+        );
+        assert!(update.get("status").is_none());
         assert!(
             update
                 .get("title")
@@ -6863,7 +6749,7 @@ mod anchor_tests {
         .unwrap();
         out.clear();
         fold.on_item_snapshot("sid", 1, &released, &mut out);
-        let update = parse_json(&out[0]).unwrap();
+        let update = parse_json(&out[0].line()).unwrap();
         let update = update.get("params").and_then(|p| p.get("update")).unwrap();
         assert_eq!(
             update.get("status").and_then(J::as_str),
@@ -6895,7 +6781,7 @@ mod anchor_tests {
             &parse_json(&format!(r#"{{"item":{}}}"#, j_to_string(&item))).unwrap(),
             &mut out,
         );
-        let update = parse_json(&out[0]).unwrap();
+        let update = parse_json(&out[0].line()).unwrap();
         let update = update.get("params").and_then(|p| p.get("update")).unwrap();
         assert_eq!(
             update.get("title").and_then(J::as_str),

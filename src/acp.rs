@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::editor::{Editor, Error, RequestId};
+use crate::out::{self, Note};
 
 use crate::fold::SessionFold;
 use crate::json::{J, esc, j_to_string, parse_json};
@@ -1655,56 +1656,65 @@ pub fn send_session_title(
     send_session_info_snapshot(stdout, s, title.as_deref(), None);
 }
 
+/// Send one typed notification.
+pub fn send_note(stdout: &StdoutShared, note: Note) {
+    written(match note {
+        Note::V1(note) => stdout.notify(note),
+        Note::V2(note) => stdout.notify(note),
+        Note::Ext(message) => stdout.notify(message),
+    });
+}
+
 /// Send fold output, replacing each `session_info_update` Muse patch with the
 /// complete current metadata snapshot. The fold mutates its own state before
-/// returning the frame, so this is the one interception point needed for hints
-/// such as foreground completion and model retry.
-pub fn send_fold_lines(stdout: &StdoutShared, s: &mut AcpSession, lines: Vec<String>) {
-    for line in lines {
-        send_fold_line(stdout, s, &line);
+/// returning the update, so this is the one interception point needed for
+/// hints such as foreground completion and model retry.
+pub fn send_fold_lines(stdout: &StdoutShared, s: &mut AcpSession, notes: Vec<Note>) {
+    for note in notes {
+        send_fold_line(stdout, s, note);
     }
 }
 
-pub fn send_fold_line(stdout: &StdoutShared, s: &mut AcpSession, line: &str) {
-    let Ok(mut root @ J::Obj(_)) = parse_json(line) else {
-        send_raw(stdout, line);
-        return;
-    };
-    let is_session_info = root
-        .get("params")
-        .and_then(|params| params.get("update"))
-        .and_then(|update| update.get("sessionUpdate"))
-        .and_then(J::as_str)
-        == Some("session_info_update");
-    if !is_session_info {
-        send_raw(stdout, line);
-        return;
-    }
-    let patch = root
-        .get("params")
-        .and_then(|params| params.get("update"))
-        .and_then(|update| update.get("_meta"))
-        .and_then(|meta| meta.get("muse"))
-        .cloned();
-    if let Some(patch) = patch.as_ref() {
-        s.absorb_session_meta_patch(patch);
-    }
-    let muse = s
-        .session_meta_json()
-        .and_then(|muse| parse_json(&format!("{{{muse}}}")).ok());
-    let J::Obj(root_fields) = &mut root else {
-        unreachable!();
-    };
-    if let Some((_, J::Obj(params))) = root_fields.iter_mut().find(|(key, _)| key == "params")
-        && let Some((_, J::Obj(update))) = params.iter_mut().find(|(key, _)| key == "update")
-        && let Some((_, J::Obj(meta))) = update.iter_mut().find(|(key, _)| key == "_meta")
-    {
-        meta.retain(|(key, _)| key != "muse");
-        if let Some(muse) = muse {
-            meta.push(("muse".to_string(), muse));
+pub fn send_fold_line(stdout: &StdoutShared, s: &mut AcpSession, mut note: Note) {
+    use agent_client_protocol::schema::MaybeUndefined;
+    use agent_client_protocol::{v1::schema as s1, v2::schema as s2};
+    match &mut note {
+        Note::V1(n) => {
+            if let s1::SessionUpdate::SessionInfoUpdate(info) = &mut n.update {
+                info.meta = complete_session_meta(s, info.meta.take());
+            }
         }
+        Note::V2(n) => {
+            if let s2::SessionUpdate::SessionInfoUpdate(info) = &mut n.update {
+                let meta = match std::mem::replace(&mut info.meta, MaybeUndefined::Undefined) {
+                    MaybeUndefined::Value(meta) => Some(meta),
+                    _ => None,
+                };
+                if let Some(meta) = complete_session_meta(s, meta) {
+                    info.meta = MaybeUndefined::Value(meta);
+                }
+            }
+        }
+        Note::Ext(_) => {}
     }
-    send_raw(stdout, &j_to_string(&root));
+    send_note(stdout, note);
+}
+
+/// A `session_info_update`'s `_meta` with its `muse` patch absorbed into the
+/// session and replaced by the complete snapshot: ACP v2 replaces a
+/// top-level `_meta` key as a whole.
+fn complete_session_meta(s: &mut AcpSession, meta: Option<out::Meta>) -> Option<out::Meta> {
+    let mut meta = meta?;
+    if let Some(patch) = meta.remove("muse") {
+        s.absorb_session_meta_patch(&crate::json::from_value(&patch));
+    }
+    if let Some(muse) = s
+        .session_meta_json()
+        .and_then(|muse| serde_json::from_str(&format!("{{{muse}}}")).ok())
+    {
+        meta.insert("muse".to_string(), muse);
+    }
+    Some(meta)
 }
 
 /// A one-line title that shows every character of what it names. Editors

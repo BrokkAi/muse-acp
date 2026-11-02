@@ -17,6 +17,7 @@ mod json;
 mod mcp;
 mod modes;
 mod msp;
+mod out;
 mod request;
 mod reviewer;
 mod sha256;
@@ -364,7 +365,7 @@ const PATCH_MAX_BYTES: u64 = 1024 * 1024;
 /// `None` keeps the ordinary text card: no patch, an unavailable or oversized
 /// one, or a document the adapter does not recognize. A diff is never
 /// synthesized for a call without a stored patch.
-fn tool_patch_diff(host: &Arc<Hosts>, msp_sid: &str, item: &J) -> Option<String> {
+fn tool_patch_diff(host: &Arc<Hosts>, msp_sid: &str, item: &J) -> Option<out::CardContent> {
     if item.get("kind").and_then(J::as_str) != Some("toolCall")
         || item.get("status").and_then(J::as_str) != Some("completed")
     {
@@ -424,7 +425,7 @@ fn tool_patch_diff(host: &Arc<Hosts>, msp_sid: &str, item: &J) -> Option<String>
             "tool patch {patch_id} not recognized; keeping the text card"
         ));
     }
-    diff
+    diff.map(out::CardContent::Diff)
 }
 
 fn send_file_report(stdout: &StdoutShared, acp_sid: &str, report: FileChangeReport) {
@@ -902,12 +903,17 @@ fn send_session_projection(
 }
 
 /// Send fold output through the session's complete Muse metadata snapshot.
-fn send_fold_output(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str, out: Vec<String>) {
+fn send_fold_output(
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    out: Vec<out::Note>,
+) {
     let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     let Some(s) = map.get_mut(acp_sid) else {
         drop(map);
-        for line in out {
-            acp::send_raw(stdout, &line);
+        for note in out {
+            acp::send_note(stdout, note);
         }
         return;
     };
@@ -3803,7 +3809,7 @@ fn abandon_session_work(stdout: &StdoutShared, s: &mut AcpSession, message: &str
     }
     s.perm_queue.clear();
     s.active_turn = None;
-    let lines = s.fold.disconnect_tasks(&s.acp_sid);
+    let lines = s.fold.disconnect_tasks(&s.acp_sid, s.ver);
     acp::send_fold_lines(stdout, s, lines);
 }
 
@@ -4601,6 +4607,7 @@ fn show_reminders() -> bool {
 /// `workspace_root` resolves relative tool paths for tool-call locations.
 fn fresh_fold(workspace_root: &str) -> SessionFold {
     let mut fold = SessionFold::new();
+    fold.ver = negotiated_ver();
     fold.workspace_root = workspace_root.to_string();
     fold.native_subagents = NATIVE_SUBAGENTS.load(Ordering::SeqCst) == 1;
     fold.air_async_tasks = AIR_ASYNC_TASKS.load(Ordering::SeqCst) == 1;
@@ -11751,13 +11758,16 @@ fn handle_msp(
                 {
                     if let Some(item_id) = item.get("itemId").and_then(J::as_str) {
                         match (diff, editor) {
-                            (Some(diff), _) | (None, Some(bridge::CardContent::Diff(diff))) => {
+                            (Some(diff), _) => {
                                 s.fold.patch_diffs.insert(item_id.to_string(), diff);
                             }
-                            (None, Some(bridge::CardContent::Terminal(terminal))) => {
+                            (None, Some(terminal @ bridge::CardContent::Terminal(_))) => {
                                 s.fold
                                     .editor_terminals
                                     .insert(item_id.to_string(), terminal);
+                            }
+                            (None, Some(diff)) => {
+                                s.fold.patch_diffs.insert(item_id.to_string(), diff);
                             }
                             (None, None) => {}
                         }

@@ -482,7 +482,7 @@ impl Editor {
     }
 
     /// Send a notification.
-    pub fn notify(&self, message: UntypedMessage) -> Result<(), Gone> {
+    pub fn notify<N: sdk::JsonRpcNotification>(&self, message: N) -> Result<(), Gone> {
         match self.connection()? {
             Connection::V1(cx) => cx.send_notification(message),
             Connection::V2(cx) => cx.send_notification(message),

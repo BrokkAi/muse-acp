@@ -16628,7 +16628,7 @@ fn editor_bridge_writes_and_edits_through_the_client_with_diff_cards() {
     );
     assert!(
         created.contains(r#""type":"diff""#)
-            && created.contains(r#""oldText":null"#)
+            && !created.contains(r#""oldText""#)
             && created.contains(r#""newText":"fresh\n""#),
         "a new file's diff: {created}"
     );

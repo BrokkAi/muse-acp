@@ -255,14 +255,9 @@ fn cancel_generation(acp_sid: &str) -> u64 {
     lock(&CANCELS).get(acp_sid).copied().unwrap_or(0)
 }
 
-/// What an editor tool call adds to its completed card.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CardContent {
-    /// ACP `diff` content from a write or edit.
-    Diff(String),
-    /// ACP `terminal` content from a command.
-    Terminal(String),
-}
+/// What an editor tool call adds to its completed card: ACP `diff` content
+/// from a write or edit, or `terminal` content from a command.
+pub use crate::out::CardContent;
 
 /// The content recorded for a completed editor tool item. Matched by
 /// `callId` when Muse sent one with the call (1.4.11+), else by tool and its
@@ -811,7 +806,7 @@ fn call(shared: &Shared, token: &str, request_id: &J, name: &str, params: Option
         .and_then(J::as_str)
         .unwrap_or("")
         .to_string();
-    let embed = |content: &str| {
+    let embed = |content: &CardContent| {
         embed_in_card(
             shared,
             &context.acp_sid,
@@ -851,7 +846,7 @@ fn embed_in_card(
     call_id: Option<&str>,
     tool: &str,
     key: &str,
-    content: &str,
+    content: &CardContent,
 ) {
     let full_name = format!("{TOOL_PREFIX}{tool}");
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -865,14 +860,10 @@ fn embed_in_card(
         std::thread::sleep(Duration::from_millis(50));
     };
     let Some(card) = card else { return };
-    acp::send_raw(
-        &shared.stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":{},\"content\":[{content}]}}}}}}",
-            esc(acp_sid),
-            esc(&card)
-        ),
-    );
+    let mut update = crate::out::Card::new(&card);
+    update.content = Some(vec![content.clone()]);
+    // Editor tools exist only for ACP v1 clients.
+    acp::send_note(&shared.stdout, update.note(acp_sid, 1, false));
 }
 
 /// How long to wait for the client's answer, and whether a cancel stops the
@@ -979,7 +970,7 @@ impl ToolOutput {
 /// wait.
 type Client<'a> = dyn Fn(&str, String, Wait) -> Result<J, ClientError> + 'a;
 /// Shows ACP tool call content on the running call's card.
-type Embed<'a> = dyn Fn(&str) + 'a;
+type Embed<'a> = dyn Fn(&CardContent) + 'a;
 
 fn run_tool(
     context: &ToolContext,
@@ -1126,7 +1117,7 @@ fn write_tool(context: &ToolContext, client: &Client<'_>, args: &J) -> Result<To
             content.lines().count()
         ),
         is_error: false,
-        card: diff_content(&path, old.as_deref(), content).map(CardContent::Diff),
+        card: diff_content(&path, old.as_deref(), content),
     })
 }
 
@@ -1166,7 +1157,7 @@ fn edit_tool(context: &ToolContext, client: &Client<'_>, args: &J) -> Result<Too
             if count == 1 { "" } else { "s" }
         ),
         is_error: false,
-        card: diff_content(&path, Some(&text), &edited).map(CardContent::Diff),
+        card: diff_content(&path, Some(&text), &edited),
     })
 }
 
@@ -1244,10 +1235,7 @@ fn terminal_tool(
         "{{\"sessionId\":{sid},\"terminalId\":{}}}",
         esc(&terminal_id)
     );
-    let content = format!(
-        "{{\"type\":\"terminal\",\"terminalId\":{}}}",
-        esc(&terminal_id)
-    );
+    let content = CardContent::Terminal(terminal_id.clone());
     embed(&content);
     let waited = client(
         "terminal/wait_for_exit",
@@ -1298,7 +1286,7 @@ fn terminal_tool(
     Ok(ToolOutput {
         text,
         is_error,
-        card: Some(CardContent::Terminal(content)),
+        card: Some(content),
     })
 }
 
@@ -1315,16 +1303,15 @@ fn exit_status(exit: &J) -> String {
 
 /// ACP `diff` tool call content, or None when the texts are too large to
 /// show.
-fn diff_content(path: &str, old: Option<&str>, new: &str) -> Option<String> {
+fn diff_content(path: &str, old: Option<&str>, new: &str) -> Option<CardContent> {
     if old.map_or(0, str::len) + new.len() > MAX_DIFF_BYTES {
         return None;
     }
-    Some(format!(
-        "{{\"type\":\"diff\",\"path\":{},\"oldText\":{},\"newText\":{}}}",
-        esc(path),
-        old.map_or_else(|| "null".to_string(), esc),
-        esc(new)
-    ))
+    Some(CardContent::FileDiff {
+        path: path.to_string(),
+        old_text: old.map(str::to_string),
+        new_text: new.to_string(),
+    })
 }
 
 /// The absolute path for a tool's `path` argument, confined to the session's
@@ -1631,7 +1618,8 @@ mod tests {
         let diff = diff_json(&output);
         assert_eq!(diff.get("type").and_then(J::as_str), Some("diff"));
         assert_eq!(diff.get("path").and_then(J::as_str), Some(file.as_str()));
-        assert!(matches!(diff.get("oldText"), Some(J::Null)));
+        // A new file has no old text, which ACP leaves out.
+        assert!(diff.get("oldText").is_none());
         assert_eq!(diff.get("newText").and_then(J::as_str), Some("one\ntwo\n"));
         assert_eq!(
             editor.methods(),
@@ -1792,7 +1780,14 @@ mod tests {
 
     fn diff_json(output: &ToolOutput) -> J {
         match &output.card {
-            Some(CardContent::Diff(diff)) => parse_json(diff).unwrap(),
+            Some(diff @ CardContent::FileDiff { .. }) => {
+                let card = crate::out::Card {
+                    content: Some(vec![diff.clone()]),
+                    ..crate::out::Card::new("tc")
+                };
+                let params = card.note("s", 1, false).params();
+                crate::json::from_value(&params["update"]["content"][0])
+            }
             other => panic!("expected a diff card, got {other:?}"),
         }
     }
@@ -2056,7 +2051,7 @@ mod tests {
                 content: if tool == "run_in_terminal" {
                     CardContent::Terminal(format!("term-{key}"))
                 } else {
-                    CardContent::Diff(format!("diff-{key}"))
+                    CardContent::Terminal(format!("diff-{key}"))
                 },
                 at: Instant::now(),
             });
@@ -2073,11 +2068,11 @@ mod tests {
         assert_eq!(take_card_content("other", &write("call-1", "a.rs")), None);
         assert_eq!(
             take_card_content("sess-cards", &write("call-1", "a.rs")),
-            Some(CardContent::Diff("diff-a.rs".into()))
+            Some(CardContent::Terminal("diff-a.rs".into()))
         );
         assert_eq!(
             take_card_content("sess-cards", &write("call-9", "b.rs")),
-            Some(CardContent::Diff("diff-b.rs".into()))
+            Some(CardContent::Terminal("diff-b.rs".into()))
         );
         assert_eq!(
             take_card_content("sess-cards", &write("call-9", "b.rs")),
@@ -2128,7 +2123,7 @@ mod tests {
     struct Terminals {
         wait: Result<&'static str, ClientError>,
         requests: RefCell<Vec<(String, J)>>,
-        embedded: RefCell<Vec<String>>,
+        embedded: RefCell<Vec<CardContent>>,
     }
 
     impl Terminals {
@@ -2172,7 +2167,7 @@ mod tests {
                     other => panic!("unexpected {other}"),
                 }
             };
-            let embed = |content: &str| self.embedded.borrow_mut().push(content.to_string());
+            let embed = |content: &CardContent| self.embedded.borrow_mut().push(content.clone());
             run_tool(context, &client, &embed, "run_in_terminal", &args(json))
         }
 
@@ -2197,11 +2192,8 @@ mod tests {
             .unwrap();
         assert_eq!(output.text, "built\n[exit code 2]");
         assert!(!output.is_error, "a failing command still ran");
-        let content = r#"{"type":"terminal","terminalId":"term-1"}"#;
-        assert_eq!(
-            output.card,
-            Some(CardContent::Terminal(content.to_string()))
-        );
+        let content = CardContent::Terminal("term-1".to_string());
+        assert_eq!(output.card, Some(content.clone()));
         assert_eq!(*terminals.embedded.borrow(), [content]);
         assert_eq!(
             terminals.methods(),
