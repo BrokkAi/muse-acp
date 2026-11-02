@@ -76,12 +76,13 @@ are emitted by the MSP host.
 These notifications are handled by the adapter but are absent from the
 vendored stable schema's `notifications` index. They belong to Muse's
 experimental surface, which reaches the adapter because it connects with
-`experimentalApi` (needed for `account/read`). The [Muse 1.3.0 disposition
+`experimentalApi` (needed for `account/read` and `session/requestDrive`). The [Muse 1.3.0 disposition
 matrix](../ROADMAP.md#9-richer-event-compatibility-matrix) also records host methods,
 errors, and deliberate omissions.
 
 | MSP notification | Disposition | ACP behavior |
 | --- | --- | --- |
+| `session/driveChanged` | Consumed | Muse 1.4.14 shared session daemon (`muse serve --join`) only: every connection hears each move of every session's drive. For its own sessions the adapter logs the session, reason, new holder's handshake name, and `youDrive`; it ignores other sessions and sends nothing to the editor. It does not track the drive: a turn refused `sessionInUse` asks for it back with `session/requestDrive` and is resent with the same `commandId` when granted; a `busy` answer keeps the refusal and names the holder in the editor's error. |
 | `mcpServer/oauthLoginCompleted` | Intentionally ignored | The terminal of an MCP OAuth login, sent to every experimental connection. The adapter never starts such a login, so it logs the server name and outcome (never the free-text message) and sends nothing to the editor. |
 
 ## Server-initiated requests

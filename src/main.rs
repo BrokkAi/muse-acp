@@ -2792,34 +2792,106 @@ fn reattach_session(
     }
 }
 
-/// Sends a user turn. Another client of a shared `muse serve` (Muse's own
-/// app resuming the session) may have taken the session's drive, and the
-/// host then refuses the turn `sessionInUse`. The editor's prompt asks for
-/// the drive back and sends the same command again.
+/// Sends a user turn. When `MUSE_SERVE_ARGS` has `--join`, the host is this
+/// machine's shared session daemon, and another of its clients (Muse's own
+/// app opening the session) may have taken the session's drive. The host
+/// then refuses the turn `sessionInUse`. The editor's prompt asks for the
+/// drive back and sends the same command again. A drive granted while the
+/// other client's turn runs moves that turn under this connection, so the
+/// resent command queues behind it or steers into it exactly as it would
+/// with a turn of our own.
 fn turn_command(host: &Arc<Hosts>, msp_sid: &str, method: &str, params: &str) -> Result<J, J> {
     match host.command(method, params) {
-        Err(e) if err_code(&e) == -32021 && take_drive(host, msp_sid) => {
-            host.command(method, params)
-        }
+        Err(e) if err_code(&e) == -32021 => match take_drive(host, msp_sid) {
+            DriveAnswer::Granted => host.command(method, params),
+            DriveAnswer::Busy(holder) => Err(drive_kept_error(e, holder.as_deref())),
+            DriveAnswer::Refused => Err(e),
+        },
         result => result,
     }
 }
 
-/// `session/requestDrive` (experimental): true when the host granted it.
-fn take_drive(host: &Arc<Hosts>, msp_sid: &str) -> bool {
+/// The answer to `session/requestDrive`.
+#[derive(Debug, PartialEq)]
+enum DriveAnswer {
+    Granted,
+    /// The holder kept the drive; its handshake name, when it is a valid one.
+    Busy(Option<String>),
+    /// An error (an older host, a session this host has not loaded) or a
+    /// status this adapter does not know: the turn keeps its own refusal.
+    Refused,
+}
+
+/// `session/requestDrive` (experimental, Muse 1.4.14).
+fn take_drive(host: &Arc<Hosts>, msp_sid: &str) -> DriveAnswer {
     match host.command(
         "session/requestDrive",
         &format!("{{\"sessionId\":{}}}", esc(msp_sid)),
     ) {
-        Ok(r) => r.get("status").and_then(|v| v.as_str()) == Some("granted"),
+        Ok(r) => drive_answer(&r),
         Err(e) => {
             log(&format!(
                 "session/requestDrive for {msp_sid} failed: {}",
                 err_message(&e)
             ));
-            false
+            DriveAnswer::Refused
         }
     }
+}
+
+fn drive_answer(result: &J) -> DriveAnswer {
+    match result.get("status").and_then(|v| v.as_str()) {
+        Some("granted") => DriveAnswer::Granted,
+        Some("busy") => DriveAnswer::Busy(drive_holder_name(result).map(str::to_string)),
+        other => {
+            log(&format!(
+                "session/requestDrive answered unknown status {other:?}; keeping the turn's refusal"
+            ));
+            DriveAnswer::Refused
+        }
+    }
+}
+
+/// `driveHolder.name` of a drive answer or `session/driveChanged`, when it
+/// is safe to show. The name is the holder's own handshake choice, so only
+/// `[a-z0-9_]+` (at most 64 bytes, for display) is kept, and never a name
+/// that the editor-facing login detection would read as an auth failure.
+fn drive_holder_name(frame: &J) -> Option<&str> {
+    frame
+        .get("driveHolder")?
+        .get("name")?
+        .as_str()
+        .filter(|name| is_client_name(name) && msp::auth_failure(name).is_none())
+}
+
+/// A handshake `clientInfo.name`: `[a-z0-9_]+`.
+fn is_client_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+/// The host's `sessionInUse` refusal, with a message that says which client
+/// kept the drive. Only the message changes; the editor receives it as the
+/// turn's error text.
+fn drive_kept_error(mut error: J, holder: Option<&str>) -> J {
+    let holder = holder.map_or_else(
+        || "another Muse client".to_string(),
+        |name| format!("Muse client `{name}`"),
+    );
+    let message = J::Str(format!(
+        "{}: {holder} is driving this session and did not hand it over; try again later",
+        err_message(&error)
+    ));
+    if let J::Obj(entries) = &mut error {
+        match entries.iter_mut().find(|(key, _)| key == "message") {
+            Some((_, value)) => *value = message,
+            None => entries.push(("message".to_string(), message)),
+        }
+    }
+    error
 }
 
 /// Starts a session that never ran a turn again under its own id.
@@ -7712,6 +7784,19 @@ fn handle_acp(
                     .unwrap_or_else(|p| p.into_inner())
                     .get_mut(&sid)
             {
+                s.active_turn = Some(turn);
+            } else if active_turn.is_none()
+                && !started_new
+                && let Some(s) = sessions
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get_mut(&sid)
+                && s.active_turn.is_none()
+            {
+                // An idle steer the host `steered` into a turn this adapter
+                // had not seen start (its `turn/started` is still on the way,
+                // or the turn came with a drive taken back from another
+                // client): track it so Stop and later steers reach it.
                 s.active_turn = Some(turn);
             }
             // Acknowledge the extension before emitting the synthetic echo.
@@ -13094,6 +13179,31 @@ fn handle_msp(
                 "MCP OAuth login completed elsewhere (ignored): server={server} outcome={outcome}"
             ));
         }
+        "session/driveChanged" => {
+            // Experimental (Muse 1.4.14): a shared session daemon
+            // (`muse serve --join`) broadcasts every drive move on every
+            // session to every connection. A drive lost here is taken back on
+            // the next turn (`turn_command`), so this is only a diagnostic,
+            // and only for this adapter's own sessions.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if find_acp_sid(sessions, msp_sid).is_some() {
+                let reason = params
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
+                let you_drive = params.get("youDrive").and_then(|v| v.as_bool()) == Some(true);
+                let holder = match params.get("driveHolder") {
+                    None => "nobody",
+                    Some(_) => drive_holder_name(params).unwrap_or("unnamed"),
+                };
+                log(&format!(
+                    "session drive changed: session={msp_sid:?} reason={reason:?} holder={holder} you_drive={you_drive}"
+                ));
+            }
+        }
         _ => {
             log(&format!("unhandled MSP notification: {method}"));
         }
@@ -16933,8 +17043,9 @@ mod tests {
         }
     }
     use super::{
-        CUA_TEXT_MAX_CHARS, CostRate, approval_title_kind, cua_card_text, cua_untrusted_text,
-        env_flag_enabled, friendly_terminal_error, friendly_turn_error, is_network_error,
+        CUA_TEXT_MAX_CHARS, CostRate, DriveAnswer, approval_title_kind, cua_card_text,
+        cua_untrusted_text, drive_answer, drive_kept_error, env_flag_enabled, err_code,
+        err_message, friendly_terminal_error, friendly_turn_error, is_network_error,
         model_retry_scheduled_log_line, parse_rates, quota_reset_phrase, retry_scheduled_log_line,
         v1_init, v2_init,
     };
@@ -17297,6 +17408,59 @@ mod tests {
     fn unrelated_turn_errors_pass_through_untouched() {
         let out = friendly_turn_error("turn/start failed", "boom");
         assert_eq!(out, "turn/start failed: boom");
+    }
+
+    #[test]
+    fn drive_answers_read_the_open_status() {
+        let answer = |text: &str| drive_answer(&parse_json(text).unwrap());
+        assert_eq!(
+            answer(r#"{"status":"granted","driveHolder":{"name":"muse_acp","version":"1"}}"#),
+            DriveAnswer::Granted
+        );
+        assert_eq!(
+            answer(r#"{"status":"busy","driveHolder":{"name":"tbh_tui","version":"1"}}"#),
+            DriveAnswer::Busy(Some("tbh_tui".to_string()))
+        );
+        // A name outside the handshake alphabet never reaches the editor.
+        assert_eq!(
+            answer(r#"{"status":"busy","driveHolder":{"name":"Evil\n[link](x)"}}"#),
+            DriveAnswer::Busy(None)
+        );
+        // Nor one the editor's login detection would take for an auth error.
+        assert_eq!(
+            answer(r#"{"status":"busy","driveHolder":{"name":"unauthenticated"}}"#),
+            DriveAnswer::Busy(None)
+        );
+        assert_eq!(answer(r#"{"status":"busy"}"#), DriveAnswer::Busy(None));
+        assert_eq!(answer(r#"{"status":"parked"}"#), DriveAnswer::Refused);
+        assert_eq!(answer("{}"), DriveAnswer::Refused);
+    }
+
+    #[test]
+    fn kept_drive_error_names_the_holder() {
+        let refusal = parse_json(
+            r#"{"code":-32021,"message":"session s-1 is already in use","data":{"kind":"sessionInUse","retryable":false,"sessionId":"s-1"}}"#,
+        )
+        .unwrap();
+        let error = drive_kept_error(refusal.clone(), Some("tbh_tui"));
+        assert_eq!(err_code(&error), -32021);
+        assert_eq!(
+            err_message(&error),
+            "session s-1 is already in use: Muse client `tbh_tui` is driving this session and did not hand it over; try again later"
+        );
+        assert_eq!(
+            error
+                .get("data")
+                .and_then(|data| data.get("kind"))
+                .and_then(|kind| kind.as_str()),
+            Some("sessionInUse")
+        );
+        let anonymous = drive_kept_error(refusal, None);
+        assert!(
+            err_message(&anonymous).contains(": another Muse client is driving"),
+            "{}",
+            err_message(&anonymous)
+        );
     }
 
     #[test]

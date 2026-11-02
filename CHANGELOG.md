@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+- Take a session's drive back when Muse refuses a turn because another
+  client holds it (#452). Only a shared Muse session daemon, which
+  `muse serve --join` in `MUSE_SERVE_ARGS` reaches, hands a session between
+  clients, for example to Muse's own app; the adapter's default private host
+  never does. A refused prompt or steering request asks with the experimental
+  `session/requestDrive` and, when granted, resends the same command. A drive
+  granted while the other client's turn runs moves that turn to the editor,
+  so a prompt queues behind it and steering lands in it.
+
+- Never let the read-only (plan mode) or reviewer host join a shared session
+  daemon. Muse 1.4.14 gives a joined host the daemon's write and shell
+  limits, so `--join` in `MUSE_SERVE_ARGS` silently re-enabled writes and
+  shell commands for hosts launched with `--disable-write` and
+  `--disable-shell`. Those hosts now drop `--join` and log that they did; the
+  main host still joins.
+
+- Name the client that kept a session's drive in the editor's error when Muse
+  answers `session/requestDrive` with `busy`. An idle steer that Muse steers
+  into a turn the adapter had not seen start now tracks that turn, so Stop and
+  later steering reach it. The experimental `session/driveChanged` broadcast
+  is logged for the adapter's own sessions instead of as an unhandled
+  notification.
+
 ## 0.20.0
 
 - Add opt-in native command prefix approval through

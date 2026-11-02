@@ -226,6 +226,16 @@ FAKE_STEER_ABSORB_TURN=<id> answers with that turn instead, the way a host
 that finds the expected turn gone can steer into the turn it is running now
 rather than refusing the request.
 
+Drive handover (Muse 1.4.14 shared daemon): `drive_taken` and `drive_busy`
+start with another client holding the session's drive, so `turn/start` and
+`turn/steer` are refused `sessionInUse` until `session/requestDrive` is
+granted (`drive_taken`) or answered `busy` with holder `tbh_tui`
+(`drive_busy`). With FAKE_DRIVE_LOST_AFTER_TURN=1, any scenario hands the
+drive to `tbh_tui` once the first turn is admitted, the way Muse's app takes
+a running session, and `session/requestDrive` grants it back. Each move is
+broadcast as `session/driveChanged`. FAKE_REQUEST_DRIVE_ERROR=1 answers
+`session/requestDrive` with `methodNotFound`, as a host without it would.
+
 Editor file tools: `editor_bridge` records the adapter's `editor` server from
 session/start or session/resume config.mcpServers and, on turn/start, plays
 Muse's MCP client against it from a thread: initialize, the initialized
@@ -288,6 +298,11 @@ MCP_CONFLICTED = [False]
 # drive_taken / drive_busy: another client of a shared `muse serve` holds the
 # session's drive, so turns are refused `sessionInUse` until it is requested.
 DRIVE_TAKEN = [SCENARIO in ("drive_taken", "drive_busy")]
+# FAKE_DRIVE_LOST_AFTER_TURN=1: another client takes the drive once the first
+# turn is admitted.
+DRIVE_LOST_AFTER_TURN = [os.environ.get("FAKE_DRIVE_LOST_AFTER_TURN") == "1"]
+DRIVE_HANDOVER = (SCENARIO in ("drive_taken", "drive_busy")
+                  or DRIVE_LOST_AFTER_TURN[0])
 USAGE_READS = [0]
 SKILL_READS = [0]
 # media/upload chunks received per uploadId, with the assembled bytes appended
@@ -3542,14 +3557,25 @@ def main():
                                     "data": {"kind": "commandRejected",
                                              "reason": "stale_attempt"}}})
                     continue
-                if (method == "session/requestDrive"
-                        and SCENARIO in ("drive_taken", "drive_busy")):
-                    granted = SCENARIO == "drive_taken"
+                if method == "session/requestDrive" and DRIVE_HANDOVER:
+                    if os.environ.get("FAKE_REQUEST_DRIVE_ERROR") == "1":
+                        # A host without the experimental method.
+                        send({"jsonrpc": "2.0", "id": ident,
+                              "error": {"code": -32601, "message": "Method not found",
+                                        "data": {"kind": "methodNotFound"}}})
+                        continue
+                    granted = SCENARIO != "drive_busy"
                     DRIVE_TAKEN[0] = not granted
                     send({"jsonrpc": "2.0", "id": ident,
                           "result": {"status": "granted" if granted else "busy",
                                      "driveHolder": {"name": "muse_acp" if granted else "tbh_tui",
                                                      "version": "1"}}})
+                    if granted:
+                        notify("session/driveChanged", {
+                            "sessionId": msg.get("params", {}).get("sessionId", ""),
+                            "reason": "requested", "youDrive": True,
+                            "driveHolder": {"name": "muse_acp", "version": "1"},
+                            "previousDriveHolder": {"name": "tbh_tui", "version": "1"}})
                     continue
                 if DRIVE_TAKEN[0] and method in ("turn/start", "turn/steer"):
                     # Muse 1.4.14's refusal to a client that does not drive.
@@ -3653,6 +3679,16 @@ def main():
                     continue
                 send({"jsonrpc": "2.0", "id": ident,
                       "result": result_for(method, msg)})
+                if method == "turn/start" and DRIVE_LOST_AFTER_TURN[0]:
+                    # The turn was admitted; another client then takes the
+                    # drive while it runs.
+                    DRIVE_LOST_AFTER_TURN[0] = False
+                    DRIVE_TAKEN[0] = True
+                    notify("session/driveChanged", {
+                        "sessionId": msg.get("params", {}).get("sessionId", ""),
+                        "reason": "requested", "youDrive": False,
+                        "driveHolder": {"name": "tbh_tui", "version": "1"},
+                        "previousDriveHolder": {"name": "muse_acp", "version": "1"}})
                 if REVIEW_HOST and method == "turn/start":
                     if os.environ.get("FAKE_REVIEW_HANG"):
                         # The review turn never answers: no item events and
