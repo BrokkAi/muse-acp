@@ -2792,6 +2792,36 @@ fn reattach_session(
     }
 }
 
+/// Sends a user turn. Another client of a shared `muse serve` (Muse's own
+/// app resuming the session) may have taken the session's drive, and the
+/// host then refuses the turn `sessionInUse`. The editor's prompt asks for
+/// the drive back and sends the same command again.
+fn turn_command(host: &Arc<Hosts>, msp_sid: &str, method: &str, params: &str) -> Result<J, J> {
+    match host.command(method, params) {
+        Err(e) if err_code(&e) == -32021 && take_drive(host, msp_sid) => {
+            host.command(method, params)
+        }
+        result => result,
+    }
+}
+
+/// `session/requestDrive` (experimental): true when the host granted it.
+fn take_drive(host: &Arc<Hosts>, msp_sid: &str) -> bool {
+    match host.command(
+        "session/requestDrive",
+        &format!("{{\"sessionId\":{}}}", esc(msp_sid)),
+    ) {
+        Ok(r) => r.get("status").and_then(|v| v.as_str()) == Some("granted"),
+        Err(e) => {
+            log(&format!(
+                "session/requestDrive for {msp_sid} failed: {}",
+                err_message(&e)
+            ));
+            false
+        }
+    }
+}
+
 /// Starts a session that never ran a turn again under its own id.
 fn restart_unsaved_session(
     hosts: &Arc<Hosts>,
@@ -7008,7 +7038,9 @@ fn handle_acp(
             } else {
                 String::new()
             };
-            match host.command(
+            match turn_command(
+                host,
+                &msp_sid,
                 "turn/start",
                 &format!(
                     "{{\"commandId\":{},\"sessionId\":{},\"input\":{}{}{display_field}{roots_param}}}",
@@ -7567,7 +7599,9 @@ fn handle_acp(
             let cmd = host.mint_cmd("cmd-");
             let input = format!("[{}]", parts.join(","));
             let result = match active_turn.as_deref() {
-                Some(expected_turn) => host.command(
+                Some(expected_turn) => turn_command(
+                    host,
+                    &msp_sid,
                     "turn/steer",
                     &format!(
                         "{{\"commandId\":{},\"sessionId\":{},\"expectedTurnId\":{},\"input\":{}{}}}",
@@ -7578,7 +7612,9 @@ fn handle_acp(
                         reasoning_effort_param(reasoning_effort.as_deref())
                     ),
                 ),
-                None => host.command(
+                None => turn_command(
+                    host,
+                    &msp_sid,
                     "turn/start",
                     &format!(
                         "{{\"commandId\":{},\"sessionId\":{},\"input\":{},\"ifBusy\":\"steer\"{}}}",
