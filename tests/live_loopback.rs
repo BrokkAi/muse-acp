@@ -1019,8 +1019,10 @@ fn resume_permission_profile_reaches_a_real_host() {
             "{response}"
         );
     } else {
+        // A resume result names no session (the client named it); the
+        // durable Muse id rides `_meta`.
         assert_eq!(
-            response["result"]["sessionId"],
+            response["result"]["_meta"]["mspSessionId"],
             json!(session),
             "{response}"
         );
@@ -2501,7 +2503,7 @@ fn side_chat_reaches_a_real_host_and_attaches_with_provenance() {
         json!({"sessionId": side, "cwd": host.workspace(), "mcpServers": []}),
     );
     let attached = adapter.result(resume);
-    assert_eq!(attached["sessionId"], json!(side), "{attached}");
+    assert_eq!(attached["_meta"]["mspSessionId"], json!(side), "{attached}");
     let turn = adapter.prompt(&side, "say hello [[script:hello]]");
     assert_eq!(adapter.result(turn)["stopReason"], "end_turn");
     adapter.finish();

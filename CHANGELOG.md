@@ -25,6 +25,9 @@
     request it gets `-32601`.
   - `initialize` with a `protocolVersion` below 1 answers with ACP v1, the
     SDK's fallback, instead of a version error.
+  - `session/load` and `session/resume` results no longer repeat the
+    `sessionId` the client sent, which neither schema defines;
+    `_meta.mspSessionId` still names the Muse session.
   - Optional result fields that are empty or unset are left out rather than
     sent as `null` or `[]` (for example `nextCursor` on the last
     `session/list` page, an empty `authMethods` or `additionalDirectories`).
