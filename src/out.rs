@@ -1050,3 +1050,14 @@ pub fn current_mode(acp_sid: &str, mode: &str) -> Note {
         s1::SessionUpdate::CurrentModeUpdate(s1::CurrentModeUpdate::new(mode.to_string())),
     )
 }
+
+/// One `session/list` row.
+#[derive(Debug, Clone)]
+pub struct SessionRow {
+    pub session_id: String,
+    pub cwd: String,
+    pub additional_directories: Vec<String>,
+    pub title: Option<String>,
+    pub updated_at: Option<String>,
+    pub meta: Option<Meta>,
+}

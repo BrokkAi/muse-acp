@@ -5338,7 +5338,8 @@ fn session_list_forwards_and_returns_pagination_cursor() {
     let second = c.wait_for(&format!("\"id\":{second_id}"), Duration::from_secs(15));
     assert!(second.contains("\"sessionId\":\"stored-201\""), "{second}");
     assert!(!second.contains("\"sessionId\":\"stored-1\""), "{second}");
-    assert!(second.contains("\"nextCursor\":null"), "{second}");
+    // The last page has no cursor, which the SDK leaves out.
+    assert!(!second.contains("\"nextCursor\""), "{second}");
     c.finish();
 }
 
@@ -5495,7 +5496,7 @@ fn v1_advertises_config_options_and_slash_commands() {
     );
     let mode_done = c.wait_for(&format!("\"id\":{mode_id}"), Duration::from_secs(15));
     assert!(
-        mode_done.contains("\"result\":{\"mode\":\"denyUnmatched\"}"),
+        mode_done.contains("\"result\":{\"_meta\":{\"muse\":{\"mode\":\"denyUnmatched\"}}}"),
         "legacy v1 modeId uses the MSP spelling: {mode_done}"
     );
     c.wait_log("session/setApprovalMode", Duration::from_secs(15));
@@ -5564,7 +5565,7 @@ fn legacy_set_mode_adopts_the_folded_host_mode() {
     );
     let mode_done = c.wait_for(&format!("\"id\":{mode_id}"), Duration::from_secs(15));
     assert!(
-        mode_done.contains("\"result\":{\"mode\":\"promptUnmatched\"}"),
+        mode_done.contains("\"result\":{\"_meta\":{\"muse\":{\"mode\":\"promptUnmatched\"}}}"),
         "legacy set_mode must report the folded host mode, not the request: {mode_done}"
     );
     c.finish();
@@ -8379,9 +8380,9 @@ fn resume_omission_drops_previously_active_additional_roots() {
         .find(|row| row["sessionId"] == sid)
         .expect("owned session listed");
     assert_eq!(row["cwd"], primary.to_str().unwrap());
-    assert_eq!(
-        row["additionalDirectories"],
-        serde_json::json!([]),
+    // No extra roots: the SDK leaves the empty list out.
+    assert!(
+        row.get("additionalDirectories").is_none(),
         "resume implicitly restored an omitted root: {listed}"
     );
     c.finish();

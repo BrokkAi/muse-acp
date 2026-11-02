@@ -514,12 +514,12 @@ impl TurnUsage {
         }
     }
 
-    /// The `"usage":{...}` member for a v1 prompt result, comma-prefixed.
-    /// Empty when no leg landed: a turn with no reported usage carries no
-    /// usage at all rather than a row of zeros.
-    pub fn result_member(&self) -> String {
+    /// The `usage` of a v1 prompt result. `None` when no leg landed: a turn
+    /// with no reported usage carries no usage at all rather than a row of
+    /// zeros.
+    pub fn result_usage(&self) -> Option<agent_client_protocol::v1::schema::Usage> {
         if self.calls == 0 {
-            return String::new();
+            return None;
         }
         let mut muse = format!("\"modelCalls\":{}", self.calls);
         if let Some(ms) = self.duration_ms {
@@ -534,9 +534,19 @@ impl TurnUsage {
                 .join(",");
             muse.push_str(&format!(",\"modelUsage\":{{{per}}}"));
         }
-        format!(
-            ",\"usage\":{{{},\"_meta\":{{\"mjolnir.dev/usage-scope\":\"turn\",\"muse\":{{{muse}}}}}}}",
-            self.totals.members()
+        let totals = &self.totals;
+        Some(
+            agent_client_protocol::v1::schema::Usage::new(
+                totals.total,
+                totals.input,
+                totals.output,
+            )
+            .thought_tokens(totals.thought)
+            .cached_read_tokens(totals.cached_read)
+            .cached_write_tokens(totals.cached_write)
+            .meta(out::meta(&format!(
+                "{{\"mjolnir.dev/usage-scope\":\"turn\",\"muse\":{{{muse}}}}}"
+            ))),
         )
     }
 }
@@ -600,7 +610,10 @@ pub fn id_json(id: &Option<RequestId>) -> String {
         .map_or_else(|| "null".to_string(), |id| id.value().to_string())
 }
 
-pub fn send_result(stdout: &StdoutShared, id: &Option<RequestId>, result_json: &str) {
+/// Answer an extension method (a `_`-prefixed method, `session/set_model`,
+/// `shutdown`) whose result no ACP schema defines; `result_json` is the
+/// result object as JSON text.
+pub fn send_ext_result(stdout: &StdoutShared, id: &Option<RequestId>, result_json: &str) {
     let Some(id) = id else {
         return;
     };
@@ -721,6 +734,108 @@ pub fn send_setup_response(
                     .meta(meta),
             ),
         },
+    }
+}
+
+/// Answer an ACP v1 `session/prompt` with how the turn ended: an ACP stop
+/// reason (`end_turn`, `cancelled`, ...), with the turn's usage when the
+/// host reported any.
+pub fn send_prompt_stop(
+    stdout: &StdoutShared,
+    id: &Option<RequestId>,
+    stop: &str,
+    usage: Option<agent_client_protocol::v1::schema::Usage>,
+) {
+    use agent_client_protocol::v1::schema as s1;
+    let stop = match stop {
+        "max_tokens" => s1::StopReason::MaxTokens,
+        "max_turn_requests" => s1::StopReason::MaxTurnRequests,
+        "refusal" => s1::StopReason::Refusal,
+        "cancelled" => s1::StopReason::Cancelled,
+        _ => s1::StopReason::EndTurn,
+    };
+    send_response(stdout, id, s1::PromptResponse::new(stop).usage(usage));
+}
+
+/// Answer `session/list` with its rows and the next page's cursor.
+pub fn send_session_list(
+    stdout: &StdoutShared,
+    id: &Option<RequestId>,
+    rows: Vec<out::SessionRow>,
+    next_cursor: Option<String>,
+) {
+    use agent_client_protocol::{v1::schema as s1, v2::schema as s2};
+    if stdout.version() == Some(2) {
+        let sessions = rows
+            .into_iter()
+            .map(|row| {
+                s2::SessionInfo::new(row.session_id, s2::AbsolutePath::new(row.cwd))
+                    .additional_directories(
+                        row.additional_directories
+                            .into_iter()
+                            .map(s2::AbsolutePath::new)
+                            .collect::<Vec<_>>(),
+                    )
+                    .title(row.title)
+                    .updated_at(row.updated_at)
+                    .meta(row.meta)
+            })
+            .collect();
+        send_response(
+            stdout,
+            id,
+            s2::ListSessionsResponse::new(sessions)
+                .next_cursor(next_cursor.map(s2::SessionListCursor::new)),
+        );
+        return;
+    }
+    let sessions = rows
+        .into_iter()
+        .map(|row| {
+            s1::SessionInfo::new(row.session_id, row.cwd)
+                .additional_directories(
+                    row.additional_directories
+                        .into_iter()
+                        .map(std::path::PathBuf::from)
+                        .collect::<Vec<_>>(),
+                )
+                .title(row.title)
+                .updated_at(row.updated_at)
+                .meta(row.meta)
+        })
+        .collect();
+    send_response(
+        stdout,
+        id,
+        s1::ListSessionsResponse::new(sessions).next_cursor(next_cursor),
+    );
+}
+
+/// The requests answered with an empty result.
+#[derive(Clone, Copy)]
+pub enum Done {
+    CloseSession,
+    DeleteSession,
+    /// A finished login: v1 `authenticate` or v2 `auth/login`.
+    Login,
+    Logout,
+    SetMode,
+}
+
+/// Answer a request whose result is empty, with its method's response type.
+pub fn send_done(stdout: &StdoutShared, id: &Option<RequestId>, done: Done) {
+    use agent_client_protocol::{v1::schema as s1, v2::schema as s2};
+    let v2 = stdout.version() == Some(2);
+    match (done, v2) {
+        (Done::CloseSession, false) => send_response(stdout, id, s1::CloseSessionResponse::new()),
+        (Done::CloseSession, true) => send_response(stdout, id, s2::CloseSessionResponse::new()),
+        (Done::DeleteSession, false) => send_response(stdout, id, s1::DeleteSessionResponse::new()),
+        (Done::DeleteSession, true) => send_response(stdout, id, s2::DeleteSessionResponse::new()),
+        (Done::Login, false) => send_response(stdout, id, s1::AuthenticateResponse::new()),
+        (Done::Login, true) => send_response(stdout, id, s2::LoginAuthResponse::new()),
+        (Done::Logout, false) => send_response(stdout, id, s1::LogoutResponse::new()),
+        (Done::Logout, true) => send_response(stdout, id, s2::LogoutAuthResponse::new()),
+        (Done::SetMode, _) => send_response(stdout, id, s1::SetSessionModeResponse::new()),
     }
 }
 

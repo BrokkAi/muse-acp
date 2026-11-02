@@ -2025,7 +2025,7 @@ fn serve_without_host(
         "initialize" => send_initialize(stdout, id, false, false),
         method @ ("shutdown" | "exit") => {
             if method == "shutdown" {
-                acp::send_result(stdout, id, "null");
+                acp::send_ext_result(stdout, id, "null");
             }
             shutdown::settle(stdout, "adapter shutting down");
             shutdown::exit(0);
@@ -2231,7 +2231,7 @@ fn finish_device_login(host: &Arc<Hosts>, stdout: &StdoutShared, params: &J) {
     if outcome == "granted" {
         // A settings view may still link the old credential.
         host.refresh_config();
-        acp::send_result(stdout, &login.login_req, "{}");
+        acp::send_done(stdout, &login.login_req, acp::Done::Login);
         return;
     }
     let detail = params
@@ -2301,7 +2301,7 @@ fn logout(host: &Arc<Hosts>, stdout: &StdoutShared, id: &Option<RequestId>) {
         };
     if confirmed {
         log("logged out of Muse via account/logout");
-        acp::send_result(stdout, id, "{}");
+        acp::send_done(stdout, id, acp::Done::Logout);
     } else {
         acp::send_error(
             stdout,
@@ -3476,7 +3476,7 @@ fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
                 acp::send_state(stdout, acp_sid, "idle", Some("cancelled"));
             }
         } else {
-            acp::send_result(stdout, &f.req_id, "{\"stopReason\":\"cancelled\"}");
+            acp::send_prompt_stop(stdout, &f.req_id, "cancelled", None);
         }
     }
 }
@@ -3866,7 +3866,7 @@ fn abandon_session_work(stdout: &StdoutShared, s: &mut AcpSession, message: &str
         if s.ver == 2 {
             acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
         } else {
-            acp::send_result(stdout, &recap.prompt_req, "{\"stopReason\":\"cancelled\"}");
+            acp::send_prompt_stop(stdout, &recap.prompt_req, "cancelled", None);
         }
     }
     s.perm_queue.clear();
@@ -5000,7 +5000,7 @@ fn subagent_control(
     // produces one host command; it is never minted again after an error or
     // host reconnect, so a duplicate replay remains host-idempotent.
     match host.command(method, &format!("{{{}}}", fields.join(","))) {
-        Ok(result) => acp::send_result(stdout, id, &j_to_string(&result)),
+        Ok(result) => acp::send_ext_result(stdout, id, &j_to_string(&result)),
         Err(error) => acp::send_error(
             stdout,
             id,
@@ -6023,7 +6023,7 @@ fn handle_acp(
                     esc(command)
                 ),
             ) {
-                Ok(result) => acp::send_result(stdout, &id, &j_to_string(&result)),
+                Ok(result) => acp::send_ext_result(stdout, &id, &j_to_string(&result)),
                 Err(error) => acp::send_error(
                     stdout,
                     &id,
@@ -6667,7 +6667,7 @@ fn handle_acp(
                             }
                         } else {
                             send_v1_user_message(stdout, &sid, &acp_content);
-                            acp::send_result(stdout, &id, "{\"stopReason\":\"end_turn\"}");
+                            acp::send_prompt_stop(stdout, &id, "end_turn", None);
                         }
                     }
                     // Typed host data (for example a rejected skill selector)
@@ -6735,7 +6735,7 @@ fn handle_acp(
                 } else {
                     send_v1_user_message(stdout, &sid, &acp_content);
                     send_agent_text(stdout, &sid, ver, note);
-                    acp::send_result(stdout, &id, "{\"stopReason\":\"end_turn\"}");
+                    acp::send_prompt_stop(stdout, &id, "end_turn", None);
                 }
                 return;
             }
@@ -6810,7 +6810,7 @@ fn handle_acp(
                 } else {
                     send_v1_user_message(stdout, &sid, &acp_content);
                     note(stdout);
-                    acp::send_result(stdout, &id, "{\"stopReason\":\"end_turn\"}");
+                    acp::send_prompt_stop(stdout, &id, "end_turn", None);
                 }
                 return;
             }
@@ -7025,7 +7025,7 @@ fn handle_acp(
             }
             host_params.push('}');
             match host.command("item/readOutput", &host_params) {
-                Ok(result) => acp::send_result(stdout, &id, &j_to_string(&result)),
+                Ok(result) => acp::send_ext_result(stdout, &id, &j_to_string(&result)),
                 Err(error) if msp::is_output_unavailable(&error) => {
                     let data = msp::output_unavailable_data(&error);
                     let availability = data
@@ -7137,7 +7137,7 @@ fn handle_acp(
                     return;
                 }
             };
-            acp::send_result(
+            acp::send_ext_result(
                 stdout,
                 &id,
                 &format!(
@@ -7187,7 +7187,7 @@ fn handle_acp(
                 "plugin/list",
                 &format!("{{\"sessionId\":{}}}", esc(&msp_sid)),
             ) {
-                Ok(result) => acp::send_result(stdout, &id, &j_to_string(&result)),
+                Ok(result) => acp::send_ext_result(stdout, &id, &j_to_string(&result)),
                 Err(error) => send_host_error(
                     stdout,
                     &id,
@@ -7273,7 +7273,7 @@ fn handle_acp(
                         .filter(|(key, _)| *key == "sideFrom")
                         .map(|(_, value)| format!(",\"sideFrom\":{}", j_to_string(value)))
                         .unwrap_or_default();
-                    acp::send_result(
+                    acp::send_ext_result(
                         stdout,
                         &id,
                         &format!(
@@ -7350,7 +7350,7 @@ fn handle_acp(
                     {
                         session.fold.note_hook_inventory(&result);
                     }
-                    acp::send_result(stdout, &id, &j_to_string(&result));
+                    acp::send_ext_result(stdout, &id, &j_to_string(&result));
                 }
                 Err(error) => acp::send_error(
                     stdout,
@@ -7454,7 +7454,7 @@ fn handle_acp(
                     }
                 };
             if active_turn.is_none() && prompt_required {
-                acp::send_result(
+                acp::send_ext_result(
                     stdout,
                     &id,
                     "{\"outcome\":\"promptRequired\",\"reason\":\"noRunningTurn\"}",
@@ -7595,7 +7595,7 @@ fn handle_acp(
             // Acknowledge the extension before emitting the synthetic echo.
             // v2 reports the synthetic user message and the running state; v1
             // echoes chunks like its prompt flow and has no state update.
-            acp::send_result(stdout, &id, &format!("{{\"outcome\":{}}}", esc(outcome)));
+            acp::send_ext_result(stdout, &id, &format!("{{\"outcome\":{}}}", esc(outcome)));
             if negotiated_ver() == 2 {
                 send_user_message(stdout, &sid, &mint_id("msg-", &ID_COUNTER), &acp_content);
                 acp::send_state(stdout, &sid, "running", None);
@@ -7623,7 +7623,7 @@ fn handle_acp(
                 .get(&sid)
                 .map(|s| s.msp_sid.clone());
             if drop_acp_session(stdout, sessions, &sid) {
-                acp::send_result(stdout, &id, "{}");
+                acp::send_done(stdout, &id, acp::Done::CloseSession);
                 if let Some(msp_sid) = msp_sid {
                     leave_session(host, &msp_sid);
                 }
@@ -7663,7 +7663,7 @@ fn handle_acp(
             if !is_session_uuid(&msp_sid) {
                 // Not a UUID, so it cannot name a Muse session: ACP says
                 // deleting a session that never existed succeeds silently.
-                acp::send_result(stdout, &id, "{}");
+                acp::send_done(stdout, &id, acp::Done::DeleteSession);
                 return;
             }
             if let Some(cmd) = pending_delete_for_session(&msp_sid) {
@@ -8027,18 +8027,8 @@ fn handle_acp(
                             }
                         }
                     }
-                    let next_cursor = r
-                        .get("nextCursor")
-                        .map(j_to_string)
-                        .unwrap_or_else(|| "null".to_string());
-                    acp::send_result(
-                        stdout,
-                        &id,
-                        &format!(
-                            "{{\"sessions\":[{}],\"nextCursor\":{next_cursor}}}",
-                            entries.join(",")
-                        ),
-                    );
+                    let next_cursor = r.get("nextCursor").and_then(J::as_str).map(str::to_string);
+                    acp::send_session_list(stdout, &id, entries, next_cursor);
                 }
                 Err(e) => {
                     if msp::acp_error_code(&e, -32603) == -32000 {
@@ -8053,19 +8043,11 @@ fn handle_acp(
                         return;
                     }
                     log(&format!("session/list failed: {}", err_message(&e)));
-                    let entries: Vec<String> =
-                        owned_session_rows(sessions, lists, list_stream, &filter_root)
-                            .into_iter()
-                            .map(|(_, row)| row)
-                            .collect();
-                    acp::send_result(
-                        stdout,
-                        &id,
-                        &format!(
-                            "{{\"sessions\":[{}],\"nextCursor\":null}}",
-                            entries.join(",")
-                        ),
-                    );
+                    let entries = owned_session_rows(sessions, lists, list_stream, &filter_root)
+                        .into_iter()
+                        .map(|(_, row)| row)
+                        .collect();
+                    acp::send_session_list(stdout, &id, entries, None);
                 }
             }
         }
@@ -8350,7 +8332,7 @@ fn handle_acp(
             };
             if let Some(target) = acp::resolve_session_mode(&value) {
                 match switch_session_mode(host, stdout, sessions, &sid, target) {
-                    Ok(()) => acp::send_result(stdout, &id, "{}"),
+                    Ok(()) => acp::send_done(stdout, &id, acp::Done::SetMode),
                     Err(e) => {
                         acp::send_error(stdout, &id, -32603, &format!("mode change failed: {e}"))
                     }
@@ -8389,7 +8371,16 @@ fn handle_acp(
                             {
                                 s.mode_value = m.to_string();
                             }
-                            acp::send_result(stdout, &id, &format!("{{\"mode\":{}}}", esc(m)))
+                            // The folded host mode rides `_meta.muse.mode`:
+                            // ACP's response has no member for it.
+                            acp::send_response(
+                                stdout,
+                                &id,
+                                agent_client_protocol::v1::schema::SetSessionModeResponse::new()
+                                    .meta(out::meta(
+                                        &serde_json::json!({"muse": {"mode": m}}).to_string(),
+                                    )),
+                            )
                         }
                         Err(e) => acp::send_error(
                             stdout,
@@ -8463,7 +8454,7 @@ fn handle_acp(
                     }
                     // Muse's `session/modelChanged` then moves the standard
                     // `model` selector, as for `session/set_config_option`.
-                    acp::send_result(stdout, &id, &format!("{{\"model\":{}}}", esc(&value)))
+                    acp::send_ext_result(stdout, &id, &format!("{{\"model\":{}}}", esc(&value)))
                 }
                 Err(e) => acp::send_error(
                     stdout,
@@ -8481,7 +8472,7 @@ fn handle_acp(
             if method_id == AUTH_METHOD_ID {
                 // A settings view may still link the old credential.
                 host.refresh_config();
-                acp::send_result(stdout, &id, "{}");
+                acp::send_done(stdout, &id, acp::Done::Login);
             } else if method_id == DEVICE_LOGIN_ID && device_login_offered() {
                 start_device_login(host, stdout, &id);
             } else {
@@ -8514,7 +8505,7 @@ fn handle_acp(
         Request::Logout => logout(host, stdout, &id),
         Request::Extension { .. } if matches!(method.as_str(), "shutdown" | "exit") => {
             if method == "shutdown" {
-                acp::send_result(stdout, &id, "null");
+                acp::send_ext_result(stdout, &id, "null");
             }
             fail_all_with_message(stdout, sessions, "adapter shutting down");
             shutdown::settle(stdout, "adapter shutting down");
@@ -10905,17 +10896,7 @@ fn session_info_row(
     attention: Option<&str>,
     resumed_by_client: Option<&str>,
     spawned_by: Option<&str>,
-) -> String {
-    let mut parts = vec![
-        format!("\"sessionId\":{}", esc(session_id)),
-        format!("\"cwd\":{}", esc(cwd)),
-    ];
-    if let Some(title) = title {
-        parts.push(format!("\"title\":{}", esc(title)));
-    }
-    if let Some(updated_at) = updated_at {
-        parts.push(format!("\"updatedAt\":{}", esc(updated_at)));
-    }
+) -> out::SessionRow {
     let mut muse = Vec::new();
     if let Some(branch) = branch {
         muse.push(format!("\"branch\":{branch}"));
@@ -10929,41 +10910,31 @@ fn session_info_row(
     if let Some(spawned) = spawned_by {
         muse.push(format!("\"spawnedBy\":{spawned}"));
     }
-    if !muse.is_empty() {
-        parts.push(format!("\"_meta\":{{\"muse\":{{{}}}}}", muse.join(",")));
+    out::SessionRow {
+        session_id: session_id.to_string(),
+        cwd: cwd.to_string(),
+        additional_directories: Vec::new(),
+        title: title.map(str::to_string),
+        updated_at: updated_at.map(str::to_string),
+        meta: out::muse_meta(&muse.join(",")),
     }
-    format!("{{{}}}", parts.join(","))
 }
 
 fn session_matches_filter(session: &AcpSession, root: &str) -> bool {
     root.is_empty() || same_workspace_root(&session.cwd, root)
 }
 
-fn owned_session_row(session: &AcpSession, updated_at: Option<&str>) -> String {
-    let mut parts = vec![
-        format!("\"sessionId\":{}", esc(&session.msp_sid)),
-        format!("\"cwd\":{}", esc(&session.cwd)),
-    ];
-    if let Some(title) = session.title_facts.selected() {
-        parts.push(format!("\"title\":{}", esc(title)));
+fn owned_session_row(session: &AcpSession, updated_at: Option<&str>) -> out::SessionRow {
+    out::SessionRow {
+        session_id: session.msp_sid.clone(),
+        cwd: session.cwd.clone(),
+        additional_directories: session.roots.iter().skip(1).cloned().collect(),
+        title: session.title_facts.selected().map(str::to_string),
+        updated_at: updated_at.map(str::to_string),
+        meta: session
+            .session_list_meta_json()
+            .and_then(|meta| out::muse_meta(&meta)),
     }
-    if let Some(updated_at) = updated_at {
-        parts.push(format!("\"updatedAt\":{}", esc(updated_at)));
-    }
-    if let Some(meta) = session.session_list_meta_json() {
-        parts.push(format!("\"_meta\":{{\"muse\":{{{meta}}}}}"));
-    }
-    parts.push(format!(
-        "\"additionalDirectories\":[{}]",
-        session
-            .roots
-            .iter()
-            .skip(1)
-            .map(|r| esc(r))
-            .collect::<Vec<_>>()
-            .join(",")
-    ));
-    format!("{{{}}}", parts.join(","))
 }
 
 /// Whether a session id can exist on an MSP host at all: a non-nil UUID in
@@ -11024,7 +10995,7 @@ fn answer_delete_waiters(
     match outcome {
         Ok(()) => {
             for waiter in waiters {
-                acp::send_result(stdout, &Some(waiter), "{}");
+                acp::send_done(stdout, &Some(waiter), acp::Done::DeleteSession);
             }
         }
         Err((code, message, data)) => {
@@ -11173,7 +11144,7 @@ fn owned_session_rows(
     lists: &SessionLists,
     list_stream: bool,
     root: &str,
-) -> Vec<(String, String)> {
+) -> Vec<(String, out::SessionRow)> {
     sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -11852,9 +11823,7 @@ fn handle_msp(
                     // `session/tokenUsage` is folded from a durable record
                     // that precedes this terminal record, so they have all
                     // arrived by now; a turn that reported none carries none.
-                    let usage = acp::take_turn_usage(s, turn_id)
-                        .map(|u| u.result_member())
-                        .unwrap_or_default();
+                    let usage = acp::take_turn_usage(s, turn_id).and_then(|u| u.result_usage());
                     (req_id, ver, rest, usage, file_report)
                 });
             if let Some((req_id, ver, rest, usage, file_report)) = settled {
@@ -11892,11 +11861,7 @@ fn handle_msp(
                 if let Some(req_id) = req_id {
                     if ver != 2 {
                         if terminal == "completed" || terminal == "cancelled" {
-                            acp::send_result(
-                                stdout,
-                                &req_id,
-                                &format!("{{\"stopReason\":\"{stop}\"{usage}}}"),
-                            );
+                            acp::send_prompt_stop(stdout, &req_id, stop, usage);
                         } else {
                             acp::send_error(
                                 stdout,
@@ -11939,7 +11904,7 @@ fn handle_msp(
                         acp::send_state(stdout, &acp_sid, "idle", Some("cancelled"));
                     }
                 } else {
-                    acp::send_result(stdout, &req_id, "{\"stopReason\":\"cancelled\"}");
+                    acp::send_prompt_stop(stdout, &req_id, "cancelled", None);
                 }
                 let _ = req_id;
             }
@@ -12211,7 +12176,7 @@ fn handle_msp(
                         acp::send_state(stdout, &acp_sid, "idle", Some("cancelled"));
                     }
                 } else {
-                    acp::send_result(stdout, &req_id, "{\"stopReason\":\"cancelled\"}");
+                    acp::send_prompt_stop(stdout, &req_id, "cancelled", None);
                 }
                 let _ = req_id;
             }
@@ -14234,7 +14199,7 @@ fn stop_async_task(
                 esc(&workflow_run_id)
             ),
         ) {
-            Ok(result) => acp::send_result(stdout, id, &j_to_string(&result)),
+            Ok(result) => acp::send_ext_result(stdout, id, &j_to_string(&result)),
             Err(e) => acp::send_error(
                 stdout,
                 id,
@@ -14263,7 +14228,7 @@ fn stop_async_task(
         Ok(ack) if ack.get("status").and_then(|v| v.as_str()) == Some("accepted") => {
             // The MSP ack only admits the stop. The item terminal event will
             // emit async_task_state_update with the authoritative outcome.
-            acp::send_result(stdout, id, "{\"stopped\":true}");
+            acp::send_ext_result(stdout, id, "{\"stopped\":true}");
         }
         Ok(ack) => {
             let status = ack
@@ -14387,7 +14352,7 @@ fn drop_acp_session(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) -
                 if s.ver == 2 {
                     acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
                 } else {
-                    acp::send_result(stdout, &f.req_id, "{\"stopReason\":\"cancelled\"}");
+                    acp::send_prompt_stop(stdout, &f.req_id, "cancelled", None);
                 }
             }
             for p in s.pending_ui {
@@ -14405,14 +14370,14 @@ fn drop_acp_session(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) -
                     cancel_v2_prompt_before_insertion(stdout, &f.prompt_req);
                     acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
                 } else {
-                    acp::send_result(stdout, &f.prompt_req, "{\"stopReason\":\"cancelled\"}");
+                    acp::send_prompt_stop(stdout, &f.prompt_req, "cancelled", None);
                 }
             }
             if let Some(r) = s.pending_recap {
                 if s.ver == 2 {
                     acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
                 } else {
-                    acp::send_result(stdout, &r.prompt_req, "{\"stopReason\":\"cancelled\"}");
+                    acp::send_prompt_stop(stdout, &r.prompt_req, "cancelled", None);
                 }
             }
             true
@@ -15098,7 +15063,7 @@ fn settle_command_with_text(
             send_v1_user_message(stdout, acp_sid, prompt_content);
         }
         send_agent_text(stdout, acp_sid, ver, text);
-        acp::send_result(stdout, &prompt_req, "{\"stopReason\":\"end_turn\"}");
+        acp::send_prompt_stop(stdout, &prompt_req, "end_turn", None);
     }
 }
 
@@ -15660,11 +15625,7 @@ fn settle_recap(
             acp::send_state(stdout, acp_sid, "idle", Some(stop));
         }
     } else {
-        acp::send_result(
-            stdout,
-            &pending.prompt_req,
-            &format!("{{\"stopReason\":\"{stop}\"}}"),
-        );
+        acp::send_prompt_stop(stdout, &pending.prompt_req, stop, None);
     }
 }
 
@@ -15922,11 +15883,7 @@ fn settle_feedback_cancelled(stdout: &StdoutShared, sessions: &Sessions, acp_sid
         cancel_v2_prompt_before_insertion(stdout, &pending.prompt_req);
         acp::send_state(stdout, acp_sid, "idle", Some("cancelled"));
     } else {
-        acp::send_result(
-            stdout,
-            &pending.prompt_req,
-            "{\"stopReason\":\"cancelled\"}",
-        );
+        acp::send_prompt_stop(stdout, &pending.prompt_req, "cancelled", None);
     }
     true
 }
