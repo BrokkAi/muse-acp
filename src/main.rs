@@ -2149,20 +2149,16 @@ fn start_device_login(host: &Arc<Hosts>, stdout: &StdoutShared, id: &Option<Requ
         return;
     };
     let elicitation_id = mint_id("login-", &ID_COUNTER);
-    let Some(elicit_req) = acp::send_request(
-        stdout,
-        "elicitation/create",
-        &format!(
-            "{{\"requestId\":{},\"mode\":\"url\",\"elicitationId\":{},\"url\":{},\"message\":{}}}",
-            acp::id_json(id),
-            esc(&elicitation_id),
-            esc(url),
-            esc(&format!(
-                "Sign in to Muse in your browser and confirm the code {code}."
-            ))
-        ),
-        acp::TAG_DEVICE_LOGIN,
-    ) else {
+    let ask = id.as_ref().and_then(|id| {
+        out::url_elicitation(
+            id,
+            &elicitation_id,
+            url,
+            &format!("Sign in to Muse in your browser and confirm the code {code}."),
+        )
+    });
+    let Some(elicit_req) = ask.and_then(|ask| acp::send_ask(stdout, ask, acp::TAG_DEVICE_LOGIN))
+    else {
         return;
     };
     // The answer is handled on this loop after this returns, so the login
@@ -2182,7 +2178,7 @@ fn complete_device_login_elicitation(
     host: &Arc<Hosts>,
     stdout: &StdoutShared,
     id: &Option<RequestId>,
-    msg: &J,
+    answer: &Result<request::Answer, editor::Error>,
 ) {
     let Some(id) = id else {
         return;
@@ -2191,13 +2187,7 @@ fn complete_device_login_elicitation(
     if pending.as_ref().is_none_or(|login| &login.elicit_req != id) {
         return;
     }
-    let accepted = msg.get("error").is_none()
-        && msg
-            .get("result")
-            .and_then(|r| r.get("action"))
-            .and_then(J::as_str)
-            == Some("accept");
-    if accepted {
+    if accepted_form(answer).is_some() {
         return;
     }
     let login = pending.take().expect("matched pending login");
@@ -4232,8 +4222,7 @@ fn main() {
         match msg {
             LoopMsg::Acp(Incoming::Answer { tag, id, result }) => {
                 if let Some(host) = host.as_ref() {
-                    let msg = answer_message(&id, result);
-                    complete_client_request(host, &stdout, &sessions, &tag, id, &msg);
+                    complete_client_request(host, &stdout, &sessions, &tag, id, result);
                 }
             }
             LoopMsg::Acp(closed @ (Incoming::Closed | Incoming::Ended { .. })) => {
@@ -4543,17 +4532,18 @@ fn complete_client_request(
     sessions: &Sessions,
     tag: &str,
     id: RequestId,
-    msg: &J,
+    answer: Result<request::Answer, editor::Error>,
 ) {
     let id = Some(id);
+    let answer = &answer;
     match tag {
-        acp::TAG_PERMISSION => complete_permission(host, stdout, sessions, &id, msg),
+        acp::TAG_PERMISSION => complete_permission(host, stdout, sessions, &id, answer),
         acp::TAG_PERMISSION_FEEDBACK => {
-            complete_permission_feedback(host, stdout, sessions, &id, msg);
+            complete_permission_feedback(host, stdout, sessions, &id, answer);
         }
-        acp::TAG_FEEDBACK => complete_feedback(host, stdout, sessions, &id, msg),
-        acp::TAG_ELICITATION => complete_elicitation(host, stdout, sessions, &id, msg),
-        acp::TAG_DEVICE_LOGIN => complete_device_login_elicitation(host, stdout, &id, msg),
+        acp::TAG_FEEDBACK => complete_feedback(host, stdout, sessions, &id, answer),
+        acp::TAG_ELICITATION => complete_elicitation(host, stdout, sessions, &id, answer),
+        acp::TAG_DEVICE_LOGIN => complete_device_login_elicitation(host, stdout, &id, answer),
         other => log(&format!(
             "internal: an answer for an unknown request kind {other}"
         )),
@@ -4604,30 +4594,13 @@ fn read_request(
     }
 }
 
-/// The client's answer to one of the adapter's requests as the `J` object the
-/// `complete_*` flows read: `id`, and `result` or `error`.
-fn answer_message(id: &editor::RequestId, result: Result<serde_json::Value, editor::Error>) -> J {
-    let mut fields = vec![
-        ("jsonrpc".to_string(), J::Str("2.0".to_string())),
-        ("id".to_string(), json::from_value(&id.value())),
-    ];
-    match result {
-        Ok(result) => fields.push(("result".to_string(), json::from_value(&result))),
-        Err(error) => {
-            let mut error_fields = vec![
-                (
-                    "code".to_string(),
-                    J::Num(i32::from(error.code).to_string()),
-                ),
-                ("message".to_string(), J::Str(error.message)),
-            ];
-            if let Some(data) = error.data {
-                error_fields.push(("data".to_string(), json::from_value(&data)));
-            }
-            fields.push(("error".to_string(), J::Obj(error_fields)));
-        }
+/// The submitted form of an `elicitation/create` answer: `None` unless the
+/// client answered with `accept`.
+fn accepted_form(answer: &Result<request::Answer, editor::Error>) -> Option<&request::Fields> {
+    match answer {
+        Ok(request::Answer::Form(form)) => form.accepted(),
+        _ => None,
     }
-    J::Obj(fields)
 }
 
 /// The catalog's default model, but only when the client asked for AIR
@@ -13511,39 +13484,30 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
         })
         .unwrap_or_else(|| format!("approval-{approval_id}"));
     let (title, kind) = approval_title_kind(params);
-    let subject = params.get("subject").cloned().unwrap_or(J::Null);
-    let mut raw_input = match &subject {
-        J::Obj(_) => format!(",\"rawInput\":{}", j_to_string(&subject)),
-        _ => String::new(),
-    };
+    let mut card = out::Card::new(&tool_call_id);
+    card.title = Some(title.clone());
+    card.kind = Some(kind.to_string());
+    card.status = Some("pending".to_string());
+    if let Some(subject @ J::Obj(_)) = params.get("subject") {
+        card.raw_input = Some(out::json(&j_to_string(subject)));
+    }
     // Muse 1.4.12 computer-use facts and Muse 1.4.14's bounded reviewer
     // escalation reason are display hints. Show them as text content and keep
     // the raw facts beside the permission for editors that render natively.
     let mut content = Vec::new();
     if let Some(text) = cua_card_text(params) {
-        content.push(text);
+        content.push(out::CardContent::Text(text));
     }
     if let Some(reason) = params
         .non_empty_str("reviewerReason")
         .and_then(cua_untrusted_text)
     {
-        content.push(format!("Reviewer concern: {reason}"));
+        content.push(out::CardContent::Text(format!(
+            "Reviewer concern: {reason}"
+        )));
     }
     if !content.is_empty() {
-        raw_input.push_str(",\"content\":[");
-        raw_input.push_str(
-            &content
-                .iter()
-                .map(|text| {
-                    format!(
-                        "{{\"type\":\"content\",\"content\":{{\"type\":\"text\",\"text\":{}}}}}",
-                        esc(text)
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        raw_input.push(']');
+        card.content = Some(content);
     }
     let facts: Vec<String> = ["cuaCardFacts", "reviewerReason"]
         .into_iter()
@@ -13558,10 +13522,8 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
                 .map(|value| format!("\"{key}\":{}", j_to_string(value)))
         })
         .collect();
-    if !facts.is_empty() {
-        raw_input.push_str(&format!(",\"_meta\":{{\"muse\":{{{}}}}}", facts.join(",")));
-    }
-    let (options_json, choices) = acp::perm_options(params);
+    card.meta = out::muse_meta(&facts.join(","));
+    let (options, choices) = acp::perm_options(params);
     if choices.is_empty() {
         // Nothing the client could answer: fail closed by cancelling the
         // turn rather than stranding the host approval with no verdict.
@@ -13588,30 +13550,11 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
     if ver == 2 {
         acp::send_state(stdout, &acp_sid, "requires_action", None);
     }
-    let params = if ver == 2 {
-        format!(
-            "{{\"sessionId\":{},\"title\":{},\"subject\":{{\"type\":\"tool_call\",\"toolCall\":{{\"toolCallId\":{},\"title\":{},\"kind\":\"{kind}\",\"status\":\"pending\"{raw_input}}}}},\"options\":{}}}",
-            esc(&acp_sid),
-            esc(&title),
-            esc(&tool_call_id),
-            esc(&title),
-            options_json
-        )
-    } else {
-        format!(
-            "{{\"sessionId\":{},\"toolCall\":{{\"toolCallId\":{},\"title\":{},\"kind\":\"{kind}\",\"status\":\"pending\"{raw_input}}},\"options\":{}}}",
-            esc(&acp_sid),
-            esc(&tool_call_id),
-            esc(&title),
-            options_json
-        )
-    };
     // The answer is handled on this loop, after this function returns, so
     // the permission is recorded before it can arrive.
-    let Some(req_id) = acp::send_request(
+    let Some(req_id) = acp::send_ask(
         stdout,
-        "session/request_permission",
-        &params,
+        out::permission(&acp_sid, ver, &title, card, options),
         acp::TAG_PERMISSION,
     ) else {
         return;
@@ -13660,12 +13603,26 @@ fn offer_permission_feedback(
     if ver == 2 {
         acp::send_state(stdout, acp_sid, "requires_action", None);
     }
-    let Some(req_id) = acp::send_request(
+    let form = out::Form {
+        fields: vec![
+            out::Field::new(
+                "feedback",
+                out::FieldKind::Text {
+                    max_length: None,
+                    default: None,
+                },
+            )
+            .description("Explain the constraint or suggest an alternative (optional)"),
+        ],
+    };
+    let Some(req_id) = acp::send_ask(
         stdout,
-        "elicitation/create",
-        &format!(
-            "{{\"sessionId\":{},\"mode\":\"form\",\"message\":\"Optional guidance for rejecting this action\",\"requestedSchema\":{{\"type\":\"object\",\"properties\":{{\"feedback\":{{\"type\":\"string\",\"description\":\"Explain the constraint or suggest an alternative (optional)\"}}}}}}}}",
-            esc(acp_sid),
+        out::form(
+            acp_sid,
+            ver,
+            None,
+            "Optional guidance for rejecting this action",
+            form,
         ),
         acp::TAG_PERMISSION_FEEDBACK,
     ) else {
@@ -13802,7 +13759,7 @@ fn complete_permission(
     stdout: &StdoutShared,
     sessions: &Sessions,
     id: &Option<RequestId>,
-    msg: &J,
+    answer: &Result<request::Answer, editor::Error>,
 ) {
     let idv = match id {
         Some(v) => v.clone(),
@@ -13871,52 +13828,47 @@ fn complete_permission(
     };
     // Ok is an explicit selection of an offered choice. Err is any other
     // reply: the log line, and the transcript notice for the fallback deny.
-    let selected: Result<String, (String, Option<&str>)> = if let Some(error) = msg.get("error") {
-        let code = match error.get("code") {
-            Some(J::Num(code)) => code.as_str(),
-            _ => "unknown",
-        };
-        Err((
+    let selected: Result<String, (String, Option<&str>)> = match answer {
+        Err(error) => Err((
             format!(
-                "session/request_permission failed at client; outcome=error option=none error={code}: {}",
-                err_message(error)
+                "session/request_permission failed at client; outcome=error option=none error={}: {}",
+                i32::from(error.code),
+                error.message
             ),
             Some("Permission denied: the permission request failed in the editor."),
-        ))
-    } else {
-        let outcome = msg.get("result").and_then(|r| r.get("outcome"));
-        let outcome_name = outcome
-            .and_then(|o| o.get("outcome"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let option_id = outcome
-            .and_then(|o| o.get("optionId"))
-            .and_then(|v| v.as_str());
-        let reply = format!(
-            "session/request_permission outcome={} option={}",
-            if outcome_name.is_empty() {
-                "missing"
-            } else {
-                outcome_name
-            },
-            option_id.unwrap_or("none")
-        );
-        match (outcome_name, option_id) {
-            ("selected", Some(cid)) if choices.iter().any(|choice| choice.id == cid) => {
-                Ok(cid.to_string())
+        )),
+        Ok(request::Answer::Permission(outcome)) => {
+            let (outcome_name, option_id) = match outcome {
+                request::Permission::Selected(id) => ("selected", Some(id.as_str())),
+                request::Permission::Cancelled => ("cancelled", None),
+                request::Permission::Other(name) if name.is_empty() => ("missing", None),
+                request::Permission::Other(name) => (name.as_str(), None),
+            };
+            let reply = format!(
+                "session/request_permission outcome={outcome_name} option={}",
+                option_id.unwrap_or("none")
+            );
+            match (outcome_name, option_id) {
+                ("selected", Some(cid)) if choices.iter().any(|choice| choice.id == cid) => {
+                    Ok(cid.to_string())
+                }
+                ("selected", _) => Err((
+                    reply,
+                    Some("Permission denied: the editor returned no usable permission option."),
+                )),
+                // ACP clients answer `cancelled` after `session/cancel`: the
+                // user stopped the turn, so the deny needs no explanation.
+                ("cancelled", _) => Err((reply, None)),
+                _ => Err((
+                    reply,
+                    Some("Permission denied: the editor did not approve the permission request."),
+                )),
             }
-            ("selected", _) => Err((
-                reply,
-                Some("Permission denied: the editor returned no usable permission option."),
-            )),
-            // ACP clients answer `cancelled` after `session/cancel`: the user
-            // stopped the turn, so the deny needs no explanation.
-            ("cancelled", _) => Err((reply, None)),
-            _ => Err((
-                reply,
-                Some("Permission denied: the editor did not approve the permission request."),
-            )),
         }
+        Ok(other) => Err((
+            format!("session/request_permission answered with {other:?}"),
+            Some("Permission denied: the editor did not approve the permission request."),
+        )),
     };
     let explicit_choice = selected.is_ok();
     let (verdict, deny_notice) = match selected {
@@ -13996,7 +13948,7 @@ fn complete_permission_feedback(
     stdout: &StdoutShared,
     sessions: &Sessions,
     id: &Option<RequestId>,
-    msg: &J,
+    answer: &Result<request::Answer, editor::Error>,
 ) {
     let idv = match id {
         Some(v) => v.clone(),
@@ -14036,18 +13988,10 @@ fn complete_permission_feedback(
             feedback.choice_id,
         )
     };
-    let feedback = if msg.get("error").is_none()
-        && let Some(res) = msg.get("result")
-        && res.get("action").and_then(|v| v.as_str()).unwrap_or("") == "accept"
-    {
-        res.get("content")
-            .and_then(|content| content.get("feedback"))
-            .and_then(|value| value.as_str())
-            .filter(|value| !value.is_empty())
-            .map(str::to_string)
-    } else {
-        None
-    };
+    let feedback = accepted_form(answer)
+        .and_then(|form| form.text("feedback"))
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
     send_permission_decision(
         host,
         stdout,
@@ -14424,7 +14368,6 @@ const UI_EXPLAIN_VALUE: &str = "_explain";
 const UI_EXPLAIN_TITLE: &str = "Explain instead";
 const UI_EXPLAIN_DESCRIPTION: &str = "Explain what you meant instead of choosing an answer.";
 
-/// Send one ACP form request for a pending MSP user-input flow.
 /// Send a form to the client. Returns its request id, which the flow named
 /// by `tag` stores to recognize the answer, or `None` when it could not be
 /// written.
@@ -14433,24 +14376,14 @@ fn send_elicitation_form(
     acp_sid: &str,
     tool_call_id: &str,
     message: &str,
-    schema: &str,
+    form: out::Form,
     tag: &str,
 ) -> Option<RequestId> {
-    let tool_f = if tool_call_id.is_empty() {
-        String::new()
-    } else {
-        format!(",\"toolCallId\":{}", esc(tool_call_id))
-    };
-    acp::send_request(
+    let tool_call_id = (!tool_call_id.is_empty()).then_some(tool_call_id);
+    let ver = stdout.version().unwrap_or(1);
+    acp::send_ask(
         stdout,
-        "elicitation/create",
-        &format!(
-            "{{\"sessionId\":{}{},\"mode\":\"form\",\"message\":{},\"requestedSchema\":{}}}",
-            esc(acp_sid),
-            tool_f,
-            esc(message),
-            schema
-        ),
+        out::form(acp_sid, ver, tool_call_id, message, form),
         tag,
     )
 }
@@ -14459,7 +14392,7 @@ fn send_elicitation_form(
 /// must be stored alongside it.
 struct PendingUiForm {
     message: String,
-    schema: String,
+    form: out::Form,
     confirmed: Vec<String>,
     question_index: usize,
 }
@@ -14490,7 +14423,7 @@ fn show_pending_ui(
         acp_sid,
         &tool_call_id,
         &form.message,
-        &form.schema,
+        form.form,
         acp::TAG_ELICITATION,
     ) else {
         return false;
@@ -14517,7 +14450,7 @@ fn reissue_pending_ui(
     acp_sid: &str,
     idx: usize,
     message: String,
-    schema: &str,
+    form: &out::Form,
 ) -> bool {
     let (confirmed, question_index) = {
         let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
@@ -14536,7 +14469,7 @@ fn reissue_pending_ui(
         idx,
         PendingUiForm {
             message,
-            schema: schema.to_string(),
+            form: form.clone(),
             confirmed,
             question_index,
         },
@@ -14564,7 +14497,7 @@ fn ask_next_ui_question(
         idx,
         PendingUiForm {
             message: ui_answer_message(next, questions),
-            schema: ui_answer_schema(next, question),
+            form: ui_answer_form(next, question),
             confirmed,
             question_index: next,
         },
@@ -14722,7 +14655,7 @@ fn bridge_user_input(
         return false;
     }
     let form_message = ui_answer_message(0, &ui_qs);
-    let schema = ui_answer_schema(0, &ui_qs[0]);
+    let form = ui_answer_form(0, &ui_qs[0]);
     if let Some(s) = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -14750,7 +14683,7 @@ fn bridge_user_input(
         acp_sid,
         &tool_call,
         &form_message,
-        &schema,
+        form,
         acp::TAG_ELICITATION,
     ) else {
         return true;
@@ -14790,30 +14723,35 @@ fn ui_titled_choice(
     title: &str,
     description: Option<&str>,
     preview: Option<&str>,
-) -> String {
-    let mut fields = vec![
-        format!("\"const\":{}", esc(value)),
-        format!("\"title\":{}", esc(title)),
-    ];
-    if let Some(description) = description {
-        fields.push(format!("\"description\":{}", esc(description)));
+) -> out::Choice {
+    out::Choice {
+        value: value.to_string(),
+        title: title.to_string(),
+        description: description.map(str::to_string),
+        meta: preview.and_then(|preview| out::muse_meta(&format!("\"preview\":{preview}"))),
     }
-    if let Some(preview) = preview {
-        fields.push(format!("\"_meta\":{{\"muse\":{{\"preview\":{preview}}}}}"));
-    }
-    format!("{{{}}}", fields.join(","))
 }
 
-/// The JSON Schema property for one question, keyed `q<index>` for the
-/// client. Option-bearing questions include the inline explanation path.
-fn ui_question_property(index: usize, q: &acp::UiQuestion) -> String {
+/// The form fields for one question, keyed `q<index>` for the client.
+/// Option-bearing questions include the inline explanation path.
+fn ui_question_fields(index: usize, q: &acp::UiQuestion) -> Vec<out::Field> {
     let key = format!("q{index}");
-    let title = esc(&q.title);
+    let required = ui_question_required(q);
     if q.labels.is_empty() {
         // Free-text question: no options, plain string answer.
-        return format!("{}: {{\"type\":\"string\",\"title\":{title}}}", esc(&key));
+        return vec![
+            out::Field::new(
+                &key,
+                out::FieldKind::Text {
+                    max_length: None,
+                    default: None,
+                },
+            )
+            .title(&q.title)
+            .required(required),
+        ];
     }
-    let mut choices: Vec<String> = q
+    let mut choices: Vec<out::Choice> = q
         .display
         .iter()
         .enumerate()
@@ -14832,30 +14770,33 @@ fn ui_question_property(index: usize, q: &acp::UiQuestion) -> String {
         Some(UI_EXPLAIN_DESCRIPTION),
         None,
     ));
-    let clarification = "\"clarification\":{\"type\":\"string\",\"maxLength\":500,\"title\":\"Clarification\",\"description\":\"Required only when you choose Explain instead.\"}";
-    if !q.multiple {
-        return format!(
-            "{}: {{\"type\":\"string\",\"title\":{title},\"oneOf\":[{}]}},{}",
-            esc(&key),
-            choices.join(","),
-            clarification
-        );
-    }
-    // The explain branch is one array item. Relax a larger host minimum to
-    // one here; complete_elicitation still enforces the host minimum when
-    // the user submits real answers.
-    let min_items = if q.min > 1 { 1 } else { q.min };
-    let mut sch = format!(
-        "{}: {{\"type\":\"array\",\"title\":{title},\"items\":{{\"anyOf\":[{}]}}",
-        esc(&key),
-        choices.join(",")
-    );
-    sch.push_str(&format!(",\"minItems\":{min_items}"));
-    if let Some(m) = q.max {
-        sch.push_str(&format!(",\"maxItems\":{}", m.max(1)));
-    }
-    sch.push_str(&format!("}},{clarification}"));
-    sch
+    let clarification = out::Field::new(
+        "clarification",
+        out::FieldKind::Text {
+            max_length: Some(500),
+            default: None,
+        },
+    )
+    .title("Clarification")
+    .description("Required only when you choose Explain instead.");
+    let kind = if q.multiple {
+        // The explain branch is one array item. Relax a larger host minimum
+        // to one here; complete_elicitation still enforces the host minimum
+        // when the user submits real answers.
+        out::FieldKind::AnyOf {
+            choices,
+            min_items: Some(q.min.min(1)),
+            max_items: q.max.map(|m| m.max(1)),
+        }
+    } else {
+        out::FieldKind::OneOf(choices)
+    };
+    vec![
+        out::Field::new(&key, kind)
+            .title(&q.title)
+            .required(required),
+        clarification,
+    ]
 }
 
 /// Whether the client must answer a question (single-mode, free text, and
@@ -14864,18 +14805,11 @@ fn ui_question_required(q: &acp::UiQuestion) -> bool {
     !q.multiple || q.min > 0
 }
 
-/// The one-question form schema for the staged answer walk.
-fn ui_answer_schema(index: usize, q: &acp::UiQuestion) -> String {
-    let required = if ui_question_required(q) {
-        format!("[{}]", esc(&format!("q{index}")))
-    } else {
-        "[]".to_string()
-    };
-    format!(
-        "{{\"type\":\"object\",\"properties\":{{{}}},\"required\":{}}}",
-        ui_question_property(index, q),
-        required
-    )
+/// The one-question form for the staged answer walk.
+fn ui_answer_form(index: usize, q: &acp::UiQuestion) -> out::Form {
+    out::Form {
+        fields: ui_question_fields(index, q),
+    }
 }
 
 /// The form message for one staged question: the question text, which the
@@ -14899,15 +14833,15 @@ fn ui_answer_message(index: usize, questions: &[acp::UiQuestion]) -> String {
 fn ui_explain_selected(
     q: &acp::UiQuestion,
     index: usize,
-    content: &J,
+    content: &request::Fields,
 ) -> Result<bool, &'static str> {
     let key = format!("q{index}");
-    match (q.multiple, content.get(key.as_str())) {
-        (false, Some(J::Str(value))) => Ok(value == &q.explain_value),
-        (true, Some(J::Arr(values))) => {
+    match (q.multiple, content.get(&key)) {
+        (false, Some(request::FieldValue::Text(value))) => Ok(value == &q.explain_value),
+        (true, Some(request::FieldValue::List(values))) => {
             let selected = values
                 .iter()
-                .filter(|value| value.as_str() == Some(q.explain_value.as_str()))
+                .filter(|value| **value == q.explain_value)
                 .count();
             if selected == 0 {
                 Ok(false)
@@ -14923,12 +14857,16 @@ fn ui_explain_selected(
 
 /// Enforce the host's multiple-selection bounds after the schema has relaxed
 /// its minimum to keep an explain-only one-item selection valid.
-fn ui_multiple_answer_error(q: &acp::UiQuestion, index: usize, content: &J) -> Option<String> {
+fn ui_multiple_answer_error(
+    q: &acp::UiQuestion,
+    index: usize,
+    content: &request::Fields,
+) -> Option<String> {
     if !q.multiple {
         return None;
     }
     let key = format!("q{index}");
-    let Some(J::Arr(values)) = content.get(key.as_str()) else {
+    let Some(request::FieldValue::List(values)) = content.get(&key) else {
         return None;
     };
     let count = values.len() as u64;
@@ -14951,10 +14889,10 @@ fn ui_multiple_answer_error(q: &acp::UiQuestion, index: usize, content: &J) -> O
 /// Convert one client form answer into an MSP `UserInputAnswer` object, or
 /// `None` when the client omitted the question's key. Selections map back to
 /// the host's original labels; unmatched strings become free text.
-fn ui_answer_json(q: &acp::UiQuestion, index: usize, content: &J) -> Option<String> {
+fn ui_answer_json(q: &acp::UiQuestion, index: usize, content: &request::Fields) -> Option<String> {
     let key = format!("q{index}");
-    match content.get(key.as_str()) {
-        Some(J::Str(v)) => Some(match ui_original(q, v) {
+    match content.get(&key) {
+        Some(request::FieldValue::Text(v)) => Some(match ui_original(q, v) {
             Some(orig) => format!(
                 "{{\"questionId\":{},\"selectedLabel\":{}}}",
                 esc(&q.qid),
@@ -14962,17 +14900,13 @@ fn ui_answer_json(q: &acp::UiQuestion, index: usize, content: &J) -> Option<Stri
             ),
             None => format!("{{\"questionId\":{},\"freeText\":{}}}", esc(&q.qid), esc(v)),
         }),
-        Some(J::Arr(vs)) => {
+        Some(request::FieldValue::List(vs)) => {
             let mut matched = Vec::new();
             let mut free = Vec::new();
             for v in vs {
-                match v.as_str().and_then(|s| ui_original(q, s)) {
+                match ui_original(q, v) {
                     Some(orig) => matched.push(esc(&orig)),
-                    None => {
-                        if let Some(s) = v.as_str() {
-                            free.push(s.to_string());
-                        }
-                    }
+                    None => free.push(v.clone()),
                 }
             }
             let mut f = vec![format!("\"questionId\":{}", esc(&q.qid))];
@@ -15013,23 +14947,49 @@ fn parse_feedback_argument(argument: &str) -> Option<(String, String)> {
 
 /// The `/feedback` elicitation form. Attachments default to off: consent is
 /// explicit for every one of them.
-fn feedback_form_schema(classification: Option<&str>, note: &str) -> String {
-    let class_default = classification
-        .map(|value| format!(",\"default\":{}", esc(value)))
-        .unwrap_or_default();
-    let note_default = if note.is_empty() {
-        String::new()
-    } else {
-        format!(",\"default\":{}", esc(note))
-    };
-    format!(
-        "{{\"type\":\"object\",\"properties\":{{\
-         \"classification\":{{\"type\":\"string\",\"enum\":[\"bug\",\"badResult\",\"goodResult\",\"other\"],\"title\":\"Classification\"{class_default}}},\
-         \"note\":{{\"type\":\"string\",\"title\":\"Note\"{note_default}}},\
-         \"withFiles\":{{\"type\":\"boolean\",\"title\":\"Include local tracing\",\"description\":\"Selected-session diagnostics, redacted\",\"default\":false}},\
-         \"attachSessionRecord\":{{\"type\":\"boolean\",\"title\":\"Attach the session record\",\"description\":\"This whole conversation's replayable trajectory, redacted. Only for Bug or Bad result, and only with local tracing.\",\"default\":false}}\
-         }},\"required\":[\"classification\",\"note\"]}}"
-    )
+fn feedback_form(classification: Option<&str>, note: &str) -> out::Form {
+    out::Form {
+        fields: vec![
+            out::Field::new(
+                "classification",
+                out::FieldKind::Enum {
+                    values: ["bug", "badResult", "goodResult", "other"]
+                        .map(str::to_string)
+                        .to_vec(),
+                    default: classification.map(str::to_string),
+                },
+            )
+            .title("Classification")
+            .required(true),
+            out::Field::new(
+                "note",
+                out::FieldKind::Text {
+                    max_length: None,
+                    default: (!note.is_empty()).then(|| note.to_string()),
+                },
+            )
+            .title("Note")
+            .required(true),
+            out::Field::new(
+                "withFiles",
+                out::FieldKind::Flag {
+                    default: Some(false),
+                },
+            )
+            .title("Include local tracing")
+            .description("Selected-session diagnostics, redacted"),
+            out::Field::new(
+                "attachSessionRecord",
+                out::FieldKind::Flag {
+                    default: Some(false),
+                },
+            )
+            .title("Attach the session record")
+            .description(
+                "This whole conversation's replayable trajectory, redacted. Only for Bug or Bad result, and only with local tracing.",
+            ),
+        ],
+    }
 }
 
 /// End a synchronous text command's turn with its receipt or refusal text.
@@ -15827,7 +15787,7 @@ fn start_feedback(
             acp_sid,
             "",
             "Send feedback about Muse",
-            &feedback_form_schema(classification.as_deref(), &note),
+            feedback_form(classification.as_deref(), &note),
             acp::TAG_FEEDBACK,
         );
         if let Some(req_id) = req_id
@@ -15894,7 +15854,7 @@ fn complete_feedback(
     stdout: &StdoutShared,
     sessions: &Sessions,
     id: &Option<RequestId>,
-    msg: &J,
+    answer: &Result<request::Answer, editor::Error>,
 ) {
     let Some(idv) = id.clone() else {
         return;
@@ -15912,13 +15872,7 @@ fn complete_feedback(
     let Some((acp_sid, pending)) = found else {
         return;
     };
-    let accepted = msg.get("error").is_none()
-        && msg
-            .get("result")
-            .and_then(|r| r.get("action"))
-            .and_then(|v| v.as_str())
-            == Some("accept");
-    if !accepted {
+    let Some(content) = accepted_form(answer) else {
         if let Some(s) = sessions
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -15936,24 +15890,11 @@ fn complete_feedback(
             "Feedback not sent.",
         );
         return;
-    }
-    let content = msg
-        .get("result")
-        .and_then(|r| r.get("content"))
-        .cloned()
-        .unwrap_or(J::Null);
-    let classification = content
-        .get("classification")
-        .and_then(J::as_str)
-        .unwrap_or("")
-        .to_string();
-    let note = content
-        .get("note")
-        .and_then(J::as_str)
-        .unwrap_or("")
-        .to_string();
-    let with_files = matches!(content.get("withFiles"), Some(J::Bool(true)));
-    let attach_record = matches!(content.get("attachSessionRecord"), Some(J::Bool(true)));
+    };
+    let classification = content.text("classification").unwrap_or("").to_string();
+    let note = content.text("note").unwrap_or("").to_string();
+    let with_files = content.flag("withFiles");
+    let attach_record = content.flag("attachSessionRecord");
     let problem = if !matches!(
         classification.as_str(),
         "bug" | "badResult" | "goodResult" | "other"
@@ -15986,7 +15927,7 @@ fn complete_feedback(
             &acp_sid,
             "",
             &format!("{problem}\n\nSend feedback about Muse"),
-            &feedback_form_schema(Some(&classification), &note),
+            feedback_form(Some(&classification), &note),
             acp::TAG_FEEDBACK,
         );
         if let Some(req_id) = req_id
@@ -16028,7 +15969,7 @@ fn complete_elicitation(
     stdout: &StdoutShared,
     sessions: &Sessions,
     id: &Option<RequestId>,
-    msg: &J,
+    answer: &Result<request::Answer, editor::Error>,
 ) {
     let idv = match id {
         Some(v) => v.clone(),
@@ -16056,13 +15997,7 @@ fn complete_elicitation(
         .cloned();
     let Some(pending) = pending else { return };
     let msp_sid = pending.owner_msp_sid.clone();
-    let accepted = msg.get("error").is_none()
-        && msg
-            .get("result")
-            .and_then(|r| r.get("action"))
-            .and_then(|v| v.as_str())
-            == Some("accept");
-    if !accepted {
+    let Some(content) = accepted_form(answer) else {
         let Some(p) = remove_pending_ui(sessions, &acp_sid, &idv) else {
             return;
         };
@@ -16102,12 +16037,7 @@ fn complete_elicitation(
             log(outcome);
         }
         return;
-    }
-    let content = msg
-        .get("result")
-        .and_then(|r| r.get("content"))
-        .cloned()
-        .unwrap_or(J::Null);
+    };
     let index = pending.question_index;
     let Some(question) = pending.questions.get(index) else {
         log(&format!(
@@ -16117,8 +16047,8 @@ fn complete_elicitation(
         return;
     };
     let form_message = ui_answer_message(index, &pending.questions);
-    let form_schema = ui_answer_schema(index, question);
-    let explaining = match ui_explain_selected(question, index, &content) {
+    let form = ui_answer_form(index, question);
+    let explaining = match ui_explain_selected(question, index, content) {
         Ok(value) => value,
         Err(message) => {
             reissue_pending_ui(
@@ -16127,20 +16057,20 @@ fn complete_elicitation(
                 &acp_sid,
                 idx,
                 format!("{form_message}\n\n{message}"),
-                &form_schema,
+                &form,
             );
             return;
         }
     };
     if explaining {
-        let Some(clarification) = content.get("clarification").and_then(|v| v.as_str()) else {
+        let Some(clarification) = content.text("clarification") else {
             reissue_pending_ui(
                 stdout,
                 sessions,
                 &acp_sid,
                 idx,
                 format!("{form_message}\n\nEnter a clarification before submitting."),
-                &form_schema,
+                &form,
             );
             return;
         };
@@ -16151,7 +16081,7 @@ fn complete_elicitation(
                 &acp_sid,
                 idx,
                 format!("{form_message}\n\nEnter a clarification before submitting."),
-                &form_schema,
+                &form,
             );
             return;
         }
@@ -16162,7 +16092,7 @@ fn complete_elicitation(
                 &acp_sid,
                 idx,
                 format!("{form_message}\n\nClarifications must be 500 characters or fewer."),
-                &form_schema,
+                &form,
             );
             return;
         }
@@ -16199,24 +16129,24 @@ fn complete_elicitation(
                         "{form_message}\n\nMuse rejected the clarification: {}",
                         err_message(&e)
                     ),
-                    &form_schema,
+                    &form,
                 );
             }
         }
         return;
     }
-    if let Some(message) = ui_multiple_answer_error(question, index, &content) {
+    if let Some(message) = ui_multiple_answer_error(question, index, content) {
         reissue_pending_ui(
             stdout,
             sessions,
             &acp_sid,
             idx,
             format!("{form_message}\n\n{message}"),
-            &form_schema,
+            &form,
         );
         return;
     }
-    let answer = ui_answer_json(question, index, &content).or_else(|| {
+    let answer = ui_answer_json(question, index, content).or_else(|| {
         // An optional multiple-selection question may be left empty; that
         // is a valid answer for a zero minimum.
         (!ui_question_required(question)).then(|| {
@@ -16233,7 +16163,7 @@ fn complete_elicitation(
             &acp_sid,
             idx,
             format!("{form_message}\n\nAnswer this question to continue."),
-            &form_schema,
+            &form,
         );
         return;
     };
@@ -16287,7 +16217,7 @@ fn complete_elicitation(
                     "{form_message}\n\nMuse rejected the answer: {}",
                     err_message(&e)
                 ),
-                &form_schema,
+                &form,
             );
         }
     }
@@ -16957,13 +16887,8 @@ mod tests {
                     continue;
                 }
                 let params = frame.get("params").cloned().unwrap_or(J::Null);
-                let (options_json, choices) = acp::perm_options(&params);
+                let (opts, choices) = acp::perm_options(&params);
                 assert!(!choices.is_empty(), "{scenario}: approval lost its choices");
-                let parsed = parse_json(&options_json)
-                    .unwrap_or_else(|e| panic!("{scenario}: invalid options JSON: {e}"));
-                let J::Arr(opts) = parsed else {
-                    panic!("{scenario}: options must be an array");
-                };
                 assert_eq!(
                     opts.len(),
                     choices.len(),

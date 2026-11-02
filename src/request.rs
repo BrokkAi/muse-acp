@@ -680,3 +680,208 @@ pub fn untyped(ver: u8, message: UntypedMessage) -> Result<Request, Error> {
     };
     Ok(request)
 }
+
+/// The client's answer to a request the adapter sent, read from the
+/// version's SDK response type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Answer {
+    /// `session/request_permission`.
+    Permission(Permission),
+    /// `elicitation/create`.
+    Form(FormAnswer),
+}
+
+/// A `session/request_permission` outcome.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Permission {
+    /// The user chose the option with this id.
+    Selected(String),
+    /// The prompt was cancelled (the turn was cancelled).
+    Cancelled,
+    /// An outcome this adapter does not know, by name.
+    Other(String),
+}
+
+/// An `elicitation/create` action.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FormAnswer {
+    /// The user submitted the form; for a URL elicitation, agreed to open it.
+    Accept(Fields),
+    Decline,
+    Cancel,
+    /// An action this adapter does not know.
+    Other,
+}
+
+impl FormAnswer {
+    pub fn accepted(&self) -> Option<&Fields> {
+        match self {
+            FormAnswer::Accept(fields) => Some(fields),
+            _ => None,
+        }
+    }
+}
+
+/// A submitted form's values, by field key.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Fields(pub std::collections::BTreeMap<String, FieldValue>);
+
+/// One submitted form value.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldValue {
+    Text(String),
+    Integer(i64),
+    Number(f64),
+    Flag(bool),
+    List(Vec<String>),
+    Other,
+}
+
+impl Fields {
+    pub fn get(&self, key: &str) -> Option<&FieldValue> {
+        self.0.get(key)
+    }
+
+    /// A text value; `None` when absent or not text.
+    pub fn text(&self, key: &str) -> Option<&str> {
+        match self.0.get(key) {
+            Some(FieldValue::Text(text)) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// Whether a boolean field was set to true.
+    pub fn flag(&self, key: &str) -> bool {
+        matches!(self.0.get(key), Some(FieldValue::Flag(true)))
+    }
+}
+
+macro_rules! permission_answer {
+    ($response:expr, $s:path) => {{
+        use $s as s;
+        #[allow(unreachable_patterns)]
+        match $response.outcome {
+            s::RequestPermissionOutcome::Selected(selected) => {
+                Permission::Selected(selected.option_id.to_string())
+            }
+            s::RequestPermissionOutcome::Cancelled { .. } => Permission::Cancelled,
+            other => Permission::Other(
+                serde_json::to_value(&other)
+                    .ok()
+                    .and_then(|v| v.get("outcome").and_then(Value::as_str).map(str::to_string))
+                    .unwrap_or_default(),
+            ),
+        }
+    }};
+}
+
+macro_rules! form_answer {
+    ($response:expr, $s:path) => {{
+        use $s as s;
+        #[allow(unreachable_patterns)]
+        match $response.action {
+            s::ElicitationAction::Accept(accept) => FormAnswer::Accept(Fields(
+                accept
+                    .content
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(key, value)| {
+                        let value = match value {
+                            s::ElicitationContentValue::String(text) => FieldValue::Text(text),
+                            s::ElicitationContentValue::Integer(n) => FieldValue::Integer(n),
+                            s::ElicitationContentValue::Number(n) => FieldValue::Number(n),
+                            s::ElicitationContentValue::Boolean(b) => FieldValue::Flag(b),
+                            s::ElicitationContentValue::StringArray(list) => FieldValue::List(list),
+                            _ => FieldValue::Other,
+                        };
+                        (key, value)
+                    })
+                    .collect(),
+            )),
+            s::ElicitationAction::Decline => FormAnswer::Decline,
+            s::ElicitationAction::Cancel => FormAnswer::Cancel,
+            _ => FormAnswer::Other,
+        }
+    }};
+}
+
+impl From<v1::schema::RequestPermissionResponse> for Answer {
+    fn from(response: v1::schema::RequestPermissionResponse) -> Answer {
+        Answer::Permission(permission_answer!(response, v1::schema))
+    }
+}
+
+impl From<v2::schema::RequestPermissionResponse> for Answer {
+    fn from(response: v2::schema::RequestPermissionResponse) -> Answer {
+        Answer::Permission(permission_answer!(response, v2::schema))
+    }
+}
+
+impl From<v1::schema::CreateElicitationResponse> for Answer {
+    fn from(response: v1::schema::CreateElicitationResponse) -> Answer {
+        Answer::Form(form_answer!(response, v1::schema))
+    }
+}
+
+impl From<v2::schema::CreateElicitationResponse> for Answer {
+    fn from(response: v2::schema::CreateElicitationResponse) -> Answer {
+        Answer::Form(form_answer!(response, v2::schema))
+    }
+}
+
+#[cfg(test)]
+mod answer_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn v2_permission(result: Value) -> Answer {
+        serde_json::from_value::<v2::schema::RequestPermissionResponse>(result)
+            .expect("v2 permission response")
+            .into()
+    }
+
+    #[test]
+    fn permission_outcomes_read_from_the_sdk_types() {
+        let v1: Answer = serde_json::from_value::<v1::schema::RequestPermissionResponse>(
+            json!({"outcome": {"outcome": "selected", "optionId": "c-1"}}),
+        )
+        .expect("v1 permission response")
+        .into();
+        assert_eq!(v1, Answer::Permission(Permission::Selected("c-1".into())));
+        assert_eq!(
+            v2_permission(json!({"outcome": {"outcome": "cancelled"}})),
+            Answer::Permission(Permission::Cancelled)
+        );
+        assert_eq!(
+            v2_permission(json!({"outcome": {"outcome": "_vendor_later"}})),
+            Answer::Permission(Permission::Other("_vendor_later".into()))
+        );
+    }
+
+    #[test]
+    fn form_answers_keep_each_value_type() {
+        let answer: Answer =
+            serde_json::from_value::<v1::schema::CreateElicitationResponse>(json!({
+                "action": "accept",
+                "content": {"note": "hi", "withFiles": true, "q0": ["a", "b"], "n": 3}
+            }))
+            .expect("v1 elicitation response")
+            .into();
+        let Answer::Form(FormAnswer::Accept(fields)) = answer else {
+            panic!("accepted form");
+        };
+        assert_eq!(fields.text("note"), Some("hi"));
+        assert!(fields.flag("withFiles"));
+        assert_eq!(
+            fields.get("q0"),
+            Some(&FieldValue::List(vec!["a".into(), "b".into()]))
+        );
+        assert_eq!(fields.get("n"), Some(&FieldValue::Integer(3)));
+        let declined: Answer = serde_json::from_value::<v2::schema::CreateElicitationResponse>(
+            json!({"action": "decline"}),
+        )
+        .expect("v2 elicitation response")
+        .into();
+        assert_eq!(declined, Answer::Form(FormAnswer::Decline));
+    }
+}

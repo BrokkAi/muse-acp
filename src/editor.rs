@@ -87,12 +87,11 @@ pub enum Incoming {
     /// The client asked, with `$/cancel_request`, to cancel one of its
     /// requests. The SDK has already marked that request's cancellation.
     CancelRequest { id: RequestId },
-    /// The client answered a request the adapter sent with
-    /// [`Editor::request`].
+    /// The client answered a request the adapter sent with [`Editor::ask`].
     Answer {
         tag: String,
         id: RequestId,
-        result: Result<Value, Error>,
+        result: Result<crate::request::Answer, Error>,
     },
     /// The client closed stdin. Answer what is owed, then call
     /// [`Editor::close`].
@@ -511,12 +510,27 @@ impl Editor {
         .map_err(|_| Gone)
     }
 
-    /// Send a request; the client's answer reaches the sink as
+    /// Send the client a request; its answer reaches the sink as
     /// [`Incoming::Answer`] carrying `tag`. Returns the request's id.
-    pub fn request(&self, message: UntypedMessage, tag: &str) -> Result<RequestId, Gone> {
+    pub fn ask(&self, ask: crate::out::Ask, tag: &str) -> Result<RequestId, Gone> {
+        use crate::out::Ask;
+        match ask {
+            Ask::PermissionV1(request) => self.ask_typed(request, tag),
+            Ask::PermissionV2(request) => self.ask_typed(request, tag),
+            Ask::ElicitationV1(request) => self.ask_typed(request, tag),
+            Ask::ElicitationV2(request) => self.ask_typed(request, tag),
+        }
+    }
+
+    fn ask_typed<R>(&self, request: R, tag: &str) -> Result<RequestId, Gone>
+    where
+        R: sdk::JsonRpcRequest,
+        crate::request::Answer: From<R::Response>,
+    {
         let tag = tag.to_string();
         let shared = Arc::clone(&self.shared);
-        self.send_request(message, move |id, result| {
+        self.send_request(request, move |id, result| {
+            let result = result.map(crate::request::Answer::from);
             (shared.sink)(Incoming::Answer { tag, id, result });
         })
     }
@@ -524,15 +538,15 @@ impl Editor {
     /// Send a request and block until the client answers it, the request is
     /// withdrawn, or `abort` says to stop waiting. A request that is not
     /// answered in `timeout` is withdrawn with `$/cancel_request`.
-    pub fn request_blocking(
+    pub fn request_blocking<R: sdk::JsonRpcRequest>(
         &self,
-        message: UntypedMessage,
+        request: R,
         timeout: Duration,
         abort: &dyn Fn() -> bool,
-    ) -> Result<Result<Value, Error>, Blocked> {
+    ) -> Result<Result<R::Response, Error>, Blocked> {
         let (answer_tx, answer_rx) = std::sync::mpsc::channel();
         let id = self
-            .send_request(message, move |_, result| {
+            .send_request(request, move |_, result| {
                 let _ = answer_tx.send(result);
             })
             .map_err(|_| Blocked::Gone)?;
@@ -555,23 +569,23 @@ impl Editor {
         }
     }
 
-    fn send_request(
+    fn send_request<R: sdk::JsonRpcRequest>(
         &self,
-        message: UntypedMessage,
-        answered: impl FnOnce(RequestId, Result<Value, Error>) + Send + 'static,
+        request: R,
+        answered: impl FnOnce(RequestId, Result<R::Response, Error>) + Send + 'static,
     ) -> Result<RequestId, Gone> {
         let shared = Arc::clone(&self.shared);
         let register = move |id: RequestId, handle: RequestCancellationHandle| {
             lock(&shared.outgoing).insert(id.clone(), handle);
             let shared = Arc::clone(&shared);
-            move |result: Result<Value, Error>| {
+            move |result: Result<R::Response, Error>| {
                 lock(&shared.outgoing).remove(&id);
                 answered(id, result);
             }
         };
         match self.connection()? {
             Connection::V1(cx) => {
-                let request = cx.prepare_request(message);
+                let request = cx.prepare_request(request);
                 let id = RequestId::of_value(request.id());
                 let done = register(id.clone(), request.cancellation_handle());
                 request
@@ -583,7 +597,7 @@ impl Editor {
                 Ok(id)
             }
             Connection::V2(cx) => {
-                let request = cx.prepare_request(message);
+                let request = cx.prepare_request(request);
                 let id = RequestId::of_value(request.id());
                 let done = register(id.clone(), request.cancellation_handle());
                 request

@@ -223,76 +223,56 @@ impl Card {
     /// v2 has only `tool_call_update`.
     pub fn note(self, acp_sid: &str, ver: u8, create: bool) -> Note {
         if ver == 2 {
-            let mut update = s2::ToolCallUpdate::new(self.id.clone());
-            if let Some(name) = self.name {
-                update = update.name(name);
-            }
-            if let Some(title) = self.title {
-                update = update.title(title);
-            }
-            if let Some(kind) = self.kind.as_deref() {
-                update = update.kind(kind_v2(kind));
-            }
-            if let Some(status) = self.status.as_deref() {
-                update = update.status(status_v2(status));
-            }
-            if let Some(content) = self.content {
-                update = update.content(
-                    content
-                        .into_iter()
-                        .filter_map(content_v2)
-                        .collect::<Vec<_>>(),
-                );
-            }
-            if let Some(locations) = self.locations {
-                update = update.locations(
-                    locations
-                        .into_iter()
-                        .map(|l| {
-                            s2::ToolCallLocation::new(std::path::PathBuf::from(l.path)).line(l.line)
-                        })
-                        .collect::<Vec<_>>(),
-                );
-            }
-            if let Some(raw_input) = self.raw_input {
-                update = update.raw_input(raw_input);
-            }
-            if let Some(meta) = self.meta {
-                update = update.meta(meta);
-            }
-            return Note::v2(acp_sid, s2::SessionUpdate::ToolCallUpdate(update));
+            return Note::v2(acp_sid, s2::SessionUpdate::ToolCallUpdate(self.update_v2()));
         }
-        let content = self.content.map(|content| {
+        if !create {
+            return Note::v1(acp_sid, s1::SessionUpdate::ToolCallUpdate(self.update_v1()));
+        }
+        let (content, locations) = self.parts_v1();
+        let mut call = s1::ToolCall::new(self.id, self.title.unwrap_or_default())
+            .name(self.name)
+            .raw_input(self.raw_input)
+            .meta(self.meta);
+        if let Some(kind) = self.kind.as_deref() {
+            call = call.kind(kind_v1(kind));
+        }
+        if let Some(status) = self.status.as_deref() {
+            call = call.status(status_v1(status));
+        }
+        if let Some(content) = content {
+            call = call.content(content);
+        }
+        if let Some(locations) = locations {
+            call = call.locations(locations);
+        }
+        Note::v1(acp_sid, s1::SessionUpdate::ToolCall(call))
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn parts_v1(
+        &self,
+    ) -> (
+        Option<Vec<s1::ToolCallContent>>,
+        Option<Vec<s1::ToolCallLocation>>,
+    ) {
+        let content = self.content.clone().map(|content| {
             content
                 .into_iter()
                 .filter_map(content_v1)
                 .collect::<Vec<_>>()
         });
-        let locations = self.locations.map(|locations| {
+        let locations = self.locations.clone().map(|locations| {
             locations
                 .into_iter()
                 .map(|l| s1::ToolCallLocation::new(l.path).line(l.line))
                 .collect::<Vec<_>>()
         });
-        if create {
-            let mut call = s1::ToolCall::new(self.id, self.title.unwrap_or_default())
-                .name(self.name)
-                .raw_input(self.raw_input)
-                .meta(self.meta);
-            if let Some(kind) = self.kind.as_deref() {
-                call = call.kind(kind_v1(kind));
-            }
-            if let Some(status) = self.status.as_deref() {
-                call = call.status(status_v1(status));
-            }
-            if let Some(content) = content {
-                call = call.content(content);
-            }
-            if let Some(locations) = locations {
-                call = call.locations(locations);
-            }
-            return Note::v1(acp_sid, s1::SessionUpdate::ToolCall(call));
-        }
+        (content, locations)
+    }
+
+    /// The card as an ACP v1 `ToolCallUpdate`.
+    pub fn update_v1(self) -> s1::ToolCallUpdate {
+        let (content, locations) = self.parts_v1();
         let fields = s1::ToolCallUpdateFields::new()
             .name(self.name)
             .title(self.title)
@@ -301,12 +281,49 @@ impl Card {
             .content(content)
             .locations(locations)
             .raw_input(self.raw_input);
-        Note::v1(
-            acp_sid,
-            s1::SessionUpdate::ToolCallUpdate(
-                s1::ToolCallUpdate::new(self.id, fields).meta(self.meta),
-            ),
-        )
+        s1::ToolCallUpdate::new(self.id, fields).meta(self.meta)
+    }
+
+    /// The card as an ACP v2 `ToolCallUpdate`.
+    pub fn update_v2(self) -> s2::ToolCallUpdate {
+        let mut update = s2::ToolCallUpdate::new(self.id.clone());
+        if let Some(name) = self.name {
+            update = update.name(name);
+        }
+        if let Some(title) = self.title {
+            update = update.title(title);
+        }
+        if let Some(kind) = self.kind.as_deref() {
+            update = update.kind(kind_v2(kind));
+        }
+        if let Some(status) = self.status.as_deref() {
+            update = update.status(status_v2(status));
+        }
+        if let Some(content) = self.content {
+            update = update.content(
+                content
+                    .into_iter()
+                    .filter_map(content_v2)
+                    .collect::<Vec<_>>(),
+            );
+        }
+        if let Some(locations) = self.locations {
+            update = update.locations(
+                locations
+                    .into_iter()
+                    .map(|l| {
+                        s2::ToolCallLocation::new(std::path::PathBuf::from(l.path)).line(l.line)
+                    })
+                    .collect::<Vec<_>>(),
+            );
+        }
+        if let Some(raw_input) = self.raw_input {
+            update = update.raw_input(raw_input);
+        }
+        if let Some(meta) = self.meta {
+            update = update.meta(meta);
+        }
+        update
     }
 }
 
@@ -1060,4 +1077,388 @@ pub struct SessionRow {
     pub title: Option<String>,
     pub updated_at: Option<String>,
     pub meta: Option<Meta>,
+}
+
+/// A request the adapter sends the client, as the negotiated version's SDK
+/// request type.
+#[derive(Debug, Clone)]
+pub enum Ask {
+    PermissionV1(s1::RequestPermissionRequest),
+    PermissionV2(s2::RequestPermissionRequest),
+    ElicitationV1(s1::CreateElicitationRequest),
+    ElicitationV2(s2::CreateElicitationRequest),
+}
+
+impl Ask {
+    /// The request's `params`, for tests.
+    #[cfg(test)]
+    pub fn params(&self) -> Value {
+        match self {
+            Ask::PermissionV1(r) => serde_json::to_value(r),
+            Ask::PermissionV2(r) => serde_json::to_value(r),
+            Ask::ElicitationV1(r) => serde_json::to_value(r),
+            Ask::ElicitationV2(r) => serde_json::to_value(r),
+        }
+        .unwrap_or(Value::Null)
+    }
+}
+
+/// One `session/request_permission` option.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionOption {
+    pub id: String,
+    pub name: String,
+    /// `allow_once`, `allow_always`, `reject_once`, or `reject_always`.
+    pub kind: &'static str,
+}
+
+fn option_kind_v1(kind: &str) -> s1::PermissionOptionKind {
+    match kind {
+        "allow_always" => s1::PermissionOptionKind::AllowAlways,
+        "reject_once" => s1::PermissionOptionKind::RejectOnce,
+        "reject_always" => s1::PermissionOptionKind::RejectAlways,
+        _ => s1::PermissionOptionKind::AllowOnce,
+    }
+}
+
+fn option_kind_v2(kind: &str) -> s2::PermissionOptionKind {
+    match kind {
+        "allow_always" => s2::PermissionOptionKind::AllowAlways,
+        "reject_once" => s2::PermissionOptionKind::RejectOnce,
+        "reject_always" => s2::PermissionOptionKind::RejectAlways,
+        _ => s2::PermissionOptionKind::AllowOnce,
+    }
+}
+
+/// `session/request_permission` for the tool call `card`. ACP v2 titles the
+/// prompt and names the tool call as its subject; v1 shows the tool call.
+pub fn permission(
+    acp_sid: &str,
+    ver: u8,
+    title: &str,
+    card: Card,
+    options: Vec<PermissionOption>,
+) -> Ask {
+    if ver == 2 {
+        let options = options
+            .into_iter()
+            .map(|o| s2::PermissionOption::new(o.id, o.name, option_kind_v2(o.kind)))
+            .collect();
+        let subject = s2::RequestPermissionSubject::ToolCall(Box::new(
+            s2::ToolCallPermissionSubject::new(card.update_v2()),
+        ));
+        return Ask::PermissionV2(
+            s2::RequestPermissionRequest::new(acp_sid.to_string(), title, options).subject(subject),
+        );
+    }
+    let options = options
+        .into_iter()
+        .map(|o| s1::PermissionOption::new(o.id, o.name, option_kind_v1(o.kind)))
+        .collect();
+    Ask::PermissionV1(s1::RequestPermissionRequest::new(
+        acp_sid.to_string(),
+        card.update_v1(),
+        options,
+    ))
+}
+
+/// An `elicitation/create` form: its fields, in display order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Form {
+    pub fields: Vec<Field>,
+}
+
+/// One form field.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Field {
+    pub key: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub required: bool,
+    pub kind: FieldKind,
+}
+
+/// What a form field asks for.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FieldKind {
+    Text {
+        max_length: Option<u32>,
+        default: Option<String>,
+    },
+    /// One of a fixed list of strings.
+    Enum {
+        values: Vec<String>,
+        default: Option<String>,
+    },
+    /// One titled choice.
+    OneOf(Vec<Choice>),
+    /// Any number of titled choices.
+    AnyOf {
+        choices: Vec<Choice>,
+        min_items: Option<u64>,
+        max_items: Option<u64>,
+    },
+    Flag {
+        default: Option<bool>,
+    },
+}
+
+/// One titled choice. `meta` is the choice's `_meta`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Choice {
+    pub value: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub meta: Option<Meta>,
+}
+
+impl Field {
+    pub fn new(key: &str, kind: FieldKind) -> Field {
+        Field {
+            key: key.to_string(),
+            title: None,
+            description: None,
+            required: false,
+            kind,
+        }
+    }
+    pub fn title(mut self, title: &str) -> Field {
+        self.title = Some(title.to_string());
+        self
+    }
+    pub fn description(mut self, description: &str) -> Field {
+        self.description = Some(description.to_string());
+        self
+    }
+    pub fn required(mut self, required: bool) -> Field {
+        self.required = required;
+        self
+    }
+}
+
+/// The form's `requestedSchema`, in one version's schema types. The two
+/// versions define the same elicitation schema in separate modules.
+macro_rules! requested_schema {
+    ($s:ident, $form:expr) => {{
+        let mut schema = $s::ElicitationSchema::new();
+        for field in $form.fields {
+            let property: $s::ElicitationPropertySchema = match field.kind {
+                FieldKind::Text {
+                    max_length,
+                    default,
+                } => $s::StringPropertySchema::new()
+                    .title(field.title)
+                    .description(field.description)
+                    .max_length(max_length)
+                    .default_value(default)
+                    .into(),
+                FieldKind::Enum { values, default } => $s::StringPropertySchema::new()
+                    .title(field.title)
+                    .description(field.description)
+                    .enum_values(values)
+                    .default_value(default)
+                    .into(),
+                FieldKind::OneOf(choices) => $s::StringPropertySchema::new()
+                    .title(field.title)
+                    .description(field.description)
+                    .one_of(
+                        choices
+                            .into_iter()
+                            .map(|c| {
+                                $s::EnumOption::new(c.value, c.title)
+                                    .description(c.description)
+                                    .meta(c.meta)
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .into(),
+                FieldKind::AnyOf {
+                    choices,
+                    min_items,
+                    max_items,
+                } => $s::MultiSelectPropertySchema::titled(
+                    choices
+                        .into_iter()
+                        .map(|c| {
+                            $s::EnumOption::new(c.value, c.title)
+                                .description(c.description)
+                                .meta(c.meta)
+                        })
+                        .collect(),
+                )
+                .title(field.title)
+                .description(field.description)
+                .min_items(min_items)
+                .max_items(max_items)
+                .into(),
+                FieldKind::Flag { default } => $s::BooleanPropertySchema::new()
+                    .title(field.title)
+                    .description(field.description)
+                    .default_value(default)
+                    .into(),
+            };
+            schema = schema.property(field.key, property, field.required);
+        }
+        schema
+    }};
+}
+
+/// A session-scoped `elicitation/create` form, tied to the tool call
+/// `tool_call_id` when there is one.
+pub fn form(acp_sid: &str, ver: u8, tool_call_id: Option<&str>, message: &str, form: Form) -> Ask {
+    if ver == 2 {
+        let scope = s2::ElicitationSessionScope::new(acp_sid.to_string())
+            .tool_call_id(tool_call_id.map(|id| s2::ToolCallId::new(id.to_string())));
+        let mode = s2::ElicitationFormMode::new(scope, requested_schema!(s2, form));
+        return Ask::ElicitationV2(s2::CreateElicitationRequest::new(mode, message));
+    }
+    let scope = s1::ElicitationSessionScope::new(acp_sid.to_string())
+        .tool_call_id(tool_call_id.map(|id| s1::ToolCallId::new(id.to_string())));
+    let mode = s1::ElicitationFormMode::new(scope, requested_schema!(s1, form));
+    Ask::ElicitationV1(s1::CreateElicitationRequest::new(mode, message))
+}
+
+/// A request-scoped URL `elicitation/create`: open `url` while the client's
+/// request `request_id` is outstanding. ACP v2 only (`auth/login`).
+pub fn url_elicitation(
+    request_id: &crate::editor::RequestId,
+    elicitation_id: &str,
+    url: &str,
+    message: &str,
+) -> Option<Ask> {
+    let request_id: s2::RequestId = serde_json::from_value(request_id.value()).ok()?;
+    let scope = s2::ElicitationRequestScope::new(request_id);
+    let mode = s2::ElicitationUrlMode::new(scope, elicitation_id.to_string(), url);
+    Some(Ask::ElicitationV2(s2::CreateElicitationRequest::new(
+        mode, message,
+    )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn sample_form() -> Form {
+        Form {
+            fields: vec![
+                Field::new(
+                    "q0",
+                    FieldKind::AnyOf {
+                        choices: vec![Choice {
+                            value: "a".to_string(),
+                            title: "A".to_string(),
+                            description: Some("first".to_string()),
+                            meta: muse_meta(r#""preview":{"content":"x","format":"markdown"}"#),
+                        }],
+                        min_items: Some(0),
+                        max_items: Some(2),
+                    },
+                )
+                .title("Pick")
+                .required(true),
+                Field::new(
+                    "ok",
+                    FieldKind::Flag {
+                        default: Some(false),
+                    },
+                )
+                .title("OK"),
+            ],
+        }
+    }
+
+    #[test]
+    fn forms_serialize_as_each_versions_elicitation_schema() {
+        for ver in [1, 2] {
+            let params = form("s-1", ver, Some("call-1"), "Answer", sample_form()).params();
+            assert_eq!(params["sessionId"], "s-1", "v{ver}");
+            assert_eq!(params["toolCallId"], "call-1", "v{ver}");
+            assert_eq!(params["mode"], "form", "v{ver}");
+            assert_eq!(params["message"], "Answer", "v{ver}");
+            let schema = &params["requestedSchema"];
+            assert_eq!(schema["type"], "object");
+            assert_eq!(schema["required"], json!(["q0"]));
+            assert_eq!(
+                schema["properties"]["q0"],
+                json!({
+                    "type": "array",
+                    "title": "Pick",
+                    "minItems": 0,
+                    "maxItems": 2,
+                    "items": {"anyOf": [{
+                        "const": "a",
+                        "title": "A",
+                        "description": "first",
+                        "_meta": {"muse": {"preview": {"content": "x", "format": "markdown"}}}
+                    }]}
+                }),
+                "v{ver}"
+            );
+            assert_eq!(
+                schema["properties"]["ok"],
+                json!({"type": "boolean", "title": "OK", "default": false})
+            );
+        }
+        // No tool call: the scope is the session alone.
+        let params = form("s-1", 2, None, "m", Form::default()).params();
+        assert!(params.get("toolCallId").is_none());
+        assert!(params["requestedSchema"].get("required").is_none());
+    }
+
+    #[test]
+    fn permission_requests_follow_each_versions_shape() {
+        let mut card = Card::new("call-1");
+        card.title = Some("Run ls".to_string());
+        card.kind = Some("execute".to_string());
+        card.status = Some("pending".to_string());
+        let options = vec![
+            PermissionOption {
+                id: "c-once".to_string(),
+                name: "Allow once".to_string(),
+                kind: "allow_once",
+            },
+            PermissionOption {
+                id: "c-deny".to_string(),
+                name: "Reject".to_string(),
+                kind: "reject_always",
+            },
+        ];
+        let v1 = permission("s-1", 1, "Run ls", card.clone(), options.clone()).params();
+        assert_eq!(
+            v1,
+            json!({
+                "sessionId": "s-1",
+                "toolCall": {"toolCallId": "call-1", "title": "Run ls", "kind": "execute", "status": "pending"},
+                "options": [
+                    {"optionId": "c-once", "name": "Allow once", "kind": "allow_once"},
+                    {"optionId": "c-deny", "name": "Reject", "kind": "reject_always"}
+                ]
+            })
+        );
+        let v2 = permission("s-1", 2, "Run ls", card, options).params();
+        assert_eq!(v2["title"], "Run ls");
+        assert_eq!(v2["subject"]["type"], "tool_call");
+        assert_eq!(v2["subject"]["toolCall"]["toolCallId"], "call-1");
+        assert_eq!(v2["subject"]["toolCall"]["kind"], "execute");
+        assert_eq!(v2["options"][1]["kind"], "reject_always");
+    }
+
+    #[test]
+    fn a_url_elicitation_is_scoped_to_the_login_request() {
+        let id = crate::editor::RequestId::of_value(&7);
+        let params = url_elicitation(&id, "login-1", "https://example.test/device", "Sign in")
+            .expect("numeric id")
+            .params();
+        assert_eq!(
+            params,
+            json!({
+                "requestId": 7,
+                "mode": "url",
+                "elicitationId": "login-1",
+                "url": "https://example.test/device",
+                "message": "Sign in"
+            })
+        );
+    }
 }

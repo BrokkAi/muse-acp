@@ -604,12 +604,6 @@ fn written<E>(outcome: Result<(), E>) {
     }
 }
 
-/// A request id as JSON text, `null` for none.
-pub fn id_json(id: &Option<RequestId>) -> String {
-    id.as_ref()
-        .map_or_else(|| "null".to_string(), |id| id.value().to_string())
-}
-
 /// Answer an extension method (a `_`-prefixed method, `session/set_model`,
 /// `shutdown`) whose result no ACP schema defines; `result_json` is the
 /// result object as JSON text.
@@ -877,26 +871,8 @@ pub const TAG_DEVICE_LOGIN: &str = "device-login";
 /// `Incoming::Answer` carrying `tag`. Returns the request's id, for the
 /// flow's state and for `send_cancel_request`, or `None` when it could not be
 /// written (the editor is gone, and the shutdown deadline is running).
-pub fn send_request(
-    stdout: &StdoutShared,
-    method: &str,
-    params_json: &str,
-    tag: &str,
-) -> Option<RequestId> {
-    let message = serde_json::from_str::<serde_json::Value>(params_json)
-        .map_err(|error| error.to_string())
-        .and_then(|params| {
-            agent_client_protocol::UntypedMessage::new(method, params)
-                .map_err(|error| error.to_string())
-        });
-    let message = match message {
-        Ok(message) => message,
-        Err(error) => {
-            crate::msp::log(&format!("internal: invalid {method} params: {error}"));
-            return None;
-        }
-    };
-    match stdout.request(message, tag) {
+pub fn send_ask(stdout: &StdoutShared, ask: out::Ask, tag: &str) -> Option<RequestId> {
+    match stdout.ask(ask, tag) {
         Ok(id) => Some(id),
         Err(_) => {
             crate::shutdown::disconnect();
@@ -1063,8 +1039,8 @@ fn perm_kind(decision: &str, scope: &str) -> &'static str {
 }
 
 /// Build ACP permission `options` from MSP `availableChoices`; returns
-/// (options_json, choices) for later decision mapping.
-pub fn perm_options(params: &J) -> (String, Vec<PermChoice>) {
+/// (options, choices) for later decision mapping.
+pub fn perm_options(params: &J) -> (Vec<out::PermissionOption>, Vec<PermChoice>) {
     let mut opts = Vec::new();
     let mut choices = Vec::new();
     if let J::Arr(items) = params.get("availableChoices").cloned().unwrap_or(J::Null) {
@@ -1102,12 +1078,11 @@ pub fn perm_options(params: &J) -> (String, Vec<PermChoice>) {
                 }
                 None => label,
             };
-            opts.push(format!(
-                "{{\"optionId\":{},\"name\":{},\"kind\":\"{}\"}}",
-                esc(&id),
-                esc(&name),
-                perm_kind(&decision, &scope)
-            ));
+            opts.push(out::PermissionOption {
+                id: id.clone(),
+                name,
+                kind: perm_kind(&decision, &scope),
+            });
             let accepts_feedback = c
                 .get("acceptsFeedback")
                 .and_then(|v| match v {
@@ -1123,7 +1098,7 @@ pub fn perm_options(params: &J) -> (String, Vec<PermChoice>) {
             });
         }
     }
-    (format!("[{}]", opts.join(",")), choices)
+    (opts, choices)
 }
 
 /// The first approving choice scoped to a single action, in host order.
@@ -2222,7 +2197,7 @@ mod tests {
             }"#,
         )
         .expect("approval choices JSON");
-        let (options_json, choices) = perm_options(&params);
+        let (options, choices) = perm_options(&params);
         assert_eq!(
             choices
                 .iter()
@@ -2249,9 +2224,6 @@ mod tests {
         }];
         assert_eq!(approve_once_choice(&durable_only), None);
 
-        let J::Arr(options) = crate::json::parse_json(&options_json).expect("options JSON") else {
-            panic!("permission options must be an array");
-        };
         let expected = [
             ("c-once", "Allow once", "allow_once"),
             (
@@ -2268,9 +2240,9 @@ mod tests {
         ];
         assert_eq!(options.len(), expected.len());
         for (option, (id, name, kind)) in options.iter().zip(expected) {
-            assert_eq!(option.get("optionId").and_then(J::as_str), Some(id));
-            assert_eq!(option.get("name").and_then(J::as_str), Some(name));
-            assert_eq!(option.get("kind").and_then(J::as_str), Some(kind));
+            assert_eq!(option.id, id);
+            assert_eq!(option.name, name);
+            assert_eq!(option.kind, kind);
         }
     }
 
