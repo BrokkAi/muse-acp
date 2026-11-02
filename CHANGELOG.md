@@ -2,6 +2,50 @@
 
 ## Unreleased
 
+- Speak ACP through the official Rust SDK, the `agent-client-protocol` crate
+  (5.0.0), instead of the in-repo `acp-lite` crate, which is removed. The SDK
+  now owns the stdio transport, JSON-RPC, ACP v1/v2 version negotiation, the
+  initialize-first rule, request parsing, the serialization of every
+  response, `session/update`, permission prompt, form, file and terminal
+  request the adapter sends, and the `$/cancel_request` withdrawal of the
+  adapter's own requests. Only Muse and JetBrains AIR extensions that no ACP
+  schema defines (`_session/*` methods, `session/set_model`, the legacy
+  `subagent/*` controls, `_meta` members, AIR updates) remain the adapter's
+  own JSON. What clients see change:
+  - JSON-RPC batches are refused in both versions with one `-32600`
+    (`id: null`), and none of their entries run. ACP v2 batches were
+    previously answered entry by entry.
+  - A request that does not fit the version's ACP schema is refused with
+    `-32602` before it reaches Muse: for example an ACP v1 `session/new`
+    without `mcpServers`, a `session/load`, `session/resume` or
+    `session/fork` without `cwd`, a stdio MCP server without `command` (ACP
+    v1 also requires its `args` and `env`), or an image block without `data`
+    (an image named only by `uri` is no longer read from disk).
+    `session/cancel` works only as the notification ACP defines; sent as a
+    request it gets `-32601`.
+  - `initialize` with a `protocolVersion` below 1 answers with ACP v1, the
+    SDK's fallback, instead of a version error.
+  - Optional result fields that are empty or unset are left out rather than
+    sent as `null` or `[]` (for example `nextCursor` on the last
+    `session/list` page, an empty `authMethods` or `additionalDirectories`).
+  - The legacy `session/set_mode` answers with the schema's empty
+    `SetSessionModeResponse`, carrying the mode Muse applied in
+    `_meta.muse.mode` instead of a top-level `mode`.
+  - `session/list` filters by `cwd` only; the non-standard
+    `additionalDirectories` filter is ignored, as the schema has no such
+    field. ACP v2 `sse` MCP servers are dropped as an unsupported transport.
+  - Native subagents follow the ACP subagents RFD as the SDK defines it: ACP
+    v1 clients that advertise `clientCapabilities.subagents`, and every ACP
+    v2 client (the RFD needs no capability there), get `subagent_update`
+    with the child's title, description and state instead of the earlier
+    draft's `subagent_spawned` and `subagent_state_update`. JetBrains AIR
+    clients that negotiate `nativeSubagentSessions` keep AIR's updates.
+  - The adapter's own request ids are the SDK's, and malformed-frame errors
+    carry the SDK's messages. An invalid UTF-8 line still gets `-32700` and
+    reading goes on.
+  - `serde_json` is built without `arbitrary_precision`: ACP numbers are
+    64-bit, as the SDK reads them.
+
 - Take a session's drive back when Muse refuses a turn because another
   client holds it (#452). Only a shared Muse session daemon, which
   `muse serve --join` in `MUSE_SERVE_ARGS` reaches, hands a session between

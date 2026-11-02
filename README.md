@@ -23,14 +23,14 @@ Client implementers should start with the
 Muse method, `_meta` shape, capability, fallback, and the ACP standard fields
 used where they exist.
 
-The workspace also contains a reusable synchronous ACP SDK for both sides of
-the protocol, [`acp-lite`](crates/acp-lite/README.md). Its client side can
-launch any ACP stdio agent, negotiate ACP v1 or v2, stream session updates,
-and route agent requests such as permissions and elicitation through a
-configurable handler. Its agent side answers a client's requests and batches,
-streams notifications, and matches the agent's own requests to the client with
-their answers. It is independent of the adapter binary and of the upstream
-`agent-client-protocol` Rust crate.
+Toward the editor, the adapter speaks ACP through the official Rust SDK, the
+[`agent-client-protocol`](https://crates.io/crates/agent-client-protocol)
+crate. The SDK owns the stdio transport, JSON-RPC, ACP v1/v2 version
+negotiation, request parsing into its typed schema, the serialization of
+every response, notification and request the adapter sends, and the
+`$/cancel_request` withdrawal of the adapter's own requests. Only Muse
+extensions that no ACP schema defines (the `_session/*` methods, `_meta`
+members, and JetBrains AIR updates) are the adapter's own JSON.
 
 Toward Muse, the adapter speaks MSP through
 [`muse-msp-client`](crates/muse-msp-client/README.md), a dependency-free
@@ -549,9 +549,11 @@ error the editor shows if Muse then refuses the profile says why.
   With form elicitation, one form collects the classification, the note, and
   explicit consent for each attachment (local tracing, the session record),
   both defaulting off.
-- **Tasks and subagents** — backgrounded shell commands, workflows, and native
-  subagents surfaced through negotiated ACP extensions where the client
-  advertises support, with synthesized tool cards otherwise. Actual tool calls
+- **Tasks and subagents** — native subagents as the ACP subagents RFD's
+  `subagent_update` (ACP v1 clients that advertise
+  `clientCapabilities.subagents`, and every ACP v2 client) or as JetBrains
+  AIR's updates, and backgrounded shell commands and workflows through
+  negotiated ACP extensions, with synthesized tool cards otherwise. Actual tool calls
   carry Muse's programmatic `Item.tool` as standard ACP `ToolCall.name`. On Muse 1.4.9+
   a tool card's title uses the host's `Item.displayLabel`: active wording while
   running, done wording after success, and neutral wording for failure or
@@ -587,12 +589,9 @@ error the editor shows if Muse then refuses the profile says why.
   outcome, and terminal reason; opt-in `_session/hooks` reads the session's
   installed handler rows (`hook/list`) and labels those cards with each
   handler's origin and enabled switch.
-- **JSON-RPC batches** — ACP v2 batch arrays follow the JSON-RPC 2.0 rules:
-  each entry runs as if sent alone, the answers that are ready leave together
-  as one array, invalid entries get their own `-32600` with `id: null`, an
-  empty array gets a single `-32600`, and a notification-only batch gets no
-  reply. A prompt that waits on its turn is answered alone when it settles.
-  ACP v1 has no batches, so a v1 batch is refused with one `-32600`.
+- **No JSON-RPC batches** — ACP does not use batches. As in the ACP SDK, a
+  batch array in either version is refused with one `-32600` (`id: null`)
+  and none of its entries run.
 
 ### Protocol extensions
 

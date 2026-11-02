@@ -29,6 +29,13 @@ ACP v1 clients also advertise standard compaction support with
 `clientCapabilities.session.compaction: {}`. ACP v2 needs no compaction
 capability.
 
+The adapter speaks ACP through the official `agent-client-protocol` Rust SDK.
+Every request is parsed into the negotiated version's schema type, so a
+request that does not fit the schema is refused with `-32602` before Muse
+sees it, and fields the schema does not define are ignored unless this page
+names them. JSON-RPC batches are refused with one `-32600` and none of their
+entries run.
+
 
 ## Extension methods
 
@@ -54,9 +61,24 @@ calling one.
 | --- | --- | --- |
 | `session/set_model` | Non-standard. The legacy unstable `SetSessionModelRequest` (ACP v0.10), absent from every current v1 and v2 schema. | Accepts `{sessionId, modelId}`, forwards the id to Muse `session/setModel`, and answers `{"model": modelId}`; Muse's `session/modelChanged` then moves the standard `model` selector through `config_option_update`. New clients should use `session/set_config_option` with the `model` option instead. The adapter never returns the legacy `models` session state, so clients that follow that unstable feature do not call it; it remains for older clients and scripts. |
 
-Subagent updates use the ACP subagent RFD through
-`capabilities.session.subagents` or AIR `nativeSubagentSessions`. Without
-negotiation they fall back to synthesized tool cards.
+### Native subagents
+
+A Muse subagent's child session is announced on its parent session and the
+child's transcript is sent under the child's session id:
+
+| Client | Updates on the parent |
+| --- | --- |
+| ACP v1 with `clientCapabilities.subagents: {}` | The ACP subagents RFD's `subagent_update`: `sessionId` (the child), `title` (the agent path), `description` (the objective), `state` (`running` while the fold sees it run; then `idle` with `stopReason` `end_turn`, `error` or `cancelled`, or `unknown` when Muse lost track of the child), and `_meta.muse` provenance (`subagentId`, `depth`, `controlStatus`). `capabilities` stays unset, so the client may not mutate the child session. |
+| ACP v2 | The same `subagent_update`; the RFD makes it a baseline v2 requirement that needs no capability. |
+| JetBrains AIR `nativeSubagentSessions` (an ACP v1 client without the standard capability, or any v2 client) | AIR's `subagent_spawned` (`subagentSessionId`, `name`, `task`, `capabilities: {}`, `_meta.muse`) and `subagent_state_update` (`completed`, `failed`, `cancelled`, `disconnected`). |
+| Anything else | Synthesized `subagent` tool cards. |
+
+With native subagents the non-standard `subagent/sendMessage`,
+`subagent/followupTask`, `subagent/interrupt`, `subagent/stop`,
+`subagent/resume`, `subagent/reopen`, `subagent/close`, and
+`subagent/readResult` requests (`{sessionId, commandId, subagentId, ...}`)
+forward to the Muse commands of the same names when the child's lifecycle
+allows them; without native subagents they are refused.
 
 
 ## Lifecycle request metadata
@@ -68,6 +90,7 @@ negotiation they fall back to synthesized tool cards.
 | `session/load` or `session/resume` `params._meta.mspSessionId` | Client to agent | Legacy recovery id for a session stored under an adapter-generated ACP id. Omit for normal modern sessions. |
 | `session/load`, `session/resume`, `session/new`, and `session/fork` result `_meta.mspSessionId` | Agent to client | The durable Muse session id. Modern ACP `sessionId` normally already equals it; this is primarily compatibility metadata. |
 | `session/fork` request `_meta.jetbrains.air.forkPoint` | Client to agent | AIR cut-point selector. It is resolved against host history before a fork command is sent. |
+| ACP v2 `session/fork` request `replayFrom` | Client to agent | AIR's extension of the v2 `session/resume` field to forks, read with the schema's `ReplayFrom` type. With it (for example `{"type":"start"}`) the fork's history is replayed; without it an ACP v2 fork replays nothing. ACP v1 forks always replay. |
 | Prompt `_meta.jetbrains.air.agentFileChangeReportRequest` | Client to agent | Requests one AIR file-change report for the turn. |
 | `_session/steering` `_meta.steering.idleBehavior` | Client to agent | `promptRequired`: when no turn is running, return `{"outcome":"promptRequired","reason":"noRunningTurn"}` instead of starting a turn, so the client can send the text as a prompt. Other values are rejected. |
 
@@ -83,6 +106,7 @@ permission profiles are separate from ACP `approvalMode`.
 | Fork result `_meta.muse.forkedFrom` | object | Host fork provenance. |
 | `session/load` and `session/resume` result `_meta.muse.blockedPrompt` | `{text}` | Muse 1.4.12+: the latest blocked main prompt, the exact submitted text, passed through verbatim. It is recall data: a client may refill its prompt box with `text`, and must not show it as history. The adapter never replays it as a message. Absent when nothing is blocked or on older hosts. |
 | Side-chat result / attached side session `_meta.muse.sideFrom` | object | Host side-chat provenance. |
+| ACP v1 `session/set_mode` result `_meta.muse.mode` | string | The approval mode Muse applied, which can differ from the requested one. The result is otherwise the schema's empty `SetSessionModeResponse`. |
 | Config option `_meta.jetbrains.air.recommendedValue` | string | AIR recommendation metadata; it never changes the selected value. |
 | Auth method `_meta["terminal-auth"]` | `{label, command, args}` | Legacy terminal-auth description used with older editors. |
 

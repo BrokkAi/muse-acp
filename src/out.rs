@@ -76,6 +76,7 @@ impl Note {
     }
 
     /// The notification's `params`, as the SDK serializes them.
+    #[cfg(test)]
     pub fn params(&self) -> Value {
         match self {
             Note::V1(note) => serde_json::to_value(note).unwrap_or(Value::Null),
@@ -84,7 +85,8 @@ impl Note {
         }
     }
 
-    /// The whole JSON-RPC frame as text, as it goes on the wire.
+    /// The whole frame as text, for tests that read it as the client would.
+    #[cfg(test)]
     pub fn line(&self) -> String {
         serde_json::json!({
             "jsonrpc": "2.0",
@@ -95,8 +97,8 @@ impl Note {
     }
 }
 
+#[cfg(test)]
 impl std::fmt::Display for Note {
-    /// The frame as it goes on the wire.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.line())
     }

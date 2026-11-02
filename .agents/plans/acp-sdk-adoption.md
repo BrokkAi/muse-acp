@@ -18,10 +18,10 @@ Observable result: an editor sees the same ACP behavior as before, except where 
 
 - [x] (2026-11-02) Baseline: `cargo test --locked --workspace` passes (451 `acp_serve` tests, 265 unit tests).
 - [x] (2026-11-02) Prototype in a scratch crate: router with v1 and v2 builders over `Lines`, typed enum dispatch forwarded to a synchronous thread, SDK framing errors, batch refusal.
-- [ ] Milestone 1: transport and JSON-RPC on the SDK; `acp-lite` deleted; batches dropped.
-- [ ] Milestone 2: typed inbound requests (SDK schema structs) for every standard method.
-- [ ] Milestone 3: typed outbound responses, session updates, and client requests.
-- [ ] Milestone 4: documentation, changelog, cleanup, full gate run.
+- [x] (2026-11-02) Milestone 1: transport and JSON-RPC on the SDK; `acp-lite` deleted; batches dropped (commit 8c8bb32).
+- [x] (2026-11-02) Milestone 2: typed inbound requests (SDK schema structs) for every standard method, read into one view per method in `src/request.rs` (c90ddaf).
+- [x] (2026-11-02) Milestone 3: typed outbound values. Transcript updates (c1d2663); initialize, session setup and config option responses (06bffd8); every other session update (9f9deff); every other standard response (12dd005); permission prompts and forms with typed answers (e024f1c); editor file and terminal requests (8b50ee0); the subagents RFD's `subagent_update` (ca2279e).
+- [x] (2026-11-02) Milestone 4: README, `docs/acp-extensions.md`, CHANGELOG, dead-code removal, full gate run.
 
 
 ## Surprises & Discoveries
@@ -33,6 +33,15 @@ Observable result: an editor sees the same ACP behavior as before, except where 
   Evidence: `ResponderDropGuard::drop` in the SDK's `src/jsonrpc.rs` returns early when `connection_state.is_shutting_down()`.
 
 - Observation: `Builder::connect_to` returns at clean stdin EOF after draining output already queued; responses produced later are lost. An `on_close` callback runs before that drain and may wait, so the adapter's close callback waits until the main loop has answered what it owes.
+
+- Observation: the test client sent requests that do not fit the ACP schema (no `mcpServers` on v1 `session/new`, no `cwd` on `session/load`, uri-only images, `session/cancel` as a request, stdio MCP entries without `args`/`env`). The SDK refuses them with `-32602` (or `-32601` for the request form of a notification). The tests now send conforming params, and the cases that tested non-conforming input assert the SDK's refusal.
+
+- Observation: ACP v2 has no `capabilities.subagents`; the earlier tests advertised one. The schema crate (feature `unstable_subagents`) defines the current subagents RFD: ACP v1 `clientCapabilities.subagents` and the `subagent_update` session update in both versions, which v2 clients must understand without a capability. The adapter had been sending an older draft's `subagent_spawned`/`subagent_state_update` to standard clients.
+  Evidence: `SubagentUpdate` in `agent-client-protocol-schema` 1.15.1 `src/v1/client.rs` and `src/v2/client.rs`; the v2 schema text "No Client capability is required."
+
+- Observation: a live side-chat resume failed with `workspace_not_composed` once every `session/resume` carried a `cwd`: the adapter marked host roots pending even when the host reported no workspace. It now marks them only when the host has one.
+
+- Observation: the live test `rename_drives_a_real_host_across_the_capability_registry` fails with `naming_unavailable` on the untouched base commit too (3 of 3 runs); it depends on the installed Muse build, not on this change.
 
 
 ## Decision Log
@@ -53,6 +62,14 @@ Observable result: an editor sees the same ACP behavior as before, except where 
   Rationale: `Stdio` ends the connection on an invalid UTF-8 line; with `Lines` such a line reaches the SDK's parser and gets its `-32700` reply, and reading goes on.
   Date/Author: 2026-11-02 / user decision.
 
+- Decision: send standard clients the SDK's typed `subagent_update` (ACP v1 with `clientCapabilities.subagents`, and every ACP v2 client), and keep AIR's own updates for clients that negotiate AIR `nativeSubagentSessions` without the standard v1 capability.
+  Rationale: the user asked that nothing the SDK does stays hand-rolled; the SDK defines the subagent update, and AIR's updates are an extension no schema defines.
+  Date/Author: 2026-11-02 / agent.
+
+- Decision: build the adapter's outgoing requests (`session/request_permission`, `elicitation/create`, `fs/*`, `terminal/*`) from the SDK's request types and read the answers as the SDK's response types (`request::Answer`), instead of reading raw JSON.
+  Rationale: the SDK parses and validates the client's answer; a malformed answer arrives as an error, which every flow already fails closed on.
+  Date/Author: 2026-11-02 / agent.
+
 - Decision: run the SDK connection on its own thread under `futures::executor::block_on`, and keep the adapter's synchronous main loop. Handlers registered on the SDK builders forward each incoming message, with its `Responder`, to the main loop over the existing `mpsc` channel.
   Rationale: the adapter's 17,000-line main loop is synchronous and blocks on MSP commands; the SDK is runtime-neutral and needs no tokio. Forwarding keeps message order and lets the SDK keep reading while the main loop is busy.
   Date/Author: 2026-11-02 / agent.
@@ -60,7 +77,11 @@ Observable result: an editor sees the same ACP behavior as before, except where 
 
 ## Outcomes & Retrospective
 
-To be written at each milestone.
+(2026-11-02) Done. `acp-lite` and every hand-built ACP frame are gone. The SDK reads every request into its typed schema, and every response, notification and request the adapter sends is an SDK schema value. What stays the adapter's own JSON is what no ACP schema defines: `_meta` members, the results of extension methods (`_session/*`, `session/set_model`, `subagent/*`, `shutdown`), JetBrains AIR updates (sent as the v2 `Other` update or, in v1, an `UntypedMessage`), and AIR's `subagents` member of the initialize response. JSON-RPC batches are refused as the SDK refuses them.
+
+Behavior that changed for clients is listed in `CHANGELOG.md` under Unreleased. All workspace tests pass (`acp_serve` 451, unit 270); the live loopback suite passes except the rename test that also fails on the base commit.
+
+Not done here because the adapter never did it, by hand or otherwise: the unstable ACP methods the SDK can parse but the adapter does not serve (`session/set_title`, `session/archive`, `session/status`, `auth/status`, `providers/*`) and the v2 `state_update.background` work list.
 
 
 ## Context and Orientation
@@ -110,7 +131,7 @@ Every step is an ordinary source edit under git; `git diff` shows progress and `
 
 ## Artifacts and Notes
 
-None yet.
+Gate run on 2026-11-02: `cargo fmt --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo test --locked --workspace`, `cargo run -- --selftest`, `node --test npm/test/launcher.test.cjs`, `python3 -m unittest discover -s scripts -p 'test_*.py'`, `sh -n install.sh`, `node scripts/smoke_npm.cjs target/debug/muse-acp`, and `MUSE_ACP_LOOPBACK=1 cargo test --locked -p muse-acp --test live_loopback`.
 
 
 ## Interfaces and Dependencies
