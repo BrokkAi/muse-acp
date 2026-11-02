@@ -46,6 +46,9 @@ Observable result: an editor sees the same ACP behavior as before, except where 
 - Observation: neither schema's `session/load` or `session/resume` result has a `sessionId`; the old adapter repeated the client's id there. Two live tests read it and now read `_meta.mspSessionId`.
 
 
+- Observation (review, 2026-11-02): three regressions against the pre-SDK adapter surfaced in review. Extension methods sent as notifications (`shutdown`, `exit`, `_session/*`, `subagent/*`, `session/set_model`) were dropped, so an `exit` notification no longer stopped the adapter until the shutdown deadline expired with status 1. ACP v2 `session/load` was read with the v1 schema, which requires `mcpServers`; the test harness masked it by adding `mcpServers` for every version. On the RFD path, a settled child that ran again was never shown running. All three are fixed with regression tests, and the harness now adds `mcpServers` for v1 only.
+
+
 ## Decision Log
 
 - Decision: drop JSON-RPC batch support.

@@ -588,33 +588,42 @@ impl Editor {
                 let request = cx.prepare_request(request);
                 let id = RequestId::of_value(request.id());
                 let done = register(id.clone(), request.cancellation_handle());
-                request
+                if request
                     .on_receiving_result(move |result| async move {
                         done(result);
                         Ok(())
                     })
-                    .map_err(|_| Gone)?;
+                    .is_err()
+                {
+                    lock(&self.shared.outgoing).remove(&id);
+                    return Err(Gone);
+                }
                 Ok(id)
             }
             Connection::V2(cx) => {
                 let request = cx.prepare_request(request);
                 let id = RequestId::of_value(request.id());
                 let done = register(id.clone(), request.cancellation_handle());
-                request
+                if request
                     .on_receiving_result(move |result| async move {
                         done(result);
                         Ok(())
                     })
-                    .map_err(|_| Gone)?;
+                    .is_err()
+                {
+                    lock(&self.shared.outgoing).remove(&id);
+                    return Err(Gone);
+                }
                 Ok(id)
             }
         }
     }
 
     /// Withdraw a request the adapter sent, with `$/cancel_request`. The
-    /// client may still answer it; that answer still arrives.
+    /// client may still answer it; that answer still arrives. The client may
+    /// also never answer it, so its cancellation handle is dropped here.
     pub fn cancel(&self, id: &RequestId) {
-        let handle = lock(&self.shared.outgoing).get(id).cloned();
+        let handle = lock(&self.shared.outgoing).remove(id);
         if let Some(handle) = handle {
             let _ = handle.cancel();
         }

@@ -242,6 +242,15 @@ pub fn v1(message: V1Message) -> Option<(Option<RequestId>, Request)> {
                 session_id: cancel.session_id.to_string(),
             },
         )),
+        // An extension notification runs its method as the request does,
+        // without an answer, as before the SDK.
+        V1Message::Notification(N::ExtNotification(ext)) => Some((
+            None,
+            Request::Extension {
+                params: serde_json::from_str(ext.params.get()).unwrap_or(Value::Null),
+                method: ext.method.to_string(),
+            },
+        )),
         V1Message::Notification(_) => None,
         V1Message::Request(id, request) => Some((
             Some(id),
@@ -431,6 +440,13 @@ pub fn v2(message: V2Message) -> Option<(Option<RequestId>, Request)> {
             None,
             Request::Cancel {
                 session_id: cancel.session_id.to_string(),
+            },
+        )),
+        V2Message::Notification(N::ExtNotification(ext)) => Some((
+            None,
+            Request::Extension {
+                params: serde_json::from_str(ext.params.get()).unwrap_or(Value::Null),
+                method: ext.method.to_string(),
             },
         )),
         V2Message::Notification(_) => None,
@@ -623,6 +639,26 @@ pub fn prompt_blocks(ver: u8, prompt: Option<&Value>) -> Result<Vec<Block>, Stri
 pub fn untyped(ver: u8, message: UntypedMessage) -> Result<Request, Error> {
     let (method, params) = message.into_parts();
     let request = match method.as_str() {
+        // ACP v2 has no `session/load`; its v2 clients send the fields of v2
+        // `session/resume` (optional `mcpServers`, v2 MCP entries), so they
+        // are read with that type. History always replays on load, so a
+        // `replayFrom` there means nothing.
+        "session/load" if ver == 2 => {
+            let r: v2::schema::ResumeSessionRequest =
+                agent_client_protocol::util::json_cast_params(&params)?;
+            Request::LoadSession(Setup {
+                session_id: r.session_id.to_string(),
+                cwd: path(&r.cwd.0),
+                additional_directories: r
+                    .additional_directories
+                    .iter()
+                    .map(|p| path(&p.0))
+                    .collect(),
+                mcp_servers: r.mcp_servers.into_iter().map(v2_mcp).collect(),
+                replay_from: None,
+                meta: meta(r.meta),
+            })
+        }
         "session/load" => Request::LoadSession(v1_load(
             v1::schema::LoadSessionRequest::parse_message(&method, &params)?,
         )),

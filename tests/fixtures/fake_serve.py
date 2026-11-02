@@ -1612,6 +1612,14 @@ def on_turn_start(params):
             notify("item/updated", {**base, "item": {
                 **item, "revision": 4, "controlStatus": "resultReady",
                 "result": result}})
+            if n == "a" and os.environ.get("FAKE_SUBAGENT_RERUN") == "1":
+                # The owner messages the settled child again: it runs, then
+                # holds a new result.
+                notify("item/updated", {**base, "item": {
+                    **item, "revision": 5, "controlStatus": "running"}})
+                notify("item/updated", {**base, "item": {
+                    **item, "revision": 6, "controlStatus": "resultReady",
+                    "result": result}})
             if n != "a":
                 notify("item/completed", {**base, "item": {
                     **item, "revision": 5, "controlStatus": "closed",

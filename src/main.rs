@@ -4587,9 +4587,10 @@ fn read_request(
         Incoming::V1(message) => request::v1(message).map(|(id, request)| (1, id, request)),
         Incoming::V2(message) => request::v2(message).map(|(id, request)| (2, id, request)),
         Incoming::Untyped { ver, id, message } => match request::untyped(ver, message) {
-            // A notification of a method the adapter serves as a request
-            // has nothing to answer.
-            Ok(_) if id.is_none() => None,
+            // A notification of a standard method the adapter serves as a
+            // request has nothing to answer. An extension method (including
+            // `shutdown` and `exit`) still runs, without an answer.
+            Ok(request) if id.is_none() && !matches!(request, Request::Extension { .. }) => None,
             Ok(request) => Some((ver, id, request)),
             Err(error) => {
                 if let Some(id) = id

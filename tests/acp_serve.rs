@@ -188,7 +188,9 @@ impl Client {
         };
         match method {
             "session/new" | "session/load" | "session/resume" | "session/fork" => {
-                if !object.contains_key("mcpServers") {
+                // ACP v2 makes `mcpServers` optional; v2 clients that leave
+                // it out must still be served.
+                if self.ver < 2 && !object.contains_key("mcpServers") {
                     object.insert("mcpServers".to_string(), serde_json::json!([]));
                 }
                 if method != "session/new" && !object.contains_key("cwd") {
@@ -6481,6 +6483,29 @@ fn prompt_keeps_the_refusal_when_the_drive_is_not_granted() {
         "the host refusal names the client that kept the drive: {error}"
     );
     assert_eq!(drive_calls(&c), ["turn/start", "session/requestDrive"]);
+    c.finish();
+}
+
+#[test]
+fn steering_sent_as_a_notification_still_reaches_the_turn() {
+    // Extension methods run whether or not the client asks for an answer.
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let prompt_id = c.prompt(&sid, "start");
+    c.wait_for(&format!("\"id\":{prompt_id}"), Duration::from_secs(15));
+    c.notify(
+        "_session/steering",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"also check the logs\"}}]}}"
+        ),
+    );
+    c.wait_input("also check the logs", Duration::from_secs(15));
+    let steers: Vec<_> = turn_inputs(&c)
+        .into_iter()
+        .filter(|params| params.get("expectedTurnId").is_some())
+        .collect();
+    assert_eq!(steers.len(), 1, "{steers:?}");
+    assert_eq!(steers[0]["expectedTurnId"], "turn-1");
     c.finish();
 }
 
@@ -12987,6 +13012,57 @@ fn native_subagent_sessions_spawn_state_and_replay_the_child() {
 }
 
 #[test]
+fn a_settled_subagent_that_runs_again_is_shown_running() {
+    // The subagents RFD mirrors the child's state, and a settled child can be
+    // messaged again. AIR's updates stay terminal-only, as before.
+    for air in [false, true] {
+        let init = if air {
+            ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}"
+        } else {
+            ""
+        };
+        let mut c = Client::spawn(
+            "subagent_result_ready",
+            &[("FAKE_CAPS", "subagents"), ("FAKE_SUBAGENT_RERUN", "1")],
+        );
+        let sid = c.new_session(2, init);
+        let pid = c.prompt(&sid, "delegate three");
+        c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        // The last child to settle; it fails.
+        let failed = if air {
+            "\"state\":\"failed\""
+        } else {
+            "\"stopReason\":\"error\""
+        };
+        c.wait_for_all(&["child-sess-ready-c", failed], Duration::from_secs(15));
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let states: Vec<serde_json::Value> = frames
+            .iter()
+            .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+            .map(|frame| frame["params"]["update"].clone())
+            .filter(|update| {
+                update["sessionId"] == "child-sess-ready-a"
+                    || update["subagentSessionId"] == "child-sess-ready-a"
+            })
+            .filter_map(|update| update.get("state").cloned())
+            .collect();
+        if air {
+            // Unchanged for AIR: one terminal update per state.
+            assert_eq!(states, [serde_json::json!("completed")], "AIR: {frames:#?}");
+        } else {
+            let idle = serde_json::json!({"state": "idle", "stopReason": "end_turn"});
+            let running = serde_json::json!({"state": "running"});
+            assert_eq!(
+                states,
+                [running.clone(), idle.clone(), running, idle],
+                "RFD: {frames:#?}"
+            );
+        }
+        c.finish();
+    }
+}
+
+#[test]
 fn native_subagent_result_ready_settles_the_child_once() {
     // #430: a child that reaches resultReady holds its result while its item
     // stays in progress, and nothing obliges the owner to read or close it.
@@ -14676,6 +14752,25 @@ fn closed_host_stdout_reaps_the_child_without_waiting_for_process_exit() {
     );
     c.finish();
     let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
+fn shutdown_and_exit_notifications_stop_the_adapter_cleanly() {
+    for (ver, method) in [(1, "exit"), (2, "exit"), (1, "shutdown"), (2, "shutdown")] {
+        let mut c = Client::spawn("quiet", &[("MUSE_SHUTDOWN_TIMEOUT_MS", "10000")]);
+        c.new_session(ver, "");
+        c.notify(method, "null");
+        // Well inside the shutdown deadline, which would exit with 1.
+        let status = c
+            .child
+            .wait_timeout(Duration::from_secs(5))
+            .expect("wait")
+            .unwrap_or_else(|| panic!("a v{ver} {method} notification left the adapter running"));
+        assert!(
+            status.success(),
+            "a v{ver} {method} notification must stop cleanly: {status}"
+        );
+    }
 }
 
 #[test]

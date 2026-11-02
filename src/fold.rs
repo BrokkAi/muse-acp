@@ -1674,6 +1674,7 @@ impl SessionFold {
     ) -> Note {
         if !self.air_subagents {
             let state = match state {
+                "running" => out::ChildState::Running,
                 "completed" => out::ChildState::Completed,
                 "failed" => out::ChildState::Failed,
                 "cancelled" => out::ChildState::Cancelled,
@@ -1952,6 +1953,13 @@ impl SessionFold {
     /// Send the child's state when it changed since the last one sent.
     fn settle_subagent(&mut self, acp_sid: &str, child: &str, item: &J, out: &mut Vec<Note>) {
         let Some(state) = Self::subagent_state(item) else {
+            // The RFD's `state` mirrors the child's, and a settled child can
+            // be messaged again: once the host reports it running after a
+            // settled state, say so. AIR's updates carry terminal states only.
+            let running = item.get("controlStatus").and_then(|v| v.as_str()) == Some("running");
+            if running && !self.air_subagents && self.subagent_states.remove(child).is_some() {
+                out.push(self.subagent_state_line(acp_sid, self.ver, child, "running"));
+            }
             return;
         };
         if self.subagent_states.get(child) == Some(&state) {

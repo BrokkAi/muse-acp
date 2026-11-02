@@ -20,9 +20,23 @@
     without `mcpServers`, a `session/load`, `session/resume` or
     `session/fork` without `cwd`, a stdio MCP server without `command` (ACP
     v1 also requires its `args` and `env`), or an image block without `data`
-    (an image named only by `uri` is no longer read from disk).
+    (an image named only by `uri` is no longer read from disk). One
+    `mcpServers` entry the schema cannot read (an unknown `type`, a missing
+    `command`) now refuses the whole request; entries that parse but that
+    Muse cannot run are still dropped one by one. Prompt blocks are read as
+    the schema defines them: a prompt given as a string rather than an array
+    of blocks, an image without `mimeType`, a `resource_link` without
+    `name`, and an embedded `resource` with neither `text` nor `blob` refuse
+    the prompt, where they were read leniently before. An ACP v2
+    `session/set_config_option` value needs its `type`, and the legacy
+    `session/set_mode` no longer accepts `mode` for `modeId`.
     `session/cancel` works only as the notification ACP defines; sent as a
     request it gets `-32601`.
+  - ACP v2 `session/fork` with `"replayFrom": null` replays nothing, as an
+    absent `replayFrom` does.
+  - On ACP v1, JetBrains AIR's `asyncTasks.backgrounded` mark on a command
+    card arrives as a `tool_call_update`, as on v2, rather than a
+    `tool_call` without the `title` the schema requires.
   - `initialize` with a `protocolVersion` below 1 answers with ACP v1, the
     SDK's fallback, instead of a version error.
   - `session/load` and `session/resume` results no longer repeat the
@@ -41,13 +55,16 @@
     v1 clients that advertise `clientCapabilities.subagents`, and every ACP
     v2 client (the RFD needs no capability there), get `subagent_update`
     with the child's title, description and state instead of the earlier
-    draft's `subagent_spawned` and `subagent_state_update`. JetBrains AIR
+    draft's `subagent_spawned` and `subagent_state_update`. The state
+    mirrors the child's: a settled child that is messaged again and runs is
+    shown running again. JetBrains AIR
     clients that negotiate `nativeSubagentSessions` keep AIR's updates.
   - The adapter's own request ids are the SDK's, and malformed-frame errors
     carry the SDK's messages. An invalid UTF-8 line still gets `-32700` and
     reading goes on.
   - `serde_json` is built without `arbitrary_precision`: ACP numbers are
-    64-bit, as the SDK reads them.
+    64-bit, as the SDK reads them. A host number wider than that, passed
+    through in `rawInput` or `_meta`, is sent as the nearest double.
 
 - Take a session's drive back when Muse refuses a turn because another
   client holds it (#452). Only a shared Muse session daemon, which
