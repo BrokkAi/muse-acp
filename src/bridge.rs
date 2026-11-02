@@ -73,12 +73,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Record the ACP v1 client's `fs` and `terminal` capabilities. ACP v2 has
 /// neither, and `MUSE_EDITOR_TOOLS=0` turns the tools off.
-pub fn negotiate(ver: u64, capabilities: Option<&J>) {
-    let v1 = capabilities.filter(|_| ver == 1);
-    let fs = v1.and_then(|c| c.get("fs"));
-    let flag = |key: &str| fs.and_then(|fs| fs.get(key)).and_then(J::as_bool) == Some(true);
-    let (read, write) = (flag("readTextFile"), flag("writeTextFile"));
-    let terminal = v1.and_then(|c| c.get("terminal")).and_then(J::as_bool) == Some(true);
+pub fn negotiate(read: bool, write: bool, terminal: bool) {
     let disabled = std::env::var("MUSE_EDITOR_TOOLS").is_ok_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),

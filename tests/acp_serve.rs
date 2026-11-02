@@ -5728,8 +5728,9 @@ fn v2_http_mcp_server_is_forwarded_and_unsupported_entries_are_dropped() {
         })
     );
     assert_mcp_servers_match_schema(&start["config"]["mcpServers"]);
+    // ACP v2 has no SSE transport, so the SDK reads one as a custom type.
     c.wait_stderr(
-        "MCP server \"legacy\" dropped: the SSE transport is not supported by Muse",
+        "MCP server \"legacy\" dropped: unsupported transport \"sse\"",
         Duration::from_secs(15),
     );
     c.wait_stderr(

@@ -17,7 +17,7 @@ pub type StdoutShared = Editor;
 
 pub struct InFlight {
     pub msp_turn: String,
-    pub req_id: J,
+    pub req_id: Option<RequestId>,
     /// True until the host announces that a queued turn has launched.
     pub queued: bool,
     pub file_report: Option<FileChangeReport>,
@@ -40,7 +40,7 @@ pub struct FileChangeReport {
 
 pub struct PendingPerm {
     /// ACP `session/request_permission` request id awaiting the client reply.
-    pub req_id: J,
+    pub req_id: Option<RequestId>,
     /// MSP session the approval belongs to (`params.sessionId`). Approval ids
     /// are only unique within one MSP session, and a child stream's approval
     /// opens here beside its parent's, so the pair identifies the approval.
@@ -91,7 +91,7 @@ pub struct PermChoice {
 
 pub struct PendingFeedback {
     /// ACP `elicitation/create` request id awaiting optional guidance.
-    pub req_id: J,
+    pub req_id: Option<RequestId>,
     pub choice_id: String,
 }
 
@@ -127,7 +127,7 @@ pub struct UiQuestion {
 #[derive(Clone)]
 pub struct PendingUi {
     /// ACP `elicitation/create` request id awaiting the client reply.
-    pub req_id: J,
+    pub req_id: Option<RequestId>,
     pub user_input_id: String,
     /// MSP session that owns the question's child target.
     pub owner_msp_sid: String,
@@ -151,9 +151,9 @@ pub struct PendingUi {
 #[derive(Clone)]
 pub struct PendingFeedbackForm {
     /// ACP `elicitation/create` request id awaiting the client reply.
-    pub req_id: J,
+    pub req_id: Option<RequestId>,
     /// The `session/prompt` request that ran `/feedback`.
-    pub prompt_req: J,
+    pub prompt_req: Option<RequestId>,
     /// The prompt's ACP content blocks, echoed when the turn settles.
     pub prompt_content: String,
     pub ver: u8,
@@ -165,7 +165,7 @@ pub struct PendingFeedbackForm {
 #[derive(Clone)]
 pub struct PendingRecap {
     /// The `session/prompt` request that ran `/recap`.
-    pub prompt_req: J,
+    pub prompt_req: Option<RequestId>,
     /// The MSP `recap/request` retry id: the settlement's correlation key.
     pub retry_id: String,
     pub ver: u8,
@@ -615,24 +615,13 @@ fn written<E>(outcome: Result<(), E>) {
     }
 }
 
-pub fn id_json(id: &Option<J>) -> String {
-    match id {
-        None => "null".to_string(),
-        Some(j) => j_to_string(j),
-    }
+/// A request id as JSON text, `null` for none.
+pub fn id_json(id: &Option<RequestId>) -> String {
+    id.as_ref()
+        .map_or_else(|| "null".to_string(), |id| id.value().to_string())
 }
 
-/// The connection's id for a request id the adapter holds as `J`.
-pub fn request_id(id: &J) -> RequestId {
-    RequestId::of_value(&crate::json::to_value(id))
-}
-
-/// The adapter's `J` for a connection request id.
-pub fn id_j(id: &RequestId) -> J {
-    crate::json::from_value(&id.value())
-}
-
-pub fn send_result(stdout: &StdoutShared, id: &Option<J>, result_json: &str) {
+pub fn send_result(stdout: &StdoutShared, id: &Option<RequestId>, result_json: &str) {
     let Some(id) = id else {
         return;
     };
@@ -640,7 +629,7 @@ pub fn send_result(stdout: &StdoutShared, id: &Option<J>, result_json: &str) {
         return;
     }
     match serde_json::from_str::<serde_json::Value>(result_json) {
-        Ok(result) => written(stdout.respond(&request_id(id), result)),
+        Ok(result) => written(stdout.respond(id, result)),
         Err(error) => {
             crate::msp::log(&format!("internal: invalid ACP result JSON: {error}"));
             send_error(
@@ -653,16 +642,16 @@ pub fn send_result(stdout: &StdoutShared, id: &Option<J>, result_json: &str) {
     }
 }
 
-fn send_rpc_error(stdout: &StdoutShared, id: &Option<J>, error: Error) {
+fn send_rpc_error(stdout: &StdoutShared, id: &Option<RequestId>, error: Error) {
     if crate::shutdown::expiring() {
         return;
     }
     if let Some(id) = id {
-        written(stdout.respond_error(&request_id(id), error));
+        written(stdout.respond_error(id, error));
     }
 }
 
-pub fn send_error(stdout: &StdoutShared, id: &Option<J>, code: i64, message: &str) {
+pub fn send_error(stdout: &StdoutShared, id: &Option<RequestId>, code: i64, message: &str) {
     send_rpc_error(stdout, id, Error::new(code as i32, message));
 }
 
@@ -684,7 +673,7 @@ pub fn send_request(
     method: &str,
     params_json: &str,
     tag: &str,
-) -> Option<J> {
+) -> Option<RequestId> {
     let message = serde_json::from_str::<serde_json::Value>(params_json)
         .map_err(|error| error.to_string())
         .and_then(|params| {
@@ -699,7 +688,7 @@ pub fn send_request(
         }
     };
     match stdout.request(message, tag) {
-        Ok(id) => Some(id_j(&id)),
+        Ok(id) => Some(id),
         Err(_) => {
             crate::shutdown::disconnect();
             None
@@ -712,14 +701,16 @@ pub fn send_request(
 /// JSON-RPC error with our own id would be a response to a request the
 /// client never made. The client may still answer the original id; that late
 /// answer reaches its flow, which no longer waits for it.
-pub fn send_cancel_request(stdout: &StdoutShared, request_id: &J) {
-    stdout.cancel(&self::request_id(request_id));
+pub fn send_cancel_request(stdout: &StdoutShared, request_id: &Option<RequestId>) {
+    if let Some(request_id) = request_id {
+        stdout.cancel(request_id);
+    }
 }
 
 /// Send an ACP error while retaining structured data supplied by MSP.
 pub fn send_error_with_data(
     stdout: &StdoutShared,
-    id: &Option<J>,
+    id: &Option<RequestId>,
     code: i64,
     message: &str,
     data_json: &str,

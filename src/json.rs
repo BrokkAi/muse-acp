@@ -1,7 +1,8 @@
 //! JSON for the adapter. The value type, parser, and serializer live in the
 //! `muse-msp-client` crate (std only); this module re-exports them and adds
-//! the adapter's own helpers. ACP frames travel as `serde_json` values through
-//! the ACP SDK, and `to_value`/`from_value` convert at that one boundary.
+//! the adapter's own helpers. ACP data travels as `serde_json` values through
+//! the ACP SDK; `from_value` converts the JSON the SDK leaves untyped
+//! (extension params and `_meta`) where adapter code reads it as `J`.
 
 pub use muse_msp_client::json::*;
 
@@ -40,30 +41,6 @@ pub fn mint_id(prefix: &str, counter: &std::sync::atomic::AtomicU64) -> String {
     format!("{prefix}{n}-{hex}")
 }
 
-/// `j` as a `serde_json` value, for the ACP connection. Objects keep their
-/// key order (`preserve_order`). Numbers become 64-bit integers or floats,
-/// as the SDK's messages carry them; a number outside that range (which no
-/// ACP field holds) becomes the nearest float, or `null` if it has none.
-pub fn to_value(j: &J) -> serde_json::Value {
-    use serde_json::Value;
-    match j {
-        J::Null => Value::Null,
-        J::Bool(b) => Value::Bool(*b),
-        J::Num(text) => text
-            .parse::<serde_json::Number>()
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        J::Str(s) => Value::String(s.clone()),
-        J::Arr(items) => Value::Array(items.iter().map(to_value).collect()),
-        J::Obj(pairs) => Value::Object(
-            pairs
-                .iter()
-                .map(|(key, value)| (key.clone(), to_value(value)))
-                .collect(),
-        ),
-    }
-}
-
 /// A `serde_json` value from the ACP connection as `J`.
 pub fn from_value(value: &serde_json::Value) -> J {
     use serde_json::Value;
@@ -86,22 +63,19 @@ mod conversion_tests {
     use super::*;
 
     #[test]
-    fn values_round_trip_with_key_order() {
-        let text = r#"{"z":1,"a":[1.5,-3,18446744073709551615,-9223372036854775808],"m":{"b":null,"a":true},"s":"é\n\u2028"}"#;
-        let j = parse_json(text).unwrap();
-        let value = to_value(&j);
-        assert_eq!(j_to_string(&from_value(&value)), j_to_string(&j));
-        let keys: Vec<&String> = value.as_object().unwrap().keys().collect();
-        assert_eq!(keys, ["z", "a", "m", "s"]);
-    }
-
-    #[test]
-    fn numbers_outside_64_bits_become_floats_or_null() {
-        let j = parse_json("[12345678901234567890123,1e400]").unwrap();
+    fn values_convert_with_key_order() {
+        let value: serde_json::Value = serde_json::from_str(
+            r#"{"z":1,"a":[1.5,-3,18446744073709551615,-9223372036854775808],"m":{"b":null,"a":true},"s":"é\n\u2028"}"#,
+        )
+        .unwrap();
+        let j = from_value(&value);
         assert_eq!(
-            to_value(&j),
-            serde_json::json!([1.2345678901234568e22, null])
+            serde_json::from_str::<serde_json::Value>(&j_to_string(&j)).unwrap(),
+            value
         );
+        let J::Obj(pairs) = j else { panic!("object") };
+        let keys: Vec<&str> = pairs.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(keys, ["z", "a", "m", "s"]);
     }
 }
 

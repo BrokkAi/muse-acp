@@ -17,6 +17,7 @@ mod json;
 mod mcp;
 mod modes;
 mod msp;
+mod request;
 mod reviewer;
 mod sha256;
 mod shutdown;
@@ -35,13 +36,14 @@ use std::sync::{
 use acp::{
     AcpSession, FileChangeReport, HostTitleFacts, InFlight, PendingPerm, Sessions, StdoutShared,
 };
-use editor::{Editor, Incoming};
+use editor::{Editor, Incoming, RequestId};
 use fold::SessionFold;
 use hosts::{HostKind, HostTag, Hosts};
 use json::{J, esc, j_to_string, mint_id, parse_json};
 use msp::{
     ExitClassification, ExitKind, ExitMessage, LaunchError, MspEvent, err_code, err_message, log,
 };
+use request::Request;
 
 static ID_COUNTER: AtomicU64 = AtomicU64::new(1);
 static VER: AtomicU64 = AtomicU64::new(0); // negotiated ACP version for the connection
@@ -89,7 +91,7 @@ type SessionLists = Arc<Mutex<SessionListCache>>;
 /// so the ACP request stays pending until that terminal arrives. Every ACP
 /// `session/delete` for the same session joins the first one's command.
 struct PendingDelete {
-    waiters: Vec<J>,
+    waiters: Vec<RequestId>,
     msp_sid: String,
     host_kind: HostKind,
 }
@@ -128,114 +130,65 @@ fn cache_session_row(lists: &SessionLists, row: &J) -> Option<(Option<String>, O
     Some((previous_title, title))
 }
 
-/// True when the client's `_meta.jetbrains.air.capabilities` advertises a key.
-fn client_supports_air(capabilities: Option<&J>, key: &str) -> bool {
-    let Some(air) = capabilities
-        .and_then(|c| c.get("_meta"))
-        .and_then(|m| m.get("jetbrains"))
-        .and_then(|j| j.get("air"))
-    else {
+/// True when the client's `capabilities._meta.jetbrains.air.capabilities`
+/// advertises a key.
+fn client_supports_air(meta: &request::Meta, key: &str) -> bool {
+    let Some(air) = meta.get("jetbrains").and_then(|j| j.get("air")) else {
         return false;
     };
     let version_ok = air
         .get("version")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
         .is_some_and(|v| v >= 1);
     let supported = air
         .get("capabilities")
-        .map(|c| match c {
-            J::Arr(values) => values.iter().any(|v| v.as_str() == Some(key)),
-            _ => false,
-        })
-        .unwrap_or(false);
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|values| values.iter().any(|v| v.as_str() == Some(key)));
     version_ok && supported
 }
 
-/// The draft ACP subagent RFD negotiates through `clientCapabilities.subagents`
-/// (canonical) or JetBrains AIR's `nativeSubagentSessions` capability key.
-fn client_supports_subagents(capabilities: Option<&J>) -> bool {
-    let Some(caps) = capabilities else {
+/// Native subagent sessions: the ACP v1 subagent capability
+/// (`clientCapabilities.subagents`), or JetBrains AIR's
+/// `nativeSubagentSessions` key in either version.
+fn client_supports_subagents(capabilities: &request::ClientCapabilities) -> bool {
+    capabilities.subagents || client_supports_air(&capabilities.meta, "nativeSubagentSessions")
+}
+
+/// Adapter extensions require explicit `capabilities._meta.muse` opt-in.
+fn client_supports_muse(meta: &request::Meta, key: &str) -> bool {
+    let Some(muse) = meta.get("muse") else {
         return false;
     };
-    if matches!(caps.get("subagents"), Some(J::Obj(_))) {
-        return true;
-    }
-    client_supports_air(Some(caps), "nativeSubagentSessions")
-}
-
-/// ACP v2 has no compaction capability gate. ACP v1 requires
-/// `clientCapabilities.session.compaction: {}`.
-/// Whether `configOptions` may carry `type: "boolean"` entries: always in
-/// ACP v2, and in ACP v1 only after
-/// `clientCapabilities.session.configOptions.boolean`.
-fn client_supports_boolean_config(capabilities: Option<&J>, ver: u64) -> bool {
-    ver >= 2
-        || capabilities
-            .and_then(|caps| caps.get("session"))
-            .and_then(|session| session.get("configOptions"))
-            .and_then(|options| options.get("boolean"))
-            .is_some_and(|boolean| matches!(boolean, J::Obj(_)))
-}
-
-/// Whether `notice` session updates may be sent: always in ACP v2, where
-/// clients that do not present them ignore them, and in ACP v1 only after
-/// `clientCapabilities.session.notices`.
-fn client_supports_notices(capabilities: Option<&J>, ver: u64) -> bool {
-    ver >= 2
-        || capabilities
-            .and_then(|caps| caps.get("session"))
-            .and_then(|session| session.get("notices"))
-            .is_some_and(|notices| matches!(notices, J::Obj(_)))
-}
-
-fn client_supports_compaction(capabilities: Option<&J>, ver: u64) -> bool {
-    ver >= 2
-        || capabilities
-            .and_then(|caps| caps.get("session"))
-            .and_then(|session| session.get("compaction"))
-            .is_some_and(|compaction| matches!(compaction, J::Obj(_)))
-}
-
-/// Adapter extensions require explicit `_meta.muse.capabilities` opt-in.
-fn client_supports_muse(capabilities: Option<&J>, key: &str) -> bool {
-    let Some(muse) = capabilities
-        .and_then(|c| c.get("_meta"))
-        .and_then(|m| m.get("muse"))
-    else {
-        return false;
-    };
-    if muse
-        .get(key)
-        .is_some_and(|value| matches!(value, J::Bool(true) | J::Obj(_)))
-    {
+    if muse.get(key).is_some_and(|value| {
+        matches!(
+            value,
+            serde_json::Value::Bool(true) | serde_json::Value::Object(_)
+        )
+    }) {
         return true;
     }
     muse.get("capabilities")
-        .map(|values| match values {
-            J::Arr(values) => values.iter().any(|v| v.as_str() == Some(key)),
-            _ => false,
-        })
-        .unwrap_or(false)
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|values| values.iter().any(|v| v.as_str() == Some(key)))
 }
 
 /// Parse the request-scoped AIR v1 file report opt-in. Invalid metadata is
 /// ignored; an extension must never affect an ordinary ACP prompt.
-fn file_report_request(params: Option<&J>) -> Option<String> {
+fn file_report_request(meta: &request::Meta) -> Option<String> {
     if AIR_FILE_REPORT.load(Ordering::SeqCst) == 0 {
         return None;
     }
-    let request = params?
-        .get("_meta")?
+    let request = meta
         .get("jetbrains")?
         .get("air")?
         .get("agentFileChangeReportRequest")?;
-    let J::Obj(fields) = request else {
-        return None;
-    };
-    if fields.len() != 2 || request.get("version").and_then(J::as_u64) != Some(1) {
+    let fields = request.as_object()?;
+    if fields.len() != 2 || request.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
         return None;
     }
-    let id = request.get("requestId").and_then(J::as_str)?;
+    let id = request
+        .get("requestId")
+        .and_then(serde_json::Value::as_str)?;
     if id.is_empty()
         || id.len() > 128
         || !id
@@ -1877,7 +1830,13 @@ fn adopt_skill_catalog(sessions: &Sessions, acp_sid: &str, skills: Option<&[acp:
     }
 }
 
-fn send_host_error(stdout: &StdoutShared, id: &Option<J>, error: &J, fallback: i64, message: &str) {
+fn send_host_error(
+    stdout: &StdoutShared,
+    id: &Option<RequestId>,
+    error: &J,
+    fallback: i64,
+    message: &str,
+) {
     let code = msp::acp_error_code(error, fallback);
     let recovery = recovery_observation(error);
     if let Some(observation) = recovery {
@@ -1978,7 +1937,12 @@ fn v1_init(session_mcp: bool, session_delete: bool) -> String {
         )
 }
 
-fn send_initialize(stdout: &StdoutShared, id: &Option<J>, session_mcp: bool, session_delete: bool) {
+fn send_initialize(
+    stdout: &StdoutShared,
+    id: &Option<RequestId>,
+    session_mcp: bool,
+    session_delete: bool,
+) {
     if negotiated_ver() == 2 {
         acp::send_result(stdout, id, &v2_init(session_mcp, session_delete));
     } else {
@@ -1989,19 +1953,23 @@ fn send_initialize(stdout: &StdoutShared, id: &Option<J>, session_mcp: bool, ses
 /// Answer ACP after `muse serve` failed to launch. Only the handshake and
 /// shutdown succeed; every other request reports why the host is missing,
 /// using the auth-required code when that is the cause.
-fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
-    let id = msg.get("id").cloned();
-    match msg.get("method").and_then(J::as_str) {
-        Some("initialize") => send_initialize(stdout, &id, false, false),
-        Some(method @ ("shutdown" | "exit")) => {
+fn serve_without_host(
+    stdout: &StdoutShared,
+    id: &Option<RequestId>,
+    request: &Request,
+    reason: &str,
+) {
+    match request.method() {
+        "initialize" => send_initialize(stdout, id, false, false),
+        method @ ("shutdown" | "exit") => {
             if method == "shutdown" {
-                acp::send_result(stdout, &id, "null");
+                acp::send_result(stdout, id, "null");
             }
             shutdown::settle(stdout, "adapter shutting down");
             shutdown::exit(0);
         }
         // Auth-required, so clients show the button that installs Muse.
-        Some(_) if id.is_some() && MUSE_NOT_INSTALLED.load(Ordering::SeqCst) => {
+        _ if id.is_some() && MUSE_NOT_INSTALLED.load(Ordering::SeqCst) => {
             let message = if login_method_offered() {
                 format!(
                     "Muse Code is not installed. Choose **{AUTH_METHOD_NAME_INSTALL}** to install \
@@ -2014,9 +1982,9 @@ fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
                      run `muse login`, and restart the agent. ({reason})"
                 )
             };
-            acp::send_error(stdout, &id, -32000, &message);
+            acp::send_error(stdout, id, -32000, &message);
         }
-        Some(_) if id.is_some() => {
+        _ if id.is_some() => {
             let code = if msp::auth_failure(reason).is_some() {
                 -32000
             } else {
@@ -2024,12 +1992,12 @@ fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
             };
             acp::send_error(
                 stdout,
-                &id,
+                id,
                 code,
                 &format!("Muse host unavailable: {reason}"),
             );
         }
-        // Notifications and client responses have nothing to answer.
+        // Notifications have nothing to answer.
         _ => {}
     }
 }
@@ -2038,7 +2006,7 @@ fn serve_without_host(stdout: &StdoutShared, msg: &J, reason: &str) {
 /// credential. Clients such as Zed show their login screen for this error on
 /// session/new or session/load, but only an error banner when it arrives
 /// with the first prompt.
-fn reject_if_logged_out(host: &Hosts, stdout: &StdoutShared, id: &Option<J>) -> bool {
+fn reject_if_logged_out(host: &Hosts, stdout: &StdoutShared, id: &Option<RequestId>) -> bool {
     // A login made in a terminal since launch must reach the host first.
     host.refresh_config();
     if !host.logged_out() {
@@ -2061,9 +2029,9 @@ fn reject_if_logged_out(host: &Hosts, stdout: &StdoutShared, id: &Option<J>) -> 
 /// `authenticate`) request it will answer, and the URL elicitation that
 /// handed its verification page to the client.
 struct DeviceLogin {
-    login_req: Option<J>,
+    login_req: Option<RequestId>,
     elicitation_id: String,
-    elicit_req: J,
+    elicit_req: RequestId,
 }
 
 static DEVICE_LOGIN: Mutex<Option<DeviceLogin>> = Mutex::new(None);
@@ -2073,7 +2041,7 @@ static DEVICE_LOGIN: Mutex<Option<DeviceLogin>> = Mutex::new(None);
 /// elicitation, with the code to confirm in the message. The login request
 /// stays open until Muse reports the flow's terminal (`account/loginCompleted`):
 /// it succeeds only on `granted`. No credential crosses ACP; Muse stores it.
-fn start_device_login(host: &Arc<Hosts>, stdout: &StdoutShared, id: &Option<J>) {
+fn start_device_login(host: &Arc<Hosts>, stdout: &StdoutShared, id: &Option<RequestId>) {
     if DEVICE_LOGIN
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -2151,17 +2119,14 @@ fn start_device_login(host: &Arc<Hosts>, stdout: &StdoutShared, id: &Option<J>) 
 fn complete_device_login_elicitation(
     host: &Arc<Hosts>,
     stdout: &StdoutShared,
-    id: &Option<J>,
+    id: &Option<RequestId>,
     msg: &J,
 ) {
     let Some(id) = id else {
         return;
     };
     let mut pending = DEVICE_LOGIN.lock().unwrap_or_else(|p| p.into_inner());
-    if pending
-        .as_ref()
-        .is_none_or(|login| j_to_string(&login.elicit_req) != j_to_string(id))
-    {
+    if pending.as_ref().is_none_or(|login| &login.elicit_req != id) {
         return;
     }
     let accepted = msg.get("error").is_none()
@@ -2232,7 +2197,7 @@ fn finish_device_login(host: &Arc<Hosts>, stdout: &StdoutShared, params: &J) {
 /// in effect, so a later `session/new` fails with auth-required until the
 /// user logs in again. `META_API_KEY` outranks the stored login and cannot be
 /// removed from here, so it fails the logout instead of being ignored.
-fn logout(host: &Arc<Hosts>, stdout: &StdoutShared, id: &Option<J>) {
+fn logout(host: &Arc<Hosts>, stdout: &StdoutShared, id: &Option<RequestId>) {
     let state = match host.main_host().command("account/logout", "{}") {
         Ok(state) => state,
         Err(error) => {
@@ -2332,16 +2297,6 @@ fn auth_method_label() -> (&'static str, &'static str) {
 /// `clientCapabilities.auth.terminal: true`, or ACP v2's
 /// `capabilities.auth.terminal` object. Absent, `null`, or any other shape
 /// advertises nothing.
-fn client_supports_terminal_auth(capabilities: Option<&J>, ver: u64) -> bool {
-    let terminal = capabilities
-        .and_then(|c| c.get("auth"))
-        .and_then(|auth| auth.get("terminal"));
-    match ver {
-        1 => matches!(terminal, Some(J::Bool(true))),
-        _ => matches!(terminal, Some(J::Obj(_))),
-    }
-}
-
 fn auth_methods_v1() -> String {
     let (name, description) = auth_method_label();
     // Clients predating the typed method read the `_meta` terminal-auth
@@ -2416,55 +2371,50 @@ fn auth_methods_v2() -> String {
 /// remains first and is the base for relative paths. Exact duplicate strings
 /// are removed without canonicalizing here; access checks canonicalize both
 /// the requested path and every root so symlinks cannot widen the boundary.
-fn additional_directories(params: Option<&J>) -> Result<Vec<String>, String> {
+fn additional_directories(setup: &request::Setup) -> Result<Vec<String>, String> {
     let mut roots = Vec::new();
-    let Some(value) = params.and_then(|p| p.get("additionalDirectories")) else {
-        return Ok(roots);
-    };
-    let J::Arr(additional) = value else {
-        return Err("params.additionalDirectories must be an array of absolute paths".to_string());
-    };
-    for value in additional {
-        let Some(path) = value.as_str() else {
-            return Err("params.additionalDirectories entries must be absolute paths".to_string());
-        };
+    for path in &setup.additional_directories {
         if path.is_empty() || !Path::new(path).is_absolute() {
             return Err("params.additionalDirectories entries must be absolute paths".to_string());
         }
         if !roots.iter().any(|root| root == path) {
-            roots.push(path.to_string());
+            roots.push(path.clone());
         }
     }
     Ok(roots)
 }
 
+/// `_meta.mspSessionId`: the legacy recovery id for a session the client
+/// stored under an adapter-generated ACP id.
+fn meta_msp_session_id(meta: &request::Meta) -> Option<String> {
+    meta.get("mspSessionId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
 /// The client-selected launch profile for ACP `session/load`/`session/resume`.
 /// It is namespaced because ACP has no core permission-profile field.
-fn resume_permission_profile(params: Option<&J>) -> Result<Option<String>, String> {
-    let Some(value) = params
-        .and_then(|params| params.get("_meta"))
-        .and_then(|meta| meta.get("muse"))
+fn resume_permission_profile(meta: &request::Meta) -> Result<Option<String>, String> {
+    let Some(value) = meta
+        .get("muse")
         .and_then(|muse| muse.get("permissionProfile"))
     else {
         return Ok(None);
     };
-    match value {
-        J::Str(profile) if !profile.is_empty() => Ok(Some(profile.clone())),
+    match value.as_str() {
+        Some(profile) if !profile.is_empty() => Ok(Some(profile.to_string())),
         _ => Err("_meta.muse.permissionProfile must be a non-empty string".to_string()),
     }
 }
 
 /// Muse 1.4.14's request-scoped model override for an ACP resume.
-fn resume_model_override(params: Option<&J>) -> Result<Option<String>, String> {
-    let Some(value) = params
-        .and_then(|params| params.get("_meta"))
-        .and_then(|meta| meta.get("muse"))
-        .and_then(|muse| muse.get("modelId"))
-    else {
+fn resume_model_override(meta: &request::Meta) -> Result<Option<String>, String> {
+    let Some(value) = meta.get("muse").and_then(|muse| muse.get("modelId")) else {
         return Ok(None);
     };
-    match value {
-        J::Str(model) if !model.trim().is_empty() => Ok(Some(model.clone())),
+    match value.as_str() {
+        Some(model) if !model.trim().is_empty() => Ok(Some(model.to_string())),
         _ => Err("_meta.muse.modelId must be a non-empty string".to_string()),
     }
 }
@@ -2473,19 +2423,15 @@ fn resume_model_override(params: Option<&J>) -> Result<Option<String>, String> {
 /// `null` mean no replay; `{"type":"start"}` replays all retained history,
 /// the only cursor this adapter supports. The schema admits custom and
 /// future cursor types, which must be refused rather than replaced by
-/// another cursor, and anything else is malformed.
-fn resume_replay_from(params: Option<&J>) -> Result<bool, String> {
-    match params.and_then(|params| params.get("replayFrom")) {
-        None | Some(J::Null) => Ok(false),
-        Some(cursor @ J::Obj(_)) => match cursor.get("type") {
-            Some(J::Str(kind)) if kind == "start" => Ok(true),
-            Some(J::Str(kind)) => Err(format!(
-                "unsupported replayFrom cursor type {}: this agent supports only {{\"type\":\"start\"}}",
-                esc(kind)
-            )),
-            _ => Err("replayFrom must be null or an object with a string type".to_string()),
-        },
-        Some(_) => Err("replayFrom must be null or an object with a string type".to_string()),
+/// another cursor.
+fn resume_replay_from(replay: &Option<request::Replay>) -> Result<bool, String> {
+    match replay {
+        None => Ok(false),
+        Some(request::Replay::Start) => Ok(true),
+        Some(request::Replay::Other(kind)) => Err(format!(
+            "unsupported replayFrom cursor type {}: this agent supports only {{\"type\":\"start\"}}",
+            esc(kind)
+        )),
     }
 }
 
@@ -2511,9 +2457,9 @@ fn current_state_snapshot(s: &AcpSession) -> &'static str {
     }
 }
 
-fn session_roots(params: Option<&J>, cwd: &str) -> Result<Vec<String>, String> {
+fn session_roots(setup: &request::Setup, cwd: &str) -> Result<Vec<String>, String> {
     let mut roots = vec![cwd.to_string()];
-    for path in additional_directories(params)? {
+    for path in additional_directories(setup)? {
         if !roots.iter().any(|root| root == &path) {
             roots.push(path);
         }
@@ -2618,21 +2564,17 @@ fn log_legacy_workspace_roots(msp_sid: &str, cwd: &str) {
     }
 }
 
-fn same_workspace_roots(left: &[String], right: &[String]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right)
-            .all(|(a, b)| same_workspace_root(a, b))
-}
-
 /// The client's MCP servers as MSP `config.mcpServers` JSON, or None when
 /// there is nothing to send. Dropped entries are logged. A host without the
 /// `sessionMcp` grant (Muse before 1.3.0) would reject a non-empty map, so
 /// the whole list is dropped there. `applied` is false for a fork, whose
 /// servers only take effect when Muse next loads the session.
-fn client_mcp_servers(host: &Arc<Hosts>, params: Option<&J>, applied: bool) -> Option<String> {
-    let translation = mcp::translate(params);
+fn client_mcp_servers(
+    host: &Arc<Hosts>,
+    servers: &[request::McpServer],
+    applied: bool,
+) -> Option<String> {
+    let translation = mcp::translate(servers);
     if !translation.supplied() {
         return None;
     }
@@ -2667,11 +2609,11 @@ fn session_mcp_servers(
     host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
-    params: Option<&J>,
+    client_servers: &[request::McpServer],
     applied: bool,
     acp_sid: Option<&str>,
 ) -> (Option<String>, Option<String>) {
-    let servers = client_mcp_servers(host, params, applied);
+    let servers = client_mcp_servers(host, client_servers, applied);
     if !bridge::offered() {
         return (servers, None);
     }
@@ -2679,7 +2621,7 @@ fn session_mcp_servers(
         log("editor file tools unavailable: this Muse host did not grant sessionMcp");
         return (servers, None);
     }
-    if mcp::translate(params)
+    if mcp::translate(client_servers)
         .forwarded
         .iter()
         .any(|name| name == bridge::SERVER_NAME)
@@ -2991,16 +2933,17 @@ fn restart_unsaved_session(
     Ok(r)
 }
 
-fn validate_session_roots(stdout: &StdoutShared, id: &Option<J>, params: Option<&J>) -> bool {
-    let cwd = params
-        .and_then(|p| p.get("cwd"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+fn validate_session_roots(
+    stdout: &StdoutShared,
+    id: &Option<RequestId>,
+    setup: &request::Setup,
+) -> bool {
+    let cwd = setup.cwd.as_str();
     if cwd.is_empty() || !Path::new(cwd).is_absolute() {
         acp::send_error(stdout, id, -32602, "params.cwd must be an absolute path");
         return false;
     }
-    if let Err(message) = session_roots(params, cwd) {
+    if let Err(message) = session_roots(setup, cwd) {
         acp::send_error(stdout, id, -32602, &message);
         return false;
     }
@@ -3015,13 +2958,13 @@ fn validate_session_roots(stdout: &StdoutShared, id: &Option<J>, params: Option<
 fn resolve_fork_cut_point(
     host: &Arc<Hosts>,
     msp_sid: &str,
-    params: Option<&J>,
+    meta: &request::Meta,
 ) -> Result<Option<String>, String> {
-    let fork_point = params
-        .and_then(|p| p.get("_meta"))
-        .and_then(|m| m.get("jetbrains"))
+    let fork_point = meta
+        .get("jetbrains")
         .and_then(|j| j.get("air"))
-        .and_then(|a| a.get("forkPoint"));
+        .and_then(|a| a.get("forkPoint"))
+        .map(json::from_value);
     let Some(fork_point) = fork_point else {
         return Ok(None);
     };
@@ -3458,7 +3401,7 @@ fn reconcile_in_flight(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str
                 acp::send_state(stdout, acp_sid, "idle", Some("cancelled"));
             }
         } else {
-            acp::send_result(stdout, &Some(f.req_id), "{\"stopReason\":\"cancelled\"}");
+            acp::send_result(stdout, &f.req_id, "{\"stopReason\":\"cancelled\"}");
         }
     }
 }
@@ -3855,11 +3798,7 @@ fn abandon_session_work(stdout: &StdoutShared, s: &mut AcpSession, message: &str
         if s.ver == 2 {
             acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
         } else {
-            acp::send_result(
-                stdout,
-                &Some(recap.prompt_req),
-                "{\"stopReason\":\"cancelled\"}",
-            );
+            acp::send_result(stdout, &recap.prompt_req, "{\"stopReason\":\"cancelled\"}");
         }
     }
     s.perm_queue.clear();
@@ -4207,7 +4146,7 @@ fn main() {
             LoopMsg::Acp(Incoming::Answer { tag, id, result }) => {
                 if let Some(host) = host.as_ref() {
                     let msg = answer_message(&id, result);
-                    complete_client_request(host, &stdout, &sessions, &tag, &msg);
+                    complete_client_request(host, &stdout, &sessions, &tag, id, &msg);
                 }
             }
             LoopMsg::Acp(closed @ (Incoming::Closed | Incoming::Ended { .. })) => {
@@ -4222,20 +4161,20 @@ fn main() {
                 shutdown::exit(0);
             }
             LoopMsg::Acp(incoming) => {
-                let Some((ver, v)) = acp_message(incoming) else {
+                let Some((ver, id, request)) = read_request(&stdout, incoming) else {
                     continue;
                 };
                 if let Some(reason) = host_unavailable.as_deref() {
-                    serve_without_host(&stdout, &v, reason);
+                    serve_without_host(&stdout, &id, &request, reason);
                     continue;
                 }
                 if host.is_none() {
                     // The SDK refuses every other request until `initialize`
                     // has been answered; a notification has nothing to do yet.
-                    if v.get("method").and_then(|m| m.as_str()) != Some("initialize") {
+                    let Request::Initialize(capabilities) = &request else {
                         continue;
-                    }
-                    let user_input_dialogs = negotiate_acp(ver, &v);
+                    };
+                    let user_input_dialogs = negotiate_acp(ver, capabilities);
                     let forward_tx = tx.clone();
                     let forward: hosts::Forward = Box::new(move |tag, events| {
                         let tx = forward_tx.clone();
@@ -4270,7 +4209,7 @@ fn main() {
                                 MUSE_NOT_INSTALLED.store(true, Ordering::SeqCst);
                             }
                             let reason = e.to_string();
-                            serve_without_host(&stdout, &v, &reason);
+                            serve_without_host(&stdout, &id, &request, &reason);
                             host_unavailable = Some(reason);
                             continue;
                         }
@@ -4308,7 +4247,8 @@ fn main() {
                     &stdout,
                     &sessions,
                     &lists,
-                    &v,
+                    id,
+                    request,
                 );
             }
             LoopMsg::Msp(tag, MspEvent::Notification { method, params }) => {
@@ -4515,9 +4455,10 @@ fn complete_client_request(
     stdout: &StdoutShared,
     sessions: &Sessions,
     tag: &str,
+    id: RequestId,
     msg: &J,
 ) {
-    let id = msg.get("id").cloned();
+    let id = Some(id);
     match tag {
         acp::TAG_PERMISSION => complete_permission(host, stdout, sessions, &id, msg),
         acp::TAG_PERMISSION_FEEDBACK => {
@@ -4542,45 +4483,38 @@ fn ends_connection(incoming: &Incoming) -> bool {
     }
 }
 
-/// An editor message as the `J` object `handle_acp` reads (`id`, `method`,
-/// and `params`), with the protocol version it arrived on.
-fn acp_message(incoming: Incoming) -> Option<(u8, J)> {
-    use agent_client_protocol::JsonRpcMessage;
-    use editor::{V1Message, V2Message};
-    let (ver, id, message) = match incoming {
-        Incoming::V1(V1Message::Request(id, request)) => {
-            (1, Some(id), request.to_untyped_message().ok()?)
-        }
-        Incoming::V1(V1Message::Notification(note)) => (1, None, note.to_untyped_message().ok()?),
-        Incoming::V2(V2Message::Request(id, request)) => {
-            (2, Some(id), request.to_untyped_message().ok()?)
-        }
-        Incoming::V2(V2Message::Notification(note)) => (2, None, note.to_untyped_message().ok()?),
-        Incoming::Untyped { ver, id, message } => (ver, id, message),
-        Incoming::CancelRequest { id } => {
-            return Some((
-                negotiated_ver(),
-                J::Obj(vec![
-                    ("jsonrpc".to_string(), J::Str("2.0".to_string())),
-                    ("method".to_string(), J::Str("$/cancel_request".to_string())),
-                    (
-                        "params".to_string(),
-                        J::Obj(vec![("requestId".to_string(), acp::id_j(&id))]),
-                    ),
-                ]),
-            ));
-        }
-        Incoming::Answer { .. } | Incoming::Closed | Incoming::Ended { .. } => return None,
-    };
-    let mut fields = vec![("jsonrpc".to_string(), J::Str("2.0".to_string()))];
-    if let Some(id) = id {
-        fields.push(("id".to_string(), acp::id_j(&id)));
+/// The request an editor message carries, with its id (none for a
+/// notification) and the protocol version it arrived on. A method claimed
+/// without its version's schema type is still parsed with the SDK's type;
+/// when that fails, the SDK's error answers the request here.
+fn read_request(
+    stdout: &StdoutShared,
+    incoming: Incoming,
+) -> Option<(u8, Option<RequestId>, Request)> {
+    match incoming {
+        Incoming::V1(message) => request::v1(message).map(|(id, request)| (1, id, request)),
+        Incoming::V2(message) => request::v2(message).map(|(id, request)| (2, id, request)),
+        Incoming::Untyped { ver, id, message } => match request::untyped(ver, message) {
+            // A notification of a method the adapter serves as a request
+            // has nothing to answer.
+            Ok(_) if id.is_none() => None,
+            Ok(request) => Some((ver, id, request)),
+            Err(error) => {
+                if let Some(id) = id
+                    && stdout.respond_error(&id, error).is_err()
+                {
+                    shutdown::disconnect();
+                }
+                None
+            }
+        },
+        Incoming::CancelRequest { id } => Some((
+            negotiated_ver(),
+            None,
+            Request::CancelPending { request_id: id },
+        )),
+        Incoming::Answer { .. } | Incoming::Closed | Incoming::Ended { .. } => None,
     }
-    fields.push(("method".to_string(), J::Str(message.method().to_string())));
-    if !message.params().is_null() {
-        fields.push(("params".to_string(), json::from_value(message.params())));
-    }
-    Some((ver, J::Obj(fields)))
 }
 
 /// The client's answer to one of the adapter's requests as the `J` object the
@@ -4588,7 +4522,7 @@ fn acp_message(incoming: Incoming) -> Option<(u8, J)> {
 fn answer_message(id: &editor::RequestId, result: Result<serde_json::Value, editor::Error>) -> J {
     let mut fields = vec![
         ("jsonrpc".to_string(), J::Str("2.0".to_string())),
-        ("id".to_string(), acp::id_j(id)),
+        ("id".to_string(), json::from_value(&id.value())),
     ];
     match result {
         Ok(result) => fields.push(("result".to_string(), json::from_value(&result))),
@@ -4686,7 +4620,12 @@ fn negotiated_ver() -> u8 {
 /// `messageId`, then report that message under the same id. Acceptance means
 /// insertion, so every successful v2 `session/prompt` path answers here
 /// rather than with an empty result.
-fn accept_v2_prompt(stdout: &StdoutShared, prompt_req: &Option<J>, sid: &str, content: &str) {
+fn accept_v2_prompt(
+    stdout: &StdoutShared,
+    prompt_req: &Option<RequestId>,
+    sid: &str,
+    content: &str,
+) {
     let msg_id = mint_id("msg-", &ID_COUNTER);
     acp::send_result(
         stdout,
@@ -4698,7 +4637,7 @@ fn accept_v2_prompt(stdout: &StdoutShared, prompt_req: &Option<J>, sid: &str, co
 
 /// Answer an ACP v2 prompt that was cancelled before its message was
 /// inserted. Only an inserted prompt may succeed.
-fn cancel_v2_prompt_before_insertion(stdout: &StdoutShared, prompt_req: &Option<J>) {
+fn cancel_v2_prompt_before_insertion(stdout: &StdoutShared, prompt_req: &Option<RequestId>) {
     acp::send_error(
         stdout,
         prompt_req,
@@ -4901,7 +4840,7 @@ fn subagent_control(
     host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
-    id: &Option<J>,
+    id: &Option<RequestId>,
     method: &str,
     params: Option<&J>,
 ) {
@@ -5024,43 +4963,29 @@ fn subagent_control(
 /// MSP's `userInputDialogs` capability is connection-scoped, so it must be
 /// derived from ACP `initialize` before the host's own handshake is sent. The
 /// SDK has already selected protocol version `v` and validated the request.
-fn negotiate_acp(v: u8, msg: &J) -> bool {
-    let v = u64::from(v);
-    VER.store(v, Ordering::SeqCst);
-    let params = msg.get("params");
-    let capabilities = params.and_then(|params| {
-        params.get(if v == 1 {
-            "clientCapabilities"
-        } else {
-            "capabilities"
-        })
-    });
+fn negotiate_acp(v: u8, capabilities: &request::ClientCapabilities) -> bool {
+    VER.store(u64::from(v), Ordering::SeqCst);
     // Both ACP versions can advertise the form elicitation extension.
-    let form = capabilities
-        .and_then(|c| c.get("elicitation"))
-        .and_then(|e| e.get("form"))
-        .is_some_and(|f| matches!(f, J::Obj(_)));
+    let form = capabilities.elicitation_form;
     ELICIT_FORM.store(u64::from(form), Ordering::SeqCst);
-    let url = capabilities
-        .and_then(|c| c.get("elicitation"))
-        .and_then(|e| e.get("url"))
-        .is_some_and(|u| matches!(u, J::Obj(_)));
-    ELICIT_URL.store(url, Ordering::SeqCst);
-    BOOLEAN_CONFIG.store(
-        client_supports_boolean_config(capabilities, v),
-        Ordering::SeqCst,
+    ELICIT_URL.store(capabilities.elicitation_url, Ordering::SeqCst);
+    BOOLEAN_CONFIG.store(capabilities.boolean_config, Ordering::SeqCst);
+    NOTICES.store(capabilities.notices, Ordering::SeqCst);
+    bridge::negotiate(
+        capabilities.fs_read,
+        capabilities.fs_write,
+        capabilities.terminal,
     );
-    NOTICES.store(client_supports_notices(capabilities, v), Ordering::SeqCst);
-    bridge::negotiate(v, capabilities);
-    let terminal_auth = client_supports_terminal_auth(capabilities, v);
+    let terminal_auth = capabilities.terminal_auth;
     AUTH_TERMINAL.store(terminal_auth, Ordering::SeqCst);
     if !terminal_auth {
         log("client did not advertise terminal auth; no typed terminal login method is offered");
     }
     let subagents = client_supports_subagents(capabilities);
     NATIVE_SUBAGENTS.store(u64::from(subagents), Ordering::SeqCst);
-    let compaction = client_supports_compaction(capabilities, v);
+    let compaction = capabilities.compaction;
     COMPACTION.store(u64::from(compaction), Ordering::SeqCst);
+    let capabilities = &capabilities.meta;
     let async_tasks = client_supports_air(capabilities, "asyncTasks");
     AIR_ASYNC_TASKS.store(u64::from(async_tasks), Ordering::SeqCst);
     // A shell launch needs both explicit execution opt-in and task controls.
@@ -5115,49 +5040,34 @@ fn negotiate_acp(v: u8, msg: &J) -> bool {
     form
 }
 
+/// Serve one request (or notification, with no `id`) from the editor. The
+/// SDK has parsed it into its protocol version's schema type; `request` is
+/// that, read into one view per method.
 fn handle_acp(
     host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
     lists: &SessionLists,
-    msg: &J,
+    id: Option<RequestId>,
+    request: Request,
 ) {
-    if let Some(method) = msg.get("method").and_then(|v| v.as_str()) {
-        msp::trace_method("acp<-client", method);
-    }
-    let method = msg
-        .get("method")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let id = msg.get("id").cloned();
-    let params = msg.get("params").cloned();
+    msp::trace_method("acp<-client", request.method());
+    let method = request.method().to_string();
 
-    // No method: not a request or notification. The client's answers to the
-    // adapter's own requests reach `complete_client_request` instead.
-    if method.is_empty() {
-        return;
-    }
-
-    match method.as_str() {
-        "initialize" => send_initialize(
+    match request {
+        Request::Initialize(_) => send_initialize(
             stdout,
             &id,
             host.handshake().session_mcp,
             host.handshake().supports_session_delete(),
         ),
-        "session/new" => {
+        Request::NewSession(setup) => {
             let ver = negotiated_ver();
-            if !validate_session_roots(stdout, &id, params.as_ref()) {
+            if !validate_session_roots(stdout, &id, &setup) {
                 return;
             }
-            let cwd = params
-                .as_ref()
-                .and_then(|p| p.get("cwd"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let roots = session_roots(params.as_ref(), &cwd)
+            let cwd = setup.cwd.clone();
+            let roots = session_roots(&setup, &cwd)
                 .expect("session roots were validated before starting the session");
             // Optional approval posture, applied atomically at start: an
             // operator-specified posture must not silently fall back.
@@ -5186,7 +5096,7 @@ fn handle_acp(
             // JetBrains IDE server) to session setup; MSP 1.3.0 loads them
             // into this session's runtime.
             let (mcp_servers, bridge_token) =
-                session_mcp_servers(host, stdout, sessions, params.as_ref(), true, None);
+                session_mcp_servers(host, stdout, sessions, &setup.mcp_servers, true, None);
             // MSP 1.4.1+ carries the whole root set to the host, so Muse's
             // own tools work in the extra folders instead of being confined
             // by the adapter alone. Roots are validated before the session
@@ -5493,38 +5403,21 @@ fn handle_acp(
                 }
             }
         }
-        "session/resume" | "session/load" => {
+        Request::ResumeSession(setup) | Request::LoadSession(setup) => {
             let ver = negotiated_ver();
-            // `cwd` is required for `session/new` but optional when
-            // resuming/loading: only validate it when one is provided.
-            if let Some(cwd) = params.as_ref().and_then(|p| p.get("cwd")) {
-                let valid = cwd
-                    .as_str()
-                    .is_some_and(|cwd| !cwd.is_empty() && Path::new(cwd).is_absolute());
-                if !valid {
-                    acp::send_error(stdout, &id, -32602, "params.cwd must be an absolute path");
-                    return;
-                }
+            if setup.cwd.is_empty() || !Path::new(&setup.cwd).is_absolute() {
+                acp::send_error(stdout, &id, -32602, "params.cwd must be an absolute path");
+                return;
             }
-            let request_extras = match additional_directories(params.as_ref()) {
+            let request_extras = match additional_directories(&setup) {
                 Ok(roots) => roots,
                 Err(message) => {
                     acp::send_error(stdout, &id, -32602, &message);
                     return;
                 }
             };
-            let resume_cwd = params
-                .as_ref()
-                .and_then(|p| p.get("cwd"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let sid = params
-                .as_ref()
-                .and_then(|p| p.get("sessionId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let resume_cwd = setup.cwd.clone();
+            let sid = setup.session_id.clone();
             if sid.is_empty() {
                 acp::send_error(
                     stdout,
@@ -5534,14 +5427,14 @@ fn handle_acp(
                 );
                 return;
             }
-            let permission_profile = match resume_permission_profile(params.as_ref()) {
+            let permission_profile = match resume_permission_profile(&setup.meta) {
                 Ok(profile) => profile,
                 Err(message) => {
                     acp::send_error(stdout, &id, -32602, &message);
                     return;
                 }
             };
-            let model_override = match resume_model_override(params.as_ref()) {
+            let model_override = match resume_model_override(&setup.meta) {
                 Ok(model) => model,
                 Err(message) => {
                     acp::send_error(stdout, &id, -32602, &message);
@@ -5555,7 +5448,7 @@ fn handle_acp(
             let replay = if method == "session/load" {
                 true
             } else if ver == 2 {
-                match resume_replay_from(params.as_ref()) {
+                match resume_replay_from(&setup.replay_from) {
                     Ok(replay) => replay,
                     Err(message) => {
                         acp::send_error(stdout, &id, -32602, &message);
@@ -5588,13 +5481,7 @@ fn handle_acp(
             // host id as the ACP id, so an unknown id can be used directly
             // after restart. `_meta.mspSessionId` recovers older `sess-*`
             // ids when a client preserved our metadata.
-            let meta_msp_sid = params
-                .as_ref()
-                .and_then(|p| p.get("_meta"))
-                .and_then(|m| m.get("mspSessionId"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
+            let meta_msp_sid = meta_msp_session_id(&setup.meta);
             let msp_sid = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -5614,7 +5501,7 @@ fn handle_acp(
             // The host does not persist session MCP configuration, so a load
             // must carry the client's servers again to restore the tools.
             let (mcp_servers, _) =
-                session_mcp_servers(host, stdout, sessions, params.as_ref(), true, Some(&sid));
+                session_mcp_servers(host, stdout, sessions, &setup.mcp_servers, true, Some(&sid));
             // A session this adapter holds keeps its mode; one loaded fresh
             // takes the mode it was left in, and a read-only or plan session
             // opens on the read-only host.
@@ -5712,7 +5599,7 @@ fn handle_acp(
                     };
                     let session_name = session_name_from_result(&r);
                     let session_origin = session_name_origin_from_result(&r);
-                    let roots = match session_roots(params.as_ref(), &restored_cwd) {
+                    let roots = match session_roots(&setup, &restored_cwd) {
                         Ok(roots) => roots,
                         Err(message) => {
                             acp::send_error(stdout, &id, -32602, &message);
@@ -6072,7 +5959,10 @@ fn handle_acp(
                 }
             }
         }
-        "_session/userShell" => {
+        Request::Extension {
+            params: ref ext, ..
+        } if method == "_session/userShell" => {
+            let params = Some(json::from_value(ext));
             if USER_SHELL.load(Ordering::SeqCst) == 0 || !host.handshake().user_shell {
                 acp::send_error(
                     stdout,
@@ -6129,14 +6019,9 @@ fn handle_acp(
                 ),
             }
         }
-        "session/fork" => {
+        Request::ForkSession(setup) => {
             let ver = negotiated_ver();
-            let src_sid = params
-                .as_ref()
-                .and_then(|p| p.get("sessionId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let src_sid = setup.session_id.clone();
             if src_sid.is_empty() {
                 acp::send_error(
                     stdout,
@@ -6146,19 +6031,14 @@ fn handle_acp(
                 );
                 return;
             }
-            // A fork may target a new workspace; when a cwd is supplied it
-            // must still be absolute (same rule as session/new).
-            let fork_cwd = params
-                .as_ref()
-                .and_then(|p| p.get("cwd"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if !fork_cwd.is_empty() && !Path::new(&fork_cwd).is_absolute() {
+            // A fork may target a new workspace; it must still be absolute
+            // (same rule as session/new).
+            let fork_cwd = setup.cwd.clone();
+            if fork_cwd.is_empty() || !Path::new(&fork_cwd).is_absolute() {
                 acp::send_error(stdout, &id, -32602, "params.cwd must be an absolute path");
                 return;
             }
-            let request_extras = match additional_directories(params.as_ref()) {
+            let request_extras = match additional_directories(&setup) {
                 Ok(roots) => roots,
                 Err(message) => {
                     acp::send_error(stdout, &id, -32602, &message);
@@ -6182,16 +6062,10 @@ fn handle_acp(
             // without MCP servers. Keep the client's set on the record so a
             // restarted host loads the fork with it.
             let (mcp_servers, bridge_token) =
-                session_mcp_servers(host, stdout, sessions, params.as_ref(), false, None);
+                session_mcp_servers(host, stdout, sessions, &setup.mcp_servers, false, None);
             // Resolve the source MSP session: known ACP session first, then
             // preserved metadata (same rule as resume).
-            let meta_msp_sid = params
-                .as_ref()
-                .and_then(|p| p.get("_meta"))
-                .and_then(|m| m.get("mspSessionId"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
+            let meta_msp_sid = meta_msp_session_id(&setup.meta);
             let msp_sid = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -6223,7 +6097,7 @@ fn handle_acp(
             }
             let fork_host = host.owner(&msp_sid);
             let fork_mode = mode_on_host(source_mode, fork_host);
-            let cut_point = match resolve_fork_cut_point(host, &msp_sid, params.as_ref()) {
+            let cut_point = match resolve_fork_cut_point(host, &msp_sid, &setup.meta) {
                 Ok(c) => c,
                 Err(e) => {
                     acp::send_error(stdout, &id, -32602, &e);
@@ -6286,7 +6160,7 @@ fn handle_acp(
                     } else {
                         fork_cwd.clone()
                     };
-                    let roots = match session_roots(params.as_ref(), &restored_cwd) {
+                    let roots = match session_roots(&setup, &restored_cwd) {
                         Ok(roots) => roots,
                         Err(message) => {
                             acp::send_error(stdout, &id, -32602, &message);
@@ -6494,7 +6368,7 @@ fn handle_acp(
                             acp::session_modes(&session_mode_out)
                         )
                     };
-                    if ver == 1 || params.as_ref().and_then(|p| p.get("replayFrom")).is_some() {
+                    if ver == 1 || setup.replay_from.is_some() {
                         send_fold_output(stdout, sessions, &new_msp, replay_lines);
                     }
                     acp::send_result(stdout, &id, &result);
@@ -6536,18 +6410,13 @@ fn handle_acp(
                 ),
             }
         }
-        "session/prompt" => {
+        Request::Prompt(prompt) => {
             // A manual `muse login` sends no `authenticate`, so a login made
             // since the last request reaches the host here.
             host.refresh_config();
             let ver = negotiated_ver();
-            let report_request = file_report_request(params.as_ref());
-            let sid = params
-                .as_ref()
-                .and_then(|p| p.get("sessionId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let report_request = file_report_request(&prompt.meta);
+            let sid = prompt.session_id.clone();
             let (
                 msp_sid,
                 cwd,
@@ -6583,7 +6452,7 @@ fn handle_acp(
             let mut media_upload =
                 |base64: &str, media_type: &str| upload_video(host, &msp_sid, base64, media_type);
             let (parts, acp_content) = match extract_prompt_parts(
-                params.as_ref(),
+                &prompt.blocks,
                 &roots,
                 skills.as_ref(),
                 &mut media_upload,
@@ -6774,7 +6643,7 @@ fn handle_acp(
                             log(&format!("{method} woke goal turn {turn}"));
                             s.in_flight.push(InFlight {
                                 msp_turn: turn.to_string(),
-                                req_id: id.clone().unwrap_or(J::Null),
+                                req_id: id.clone(),
                                 queued: false,
                                 file_report: report_request.map(new_file_report),
                                 declined_retract_notified: false,
@@ -7050,7 +6919,7 @@ fn handle_acp(
                         }
                         s.in_flight.push(InFlight {
                             msp_turn: turn.clone(),
-                            req_id: id.clone().unwrap_or(J::Null),
+                            req_id: id.clone(),
                             queued: !started,
                             file_report: report_request.map(new_file_report),
                             declined_retract_notified: false,
@@ -7093,7 +6962,10 @@ fn handle_acp(
                 }
             }
         }
-        "_session/readOutput" => {
+        Request::Extension {
+            params: ref ext, ..
+        } if method == "_session/readOutput" => {
+            let params = Some(json::from_value(ext));
             if READ_OUTPUT.load(Ordering::SeqCst) == 0 {
                 acp::send_error(
                     stdout,
@@ -7199,7 +7071,10 @@ fn handle_acp(
                 ),
             }
         }
-        "_session/computerUse" => {
+        Request::Extension {
+            params: ref ext, ..
+        } if method == "_session/computerUse" => {
+            let params = Some(json::from_value(ext));
             if COMPUTER_USE.load(Ordering::SeqCst) == 0 || !host.handshake().computer_use_setup {
                 acp::send_error(
                     stdout,
@@ -7290,7 +7165,10 @@ fn handle_acp(
                 ),
             );
         }
-        "_session/plugins" => {
+        Request::Extension {
+            params: ref ext, ..
+        } if method == "_session/plugins" => {
+            let params = Some(json::from_value(ext));
             if PLUGINS.load(Ordering::SeqCst) == 0 {
                 acp::send_error(
                     stdout,
@@ -7337,7 +7215,10 @@ fn handle_acp(
                 ),
             }
         }
-        "_session/sideChat" => {
+        Request::Extension {
+            params: ref ext, ..
+        } if method == "_session/sideChat" => {
+            let params = Some(json::from_value(ext));
             if SIDE_CHAT.load(Ordering::SeqCst) == 0 {
                 acp::send_error(
                     stdout,
@@ -7437,7 +7318,10 @@ fn handle_acp(
                 ),
             }
         }
-        "_session/hooks" => {
+        Request::Extension {
+            params: ref ext, ..
+        } if method == "_session/hooks" => {
+            let params = Some(json::from_value(ext));
             if HOOKS.load(Ordering::SeqCst) == 0 {
                 acp::send_error(
                     stdout,
@@ -7489,20 +7373,33 @@ fn handle_acp(
                 ),
             }
         }
-        "_session/async_task/stop" => {
+        Request::Extension {
+            params: ref ext, ..
+        } if method == "_session/async_task/stop" => {
+            let params = Some(json::from_value(ext));
             stop_async_task(host, stdout, sessions, &id, params.as_ref());
         }
-        "subagent/sendMessage"
-        | "subagent/followupTask"
-        | "subagent/interrupt"
-        | "subagent/stop"
-        | "subagent/resume"
-        | "subagent/reopen"
-        | "subagent/close"
-        | "subagent/readResult" => {
+        Request::Extension {
+            params: ref ext, ..
+        } if matches!(
+            method.as_str(),
+            "subagent/sendMessage"
+                | "subagent/followupTask"
+                | "subagent/interrupt"
+                | "subagent/stop"
+                | "subagent/resume"
+                | "subagent/reopen"
+                | "subagent/close"
+                | "subagent/readResult"
+        ) =>
+        {
+            let params = Some(json::from_value(ext));
             subagent_control(host, stdout, sessions, &id, &method, params.as_ref());
         }
-        "_session/steering" => {
+        Request::Extension {
+            params: ref ext, ..
+        } if method == "_session/steering" => {
+            let params = Some(json::from_value(ext));
             let prompt_required = match steering_prompt_required(params.as_ref()) {
                 Ok(value) => value,
                 Err(message) => {
@@ -7546,24 +7443,29 @@ fn handle_acp(
                 );
                 return;
             }
-            let mut media_upload =
-                |base64: &str, media_type: &str| upload_video(host, &msp_sid, base64, media_type);
-            let (parts, acp_content) = match extract_prompt_parts(
-                params.as_ref(),
-                &roots,
-                skills.as_ref(),
-                &mut media_upload,
-            ) {
-                Ok((parts, content)) if !parts.is_empty() => (parts, content),
-                Ok(_) => {
-                    acp::send_error(stdout, &id, -32602, "steering requires content");
-                    return;
-                }
+            // The steering input is ACP prompt content, read with the
+            // negotiated version's schema type.
+            let blocks = match request::prompt_blocks(negotiated_ver(), ext.get("prompt")) {
+                Ok(blocks) => blocks,
                 Err(message) => {
                     acp::send_error(stdout, &id, -32602, &message);
                     return;
                 }
             };
+            let mut media_upload =
+                |base64: &str, media_type: &str| upload_video(host, &msp_sid, base64, media_type);
+            let (parts, acp_content) =
+                match extract_prompt_parts(&blocks, &roots, skills.as_ref(), &mut media_upload) {
+                    Ok((parts, content)) if !parts.is_empty() => (parts, content),
+                    Ok(_) => {
+                        acp::send_error(stdout, &id, -32602, "steering requires content");
+                        return;
+                    }
+                    Err(message) => {
+                        acp::send_error(stdout, &id, -32602, &message);
+                        return;
+                    }
+                };
             if active_turn.is_none() && prompt_required {
                 acp::send_result(
                     stdout,
@@ -7674,7 +7576,7 @@ fn handle_acp(
                 s.active_turn = Some(turn.clone());
                 s.in_flight.push(InFlight {
                     msp_turn: turn.clone(),
-                    req_id: J::Null,
+                    req_id: None,
                     queued: false,
                     file_report: None,
                     declined_retract_notified: false,
@@ -7714,15 +7616,10 @@ fn handle_acp(
                 send_v1_user_message(stdout, &sid, &acp_content);
             }
         }
-        "session/close" => {
+        Request::CloseSession { session_id } => {
             // v2 baseline: stop session work, drop local state, resolve
             // pending client interactions as cancelled, return {}.
-            let sid = params
-                .as_ref()
-                .and_then(|p| p.get("sessionId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let sid = session_id.clone();
             if sid.is_empty() {
                 acp::send_error(
                     stdout,
@@ -7747,7 +7644,7 @@ fn handle_acp(
                 acp::send_error(stdout, &id, -32602, "unknown sessionId");
             }
         }
-        "session/delete" => {
+        Request::DeleteSession { session_id, meta } => {
             // MSP answers `session/delete` with an admission ack and reports
             // the outcome later as `session/deleteCompleted`, so the ACP
             // request stays pending until that terminal arrives. Answering on
@@ -7756,12 +7653,7 @@ fn handle_acp(
                 acp::send_error(stdout, &id, -32601, "this Muse host cannot delete sessions");
                 return;
             }
-            let sid = params
-                .as_ref()
-                .and_then(|p| p.get("sessionId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let sid = session_id.clone();
             if sid.is_empty() {
                 acp::send_error(
                     stdout,
@@ -7773,13 +7665,7 @@ fn handle_acp(
             }
             // Resolve the durable MSP id the way resume does: the live
             // session, then preserved metadata, then the id itself.
-            let meta_msp_sid = params
-                .as_ref()
-                .and_then(|p| p.get("_meta"))
-                .and_then(|m| m.get("mspSessionId"))
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
+            let meta_msp_sid = meta_msp_session_id(&meta);
             let msp_sid = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -7859,13 +7745,8 @@ fn handle_acp(
                 }
             }
         }
-        "session/cancel" => {
-            let sid = params
-                .as_ref()
-                .and_then(|p| p.get("sessionId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+        Request::Cancel { session_id } => {
+            let sid = session_id.clone();
             if sid.is_empty() {
                 return; // notification: nothing to acknowledge
             }
@@ -7994,19 +7875,11 @@ fn handle_acp(
             invalidate_pending_approval(stdout, sessions, &sid, None, true);
             settle_feedback_cancelled(stdout, sessions, &sid);
         }
-        "$/cancel_request" => {
+        Request::CancelPending { request_id } => {
             // ACP cancellation is scoped to the original request id. A
             // queued session/prompt can be reclaimed without disturbing the
             // running turn or any other queued prompts.
-            let Some(request_id) = params.as_ref().and_then(|p| p.get("requestId")) else {
-                log("$/cancel_request ignored: missing requestId");
-                return;
-            };
-            if !matches!(request_id, J::Null | J::Num(_) | J::Str(_)) {
-                log("$/cancel_request ignored: requestId is not a JSON-RPC id");
-                return;
-            }
-            let request_text = j_to_string(request_id);
+            let request_text = request_id.to_string();
             let target = sessions
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -8014,7 +7887,7 @@ fn handle_acp(
                 .find_map(|s| {
                     s.in_flight
                         .iter()
-                        .find(|f| j_to_string(&f.req_id) == request_text)
+                        .find(|f| f.req_id.as_ref() == Some(&request_id))
                         .map(|f| (s.msp_sid.clone(), f.msp_turn.clone(), f.queued))
                 });
             let Some((msp_sid, turn_id, queued)) = target else {
@@ -8049,37 +7922,18 @@ fn handle_acp(
                 )),
             }
         }
-        "session/list" => {
+        Request::ListSessions { cwd, cursor } => {
             // Sessions are durable in the host: list them there so existing
             // threads are visible to plain clients. Always publish the host
             // id, including for adapter-live sessions, because clients persist
             // this value and may load it through a fresh adapter process.
-            let filter_root = params
-                .as_ref()
-                .and_then(|p| p.get("cwd"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let list_cursor = params.as_ref().and_then(|p| p.get("cursor"));
+            let filter_root = cwd.unwrap_or_default();
+            let list_cursor = cursor;
             let list_stream = host.handshake().session_list_stream;
-            let filter_additional = match additional_directories(params.as_ref()) {
-                Ok(mut roots) => {
-                    // session/new removes an exact duplicate of cwd from the
-                    // effective additional roots. Apply the same
-                    // normalization to list filters so callers can reuse the
-                    // accepted creation parameters.
-                    roots.retain(|root| !same_workspace_root(root, &filter_root));
-                    roots
-                }
-                Err(message) => {
-                    acp::send_error(stdout, &id, -32602, &message);
-                    return;
-                }
-            };
             let cmd = host.mint_cmd("cmd-");
             let mut host_params = format!("{{\"commandId\":{},\"limit\":200", esc(&cmd));
-            if let Some(cursor) = list_cursor {
-                host_params.push_str(&format!(",\"cursor\":{}", j_to_string(cursor)));
+            if let Some(cursor) = &list_cursor {
+                host_params.push_str(&format!(",\"cursor\":{}", esc(cursor)));
             }
             if !filter_root.is_empty() {
                 host_params.push_str(&format!(",\"workspaceRoot\":{}", esc(&filter_root)));
@@ -8132,8 +7986,7 @@ fn handle_acp(
                                 if !first_page {
                                     continue;
                                 }
-                                if session_matches_filter(session, &filter_root, &filter_additional)
-                                {
+                                if session_matches_filter(session, &filter_root) {
                                     entries.push(owned_session_row(
                                         session,
                                         item.get("updatedAt").and_then(J::as_str),
@@ -8149,9 +8002,8 @@ fn handle_acp(
                                     skipped_null_root += 1;
                                     continue;
                                 }
-                                if !filter_additional.is_empty()
-                                    || (!filter_root.is_empty()
-                                        && !same_workspace_root(cwd, &filter_root))
+                                if !filter_root.is_empty()
+                                    && !same_workspace_root(cwd, &filter_root)
                                 {
                                     continue;
                                 }
@@ -8180,13 +8032,9 @@ fn handle_acp(
                     // appended to the first page only, so a client paging
                     // through the cursor never sees one twice.
                     if first_page {
-                        for (sid, row) in owned_session_rows(
-                            sessions,
-                            lists,
-                            list_stream,
-                            &filter_root,
-                            &filter_additional,
-                        ) {
+                        for (sid, row) in
+                            owned_session_rows(sessions, lists, list_stream, &filter_root)
+                        {
                             if !listed.contains(&sid) {
                                 entries.push(row);
                             }
@@ -8218,16 +8066,11 @@ fn handle_acp(
                         return;
                     }
                     log(&format!("session/list failed: {}", err_message(&e)));
-                    let entries: Vec<String> = owned_session_rows(
-                        sessions,
-                        lists,
-                        list_stream,
-                        &filter_root,
-                        &filter_additional,
-                    )
-                    .into_iter()
-                    .map(|(_, row)| row)
-                    .collect();
+                    let entries: Vec<String> =
+                        owned_session_rows(sessions, lists, list_stream, &filter_root)
+                            .into_iter()
+                            .map(|(_, row)| row)
+                            .collect();
                     acp::send_result(
                         stdout,
                         &id,
@@ -8239,32 +8082,26 @@ fn handle_acp(
                 }
             }
         }
-        "session/set_config_option" => {
+        Request::SetConfigOption {
+            session_id,
+            config_id,
+            value,
+        } => {
             // Config selectors: approval posture, model, and the session's
             // standing reasoning default (with a per-turn fallback for hosts
             // that predate MSP 1.3.0).
-            let sid = params
-                .as_ref()
-                .and_then(|p| p.get("sessionId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let key = params
-                .as_ref()
-                .and_then(|p| p.get("configId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let sid = session_id;
+            let key = config_id;
             // A boolean value (`type: "boolean"`) is only meaningful for the
             // Auto-review toggle; it maps onto the selector's own ids.
-            let value = match params.as_ref().and_then(|p| p.get("value")) {
-                Some(J::Bool(on)) if key == "auto_review" => if *on {
+            let value = match value {
+                request::ConfigValue::Bool(on) if key == "auto_review" => if on {
                     acp::AUTO_REVIEW_ON
                 } else {
                     acp::AUTO_REVIEW_OFF
                 }
                 .to_string(),
-                Some(J::Bool(_)) => {
+                request::ConfigValue::Bool(_) => {
                     acp::send_error(
                         stdout,
                         &id,
@@ -8273,7 +8110,18 @@ fn handle_acp(
                     );
                     return;
                 }
-                value => value.and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                // ACP requires refusing a value type the agent does not
+                // support with -32602.
+                request::ConfigValue::Other(kind) => {
+                    acp::send_error(
+                        stdout,
+                        &id,
+                        -32602,
+                        &format!("unsupported config option value type {}", esc(&kind)),
+                    );
+                    return;
+                }
+                request::ConfigValue::Id(value) => value,
             };
             let msp_sid = match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
                 Some(s) => s.msp_sid.clone(),
@@ -8489,20 +8337,13 @@ fn handle_acp(
                 ),
             }
         }
-        "session/set_mode" => {
+        Request::SetMode {
+            session_id,
+            mode_id,
+        } => {
             // v1 operating mode switch, same MSP ApprovalMode vocabulary.
-            let sid = params
-                .as_ref()
-                .and_then(|p| p.get("sessionId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let value = params
-                .as_ref()
-                .and_then(|p| p.get("modeId").or_else(|| p.get("mode")))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
+            let sid = session_id;
+            let value = mode_id;
             let msp_sid = match sessions.lock().unwrap_or_else(|p| p.into_inner()).get(&sid) {
                 Some(s) => s.msp_sid.clone(),
                 None => {
@@ -8573,7 +8414,10 @@ fn handle_acp(
         // `SetSessionModelRequest` (ACP v0.10). Kept as a documented
         // compatibility method with the same effect as the `model`
         // config option; see docs/acp-extensions.md.
-        "session/set_model" => {
+        Request::Extension {
+            params: ref ext, ..
+        } if method == "session/set_model" => {
+            let params = Some(json::from_value(ext));
             let sid = params
                 .as_ref()
                 .and_then(|p| p.get("sessionId"))
@@ -8632,15 +8476,11 @@ fn handle_acp(
                 ),
             }
         }
-        "authenticate" => {
+        Request::Authenticate { method_id } => {
             // The terminal-auth login already ran outside ACP. Muse checks
             // its credentials on the next turn, and a still-unauthenticated
             // prompt fails with -32000 again, so success cannot mask it.
-            let method_id = params
-                .as_ref()
-                .and_then(|p| p.get("methodId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let method_id = method_id.as_str();
             if method_id == AUTH_METHOD_ID {
                 // A settings view may still link the old credential.
                 host.refresh_config();
@@ -8656,15 +8496,11 @@ fn handle_acp(
                 );
             }
         }
-        "auth/login" => {
+        Request::LoginAuth { method_id } => {
             // The only advertised method is terminal auth, which clients run
             // in a terminal and must never pass to auth/login. Login itself
             // stays with the Muse CLI, so credentials never cross ACP.
-            let method_id = params
-                .as_ref()
-                .and_then(|p| p.get("methodId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let method_id = method_id.as_str();
             if method_id == DEVICE_LOGIN_ID && !device_login_method("methodId").is_empty() {
                 start_device_login(host, stdout, &id);
                 return;
@@ -8678,8 +8514,8 @@ fn handle_acp(
             };
             acp::send_error(stdout, &id, -32602, &message);
         }
-        "auth/logout" | "logout" => logout(host, stdout, &id),
-        "shutdown" | "exit" => {
+        Request::Logout => logout(host, stdout, &id),
+        Request::Extension { .. } if matches!(method.as_str(), "shutdown" | "exit") => {
             if method == "shutdown" {
                 acp::send_result(stdout, &id, "null");
             }
@@ -8688,7 +8524,7 @@ fn handle_acp(
             host.shutdown();
             shutdown::exit(0);
         }
-        _ => {
+        Request::Extension { .. } | Request::Unsupported { .. } => {
             if id.is_some() {
                 acp::send_error(stdout, &id, -32601, "method not found");
             }
@@ -8992,21 +8828,6 @@ fn seed_task_inventory(
     }
 }
 
-fn mime_for(path: &str) -> &'static str {
-    let p = path.to_lowercase();
-    if p.ends_with(".png") {
-        "image/png"
-    } else if p.ends_with(".jpg") || p.ends_with(".jpeg") {
-        "image/jpeg"
-    } else if p.ends_with(".gif") {
-        "image/gif"
-    } else if p.ends_with(".webp") {
-        "image/webp"
-    } else {
-        "application/octet-stream"
-    }
-}
-
 fn image_part(data_b64: &str, mime: &str) -> String {
     format!(
         "{{\"type\":\"image\",\"base64Data\":{},\"mediaType\":{}}}",
@@ -9178,23 +8999,12 @@ fn video_media_type(mime: &str, uri: &str) -> Option<&'static str> {
 /// Returns `(msp_parts, acp_content)`: the host input and the accepted prompt
 /// re-serialized as ACP content for the user-message echo.
 fn extract_prompt_parts(
-    params: Option<&J>,
+    blocks: &[request::Block],
     roots: &[String],
     skills: Option<&HashMap<String, Option<String>>>,
     media: &mut dyn FnMut(&str, &str) -> Result<String, String>,
 ) -> Result<(Vec<String>, String), String> {
-    let p = params.ok_or("session/prompt requires params")?;
-    let prompt = p.get("prompt").unwrap_or(p);
-    let blocks: Vec<J> = match prompt {
-        J::Arr(b) => b.clone(),
-        J::Str(s) => vec![J::Str(s.clone())],
-        J::Obj(_) => match p.get("prompt") {
-            Some(J::Arr(b)) => b.clone(),
-            Some(J::Str(s)) => vec![J::Str(s.clone())],
-            _ => return Err("session/prompt requires a prompt array".to_string()),
-        },
-        _ => return Err("session/prompt requires a prompt array".to_string()),
-    };
+    use request::Content;
     let mut texts = Vec::new();
     let mut parts = Vec::new();
     let mut content: Vec<String> = Vec::new(); // accepted prompt as ACP content
@@ -9210,127 +9020,105 @@ fn extract_prompt_parts(
         }
         texts.clear();
     };
-    for b in &blocks {
-        match b {
-            J::Str(s) => {
-                texts.push(s.clone());
-                content.push(format!("{{\"type\":\"text\",\"text\":{}}}", esc(s)));
+    for block in blocks {
+        let echo = || block.echo.to_string();
+        match &block.content {
+            Content::Text(text) => {
+                texts.push(text.clone());
+                content.push(echo());
             }
-            J::Obj(_) => {
-                let t = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
-                match t {
-                    "text" => {
-                        if let Some(x) = b.get("text").and_then(|v| v.as_str()) {
-                            texts.push(x.to_string());
-                            content.push(format!("{{\"type\":\"text\",\"text\":{}}}", esc(x)));
-                        }
-                    }
-                    "resource" => {
-                        let r = b.get("resource").cloned().unwrap_or(J::Null);
-                        let uri = r.get("uri").and_then(|v| v.as_str()).unwrap_or("");
-                        let mime = r.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
-                        match r.get("text").and_then(|v| v.as_str()) {
-                            Some(x) => {
-                                texts.push(x.to_string());
-                                content.push(j_to_string(b));
-                            }
-                            None => match r.get("blob").and_then(|v| v.as_str()) {
-                                Some(blob) if mime.starts_with("image/") => {
-                                    flush_text(&mut texts, &mut parts);
-                                    parts.push(image_part(blob, mime));
-                                    content.push(j_to_string(b));
-                                }
-                                Some(blob) if video_media_type(mime, uri).is_some() => {
-                                    // Upload the inline video to the session's
-                                    // video store and consume the receipt.
-                                    flush_text(&mut texts, &mut parts);
-                                    let media_type = video_media_type(mime, uri)
-                                        .expect("checked video media type");
-                                    let upload_id = media(blob, media_type)?;
-                                    parts.push(format!(
-                                        "{{\"type\":\"video\",\"uploadId\":{}}}",
-                                        esc(&upload_id)
-                                    ));
-                                    content.push(j_to_string(b));
-                                }
-                                Some(_) => return Err("embedded non-image resource blobs are not supported; send text".to_string()),
-                                None if !uri.is_empty() => {
-                                    texts.push(format!("[resource: {uri}]"));
-                                    content.push(j_to_string(b));
-                                }
-                                None => return Err("resource block needs resource.text, resource.blob, or resource.uri".to_string()),
-                            },
-                        }
-                    }
-                    "resource_link" => {
-                        // Baseline content: resources the agent can access.
-                        let uri = b.get("uri").and_then(|v| v.as_str()).unwrap_or("");
-                        let name = b.get("name").and_then(|v| v.as_str()).unwrap_or(uri);
-                        let mime = b.get("mimeType").and_then(|v| v.as_str()).unwrap_or("");
-                        if uri.is_empty() {
-                            return Err("resource_link block needs uri".to_string());
-                        }
-                        if video_media_type(mime, uri).is_some() {
-                            // A video reference is uploaded to the session's
-                            // video store and consumed as a `video` part; the
-                            // file must be readable inside the approved roots.
-                            flush_text(&mut texts, &mut parts);
-                            let media_type =
-                                video_media_type(mime, uri).expect("checked video media type");
-                            let Some(bytes) = local_file_bytes(uri, roots, MEDIA_MAX_BYTES)? else {
-                                return Err(format!(
-                                    "video resource {uri} is not a readable local file within the approved roots"
-                                ));
-                            };
-                            let upload_id = media(&base64_encode(&bytes), media_type)?;
-                            parts.push(format!(
-                                "{{\"type\":\"video\",\"uploadId\":{}}}",
-                                esc(&upload_id)
-                            ));
-                            content.push(j_to_string(b));
-                            continue;
-                        }
-                        let textual = mime.starts_with("text/") || mime.is_empty() || looks_textual(uri);
-                        let local_text = if textual {
-                            local_file_text(uri, roots)?
-                        } else {
-                            // Validate local URI syntax without opening a
-                            // resource that was not identified as text.
-                            if uri.starts_with("file://") {
-                                let cwd = roots.first().map(String::as_str).unwrap_or("/");
-                                file_uri_path(uri, cwd)?;
-                            }
-                            None
-                        };
-                        match local_text {
-                            Some(text) => {
-                                texts.push(format!("[{name} {uri}]\n{text}"));
-                            }
-                            _ => {
-                                texts.push(format!("[resource: {name} ({uri})]"));
-                            }
-                        }
-                        content.push(j_to_string(b));
-                    }
-                    "image" => {
-                        flush_text(&mut texts, &mut parts);
-                        if let Some(d) = b.get("data").and_then(|v| v.as_str()) {
-                            let mime = b.get("mimeType").and_then(|v| v.as_str()).unwrap_or("image/png");
-                            parts.push(image_part(d, mime));
-                            content.push(j_to_string(b));
-                        } else if let Some(uri) = b.get("uri").and_then(|v| v.as_str()) {
-                            let (bytes, mime) = read_image_uri(uri, roots)?;
-                            parts.push(image_part(&json::b64(&bytes), &mime));
-                            content.push(j_to_string(b));
-                        } else {
-                            return Err("image block needs data or uri".to_string());
-                        }
-                    }
-                    "audio" => return Err("audio blocks are not supported: the host input type is closed (text|image)".to_string()),
-                    _ => return Err(format!("unsupported content block type '{t}'")),
+            Content::TextResource { text, .. } => {
+                texts.push(text.clone());
+                content.push(echo());
+            }
+            Content::BlobResource {
+                uri,
+                blob,
+                mime_type,
+            } => {
+                let mime = mime_type.as_deref().unwrap_or("");
+                if mime.starts_with("image/") {
+                    flush_text(&mut texts, &mut parts);
+                    parts.push(image_part(blob, mime));
+                    content.push(echo());
+                } else if let Some(media_type) = video_media_type(mime, uri) {
+                    // Upload the inline video to the session's video store
+                    // and consume the receipt.
+                    flush_text(&mut texts, &mut parts);
+                    let upload_id = media(blob, media_type)?;
+                    parts.push(format!(
+                        "{{\"type\":\"video\",\"uploadId\":{}}}",
+                        esc(&upload_id)
+                    ));
+                    content.push(echo());
+                } else {
+                    return Err(
+                        "embedded non-image resource blobs are not supported; send text"
+                            .to_string(),
+                    );
                 }
             }
-            _ => return Err("prompt blocks must be objects or strings".to_string()),
+            Content::ResourceLink {
+                uri,
+                name,
+                mime_type,
+            } => {
+                // Baseline content: resources the agent can access.
+                let name = if name.is_empty() { uri } else { name };
+                let mime = mime_type.as_deref().unwrap_or("");
+                if uri.is_empty() {
+                    return Err("resource_link block needs uri".to_string());
+                }
+                if let Some(media_type) = video_media_type(mime, uri) {
+                    // A video reference is uploaded to the session's video
+                    // store and consumed as a `video` part; the file must be
+                    // readable inside the approved roots.
+                    flush_text(&mut texts, &mut parts);
+                    let Some(bytes) = local_file_bytes(uri, roots, MEDIA_MAX_BYTES)? else {
+                        return Err(format!(
+                            "video resource {uri} is not a readable local file within the approved roots"
+                        ));
+                    };
+                    let upload_id = media(&base64_encode(&bytes), media_type)?;
+                    parts.push(format!(
+                        "{{\"type\":\"video\",\"uploadId\":{}}}",
+                        esc(&upload_id)
+                    ));
+                    content.push(echo());
+                    continue;
+                }
+                let textual = mime.starts_with("text/") || mime.is_empty() || looks_textual(uri);
+                let local_text = if textual {
+                    local_file_text(uri, roots)?
+                } else {
+                    // Validate local URI syntax without opening a resource
+                    // that was not identified as text.
+                    if uri.starts_with("file://") {
+                        let cwd = roots.first().map(String::as_str).unwrap_or("/");
+                        file_uri_path(uri, cwd)?;
+                    }
+                    None
+                };
+                match local_text {
+                    Some(text) => texts.push(format!("[{name} {uri}]\n{text}")),
+                    None => texts.push(format!("[resource: {name} ({uri})]")),
+                }
+                content.push(echo());
+            }
+            Content::Image { data, mime_type } => {
+                flush_text(&mut texts, &mut parts);
+                parts.push(image_part(data, mime_type));
+                content.push(echo());
+            }
+            Content::Audio => {
+                return Err(
+                    "audio blocks are not supported: the host input type is closed (text|image)"
+                        .to_string(),
+                );
+            }
+            Content::Other(kind) => {
+                return Err(format!("unsupported content block type '{kind}'"));
+            }
         }
     }
     flush_text(&mut texts, &mut parts);
@@ -10911,15 +10699,6 @@ fn looks_textual(path: &str) -> bool {
         || p.ends_with(".log")
 }
 
-fn read_image_uri(uri: &str, roots: &[String]) -> Result<(Vec<u8>, String), String> {
-    let cwd = roots.first().map(String::as_str).unwrap_or("/");
-    let requested = file_uri_path(uri, cwd)?;
-    let path = confined_path(&requested, roots)?;
-    let bytes =
-        std::fs::read(&path).map_err(|e| format!("cannot read image {}: {e}", path.display()))?;
-    Ok((bytes, mime_for(&requested).to_string()))
-}
-
 /// Read a small text file for resource_link inlining (None = mention only).
 fn local_file_text(uri: &str, roots: &[String]) -> Result<Option<String>, String> {
     if uri.contains("://") && !uri.starts_with("file://") {
@@ -11165,10 +10944,8 @@ fn session_info_row(
     format!("{{{}}}", parts.join(","))
 }
 
-fn session_matches_filter(session: &AcpSession, root: &str, additional: &[String]) -> bool {
-    (root.is_empty() || same_workspace_root(&session.cwd, root))
-        && (additional.is_empty()
-            || same_workspace_roots(session.roots.get(1..).unwrap_or_default(), additional))
+fn session_matches_filter(session: &AcpSession, root: &str) -> bool {
+    root.is_empty() || same_workspace_root(&session.cwd, root)
 }
 
 fn owned_session_row(session: &AcpSession, updated_at: Option<&str>) -> String {
@@ -11250,7 +11027,7 @@ fn delete_failure_message(reason: Option<&str>, physical_change: Option<&str>) -
 /// Answer every ACP waiter of one delete command with the same outcome.
 fn answer_delete_waiters(
     stdout: &StdoutShared,
-    waiters: Vec<J>,
+    waiters: Vec<RequestId>,
     outcome: Result<(), (i64, String, Option<String>)>,
 ) {
     match outcome {
@@ -11405,14 +11182,13 @@ fn owned_session_rows(
     lists: &SessionLists,
     list_stream: bool,
     root: &str,
-    additional: &[String],
 ) -> Vec<(String, String)> {
     sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .values()
         .filter(|s| {
-            session_matches_filter(s, root, additional)
+            session_matches_filter(s, root)
                 && (!list_stream || {
                     let cache = lists.lock().unwrap_or_else(|p| p.into_inner());
                     !cache.deleted.contains(&s.msp_sid)
@@ -12133,13 +11909,13 @@ fn handle_msp(
                         if terminal == "completed" || terminal == "cancelled" {
                             acp::send_result(
                                 stdout,
-                                &Some(req_id),
+                                &req_id,
                                 &format!("{{\"stopReason\":\"{stop}\"{usage}}}"),
                             );
                         } else {
                             acp::send_error(
                                 stdout,
-                                &Some(req_id),
+                                &req_id,
                                 if auth_required { -32000 } else { -32603 },
                                 &terminal_detail,
                             );
@@ -12178,7 +11954,7 @@ fn handle_msp(
                         acp::send_state(stdout, &acp_sid, "idle", Some("cancelled"));
                     }
                 } else {
-                    acp::send_result(stdout, &Some(req_id), "{\"stopReason\":\"cancelled\"}");
+                    acp::send_result(stdout, &req_id, "{\"stopReason\":\"cancelled\"}");
                 }
                 let _ = req_id;
             }
@@ -12450,7 +12226,7 @@ fn handle_msp(
                         acp::send_state(stdout, &acp_sid, "idle", Some("cancelled"));
                     }
                 } else {
-                    acp::send_result(stdout, &Some(req_id), "{\"stopReason\":\"cancelled\"}");
+                    acp::send_result(stdout, &req_id, "{\"stopReason\":\"cancelled\"}");
                 }
                 let _ = req_id;
             }
@@ -13902,7 +13678,7 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
         .get_mut(&acp_sid)
     {
         s.pending_perm = Some(PendingPerm {
-            req_id,
+            req_id: Some(req_id),
             approval_sid: msp_sid.to_string(),
             approval_id,
             requirement,
@@ -13960,7 +13736,7 @@ fn offer_permission_feedback(
         .and_then(|s| s.pending_perm.as_mut())
     {
         p.feedback = Some(acp::PendingFeedback {
-            req_id,
+            req_id: Some(req_id),
             choice_id: choice_id.to_string(),
         });
     }
@@ -14081,7 +13857,7 @@ fn complete_permission(
     host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
-    id: &Option<J>,
+    id: &Option<RequestId>,
     msg: &J,
 ) {
     let idv = match id {
@@ -14094,7 +13870,7 @@ fn complete_permission(
         .unwrap_or_else(|p| p.into_inner())
         .iter()
         .find_map(|(k, s)| match &s.pending_perm {
-            Some(p) if j_to_string(&p.req_id) == j_to_string(&idv) => Some(k.clone()),
+            Some(p) if p.req_id.as_ref() == Some(&idv) => Some(k.clone()),
             _ => None,
         });
     let acp_sid = match found {
@@ -14275,7 +14051,7 @@ fn complete_permission_feedback(
     host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
-    id: &Option<J>,
+    id: &Option<RequestId>,
     msg: &J,
 ) {
     let idv = match id {
@@ -14288,9 +14064,9 @@ fn complete_permission_feedback(
         .iter()
         .find_map(|(k, s)| {
             s.pending_perm.as_ref().and_then(|p| {
-                p.feedback.as_ref().and_then(|f| {
-                    (j_to_string(&f.req_id) == j_to_string(&idv)).then_some(k.clone())
-                })
+                p.feedback
+                    .as_ref()
+                    .and_then(|f| (f.req_id.as_ref() == Some(&idv)).then_some(k.clone()))
             })
         });
     let acp_sid = match acp_sid {
@@ -14419,7 +14195,7 @@ fn stop_async_task(
     host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
-    id: &Option<J>,
+    id: &Option<RequestId>,
     params: Option<&J>,
 ) {
     let sid = params
@@ -14632,7 +14408,7 @@ fn drop_acp_session(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) -
                 if s.ver == 2 {
                     acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
                 } else {
-                    acp::send_result(stdout, &Some(f.req_id), "{\"stopReason\":\"cancelled\"}");
+                    acp::send_result(stdout, &f.req_id, "{\"stopReason\":\"cancelled\"}");
                 }
             }
             for p in s.pending_ui {
@@ -14647,25 +14423,17 @@ fn drop_acp_session(stdout: &StdoutShared, sessions: &Sessions, acp_sid: &str) -
                 if s.ver == 2 {
                     // The feedback form runs before its prompt is inserted,
                     // so closing prevented insertion.
-                    cancel_v2_prompt_before_insertion(stdout, &Some(f.prompt_req));
+                    cancel_v2_prompt_before_insertion(stdout, &f.prompt_req);
                     acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
                 } else {
-                    acp::send_result(
-                        stdout,
-                        &Some(f.prompt_req),
-                        "{\"stopReason\":\"cancelled\"}",
-                    );
+                    acp::send_result(stdout, &f.prompt_req, "{\"stopReason\":\"cancelled\"}");
                 }
             }
             if let Some(r) = s.pending_recap {
                 if s.ver == 2 {
                     acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
                 } else {
-                    acp::send_result(
-                        stdout,
-                        &Some(r.prompt_req),
-                        "{\"stopReason\":\"cancelled\"}",
-                    );
+                    acp::send_result(stdout, &r.prompt_req, "{\"stopReason\":\"cancelled\"}");
                 }
             }
             true
@@ -14712,7 +14480,7 @@ fn fail_in_flight(stdout: &StdoutShared, s: &mut AcpSession, message: &str) {
         acp::send_state(stdout, &s.acp_sid, "idle", Some("cancelled"));
     } else {
         for f in s.in_flight.drain(..) {
-            acp::send_error(stdout, &Some(f.req_id), -32603, message);
+            acp::send_error(stdout, &f.req_id, -32603, message);
         }
     }
 }
@@ -14732,7 +14500,7 @@ fn send_elicitation_form(
     message: &str,
     schema: &str,
     tag: &str,
-) -> Option<J> {
+) -> Option<RequestId> {
     let tool_f = if tool_call_id.is_empty() {
         String::new()
     } else {
@@ -14801,7 +14569,7 @@ fn show_pending_ui(
         .get_mut(acp_sid)
         .and_then(|s| s.pending_ui.get_mut(idx))
     {
-        p.req_id = req_id;
+        p.req_id = Some(req_id);
     }
     true
 }
@@ -14868,13 +14636,17 @@ fn ask_next_ui_question(
     )
 }
 
-fn remove_pending_ui(sessions: &Sessions, acp_sid: &str, req_id: &J) -> Option<acp::PendingUi> {
+fn remove_pending_ui(
+    sessions: &Sessions,
+    acp_sid: &str,
+    req_id: &RequestId,
+) -> Option<acp::PendingUi> {
     let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
     let s = map.get_mut(acp_sid)?;
     let idx = s
         .pending_ui
         .iter()
-        .position(|p| j_to_string(&p.req_id) == j_to_string(req_id))?;
+        .position(|p| p.req_id.as_ref() == Some(req_id))?;
     Some(s.pending_ui.remove(idx))
 }
 
@@ -15023,7 +14795,7 @@ fn bridge_user_input(
     {
         // The form's request id is stored once it is sent.
         s.pending_ui.push(acp::PendingUi {
-            req_id: J::Null,
+            req_id: None,
             user_input_id: user_input_id.clone(),
             owner_msp_sid: owner_msp_sid.to_string(),
             turn_id,
@@ -15050,7 +14822,7 @@ fn bridge_user_input(
     };
     log(&format!(
         "bridging userInput {user_input_id} to elicitation {}",
-        j_to_string(&req_id)
+        req_id
     ));
     if let Some(p) = sessions
         .lock()
@@ -15062,7 +14834,7 @@ fn bridge_user_input(
                 .find(|p| p.user_input_id == user_input_id)
         })
     {
-        p.req_id = req_id;
+        p.req_id = Some(req_id);
     }
     true
 }
@@ -15331,11 +15103,11 @@ fn settle_command_with_text(
     sessions: &Sessions,
     acp_sid: &str,
     ver: u8,
-    prompt_req: &J,
+    prompt_req: &Option<RequestId>,
     prompt_content: &str,
     text: &str,
 ) {
-    let prompt_req = Some(prompt_req.clone());
+    let prompt_req = prompt_req.clone();
     if ver == 2 {
         // A local command uses the foreground lifecycle even without model
         // work: running, then idle. The command is done, not the session: a
@@ -15371,7 +15143,7 @@ fn start_recap(
     sessions: &Sessions,
     acp_sid: &str,
     ver: u8,
-    prompt_req: Option<J>,
+    prompt_req: Option<RequestId>,
     prompt_content: &str,
     argument: &str,
 ) {
@@ -15426,7 +15198,7 @@ fn start_recap(
         .get_mut(acp_sid)
         .map(|s| {
             s.pending_recap = Some(acp::PendingRecap {
-                prompt_req: prompt_req.clone().unwrap_or(J::Null),
+                prompt_req: prompt_req.clone(),
                 retry_id,
                 ver,
             });
@@ -15454,7 +15226,7 @@ fn run_cua(
     sessions: &Sessions,
     acp_sid: &str,
     ver: u8,
-    prompt_req: Option<J>,
+    prompt_req: Option<RequestId>,
     prompt_content: &str,
     action: CuaAction,
 ) {
@@ -15621,7 +15393,7 @@ fn run_cua(
         sessions,
         acp_sid,
         ver,
-        &prompt_req.unwrap_or(J::Null),
+        &prompt_req,
         prompt_content,
         &text,
     );
@@ -15770,7 +15542,7 @@ fn import_skills(
     sessions: &Sessions,
     acp_sid: &str,
     ver: u8,
-    prompt_req: Option<J>,
+    prompt_req: Option<RequestId>,
     prompt_content: &str,
     source: &str,
     dry_run: bool,
@@ -15804,7 +15576,7 @@ fn import_skills(
             sessions,
             acp_sid,
             ver,
-            &prompt_req.unwrap_or(J::Null),
+            &prompt_req,
             prompt_content,
             &skill_import_text(&result),
         ),
@@ -15920,7 +15692,7 @@ fn settle_recap(
     } else {
         acp::send_result(
             stdout,
-            &Some(pending.prompt_req.clone()),
+            &pending.prompt_req,
             &format!("{{\"stopReason\":\"{stop}\"}}"),
         );
     }
@@ -15949,7 +15721,7 @@ fn fail_recap(
             acp::send_state(stdout, acp_sid, "idle", Some("_failed"));
         }
     } else {
-        acp::send_error(stdout, &Some(pending.prompt_req.clone()), -32603, message);
+        acp::send_error(stdout, &pending.prompt_req, -32603, message);
     }
 }
 
@@ -16023,7 +15795,7 @@ fn submit_feedback(
     sessions: &Sessions,
     acp_sid: &str,
     ver: u8,
-    prompt_req: &J,
+    prompt_req: &Option<RequestId>,
     prompt_content: &str,
     classification: &str,
     note: &str,
@@ -16075,7 +15847,7 @@ fn start_feedback(
     sessions: &Sessions,
     acp_sid: &str,
     ver: u8,
-    prompt_req: Option<J>,
+    prompt_req: Option<RequestId>,
     prompt_content: &str,
     argument: &str,
 ) {
@@ -16093,8 +15865,8 @@ fn start_feedback(
                 Some(s) => {
                     // The form's request id is stored once it is sent.
                     s.pending_feedback = Some(acp::PendingFeedbackForm {
-                        req_id: J::Null,
-                        prompt_req: prompt_req.clone().unwrap_or(J::Null),
+                        req_id: None,
+                        prompt_req: prompt_req.clone(),
                         prompt_content: prompt_content.to_string(),
                         ver,
                     });
@@ -16134,11 +15906,10 @@ fn start_feedback(
                 .get_mut(acp_sid)
                 .and_then(|s| s.pending_feedback.as_mut())
         {
-            pending.req_id = req_id;
+            pending.req_id = Some(req_id);
         }
         return;
     }
-    let prompt_req = prompt_req.unwrap_or(J::Null);
     match parse_feedback_argument(argument) {
         Some((classification, note)) if !note.is_empty() => submit_feedback(
             host,
@@ -16178,12 +15949,12 @@ fn settle_feedback_cancelled(stdout: &StdoutShared, sessions: &Sessions, acp_sid
     if pending.ver == 2 {
         // The form runs before the prompt is inserted, so a stop prevents
         // insertion.
-        cancel_v2_prompt_before_insertion(stdout, &Some(pending.prompt_req));
+        cancel_v2_prompt_before_insertion(stdout, &pending.prompt_req);
         acp::send_state(stdout, acp_sid, "idle", Some("cancelled"));
     } else {
         acp::send_result(
             stdout,
-            &Some(pending.prompt_req),
+            &pending.prompt_req,
             "{\"stopReason\":\"cancelled\"}",
         );
     }
@@ -16195,7 +15966,7 @@ fn complete_feedback(
     host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
-    id: &Option<J>,
+    id: &Option<RequestId>,
     msg: &J,
 ) {
     let Some(idv) = id.clone() else {
@@ -16208,7 +15979,7 @@ fn complete_feedback(
         .find_map(|(sid, s)| {
             s.pending_feedback
                 .as_ref()
-                .filter(|p| j_to_string(&p.req_id) == j_to_string(&idv))
+                .filter(|p| p.req_id.as_ref() == Some(&idv))
                 .map(|p| (sid.clone(), p.clone()))
         });
     let Some((acp_sid, pending)) = found else {
@@ -16298,7 +16069,7 @@ fn complete_feedback(
                 .get_mut(&acp_sid)
                 .and_then(|s| s.pending_feedback.as_mut())
         {
-            pending.req_id = req_id;
+            pending.req_id = Some(req_id);
         }
         return;
     }
@@ -16329,7 +16100,7 @@ fn complete_elicitation(
     host: &Arc<Hosts>,
     stdout: &StdoutShared,
     sessions: &Sessions,
-    id: &Option<J>,
+    id: &Option<RequestId>,
     msg: &J,
 ) {
     let idv = match id {
@@ -16343,7 +16114,7 @@ fn complete_elicitation(
         .find_map(|(k, s)| {
             s.pending_ui
                 .iter()
-                .position(|p| j_to_string(&p.req_id) == j_to_string(&idv))
+                .position(|p| p.req_id.as_ref() == Some(&idv))
                 .map(|i| (k.clone(), i))
         });
     let (acp_sid, idx) = match found {
