@@ -876,7 +876,9 @@ fn client_options(user_input_dialogs: bool, user_shell: bool, computer_use: bool
     }
     // `experimentalApi` is the only way to reach `account/read`, which
     // lets session/new report a logged-out host before the first turn
-    // (see `MspHost::logged_out`). On Muse 1.4.0 it gates nothing else.
+    // (see `MspHost::logged_out`), and Muse 1.4.14's `session/requestDrive`,
+    // which takes a session back from another client of a shared daemon
+    // (see `turn_command`).
     let mut options = ClientOptions::default()
         .client_info(ClientInfo {
             name: "muse_acp".to_string(),
@@ -979,11 +981,14 @@ fn serve_config(
     extra_args: &[&str],
 ) -> (LaunchConfig, Option<crate::host_config::HostConfig>) {
     let mut config = LaunchConfig::new(bin);
-    let env_args: Vec<String> = std::env::var("MUSE_SERVE_ARGS")
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(str::to_string)
-        .collect();
+    let env_args = host_env_args(
+        std::env::var("MUSE_SERVE_ARGS")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
+        flags,
+    );
     // A setting may appear once: `muse serve` refuses a repeated key
     // ("one setting, one occurrence") and exits 2, so a caller's own
     // `MUSE_SERVE_ARGS` value wins over a pinned default instead of colliding
@@ -994,6 +999,21 @@ fn serve_config(
     config.host_flags(flags);
     let host_config = crate::host_config::configure(&mut config);
     (config, host_config)
+}
+
+/// `MUSE_SERVE_ARGS` for one host. `--join` serves through the machine's
+/// shared session daemon, and Muse 1.4.14 then applies the daemon's limits:
+/// a joined `--disable-write --disable-shell` host still reports
+/// `writesEnabled` and `shellEnabled`. The read-only and reviewer hosts rest
+/// on those flags, so they never join and keep their own process.
+fn host_env_args(mut args: Vec<String>, flags: HostFlags) -> Vec<String> {
+    if (flags.disable_write || flags.disable_shell) && args.iter().any(|arg| arg == "--join") {
+        args.retain(|arg| arg != "--join");
+        log(
+            "MUSE_SERVE_ARGS --join ignored for a read-only host: a joined host takes the shared daemon's write and shell limits",
+        );
+    }
+    args
 }
 
 /// Drop each `-c KEY=…` / `--config=KEY=…` pair from `later` whose key
@@ -1172,13 +1192,38 @@ pub fn output_unavailable_data(error: &J) -> J {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExitKind, ExitMessage, HANDLED_SERVER_REQUESTS, command_timeout,
+        ExitKind, ExitMessage, HANDLED_SERVER_REQUESTS, HostFlags, command_timeout, host_env_args,
         is_session_configuration_conflict, rejection_reason, session_profile_hint, session_suffix,
         without_duplicate_config_args,
     };
     use crate::json::parse_json;
     use muse_msp_client::classify_exit_parts;
     use std::time::Duration;
+
+    #[test]
+    fn read_only_hosts_never_join_the_shared_daemon() {
+        let args =
+            |raw: &str| -> Vec<String> { raw.split_whitespace().map(str::to_string).collect() };
+        let read_only = HostFlags {
+            no_session_log: false,
+            disable_write: true,
+            disable_shell: true,
+        };
+        assert_eq!(
+            host_env_args(args("--join --trust-workspace"), read_only),
+            args("--trust-workspace")
+        );
+        let no_shell = HostFlags {
+            disable_shell: true,
+            ..HostFlags::default()
+        };
+        assert_eq!(host_env_args(args("--join"), no_shell), args(""));
+        // The main host keeps the user's choice.
+        assert_eq!(
+            host_env_args(args("--join --trust-workspace"), HostFlags::default()),
+            args("--join --trust-workspace")
+        );
+    }
 
     #[test]
     fn a_setting_already_in_the_environment_arguments_is_not_repeated() {

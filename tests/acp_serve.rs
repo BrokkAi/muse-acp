@@ -6344,6 +6344,27 @@ fn skill_import_renders_the_host_receipt() {
     c.finish();
 }
 
+/// The turn commands and drive requests the fake host saw, in order.
+fn drive_calls(c: &Client) -> Vec<String> {
+    std::fs::read_to_string(&c.fake_log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|m| matches!(*m, "turn/start" | "turn/steer" | "session/requestDrive"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The params of every turn command the fake host saw, refused ones
+/// included, in order.
+fn turn_inputs(c: &Client) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(format!("{}.input", c.fake_log))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|params| params.get("input").is_some())
+        .collect()
+}
+
 #[test]
 fn prompt_takes_back_a_drive_another_client_took() {
     let mut c = Client::spawn("drive_taken", &[]);
@@ -6351,12 +6372,16 @@ fn prompt_takes_back_a_drive_another_client_took() {
     let pid = c.prompt(&sid, "hi");
     let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
     assert!(done.contains("\"stopReason\""), "the prompt runs: {done}");
-    let calls = std::fs::read_to_string(&c.fake_log).unwrap();
-    let calls: Vec<&str> = calls
-        .lines()
-        .filter(|m| matches!(*m, "turn/start" | "session/requestDrive"))
-        .collect();
-    assert_eq!(calls, ["turn/start", "session/requestDrive", "turn/start"]);
+    assert_eq!(
+        drive_calls(&c),
+        ["turn/start", "session/requestDrive", "turn/start"]
+    );
+    let inputs = turn_inputs(&c);
+    assert_eq!(inputs.len(), 2, "{inputs:?}");
+    assert_eq!(
+        inputs[0]["commandId"], inputs[1]["commandId"],
+        "the turn is resent under its own command id"
+    );
     c.finish();
 }
 
@@ -6367,10 +6392,105 @@ fn prompt_keeps_the_refusal_when_the_drive_is_not_granted() {
     let pid = c.prompt(&sid, "hi");
     let error = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
     assert!(
-        error.contains("already in use"),
-        "the host refusal: {error}"
+        error.contains(
+            "already in use: Muse client `tbh_tui` is driving this session and did not hand it over"
+        ),
+        "the host refusal names the client that kept the drive: {error}"
     );
-    c.wait_log("session/requestDrive", Duration::from_secs(15));
+    assert_eq!(drive_calls(&c), ["turn/start", "session/requestDrive"]);
+    c.finish();
+}
+
+#[test]
+fn steering_takes_back_a_drive_lost_mid_turn() {
+    // Muse's app takes the session while our turn runs; the steer is refused
+    // until the drive comes back, then lands in the same turn.
+    let mut c = Client::spawn("quiet", &[("FAKE_DRIVE_LOST_AFTER_TURN", "1")]);
+    let sid = c.new_session(2, "");
+    let prompt_id = c.prompt(&sid, "start");
+    c.wait_for(&format!("\"id\":{prompt_id}"), Duration::from_secs(15));
+    c.wait_stderr(
+        "reason=\"requested\" holder=tbh_tui you_drive=false",
+        Duration::from_secs(15),
+    );
+
+    let steer_id = c.req(
+        "_session/steering",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"also check the logs\"}}]}}"
+        ),
+    );
+    let response = c.wait_for(&format!("\"id\":{steer_id}"), Duration::from_secs(15));
+    assert!(response.contains("\"outcome\":\"injected\""), "{response}");
+    assert_eq!(
+        drive_calls(&c),
+        [
+            "turn/start",
+            "turn/steer",
+            "session/requestDrive",
+            "turn/steer"
+        ]
+    );
+    let steers: Vec<_> = turn_inputs(&c)
+        .into_iter()
+        .filter(|params| params.get("expectedTurnId").is_some())
+        .collect();
+    assert_eq!(steers.len(), 2, "{steers:?}");
+    assert_eq!(steers[0], steers[1], "the steer is resent unchanged");
+    assert_eq!(steers[1]["expectedTurnId"], "turn-1");
+    c.wait_stderr(
+        "reason=\"requested\" holder=muse_acp you_drive=true",
+        Duration::from_secs(15),
+    );
+    // Drive moves are diagnostics only; the editor never hears of them.
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert!(
+        !frames
+            .iter()
+            .any(|frame| frame.contains("driveChanged") || frame.contains("tbh_tui")),
+        "a drive move reached the editor: {frames:?}"
+    );
+    c.finish();
+}
+
+#[test]
+fn prompt_keeps_the_refusal_when_the_host_cannot_hand_over_the_drive() {
+    let mut c = Client::spawn("drive_taken", &[("FAKE_REQUEST_DRIVE_ERROR", "1")]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    let error = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        error.contains("is already in use") && !error.contains("is driving this session"),
+        "the host's own refusal, unchanged: {error}"
+    );
+    assert_eq!(drive_calls(&c), ["turn/start", "session/requestDrive"]);
+    c.wait_stderr("session/requestDrive for", Duration::from_secs(15));
+    c.finish();
+}
+
+#[test]
+fn idle_steering_takes_back_the_drive() {
+    let mut c = Client::spawn("drive_taken", &[]);
+    let sid = c.new_session(2, "");
+    let steer_id = c.req(
+        "_session/steering",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"start here\"}}]}}"
+        ),
+    );
+    let response = c.wait_for(&format!("\"id\":{steer_id}"), Duration::from_secs(15));
+    assert!(
+        response.contains("\"outcome\":\"startedNewTurn\""),
+        "{response}"
+    );
+    assert_eq!(
+        drive_calls(&c),
+        ["turn/start", "session/requestDrive", "turn/start"]
+    );
+    let inputs = turn_inputs(&c);
+    assert_eq!(inputs.len(), 2, "{inputs:?}");
+    assert_eq!(inputs[0], inputs[1], "the start is resent unchanged");
+    assert_eq!(inputs[1]["ifBusy"], "steer");
     c.finish();
 }
 
