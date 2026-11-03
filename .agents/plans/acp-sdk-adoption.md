@@ -43,7 +43,9 @@ Observable result: an editor sees the same ACP behavior as before, except where 
 
 - Observation: the live test `rename_drives_a_real_host_across_the_capability_registry` failed with `naming_unavailable` on the untouched base commit too (3 of 3 runs) during this work; it depends on the installed Muse host's naming service, not on this change, and passed in the final run.
 
-- Observation (review, 2026-11-03): with the SDK reading stdin through its own executor, the end of input reached the adapter only after the SDK had worked through every queued line. It cannot do that while the editor does not read stdout. `shutdown_deadline_bounds_unread_editor_stdout` took about 5.1 s against its 5 s bound (`master`: about 3.3 s); parallel runs hid it. Stdin is now read on its own thread, which feeds the SDK and arms the shutdown deadline as soon as input ends (1.8 s).
+- Observation (review, 2026-11-03): with the SDK reading stdin through its own executor, the end of input reached the adapter only after the SDK had worked through every queued line. It cannot do that while the editor does not read stdout. `shutdown_deadline_bounds_unread_editor_stdout` took about 5.1 s against its 5 s bound (`master`: about 3.3 s); parallel runs hid it. Stdin is now read on its own thread, which feeds the SDK and arms the shutdown deadline as soon as input ends (1.8 s). That reader made every line ready at once, and the SDK's single executor then routed all of them before running any handler: with 16,384 queued `initialize` requests the host never launched before the deadline. The stream now yields once per line.
+
+- Observation (nightly, 2026-11-03): the 19 load and resume tests that do not create the session first failed on Windows, because the test harness defaulted their `cwd` to `/tmp/fake-ws`, which is not absolute there. The harness now gives each fake host an absolute workspace in the test's temporary directory.
 
 - Observation: neither schema's `session/load` or `session/resume` result has a `sessionId`; the old adapter repeated the client's id there. Two live tests read it and now read `_meta.mspSessionId`.
 

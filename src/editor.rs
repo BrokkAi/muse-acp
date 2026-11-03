@@ -645,5 +645,32 @@ fn stdio_lines(incoming: StdinLines) -> impl ConnectTo<Agent> {
         stdout.flush().await?;
         Ok::<_, std::io::Error>(stdout)
     });
-    Lines::new(Box::pin(outgoing), incoming)
+    // The SDK runs on one executor thread. A stream that always has a line
+    // ready would keep its reader busy and starve the handlers that answer
+    // those lines, so each line yields to them once.
+    let incoming = futures::StreamExt::then(incoming, async |line| {
+        YieldNow(false).await;
+        line
+    });
+    Lines::new(Box::pin(outgoing), Box::pin(incoming))
+}
+
+/// Returns `Pending` once, after waking its task, so other futures on the
+/// executor run first.
+struct YieldNow(bool);
+
+impl Future for YieldNow {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<()> {
+        if self.0 {
+            return std::task::Poll::Ready(());
+        }
+        self.0 = true;
+        cx.waker().wake_by_ref();
+        std::task::Poll::Pending
+    }
 }

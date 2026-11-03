@@ -127,6 +127,13 @@ impl Client {
         cmd.env("FAKE_INPUT", format!("{fake_log}.input"));
         cmd.env("FAKE_FRAMES", format!("{fake_log}.frames"));
         cmd.env("FAKE_PID", format!("{fake_log}.pid"));
+        // The fake host's workspace, absolute on every OS: `session/load`
+        // and `session/resume` default their `cwd` to it, and the adapter
+        // refuses a relative one (`/tmp/...` is relative on Windows).
+        let default_workspace = dir.join("fake-ws");
+        std::fs::create_dir_all(&default_workspace).expect("fake workspace");
+        let default_workspace = default_workspace.to_str().unwrap().to_string();
+        cmd.env("FAKE_WORKSPACE_ROOT", &default_workspace);
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -167,7 +174,7 @@ impl Client {
             host_workspace: extra_env
                 .iter()
                 .find(|(key, _)| *key == "FAKE_WORKSPACE_ROOT")
-                .map_or("/tmp/fake-ws".to_string(), |(_, value)| value.to_string()),
+                .map_or(default_workspace, |(_, value)| value.to_string()),
             stderr_log,
             fake_log,
         }
