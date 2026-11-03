@@ -7682,7 +7682,7 @@ fn v2_resume_snapshots_state_after_replay_and_before_the_response() {
 
 #[test]
 fn v2_resume_snapshot_reports_running_work() {
-    let mut c = Client::spawn("resume_active", &[("FAKE_WORKSPACE_ROOT", "/tmp")]);
+    let mut c = Client::spawn("resume_active", &[]);
     c.initialize(2, "");
     let id = c.req("session/resume", r#"{"sessionId":"msp-sess-1"}"#);
     c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
