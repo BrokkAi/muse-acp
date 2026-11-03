@@ -43,6 +43,8 @@ Observable result: an editor sees the same ACP behavior as before, except where 
 
 - Observation: the live test `rename_drives_a_real_host_across_the_capability_registry` failed with `naming_unavailable` on the untouched base commit too (3 of 3 runs) during this work; it depends on the installed Muse host's naming service, not on this change, and passed in the final run.
 
+- Observation (review, 2026-11-03): with the SDK reading stdin through its own executor, the end of input reached the adapter only after the SDK had worked through every queued line. It cannot do that while the editor does not read stdout. `shutdown_deadline_bounds_unread_editor_stdout` took about 5.1 s against its 5 s bound (`master`: about 3.3 s); parallel runs hid it. Stdin is now read on its own thread, which feeds the SDK and arms the shutdown deadline as soon as input ends (1.8 s).
+
 - Observation: neither schema's `session/load` or `session/resume` result has a `sessionId`; the old adapter repeated the client's id there. Two live tests read it and now read `_meta.mspSessionId`.
 
 
@@ -63,7 +65,7 @@ Observable result: an editor sees the same ACP behavior as before, except where 
   Rationale: the SDK's untagged message enum rejects integers wider than 64 bits when it is on.
   Date/Author: 2026-11-02 / user decision.
 
-- Decision: read stdin through the SDK's `Lines` transport with a byte-line reader that decodes each line lossily, instead of the SDK's `Stdio` transport.
+- Decision: read stdin through the SDK's `Lines` transport with a byte-line reader that decodes each line lossily, instead of the SDK's `Stdio` transport. The reader is its own thread (see the 2026-11-03 observation), so the end of input arms the shutdown deadline at once.
   Rationale: `Stdio` ends the connection on an invalid UTF-8 line; with `Lines` such a line reaches the SDK's parser and gets its `-32700` reply, and reading goes on.
   Date/Author: 2026-11-02 / user decision.
 
@@ -93,8 +95,6 @@ Observable result: an editor sees the same ACP behavior as before, except where 
 (2026-11-02) Done. `acp-lite` and every hand-built ACP frame are gone. The SDK reads every request into its typed schema, and every response, notification and request the adapter sends is an SDK schema value. What stays the adapter's own JSON is what no ACP schema defines: `_meta` members, the results of extension methods (`_session/*`, `_subagent/*`), JetBrains AIR updates (sent as the v2 `Other` update or, in v1, an `UntypedMessage`), and AIR's `subagents` member of the initialize response. JSON-RPC batches are refused as the SDK refuses them.
 
 Behavior that changed for clients is listed in `CHANGELOG.md` under Unreleased. All workspace tests pass (`acp_serve` 451, unit 270), and the live loopback suite passes against Muse 1.4.14 (52 of 52).
-
-Not done yet, AIR: a settled AIR child that runs again is not reopened as a new generation (`<id>:generation:<n>` with a new `subagent_spawned`), and updates addressed to a settled AIR child are not dropped. Only its later state updates are. Child routing is spread across the MSP event handlers, so this needs its own change.
 
 Not done here because the adapter never did it, by hand or otherwise: the unstable ACP methods the SDK can parse but the adapter does not serve (`session/set_title`, `session/archive`, `session/status`, `auth/status`, `providers/*`) and the v2 `state_update.background` work list.
 

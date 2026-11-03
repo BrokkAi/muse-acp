@@ -38,7 +38,10 @@
       `subagent_state_update` when it declares either the standard
       `clientCapabilities.subagents` or `nativeSubagentSessions`, never the
       RFD's `subagent_update`, and subagent tool cards without either. A
-      child ends at its first terminal state.
+      child ends at its first terminal state, after its transcript, and a
+      child that runs again is a new generation,
+      `<child>:generation:<n>`, with its own `subagent_spawned`,
+      transcript and terminal state.
     - ACP v2 carries AIR's updates under AIR's v2 tags: `_subagent_update`
       for both subagent updates, `_async_task_spawned` and
       `_async_task_state_update`. `async_task_spawned` now has its

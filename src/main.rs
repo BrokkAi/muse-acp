@@ -4252,12 +4252,18 @@ fn main() {
     // client is gone, and the serve host (our child) dies with us. The SDK
     // answers frames that are not JSON-RPC messages itself.
     let acp_tx = tx.clone();
-    let stdout = Editor::start(move |incoming| {
-        if ends_connection(&incoming) {
-            shutdown::disconnect();
-        }
-        let _ = acp_tx.send(LoopMsg::Acp(incoming));
-    })
+    let stdout = Editor::start(
+        move |incoming| {
+            if ends_connection(&incoming) {
+                shutdown::disconnect();
+            }
+            let _ = acp_tx.send(LoopMsg::Acp(incoming));
+        },
+        // The end of input arms the deadline at once, also while the SDK
+        // still works through queued lines it cannot answer into an unread
+        // stdout.
+        shutdown::disconnect,
+    )
     .unwrap_or_else(|error| {
         eprintln!("[muse-acp] cannot read ACP from stdin: {error}");
         shutdown::exit(1)
@@ -11209,16 +11215,24 @@ fn drill_down_subagent_child(
     else {
         return;
     };
-    let (ver, needs_read) = {
+    // A child's transcript is read once, and again for each new AIR
+    // generation: the child's fold has seen what the earlier one sent, so
+    // only the new run reaches the new generation's session.
+    let (ver, needs_read, target) = {
         let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
         let Some(s) = map.get_mut(acp_sid) else {
             return;
         };
-        let needs = !s.child_folds.contains_key(child);
-        if needs {
+        let new_generation = s.fold.take_child_read(child);
+        let needs = !s.child_folds.contains_key(child) || new_generation;
+        if !s.child_folds.contains_key(child) {
             s.child_folds.insert(child.to_string(), fresh_fold(&s.cwd));
         }
-        (s.ver, needs)
+        let target = s.fold.child_session_id(child);
+        if needs {
+            s.fold.begin_child_read(&target);
+        }
+        (s.ver, needs, target)
     };
     if !needs_read {
         return;
@@ -11238,28 +11252,42 @@ fn drill_down_subagent_child(
             "session/read",
             &format!("{{\"sessionId\":{},\"excludeItems\":false}}", esc(&child)),
         );
-        match read {
-            Ok(r) => {
-                let mut out = Vec::new();
+        if let Err(e) = &read {
+            log(&format!(
+                "subagent child {target} transcript read failed: {}",
+                err_message(e)
+            ));
+        }
+        let mut out = Vec::new();
+        let mut held = None;
+        {
+            let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(s) = map.get_mut(&acp_sid) {
+                if let Ok(r) = &read
+                    && let Some(fold) = s.child_folds.get_mut(&child)
+                    && let Some(items) = replay_items(r)
                 {
-                    let mut map = sessions.lock().unwrap_or_else(|p| p.into_inner());
-                    if let Some(s) = map.get_mut(&acp_sid)
-                        && let Some(fold) = s.child_folds.get_mut(&child)
-                        && let Some(items) = replay_items(&r)
-                    {
-                        fold.replay_history_items(&child, ver, &items, &mut out);
-                    }
+                    fold.replay_history_items(&target, ver, &items, &mut out);
                 }
-                send_fold_output(&stdout, &sessions, &child, out);
-                log(&format!("subagent child {child} transcript replayed"));
-            }
-            Err(e) => {
-                log(&format!(
-                    "subagent child {child} transcript read failed: {}",
-                    err_message(&e)
-                ));
+                // AIR drops an update for a child session whose terminal
+                // state went out; its fold still saw the run, so a next
+                // generation does not send it again. A terminal held for
+                // this read follows the transcript.
+                let (sendable, terminal) = s.fold.end_child_read(&child, &target);
+                if !sendable && !out.is_empty() {
+                    log(&format!(
+                        "subagent child {target} ended before its transcript arrived; not sent"
+                    ));
+                    out.clear();
+                }
+                held = terminal;
             }
         }
+        if read.is_ok() && !out.is_empty() {
+            log(&format!("subagent child {target} transcript replayed"));
+        }
+        out.extend(held);
+        send_fold_output(&stdout, &sessions, &target, out);
     });
 }
 

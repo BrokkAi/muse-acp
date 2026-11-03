@@ -13213,7 +13213,8 @@ fn native_subagent_sessions_spawn_state_and_replay_the_child() {
 #[test]
 fn a_settled_subagent_that_runs_again_is_shown_running() {
     // The subagents RFD mirrors the child's state, and a settled child can be
-    // messaged again. AIR's updates stay terminal-only, as before.
+    // messaged again. AIR's updates stay terminal-only: the run is a new
+    // generation.
     for air in [false, true] {
         let init = if air {
             ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}"
@@ -13246,8 +13247,13 @@ fn a_settled_subagent_that_runs_again_is_shown_running() {
             .filter_map(|update| update.get("state").cloned())
             .collect();
         if air {
-            // Unchanged for AIR: one terminal update per state.
+            // AIR: the child's run ended; the next run is its generation 2.
             assert_eq!(states, [serde_json::json!("completed")], "AIR: {frames:#?}");
+            let generation = frames
+                .iter()
+                .filter(|f| f.contains("\"subagentSessionId\":\"child-sess-ready-a:generation:2\""))
+                .count();
+            assert_eq!(generation, 2, "spawn and terminal: {frames:#?}");
         } else {
             let idle = serde_json::json!({"state": "idle", "stopReason": "end_turn"});
             let running = serde_json::json!({"state": "running"});
@@ -13262,9 +13268,10 @@ fn a_settled_subagent_that_runs_again_is_shown_running() {
 }
 
 #[test]
-fn an_air_child_ends_at_its_first_terminal_state() {
-    // AIR ends a child for good: a later, different outcome of the same child
-    // sends no second terminal.
+fn an_air_child_that_runs_again_is_a_new_generation() {
+    // AIR ends a child at its first terminal state. When it runs again, the
+    // run is announced as a new generation with its own session id, which
+    // gets its own terminal state.
     let mut c = Client::spawn(
         "subagent_result_ready",
         &[
@@ -13281,12 +13288,34 @@ fn an_air_child_ends_at_its_first_terminal_state() {
         Duration::from_secs(15),
     );
     let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
-    let states: Vec<&String> = frames
+    let updates: Vec<serde_json::Value> = frames
         .iter()
-        .filter(|f| f.contains("subagent_state_update") && f.contains("child-sess-ready-a"))
+        .filter_map(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+        .map(|f| f["params"]["update"].clone())
+        .filter(|u| {
+            u["subagentSessionId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("child-sess-ready-a"))
+        })
+        .map(|u| {
+            serde_json::json!({
+                "sessionUpdate": u["sessionUpdate"],
+                "subagentSessionId": u["subagentSessionId"],
+                "state": u["state"],
+            })
+        })
         .collect();
-    assert_eq!(states.len(), 1, "{states:#?}");
-    assert!(states[0].contains("\"state\":\"completed\""), "{states:#?}");
+    let generation = "child-sess-ready-a:generation:2";
+    assert_eq!(
+        updates,
+        [
+            serde_json::json!({"sessionUpdate": "subagent_spawned", "subagentSessionId": "child-sess-ready-a", "state": null}),
+            serde_json::json!({"sessionUpdate": "subagent_state_update", "subagentSessionId": "child-sess-ready-a", "state": "completed"}),
+            serde_json::json!({"sessionUpdate": "subagent_spawned", "subagentSessionId": generation, "state": null}),
+            serde_json::json!({"sessionUpdate": "subagent_state_update", "subagentSessionId": generation, "state": "failed"}),
+        ],
+        "{frames:#?}"
+    );
     drop(frames);
     c.finish();
 }

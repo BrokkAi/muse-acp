@@ -28,7 +28,7 @@ use agent_client_protocol::{
     self as sdk, Agent, AgentProtocolRouter, Client, ConnectTo, Dispatch, DynConnectTo, Handled,
     Lines, RequestCancellationHandle, Responder, v1, v2,
 };
-use futures::{AsyncBufReadExt, AsyncWriteExt};
+use futures::AsyncWriteExt;
 use serde_json::Value;
 
 /// A request or notification of ACP v1, parsed into the SDK's schema types.
@@ -156,8 +156,15 @@ where
 
 impl Editor {
     /// Start serving ACP on stdin and stdout. `sink` receives every message,
-    /// on the connection's thread, in arrival order.
-    pub fn start(sink: impl Fn(Incoming) + Send + Sync + 'static) -> std::io::Result<Editor> {
+    /// on the connection's thread, in arrival order. `on_eof` runs on the
+    /// stdin reader as soon as input ends, before the SDK has worked through
+    /// the lines still queued, which it cannot while the editor does not read
+    /// stdout.
+    pub fn start(
+        sink: impl Fn(Incoming) + Send + Sync + 'static,
+        on_eof: impl FnOnce() + Send + 'static,
+    ) -> std::io::Result<Editor> {
+        let lines = read_stdin(on_eof)?;
         let (stop_tx, stop_rx) = futures::channel::oneshot::channel::<()>();
         let shared = Arc::new(Shared {
             connection: Mutex::new(None),
@@ -175,10 +182,11 @@ impl Editor {
         let thread = std::thread::Builder::new()
             .name("acp-connection".to_string())
             .spawn(move || {
-                let reason = match futures::executor::block_on(serving.clone().serve(stop_rx)) {
-                    Ok(()) => "the ACP connection ended".to_string(),
-                    Err(error) => format!("the ACP connection failed: {error}"),
-                };
+                let reason =
+                    match futures::executor::block_on(serving.clone().serve(stop_rx, lines)) {
+                        Ok(()) => "the ACP connection ended".to_string(),
+                        Err(error) => format!("the ACP connection failed: {error}"),
+                    };
                 serving.shared.sealed.store(true, Ordering::SeqCst);
                 (serving.shared.sink)(Incoming::Ended { reason });
             })?;
@@ -186,7 +194,11 @@ impl Editor {
         Ok(editor)
     }
 
-    async fn serve(self, stop: futures::channel::oneshot::Receiver<()>) -> Result<(), Error> {
+    async fn serve(
+        self,
+        stop: futures::channel::oneshot::Receiver<()>,
+        lines: StdinLines,
+    ) -> Result<(), Error> {
         // Whichever version the router selects gets the stop signal.
         let stop = Arc::new(Mutex::new(Some(stop)));
         let v1 = Self::v1_builder(&self);
@@ -206,7 +218,7 @@ impl Editor {
             })
         });
         let router = AgentProtocolRouter::new().with_v1(v1).with_v2(v2);
-        router.connect_to(stdio_lines()).await
+        router.connect_to(stdio_lines(lines)).await
     }
 
     #[allow(clippy::type_complexity)]
@@ -575,35 +587,57 @@ async fn wait_for_stop(stop: &Mutex<Option<futures::channel::oneshot::Receiver<(
     }
 }
 
-/// Stdin and stdout as the SDK's `Lines` transport. JSON text must be
-/// UTF-8, so a line that is not reaches the SDK's parser marked as such and
-/// never as JSON: the SDK answers it with `-32700` and keeps reading. The
-/// SDK's `Stdio` transport would end the connection instead.
-fn stdio_lines() -> impl ConnectTo<Agent> {
-    let stdin = futures::io::BufReader::new(blocking::Unblock::new(std::io::stdin()));
-    let incoming = futures::stream::unfold(stdin, async |mut reader| {
-        let mut bytes = Vec::new();
-        match reader.read_until(b'\n', &mut bytes).await {
-            Ok(0) => None,
-            Ok(_) => {
-                if bytes.last() == Some(&b'\n') {
-                    bytes.pop();
-                    if bytes.last() == Some(&b'\r') {
-                        bytes.pop();
+/// Lines read from stdin, in order.
+type StdinLines = futures::channel::mpsc::UnboundedReceiver<std::io::Result<String>>;
+
+/// Read stdin on its own thread, as fast as the editor writes, whatever the
+/// SDK is doing, and run `on_eof` when input ends. JSON text must be UTF-8,
+/// so a line that is not reaches the SDK's parser marked as such and never
+/// as JSON: the SDK answers it with `-32700` and keeps reading. The SDK's
+/// `Stdio` transport would end the connection instead.
+fn read_stdin(on_eof: impl FnOnce() + Send + 'static) -> std::io::Result<StdinLines> {
+    use std::io::BufRead;
+    let (tx, rx) = futures::channel::mpsc::unbounded();
+    std::thread::Builder::new()
+        .name("acp-stdin".to_string())
+        .spawn(move || {
+            let mut reader = std::io::stdin().lock();
+            loop {
+                let mut bytes = Vec::new();
+                match reader.read_until(b'\n', &mut bytes) {
+                    Ok(0) => break,
+                    Ok(_) => {
+                        if bytes.last() == Some(&b'\n') {
+                            bytes.pop();
+                            if bytes.last() == Some(&b'\r') {
+                                bytes.pop();
+                            }
+                        }
+                        let line = match String::from_utf8(bytes) {
+                            Ok(line) => line,
+                            Err(error) => format!(
+                                "invalid UTF-8: {}",
+                                String::from_utf8_lossy(error.as_bytes())
+                            ),
+                        };
+                        if tx.unbounded_send(Ok(line)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(error) => {
+                        let _ = tx.unbounded_send(Err(error));
+                        break;
                     }
                 }
-                let line = match String::from_utf8(bytes) {
-                    Ok(line) => line,
-                    Err(error) => format!(
-                        "invalid UTF-8: {}",
-                        String::from_utf8_lossy(error.as_bytes())
-                    ),
-                };
-                Some((Ok(line), reader))
             }
-            Err(error) => Some((Err(error), reader)),
-        }
-    });
+            on_eof();
+        })?;
+    Ok(rx)
+}
+
+/// The stdin lines and stdout as the SDK's `Lines` transport.
+fn stdio_lines(incoming: StdinLines) -> impl ConnectTo<Agent> {
     let stdout = blocking::Unblock::new(std::io::stdout());
     let outgoing = futures::sink::unfold(stdout, async |mut stdout, line: String| {
         stdout.write_all(line.as_bytes()).await?;
@@ -611,5 +645,5 @@ fn stdio_lines() -> impl ConnectTo<Agent> {
         stdout.flush().await?;
         Ok::<_, std::io::Error>(stdout)
     });
-    Lines::new(Box::pin(outgoing), Box::pin(incoming))
+    Lines::new(Box::pin(outgoing), incoming)
 }

@@ -307,6 +307,18 @@ pub struct SessionFold {
     /// Last `subagent_state_update` sent per child session id, so a terminal
     /// state reaches the client once however many snapshots repeat it.
     subagent_states: HashMap<String, &'static str>,
+    /// AIR ends a child at its first terminal state; a child that runs again
+    /// is a new generation with its own session id
+    /// (`<child>:generation:<n>`). The current generation per Muse child
+    /// session, absent for the first.
+    subagent_generations: HashMap<String, u32>,
+    /// AIR children whose new generation still needs its transcript read.
+    child_reads: std::collections::HashSet<String>,
+    /// Child session ids (generations) whose transcript read is in flight.
+    child_reads_in_flight: std::collections::HashSet<String>,
+    /// AIR terminal states held until their child's transcript is sent, by
+    /// child session id: AIR drops what reaches a child after its terminal.
+    held_child_states: HashMap<String, Note>,
     /// Whether the client negotiated the AIR async-tasks extension.
     pub air_async_tasks: bool,
     /// ACP v2 always supports standard compaction; ACP v1 must opt in.
@@ -470,6 +482,10 @@ impl SessionFold {
             air_subagents: false,
             spawned_subagents: std::collections::HashSet::new(),
             subagent_states: HashMap::new(),
+            subagent_generations: HashMap::new(),
+            child_reads: std::collections::HashSet::new(),
+            child_reads_in_flight: std::collections::HashSet::new(),
+            held_child_states: HashMap::new(),
             air_async_tasks: false,
             compaction_supported: false,
             announced_tasks: std::collections::HashSet::new(),
@@ -1958,28 +1974,129 @@ impl SessionFold {
         Some(state)
     }
 
+    /// The ACP session id of a Muse child session: the child's own id, or
+    /// for an AIR child that ran again, its current generation's id.
+    pub fn child_session_id(&self, child: &str) -> String {
+        match self.subagent_generations.get(child) {
+            Some(generation) => format!("{child}:generation:{generation}"),
+            None => child.to_string(),
+        }
+    }
+
+    /// Whether the client gets no more updates for a child: AIR ends a
+    /// child's generation at its terminal state.
+    pub fn child_finished(&self, child: &str) -> bool {
+        self.air_subagents && self.subagent_states.contains_key(child)
+    }
+
+    /// Whether an AIR child's new generation still needs its transcript
+    /// read; true once per generation.
+    pub fn take_child_read(&mut self, child: &str) -> bool {
+        self.child_reads.remove(child)
+    }
+
+    /// A transcript read for child session `session_id` (a child or one of
+    /// its generations) started. Until it ends, that session's AIR terminal
+    /// state is held, so the transcript reaches the client first.
+    pub fn begin_child_read(&mut self, session_id: &str) {
+        self.child_reads_in_flight.insert(session_id.to_string());
+    }
+
+    /// The transcript read for child session `session_id` of Muse child
+    /// `child` ended. Returns whether the transcript may still be sent (for
+    /// AIR, not once that session's terminal state went out), and the
+    /// terminal state held for it, which follows the transcript.
+    pub fn end_child_read(&mut self, child: &str, session_id: &str) -> (bool, Option<Note>) {
+        self.child_reads_in_flight.remove(session_id);
+        let held = self.held_child_states.remove(session_id);
+        let ended = self.air_subagents
+            && held.is_none()
+            && (self.child_session_id(child) != session_id || self.child_finished(child));
+        (!ended, held)
+    }
+
+    /// The `subagent_spawned` name and task of a subagent item, and its
+    /// `_meta.muse` provenance members.
+    fn subagent_spawn_facts(item: &J) -> (String, String, Option<String>) {
+        let name = item
+            .get("agentPath")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("subagent");
+        let task = item
+            .get("objective")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("Delegated task");
+        let parts: Vec<String> = [
+            ("subagentId", item.get("subagentId")),
+            ("depth", item.get("depth")),
+            ("controlStatus", item.get("controlStatus")),
+        ]
+        .into_iter()
+        .filter(|(_, v)| matches!(v, Some(J::Num(_)) | Some(J::Str(_))))
+        .map(|(k, v)| format!("\"{k}\":{}", j_to_string(v.unwrap())))
+        .collect();
+        (
+            name.to_string(),
+            task.to_string(),
+            (!parts.is_empty()).then(|| parts.join(",")),
+        )
+    }
+
     /// Send the child's state when it changed since the last one sent.
     fn settle_subagent(&mut self, acp_sid: &str, child: &str, item: &J, out: &mut Vec<Note>) {
         let Some(state) = Self::subagent_state(item) else {
-            // The RFD's `state` mirrors the child's, and a settled child can
-            // be messaged again: once the host reports it running after a
-            // settled state, say so. AIR's updates carry terminal states only.
+            // A settled child can be messaged again. Once the host reports it
+            // running after a settled state, the RFD's `state`, which mirrors
+            // the child's, says so; AIR, whose children end at their terminal
+            // state, announces it as a new generation, whose transcript and
+            // terminal state go to its own session id.
             let running = item.get("controlStatus").and_then(|v| v.as_str()) == Some("running");
-            if running && !self.air_subagents && self.subagent_states.remove(child).is_some() {
-                out.push(self.subagent_state_line(acp_sid, self.ver, child, "running"));
+            if running && self.subagent_states.remove(child).is_some() {
+                if self.air_subagents {
+                    // The ended generation's state goes out before the new
+                    // one is announced, even while its transcript is read.
+                    if let Some(held) = self.held_child_states.remove(&self.child_session_id(child))
+                    {
+                        out.push(held);
+                    }
+                    let generation = self.subagent_generations.get(child).copied().unwrap_or(1);
+                    self.subagent_generations
+                        .insert(child.to_string(), generation + 1);
+                    self.child_reads.insert(child.to_string());
+                    let (name, task, fields) = Self::subagent_spawn_facts(item);
+                    out.push(self.subagent_spawned_line(
+                        acp_sid,
+                        self.ver,
+                        &self.child_session_id(child),
+                        &name,
+                        &task,
+                        true,
+                        fields.as_deref(),
+                    ));
+                } else {
+                    out.push(self.subagent_state_line(acp_sid, self.ver, child, "running"));
+                }
             }
             return;
         };
-        // AIR ends a child at its first terminal state: no later state is
-        // sent for it.
-        if self.air_subagents && self.subagent_states.contains_key(child) {
-            return;
-        }
         if self.subagent_states.get(child) == Some(&state) {
             return;
         }
+        // AIR ends a child's generation at its first terminal state: no later
+        // state is sent for it.
+        if self.child_finished(child) {
+            return;
+        }
         self.subagent_states.insert(child.to_string(), state);
-        out.push(self.subagent_state_line(acp_sid, self.ver, child, state));
+        let session_id = self.child_session_id(child);
+        let note = self.subagent_state_line(acp_sid, self.ver, &session_id, state);
+        if self.air_subagents && self.child_reads_in_flight.contains(&session_id) {
+            self.held_child_states.insert(session_id, note);
+        } else {
+            out.push(note);
+        }
     }
 
     /// Stable synthetic toolCall id + first-announcement flag for host cards.
