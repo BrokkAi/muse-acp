@@ -1000,7 +1000,7 @@ fn resume_permission_profile_reaches_a_real_host() {
     let session = adapter.new_session(&host, json!([]));
     let id = adapter.request(
         "session/load",
-        json!({"sessionId": session, "_meta": {"muse": {
+        json!({"sessionId": session, "cwd": host.workspace(), "mcpServers": [], "_meta": {"muse": {
             "permissionProfile": ":ask-me"
         }}}),
     );
@@ -1019,8 +1019,10 @@ fn resume_permission_profile_reaches_a_real_host() {
             "{response}"
         );
     } else {
+        // A resume result names no session (the client named it); the
+        // durable Muse id rides `_meta`.
         assert_eq!(
-            response["result"]["sessionId"],
+            response["result"]["_meta"]["mspSessionId"],
             json!(session),
             "{response}"
         );
@@ -1030,7 +1032,7 @@ fn resume_permission_profile_reaches_a_real_host() {
     // generic adapter failure.
     let id = adapter.request(
         "session/load",
-        json!({"sessionId": session, "_meta": {"muse": {
+        json!({"sessionId": session, "cwd": host.workspace(), "mcpServers": [], "_meta": {"muse": {
             "permissionProfile": ":muse-acp-live-missing"
         }}}),
     );
@@ -1364,7 +1366,10 @@ fn session_delete_removes_a_fresh_session() {
             .any(|row| row["sessionId"] == session),
         "a deleted session must not be listed: {listed}"
     );
-    let load = adapter.request("session/load", json!({"sessionId": session}));
+    let load = adapter.request(
+        "session/load",
+        json!({"sessionId": session, "cwd": host.workspace(), "mcpServers": []}),
+    );
     let response = adapter.response(load);
     let error = response
         .get("error")
@@ -2444,7 +2449,10 @@ fn task_list_seeds_the_async_task_inventory_after_resume() {
         return;
     };
     let session = adapter.new_session(&host, json!([]));
-    let resume = adapter.request("session/resume", json!({"sessionId": session}));
+    let resume = adapter.request(
+        "session/resume",
+        json!({"sessionId": session, "cwd": host.workspace(), "mcpServers": []}),
+    );
     let _ = adapter.result(resume);
     // A fresh session has no running work, so the host's answer is the empty
     // inventory; the point is that the authoritative read happens and
@@ -2490,9 +2498,12 @@ fn side_chat_reaches_a_real_host_and_attaches_with_provenance() {
     });
     assert!(announced["params"]["update"]["sessionUpdate"] == "session_info_update");
     // The side attaches through the ordinary resume path and serves a turn.
-    let resume = adapter.request("session/resume", json!({"sessionId": side}));
+    let resume = adapter.request(
+        "session/resume",
+        json!({"sessionId": side, "cwd": host.workspace(), "mcpServers": []}),
+    );
     let attached = adapter.result(resume);
-    assert_eq!(attached["sessionId"], json!(side), "{attached}");
+    assert_eq!(attached["_meta"]["mspSessionId"], json!(side), "{attached}");
     let turn = adapter.prompt(&side, "say hello [[script:hello]]");
     assert_eq!(adapter.result(turn)["stopReason"], "end_turn");
     adapter.finish();
@@ -2850,6 +2861,13 @@ fn a_fork_starts_from_the_source_history_and_continues_on_its_own() {
     };
     let fork = forked["sessionId"].as_str().unwrap().to_string();
     assert_ne!(fork, session);
+    // ACP and AIR define no replay on fork; loading the fork replays the
+    // history it copied.
+    let load = adapter.request(
+        "session/load",
+        json!({"sessionId": fork, "cwd": host.workspace(), "mcpServers": []}),
+    );
+    adapter.result(load);
     adapter.wait("the fork's copy of the first prompt", |frame| {
         frame["params"]["sessionId"] == fork.as_str()
             && frame["params"]["update"]["sessionUpdate"] == "user_message_chunk"
@@ -3209,7 +3227,10 @@ fn resume_permission_pick_over_an_unrestorable_record_is_refused() {
             Some(profile) => json!({"muse": {"permissionProfile": profile}}),
             None => json!({}),
         };
-        let id = adapter.request("session/load", json!({"sessionId": session, "_meta": meta}));
+        let id = adapter.request(
+            "session/load",
+            json!({"sessionId": session, "cwd": host.workspace(), "mcpServers": [], "_meta": meta}),
+        );
         let response = adapter.response(id);
         let message = response["error"]["message"].as_str().unwrap_or_else(|| {
             panic!("a pick must not resume an unrestorable record ({pick:?}): {response}")

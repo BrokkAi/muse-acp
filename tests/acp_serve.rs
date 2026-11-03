@@ -87,6 +87,13 @@ struct Client {
     stdin: std::process::ChildStdin,
     frames: Arc<Mutex<Vec<String>>>,
     next_id: u64,
+    /// The protocol version the last `initialize` asked for.
+    ver: u64,
+    /// The `cwd` of the last `session/new`, which the fake host reports as
+    /// the session's workspace when it is resumed.
+    cwd: Option<serde_json::Value>,
+    /// `FAKE_WORKSPACE_ROOT`, the fake host's workspace before any session.
+    host_workspace: String,
     stderr_log: String,
     fake_log: String,
 }
@@ -120,6 +127,13 @@ impl Client {
         cmd.env("FAKE_INPUT", format!("{fake_log}.input"));
         cmd.env("FAKE_FRAMES", format!("{fake_log}.frames"));
         cmd.env("FAKE_PID", format!("{fake_log}.pid"));
+        // The fake host's workspace, absolute on every OS: `session/load`
+        // and `session/resume` default their `cwd` to it, and the adapter
+        // refuses a relative one (`/tmp/...` is relative on Windows).
+        let default_workspace = dir.join("fake-ws");
+        std::fs::create_dir_all(&default_workspace).expect("fake workspace");
+        let default_workspace = default_workspace.to_str().unwrap().to_string();
+        cmd.env("FAKE_WORKSPACE_ROOT", &default_workspace);
         for (k, v) in extra_env {
             cmd.env(k, v);
         }
@@ -155,12 +169,73 @@ impl Client {
             stdin,
             frames,
             next_id: 1,
+            ver: 1,
+            cwd: None,
+            host_workspace: extra_env
+                .iter()
+                .find(|(key, _)| *key == "FAKE_WORKSPACE_ROOT")
+                .map_or(default_workspace, |(_, value)| value.to_string()),
             stderr_log,
             fake_log,
         }
     }
 
+    /// Params as a conforming client sends them. ACP v1 requires `mcpServers`
+    /// on `session/new`, `session/load`, `session/resume` and `session/fork`,
+    /// and both versions require `cwd` on the last three; a test that does
+    /// not care about them leaves them out and gets the empty server list
+    /// and the workspace the fake host reports for the session. ACP v2 config values carry a `type`
+    /// discriminator, `id` for a value id. Params that are not a JSON object
+    /// go out as written, so tests of malformed requests stay malformed.
+    fn conforming_params(&self, method: &str, params: &str) -> String {
+        let Ok(serde_json::Value::Object(mut object)) =
+            serde_json::from_str::<serde_json::Value>(params)
+        else {
+            return params.to_string();
+        };
+        match method {
+            "session/new" | "session/load" | "session/resume" | "session/fork" => {
+                // ACP v2 makes `mcpServers` optional; v2 clients that leave
+                // it out must still be served.
+                if self.ver < 2 && !object.contains_key("mcpServers") {
+                    object.insert("mcpServers".to_string(), serde_json::json!([]));
+                }
+                if method != "session/new" && !object.contains_key("cwd") {
+                    let cwd = self
+                        .cwd
+                        .clone()
+                        .unwrap_or_else(|| serde_json::json!(self.host_workspace));
+                    object.insert("cwd".to_string(), cwd);
+                }
+            }
+            "session/set_config_option"
+                if self.ver >= 2
+                    && !object.contains_key("type")
+                    && object
+                        .get("value")
+                        .is_some_and(serde_json::Value::is_string) =>
+            {
+                object.insert("type".to_string(), serde_json::json!("id"));
+            }
+            _ => return params.to_string(),
+        }
+        serde_json::Value::Object(object).to_string()
+    }
+
     fn req(&mut self, method: &str, params: &str) -> u64 {
+        if method == "initialize"
+            && let Ok(init) = serde_json::from_str::<serde_json::Value>(params)
+        {
+            self.ver = init["protocolVersion"].as_u64().unwrap_or(1);
+        }
+        let params = self.conforming_params(method, params);
+        if method == "session/new"
+            && let Ok(new) = serde_json::from_str::<serde_json::Value>(&params)
+            && new["cwd"].is_string()
+        {
+            self.cwd = Some(new["cwd"].clone());
+        }
+        let params = params.as_str();
         let id = self.next_id;
         self.next_id += 1;
         let frame = format!(
@@ -1901,6 +1976,108 @@ fn shell_tools_carry_no_guessed_location() {
 }
 
 #[test]
+fn a_cancelled_turn_reports_its_file_changes_unavailable_and_request_ids_are_single_use() {
+    let caps = ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}";
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(1, caps);
+    let prompt = |c: &mut Client| {
+        c.req(
+            "session/prompt",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"change files\"}}],\"_meta\":{{\"jetbrains\":{{\"air\":{{\"agentFileChangeReportRequest\":{{\"version\":1,\"requestId\":\"report-cancel\"}}}}}}}}}}"
+            ),
+        )
+    };
+    for _ in 0..2 {
+        let pid = prompt(&mut c);
+        c.wait_log("turn/start", Duration::from_secs(15));
+        c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+        let done = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(done.contains("cancelled"), "{done}");
+    }
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let reports: Vec<&String> = frames
+        .iter()
+        .filter(|frame| frame.contains("\"agentFileChangeReport\":{"))
+        .collect();
+    // One report for the first prompt; the repeated request id is ignored.
+    assert_eq!(reports.len(), 1, "{frames:#?}");
+    let report: serde_json::Value = serde_json::from_str(reports[0]).unwrap();
+    assert_eq!(
+        report["params"]["update"]["_meta"]["jetbrains"]["air"]["agentFileChangeReport"],
+        serde_json::json!({
+            "version": 1,
+            "requestId": "report-cancel",
+            "status": "unavailable",
+            "reason": "cancelled",
+        }),
+        "{report}"
+    );
+    let first_answer = frames
+        .iter()
+        .position(|frame| frame.contains("\"stopReason\":\"cancelled\""))
+        .unwrap();
+    let report_at = frames.iter().position(|frame| frame == reports[0]).unwrap();
+    assert!(
+        report_at < first_answer,
+        "the report precedes the prompt answer"
+    );
+    drop(frames);
+    c.finish();
+}
+
+#[test]
+fn air_keys_reach_only_air_clients() {
+    // AIR: the agent side of the extension goes in the initialize response's
+    // top-level `_meta`, for an AIR client only, and only an ACP v1 AIR
+    // client gets the draft `sessionCapabilities.subagents`.
+    for ver in [1u64, 2] {
+        for air in [false, true] {
+            let caps_key = if ver == 1 {
+                "clientCapabilities"
+            } else {
+                "capabilities"
+            };
+            let extra = if air {
+                format!(
+                    r#","{caps_key}":{{"_meta":{{"jetbrains":{{"air":{{"version":1,"capabilities":[]}}}}}}}}"#
+                )
+            } else {
+                String::new()
+            };
+            let mut c = Client::spawn("quiet", &[]);
+            let id = c.req("initialize", &initialize_params(ver, &extra));
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            let result = &serde_json::from_str::<serde_json::Value>(&frame).unwrap()["result"];
+            let (capabilities, session) = if ver == 1 {
+                (
+                    &result["agentCapabilities"],
+                    &result["agentCapabilities"]["sessionCapabilities"],
+                )
+            } else {
+                (&result["capabilities"], &result["capabilities"]["session"])
+            };
+            assert!(
+                capabilities["_meta"].get("jetbrains").is_none(),
+                "v{ver}: AIR keys go in the top-level _meta: {frame}"
+            );
+            assert_eq!(
+                result["_meta"]["jetbrains"]["air"]["capabilities"].is_array(),
+                air,
+                "v{ver} air={air}: {frame}"
+            );
+            assert_eq!(
+                session.get("subagents").is_some(),
+                air && ver == 1,
+                "v{ver} air={air}: {frame}"
+            );
+            assert_eq!(result["_meta"]["steering"]["supported"], true, "{frame}");
+            c.finish();
+        }
+    }
+}
+
+#[test]
 fn negotiated_file_change_report_uses_successful_host_tool_paths_once() {
     let caps = ",\"clientCapabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"agentFileChangeReport\"]}}}}";
     let mut c = Client::spawn("file_changes", &[]);
@@ -2818,7 +2995,7 @@ fn cancelling_the_turn_invalidates_a_pending_feedback_form() {
     ));
     let form = c.wait_for("elicitation/create", Duration::from_secs(15));
     let form_id = extract_str(&form, "id").expect("feedback form id");
-    c.req("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
     let stale = c.wait_for(
         &format!("\"requestId\":\"{form_id}\""),
         Duration::from_secs(15),
@@ -4438,7 +4615,7 @@ fn a_permission_resolved_elsewhere_is_withdrawn_with_cancel_request() {
 #[test]
 fn a_child_approval_resolved_elsewhere_is_withdrawn() {
     let mut c = Client::spawn("child_approval_resolved", &[("FAKE_CAPS", "subagents")]);
-    let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let sid = c.new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}");
     let _pid = c.prompt(&sid, "child needs permission");
     let permission = c.wait_for("request_permission", Duration::from_secs(15));
     let permission_id = extract_str(&permission, "id").expect("permission request id");
@@ -4463,7 +4640,7 @@ fn a_child_approval_resolved_elsewhere_is_withdrawn() {
 #[test]
 fn a_parent_approval_reusing_a_resolved_child_id_still_opens() {
     let mut c = Client::spawn("child_then_parent_approval", &[("FAKE_CAPS", "subagents")]);
-    let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let sid = c.new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}");
     let _pid = c.prompt(&sid, "child and parent need permission");
     let parent = c.wait_for("\"toolCallId\":\"call-parent\"", Duration::from_secs(15));
     assert!(
@@ -4484,7 +4661,7 @@ fn a_parent_resolution_keeps_a_child_prompt_with_the_same_id() {
         "parent_resolved_beside_child",
         &[("FAKE_CAPS", "subagents")],
     );
-    let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let sid = c.new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}");
     let _pid = c.prompt(&sid, "child needs permission");
     let permission = c.wait_for("\"toolCallId\":\"call-child\"", Duration::from_secs(15));
     let permission_id = extract_str(&permission, "id").expect("permission request id");
@@ -4785,7 +4962,13 @@ fn load_and_resume_pass_the_blocked_prompt_recall_seed_through() {
     for ver in [1, 2] {
         let mut c = Client::spawn("load", &[("FAKE_BLOCKED_PROMPT", text)]);
         let sid = c.new_session(ver, "");
-        for method in ["session/load", "session/resume"] {
+        // ACP v2 has no `session/load`.
+        let methods: &[&str] = if ver == 1 {
+            &["session/load", "session/resume"]
+        } else {
+            &["session/resume"]
+        };
+        for method in methods {
             let rid = c.req(method, &format!("{{\"sessionId\":\"{sid}\"}}"));
             let result = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
             assert!(
@@ -5272,7 +5455,8 @@ fn session_list_forwards_and_returns_pagination_cursor() {
     let second = c.wait_for(&format!("\"id\":{second_id}"), Duration::from_secs(15));
     assert!(second.contains("\"sessionId\":\"stored-201\""), "{second}");
     assert!(!second.contains("\"sessionId\":\"stored-1\""), "{second}");
-    assert!(second.contains("\"nextCursor\":null"), "{second}");
+    // The last page has no cursor, which the SDK leaves out.
+    assert!(!second.contains("\"nextCursor\""), "{second}");
     c.finish();
 }
 
@@ -5311,7 +5495,6 @@ fn session_load_rejects_invalid_roots_and_tolerates_mcp() {
         "{\"sessionId\":\"msp-sess-old\",\"cwd\":\"\"}",
         "{\"sessionId\":\"msp-sess-old\",\"cwd\":\"relative\"}",
         "{\"sessionId\":\"msp-sess-old\",\"cwd\":7}",
-        "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":null}",
         "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":[\"relative\"]}",
         "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":[\"\"]}",
         "{\"sessionId\":\"msp-sess-old\",\"additionalDirectories\":[7]}",
@@ -5329,7 +5512,7 @@ fn session_load_rejects_invalid_roots_and_tolerates_mcp() {
 
     let id = c.req(
         "session/load",
-        "{\"sessionId\":\"msp-sess-old\",\"mcpServers\":[{\"name\":\"intellij\",\"command\":\"idea\",\"args\":[\"stdioMcpServer\"]}]}",
+        "{\"sessionId\":\"msp-sess-old\",\"mcpServers\":[{\"name\":\"intellij\",\"command\":\"idea\",\"args\":[\"stdioMcpServer\"],\"env\":[]}]}",
     );
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     assert!(frame.contains("\"result\""), "load failed: {frame}");
@@ -5430,7 +5613,7 @@ fn v1_advertises_config_options_and_slash_commands() {
     );
     let mode_done = c.wait_for(&format!("\"id\":{mode_id}"), Duration::from_secs(15));
     assert!(
-        mode_done.contains("\"result\":{\"mode\":\"denyUnmatched\"}"),
+        mode_done.contains("\"result\":{\"_meta\":{\"muse\":{\"mode\":\"denyUnmatched\"}}}"),
         "legacy v1 modeId uses the MSP spelling: {mode_done}"
     );
     c.wait_log("session/setApprovalMode", Duration::from_secs(15));
@@ -5438,52 +5621,68 @@ fn v1_advertises_config_options_and_slash_commands() {
 }
 
 #[test]
-fn legacy_set_model_accepts_model_id_and_forwards_to_msp() {
-    let mut c = Client::spawn("quiet", &[]);
-    let sid = c.new_session(1, "");
-    let model_id = c.req(
-        "session/set_model",
-        &format!("{{\"sessionId\":\"{sid}\",\"modelId\":\"fake-model\"}}"),
-    );
-    let model_done = c.wait_for(&format!("\"id\":{model_id}"), Duration::from_secs(15));
-    assert!(
-        model_done.contains("\"result\":{\"model\":\"fake-model\"}"),
-        "legacy modelId is accepted: {model_done}"
-    );
-    c.wait_log("session/setModel", Duration::from_secs(15));
-    let frames = std::fs::read_to_string(format!("{}.frames", c.fake_log)).expect("host frames");
-    assert!(
-        frames.lines().any(|line| {
-            line.contains("\"method\": \"session/setModel\"")
-                && line.contains("\"modelId\": \"fake-model\"")
-        }),
-        "MSP setModel receives the requested modelId: {frames}"
-    );
-    // The standard selector follows the legacy change.
-    let answered = frame_index(&c, &format!("\"id\":{model_id}"));
-    let start = Instant::now();
-    loop {
-        let followed = c
-            .frames
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+fn methods_outside_the_negotiated_schema_are_not_found() {
+    // Custom methods must start with `_`, and each version serves only its
+    // own schema's methods.
+    let not_standard = [
+        (
+            "session/set_model",
+            r#"{"sessionId":"SID","modelId":"fake-model"}"#,
+        ),
+        (
+            "subagent/sendMessage",
+            r#"{"sessionId":"SID","commandId":"c1","subagentId":"s1","message":"hi"}"#,
+        ),
+        ("shutdown", "null"),
+        ("exit", "null"),
+    ];
+    let v1_only = [
+        (
+            "session/set_mode",
+            r#"{"sessionId":"SID","modeId":"default"}"#,
+        ),
+        ("authenticate", r#"{"methodId":"muse-login"}"#),
+        ("logout", "{}"),
+    ];
+    let v2_only = [
+        ("auth/login", r#"{"methodId":"muse-login"}"#),
+        ("auth/logout", "{}"),
+    ];
+    for ver in [1, 2] {
+        let mut c = Client::spawn("quiet", &[]);
+        let sid = c.new_session(ver, "");
+        let other_version: &[(&str, &str)] = if ver == 1 { &v2_only } else { &v1_only };
+        let mut methods: Vec<(&str, String)> = not_standard
             .iter()
-            .skip(answered + 1)
-            .any(|f| {
-                f.contains("\"config_option_update\"")
-                    && f.contains(&sid)
-                    && f.contains("\"currentValue\":\"fake-model\"")
-            });
-        if followed {
-            break;
+            .chain(other_version)
+            .map(|(method, params)| (*method, params.replace("SID", &sid)))
+            .collect();
+        if ver == 2 {
+            // ACP v2 resumes with `session/resume`; it has no `session/load`.
+            methods.push((
+                "session/load",
+                format!(r#"{{"sessionId":"{sid}","cwd":{}}}"#, temp_cwd_json()),
+            ));
         }
+        for (method, params) in methods {
+            let id = c.req(method, &params);
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
+            assert!(
+                frame.contains("\"code\":-32601"),
+                "v{ver} {method} must be method-not-found: {frame}"
+            );
+        }
+        // Still serving.
+        let id = c.req("session/list", "{}");
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
+        assert!(frame.contains("\"result\""), "v{ver}: {frame}");
+        let frames = std::fs::read_to_string(format!("{}.frames", c.fake_log)).unwrap_or_default();
         assert!(
-            start.elapsed() < Duration::from_secs(15),
-            "no config_option_update after session/set_model"
+            !frames.contains("session/setModel"),
+            "v{ver}: a refused method reached Muse: {frames}"
         );
-        std::thread::sleep(Duration::from_millis(20));
+        c.finish();
     }
-    c.finish();
 }
 
 #[test]
@@ -5499,7 +5698,7 @@ fn legacy_set_mode_adopts_the_folded_host_mode() {
     );
     let mode_done = c.wait_for(&format!("\"id\":{mode_id}"), Duration::from_secs(15));
     assert!(
-        mode_done.contains("\"result\":{\"mode\":\"promptUnmatched\"}"),
+        mode_done.contains("\"result\":{\"_meta\":{\"muse\":{\"mode\":\"promptUnmatched\"}}}"),
         "legacy set_mode must report the folded host mode, not the request: {mode_done}"
     );
     c.finish();
@@ -5638,7 +5837,6 @@ fn v2_http_mcp_server_is_forwarded_and_unsupported_entries_are_dropped() {
         concat!(
             r#"[{"type":"http","name":"docs","url":"https://SECRET.example/mcp","headers":[{"name":"Authorization","value":"Bearer SECRET-TOKEN"}]},"#,
             r#"{"type":"sse","name":"legacy","url":"https://SECRET.example/sse"},"#,
-            r#"{"type":"stdio","name":"broken"},"#,
             r#"{"type":"stdio","name":"files","command":"/usr/bin/files-mcp"}]"#,
         ),
     );
@@ -5664,18 +5862,26 @@ fn v2_http_mcp_server_is_forwarded_and_unsupported_entries_are_dropped() {
         })
     );
     assert_mcp_servers_match_schema(&start["config"]["mcpServers"]);
+    // ACP v2 has no SSE transport, so the SDK reads one as a custom type.
     c.wait_stderr(
-        "MCP server \"legacy\" dropped: the SSE transport is not supported by Muse",
-        Duration::from_secs(15),
-    );
-    c.wait_stderr(
-        "MCP server \"broken\" dropped: missing command",
+        "MCP server \"legacy\" dropped: unsupported transport \"sse\"",
         Duration::from_secs(15),
     );
     c.wait_stderr(
         "forwarding 2 client MCP server(s) to Muse: \"docs\", \"files\"",
         Duration::from_secs(15),
     );
+    // A stdio entry without its command does not fit the schema, so the SDK
+    // refuses the whole request before the adapter sees it.
+    let id = c.req(
+        "session/new",
+        &format!(
+            r#"{{"cwd":{},"mcpServers":[{{"type":"stdio","name":"broken"}}]}}"#,
+            temp_cwd_json()
+        ),
+    );
+    let refused = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(refused.contains("\"code\":-32602"), "{refused}");
     let stderr_log = c.stderr_log.clone();
     c.finish();
     let stderr = std::fs::read_to_string(stderr_log).unwrap();
@@ -5689,7 +5895,13 @@ fn v2_http_mcp_server_is_forwarded_and_unsupported_entries_are_dropped() {
 fn a_host_without_the_session_mcp_grant_receives_no_client_mcp_servers() {
     for ver in [1, 2] {
         let mut c = Client::spawn("quiet", &[("FAKE_NO_SESSION_MCP", "1")]);
-        let (init, _) = open_with_mcp(&mut c, ver, r#"[{"name":"intellij","command":"idea"}]"#);
+        // ACP v1 leaves a stdio server's `type` out; v2 names it.
+        let servers = if ver == 1 {
+            r#"[{"name":"intellij","command":"idea","args":[],"env":[]}]"#
+        } else {
+            r#"[{"type":"stdio","name":"intellij","command":"idea","args":[],"env":[]}]"#
+        };
+        let (init, _) = open_with_mcp(&mut c, ver, servers);
         if ver == 1 {
             assert!(
                 init.contains("\"mcpCapabilities\":{\"http\":false,\"sse\":false}"),
@@ -5715,7 +5927,7 @@ fn load_resends_client_mcp_servers_and_survives_a_configuration_conflict() {
     let load = |c: &mut Client| {
         let id = c.req(
             "session/load",
-            r#"{"sessionId":"msp-sess-old","mcpServers":[{"name":"intellij","command":"idea"}],"_meta":{"muse":{"permissionProfile":"team-safe","modelId":"model-explicit"}}}"#,
+            r#"{"sessionId":"msp-sess-old","mcpServers":[{"name":"intellij","command":"idea","args":[],"env":[]}],"_meta":{"muse":{"permissionProfile":"team-safe","modelId":"model-explicit"}}}"#,
         );
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
         assert!(frame.contains("\"result\""), "load failed: {frame}");
@@ -5918,7 +6130,7 @@ fn session_fork_never_carries_a_permission_profile() {
 #[test]
 fn fork_keeps_client_mcp_servers_for_the_next_load_only() {
     let mut c = Client::spawn("quiet", &[]);
-    let servers = r#"[{"name":"intellij","command":"idea"}]"#;
+    let servers = r#"[{"name":"intellij","command":"idea","args":[],"env":[]}]"#;
     let (_, frame) = open_with_mcp(&mut c, 1, servers);
     let sid = extract_str(&frame, "sessionId").expect("sessionId");
     let id = c.req(
@@ -5951,7 +6163,11 @@ fn a_restarted_host_reloads_the_client_mcp_servers() {
     ));
     let marker_str = marker.to_str().unwrap().to_string();
     let mut c = Client::spawn("host_exit", &[("FAKE_RESTART_MARKER", marker_str.as_str())]);
-    let (_, frame) = open_with_mcp(&mut c, 1, r#"[{"name":"intellij","command":"idea"}]"#);
+    let (_, frame) = open_with_mcp(
+        &mut c,
+        1,
+        r#"[{"name":"intellij","command":"idea","args":[],"env":[]}]"#,
+    );
     let sid = extract_str(&frame, "sessionId").expect("sessionId");
     let p1 = c.prompt(&sid, "before crash");
     c.wait_for(&format!("\"id\":{p1}"), Duration::from_secs(15));
@@ -5980,6 +6196,10 @@ fn model_catalog_refreshes_after_initial_partial_snapshot() {
             "session/resume",
             "session/set_config_option",
         ] {
+            if ver == 2 && method == "session/load" {
+                // ACP v2 has no `session/load`.
+                continue;
+            }
             let mut c = Client::spawn("catalog_grows", &[]);
             let sid = c.new_session(ver, "");
             let initial = c
@@ -6398,6 +6618,29 @@ fn prompt_keeps_the_refusal_when_the_drive_is_not_granted() {
         "the host refusal names the client that kept the drive: {error}"
     );
     assert_eq!(drive_calls(&c), ["turn/start", "session/requestDrive"]);
+    c.finish();
+}
+
+#[test]
+fn steering_sent_as_a_notification_still_reaches_the_turn() {
+    // Extension methods run whether or not the client asks for an answer.
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(2, "");
+    let prompt_id = c.prompt(&sid, "start");
+    c.wait_for(&format!("\"id\":{prompt_id}"), Duration::from_secs(15));
+    c.notify(
+        "_session/steering",
+        &format!(
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"text\",\"text\":\"also check the logs\"}}]}}"
+        ),
+    );
+    c.wait_input("also check the logs", Duration::from_secs(15));
+    let steers: Vec<_> = turn_inputs(&c)
+        .into_iter()
+        .filter(|params| params.get("expectedTurnId").is_some())
+        .collect();
+    assert_eq!(steers.len(), 1, "{steers:?}");
+    assert_eq!(steers[0]["expectedTurnId"], "turn-1");
     c.finish();
 }
 
@@ -7337,6 +7580,16 @@ fn air_recommended_reasoning_falls_back_to_the_model_default() {
         Some("medium"),
         "{frame}"
     );
+    // AIR replaces the ambiguous "Muse default" row with the concrete tier it
+    // resolves to, shown as current while the session keeps Muse's default.
+    let values: Vec<&str> = option["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|o| o["value"].as_str())
+        .collect();
+    assert!(!values.contains(&"default"), "{frame}");
+    assert_eq!(option["currentValue"], "medium", "{frame}");
     // Switching models moves the recommendation to the new model's default.
     let switch = c.req(
         "session/set_config_option",
@@ -7429,7 +7682,7 @@ fn v2_resume_snapshots_state_after_replay_and_before_the_response() {
 
 #[test]
 fn v2_resume_snapshot_reports_running_work() {
-    let mut c = Client::spawn("resume_active", &[("FAKE_WORKSPACE_ROOT", "/tmp")]);
+    let mut c = Client::spawn("resume_active", &[]);
     c.initialize(2, "");
     let id = c.req("session/resume", r#"{"sessionId":"msp-sess-1"}"#);
     c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
@@ -7727,7 +7980,11 @@ fn steering_idle_prompt_required_on_v1_connections() {
 
 #[test]
 fn steering_targets_a_turn_rehydrated_by_resume() {
-    let mut c = Client::spawn("resume_active", &[]);
+    let workspace = std::env::temp_dir();
+    let mut c = Client::spawn(
+        "resume_active",
+        &[("FAKE_WORKSPACE_ROOT", workspace.to_str().unwrap())],
+    );
     let init = c.req("initialize", &initialize_params(2, ""));
     c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
     c.notify("initialized", "{}");
@@ -8083,33 +8340,22 @@ fn session_list_matches_workspace_symlink_aliases() {
     c.finish();
 }
 
-#[cfg(unix)]
 #[test]
-fn image_symlink_uses_the_requested_filename_for_mime() {
-    use std::os::unix::fs::symlink;
-
+fn an_image_without_data_is_refused_before_the_host() {
+    // ACP requires an image block's `data` and `mimeType`; a block that
+    // only names a file does not fit the schema, so the SDK refuses the
+    // prompt and no turn starts.
     let mut c = Client::spawn("quiet", &[]);
-    let primary = std::path::Path::new(&c.fake_log)
-        .parent()
-        .expect("fake log parent")
-        .join("workspace");
-    std::fs::create_dir_all(&primary).expect("workspace");
-    std::fs::write(primary.join("image-target"), b"fake jpeg bytes").expect("image target");
-    symlink(primary.join("image-target"), primary.join("photo.jpg")).expect("image symlink");
-    let sid = c.new_session_at(1, &primary, &[]);
-    c.req(
+    let sid = c.new_session(1, "");
+    let id = c.req(
         "session/prompt",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"image\",\"uri\":\"{}\"}}]}}",
-            primary.join("photo.jpg").display()
+            "{{\"sessionId\":\"{sid}\",\"prompt\":[{{\"type\":\"image\",\"uri\":\"file:///tmp/photo.jpg\"}}]}}"
         ),
     );
-    c.wait_input("image/jpeg", Duration::from_secs(15));
-    let input = std::fs::read_to_string(format!("{}.input", c.fake_log)).unwrap();
-    assert!(
-        input.contains("\"mediaType\": \"image/jpeg\""),
-        "image MIME did not follow the requested .jpg name: {input}"
-    );
+    let refused = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(refused.contains("\"code\":-32602"), "{refused}");
+    assert!(host_requests(&c, "turn/start").is_empty());
     c.finish();
 }
 
@@ -8304,9 +8550,9 @@ fn resume_omission_drops_previously_active_additional_roots() {
         .find(|row| row["sessionId"] == sid)
         .expect("owned session listed");
     assert_eq!(row["cwd"], primary.to_str().unwrap());
-    assert_eq!(
-        row["additionalDirectories"],
-        serde_json::json!([]),
+    // No extra roots: the SDK leaves the empty list out.
+    assert!(
+        row.get("additionalDirectories").is_none(),
         "resume implicitly restored an omitted root: {listed}"
     );
     c.finish();
@@ -8390,111 +8636,54 @@ fn base64(data: &[u8]) -> String {
     out
 }
 
-/// Frames that are JSON arrays: batch replies.
-fn batch_frames(c: &Client) -> Vec<serde_json::Value> {
-    c.frames
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .iter()
-        .filter(|frame| frame.starts_with('['))
-        .map(|frame| serde_json::from_str(frame).expect("batch reply JSON"))
-        .collect()
-}
-
 #[test]
-fn v2_batches_follow_the_json_rpc_batch_rules() {
-    let mut c = Client::spawn("happy", &[]);
-    c.new_session(2, "");
-
-    // An empty batch is one Invalid Request object, not an array.
-    c.raw("[]");
-    let empty = c.wait_for("empty batch", Duration::from_secs(15));
-    let empty: serde_json::Value = serde_json::from_str(&empty).expect("error JSON");
-    assert_eq!(empty["id"], serde_json::Value::Null, "{empty}");
-    assert_eq!(empty["error"]["code"], -32600, "{empty}");
-
-    // Two requests come back together, each echoing its own id.
-    c.raw(
-        r#"[{"jsonrpc":"2.0","id":"batch-a","method":"session/list","params":{}},{"jsonrpc":"2.0","id":"batch-b","method":"session/list","params":{}}]"#,
-    );
-    c.wait_for("\"batch-b\"", Duration::from_secs(15));
-    let replies = batch_frames(&c);
-    assert_eq!(replies.len(), 1, "one response array: {replies:?}");
-    let ids: Vec<&serde_json::Value> = replies[0]
-        .as_array()
-        .expect("array reply")
-        .iter()
-        .map(|reply| &reply["id"])
-        .collect();
-    assert_eq!(ids, ["batch-a", "batch-b"], "{replies:?}");
-    assert!(
-        replies[0]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|reply| reply["result"]["sessions"].is_array()),
-        "both requests ran: {replies:?}"
-    );
-
-    // Invalid entries get their own -32600 and do not fail a valid sibling;
-    // the notification gets no reply of its own.
-    c.raw(
-        r#"[17,true,null,{"jsonrpc":"2.0","method":"_muse/batch_notice"},{"jsonrpc":"2.0","id":"batch-c","method":"session/list","params":{}}]"#,
-    );
-    c.wait_for("\"batch-c\"", Duration::from_secs(15));
-    let replies = batch_frames(&c);
-    assert_eq!(replies.len(), 2, "{replies:?}");
-    let mixed = replies[1].as_array().expect("array reply");
-    assert_eq!(
-        mixed.len(),
-        4,
-        "three invalid entries and one request: {mixed:?}"
-    );
-    let invalid: Vec<_> = mixed.iter().filter(|reply| reply["id"].is_null()).collect();
-    assert_eq!(invalid.len(), 3, "{mixed:?}");
-    assert!(
-        invalid.iter().all(|reply| reply["error"]["code"] == -32600),
-        "{mixed:?}"
-    );
-    assert!(
-        mixed
-            .iter()
-            .any(|reply| reply["id"] == "batch-c" && reply["result"]["sessions"].is_array()),
-        "{mixed:?}"
-    );
-
-    // A notification-only batch is never answered, and the connection stays
-    // usable afterwards.
-    c.raw(r#"[{"jsonrpc":"2.0","method":"_muse/batch_notice"}]"#);
-    let id = c.req("session/list", "{}");
-    c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
-    assert_eq!(batch_frames(&c).len(), 2, "no reply to notifications");
-    c.finish();
-}
-
-#[test]
-fn v1_batches_are_refused_as_a_whole() {
-    let mut c = Client::spawn("happy", &[]);
-    c.new_session(1, "");
-    c.raw(r#"[{"jsonrpc":"2.0","id":"batch-v1","method":"session/list","params":{}}]"#);
-    let refused = c.wait_for("batches need ACP v2", Duration::from_secs(15));
-    let refused: serde_json::Value = serde_json::from_str(&refused).expect("error JSON");
-    assert_eq!(refused["id"], serde_json::Value::Null, "{refused}");
-    assert_eq!(refused["error"]["code"], -32600, "{refused}");
-    assert!(batch_frames(&c).is_empty());
-    let frames = c
-        .frames
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .join("\n");
-    assert!(
-        !frames.contains("\"batch-v1\""),
-        "the entry did not run: {frames}"
-    );
-    drop(frames);
-    let id = c.req("session/list", "{}");
-    c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
-    c.finish();
+fn json_rpc_batches_are_refused_in_both_versions() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("happy", &[]);
+        c.new_session(ver, "");
+        // ACP forbids JSON-RPC batches. The SDK answers any array, empty or
+        // not, with one Invalid Request error and runs none of its entries.
+        for batch in [
+            "[]",
+            r#"[{"jsonrpc":"2.0","id":"batch-a","method":"session/list","params":{}}]"#,
+        ] {
+            let before = c.frames.lock().unwrap_or_else(|p| p.into_inner()).len();
+            c.raw(batch);
+            let start = Instant::now();
+            let refused = loop {
+                let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(frame) = frames[before..]
+                    .iter()
+                    .find(|frame| frame.contains("batches are not supported"))
+                {
+                    break frame.clone();
+                }
+                drop(frames);
+                assert!(
+                    start.elapsed() < Duration::from_secs(15),
+                    "v{ver} batch {batch} was not refused"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let refused: serde_json::Value = serde_json::from_str(&refused).expect("error JSON");
+            assert_eq!(refused["id"], serde_json::Value::Null, "{refused}");
+            assert_eq!(refused["error"]["code"], -32600, "{refused}");
+        }
+        let frames = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n");
+        assert!(
+            !frames.contains("\"batch-a\""),
+            "the entry did not run: {frames}"
+        );
+        drop(frames);
+        // The connection stays usable.
+        let id = c.req("session/list", "{}");
+        c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        c.finish();
+    }
 }
 
 #[test]
@@ -8534,10 +8723,6 @@ fn v2_initialize_requires_well_formed_info_before_launching_the_host() {
             "non-string name",
             r#"{"protocolVersion":2,"info":{"name":7,"version":"1.0.0"}}"#,
         ),
-        (
-            "non-string title",
-            r#"{"protocolVersion":2,"info":{"name":"client","title":7,"version":"1.0.0"}}"#,
-        ),
     ] {
         let mut c = Client::spawn("quiet", &[]);
         let id = c.req("initialize", params);
@@ -8571,26 +8756,15 @@ fn initialize_selects_the_highest_supported_version_at_or_below_the_request() {
 }
 
 #[test]
-fn unsupported_initialize_version_returns_structured_version_data() {
+fn initialize_version_zero_falls_back_to_v1() {
+    // The SDK selects v2 only for a request at or above v2; any lower
+    // version gets ACP v1's fallback to the latest version it supports.
     let params = r#"{"protocolVersion":0,"info":{"name":"client","version":"1.0.0"}}"#;
     let mut c = Client::spawn("quiet", &[]);
     let id = c.req("initialize", params);
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
     let reply: serde_json::Value = serde_json::from_str(&frame).expect("initialize response JSON");
-    assert_eq!(
-        reply["error"]["code"], -32022,
-        "unsupported version must use the protocol error: {frame}"
-    );
-    assert_eq!(reply["error"]["data"]["requested"], 0, "{frame}");
-    assert_eq!(
-        reply["error"]["data"]["supported"],
-        serde_json::json!([1, 2]),
-        "{frame}"
-    );
-    assert!(
-        !std::path::Path::new(&c.fake_log).exists(),
-        "an unsupported version launched the host: {frame}"
-    );
+    assert_eq!(reply["result"]["protocolVersion"], 1, "{frame}");
     c.finish();
 }
 
@@ -8603,7 +8777,6 @@ fn invalid_session_roots_are_rejected() {
 
     for params in [
         "{\"cwd\":\"relative\"}",
-        "{\"cwd\":\"/tmp\",\"additionalDirectories\":null}",
         "{\"cwd\":\"/tmp\",\"additionalDirectories\":[\"relative\"]}",
         "{\"cwd\":\"/tmp\",\"additionalDirectories\":[\"\"]}",
         "{\"cwd\":\"/tmp\",\"additionalDirectories\":[7]}",
@@ -9770,29 +9943,20 @@ fn feedback_during_a_running_turn_keeps_the_session_running() {
 }
 
 #[test]
-fn a_resume_without_a_resolvable_root_still_runs_turns() {
-    let gone = fresh_workspace_dir("resume-gone-root").join("gone");
-    let mut c = Client::spawn(
-        "happy",
-        &[
-            ("FAKE_SERVER_VERSION", "1.4.2"),
-            ("FAKE_WORKSPACE_ROOT", gone.to_str().unwrap()),
-        ],
-    );
+fn a_load_without_cwd_is_refused_before_the_host() {
+    // Both ACP versions require `cwd` on `session/load` and `session/resume`;
+    // the SDK refuses a request without one before the adapter sees it.
+    let mut c = Client::spawn("happy", &[("FAKE_SERVER_VERSION", "1.4.2")]);
     c.initialize(1, "");
-    let load = c.req("session/load", "{\"sessionId\":\"msp-sess-1\"}");
-    let attached = c.wait_for(&format!("\"id\":{load}"), Duration::from_secs(15));
-    assert!(attached.contains("\"result\""), "{attached}");
-    for text in ["first", "second"] {
-        let prompt = c.prompt("msp-sess-1", text);
-        let done = c.wait_for(&format!("\"id\":{prompt}"), Duration::from_secs(15));
-        assert!(done.contains("end_turn"), "{done}");
-    }
-    let starts = host_requests(&c, "turn/start");
-    assert_eq!(starts.len(), 2, "{starts:?}");
+    c.raw(r#"{"jsonrpc":"2.0","id":"no-cwd","method":"session/load","params":{"sessionId":"msp-sess-1","mcpServers":[]}}"#);
+    let refused = c.wait_for("\"id\":\"no-cwd\"", Duration::from_secs(15));
     assert!(
-        starts.iter().all(|s| s.get("workspaceRoots").is_none()),
-        "an unresolvable primary root leaves the host on its own: {starts:?}"
+        refused.contains("\"code\":-32602") && refused.contains("missing field `cwd`"),
+        "{refused}"
+    );
+    assert!(
+        host_requests(&c, "session/resume").is_empty(),
+        "a refused load must not reach the host"
     );
     c.finish();
 }
@@ -11605,10 +11769,9 @@ fn workflow_async_task_stop_admits_cancel_and_waits_for_view_terminal() {
         &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"wfr-control\"}}"),
     );
     let ack = c.wait_for(&format!("\"id\":{stop_id}"), Duration::from_secs(15));
-    assert!(
-        ack.contains("\"status\":\"accepted\""),
-        "cancel is admission-only: {ack}"
-    );
+    // AIR's stop result; the cancel is admission only, and the workflow's
+    // own terminal settles the task.
+    assert!(ack.contains("\"result\":{\"stopped\":true}"), "{ack}");
     c.wait_log("workflow/cancel", Duration::from_secs(15));
     let stopped = c.wait_for("\"state\":\"stopped\"", Duration::from_secs(15));
     assert!(
@@ -11742,7 +11905,7 @@ fn session_fork_resolves_a_message_id_cut_point() {
     let fid = c.req(
         "session/fork",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageId\":\"msg-fork\"}}}}}}}}}}"
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"msg-fork\"}}}}}}}}}}"
         ),
     );
     let frame = c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
@@ -11762,40 +11925,53 @@ fn session_fork_resolves_a_message_id_cut_point() {
 }
 
 #[test]
-fn session_fork_rejects_unresolvable_and_fingerprint_cut_points() {
+fn session_fork_rejects_an_unmatched_point_and_ignores_a_malformed_one() {
+    // AIR: a fork point that matches no message fails with invalid params
+    // before any fork reaches the host.
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(1, "");
-
     let missing = c.req(
         "session/fork",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageId\":\"no-such-message\"}}}}}}}}}}"
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"no-such-message\"}}}}}}}}}}"
         ),
     );
     let frame = c.wait_for(&format!("\"id\":{missing}"), Duration::from_secs(15));
     assert!(
-        frame.contains("not found in session history"),
+        frame.contains("\"code\":-32602") && frame.contains("not found in session history"),
         "unresolved point must fail closed: {frame}"
     );
-
-    let fp = c.req(
-        "session/fork",
-        &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"abc\",\"messageOccurrence\":1}}}}}}}}}}"
-        ),
-    );
-    let frame = c.wait_for(&format!("\"id\":{fp}"), Duration::from_secs(15));
-    assert!(
-        frame.contains("sha256:<64 hex chars>"),
-        "malformed fingerprint must be explicit: {frame}"
-    );
-
     let seen = std::fs::read_to_string(&c.fake_log).expect("fake log");
     assert!(
         !seen.lines().any(|l| l == "session/fork"),
-        "no fork command may reach the host on invalid points: {seen}"
+        "no fork command may reach the host on an unmatched point: {seen}"
     );
     c.finish();
+
+    // AIR ignores a fork object without version 1 or a non-blank messageId,
+    // and forks the whole session.
+    for fork in [
+        r#"{"messageFingerprint":"abc","messageOccurrence":1}"#,
+        r#"{"version":2,"messageId":"msg-fork"}"#,
+        r#"{"version":1,"messageId":"  "}"#,
+    ] {
+        let mut c = Client::spawn("quiet", &[]);
+        let sid = c.new_session(1, "");
+        let id = c.req(
+            "session/fork",
+            &format!(
+                "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{fork}}}}}}}}}"
+            ),
+        );
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\""), "{fork}: {frame}");
+        let fork_params = &host_requests(&c, "session/fork")[0];
+        assert!(
+            fork_params.get("cutPoint").is_none(),
+            "{fork}: {fork_params}"
+        );
+        c.finish();
+    }
 }
 
 #[test]
@@ -12922,10 +13098,50 @@ fn hook_inventory_labels_hook_run_items() {
 }
 
 #[test]
+fn air_clients_get_air_subagent_updates_for_either_signal() {
+    // AIR: an AIR client gets AIR's updates when it declares the standard
+    // `clientCapabilities.subagents` or AIR's `nativeSubagentSessions`, never
+    // the RFD's `subagent_update`, and subagent tool cards without either.
+    let air_only = r#""_meta":{"jetbrains":{"air":{"version":1,"capabilities":[]}}}"#;
+    for (ver, caps, native) in [
+        (1, format!(r#","clientCapabilities":{{"subagents":{{}},{air_only}}}"#), true),
+        (
+            1,
+            r#","clientCapabilities":{"subagents":{},"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["nativeSubagentSessions"]}}}}"#.to_string(),
+            true,
+        ),
+        (2, format!(r#","capabilities":{{{air_only}}}"#), false),
+    ] {
+        let mut c = Client::spawn("subagent_native", &[("FAKE_CAPS", "subagents")]);
+        let sid = c.new_session(ver, &caps);
+        let pid = c.prompt(&sid, "delegate natively");
+        c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        if native {
+            c.wait_for("\"sessionUpdate\":\"subagent_state_update\"", Duration::from_secs(15));
+        } else {
+            c.wait_for("subagent-it-subn", Duration::from_secs(15));
+        }
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).join("\n");
+        assert!(!frames.contains("\"subagent_update\""), "v{ver} {caps}: {frames}");
+        assert_eq!(
+            frames.contains("\"sessionUpdate\":\"subagent_spawned\""),
+            native,
+            "v{ver} {caps}: {frames}"
+        );
+        assert_eq!(
+            frames.contains("subagent-it-subn"),
+            !native,
+            "v{ver} {caps}: {frames}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn native_subagent_sessions_spawn_state_and_replay_the_child() {
     let mut c = Client::spawn("subagent_native", &[("FAKE_CAPS", "subagents")]);
     let sid = c
-        .new_session(2, ",\"capabilities\":{\"subagents\":{}}")
+        .new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}")
         .to_string();
     c.wait_stderr(
         "client negotiated native subagent sessions",
@@ -12934,7 +13150,10 @@ fn native_subagent_sessions_spawn_state_and_replay_the_child() {
     let _pid = c.prompt(&sid, "delegate natively");
 
     // Spawn announcement on the parent, exactly once, with provenance.
-    let spawned = c.wait_for("subagent_spawned", Duration::from_secs(15));
+    let spawned = c.wait_for_all(
+        &["\"sessionUpdate\":\"_subagent_update\"", "\"task\""],
+        Duration::from_secs(15),
+    );
     assert!(
         spawned.contains("\"subagentSessionId\":\"child-sess-native\""),
         "child session id missing: {spawned}"
@@ -12968,7 +13187,10 @@ fn native_subagent_sessions_spawn_state_and_replay_the_child() {
     );
 
     // Terminal state lands on the parent.
-    let state = c.wait_for("subagent_state_update", Duration::from_secs(15));
+    let state = c.wait_for_all(
+        &["\"sessionUpdate\":\"_subagent_update\"", "\"state\""],
+        Duration::from_secs(15),
+    );
     assert!(
         state.contains("\"state\":\"completed\""),
         "state missing: {state}"
@@ -12985,10 +13207,123 @@ fn native_subagent_sessions_spawn_state_and_replay_the_child() {
         "legacy card must not appear when native is negotiated: {frames}"
     );
     assert_eq!(
-        frames.matches("subagent_spawned").count(),
+        frames
+            .lines()
+            .filter(|l| l.contains("\"_subagent_update\"") && l.contains("\"task\""))
+            .count(),
         1,
         "spawn must be idempotent across started+completed: {frames}"
     );
+    c.finish();
+}
+
+#[test]
+fn a_settled_subagent_that_runs_again_is_shown_running() {
+    // The subagents RFD mirrors the child's state, and a settled child can be
+    // messaged again. AIR's updates stay terminal-only: the run is a new
+    // generation.
+    for air in [false, true] {
+        let init = if air {
+            ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}"
+        } else {
+            ""
+        };
+        let mut c = Client::spawn(
+            "subagent_result_ready",
+            &[("FAKE_CAPS", "subagents"), ("FAKE_SUBAGENT_RERUN", "1")],
+        );
+        let sid = c.new_session(2, init);
+        let pid = c.prompt(&sid, "delegate three");
+        c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        // The last child to settle; it fails.
+        let failed = if air {
+            "\"state\":\"failed\""
+        } else {
+            "\"stopReason\":\"error\""
+        };
+        c.wait_for_all(&["child-sess-ready-c", failed], Duration::from_secs(15));
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let states: Vec<serde_json::Value> = frames
+            .iter()
+            .filter_map(|frame| serde_json::from_str::<serde_json::Value>(frame).ok())
+            .map(|frame| frame["params"]["update"].clone())
+            .filter(|update| {
+                update["sessionId"] == "child-sess-ready-a"
+                    || update["subagentSessionId"] == "child-sess-ready-a"
+            })
+            .filter_map(|update| update.get("state").cloned())
+            .collect();
+        if air {
+            // AIR: the child's run ended; the next run is its generation 2.
+            assert_eq!(states, [serde_json::json!("completed")], "AIR: {frames:#?}");
+            let generation = frames
+                .iter()
+                .filter(|f| f.contains("\"subagentSessionId\":\"child-sess-ready-a:generation:2\""))
+                .count();
+            assert_eq!(generation, 2, "spawn and terminal: {frames:#?}");
+        } else {
+            let idle = serde_json::json!({"state": "idle", "stopReason": "end_turn"});
+            let running = serde_json::json!({"state": "running"});
+            assert_eq!(
+                states,
+                [running.clone(), idle.clone(), running, idle],
+                "RFD: {frames:#?}"
+            );
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn an_air_child_that_runs_again_is_a_new_generation() {
+    // AIR ends a child at its first terminal state. When it runs again, the
+    // run is announced as a new generation with its own session id, which
+    // gets its own terminal state.
+    let mut c = Client::spawn(
+        "subagent_result_ready",
+        &[
+            ("FAKE_CAPS", "subagents"),
+            ("FAKE_SUBAGENT_RERUN", "1"),
+            ("FAKE_SUBAGENT_RERUN_FAILS", "1"),
+        ],
+    );
+    let sid = c.new_session(1, r#","clientCapabilities":{"_meta":{"jetbrains":{"air":{"version":1,"capabilities":["nativeSubagentSessions"]}}}}"#);
+    let pid = c.prompt(&sid, "delegate three");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    c.wait_for_all(
+        &["child-sess-ready-c", "\"state\":\"failed\""],
+        Duration::from_secs(15),
+    );
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    let updates: Vec<serde_json::Value> = frames
+        .iter()
+        .filter_map(|f| serde_json::from_str::<serde_json::Value>(f).ok())
+        .map(|f| f["params"]["update"].clone())
+        .filter(|u| {
+            u["subagentSessionId"]
+                .as_str()
+                .is_some_and(|id| id.starts_with("child-sess-ready-a"))
+        })
+        .map(|u| {
+            serde_json::json!({
+                "sessionUpdate": u["sessionUpdate"],
+                "subagentSessionId": u["subagentSessionId"],
+                "state": u["state"],
+            })
+        })
+        .collect();
+    let generation = "child-sess-ready-a:generation:2";
+    assert_eq!(
+        updates,
+        [
+            serde_json::json!({"sessionUpdate": "subagent_spawned", "subagentSessionId": "child-sess-ready-a", "state": null}),
+            serde_json::json!({"sessionUpdate": "subagent_state_update", "subagentSessionId": "child-sess-ready-a", "state": "completed"}),
+            serde_json::json!({"sessionUpdate": "subagent_spawned", "subagentSessionId": generation, "state": null}),
+            serde_json::json!({"sessionUpdate": "subagent_state_update", "subagentSessionId": generation, "state": "failed"}),
+        ],
+        "{frames:#?}"
+    );
+    drop(frames);
     c.finish();
 }
 
@@ -12998,7 +13333,7 @@ fn native_subagent_result_ready_settles_the_child_once() {
     // stays in progress, and nothing obliges the owner to read or close it.
     // A result with an errorKind settles failed, as the host later closes it.
     let mut c = Client::spawn("subagent_result_ready", &[("FAKE_CAPS", "subagents")]);
-    let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let sid = c.new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}");
     let pid = c.prompt(&sid, "delegate three");
     c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
     for child in [
@@ -13011,7 +13346,8 @@ fn native_subagent_result_ready_settles_the_child_once() {
         // that each child settled exactly once.
         c.wait_for_all(
             &[
-                "\"sessionUpdate\":\"subagent_state_update\"",
+                "\"sessionUpdate\":\"_subagent_update\"",
+                "\"state\"",
                 &format!("\"subagentSessionId\":\"{child}\""),
             ],
             Duration::from_secs(15),
@@ -13024,7 +13360,7 @@ fn native_subagent_result_ready_settles_the_child_once() {
         .join("\n");
     let states: Vec<&str> = frames
         .lines()
-        .filter(|l| l.contains("subagent_state_update"))
+        .filter(|l| l.contains("\"_subagent_update\"") && l.contains("\"state\""))
         .collect();
     for (child, state) in [
         ("child-sess-ready-a", "completed"),
@@ -13047,12 +13383,12 @@ fn native_subagent_result_ready_settles_the_child_once() {
 #[test]
 fn native_subagent_controls_forward_owner_scope_and_client_command_ids() {
     let mut c = Client::spawn("subagent_control", &[("FAKE_CAPS", "subagents")]);
-    let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let sid = c.new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}");
     let _pid = c.prompt(&sid, "hold child");
-    c.wait_for("subagent_spawned", Duration::from_secs(15));
+    c.wait_for("\"_subagent_update\"", Duration::from_secs(15));
 
     let send = c.req(
-        "subagent/sendMessage",
+        "_subagent/sendMessage",
         &format!(
             "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-send\",\"subagentId\":\"sub-control\",\"body\":\"  focus on ✓  \"}}"
         ),
@@ -13065,7 +13401,7 @@ fn native_subagent_controls_forward_owner_scope_and_client_command_ids() {
     c.wait_input("\"body\": \"focus on", Duration::from_secs(15));
 
     let stop = c.req(
-        "subagent/stop",
+        "_subagent/stop",
         &format!(
             "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-stop\",\"subagentId\":\"sub-control\",\"reason\":\"operator asked\"}}"
         ),
@@ -13079,7 +13415,7 @@ fn native_subagent_controls_forward_owner_scope_and_client_command_ids() {
     // A replay retains the caller's idempotency key. The adapter does not
     // mint a second command id or turn the replay into a second message.
     let replay = c.req(
-        "subagent/stop",
+        "_subagent/stop",
         &format!(
             "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-stop\",\"subagentId\":\"sub-control\",\"reason\":\"operator asked\"}}"
         ),
@@ -13109,11 +13445,11 @@ fn native_subagent_controls_forward_owner_scope_and_client_command_ids() {
 #[test]
 fn subagent_controls_are_gated_by_negotiation_and_item_terminal_status() {
     let mut legacy = Client::spawn("subagent_control", &[]);
-    let legacy_sid = legacy.new_session(2, "");
+    let legacy_sid = legacy.new_session(1, "");
     let _pid = legacy.prompt(&legacy_sid, "hold child");
     legacy.wait_for("subagent-it-sub-control", Duration::from_secs(15));
     let legacy_stop = legacy.req(
-        "subagent/stop",
+        "_subagent/stop",
         &format!(
             "{{\"sessionId\":\"{legacy_sid}\",\"commandId\":\"cmd-legacy\",\"subagentId\":\"sub-control\"}}"
         ),
@@ -13139,11 +13475,11 @@ fn subagent_controls_are_gated_by_negotiation_and_item_terminal_status() {
             ("FAKE_SUBAGENT_ITEM_STATUS", "completed"),
         ],
     );
-    let terminal_sid = terminal.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let terminal_sid = terminal.new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}");
     let _pid = terminal.prompt(&terminal_sid, "finished child");
-    terminal.wait_for("subagent_spawned", Duration::from_secs(15));
+    terminal.wait_for("\"_subagent_update\"", Duration::from_secs(15));
     let terminal_stop = terminal.req(
-        "subagent/stop",
+        "_subagent/stop",
         &format!(
             "{{\"sessionId\":\"{terminal_sid}\",\"commandId\":\"cmd-terminal\",\"subagentId\":\"sub-control\"}}"
         ),
@@ -13166,7 +13502,7 @@ fn subagent_controls_are_gated_by_negotiation_and_item_terminal_status() {
 #[test]
 fn child_approval_fails_closed_through_the_owner_session() {
     let mut c = Client::spawn("subagent_child_approval", &[("FAKE_CAPS", "subagents")]);
-    let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let sid = c.new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}");
     let _pid = c.prompt(&sid, "child needs permission");
     c.wait_log("subagent/stop", Duration::from_secs(15));
     // The method log is written before result_for records its parameters.
@@ -13214,11 +13550,11 @@ fn subagent_control_lifecycle_states_and_rejections_are_single_shot() {
                 ("FAKE_SUBAGENT_ITEM_STATUS", status),
             ],
         );
-        let sid = c.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+        let sid = c.new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}");
         let _pid = c.prompt(&sid, "lifecycle child");
-        c.wait_for("subagent_spawned", Duration::from_secs(15));
+        c.wait_for("\"_subagent_update\"", Duration::from_secs(15));
         let req = c.req(
-            method,
+            &format!("_{method}"),
             &format!(
                 "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-{index}\",\"subagentId\":\"sub-control\"{}}}",
                 if matches!(method, "subagent/sendMessage" | "subagent/followupTask") {
@@ -13249,11 +13585,11 @@ fn subagent_control_lifecycle_states_and_rejections_are_single_shot() {
             ),
         ],
     );
-    let sid = rejected.new_session(2, ",\"capabilities\":{\"subagents\":{}}");
+    let sid = rejected.new_session(2, ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"nativeSubagentSessions\"]}}}}");
     let _pid = rejected.prompt(&sid, "rejected result");
-    rejected.wait_for("subagent_spawned", Duration::from_secs(15));
+    rejected.wait_for("\"_subagent_update\"", Duration::from_secs(15));
     let req = rejected.req(
-        "subagent/readResult",
+        "_subagent/readResult",
         &format!(
             "{{\"sessionId\":\"{sid}\",\"commandId\":\"cmd-reject\",\"subagentId\":\"sub-control\"}}"
         ),
@@ -13274,8 +13610,9 @@ fn subagent_control_lifecycle_states_and_rejections_are_single_shot() {
 
 #[test]
 fn subagent_cards_stay_legacy_without_negotiation() {
+    // ACP v1 needs `clientCapabilities.subagents`; v2 needs no capability.
     let mut c = Client::spawn("subagent", &[]);
-    let sid = c.new_session(2, "");
+    let sid = c.new_session(1, "");
     let _pid = c.prompt(&sid, "delegate legacy");
     let card = c.wait_for("subagent-it-sub1", Duration::from_secs(15));
     assert!(
@@ -13288,10 +13625,76 @@ fn subagent_cards_stay_legacy_without_negotiation() {
         .unwrap_or_else(|p| p.into_inner())
         .join("\n");
     assert!(
-        !frames.contains("subagent_spawned"),
+        !frames.contains("subagent_spawned") && !frames.contains("subagent_update"),
         "native updates must not leak without negotiation: {frames}"
     );
     c.finish();
+}
+
+/// The ACP subagents RFD: v1 clients that advertise
+/// `clientCapabilities.subagents`, and every v2 client, get the SDK's typed
+/// `subagent_update` instead of JetBrains AIR's updates.
+#[test]
+fn standard_subagent_updates_announce_and_settle_the_child() {
+    for (ver, init) in [(1, ",\"clientCapabilities\":{\"subagents\":{}}"), (2, "")] {
+        let mut c = Client::spawn("subagent_native", &[("FAKE_CAPS", "subagents")]);
+        let sid = c.new_session(ver, init);
+        c.wait_stderr(
+            "client negotiated native subagent sessions",
+            Duration::from_secs(10),
+        );
+        let _pid = c.prompt(&sid, "delegate natively");
+        let announced = c.wait_for(
+            "\"sessionUpdate\":\"subagent_update\"",
+            Duration::from_secs(15),
+        );
+        let frame: serde_json::Value = serde_json::from_str(&announced).expect("JSON frame");
+        let update = &frame["params"]["update"];
+        assert_eq!(
+            frame["params"]["sessionId"],
+            sid.as_str(),
+            "v{ver}: {announced}"
+        );
+        assert_eq!(
+            update["sessionId"], "child-sess-native",
+            "v{ver}: {announced}"
+        );
+        assert_eq!(update["title"], "researcher", "v{ver}: {announced}");
+        assert_eq!(
+            update["description"], "survey failing tests",
+            "v{ver}: {announced}"
+        );
+        assert_eq!(
+            update["_meta"]["muse"]["subagentId"], "sub-n1",
+            "v{ver}: {announced}"
+        );
+        assert!(
+            update.get("capabilities").is_none(),
+            "v{ver}: no client mutations: {announced}"
+        );
+
+        let settled = c.wait_for("\"stopReason\":\"end_turn\"", Duration::from_secs(15));
+        let frame: serde_json::Value = serde_json::from_str(&settled).expect("JSON frame");
+        assert_eq!(
+            frame["params"]["update"]["sessionUpdate"],
+            "subagent_update"
+        );
+        assert_eq!(
+            frame["params"]["update"]["state"],
+            serde_json::json!({"state": "idle", "stopReason": "end_turn"}),
+            "v{ver}: {settled}"
+        );
+        let frames = c
+            .frames
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .join("\n");
+        assert!(
+            !frames.contains("subagent_spawned") && !frames.contains("subagent_state_update"),
+            "v{ver}: AIR updates without AIR: {frames}"
+        );
+        c.finish();
+    }
 }
 
 #[test]
@@ -13354,10 +13757,16 @@ fn managed_bash_work_id_is_published_on_the_card_and_air_task() {
         ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
     );
     let _pid = c.prompt(&sid, "run in background");
-    c.wait_for(
-        "\"sessionUpdate\":\"async_task_spawned\"",
+    // ACP v2 carries AIR's update under its `_`-prefixed tag; AIR's spawn
+    // has a description.
+    let spawned = c.wait_for(
+        "\"sessionUpdate\":\"_async_task_spawned\"",
         Duration::from_secs(15),
     );
+    let spawned: serde_json::Value = serde_json::from_str(&spawned).unwrap();
+    let update = &spawned["params"]["update"];
+    assert!(update["description"].is_string(), "{spawned}");
+    assert_eq!(update["description"], update["name"], "{spawned}");
     let frames = c
         .frames
         .lock()
@@ -13484,18 +13893,35 @@ fn a_resumed_background_completion_settles_its_restored_task() {
 }
 
 #[test]
-fn async_task_stop_is_rejected_honestly() {
+fn async_task_stop_of_a_task_it_cannot_stop_answers_not_stopped() {
+    // AIR answers `{"stopped": false}`, not an error, for a task the agent
+    // cannot stop: without negotiation, an unknown session, an unknown task.
     let mut c = Client::spawn("quiet", &[]);
     let sid = c.new_session(2, "");
+    for (session, task) in [(sid.as_str(), "task-1"), ("no-such-session", "task-1")] {
+        let rid = c.req(
+            "_session/async_task/stop",
+            &format!("{{\"sessionId\":\"{session}\",\"asyncTaskId\":\"{task}\"}}"),
+        );
+        let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+        assert!(
+            frame.contains("\"result\":{\"stopped\":false}"),
+            "{session}/{task}: {frame}"
+        );
+    }
+    c.finish();
+
+    let mut c = Client::spawn("quiet", &[]);
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"jetbrains\":{\"air\":{\"version\":1,\"capabilities\":[\"asyncTasks\"]}}}}",
+    );
     let rid = c.req(
         "_session/async_task/stop",
-        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\"task-1\"}}"),
+        &format!("{{\"sessionId\":\"{sid}\",\"asyncTaskId\":\" no-such-task \"}}"),
     );
     let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
-    assert!(
-        frame.contains("not supported by the Muse host"),
-        "stop must fail explicitly: {frame}"
-    );
+    assert!(frame.contains("\"result\":{\"stopped\":false}"), "{frame}");
     c.finish();
 }
 
@@ -13737,15 +14163,8 @@ fn missing_cli_still_completes_the_handshake_and_names_the_next_action() {
     );
     let log = std::fs::read_to_string(&c.stderr_log).expect("adapter log");
     assert!(log.contains("host unavailable"), "{log}");
-    let id = c.req("shutdown", "{}");
-    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
-    assert!(frame.contains("\"result\":null"), "{frame}");
-    let status = c
-        .child
-        .wait_timeout(Duration::from_secs(10))
-        .expect("wait")
-        .expect("adapter exited");
-    assert!(status.success(), "shutdown must stay clean: {status}");
+    // Closing stdin ends the session cleanly even without a host.
+    c.finish();
 }
 
 #[cfg(unix)]
@@ -14046,9 +14465,10 @@ fn host_restart_settles_orphaned_turns_of_a_legacy_session_id() {
         "{\"sessionId\":\"sess-legacy-1\",\"_meta\":{\"mspSessionId\":\"msp-sess-1\"}}",
     );
     let resumed = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
+    // A resume result names no session (the client named it); the prompt
+    // below proves the legacy id stays the ACP key.
     assert!(
-        resumed.contains("\"sessionId\":\"sess-legacy-1\"")
-            && resumed.contains("\"mspSessionId\":\"msp-sess-1\""),
+        resumed.contains("\"result\"") && resumed.contains("\"mspSessionId\":\"msp-sess-1\""),
         "legacy id stays the ACP key: {resumed}"
     );
     let pid = c.prompt("sess-legacy-1", "in flight when we crash");
@@ -14344,7 +14764,7 @@ fn emitted_frames_conform_to_the_vendored_schema() {
     c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
     let fid = c.req(
         "session/fork",
-        &format!("{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageId\":\"msg-fork\"}}}}}}}}}}"),
+        &format!("{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"msg-fork\"}}}}}}}}}}"),
     );
     c.wait_for(&format!("\"id\":{fid}"), Duration::from_secs(15));
     let cid = c.prompt(&sid, "/compact");
@@ -14370,7 +14790,7 @@ fn emitted_frames_conform_to_the_vendored_schema() {
         &format!("{{\"sessionId\":\"{sid}\",\"configId\":\"model\",\"value\":\"fake-model\"}}"),
     );
     c.wait_for(&format!("\"id\":{oid}"), Duration::from_secs(15));
-    c.req("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
+    c.notify("session/cancel", &format!("{{\"sessionId\":\"{sid}\"}}"));
     let did = c.req("session/delete", &format!("{{\"sessionId\":\"{sid}\"}}"));
     c.wait_for(&format!("\"id\":{did}"), Duration::from_secs(15));
     let frames_path = format!("{}.frames", c.fake_log);
@@ -14449,7 +14869,7 @@ fn session_fork_resolves_fingerprint_occurrences() {
     let first = c.req(
         "session/fork",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"{fp}\",\"messageOccurrence\":1}}}}}}}}}}"
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"msg-unknown\",\"messageFingerprint\":\"{fp}\",\"messageOccurrence\":1}}}}}}}}}}"
         ),
     );
     let frame = c.wait_for(&format!("\"id\":{first}"), Duration::from_secs(15));
@@ -14471,7 +14891,7 @@ fn session_fork_resolves_fingerprint_occurrences() {
     let second = c.req(
         "session/fork",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"{fp}\",\"messageOccurrence\":2}}}}}}}}}}"
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"msg-unknown\",\"messageFingerprint\":\"{fp}\",\"messageOccurrence\":2}}}}}}}}}}"
         ),
     );
     let frame = c.wait_for(&format!("\"id\":{second}"), Duration::from_secs(15));
@@ -14501,7 +14921,7 @@ fn session_fork_rejects_unmatched_and_malformed_fingerprints() {
     let rid = c.req(
         "session/fork",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"{unmatched}\"}}}}}}}}}}"
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"msg-unknown\",\"messageFingerprint\":\"{unmatched}\"}}}}}}}}}}"
         ),
     );
     let frame = c.wait_for(&format!("\"id\":{rid}"), Duration::from_secs(15));
@@ -14513,13 +14933,14 @@ fn session_fork_rejects_unmatched_and_malformed_fingerprints() {
     let bad = c.req(
         "session/fork",
         &format!(
-            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"forkPoint\":{{\"messageFingerprint\":\"not-a-digest\"}}}}}}}}}}"
+            "{{\"sessionId\":\"{sid}\",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"fork\":{{\"version\":1,\"messageId\":\"msg-unknown\",\"messageFingerprint\":\"not-a-digest\"}}}}}}}}}}"
         ),
     );
     let frame = c.wait_for(&format!("\"id\":{bad}"), Duration::from_secs(15));
+    // A malformed fingerprint is not used, so only the id is looked up.
     assert!(
-        frame.contains("sha256:<64 hex chars>"),
-        "malformed fingerprint must be explicit: {frame}"
+        frame.contains("\"code\":-32602") && frame.contains("not found in session history"),
+        "malformed fingerprint: {frame}"
     );
 
     let seen = std::fs::read_to_string(&c.fake_log).expect("fake log");
@@ -14614,6 +15035,27 @@ fn closed_host_stdout_reaps_the_child_without_waiting_for_process_exit() {
     );
     c.finish();
     let _ = std::fs::remove_file(&marker);
+}
+
+#[test]
+fn shutdown_and_exit_notifications_are_ignored() {
+    // ACP defines no `shutdown` or `exit`, and an extension notification
+    // starts with `_`; only the request forms stop the adapter.
+    for (ver, method) in [(1, "exit"), (2, "exit"), (1, "shutdown"), (2, "shutdown")] {
+        let mut c = Client::spawn("quiet", &[("MUSE_SHUTDOWN_TIMEOUT_MS", "500")]);
+        c.new_session(ver, "");
+        c.notify(method, "null");
+        // Past the shutdown deadline a disconnect would have armed.
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(
+            c.child.try_wait().expect("wait").is_none(),
+            "a v{ver} {method} notification stopped the adapter"
+        );
+        let id = c.req("session/list", "{}");
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(10));
+        assert!(frame.contains("\"result\""), "v{ver} {method}: {frame}");
+        c.finish();
+    }
 }
 
 #[test]
@@ -15032,15 +15474,19 @@ fn terminal_auth_method_runs_muse_acp_login() {
             assert_eq!(legacy["args"], serde_json::json!(["login"]), "{frame}");
         }
 
-        let id = c.req("authenticate", r#"{"methodId":"muse-login"}"#);
-        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
-        assert!(frame.contains("\"result\":{}"), "v{version}: {frame}");
-        let id = c.req("authenticate", r#"{"methodId":"login"}"#);
-        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
-        assert!(
-            frame.contains("\"code\":-32602") && frame.contains("muse-login"),
-            "v{version}: {frame}"
-        );
+        if version == 1 {
+            let id = c.req("authenticate", r#"{"methodId":"muse-login"}"#);
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            assert!(frame.contains("\"result\":{}"), "v{version}: {frame}");
+            let id = c.req("authenticate", r#"{"methodId":"login"}"#);
+            let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+            assert!(
+                frame.contains("\"code\":-32602") && frame.contains("muse-login"),
+                "v{version}: {frame}"
+            );
+            c.finish();
+            continue;
+        }
         // The terminal method is never an auth/login method.
         let id = c.req("auth/login", r#"{"methodId":"muse-login"}"#);
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
@@ -15228,9 +15674,15 @@ fn terminal_auth_is_offered_only_to_clients_that_support_it() {
         let id = c.req("initialize", &initialize_params(version, capabilities));
         let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
         let reply: serde_json::Value = serde_json::from_str(&frame).expect("initialize json");
-        let methods = reply["result"]["authMethods"]
-            .as_array()
-            .unwrap_or_else(|| panic!("v{version} {capabilities}: {frame}"));
+        // The SDK leaves out an empty `authMethods`, which ACP v2 defaults to
+        // the empty list.
+        let methods = match &reply["result"]["authMethods"] {
+            serde_json::Value::Null if version == 2 => Vec::new(),
+            methods => methods
+                .as_array()
+                .cloned()
+                .unwrap_or_else(|| panic!("v{version} {capabilities}: {frame}")),
+        };
         assert!(
             methods.iter().all(|method| method["type"] != "terminal"),
             "v{version} {capabilities}: {frame}"
@@ -15502,10 +15954,10 @@ fn streamed_rows_preserve_metadata_priority_and_clear_omitted_fields() {
 }
 
 #[test]
-fn fork_replays_host_cards_without_live_side_effects() {
-    // #393 names all three replay paths. load and resume are covered by
-    // `load_and_resume_replay_host_cards_without_live_side_effects`; this is
-    // the fork path, whose items come from `collect_history` instead.
+fn fork_sends_no_history_replay() {
+    // ACP and AIR define no replay on `session/fork`: the client replays a
+    // fork with a later load or resume. The fork's history still reaches the
+    // adapter (#393), and seeds the fork's fold.
     let mut c = Client::spawn("fork_history_cards", &[]);
     let sid = c.new_session(1, "");
     let cwd = std::path::Path::new(&c.fake_log)
@@ -15532,48 +15984,66 @@ fn fork_replays_host_cards_without_live_side_effects() {
         "cargo build",
         "Damaged session log range",
         "Fork future card",
+        "fork here",
     ] {
         assert!(
-            frames.contains(title),
-            "fork replay is missing the {title:?} card:\n{frames}"
+            !frames.contains(title),
+            "a fork must not replay its history ({title:?}):\n{frames}"
         );
     }
-    assert!(
-        frames.contains("fork here"),
-        "the forked message still replays: {frames}"
-    );
-    assert!(
-        !frames.contains("\"terminal_update\""),
-        "a finished shell must not open a terminal on fork replay: {frames}"
-    );
-    assert!(
-        frames.contains("\"itemKind\":\"webSearch\""),
-        "replayed fork cards carry their kind metadata: {frames}"
-    );
     c.finish();
 }
 
 #[test]
-fn fork_history_replays_only_the_forked_view_and_preserves_provenance() {
+fn loading_a_fork_replays_the_history_it_copied() {
+    // The fork sent nothing; a load replays the whole conversation, also what
+    // the adapter's fold of the fork already holds.
+    let mut c = Client::spawn("fork_history_inline", &[]);
+    let sid = c.new_session(1, "");
+    let id = c.req(
+        "session/fork",
+        &serde_json::json!({"sessionId": sid}).to_string(),
+    );
+    let result = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    let fork: serde_json::Value = serde_json::from_str(&result).unwrap();
+    let fork = fork["result"]["sessionId"].as_str().unwrap().to_string();
+    let load = c.req(
+        "session/load",
+        &serde_json::json!({"sessionId": fork}).to_string(),
+    );
+    c.wait_for(&format!("\"id\":{load}"), Duration::from_secs(15));
+    let frames = c.frames.lock().unwrap().clone();
+    let replayed = frames
+        .iter()
+        .filter(|f| f.contains(&fork) && f.contains("agent_message") && f.contains("fork here"))
+        .count();
+    assert_eq!(replayed, 1, "{frames:#?}");
+    drop(frames);
+    c.finish();
+}
+
+#[test]
+fn fork_reads_only_the_forked_view_and_preserves_provenance() {
+    // Every history shape the host returns for the fork seeds its fold, so
+    // the live events that repeat that history are not sent either.
     for scenario in [
         "fork_history_inline",
         "fork_history_paged",
         "fork_history_snapshot",
     ] {
-        for (ver, cut, second) in [
-            (1, serde_json::json!({"messageId":"msg-fork"}), false),
+        for (ver, cut) in [
+            (1, serde_json::json!({"version":1,"messageId":"msg-fork"})),
             (
                 2,
-                serde_json::json!({"messageFingerprint":"sha256:e2bab1be910abb02f77bcbfaf13466c19100b8f0db25b9a2b4f9c80164556eab", "messageOccurrence":2}),
-                true,
+                serde_json::json!({"version":1,"messageId":"msg-unknown","messageFingerprint":"sha256:e2bab1be910abb02f77bcbfaf13466c19100b8f0db25b9a2b4f9c80164556eab", "messageOccurrence":2}),
             ),
-            (2, serde_json::Value::Null, true),
+            (2, serde_json::Value::Null),
         ] {
             let mut c = Client::spawn(scenario, &[]);
             let sid = c.new_session(ver, "");
-            let mut params = serde_json::json!({"sessionId":sid, "replayFrom":{"type":"start"}});
+            let mut params = serde_json::json!({"sessionId":sid});
             if !cut.is_null() {
-                params["_meta"] = serde_json::json!({"jetbrains":{"air":{"forkPoint":cut}}});
+                params["_meta"] = serde_json::json!({"jetbrains":{"air":{"fork":cut}}});
             }
             let id = c.req("session/fork", &params.to_string());
             let result = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
@@ -15589,25 +16059,7 @@ fn fork_history_replays_only_the_forked_view_and_preserves_provenance() {
                 .iter()
                 .filter(|f| f.contains("msp-sess-forked") && f.contains("agent_message"))
                 .collect();
-            assert_eq!(
-                messages.iter().filter(|f| f.contains("fork here")).count(),
-                1,
-                "{scenario}: {messages:?}"
-            );
-            assert_eq!(
-                messages
-                    .iter()
-                    .filter(|f| f.contains("second turn"))
-                    .count(),
-                usize::from(second),
-                "{messages:?}"
-            );
-            assert!(
-                !messages
-                    .iter()
-                    .any(|f| f.contains("must not replay") || f.contains("partial")),
-                "{messages:?}"
-            );
+            assert!(messages.is_empty(), "{scenario} v{ver}: {messages:?}");
             c.finish();
         }
     }
@@ -16035,7 +16487,7 @@ fn invalid_utf8_editor_frame_is_rejected_without_disconnect() {
         .write_all(b"{\"method\":\"session/prompt\",\"params\":\"\xff\"}\n")
         .unwrap();
     c.stdin.flush().unwrap();
-    let error = c.wait_for("invalid UTF-8 frame", Duration::from_secs(5));
+    let error = c.wait_for("invalid UTF-8", Duration::from_secs(5));
     assert!(error.contains("-32700"), "{error}");
     let id = c.prompt(&sid, "healthy next frame");
     let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
@@ -16635,7 +17087,7 @@ fn editor_bridge_writes_and_edits_through_the_client_with_diff_cards() {
     );
     assert!(
         created.contains(r#""type":"diff""#)
-            && created.contains(r#""oldText":null"#)
+            && !created.contains(r#""oldText""#)
             && created.contains(r#""newText":"fresh\n""#),
         "a new file's diff: {created}"
     );

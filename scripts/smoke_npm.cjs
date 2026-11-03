@@ -44,7 +44,7 @@ try {
     },
     input: [
       { jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1 } },
-      { jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd: root } },
+      { jsonrpc: '2.0', id: 2, method: 'session/new', params: { cwd: root, mcpServers: [] } },
     ].map(frame => JSON.stringify(frame) + '\n').join(''),
   });
   assert.equal(startup.status, 0, startup.stderr || String(startup.error));

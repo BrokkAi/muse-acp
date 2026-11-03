@@ -38,7 +38,16 @@ pub fn expiring() -> bool {
     EXPIRING.load(Ordering::SeqCst)
 }
 
+/// Exit the process. Everything already sent to the editor is written
+/// first: the SDK writes on its own thread, so frames can still be queued.
 pub fn exit(code: i32) -> ! {
+    if let Some(editor) = OUTPUT.get() {
+        editor.close(if expiring() {
+            Duration::from_millis(250)
+        } else {
+            timeout()
+        });
+    }
     std::process::exit(if expiring() { 1 } else { code });
 }
 
@@ -88,10 +97,8 @@ pub fn disconnect() {
 
 /// Settle requests the main loop has not handled yet as well as active prompts:
 /// the connection answers every request that has no response yet with an
-/// error, then takes no more writes. A held batch is sent first, so a
-/// `shutdown` dispatched inside a batch does not strand its siblings'
-/// answers. Callers must keep a deadline armed: even a diagnostic pipe can
-/// be blocked.
+/// error, then takes no more writes. Callers must keep a deadline armed: even
+/// a diagnostic pipe can be blocked.
 pub fn settle(stdout: &StdoutShared, message: &str) {
     let _deadline = deadline("pending request settlement");
     let message = if expiring() {
@@ -139,5 +146,8 @@ fn expire(context: &'static str) -> ! {
     // temporary view leaks; `process::exit` runs no destructors.
     let _ = stop_rx.recv_timeout(Duration::from_secs(4).saturating_sub(started.elapsed()));
     std::thread::sleep(grace.saturating_sub(started.elapsed()));
+    if let Some(stdout) = OUTPUT.get() {
+        stdout.close(grace);
+    }
     std::process::exit(1);
 }

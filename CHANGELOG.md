@@ -2,6 +2,127 @@
 
 ## Unreleased
 
+- Speak ACP through the official Rust SDK, the `agent-client-protocol` crate
+  (5.0.0), instead of the in-repo `acp-lite` crate, which is removed. The SDK
+  now owns the stdio transport, JSON-RPC, ACP v1/v2 version negotiation, the
+  initialize-first rule, request parsing, the serialization of every
+  response, `session/update`, permission prompt, form, file and terminal
+  request the adapter sends, and the `$/cancel_request` withdrawal of the
+  adapter's own requests. Only Muse and JetBrains AIR extensions that no ACP
+  schema defines (`_session/*` and `_subagent/*` methods, `_meta` members,
+  AIR updates) remain the adapter's own JSON. What clients see change:
+  - Each protocol version serves only its own schema's methods, and Muse's
+    own methods all start with `_`, as ACP requires of extensions. Anything
+    else gets `-32601`; sent as a notification, it is ignored:
+    - ACP v2 clients no longer get v1's `session/load` (use
+      `session/resume`, with `replayFrom` to replay history),
+      `session/set_mode`, `authenticate` or `logout` (use `auth/logout`),
+      and ACP v1 clients no longer get v2's `auth/login` or `auth/logout`.
+    - The legacy `session/set_model` is removed; set the `model` config
+      option with `session/set_config_option` instead.
+    - The native-subagent controls are renamed from `subagent/<name>` to
+      `_subagent/<name>` (`sendMessage`, `followupTask`, `interrupt`,
+      `stop`, `resume`, `reopen`, `close`, `readResult`), with the same
+      params and results.
+    - `shutdown` and `exit` are removed: closing stdin ends the session, as
+      ACP defines.
+    - `_session/*` and `_subagent/*` sent as notifications run, without an
+      answer.
+  - JetBrains AIR's extension follows AIR's specification:
+    - Only a client that declares `_meta.jetbrains.air` gets AIR keys. The
+      agent side moves to the initialize response's top-level
+      `_meta.jetbrains.air` (it was under ACP v1 `agentCapabilities._meta`),
+      and the draft `sessionCapabilities.subagents` goes to ACP v1 AIR
+      clients only. Other clients, Zed among them, get neither.
+    - An AIR client gets AIR's `subagent_spawned` and
+      `subagent_state_update` when it declares either the standard
+      `clientCapabilities.subagents` or `nativeSubagentSessions`, never the
+      RFD's `subagent_update`, and subagent tool cards without either. A
+      child ends at its first terminal state, after its transcript, and a
+      child that runs again is a new generation,
+      `<child>:generation:<n>`, with its own `subagent_spawned`,
+      transcript and terminal state.
+    - ACP v2 carries AIR's updates under AIR's v2 tags: `_subagent_update`
+      for both subagent updates, `_async_task_spawned` and
+      `_async_task_state_update`. `async_task_spawned` now has its
+      `description`.
+    - The fork point is read from AIR's `_meta.jetbrains.air.fork`
+      (`{version: 1, messageId, messageFingerprint?, messageOccurrence?}`)
+      instead of `forkPoint`. A malformed object forks the whole session;
+      the fingerprint is used only when no message has the id; a point that
+      matches nothing is refused with `-32602`.
+    - `session/fork` replays no history in either version (ACP v1 forks
+      replayed it, and ACP v2 forks did with `replayFrom`, which neither
+      ACP nor AIR defines on a fork); a later load or resume replays it.
+      A load now replays the whole conversation also for a session this
+      connection already shows, as ACP v1 `session/load` requires, where it
+      left out what the adapter had already sent.
+    - `_session/async_task/stop` answers `{"stopped": false}` for an unknown
+      session or task, a finished one, one Muse would not stop, or without
+      `asyncTasks`, instead of an error, and `{"stopped": true}` for a
+      workflow task instead of Muse's raw result.
+    - A file-change report for a cancelled or failed turn is
+      `status: "unavailable"` with `reason` `cancelled` or `providerError`,
+      and every prompt that asked for one gets one, including turns that
+      end by reconciliation or disconnect. A repeated `requestId` is
+      ignored.
+    - With `recommendedValue`, the reasoning selector replaces its
+      "Muse default" row with the recommended tier, shown as current while
+      the session keeps Muse's default.
+  - JSON-RPC batches are refused in both versions with one `-32600`
+    (`id: null`), and none of their entries run. ACP v2 batches were
+    previously answered entry by entry.
+  - A request that does not fit the version's ACP schema is refused with
+    `-32602` before it reaches Muse: for example an ACP v1 `session/new`
+    without `mcpServers`, a `session/load`, `session/resume` or
+    `session/fork` without `cwd`, a stdio MCP server without `command` (ACP
+    v1 also requires its `args` and `env`), or an image block without `data`
+    (an image named only by `uri` is no longer read from disk). One
+    `mcpServers` entry the schema cannot read (an unknown `type`, a missing
+    `command`) now refuses the whole request; entries that parse but that
+    Muse cannot run are still dropped one by one. Prompt blocks are read as
+    the schema defines them: a prompt given as a string rather than an array
+    of blocks, an image without `mimeType`, a `resource_link` without
+    `name`, and an embedded `resource` with neither `text` nor `blob` refuse
+    the prompt, where they were read leniently before. An ACP v2
+    `session/set_config_option` value needs its `type`, and ACP v1
+    `session/set_mode` no longer accepts `mode` for `modeId`.
+    `session/cancel` works only as the notification ACP defines; sent as a
+    request it gets `-32601`.
+  - ACP v2 `session/fork` with `"replayFrom": null` replays nothing, as an
+    absent `replayFrom` does.
+  - On ACP v1, JetBrains AIR's `asyncTasks.backgrounded` mark on a command
+    card arrives as a `tool_call_update`, as on v2, rather than a
+    `tool_call` without the `title` the schema requires.
+  - `initialize` with a `protocolVersion` below 1 answers with ACP v1, the
+    SDK's fallback, instead of a version error.
+  - `session/load` and `session/resume` results no longer repeat the
+    `sessionId` the client sent, which neither schema defines;
+    `_meta.mspSessionId` still names the Muse session.
+  - Optional result fields that are empty or unset are left out rather than
+    sent as `null` or `[]` (for example `nextCursor` on the last
+    `session/list` page, an empty `authMethods` or `additionalDirectories`).
+  - ACP v1 `session/set_mode` answers with the schema's empty
+    `SetSessionModeResponse`, carrying the mode Muse applied in
+    `_meta.muse.mode` instead of a top-level `mode`.
+  - `session/list` filters by `cwd` only; the non-standard
+    `additionalDirectories` filter is ignored, as the schema has no such
+    field. ACP v2 `sse` MCP servers are dropped as an unsupported transport.
+  - Native subagents follow the ACP subagents RFD as the SDK defines it: ACP
+    v1 clients that advertise `clientCapabilities.subagents`, and every ACP
+    v2 client (the RFD needs no capability there), get `subagent_update`
+    with the child's title, description and state instead of the earlier
+    draft's `subagent_spawned` and `subagent_state_update`. The state
+    mirrors the child's: a settled child that is messaged again and runs is
+    shown running again. JetBrains AIR clients get AIR's updates (see
+    above).
+  - The adapter's own request ids are the SDK's, and malformed-frame errors
+    carry the SDK's messages. An invalid UTF-8 line still gets `-32700` and
+    reading goes on.
+  - `serde_json` is built without `arbitrary_precision`: ACP numbers are
+    64-bit, as the SDK reads them. A host number wider than that, passed
+    through in `rawInput` or `_meta`, is sent as the nearest double.
+
 - Take a session's drive back when Muse refuses a turn because another
   client holds it (#452). Only a shared Muse session daemon, which
   `muse serve --join` in `MUSE_SERVE_ARGS` reaches, hands a session between

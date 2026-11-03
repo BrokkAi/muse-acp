@@ -6,21 +6,19 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use acp_lite::{AgentError, RequestId, RpcError};
-use serde_json::value::RawValue;
+use crate::editor::{Editor, Error, RequestId};
+use crate::out::{self, Note};
 
 use crate::fold::SessionFold;
 use crate::json::{J, esc, j_to_string, parse_json};
 
-/// The editor connection. Every ACP frame goes out through `acp-lite`'s
-/// agent side, which writes to stdout, tracks which requests are still
-/// unanswered, and holds batch responses. The name predates that: it was a
-/// shared stdout handle.
-pub type StdoutShared = acp_lite::AgentConnection;
+/// The editor connection, on the ACP SDK (see `crate::editor`). The name
+/// predates it: it was a shared stdout handle.
+pub type StdoutShared = Editor;
 
 pub struct InFlight {
     pub msp_turn: String,
-    pub req_id: J,
+    pub req_id: Option<RequestId>,
     /// True until the host announces that a queued turn has launched.
     pub queued: bool,
     pub file_report: Option<FileChangeReport>,
@@ -43,7 +41,7 @@ pub struct FileChangeReport {
 
 pub struct PendingPerm {
     /// ACP `session/request_permission` request id awaiting the client reply.
-    pub req_id: J,
+    pub req_id: Option<RequestId>,
     /// MSP session the approval belongs to (`params.sessionId`). Approval ids
     /// are only unique within one MSP session, and a child stream's approval
     /// opens here beside its parent's, so the pair identifies the approval.
@@ -94,7 +92,7 @@ pub struct PermChoice {
 
 pub struct PendingFeedback {
     /// ACP `elicitation/create` request id awaiting optional guidance.
-    pub req_id: J,
+    pub req_id: Option<RequestId>,
     pub choice_id: String,
 }
 
@@ -130,7 +128,7 @@ pub struct UiQuestion {
 #[derive(Clone)]
 pub struct PendingUi {
     /// ACP `elicitation/create` request id awaiting the client reply.
-    pub req_id: J,
+    pub req_id: Option<RequestId>,
     pub user_input_id: String,
     /// MSP session that owns the question's child target.
     pub owner_msp_sid: String,
@@ -154,11 +152,11 @@ pub struct PendingUi {
 #[derive(Clone)]
 pub struct PendingFeedbackForm {
     /// ACP `elicitation/create` request id awaiting the client reply.
-    pub req_id: J,
+    pub req_id: Option<RequestId>,
     /// The `session/prompt` request that ran `/feedback`.
-    pub prompt_req: J,
+    pub prompt_req: Option<RequestId>,
     /// The prompt's ACP content blocks, echoed when the turn settles.
-    pub prompt_content: String,
+    pub prompt_content: out::Echo,
     pub ver: u8,
 }
 
@@ -168,7 +166,7 @@ pub struct PendingFeedbackForm {
 #[derive(Clone)]
 pub struct PendingRecap {
     /// The `session/prompt` request that ran `/recap`.
-    pub prompt_req: J,
+    pub prompt_req: Option<RequestId>,
     /// The MSP `recap/request` retry id: the settlement's correlation key.
     pub retry_id: String,
     pub ver: u8,
@@ -516,12 +514,12 @@ impl TurnUsage {
         }
     }
 
-    /// The `"usage":{...}` member for a v1 prompt result, comma-prefixed.
-    /// Empty when no leg landed: a turn with no reported usage carries no
-    /// usage at all rather than a row of zeros.
-    pub fn result_member(&self) -> String {
+    /// The `usage` of a v1 prompt result. `None` when no leg landed: a turn
+    /// with no reported usage carries no usage at all rather than a row of
+    /// zeros.
+    pub fn result_usage(&self) -> Option<agent_client_protocol::v1::schema::Usage> {
         if self.calls == 0 {
-            return String::new();
+            return None;
         }
         let mut muse = format!("\"modelCalls\":{}", self.calls);
         if let Some(ms) = self.duration_ms {
@@ -536,9 +534,19 @@ impl TurnUsage {
                 .join(",");
             muse.push_str(&format!(",\"modelUsage\":{{{per}}}"));
         }
-        format!(
-            ",\"usage\":{{{},\"_meta\":{{\"mjolnir.dev/usage-scope\":\"turn\",\"muse\":{{{muse}}}}}}}",
-            self.totals.members()
+        let totals = &self.totals;
+        Some(
+            agent_client_protocol::v1::schema::Usage::new(
+                totals.total,
+                totals.input,
+                totals.output,
+            )
+            .thought_tokens(totals.thought)
+            .cached_read_tokens(totals.cached_read)
+            .cached_write_tokens(totals.cached_write)
+            .meta(out::meta(&format!(
+                "{{\"mjolnir.dev/usage-scope\":\"turn\",\"muse\":{{{muse}}}}}"
+            ))),
         )
     }
 }
@@ -589,41 +597,24 @@ pub fn take_turn_usage(s: &mut AcpSession, turn_id: &str) -> Option<TurnUsage> {
     Some(s.turn_usage.remove(pos))
 }
 
-pub fn send_raw(stdout: &StdoutShared, line: &str) {
-    match RawValue::from_string(line.to_string()) {
-        Ok(frame) => written(stdout.send_raw_frame(&frame)),
-        Err(error) => crate::msp::log(&format!("internal: dropped an invalid ACP frame: {error}")),
-    }
-}
-
 /// A failed write means the editor is gone: start the shutdown deadline.
-fn written(outcome: Result<(), AgentError>) {
+fn written<E>(outcome: Result<(), E>) {
     if outcome.is_err() {
         crate::shutdown::disconnect();
     }
 }
 
-pub fn id_json(id: &Option<J>) -> String {
-    match id {
-        None => "null".to_string(),
-        Some(j) => j_to_string(j),
-    }
-}
-
-/// The connection's id for a request id the adapter holds as `J`.
-pub fn request_id(id: &J) -> RequestId {
-    RequestId::new(crate::json::to_value(id))
-}
-
-pub fn send_result(stdout: &StdoutShared, id: &Option<J>, result_json: &str) {
+/// Answer a `_`-prefixed extension method, whose result no ACP schema
+/// defines; `result_json` is the result object as JSON text.
+pub fn send_ext_result(stdout: &StdoutShared, id: &Option<RequestId>, result_json: &str) {
     let Some(id) = id else {
         return;
     };
     if crate::shutdown::expiring() {
         return;
     }
-    match RawValue::from_string(result_json.to_string()) {
-        Ok(result) => written(stdout.respond_raw(&request_id(id), &result)),
+    match serde_json::from_str::<serde_json::Value>(result_json) {
+        Ok(result) => written(stdout.respond(id, result)),
         Err(error) => {
             crate::msp::log(&format!("internal: invalid ACP result JSON: {error}"));
             send_error(
@@ -636,16 +627,234 @@ pub fn send_result(stdout: &StdoutShared, id: &Option<J>, result_json: &str) {
     }
 }
 
-fn send_rpc_error(stdout: &StdoutShared, id: &Option<J>, error: RpcError) {
+/// Answer request `id` with a typed response.
+pub fn send_response<T: agent_client_protocol::JsonRpcResponse>(
+    stdout: &StdoutShared,
+    id: &Option<RequestId>,
+    response: T,
+) {
+    let Some(id) = id else {
+        return;
+    };
     if crate::shutdown::expiring() {
         return;
     }
-    let id = id.as_ref().map(request_id);
-    written(stdout.respond_error(id.as_ref(), error));
+    written(stdout.respond_typed(id, response));
 }
 
-pub fn send_error(stdout: &StdoutShared, id: &Option<J>, code: i64, message: &str) {
-    send_rpc_error(stdout, id, RpcError::new(code, message));
+/// The session setup method a response answers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Setup {
+    New,
+    Load,
+    Resume,
+    Fork,
+}
+
+/// Answer `session/new`, `session/load`, `session/resume` or `session/fork`:
+/// the session's selectors, ACP v1's legacy mode state, and the adapter's
+/// `_meta`. `session_id` names the new session of `new` and `fork`.
+pub fn send_setup_response(
+    stdout: &StdoutShared,
+    id: &Option<RequestId>,
+    method: Setup,
+    session_id: &str,
+    options: out::ConfigOptions,
+    session_mode: &str,
+    meta: Option<out::Meta>,
+) {
+    use agent_client_protocol::{v1::schema as s1, v2::schema as s2};
+    match options {
+        out::ConfigOptions::V1(options) => {
+            let modes = session_modes(session_mode);
+            match method {
+                Setup::New => send_response(
+                    stdout,
+                    id,
+                    s1::NewSessionResponse::new(session_id.to_string())
+                        .modes(modes)
+                        .config_options(options)
+                        .meta(meta),
+                ),
+                Setup::Load => send_response(
+                    stdout,
+                    id,
+                    s1::LoadSessionResponse::new()
+                        .modes(modes)
+                        .config_options(options)
+                        .meta(meta),
+                ),
+                Setup::Resume => send_response(
+                    stdout,
+                    id,
+                    s1::ResumeSessionResponse::new()
+                        .modes(modes)
+                        .config_options(options)
+                        .meta(meta),
+                ),
+                Setup::Fork => send_response(
+                    stdout,
+                    id,
+                    s1::ForkSessionResponse::new(session_id.to_string())
+                        .modes(modes)
+                        .config_options(options)
+                        .meta(meta),
+                ),
+            }
+        }
+        out::ConfigOptions::V2(options) => match method {
+            Setup::New => send_response(
+                stdout,
+                id,
+                s2::NewSessionResponse::new(session_id.to_string())
+                    .config_options(options)
+                    .meta(meta),
+            ),
+            // ACP v2 has no `session/load`; a v2 client calling it gets the
+            // response of `session/resume`, which it otherwise matches.
+            Setup::Load | Setup::Resume => send_response(
+                stdout,
+                id,
+                s2::ResumeSessionResponse::new()
+                    .config_options(options)
+                    .meta(meta),
+            ),
+            Setup::Fork => send_response(
+                stdout,
+                id,
+                s2::ForkSessionResponse::new(session_id.to_string())
+                    .config_options(options)
+                    .meta(meta),
+            ),
+        },
+    }
+}
+
+/// Answer an ACP v1 `session/prompt` with how the turn ended: an ACP stop
+/// reason (`end_turn`, `cancelled`, ...), with the turn's usage when the
+/// host reported any.
+pub fn send_prompt_stop(
+    stdout: &StdoutShared,
+    id: &Option<RequestId>,
+    stop: &str,
+    usage: Option<agent_client_protocol::v1::schema::Usage>,
+) {
+    use agent_client_protocol::v1::schema as s1;
+    let stop = match stop {
+        "max_tokens" => s1::StopReason::MaxTokens,
+        "max_turn_requests" => s1::StopReason::MaxTurnRequests,
+        "refusal" => s1::StopReason::Refusal,
+        "cancelled" => s1::StopReason::Cancelled,
+        _ => s1::StopReason::EndTurn,
+    };
+    send_response(stdout, id, s1::PromptResponse::new(stop).usage(usage));
+}
+
+/// Answer `session/list` with its rows and the next page's cursor.
+pub fn send_session_list(
+    stdout: &StdoutShared,
+    id: &Option<RequestId>,
+    rows: Vec<out::SessionRow>,
+    next_cursor: Option<String>,
+) {
+    use agent_client_protocol::{v1::schema as s1, v2::schema as s2};
+    if stdout.version() == Some(2) {
+        let sessions = rows
+            .into_iter()
+            .map(|row| {
+                s2::SessionInfo::new(row.session_id, s2::AbsolutePath::new(row.cwd))
+                    .additional_directories(
+                        row.additional_directories
+                            .into_iter()
+                            .map(s2::AbsolutePath::new)
+                            .collect::<Vec<_>>(),
+                    )
+                    .title(row.title)
+                    .updated_at(row.updated_at)
+                    .meta(row.meta)
+            })
+            .collect();
+        send_response(
+            stdout,
+            id,
+            s2::ListSessionsResponse::new(sessions)
+                .next_cursor(next_cursor.map(s2::SessionListCursor::new)),
+        );
+        return;
+    }
+    let sessions = rows
+        .into_iter()
+        .map(|row| {
+            s1::SessionInfo::new(row.session_id, row.cwd)
+                .additional_directories(
+                    row.additional_directories
+                        .into_iter()
+                        .map(std::path::PathBuf::from)
+                        .collect::<Vec<_>>(),
+                )
+                .title(row.title)
+                .updated_at(row.updated_at)
+                .meta(row.meta)
+        })
+        .collect();
+    send_response(
+        stdout,
+        id,
+        s1::ListSessionsResponse::new(sessions).next_cursor(next_cursor),
+    );
+}
+
+/// The requests answered with an empty result.
+#[derive(Clone, Copy)]
+pub enum Done {
+    CloseSession,
+    DeleteSession,
+    /// A finished login: v1 `authenticate` or v2 `auth/login`.
+    Login,
+    Logout,
+    SetMode,
+}
+
+/// Answer a request whose result is empty, with its method's response type.
+pub fn send_done(stdout: &StdoutShared, id: &Option<RequestId>, done: Done) {
+    use agent_client_protocol::{v1::schema as s1, v2::schema as s2};
+    let v2 = stdout.version() == Some(2);
+    match (done, v2) {
+        (Done::CloseSession, false) => send_response(stdout, id, s1::CloseSessionResponse::new()),
+        (Done::CloseSession, true) => send_response(stdout, id, s2::CloseSessionResponse::new()),
+        (Done::DeleteSession, false) => send_response(stdout, id, s1::DeleteSessionResponse::new()),
+        (Done::DeleteSession, true) => send_response(stdout, id, s2::DeleteSessionResponse::new()),
+        (Done::Login, false) => send_response(stdout, id, s1::AuthenticateResponse::new()),
+        (Done::Login, true) => send_response(stdout, id, s2::LoginAuthResponse::new()),
+        (Done::Logout, false) => send_response(stdout, id, s1::LogoutResponse::new()),
+        (Done::Logout, true) => send_response(stdout, id, s2::LogoutAuthResponse::new()),
+        (Done::SetMode, _) => send_response(stdout, id, s1::SetSessionModeResponse::new()),
+    }
+}
+
+/// Answer request `id` with a result no schema type holds: an extension
+/// method's result, or a schema response the adapter extended.
+pub fn send_value(stdout: &StdoutShared, id: &Option<RequestId>, result: serde_json::Value) {
+    let Some(id) = id else {
+        return;
+    };
+    if crate::shutdown::expiring() {
+        return;
+    }
+    written(stdout.respond(id, result));
+}
+
+fn send_rpc_error(stdout: &StdoutShared, id: &Option<RequestId>, error: Error) {
+    if crate::shutdown::expiring() {
+        return;
+    }
+    if let Some(id) = id {
+        written(stdout.respond_error(id, error));
+    }
+}
+
+pub fn send_error(stdout: &StdoutShared, id: &Option<RequestId>, code: i64, message: &str) {
+    send_rpc_error(stdout, id, Error::new(code as i32, message));
 }
 
 /// The flows that send requests to the client. The connection tags each
@@ -658,24 +867,12 @@ pub const TAG_ELICITATION: &str = "elicitation";
 pub const TAG_DEVICE_LOGIN: &str = "device-login";
 
 /// Send a request to the client. Its answer comes back to the main loop as an
-/// `AgentEvent::Response` carrying `tag`. Returns the request's id, for the
+/// `Incoming::Answer` carrying `tag`. Returns the request's id, for the
 /// flow's state and for `send_cancel_request`, or `None` when it could not be
 /// written (the editor is gone, and the shutdown deadline is running).
-pub fn send_request(
-    stdout: &StdoutShared,
-    method: &str,
-    params_json: &str,
-    tag: &str,
-) -> Option<J> {
-    let params = match RawValue::from_string(params_json.to_string()) {
-        Ok(params) => params,
-        Err(error) => {
-            crate::msp::log(&format!("internal: invalid {method} params: {error}"));
-            return None;
-        }
-    };
-    match stdout.request_routed_raw(method, &params, tag) {
-        Ok(id) => Some(crate::json::from_value(id.value())),
+pub fn send_ask(stdout: &StdoutShared, ask: out::Ask, tag: &str) -> Option<RequestId> {
+    match stdout.ask(ask, tag) {
+        Ok(id) => Some(id),
         Err(_) => {
             crate::shutdown::disconnect();
             None
@@ -687,22 +884,24 @@ pub fn send_request(
 /// or form). ACP cancels an outgoing request with `$/cancel_request`; a
 /// JSON-RPC error with our own id would be a response to a request the
 /// client never made. The client may still answer the original id; that late
-/// answer arrives untagged and is ignored.
-pub fn send_cancel_request(stdout: &StdoutShared, request_id: &J) {
-    written(stdout.cancel_request(&self::request_id(request_id)));
+/// answer reaches its flow, which no longer waits for it.
+pub fn send_cancel_request(stdout: &StdoutShared, request_id: &Option<RequestId>) {
+    if let Some(request_id) = request_id {
+        stdout.cancel(request_id);
+    }
 }
 
 /// Send an ACP error while retaining structured data supplied by MSP.
 pub fn send_error_with_data(
     stdout: &StdoutShared,
-    id: &Option<J>,
+    id: &Option<RequestId>,
     code: i64,
     message: &str,
     data_json: &str,
 ) {
-    let mut error = RpcError::new(code, message);
-    match serde_json::from_str(data_json) {
-        Ok(data) => error = error.with_data(data),
+    let mut error = Error::new(code as i32, message);
+    match serde_json::from_str::<serde_json::Value>(data_json) {
+        Ok(data) => error = error.data(data),
         Err(problem) => crate::msp::log(&format!("internal: invalid ACP error data: {problem}")),
     }
     send_rpc_error(stdout, id, error);
@@ -749,32 +948,41 @@ pub fn send_usage(
         canonical.push(format!("\"subscriptionUsage\":{subscription}"));
         legacy.push(format!("\"museSubscriptionUsage\":{subscription}"));
     }
-    let meta = format!("\"muse\":{{{}}},{}", canonical.join(","), legacy.join(","));
-    // `amount` must be a JSON number: Rust's Display prints `inf`/`NaN`
-    // verbatim, which would corrupt the whole frame. ACP's `Cost` allows only
-    // `amount`, `currency`, and `_meta`, so the provenance lives in `_meta`.
-    let cost_f = if host_reports_cost {
+    let meta = out::meta(&format!(
+        "{{\"muse\":{{{}}},{}}}",
+        canonical.join(","),
+        legacy.join(",")
+    ));
+    // `amount` must be a finite number: JSON has no `inf` or `NaN`. ACP's
+    // `Cost` allows only `amount`, `currency`, and `_meta`, so the provenance
+    // lives in `_meta`.
+    let cost = if host_reports_cost {
         match &s.host_cost {
-            Some((amount, partial)) if amount.is_finite() => format!(
-                ",\"cost\":{{\"amount\":{amount},\"currency\":\"USD\",\"_meta\":{{\"muse\":{{\"source\":\"muse-host\",\"estimate\":true,\"partial\":{partial}}}}}}}"
-            ),
-            _ => String::new(),
+            Some((amount, partial)) if amount.is_finite() => Some((
+                *amount,
+                "USD".to_string(),
+                out::meta(
+                    &serde_json::json!({"muse": {"source": "muse-host", "estimate": true, "partial": partial}})
+                        .to_string(),
+                ),
+            )),
+            _ => None,
         }
     } else {
         match &s.cost_amount {
-            Some((amount, currency)) if amount.is_finite() => format!(
-                ",\"cost\":{{\"amount\":{amount},\"currency\":{},\"_meta\":{{\"muse\":{{\"source\":\"adapter-estimate\",\"basis\":\"catalog-list-price\",\"billing\":false}}}}}}",
-                esc(currency)
-            ),
-            _ => String::new(),
+            Some((amount, currency)) if amount.is_finite() => Some((
+                *amount,
+                currency.clone(),
+                out::meta(
+                    r#"{"muse":{"source":"adapter-estimate","basis":"catalog-list-price","billing":false}}"#,
+                ),
+            )),
+            _ => None,
         }
     };
-    send_raw(
+    send_note(
         stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"usage_update\",\"used\":{used},\"size\":{size}{cost_f},\"_meta\":{{{meta}}}}}}}}}",
-            esc(&s.acp_sid),
-        ),
+        out::usage(&s.acp_sid, s.ver, used, size, cost, meta),
     );
 }
 
@@ -796,7 +1004,7 @@ pub fn send_subscription_usage(stdout: &StdoutShared, s: &mut AcpSession, clear:
     send_session_info_with_extra(
         stdout,
         s,
-        None,
+        out::Title::Keep,
         None,
         Some(&format!("\"museSubscriptionUsage\":{subscription}")),
     );
@@ -804,29 +1012,17 @@ pub fn send_subscription_usage(stdout: &StdoutShared, s: &mut AcpSession, clear:
 
 /// v2 `state_update`. v1 callers use the prompt response instead.
 pub fn send_state(stdout: &StdoutShared, acp_sid: &str, state: &str, stop: Option<&str>) {
-    let stop_f = stop
-        .map(|s| format!(",\"stopReason\":{}", esc(s)))
-        .unwrap_or_default();
-    send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"state_update\",\"state\":\"{state}\"{stop_f}}}}}}}",
-            esc(acp_sid),
-        ),
-    );
+    send_note(stdout, out::state(acp_sid, state, stop));
 }
 
 /// Reflect a host-side configuration change in the client's selector. ACP
-/// requires the complete `configOptions` list, not the changed selector, so
-/// callers pass the same JSON the selector result uses.
-pub fn send_config_options_update(stdout: &StdoutShared, acp_sid: &str, config_options_json: &str) {
-    send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"config_option_update\",\"configOptions\":{config_options_json}}}}}}}",
-            esc(acp_sid),
-        ),
-    );
+/// requires the complete `configOptions` list, not the changed selector.
+pub fn send_config_options_update(
+    stdout: &StdoutShared,
+    acp_sid: &str,
+    options: out::ConfigOptions,
+) {
+    send_note(stdout, options.update(acp_sid));
 }
 
 fn perm_kind(decision: &str, scope: &str) -> &'static str {
@@ -842,8 +1038,8 @@ fn perm_kind(decision: &str, scope: &str) -> &'static str {
 }
 
 /// Build ACP permission `options` from MSP `availableChoices`; returns
-/// (options_json, choices) for later decision mapping.
-pub fn perm_options(params: &J) -> (String, Vec<PermChoice>) {
+/// (options, choices) for later decision mapping.
+pub fn perm_options(params: &J) -> (Vec<out::PermissionOption>, Vec<PermChoice>) {
     let mut opts = Vec::new();
     let mut choices = Vec::new();
     if let J::Arr(items) = params.get("availableChoices").cloned().unwrap_or(J::Null) {
@@ -881,12 +1077,11 @@ pub fn perm_options(params: &J) -> (String, Vec<PermChoice>) {
                 }
                 None => label,
             };
-            opts.push(format!(
-                "{{\"optionId\":{},\"name\":{},\"kind\":\"{}\"}}",
-                esc(&id),
-                esc(&name),
-                perm_kind(&decision, &scope)
-            ));
+            opts.push(out::PermissionOption {
+                id: id.clone(),
+                name,
+                kind: perm_kind(&decision, &scope),
+            });
             let accepts_feedback = c
                 .get("acceptsFeedback")
                 .and_then(|v| match v {
@@ -902,7 +1097,7 @@ pub fn perm_options(params: &J) -> (String, Vec<PermChoice>) {
             });
         }
     }
-    (format!("[{}]", opts.join(",")), choices)
+    (opts, choices)
 }
 
 /// The first approving choice scoped to a single action, in host order.
@@ -1039,21 +1234,6 @@ pub fn is_read_only_mode(mode: &str) -> bool {
     mode == READ_ONLY_MODE || mode == PLAN_MODE
 }
 
-fn mode_options_json(key: &str, modes: &[(&str, &str, &str)]) -> String {
-    modes
-        .iter()
-        .map(|(id, name, desc)| {
-            format!(
-                "{{\"{key}\":{},\"name\":{},\"description\":{}}}",
-                esc(id),
-                esc(name),
-                esc(desc)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 /// Selector value for "no tier chosen here": Muse applies its own configured
 /// default and the adapter sends no per-turn override. It is not an MSP
 /// `ReasoningEffort` and is never sent to the host.
@@ -1142,16 +1322,12 @@ pub struct ConfigOptions<'a> {
 /// `configId` (the setter still uses `configId` in both versions).
 /// Auto-review is adapter policy: see [`AUTO_REVIEW_OFF`] and
 /// [`AUTO_REVIEW_WORKSPACE`].
-pub fn config_options(ver: u8, options: ConfigOptions<'_>, models: &[CatalogModel]) -> String {
-    let mut model_opts = Vec::new();
-    for model in models {
-        model_opts.push(format!(
-            "{{\"value\":{},\"name\":{}}}",
-            esc(&model.id),
-            esc(&model.label)
-        ));
-    }
-    let id_key = if ver == 1 { "id" } else { "configId" };
+pub fn config_options(
+    ver: u8,
+    options: ConfigOptions<'_>,
+    models: &[CatalogModel],
+) -> out::ConfigOptions {
+    use out::{ConfigKind, ConfigOption};
     // The reasoning selector offers exactly the tiers the current model
     // serves, with the catalog's own descriptions. A model whose row does not
     // publish tiers keeps today's fixed list. The current value always stays
@@ -1185,81 +1361,152 @@ pub fn config_options(ver: u8, options: ConfigOptions<'_>, models: &[CatalogMode
             tier_description(options.reasoning_effort),
         ));
     }
-    let reasoning_options_json = reasoning_options
-        .iter()
-        .map(|(tier, description)| match description {
-            Some(description) if !description.is_empty() => format!(
-                "{{\"value\":{},\"name\":{},\"description\":{}}}",
-                esc(tier),
-                esc(reasoning_tier_name(tier)),
-                esc(description)
-            ),
-            _ => format!(
-                "{{\"value\":{},\"name\":{}}}",
-                esc(tier),
-                esc(reasoning_tier_name(tier))
-            ),
-        })
-        .collect::<Vec<_>>()
-        .join(",");
     // AIR recommendedValue is additive metadata: emit it only when the client
     // negotiated it and the value is present among this selector's options.
     let (recommended_model, recommended_reasoning) = options.recommendations;
+    let recommended = |value: &str| {
+        out::meta(
+            &serde_json::json!({"jetbrains": {"air": {"version": 1, "recommendedValue": value}}})
+                .to_string(),
+        )
+    };
     let reasoning_meta = recommended_reasoning
         .filter(|value| reasoning_options.iter().any(|(tier, _)| tier == value))
-        .map(|value| format!(",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}", esc(value)))
-        .unwrap_or_default();
-    let recommended_meta = match recommended_model {
-        Some(model) if models.iter().any(|row| row.id == model) => format!(
-            ",\"_meta\":{{\"jetbrains\":{{\"air\":{{\"version\":1,\"recommendedValue\":{}}}}}}}",
-            esc(model)
-        ),
-        _ => String::new(),
+        .and_then(recommended);
+    let model_meta = recommended_model
+        .filter(|model| models.iter().any(|row| row.id == *model))
+        .and_then(recommended);
+    // AIR's recommendedValue replaces the ambiguous "Muse default" row with
+    // the concrete tier it resolves to: the recommended one, shown as
+    // current while the session keeps Muse's default.
+    let recommended_tier = reasoning_meta
+        .as_ref()
+        .and(recommended_reasoning)
+        .filter(|tier| *tier != REASONING_DEFAULT);
+    let reasoning_current = match recommended_tier {
+        Some(tier) if options.reasoning_effort == REASONING_DEFAULT => tier,
+        _ => options.reasoning_effort,
     };
     // MSP cannot clear a standing session default, so "Muse default" is only
     // offered while no host default is in force.
-    let muse_default = if options.offer_muse_default {
-        "{\"value\":\"default\",\"name\":\"Muse default\"},"
-    } else {
-        ""
+    let mut reasoning_choices = Vec::new();
+    if options.offer_muse_default && recommended_tier.is_none() {
+        reasoning_choices.push(("default".to_string(), "Muse default".to_string(), None));
+    }
+    reasoning_choices.extend(reasoning_options.iter().map(|(tier, description)| {
+        (
+            tier.clone(),
+            reasoning_tier_name(tier).to_string(),
+            description
+                .clone()
+                .filter(|description| !description.is_empty()),
+        )
+    }));
+    let choices = |modes: &[(&str, &str, &str)]| {
+        modes
+            .iter()
+            .map(|(id, name, description)| {
+                (
+                    id.to_string(),
+                    name.to_string(),
+                    Some(description.to_string()),
+                )
+            })
+            .collect()
     };
     // A client that accepts boolean options gets a toggle; others keep the
     // off/on selector.
-    let auto_review_shape = if options.boolean_toggles {
-        format!(
-            "\"type\":\"boolean\",\"currentValue\":{}",
-            options.auto_review
-        )
+    let auto_review = if options.boolean_toggles {
+        ConfigKind::Boolean(options.auto_review)
     } else {
-        format!(
-            "\"type\":\"select\",\"currentValue\":{},\"options\":[{{\"value\":\"off\",\"name\":\"Off\"}},{{\"value\":\"on\",\"name\":\"On\"}}]",
-            esc(if options.auto_review {
+        ConfigKind::Select {
+            current: if options.auto_review {
                 AUTO_REVIEW_ON
             } else {
                 AUTO_REVIEW_OFF
-            })
-        )
+            }
+            .to_string(),
+            choices: vec![
+                ("off".to_string(), "Off".to_string(), None),
+                ("on".to_string(), "On".to_string(), None),
+            ],
+        }
     };
-    format!(
-        "[{{\"{id_key}\":\"mode\",\"name\":\"Mode\",\"description\":\"Read-only and Plan block Muse's file and shell tools; client MCP tools remain available\",\"category\":\"mode\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"approval_mode\",\"name\":\"Approval Mode\",\"description\":\"Muse approval enforcement mode for tool actions\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]}},{{\"{id_key}\":\"auto_review\",\"name\":\"Auto-review\",\"description\":\"Dangerous: send every permission request to an auto-review agent that can approve or deny it without asking you\",{auto_review_shape}}},{{\"{id_key}\":\"model\",\"name\":\"Model\",\"category\":\"model\",\"type\":\"select\",\"currentValue\":{},\"options\":[{}]{recommended_meta}}},{{\"{id_key}\":\"reasoning_effort\",\"name\":\"Reasoning Effort\",\"description\":\"Muse reasoning effort for this session; Muse default keeps the tier configured in Muse\",\"category\":\"thought_level\",\"type\":\"select\",\"currentValue\":{},\"options\":[{muse_default}{reasoning_options_json}]{reasoning_meta}}}]",
-        esc(options.session_mode),
-        mode_options_json("value", &SESSION_MODES),
-        esc(options.approval_mode),
-        mode_options_json("value", &APPROVAL_MODES),
-        esc(options.model),
-        model_opts.join(","),
-        esc(options.reasoning_effort)
+    out::ConfigOptions::new(
+        ver,
+        vec![
+            ConfigOption {
+                id: "mode".to_string(),
+                name: "Mode".to_string(),
+                description: Some(
+                    "Read-only and Plan block Muse's file and shell tools; client MCP tools remain available"
+                        .to_string(),
+                ),
+                category: Some("mode".to_string()),
+                kind: ConfigKind::Select {
+                    current: options.session_mode.to_string(),
+                    choices: choices(&SESSION_MODES),
+                },
+                meta: None,
+            },
+            ConfigOption {
+                id: "approval_mode".to_string(),
+                name: "Approval Mode".to_string(),
+                description: Some("Muse approval enforcement mode for tool actions".to_string()),
+                category: None,
+                kind: ConfigKind::Select {
+                    current: options.approval_mode.to_string(),
+                    choices: choices(&APPROVAL_MODES),
+                },
+                meta: None,
+            },
+            ConfigOption {
+                id: "auto_review".to_string(),
+                name: "Auto-review".to_string(),
+                description: Some(
+                    "Dangerous: send every permission request to an auto-review agent that can approve or deny it without asking you"
+                        .to_string(),
+                ),
+                category: None,
+                kind: auto_review,
+                meta: None,
+            },
+            ConfigOption {
+                id: "model".to_string(),
+                name: "Model".to_string(),
+                description: None,
+                category: Some("model".to_string()),
+                kind: ConfigKind::Select {
+                    current: options.model.to_string(),
+                    choices: models
+                        .iter()
+                        .map(|model| (model.id.clone(), model.label.clone(), None))
+                        .collect(),
+                },
+                meta: model_meta,
+            },
+            ConfigOption {
+                id: "reasoning_effort".to_string(),
+                name: "Reasoning Effort".to_string(),
+                description: Some(
+                    "Muse reasoning effort for this session; Muse default keeps the tier configured in Muse"
+                        .to_string(),
+                ),
+                category: Some("thought_level".to_string()),
+                kind: ConfigKind::Select {
+                    current: reasoning_current.to_string(),
+                    choices: reasoning_choices,
+                },
+                meta: reasoning_meta,
+            },
+        ],
     )
 }
 
 /// Legacy v1 mode state for clients which predate `configOptions`: the
 /// session modes.
-pub fn session_modes(session_mode: &str) -> String {
-    format!(
-        "{{\"currentModeId\":{},\"availableModes\":[{}]}}",
-        esc(session_mode),
-        mode_options_json("id", &SESSION_MODES)
-    )
+pub fn session_modes(session_mode: &str) -> agent_client_protocol::v1::schema::SessionModeState {
+    out::mode_state(session_mode, &SESSION_MODES)
 }
 
 /// Build the editor command palette from the host's current skill catalog.
@@ -1272,52 +1519,54 @@ pub fn session_modes(session_mode: &str) -> String {
 /// Catalog
 /// rows with a local command's name are deduplicated below so each local
 /// command is advertised exactly once.
-fn available_commands_json(ver: u8, skills: &[CatalogSkill], feedback: bool) -> String {
-    let input = |hint: &str| {
-        if ver == 1 {
-            format!("{{\"hint\":{}}}", esc(hint))
-        } else {
-            format!("{{\"type\":\"text\",\"hint\":{}}}", esc(hint))
-        }
+fn available_commands(skills: &[CatalogSkill], feedback: bool) -> Vec<out::Command> {
+    let command = |name: &str, description: &str, hint: Option<&str>| out::Command {
+        name: name.to_string(),
+        description: description.to_string(),
+        hint: hint.map(str::to_string),
+        title: None,
     };
     let goal_hint = "[<objective>|edit <objective>|clear|pause|resume]";
     let mut items = vec![
-        "{\"name\":\"compact\",\"description\":\"Compact the session context\"}".to_string(),
-        format!(
-            "{{\"name\":\"goal\",\"description\":\"Start or manage continuous work toward a goal\",\"input\":{}}}",
-            input(goal_hint)
+        command("compact", "Compact the session context", None),
+        command(
+            "goal",
+            "Start or manage continuous work toward a goal",
+            Some(goal_hint),
         ),
-        format!(
-            "{{\"name\":\"rename\",\"description\":\"Rename this session\",\"input\":{}}}",
-            input("<name>")
+        command("rename", "Rename this session", Some("<name>")),
+        command(
+            "cua",
+            "Computer-use setup and settings",
+            Some(
+                "[status|apps|host [status|check]|on|set <capability> <choice>|app <bundleId> <choice>|block|unblock <bundleId>]",
+            ),
         ),
-        format!(
-            "{{\"name\":\"cua\",\"description\":\"Computer-use setup and settings\",\"input\":{}}}",
-            input(
-                "[status|apps|host [status|check]|on|set <capability> <choice>|app <bundleId> <choice>|block|unblock <bundleId>]"
-            )
+        command(
+            "plugin",
+            "Install plugins and manage marketplaces",
+            Some("install <marketplace> <name> | marketplace add|remove|update <name>"),
         ),
-        format!(
-            "{{\"name\":\"plugin\",\"description\":\"Install plugins and manage marketplaces\",\"input\":{}}}",
-            input("install <marketplace> <name> | marketplace add|remove|update <name>")
+        command("recap", "Summarize what happened while you were away", None),
+        command(
+            "skill-activation",
+            "Turn one skill on or off",
+            Some("<selector> on|userInvocableOnly|off [scope]"),
         ),
-        "{\"name\":\"recap\",\"description\":\"Summarize what happened while you were away\"}"
-            .to_string(),
-        format!(
-            "{{\"name\":\"skill-activation\",\"description\":\"Turn one skill on or off\",\"input\":{}}}",
-            input("<selector> on|userInvocableOnly|off [scope]")
+        command(
+            "skill-import",
+            "Import skills from Claude Code or Codex",
+            Some("<claude|codex> [dry-run] [force]"),
         ),
-        format!(
-            "{{\"name\":\"skill-import\",\"description\":\"Import skills from Claude Code or Codex\",\"input\":{}}}",
-            input("<claude|codex> [dry-run] [force]")
+        command(
+            "workflow",
+            "Pause or resume a running workflow",
+            Some("pause|resume [<runId>]"),
         ),
-        format!(
-            "{{\"name\":\"workflow\",\"description\":\"Pause or resume a running workflow\",\"input\":{}}}",
-            input("pause|resume [<runId>]")
-        ),
-        format!(
-            "{{\"name\":\"workflow-child\",\"description\":\"Skip or retry a running workflow child\",\"input\":{}}}",
-            input("skip|retry <childId>")
+        command(
+            "workflow-child",
+            "Skip or retry a running workflow child",
+            Some("skip|retry <childId>"),
         ),
     ];
     items.extend(
@@ -1337,33 +1586,23 @@ fn available_commands_json(ver: u8, skills: &[CatalogSkill], feedback: bool) -> 
                         | "workflow-child"
                 ) && !(feedback && skill.selector == "feedback")
             })
-            .map(|skill| {
-                let input = skill
-                    .argument_hint
-                    .as_deref()
-                    .map(|hint| format!(",\"input\":{}", input(hint)))
-                    .unwrap_or_default();
+            .map(|skill| out::Command {
+                name: skill.selector.clone(),
+                description: skill.description.clone(),
+                hint: skill.argument_hint.clone(),
                 // ACP commands have no human-readable name field (`name` is
                 // the slash token), so the skill's name rides in `_meta`.
-                let meta = skill
-                    .title
-                    .as_deref()
-                    .map(|title| format!(",\"_meta\":{{\"muse\":{{\"title\":{}}}}}", esc(title)))
-                    .unwrap_or_default();
-                format!(
-                    "{{\"name\":{},\"description\":{}{input}{meta}}}",
-                    esc(&skill.selector),
-                    esc(&skill.description),
-                )
+                title: skill.title.clone(),
             }),
     );
     if feedback {
-        items.push(format!(
-            "{{\"name\":\"feedback\",\"description\":\"Send feedback about Muse\",\"input\":{}}}",
-            input("[bug|bad|good|other] <note>")
+        items.push(command(
+            "feedback",
+            "Send feedback about Muse",
+            Some("[bug|bad|good|other] <note>"),
         ));
     }
-    format!("[{}]", items.join(","))
+    items
 }
 
 pub fn send_available_commands(
@@ -1373,13 +1612,9 @@ pub fn send_available_commands(
     skills: &[CatalogSkill],
     feedback: bool,
 ) {
-    send_raw(
+    send_note(
         stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"available_commands_update\",\"availableCommands\":{}}}}}}}",
-            esc(acp_sid),
-            available_commands_json(ver, skills, feedback)
-        ),
+        out::available_commands(acp_sid, ver, available_commands(skills, feedback)),
     );
 }
 
@@ -1388,7 +1623,7 @@ pub fn send_available_commands(
 /// MSP statuses are a superset (`cancelled` and open values): anything that is
 /// not `inProgress`/`completed` stays `pending` so an unknown state can never
 /// be presented as finished work.
-fn todo_entry(item: &J) -> Option<String> {
+fn todo_entry(item: &J) -> Option<out::PlanEntry> {
     let text = item.get("text").and_then(|v| v.as_str())?;
     if text.trim().is_empty() {
         return None;
@@ -1398,10 +1633,7 @@ fn todo_entry(item: &J) -> Option<String> {
         "completed" => "completed",
         _ => "pending",
     };
-    Some(format!(
-        "{{\"content\":{},\"priority\":\"medium\",\"status\":\"{status}\"}}",
-        esc(text)
-    ))
+    Some((text.to_string(), status))
 }
 
 /// ACP v2 identifies plans by id; MSP keeps exactly one todo list per session
@@ -1412,11 +1644,6 @@ const TODO_PLAN_ID: &str = "muse-todo";
 /// Emit an ACP plan update from an MSP todo list. The whole list is replaced
 /// on every event (and an empty list is a cleared plan, not a no-op), matching
 /// both protocols' replace-wholesale semantics.
-///
-/// ACP v1 has one implicit plan per session and clears it with an empty
-/// `entries` array. ACP v2 names plans and splits the shapes: a snapshot
-/// becomes `plan_update` whose `plan` is an `items` checklist, and an empty
-/// list becomes `plan_removed` for the known plan id.
 pub fn send_plan(stdout: &StdoutShared, acp_sid: &str, ver: u8, items: Option<&J>) {
     let entries = match items {
         Some(J::Arr(values)) => values.iter().filter_map(todo_entry).collect::<Vec<_>>(),
@@ -1424,50 +1651,28 @@ pub fn send_plan(stdout: &StdoutShared, acp_sid: &str, ver: u8, items: Option<&J
         // last plan rather than clearing on garbage.
         _ => return,
     };
-    let update = if ver == 2 {
-        if entries.is_empty() {
-            format!("{{\"sessionUpdate\":\"plan_removed\",\"planId\":\"{TODO_PLAN_ID}\"}}")
-        } else {
-            format!(
-                "{{\"sessionUpdate\":\"plan_update\",\"plan\":{{\"type\":\"items\",\"planId\":\"{TODO_PLAN_ID}\",\"entries\":[{}]}}}}",
-                entries.join(",")
-            )
-        }
-    } else {
-        format!(
-            "{{\"sessionUpdate\":\"plan\",\"entries\":[{}]}}",
-            entries.join(",")
-        )
-    };
-    send_raw(
-        stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{update}}}}}",
-            esc(acp_sid)
-        ),
-    );
+    send_note(stdout, out::plan(acp_sid, ver, TODO_PLAN_ID, entries));
 }
 
 fn send_session_info_snapshot(
     stdout: &StdoutShared,
     s: &AcpSession,
-    title: Option<&str>,
+    title: out::Title,
     goal: Option<&str>,
 ) {
     send_session_info_with_extra(stdout, s, title, goal, None);
 }
 
+/// A `session_info_update` with the session's complete `_meta.muse`
+/// snapshot. `goal` is the provider-neutral `_meta.goal` JSON, and
+/// `extra_meta` more `_meta` members as `"key":value` JSON.
 fn send_session_info_with_extra(
     stdout: &StdoutShared,
     s: &AcpSession,
-    title: Option<&str>,
+    title: out::Title,
     goal: Option<&str>,
     extra_meta: Option<&str>,
 ) {
-    let mut fields = vec!["\"sessionUpdate\":\"session_info_update\"".to_string()];
-    if let Some(title) = title {
-        fields.push(format!("\"title\":{title}"));
-    }
     let mut meta = Vec::new();
     if let Some(goal) = goal {
         meta.push(format!("\"goal\":{goal}"));
@@ -1478,19 +1683,13 @@ fn send_session_info_with_extra(
     if let Some(extra) = extra_meta {
         meta.push(extra.to_string());
     }
-    if !meta.is_empty() {
-        fields.push(format!("\"_meta\":{{{}}}", meta.join(",")));
-    }
-    if fields.len() == 1 {
+    if meta.is_empty() && matches!(title, out::Title::Keep) {
         return;
     }
-    send_raw(
+    let meta = out::meta(&format!("{{{}}}", meta.join(",")));
+    send_note(
         stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{{}}}}}}}",
-            esc(&s.acp_sid),
-            fields.join(",")
-        ),
+        out::session_info(&s.acp_sid, s.ver, title, None, meta),
     );
 }
 
@@ -1506,7 +1705,7 @@ pub fn send_session_meta(
     if let Some(branch) = branch {
         s.set_session_meta("branch", branch.to_string());
     }
-    send_session_info_snapshot(stdout, s, None, goal);
+    send_session_info_snapshot(stdout, s, out::Title::Keep, goal);
 }
 
 /// Publish the host's session provenance (`sideFrom` or `forkedFrom`) while
@@ -1515,18 +1714,21 @@ pub fn send_session_provenance(stdout: &StdoutShared, s: &mut AcpSession, muse: 
     if let Ok(patch) = parse_json(muse) {
         s.absorb_session_meta_patch(&patch);
     }
-    send_session_info_snapshot(stdout, s, None, None);
+    send_session_info_snapshot(stdout, s, out::Title::Keep, None);
 }
 
 /// A side-chat result can name provenance before the client attaches the new
 /// session. No per-session metadata store exists yet, so this one-off update
 /// carries the patch itself; attach republishes it through the full snapshot.
-pub fn send_session_provenance_only(stdout: &StdoutShared, acp_sid: &str, muse: &str) {
-    send_raw(
+pub fn send_session_provenance_only(stdout: &StdoutShared, acp_sid: &str, ver: u8, muse: &str) {
+    send_note(
         stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"session_info_update\",\"_meta\":{{\"muse\":{muse}}}}}}}}}",
-            esc(acp_sid)
+        out::session_info(
+            acp_sid,
+            ver,
+            out::Title::Keep,
+            None,
+            out::meta(&format!("{{\"muse\":{muse}}}")),
         ),
     );
 }
@@ -1554,7 +1756,7 @@ pub fn send_session_status(
             .join(",");
         s.set_session_meta("attention", format!("[{values}]"));
     }
-    send_session_info_snapshot(stdout, s, None, None);
+    send_session_info_snapshot(stdout, s, out::Title::Keep, None);
 }
 
 /// Publish approvals currently held by Muse's native reviewer. An empty list
@@ -1582,7 +1784,7 @@ pub fn send_approval_reviewing(
             .join(",");
         s.set_session_meta("approvalReviewing", format!("[{rows}]"));
     }
-    send_session_info_snapshot(stdout, s, None, None);
+    send_session_info_snapshot(stdout, s, out::Title::Keep, None);
 }
 
 /// How a title update represents the optional generated short title.
@@ -1633,63 +1835,85 @@ pub fn send_session_title(
         GeneratedName::Value(name) => s.set_session_meta("generatedName", esc(name)),
     }
     let title = match title {
-        TitleUpdate::Omit => None,
-        TitleUpdate::Clear => Some("null".to_string()),
-        TitleUpdate::Value(title) => Some(esc(title)),
+        TitleUpdate::Omit => out::Title::Keep,
+        TitleUpdate::Clear => out::Title::Clear,
+        TitleUpdate::Value(title) => out::Title::Set(title.to_string()),
     };
-    send_session_info_snapshot(stdout, s, title.as_deref(), None);
+    send_session_info_snapshot(stdout, s, title, None);
+}
+
+/// `elicitation/complete`: the URL elicitation `elicitation_id` has finished.
+pub fn send_elicitation_complete(stdout: &StdoutShared, elicitation_id: &str) {
+    use agent_client_protocol::{v1::schema as s1, v2::schema as s2};
+    written(match stdout.version() {
+        Some(2) => stdout.notify(s2::CompleteElicitationNotification::new(
+            elicitation_id.to_string(),
+        )),
+        _ => stdout.notify(s1::CompleteElicitationNotification::new(
+            elicitation_id.to_string(),
+        )),
+    });
+}
+
+/// Send one typed notification.
+pub fn send_note(stdout: &StdoutShared, note: Note) {
+    written(match note {
+        Note::V1(note) => stdout.notify(note),
+        Note::V2(note) => stdout.notify(note),
+        Note::Ext(message) => stdout.notify(message),
+    });
 }
 
 /// Send fold output, replacing each `session_info_update` Muse patch with the
 /// complete current metadata snapshot. The fold mutates its own state before
-/// returning the frame, so this is the one interception point needed for hints
-/// such as foreground completion and model retry.
-pub fn send_fold_lines(stdout: &StdoutShared, s: &mut AcpSession, lines: Vec<String>) {
-    for line in lines {
-        send_fold_line(stdout, s, &line);
+/// returning the update, so this is the one interception point needed for
+/// hints such as foreground completion and model retry.
+pub fn send_fold_lines(stdout: &StdoutShared, s: &mut AcpSession, notes: Vec<Note>) {
+    for note in notes {
+        send_fold_line(stdout, s, note);
     }
 }
 
-pub fn send_fold_line(stdout: &StdoutShared, s: &mut AcpSession, line: &str) {
-    let Ok(mut root @ J::Obj(_)) = parse_json(line) else {
-        send_raw(stdout, line);
-        return;
-    };
-    let is_session_info = root
-        .get("params")
-        .and_then(|params| params.get("update"))
-        .and_then(|update| update.get("sessionUpdate"))
-        .and_then(J::as_str)
-        == Some("session_info_update");
-    if !is_session_info {
-        send_raw(stdout, line);
-        return;
-    }
-    let patch = root
-        .get("params")
-        .and_then(|params| params.get("update"))
-        .and_then(|update| update.get("_meta"))
-        .and_then(|meta| meta.get("muse"))
-        .cloned();
-    if let Some(patch) = patch.as_ref() {
-        s.absorb_session_meta_patch(patch);
-    }
-    let muse = s
-        .session_meta_json()
-        .and_then(|muse| parse_json(&format!("{{{muse}}}")).ok());
-    let J::Obj(root_fields) = &mut root else {
-        unreachable!();
-    };
-    if let Some((_, J::Obj(params))) = root_fields.iter_mut().find(|(key, _)| key == "params")
-        && let Some((_, J::Obj(update))) = params.iter_mut().find(|(key, _)| key == "update")
-        && let Some((_, J::Obj(meta))) = update.iter_mut().find(|(key, _)| key == "_meta")
-    {
-        meta.retain(|(key, _)| key != "muse");
-        if let Some(muse) = muse {
-            meta.push(("muse".to_string(), muse));
+pub fn send_fold_line(stdout: &StdoutShared, s: &mut AcpSession, mut note: Note) {
+    use agent_client_protocol::schema::MaybeUndefined;
+    use agent_client_protocol::{v1::schema as s1, v2::schema as s2};
+    match &mut note {
+        Note::V1(n) => {
+            if let s1::SessionUpdate::SessionInfoUpdate(info) = &mut n.update {
+                info.meta = complete_session_meta(s, info.meta.take());
+            }
         }
+        Note::V2(n) => {
+            if let s2::SessionUpdate::SessionInfoUpdate(info) = &mut n.update {
+                let meta = match std::mem::replace(&mut info.meta, MaybeUndefined::Undefined) {
+                    MaybeUndefined::Value(meta) => Some(meta),
+                    _ => None,
+                };
+                if let Some(meta) = complete_session_meta(s, meta) {
+                    info.meta = MaybeUndefined::Value(meta);
+                }
+            }
+        }
+        Note::Ext(_) => {}
     }
-    send_raw(stdout, &j_to_string(&root));
+    send_note(stdout, note);
+}
+
+/// A `session_info_update`'s `_meta` with its `muse` patch absorbed into the
+/// session and replaced by the complete snapshot: ACP v2 replaces a
+/// top-level `_meta` key as a whole.
+fn complete_session_meta(s: &mut AcpSession, meta: Option<out::Meta>) -> Option<out::Meta> {
+    let mut meta = meta?;
+    if let Some(patch) = meta.remove("muse") {
+        s.absorb_session_meta_patch(&crate::json::from_value(&patch));
+    }
+    if let Some(muse) = s
+        .session_meta_json()
+        .and_then(|muse| serde_json::from_str(&format!("{{{muse}}}")).ok())
+    {
+        meta.insert("muse".to_string(), muse);
+    }
+    Some(meta)
 }
 
 /// A one-line title that shows every character of what it names. Editors
@@ -1806,7 +2030,9 @@ mod tests {
                     recommendations: (None, None),
                 },
                 &models,
-            );
+            )
+            .json()
+            .to_string();
             let parsed = crate::json::parse_json(&options).expect("config options JSON");
             let J::Arr(items) = parsed else {
                 panic!("config options must be an array");
@@ -1841,7 +2067,9 @@ mod tests {
                 skill("rename", "Host rename skill", None, None),
                 skill("feedback", "Host feedback skill", None, None),
             ];
-            let commands = available_commands_json(ver, &skills, true);
+            let commands = out::available_commands("s", ver, available_commands(&skills, true))
+                .params()["update"]["availableCommands"]
+                .to_string();
             assert!(
                 commands.contains("\"name\":\"feedback\""),
                 "a granted feedback capability must be advertised: {commands}"
@@ -1880,7 +2108,7 @@ mod tests {
             assert!(commands.contains("\"name\":\"workflow-child\""));
             assert!(!commands.contains("Host rename skill"));
         }
-        assert!(crate::json::parse_json(&session_modes("default")).is_ok());
+        assert_eq!(session_modes("default").available_modes.len(), 3);
     }
 
     #[test]
@@ -1910,7 +2138,9 @@ mod tests {
                 recommendations: (None, None),
             },
             &models,
-        );
+        )
+        .json()
+        .to_string();
         crate::json::parse_json(&options).expect("config options JSON");
         assert!(
             options.contains("\"value\":\"max\""),
@@ -1939,7 +2169,9 @@ mod tests {
                         recommendations: (None, None),
                     },
                     &[],
-                );
+                )
+                .json()
+                .to_string();
                 let J::Arr(items) = crate::json::parse_json(&options).expect("JSON") else {
                     panic!("config options must be an array");
                 };
@@ -1975,7 +2207,7 @@ mod tests {
             }"#,
         )
         .expect("approval choices JSON");
-        let (options_json, choices) = perm_options(&params);
+        let (options, choices) = perm_options(&params);
         assert_eq!(
             choices
                 .iter()
@@ -2002,9 +2234,6 @@ mod tests {
         }];
         assert_eq!(approve_once_choice(&durable_only), None);
 
-        let J::Arr(options) = crate::json::parse_json(&options_json).expect("options JSON") else {
-            panic!("permission options must be an array");
-        };
         let expected = [
             ("c-once", "Allow once", "allow_once"),
             (
@@ -2021,9 +2250,9 @@ mod tests {
         ];
         assert_eq!(options.len(), expected.len());
         for (option, (id, name, kind)) in options.iter().zip(expected) {
-            assert_eq!(option.get("optionId").and_then(J::as_str), Some(id));
-            assert_eq!(option.get("name").and_then(J::as_str), Some(name));
-            assert_eq!(option.get("kind").and_then(J::as_str), Some(kind));
+            assert_eq!(option.id, id);
+            assert_eq!(option.name, name);
+            assert_eq!(option.kind, kind);
         }
     }
 

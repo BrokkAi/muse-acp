@@ -25,12 +25,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use acp_lite::AgentError;
-use serde_json::value::RawValue;
-
 use crate::acp::{self, Sessions, StdoutShared};
 use crate::json::{J, esc, j_to_string, parse_json};
 use crate::msp::log;
+use agent_client_protocol::{JsonRpcRequest, v1::schema as s1};
 
 /// The MCP server name; the model sees `mcp__editor__<tool>`.
 pub const SERVER_NAME: &str = "editor";
@@ -76,12 +74,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 /// Record the ACP v1 client's `fs` and `terminal` capabilities. ACP v2 has
 /// neither, and `MUSE_EDITOR_TOOLS=0` turns the tools off.
-pub fn negotiate(ver: u64, capabilities: Option<&J>) {
-    let v1 = capabilities.filter(|_| ver == 1);
-    let fs = v1.and_then(|c| c.get("fs"));
-    let flag = |key: &str| fs.and_then(|fs| fs.get(key)).and_then(J::as_bool) == Some(true);
-    let (read, write) = (flag("readTextFile"), flag("writeTextFile"));
-    let terminal = v1.and_then(|c| c.get("terminal")).and_then(J::as_bool) == Some(true);
+pub fn negotiate(read: bool, write: bool, terminal: bool) {
     let disabled = std::env::var("MUSE_EDITOR_TOOLS").is_ok_and(|value| {
         matches!(
             value.trim().to_ascii_lowercase().as_str(),
@@ -263,14 +256,9 @@ fn cancel_generation(acp_sid: &str) -> u64 {
     lock(&CANCELS).get(acp_sid).copied().unwrap_or(0)
 }
 
-/// What an editor tool call adds to its completed card.
-#[derive(Debug, Clone, PartialEq)]
-pub enum CardContent {
-    /// ACP `diff` content from a write or edit.
-    Diff(String),
-    /// ACP `terminal` content from a command.
-    Terminal(String),
-}
+/// What an editor tool call adds to its completed card: ACP `diff` content
+/// from a write or edit, or `terminal` content from a command.
+pub use crate::out::CardContent;
 
 /// The content recorded for a completed editor tool item. Matched by
 /// `callId` when Muse sent one with the call (1.4.11+), else by tool and its
@@ -811,15 +799,16 @@ fn call(shared: &Shared, token: &str, request_id: &J, name: &str, params: Option
     let generation = cancel_generation(&context.acp_sid);
     let abort =
         || cancelled.load(Ordering::SeqCst) || cancel_generation(&context.acp_sid) != generation;
-    let client = |method: &str, params: String, wait: Wait| {
-        client_request(&shared.stdout, method, &params, wait, &abort)
+    let client = EditorClient {
+        stdout: &shared.stdout,
+        abort: &abort,
     };
     let key_value = args
         .get(key_arg(name))
         .and_then(J::as_str)
         .unwrap_or("")
         .to_string();
-    let embed = |content: &str| {
+    let embed = |content: &CardContent| {
         embed_in_card(
             shared,
             &context.acp_sid,
@@ -859,7 +848,7 @@ fn embed_in_card(
     call_id: Option<&str>,
     tool: &str,
     key: &str,
-    content: &str,
+    content: &CardContent,
 ) {
     let full_name = format!("{TOOL_PREFIX}{tool}");
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -873,14 +862,10 @@ fn embed_in_card(
         std::thread::sleep(Duration::from_millis(50));
     };
     let Some(card) = card else { return };
-    acp::send_raw(
-        &shared.stdout,
-        &format!(
-            "{{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{{\"sessionId\":{},\"update\":{{\"sessionUpdate\":\"tool_call_update\",\"toolCallId\":{},\"content\":[{content}]}}}}}}",
-            esc(acp_sid),
-            esc(&card)
-        ),
-    );
+    let mut update = crate::out::Card::new(&card);
+    update.content = Some(vec![content.clone()]);
+    // Editor tools exist only for ACP v1 clients.
+    acp::send_note(&shared.stdout, update.note(acp_sid, 1, false));
 }
 
 /// How long to wait for the client's answer, and whether a cancel stops the
@@ -920,44 +905,34 @@ impl std::fmt::Display for ClientError {
     }
 }
 
-/// Send one ACP request to the client and wait for its answer.
-fn client_request(
-    stdout: &StdoutShared,
-    method: &str,
-    params: &str,
-    wait: Wait,
-    abort: &dyn Fn() -> bool,
-) -> Result<J, ClientError> {
-    let params = RawValue::from_string(params.to_string()).map_err(|error| {
-        ClientError::Failed(format!("internal: invalid {method} params: {error}"))
-    })?;
-    crate::msp::trace_method("acp->client", method);
-    let mut pending = stdout.send_request_raw(method, &params).map_err(|_| {
-        crate::shutdown::disconnect();
-        ClientError::Failed("the editor did not answer".into())
-    })?;
-    let deadline = Instant::now() + wait.timeout;
-    loop {
-        if let Some(outcome) = pending.wait_timeout(Duration::from_millis(200)) {
-            return match outcome {
-                Ok(result) => Ok(crate::json::from_value(&result)),
-                Err(AgentError::Rpc(error)) if !error.message.is_empty() => {
-                    Err(ClientError::Failed(error.message))
-                }
-                Err(AgentError::Rpc(_)) => Err(ClientError::Failed("request failed".into())),
-                Err(_) => Err(ClientError::Failed("the editor did not answer".into())),
-            };
+/// Sends ACP requests to the client and waits for each answer.
+trait Client {
+    fn call<R: JsonRpcRequest>(&self, request: R, wait: Wait) -> Result<R::Response, ClientError>;
+}
+
+/// The editor connection, for one tool call: `abort` stops waiting when the
+/// call is cancelled.
+struct EditorClient<'a> {
+    stdout: &'a StdoutShared,
+    abort: &'a dyn Fn() -> bool,
+}
+
+impl Client for EditorClient<'_> {
+    fn call<R: JsonRpcRequest>(&self, request: R, wait: Wait) -> Result<R::Response, ClientError> {
+        crate::msp::trace_method("acp->client", request.method());
+        let abort = || wait.abortable && (self.abort)();
+        match self.stdout.request_blocking(request, wait.timeout, &abort) {
+            Ok(Ok(response)) => Ok(response),
+            Ok(Err(error)) if !error.message.is_empty() => Err(ClientError::Failed(error.message)),
+            Ok(Err(_)) => Err(ClientError::Failed("request failed".into())),
+            // A withdrawn request's late answer is ignored.
+            Err(crate::editor::Blocked::Aborted) => Err(ClientError::Cancelled),
+            Err(crate::editor::Blocked::TimedOut) => Err(ClientError::TimedOut),
+            Err(crate::editor::Blocked::Gone) => {
+                crate::shutdown::disconnect();
+                Err(ClientError::Failed("the editor did not answer".into()))
+            }
         }
-        let stop = if wait.abortable && abort() {
-            ClientError::Cancelled
-        } else if Instant::now() >= deadline {
-            ClientError::TimedOut
-        } else {
-            continue;
-        };
-        // Withdraw it with `$/cancel_request`; a late answer is ignored.
-        let _ = pending.cancel();
-        return Err(stop);
     }
 }
 
@@ -991,15 +966,12 @@ impl ToolOutput {
     }
 }
 
-/// Sends one ACP request to the client: method, params JSON, and how long to
-/// wait.
-type Client<'a> = dyn Fn(&str, String, Wait) -> Result<J, ClientError> + 'a;
 /// Shows ACP tool call content on the running call's card.
-type Embed<'a> = dyn Fn(&str) + 'a;
+type Embed<'a> = dyn Fn(&CardContent) + 'a;
 
 fn run_tool(
     context: &ToolContext,
-    client: &Client<'_>,
+    client: &impl Client,
     embed: &Embed<'_>,
     name: &str,
     args: &J,
@@ -1019,10 +991,10 @@ fn string_arg<'a>(args: &'a J, key: &str) -> Result<&'a str, String> {
         .ok_or_else(|| format!("{key} must be a string"))
 }
 
-fn line_arg(args: &J, key: &str) -> Result<Option<u64>, String> {
+fn line_arg(args: &J, key: &str) -> Result<Option<u32>, String> {
     match args.get(key) {
         None | Some(J::Null) => Ok(None),
-        Some(value) => match value.as_u64() {
+        Some(value) => match value.as_u64().and_then(|n| u32::try_from(n).ok()) {
             Some(n) if n >= 1 => Ok(Some(n)),
             _ => Err(format!("{key} must be a positive integer")),
         },
@@ -1049,52 +1021,33 @@ fn writable(context: &ToolContext) -> Result<(), String> {
 
 fn editor_read(
     context: &ToolContext,
-    client: &Client<'_>,
+    client: &impl Client,
     path: &str,
-    range: (Option<u64>, Option<u64>),
+    range: (Option<u32>, Option<u32>),
 ) -> Result<String, String> {
-    let mut params = format!(
-        "{{\"sessionId\":{},\"path\":{}",
-        esc(&context.acp_sid),
-        esc(path)
-    );
-    if let Some(line) = range.0 {
-        params.push_str(&format!(",\"line\":{line}"));
-    }
-    if let Some(limit) = range.1 {
-        params.push_str(&format!(",\"limit\":{limit}"));
-    }
-    params.push('}');
-    let result = client("fs/read_text_file", params, ASK)
-        .map_err(|e| format!("The editor could not read {path}: {e}"))?;
-    result
-        .get("content")
-        .and_then(J::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| format!("The editor returned no text for {path}."))
+    let request = s1::ReadTextFileRequest::new(context.acp_sid.clone(), path)
+        .line(range.0)
+        .limit(range.1);
+    client
+        .call(request, ASK)
+        .map(|response| response.content)
+        .map_err(|e| format!("The editor could not read {path}: {e}"))
 }
 
 fn editor_write(
     context: &ToolContext,
-    client: &Client<'_>,
+    client: &impl Client,
     path: &str,
     content: &str,
 ) -> Result<(), String> {
-    client(
-        "fs/write_text_file",
-        format!(
-            "{{\"sessionId\":{},\"path\":{},\"content\":{}}}",
-            esc(&context.acp_sid),
-            esc(path),
-            esc(content)
-        ),
-        ASK,
-    )
-    .map(|_| ())
-    .map_err(|e| format!("The editor could not write {path}: {e}"))
+    let request = s1::WriteTextFileRequest::new(context.acp_sid.clone(), path, content);
+    client
+        .call(request, ASK)
+        .map(|_| ())
+        .map_err(|e| format!("The editor could not write {path}: {e}"))
 }
 
-fn read_tool(context: &ToolContext, client: &Client<'_>, args: &J) -> Result<ToolOutput, String> {
+fn read_tool(context: &ToolContext, client: &impl Client, args: &J) -> Result<ToolOutput, String> {
     let path = resolve_path(string_arg(args, "path")?, &context.cwd, &context.roots)?;
     let range = (line_arg(args, "line")?, line_arg(args, "limit")?);
     let text = editor_read(context, client, &path, range)?;
@@ -1120,7 +1073,7 @@ fn bounded(mut text: String) -> String {
 
 /// The file's text before a write: the editor's when it can read files, else
 /// the disk's. None for a new file.
-fn previous_text(context: &ToolContext, client: &Client<'_>, path: &str) -> Option<String> {
+fn previous_text(context: &ToolContext, client: &impl Client, path: &str) -> Option<String> {
     if READ.load(Ordering::SeqCst)
         && let Ok(text) = editor_read(context, client, path, (None, None))
     {
@@ -1129,7 +1082,7 @@ fn previous_text(context: &ToolContext, client: &Client<'_>, path: &str) -> Opti
     std::fs::read_to_string(path).ok()
 }
 
-fn write_tool(context: &ToolContext, client: &Client<'_>, args: &J) -> Result<ToolOutput, String> {
+fn write_tool(context: &ToolContext, client: &impl Client, args: &J) -> Result<ToolOutput, String> {
     writable(context)?;
     let path = resolve_path(string_arg(args, "path")?, &context.cwd, &context.roots)?;
     let content = string_arg(args, "content")?;
@@ -1142,11 +1095,11 @@ fn write_tool(context: &ToolContext, client: &Client<'_>, args: &J) -> Result<To
             content.lines().count()
         ),
         is_error: false,
-        card: diff_content(&path, old.as_deref(), content).map(CardContent::Diff),
+        card: diff_content(&path, old.as_deref(), content),
     })
 }
 
-fn edit_tool(context: &ToolContext, client: &Client<'_>, args: &J) -> Result<ToolOutput, String> {
+fn edit_tool(context: &ToolContext, client: &impl Client, args: &J) -> Result<ToolOutput, String> {
     writable(context)?;
     let path = resolve_path(string_arg(args, "path")?, &context.cwd, &context.roots)?;
     let old_string = string_arg(args, "old_string")?;
@@ -1182,7 +1135,7 @@ fn edit_tool(context: &ToolContext, client: &Client<'_>, args: &J) -> Result<Too
             if count == 1 { "" } else { "s" }
         ),
         is_error: false,
-        card: diff_content(&path, Some(&text), &edited).map(CardContent::Diff),
+        card: diff_content(&path, Some(&text), &edited),
     })
 }
 
@@ -1205,7 +1158,7 @@ fn shell() -> (&'static str, &'static [&'static str], &'static str) {
 
 fn terminal_tool(
     context: &ToolContext,
-    client: &Client<'_>,
+    client: &impl Client,
     embed: &Embed<'_>,
     args: &J,
 ) -> Result<ToolOutput, String> {
@@ -1236,60 +1189,47 @@ fn terminal_tool(
         .iter()
         .copied()
         .chain([command])
-        .map(esc)
-        .collect::<Vec<_>>()
-        .join(",");
-    let sid = esc(&context.acp_sid);
-    let created = client(
-        "terminal/create",
-        format!(
-            "{{\"sessionId\":{sid},\"command\":{},\"args\":[{argv}],\"cwd\":{},\"outputByteLimit\":{MAX_READ_BYTES}}}",
-            esc(program),
-            esc(&cwd)
-        ),
-        ASK,
-    )
-    .map_err(|e| format!("The editor could not start a terminal: {e}"))?;
-    let terminal_id = created
-        .get("terminalId")
-        .and_then(J::as_str)
-        .filter(|id| !id.is_empty())
-        .ok_or("The editor returned no terminal id.")?
-        .to_string();
-    let terminal = format!(
-        "{{\"sessionId\":{sid},\"terminalId\":{}}}",
-        esc(&terminal_id)
-    );
-    let content = format!(
-        "{{\"type\":\"terminal\",\"terminalId\":{}}}",
-        esc(&terminal_id)
-    );
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let sid = context.acp_sid.clone();
+    let mut create = s1::CreateTerminalRequest::new(sid.clone(), program)
+        .args(argv)
+        .cwd(std::path::PathBuf::from(&cwd));
+    create.output_byte_limit = Some(MAX_READ_BYTES as u64);
+    let created = client
+        .call(create, ASK)
+        .map_err(|e| format!("The editor could not start a terminal: {e}"))?;
+    let terminal_id = created.terminal_id.to_string();
+    if terminal_id.is_empty() {
+        return Err("The editor returned no terminal id.".to_string());
+    }
+    let content = CardContent::Terminal(terminal_id.clone());
     embed(&content);
-    let waited = client(
-        "terminal/wait_for_exit",
-        terminal.clone(),
+    let waited = client.call(
+        s1::WaitForTerminalExitRequest::new(sid.clone(), terminal_id.clone()),
         Wait {
             timeout: Duration::from_secs(timeout),
             abortable: true,
         },
     );
     if waited.is_err() {
-        let _ = client("terminal/kill", terminal.clone(), CLEANUP);
+        let _ = client.call(
+            s1::KillTerminalRequest::new(sid.clone(), terminal_id.clone()),
+            CLEANUP,
+        );
     }
-    let output = client("terminal/output", terminal.clone(), CLEANUP).ok();
-    let _ = client("terminal/release", terminal, CLEANUP);
+    let output = client
+        .call(
+            s1::TerminalOutputRequest::new(sid.clone(), terminal_id.clone()),
+            CLEANUP,
+        )
+        .ok();
+    let _ = client.call(s1::ReleaseTerminalRequest::new(sid, terminal_id), CLEANUP);
     let mut text = output
         .as_ref()
-        .and_then(|o| o.get("output"))
-        .and_then(J::as_str)
-        .unwrap_or("")
-        .to_string();
-    if output
-        .as_ref()
-        .and_then(|o| o.get("truncated"))
-        .and_then(J::as_bool)
-        == Some(true)
-    {
+        .map(|o| o.output.clone())
+        .unwrap_or_default();
+    if output.as_ref().is_some_and(|o| o.truncated) {
         text.insert_str(
             0,
             &format!("[output truncated to its last {MAX_READ_BYTES} bytes]\n"),
@@ -1299,7 +1239,7 @@ fn terminal_tool(
         text.push('\n');
     }
     let (status, is_error) = match &waited {
-        Ok(exit) => (exit_status(exit), false),
+        Ok(exit) => (exit_status(&exit.exit_status), false),
         Err(ClientError::Cancelled) => ("[stopped: the user cancelled the turn]".to_string(), true),
         Err(ClientError::TimedOut) => (
             format!("[stopped: the command ran longer than {timeout} seconds]"),
@@ -1314,16 +1254,16 @@ fn terminal_tool(
     Ok(ToolOutput {
         text,
         is_error,
-        card: Some(CardContent::Terminal(content)),
+        card: Some(content),
     })
 }
 
 /// `[exit code N]` or `[terminated by signal S]` from an ACP exit status.
-fn exit_status(exit: &J) -> String {
-    if let Some(code) = exit.get("exitCode").filter(|c| !matches!(c, J::Null)) {
-        return format!("[exit code {}]", j_to_string(code));
+fn exit_status(exit: &s1::TerminalExitStatus) -> String {
+    if let Some(code) = exit.exit_code {
+        return format!("[exit code {code}]");
     }
-    match exit.get("signal").and_then(J::as_str) {
+    match &exit.signal {
         Some(signal) => format!("[terminated by signal {signal}]"),
         None => "[exited]".to_string(),
     }
@@ -1331,16 +1271,15 @@ fn exit_status(exit: &J) -> String {
 
 /// ACP `diff` tool call content, or None when the texts are too large to
 /// show.
-fn diff_content(path: &str, old: Option<&str>, new: &str) -> Option<String> {
+fn diff_content(path: &str, old: Option<&str>, new: &str) -> Option<CardContent> {
     if old.map_or(0, str::len) + new.len() > MAX_DIFF_BYTES {
         return None;
     }
-    Some(format!(
-        "{{\"type\":\"diff\",\"path\":{},\"oldText\":{},\"newText\":{}}}",
-        esc(path),
-        old.map_or_else(|| "null".to_string(), esc),
-        esc(new)
-    ))
+    Some(CardContent::FileDiff {
+        path: path.to_string(),
+        old_text: old.map(str::to_string),
+        new_text: new.to_string(),
+    })
 }
 
 /// The absolute path for a tool's `path` argument, confined to the session's
@@ -1462,6 +1401,25 @@ mod tests {
         parse_json(json).unwrap()
     }
 
+    /// A fake client: the SDK's typed request goes out as its wire method
+    /// and params, and the fake's JSON answer is read with the SDK's
+    /// response type, as from the editor.
+    struct Fake<F>(F);
+
+    impl<F: Fn(&str, J, Wait) -> Result<J, ClientError>> Client for Fake<F> {
+        fn call<R: JsonRpcRequest>(
+            &self,
+            request: R,
+            wait: Wait,
+        ) -> Result<R::Response, ClientError> {
+            use agent_client_protocol::JsonRpcResponse;
+            let (method, params) = request.to_untyped_message().unwrap().into_parts();
+            let answer = (self.0)(&method, crate::json::from_value(&params), wait)?;
+            let answer: serde_json::Value = serde_json::from_str(&j_to_string(&answer)).unwrap();
+            Ok(R::Response::from_json(&method, answer).expect("a schema-valid answer"))
+        }
+    }
+
     /// A fake editor: answers reads from `buffers` and records every request.
     struct Editor {
         buffers: RefCell<HashMap<String, String>>,
@@ -1481,8 +1439,7 @@ mod tests {
             }
         }
 
-        fn answer(&self, method: &str, params: String) -> Result<J, ClientError> {
-            let params = parse_json(&params).unwrap();
+        fn answer(&self, method: &str, params: J) -> Result<J, ClientError> {
             self.requests
                 .borrow_mut()
                 .push((method.to_string(), params.clone()));
@@ -1520,7 +1477,7 @@ mod tests {
     ) -> Result<ToolOutput, String> {
         READ.store(true, Ordering::SeqCst);
         WRITE.store(true, Ordering::SeqCst);
-        let client = |method: &str, params: String, _: Wait| editor.answer(method, params);
+        let client = Fake(|method: &str, params: J, _: Wait| editor.answer(method, params));
         run_tool(context, &client, &|_| {}, name, &args(json))
     }
 
@@ -1647,7 +1604,8 @@ mod tests {
         let diff = diff_json(&output);
         assert_eq!(diff.get("type").and_then(J::as_str), Some("diff"));
         assert_eq!(diff.get("path").and_then(J::as_str), Some(file.as_str()));
-        assert!(matches!(diff.get("oldText"), Some(J::Null)));
+        // A new file has no old text, which ACP leaves out.
+        assert!(diff.get("oldText").is_none());
         assert_eq!(diff.get("newText").and_then(J::as_str), Some("one\ntwo\n"));
         assert_eq!(
             editor.methods(),
@@ -1808,7 +1766,14 @@ mod tests {
 
     fn diff_json(output: &ToolOutput) -> J {
         match &output.card {
-            Some(CardContent::Diff(diff)) => parse_json(diff).unwrap(),
+            Some(diff @ CardContent::FileDiff { .. }) => {
+                let card = crate::out::Card {
+                    content: Some(vec![diff.clone()]),
+                    ..crate::out::Card::new("tc")
+                };
+                let params = card.note("s", 1, false).params();
+                crate::json::from_value(&params["update"]["content"][0])
+            }
             other => panic!("expected a diff card, got {other:?}"),
         }
     }
@@ -2072,7 +2037,7 @@ mod tests {
                 content: if tool == "run_in_terminal" {
                     CardContent::Terminal(format!("term-{key}"))
                 } else {
-                    CardContent::Diff(format!("diff-{key}"))
+                    CardContent::Terminal(format!("diff-{key}"))
                 },
                 at: Instant::now(),
             });
@@ -2089,11 +2054,11 @@ mod tests {
         assert_eq!(take_card_content("other", &write("call-1", "a.rs")), None);
         assert_eq!(
             take_card_content("sess-cards", &write("call-1", "a.rs")),
-            Some(CardContent::Diff("diff-a.rs".into()))
+            Some(CardContent::Terminal("diff-a.rs".into()))
         );
         assert_eq!(
             take_card_content("sess-cards", &write("call-9", "b.rs")),
-            Some(CardContent::Diff("diff-b.rs".into()))
+            Some(CardContent::Terminal("diff-b.rs".into()))
         );
         assert_eq!(
             take_card_content("sess-cards", &write("call-9", "b.rs")),
@@ -2144,7 +2109,7 @@ mod tests {
     struct Terminals {
         wait: Result<&'static str, ClientError>,
         requests: RefCell<Vec<(String, J)>>,
-        embedded: RefCell<Vec<String>>,
+        embedded: RefCell<Vec<CardContent>>,
     }
 
     impl Terminals {
@@ -2158,8 +2123,7 @@ mod tests {
 
         fn run(&self, context: &ToolContext, json: &str) -> Result<ToolOutput, String> {
             TERMINAL.store(true, Ordering::SeqCst);
-            let client = |method: &str, params: String, wait: Wait| {
-                let params = parse_json(&params).unwrap();
+            let client = Fake(|method: &str, params: J, wait: Wait| {
                 self.requests
                     .borrow_mut()
                     .push((method.to_string(), params.clone()));
@@ -2187,8 +2151,8 @@ mod tests {
                     }
                     other => panic!("unexpected {other}"),
                 }
-            };
-            let embed = |content: &str| self.embedded.borrow_mut().push(content.to_string());
+            });
+            let embed = |content: &CardContent| self.embedded.borrow_mut().push(content.clone());
             run_tool(context, &client, &embed, "run_in_terminal", &args(json))
         }
 
@@ -2213,11 +2177,8 @@ mod tests {
             .unwrap();
         assert_eq!(output.text, "built\n[exit code 2]");
         assert!(!output.is_error, "a failing command still ran");
-        let content = r#"{"type":"terminal","terminalId":"term-1"}"#;
-        assert_eq!(
-            output.card,
-            Some(CardContent::Terminal(content.to_string()))
-        );
+        let content = CardContent::Terminal("term-1".to_string());
+        assert_eq!(output.card, Some(content.clone()));
         assert_eq!(*terminals.embedded.borrow(), [content]);
         assert_eq!(
             terminals.methods(),
@@ -2328,7 +2289,7 @@ mod tests {
 
     #[test]
     fn exit_statuses_read_as_text() {
-        let status = |json: &str| exit_status(&parse_json(json).unwrap());
+        let status = |json: &str| exit_status(&serde_json::from_str(json).unwrap());
         assert_eq!(status(r#"{"exitCode":0}"#), "[exit code 0]");
         assert_eq!(
             status(r#"{"exitCode":null,"signal":"SIGKILL"}"#),

@@ -18,7 +18,7 @@
 //! modification. Anything that does not have this shape yields no diff, so
 //! the card keeps its text instead of a guessed one.
 
-use crate::json::{J, esc};
+use crate::json::J;
 
 /// Native tools that write a whole file: a file with no prior lines is one
 /// they created.
@@ -96,7 +96,7 @@ fn range(start: u64, lines: u64) -> String {
 
 /// The ACP v2 `diff` content item for one tool's stored patch document, or
 /// `None` when the document is not a recognizable, non-empty patch.
-pub fn acp_v2_diff(tool: &str, document: &J) -> Option<String> {
+pub fn acp_v2_diff(tool: &str, document: &J) -> Option<crate::out::Diff> {
     let J::Arr(files) = document.get("files")? else {
         return None;
     };
@@ -116,11 +116,7 @@ pub fn acp_v2_diff(tool: &str, document: &J) -> Option<String> {
             continue;
         }
         let added = creates && hunks.iter().all(|h| h.old_lines == 0);
-        changes.push(format!(
-            "{{\"operation\":{},\"path\":{}}}",
-            esc(if added { "add" } else { "modify" }),
-            esc(path)
-        ));
+        changes.push((added, path.to_string()));
         let shown = git_path(path);
         patch.push_str(&format!("diff --git {shown} {shown}\n"));
         if added {
@@ -143,11 +139,7 @@ pub fn acp_v2_diff(tool: &str, document: &J) -> Option<String> {
     if changes.is_empty() {
         return None;
     }
-    Some(format!(
-        "{{\"type\":\"diff\",\"changes\":[{}],\"patch\":{{\"format\":\"git_patch\",\"text\":{}}}}}",
-        changes.join(","),
-        esc(&patch)
-    ))
+    Some(crate::out::Diff { changes, patch })
 }
 
 #[cfg(test)]
@@ -155,8 +147,15 @@ mod tests {
     use super::*;
     use crate::json::parse_json;
 
+    /// The diff as the SDK serializes its ACP v2 tool call content.
     fn diff(tool: &str, document: &str) -> Option<J> {
-        acp_v2_diff(tool, &parse_json(document).unwrap()).map(|d| parse_json(&d).unwrap())
+        let diff = acp_v2_diff(tool, &parse_json(document).unwrap())?;
+        let card = crate::out::Card {
+            content: Some(vec![crate::out::CardContent::Diff(diff)]),
+            ..crate::out::Card::new("tc")
+        };
+        let params = card.note("s", 2, false).params();
+        Some(crate::json::from_value(&params["update"]["content"][0]))
     }
 
     #[cfg(unix)]
