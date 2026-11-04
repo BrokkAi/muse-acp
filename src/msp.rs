@@ -616,20 +616,38 @@ pub struct MspHost {
 impl MspHost {
     /// Last-resort kill without waiting for a lock or child progress.
     pub fn force_stop(&self) {
-        if !self.client.force_stop() {
+        let reached = self.client.force_stop();
+        // A false result means another thread held the child lock. If that
+        // thread is already closing the host, it is killing the child, so the
+        // view is still safe to take; otherwise the host may yet write to it.
+        if !reached && !self.client.is_closing() {
             return;
         }
         // The deadline exits the whole adapter without running Drop, so clean
         // up the settings view here even if the main loop is blocked writing
-        // to the editor. The client re-arms its reap budget after `taskkill`
-        // and reports success whenever it reached the child, so this cleanup
-        // is never skipped; skipping it would leak the temporary view.
-        let config = match self.host_config.try_lock() {
-            Ok(mut config) => config.take(),
-            Err(std::sync::TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
-            Err(std::sync::TryLockError::WouldBlock) => None,
-        };
-        drop(config);
+        // to the editor. A concurrent close may hold the view while it takes
+        // its own last look, so wait briefly for that lock rather than leave
+        // the view behind.
+        drop(self.take_config(std::time::Duration::from_millis(500)));
+    }
+
+    /// Takes the private settings view, waiting up to `wait` for a concurrent
+    /// refresh or close to release it. Dropping the returned value restores
+    /// and removes the view.
+    fn take_config(&self, wait: std::time::Duration) -> Option<crate::host_config::HostConfig> {
+        let until = std::time::Instant::now() + wait;
+        loop {
+            match self.host_config.try_lock() {
+                Ok(mut config) => return config.take(),
+                Err(std::sync::TryLockError::Poisoned(poisoned)) => {
+                    return poisoned.into_inner().take();
+                }
+                Err(std::sync::TryLockError::WouldBlock) if std::time::Instant::now() < until => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(std::sync::TryLockError::WouldBlock) => return None,
+            }
+        }
     }
 
     /// Brings changes made to the real Muse config while the host runs, such
@@ -661,6 +679,11 @@ impl MspHost {
     pub fn reap(&self) -> Option<ExitClassification> {
         let exit = self.client.reap()?;
         // Removing (or, on Windows, restoring) the view touches the disk.
+        // Once the deadline is expiring, `force_stop` owns that cleanup, and
+        // `process::exit` may cut this thread off mid-removal.
+        if crate::shutdown::expiring() {
+            return Some(exit);
+        }
         let _deadline = crate::shutdown::deadline("settings view cleanup");
         self.host_config
             .lock()
@@ -674,11 +697,15 @@ impl MspHost {
     /// broken host cannot strand adapter shutdown.
     pub fn shutdown(&self) {
         if self.client.close().is_some() {
+            // Once the deadline is expiring, `force_stop` owns the view: it
+            // runs before `process::exit`, while this thread may still be
+            // inside `close`. Removing the view here could be cut short by
+            // that exit and leave it behind.
+            if crate::shutdown::expiring() {
+                return;
+            }
             let _deadline = crate::shutdown::deadline("settings view cleanup");
-            self.host_config
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .take();
+            drop(self.take_config(std::time::Duration::ZERO));
         }
     }
 }

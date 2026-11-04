@@ -260,6 +260,7 @@ import os
 import sys
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.request
 
@@ -1004,6 +1005,22 @@ def editor_bridge_turn(base):
     notify("turn/completed", {**base, "terminal": "completed"})
 
 
+def editor_bridge_turn_guarded(base):
+    """Run the bridge turn on its own thread, and end the turn if it fails.
+
+    An exception in a daemon thread would otherwise leave the host alive with
+    the turn pending, which a test sees only as a timeout.
+    """
+    try:
+        editor_bridge_turn(base)
+    except Exception:
+        traceback.print_exc()
+        notify("turn/completed", {**base, "terminal": "failed", "error": {
+            "kind": "internalError",
+            "message": "editor bridge turn failed",
+            "retryable": False}})
+
+
 def on_turn_start(params):
     tid = turn_id()
     base = {"sessionId": ACTIVE_SESSION[0], "turnId": tid}
@@ -1192,7 +1209,7 @@ def on_turn_start(params):
             },
         })
     elif SCENARIO == "editor_bridge":
-        threading.Thread(target=editor_bridge_turn, args=(base,),
+        threading.Thread(target=editor_bridge_turn_guarded, args=(base,),
                          daemon=True).start()
     elif SCENARIO == "tool":
         notify("item/completed", {**base, "item": {
