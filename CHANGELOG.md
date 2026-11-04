@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.21.0
 
 - Speak ACP through the official Rust SDK, the `agent-client-protocol` crate
   (5.0.0), instead of the in-repo `acp-lite` crate, which is removed. The SDK
