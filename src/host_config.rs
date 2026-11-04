@@ -42,7 +42,28 @@ impl Drop for HostConfig {
         #[cfg(windows)]
         self.links.restore();
         // remove_dir_all removes the links themselves, never their targets.
-        let _ = fs::remove_dir_all(&self.root);
+        // Windows can refuse the removal while a just-killed host or a
+        // scanner still holds a handle, so retry briefly before giving up.
+        remove_view(&self.root);
+    }
+}
+
+fn remove_view(root: &Path) {
+    #[cfg(not(windows))]
+    let deadline = std::time::Instant::now();
+    #[cfg(windows)]
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let mut wait = std::time::Duration::from_millis(10);
+    loop {
+        match fs::remove_dir_all(root) {
+            Ok(()) => return,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Err(_) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(wait);
+                wait = (wait * 2).min(std::time::Duration::from_millis(100));
+            }
+            Err(_) => return,
+        }
     }
 }
 

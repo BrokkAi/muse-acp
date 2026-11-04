@@ -340,6 +340,9 @@ struct Request {
     headers: Vec<(String, String)>,
     body: Vec<u8>,
     close: bool,
+    /// The body was not read because the head was refused. Drain it after
+    /// answering so closing does not reset the connection.
+    drain: bool,
 }
 
 impl Request {
@@ -405,8 +408,34 @@ fn serve_connection(stream: TcpStream, shared: &Shared) {
         let response = route(&request, &|token, method, id, params| {
             handle_request(shared, token, method, id, params)
         });
-        if write_response(&mut writer, &response, request.close).is_err() || request.close {
+        if write_response(&mut writer, &response, request.close).is_err() {
             return;
+        }
+        if request.close {
+            if request.drain {
+                drain_refused_body(&mut writer, &mut reader);
+            }
+            return;
+        }
+    }
+}
+
+/// A refused request is answered without reading its body. Half-close the
+/// write side and consume what the peer already sent before closing: a close
+/// with unread input resets the connection on Windows, which can discard the
+/// response the peer is waiting for. The drain is bounded so an unauthenticated
+/// peer cannot keep the thread busy with a huge body.
+fn drain_refused_body(writer: &mut TcpStream, reader: &mut BufReader<TcpStream>) {
+    let _ = writer.shutdown(std::net::Shutdown::Write);
+    let _ = reader
+        .get_ref()
+        .set_read_timeout(Some(Duration::from_millis(100)));
+    let mut buf = [0u8; 8 * 1024];
+    let mut total = 0;
+    while total < MAX_HEAD_BYTES {
+        match reader.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => total += n,
         }
     }
 }
@@ -503,6 +532,7 @@ fn read_request_admitting(
         headers,
         body: Vec::new(),
         close: false,
+        drain: false,
     };
     let connection = request
         .header("connection")
@@ -515,6 +545,7 @@ fn read_request_admitting(
     };
     if !admit(&request) {
         request.close = true;
+        request.drain = true;
         return Ok(request);
     }
     let chunked = request
@@ -1893,6 +1924,7 @@ mod tests {
                 .collect(),
             body: body.as_bytes().to_vec(),
             close: false,
+            drain: false,
         }
     }
 
