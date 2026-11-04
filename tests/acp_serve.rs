@@ -10371,6 +10371,24 @@ fn auto_review_settings_are_cleaned_up_on_forced_shutdown() {
         .spawn()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
+    // Launch the host, and so create its private settings view, before the
+    // flood fills stdout. Otherwise a slow runner can hit the shutdown
+    // deadline while the first initialize is still queued, and the view this
+    // test is about never existed.
+    writeln!(
+        input,
+        "{{\"jsonrpc\":\"2.0\",\"id\":0,\"method\":\"initialize\",\"params\":{{\"protocolVersion\":1}}}}"
+    )
+    .unwrap();
+    let config_path = source.join("fake.config");
+    let launch_deadline = Instant::now() + Duration::from_secs(10);
+    while !config_path.exists() {
+        assert!(
+            Instant::now() < launch_deadline,
+            "the host never created its settings view before shutdown"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     initialize_with_unread_stdout(&mut input);
     drop(input);
     let status = child
