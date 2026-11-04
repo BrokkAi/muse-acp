@@ -10356,6 +10356,8 @@ fn auto_review_settings_are_scoped_to_the_host_and_human_approvals_still_work() 
 #[test]
 fn auto_review_settings_are_cleaned_up_on_forced_shutdown() {
     let (source, original) = auto_review_config();
+    let stderr_path = source.with_extension("stderr");
+    let stderr = std::fs::File::create(&stderr_path).unwrap();
     let mut child = Command::new(adapter_bin())
         .env("XDG_STATE_HOME", fresh_state_dir())
         .env("MUSE_CLI", fixture())
@@ -10367,7 +10369,7 @@ fn auto_review_settings_are_cleaned_up_on_forced_shutdown() {
         .env("MUSE_SHUTDOWN_TIMEOUT_MS", "1500")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::from(stderr))
         .spawn()
         .unwrap();
     let mut input = child.stdin.take().unwrap();
@@ -10403,10 +10405,19 @@ fn auto_review_settings_are_cleaned_up_on_forced_shutdown() {
     )
     .unwrap();
     let root = std::path::PathBuf::from(config["root"].as_str().unwrap());
-    assert!(
-        !root.exists(),
-        "forced shutdown left temporary settings at {root:?}"
-    );
+    if root.exists() {
+        let entries: Vec<String> = std::fs::read_dir(&root)
+            .map(|dir| {
+                dir.flatten()
+                    .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let log = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        panic!(
+            "forced shutdown left temporary settings at {root:?}: {entries:?}\nadapter stderr:\n{log}"
+        );
+    }
     assert_eq!(
         std::fs::read_to_string(source.join("muse/settings.json")).unwrap(),
         original

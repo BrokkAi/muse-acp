@@ -44,11 +44,37 @@ impl Drop for HostConfig {
         // remove_dir_all removes the links themselves, never their targets.
         // Windows can refuse the removal while a just-killed host or a
         // scanner still holds a handle, so retry briefly before giving up.
-        remove_view(&self.root);
+        let removed = remove_view(&self.root);
+        if !removed {
+            let mut entries = Vec::new();
+            if let Ok(dir) = fs::read_dir(&self.root) {
+                for entry in dir.flatten().take(16) {
+                    let kind = entry.file_type().map(|kind| {
+                        if kind.is_dir() {
+                            "dir"
+                        } else if kind.is_symlink() {
+                            "link"
+                        } else {
+                            "file"
+                        }
+                    });
+                    entries.push(format!(
+                        "{} ({})",
+                        entry.file_name().to_string_lossy(),
+                        kind.unwrap_or("unknown")
+                    ));
+                }
+            }
+            crate::msp::log(&format!(
+                "could not remove the settings view at {}: {}",
+                self.root.display(),
+                entries.join(", ")
+            ));
+        }
     }
 }
 
-fn remove_view(root: &Path) {
+fn remove_view(root: &Path) -> bool {
     #[cfg(not(windows))]
     let deadline = std::time::Instant::now();
     #[cfg(windows)]
@@ -56,13 +82,16 @@ fn remove_view(root: &Path) {
     let mut wait = std::time::Duration::from_millis(10);
     loop {
         match fs::remove_dir_all(root) {
-            Ok(()) => return,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+            Ok(()) => return true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
             Err(_) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(wait);
                 wait = (wait * 2).min(std::time::Duration::from_millis(100));
             }
-            Err(_) => return,
+            Err(error) => {
+                crate::msp::log(&format!("settings view removal failed: {error}"));
+                return false;
+            }
         }
     }
 }
