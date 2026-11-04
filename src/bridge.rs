@@ -423,16 +423,17 @@ fn serve_connection(stream: TcpStream, shared: &Shared) {
 /// A refused request is answered without reading its body. Half-close the
 /// write side and consume what the peer already sent before closing: a close
 /// with unread input resets the connection on Windows, which can discard the
-/// response the peer is waiting for. The drain is bounded so an unauthenticated
-/// peer cannot keep the thread busy with a huge body.
+/// response the peer is waiting for. Both the bytes and the time are bounded
+/// so an unauthenticated peer cannot keep the thread busy with a slow trickle.
 fn drain_refused_body(writer: &mut TcpStream, reader: &mut BufReader<TcpStream>) {
+    let until = Instant::now() + Duration::from_millis(200);
     let _ = writer.shutdown(std::net::Shutdown::Write);
     let _ = reader
         .get_ref()
         .set_read_timeout(Some(Duration::from_millis(100)));
     let mut buf = [0u8; 8 * 1024];
     let mut total = 0;
-    while total < MAX_HEAD_BYTES {
+    while total < MAX_HEAD_BYTES && Instant::now() < until {
         match reader.read(&mut buf) {
             Ok(0) | Err(_) => break,
             Ok(n) => total += n,

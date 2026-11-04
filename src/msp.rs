@@ -616,7 +616,11 @@ pub struct MspHost {
 impl MspHost {
     /// Last-resort kill without waiting for a lock or child progress.
     pub fn force_stop(&self) {
-        if !self.client.force_stop() {
+        let reached = self.client.force_stop();
+        // A false result means another thread held the child lock. If that
+        // thread is already closing the host, it is killing the child, so the
+        // view is still safe to take; otherwise the host may yet write to it.
+        if !reached && !self.client.is_closing() {
             return;
         }
         // The deadline exits the whole adapter without running Drop, so clean
