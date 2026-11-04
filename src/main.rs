@@ -4540,6 +4540,12 @@ fn main() {
                 // terminals arrive on resume. Ephemeral or unrecognized
                 // profiles get no such guarantee, so they fail closed.
                 drop(cleanup_deadline);
+                if shutdown::expiring() {
+                    // The deadline owns shutdown now. Restarting the host
+                    // would create a settings view that its forced exit
+                    // cannot clean up.
+                    continue;
+                }
                 if old_host.handshake().restartable() {
                     let Some(delay) = restart_budget.admit(std::time::Instant::now()) else {
                         let message = format!(

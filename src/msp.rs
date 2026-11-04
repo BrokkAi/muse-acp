@@ -753,6 +753,14 @@ impl MspHost {
         flags: HostFlags,
         extra_args: &[&str],
     ) -> Result<(Arc<MspHost>, Receiver<MspEvent>), LaunchError> {
+        // The shutdown deadline exits the process without a final sweep. Do
+        // not create a settings view after it has fired: nothing would clean
+        // it up, and a host killed on the way out can leave one behind.
+        if crate::shutdown::expiring() {
+            return Err(LaunchError::Startup(
+                "the adapter is shutting down; no new muse serve was started".into(),
+            ));
+        }
         let bin = muse_cli();
         let (mut config, host_config) = serve_config(&bin, flags, extra_args);
         config.options(client_options(user_input_dialogs, user_shell, computer_use));
