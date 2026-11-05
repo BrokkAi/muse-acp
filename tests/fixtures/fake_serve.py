@@ -89,6 +89,7 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   recap_pending recap/request is accepted and never settles (for cancels)
   recap_failed recap/request settles failed(providerFailed)
   recap_timeout recap/request settles timedOut
+  recap_noop   recap/request acks noop, off-schema, and never settles
   load         session/resume serves inline history (for session/load replay)
   resume_active session/resume reports a running turn (for steering reattach)
   async_resume session/resume reports running background work
@@ -3013,7 +3014,8 @@ def result_for(method, msg):
             if kind == "failed":
                 completion["reason"] = "providerFailed"
             notify("recap/completed", completion)
-        return {"commandId": params.get("commandId", ""), "status": "accepted"}
+        status = "noop" if SCENARIO == "recap_noop" else "accepted"
+        return {"commandId": params.get("commandId", ""), "status": status}
     if method == "recap/cancel":
         # In flight -> the recap settles cancelled; the adapter has already
         # settled its held prompt, so the late settlement is a no-op there.

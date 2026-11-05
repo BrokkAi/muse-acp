@@ -15159,7 +15159,22 @@ fn start_recap(
             esc(&msp_sid)
         ),
     ) {
-        Ok(_) => {}
+        Ok(ack) if ack.get("status").and_then(|v| v.as_str()) == Some("accepted") => {}
+        Ok(ack) => {
+            // MSP admits a recap only as `accepted`. Any other ack means no
+            // `recap/completed` will follow, so holding the prompt would hang.
+            let status = ack
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("missing");
+            acp::send_error(
+                stdout,
+                &prompt_req,
+                -32603,
+                &format!("recap/request was not accepted by the Muse host: {status}"),
+            );
+            return;
+        }
         Err(error) => {
             acp::send_error(
                 stdout,

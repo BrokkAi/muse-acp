@@ -689,6 +689,21 @@ fn failed_and_timed_out_recaps_are_reported_as_failures() {
 }
 
 #[test]
+fn a_recap_ack_other_than_accepted_fails_the_prompt() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("recap_noop", &[]);
+        let sid = c.new_session(ver, "");
+        let pid = c.prompt(&sid, "/recap");
+        let result = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+        assert!(
+            result.contains("\"error\"") && result.contains("not accepted by the Muse host: noop"),
+            "v{ver} fails the prompt instead of holding it: {result}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn recap_frames_conform_to_the_vendored_schema() {
     let mut c = Client::spawn("recap", &[]);
     let sid = c.new_session(2, "");
