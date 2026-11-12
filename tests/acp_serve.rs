@@ -10307,6 +10307,11 @@ fn auto_review_reviewer_host_is_pinned_to_the_low_reasoning_tier() {
             .any(|pair| pair[0] == "-c" && pair[1] == "reasoning_effort=\"low\""),
         "the reviewer host is pinned to the low tier: {reviewer:?}"
     );
+    // Workspace rules must not steer the judge of an approval.
+    assert!(
+        !reviewer.iter().any(|arg| arg == "--trust-workspace"),
+        "the reviewer host does not trust the workspace: {reviewer:?}"
+    );
     for main in launches
         .iter()
         .map(argv)
@@ -10315,6 +10320,13 @@ fn auto_review_reviewer_host_is_pinned_to_the_low_reasoning_tier() {
         assert!(
             !main.iter().any(|arg| arg.contains("reasoning_effort")),
             "the user's own host keeps the session tier: {main:?}"
+        );
+        // Every workspace is trusted, as claude-agent-acp does: Muse 1.4.15
+        // withholds the editor's MCP tools from an untrusted one.
+        assert_eq!(
+            main,
+            ["serve", "--trust-workspace"],
+            "the session host trusts the workspace"
         );
     }
     c.finish();
@@ -16725,6 +16737,62 @@ fn read_only_mode_moves_the_session_to_a_read_only_host_and_back() {
     c.wait_log("turn/start", Duration::from_secs(15));
     c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
     c.finish();
+}
+
+#[test]
+fn the_read_only_host_trusts_the_workspace_too() {
+    // Read-only and plan sessions keep the editor's file tools and MCP
+    // servers, which Muse 1.4.15 withholds from an untrusted workspace.
+    let (source, _original) = auto_review_config();
+    let mut c = Client::spawn(
+        "happy",
+        &[
+            ("XDG_CONFIG_HOME", source.to_str().unwrap()),
+            ("FAKE_CHECK_HOST_CONFIG", "1"),
+        ],
+    );
+    let sid = c.new_session(1, "");
+    set_session_mode(&mut c, &sid, "readOnly");
+    c.wait_log("ro:session/resume", Duration::from_secs(15));
+    let log = std::fs::read_to_string(format!("{}.config", c.fake_log)).unwrap();
+    let launches: Vec<Vec<String>> = log
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            let launch: serde_json::Value = serde_json::from_str(line).unwrap();
+            launch["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|arg| arg.as_str().unwrap().to_string())
+                .collect()
+        })
+        .collect();
+    // The main host also restarts to release the session; each launch trusts.
+    assert!(
+        launches.contains(&vec![
+            "serve".to_string(),
+            "--trust-workspace".to_string(),
+            "--disable-write".to_string(),
+            "--disable-shell".to_string(),
+        ]),
+        "the read-only host launched trusted: {log}"
+    );
+    for args in &launches {
+        assert!(
+            args == &["serve", "--trust-workspace"]
+                || args
+                    == &[
+                        "serve",
+                        "--trust-workspace",
+                        "--disable-write",
+                        "--disable-shell"
+                    ],
+            "every session host trusts the workspace: {log}"
+        );
+    }
+    c.finish();
+    std::fs::remove_dir_all(source).unwrap();
 }
 
 #[test]

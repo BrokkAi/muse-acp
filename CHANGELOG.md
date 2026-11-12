@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Trust every workspace, as claude-agent-acp does: the main and read-only
+  hosts now run `muse serve --trust-workspace`, so Muse loads each
+  workspace's skills, rules, and MCP servers. Muse 1.4.15 withholds a
+  session's MCP servers from an untrusted workspace without telling the
+  client, which silently removed the editor file and terminal tools and every
+  MCP server the editor attaches. The auto-review reviewer host stays
+  untrusted, so a repository's rules cannot steer the judge of an approval. A
+  `--trust-workspace` already in `MUSE_SERVE_ARGS` is not repeated, and
+  `--per-session`, which `muse serve` refuses beside it, leaves trust to that
+  host.
+
 ## 0.21.0
 
 - Speak ACP through the official Rust SDK, the `agent-client-protocol` crate
