@@ -560,7 +560,8 @@ impl MspClient {
         self.core.reap()
     }
 
-    /// Whether a close (or forced stop) has started on this client.
+    /// Whether a close, a forced stop that reached the host, or a kill after
+    /// a stuck write has started on this client.
     pub fn is_closing(&self) -> bool {
         self.core.close_started.load(Ordering::SeqCst)
     }
@@ -712,6 +713,10 @@ impl Core {
     }
 
     fn terminate(&self) {
+        // Terminating kills the host, so a concurrent `force_stop` must see
+        // the client as closing; otherwise it abandons any settings view
+        // while this kill is still running.
+        self.close_started.store(true, Ordering::SeqCst);
         match &self.end {
             End::Process(process) => kill_and_reap(
                 &mut process.child.lock().unwrap_or_else(|p| p.into_inner()),
@@ -897,6 +902,7 @@ impl Core {
         let process = match &self.end {
             End::Process(process) => process,
             End::Custom(terminate) => {
+                self.close_started.store(true, Ordering::SeqCst);
                 let hook = match terminate.try_lock() {
                     Ok(mut hook) => hook.take(),
                     Err(TryLockError::Poisoned(poisoned)) => poisoned.into_inner().take(),
@@ -919,6 +925,12 @@ impl Core {
                 }
                 Err(TryLockError::WouldBlock) => return false,
             };
+            // Mark the close only once this thread holds the child and is
+            // about to kill it. A concurrent forced stop that cannot reach the
+            // child while this kill runs then sees the client as closing,
+            // while one that finds the child held by anything else still
+            // reports that the host may be running.
+            self.close_started.store(true, Ordering::SeqCst);
             terminate_child(&mut child);
             // `terminate_child` can spend up to two seconds in `taskkill`, so
             // the reap gets a fresh budget.

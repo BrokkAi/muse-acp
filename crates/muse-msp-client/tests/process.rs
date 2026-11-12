@@ -491,6 +491,9 @@ fn a_stuck_write_kills_the_host() {
         other => panic!("unexpected {other:?}"),
     }
     assert!(settled.elapsed() < Duration::from_secs(1));
+    // Terminating the host on a stuck write is a close too: a watchdog that
+    // fires while the kill runs must see the host as closing.
+    assert!(client.is_closing());
     let exit = client.reap().expect("the host was killed");
     assert_ne!(exit.kind, ExitKind::CleanShutdown);
     wait_closed(&events);
@@ -587,6 +590,9 @@ fn a_refused_handshake_closes_the_host() {
 fn force_stop_kills_without_waiting() {
     let (client, _events) = MspClient::launch(fake(&[("FAKE_IGNORE_EOF", "1")])).expect("launch");
     assert!(client.force_stop());
+    // A forced stop is a close: a concurrent watchdog must see the host as
+    // closing, or it leaves the adapter's settings view behind.
+    assert!(client.is_closing());
     let exit = client.reap().expect("killed");
     assert_ne!(exit.kind, ExitKind::CleanShutdown);
 }

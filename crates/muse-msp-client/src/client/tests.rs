@@ -734,3 +734,23 @@ fn command_ids_are_unique_uuid_v7() {
         assert!(seen.insert(id));
     }
 }
+
+#[test]
+fn only_a_forced_stop_that_reaches_the_host_marks_the_client_closing() {
+    // Any short-lived child will do: the test only needs a process-backed
+    // client whose child lock it can hold.
+    let mut config = LaunchConfig::new(std::env::current_exe().unwrap());
+    config.arg("--list");
+    let (client, _events) = MspClient::spawn(config).expect("spawn");
+    let End::Process(process) = &client.core.end else {
+        unreachable!("a launched host is a process");
+    };
+    let held = process.child.lock().unwrap();
+    assert!(!client.force_stop(), "the child lock is held");
+    // The holder is not killing the host, so a watchdog must not treat the
+    // host as closing and remove the settings view it may still write to.
+    assert!(!client.is_closing());
+    drop(held);
+    assert!(client.force_stop());
+    assert!(client.is_closing());
+}
