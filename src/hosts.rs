@@ -69,7 +69,7 @@ impl HostKind {
     fn args(self) -> &'static [&'static str] {
         match self {
             HostKind::Reviewer => &REVIEWER_ARGS,
-            HostKind::Main | HostKind::ReadOnly => &[],
+            HostKind::Main | HostKind::ReadOnly => &crate::msp::SESSION_HOST_ARGS,
         }
     }
 }
@@ -391,4 +391,18 @@ fn args_rejected(error: &LaunchError) -> bool {
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{HostKind, REVIEWER_ARGS};
+
+    #[test]
+    fn session_hosts_trust_the_workspace_and_the_reviewer_does_not() {
+        for kind in [HostKind::Main, HostKind::ReadOnly] {
+            assert_eq!(kind.args(), ["--trust-workspace"], "{}", kind.name());
+        }
+        assert_eq!(HostKind::Reviewer.args(), REVIEWER_ARGS);
+        assert!(!HostKind::Reviewer.args().contains(&"--trust-workspace"));
+    }
 }

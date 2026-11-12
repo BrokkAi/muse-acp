@@ -3447,7 +3447,13 @@ fn support_bundle() -> i32 {
 /// `initialize` handshake with a short-lived `muse serve`. Only the
 /// classified facts are printed, never the host's raw strings.
 fn support_sandbox_line() -> String {
-    match msp::MspHost::launch(false, false, false, msp::HostFlags::default(), &[]) {
+    match msp::MspHost::launch(
+        false,
+        false,
+        false,
+        msp::HostFlags::default(),
+        &msp::SESSION_HOST_ARGS,
+    ) {
         Ok((host, _events)) => {
             let line = format!("support-{}", host.handshake().sandbox_line());
             host.shutdown();

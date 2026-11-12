@@ -1035,11 +1035,44 @@ fn serve_config(
     // `MUSE_SERVE_ARGS` value wins over a pinned default instead of colliding
     // with it.
     let extra = without_duplicate_config_args(&env_args, extra_args);
+    let extra = without_repeated_trust(&env_args, extra);
     config.args(env_args);
     config.args(extra);
     config.host_flags(flags);
     let host_config = crate::host_config::configure(&mut config);
     (config, host_config)
+}
+
+/// `muse serve`'s flag that loads each session workspace's skills, rules, and
+/// MCP servers.
+pub const TRUST_WORKSPACE: &str = "--trust-workspace";
+
+/// The extra arguments of the hosts that serve the editor's sessions: every
+/// workspace is trusted, as claude-agent-acp does. ACP has no trust prompt,
+/// and Muse 1.4.15 withholds a session's MCP servers in an untrusted
+/// workspace, which includes the editor's own file and terminal tools and
+/// the MCP servers the editor forwards. The reviewer host does not take it:
+/// it judges approvals, so workspace rules must not steer it.
+pub const SESSION_HOST_ARGS: [&str; 1] = [TRUST_WORKSPACE];
+
+/// Drops `--trust-workspace` from `later` when `earlier` (`MUSE_SERVE_ARGS`)
+/// already passes it, or passes `--per-session`, which `muse serve` refuses
+/// beside it (exit 2: a per-session host decides each session's trust).
+fn without_repeated_trust<'a>(earlier: &[String], later: Vec<&'a str>) -> Vec<&'a str> {
+    let per_session = earlier.iter().any(|arg| arg == "--per-session");
+    let trusted = earlier.iter().any(|arg| arg == TRUST_WORKSPACE);
+    if !(per_session || trusted) {
+        return later;
+    }
+    if per_session && !trusted && later.contains(&TRUST_WORKSPACE) {
+        log(
+            "MUSE_SERVE_ARGS --per-session: not passing --trust-workspace, which muse serve refuses beside it; that host decides workspace trust for each session",
+        );
+    }
+    later
+        .into_iter()
+        .filter(|arg| *arg != TRUST_WORKSPACE)
+        .collect()
 }
 
 /// `MUSE_SERVE_ARGS` for one host. `--join` serves through the machine's
@@ -1132,7 +1165,7 @@ pub fn probe_serve_exit(
     timeout: std::time::Duration,
 ) -> Result<Option<ExitClassification>, String> {
     let bin = muse_cli();
-    let (config, _host_config) = serve_config(&bin, HostFlags::default(), &[]);
+    let (config, _host_config) = serve_config(&bin, HostFlags::default(), &SESSION_HOST_ARGS);
     muse_msp_client::probe_exit(&config, timeout).map_err(|error| match error {
         muse_msp_client::LaunchError::Spawn { error, .. } => describe_spawn_error(&bin, &error),
         other => other.to_string(),
@@ -1233,9 +1266,10 @@ pub fn output_unavailable_data(error: &J) -> J {
 #[cfg(test)]
 mod tests {
     use super::{
-        ExitKind, ExitMessage, HANDLED_SERVER_REQUESTS, HostFlags, command_timeout, host_env_args,
-        is_session_configuration_conflict, rejection_reason, session_profile_hint, session_suffix,
-        without_duplicate_config_args,
+        ExitKind, ExitMessage, HANDLED_SERVER_REQUESTS, HostFlags, SESSION_HOST_ARGS,
+        TRUST_WORKSPACE, command_timeout, host_env_args, is_session_configuration_conflict,
+        rejection_reason, session_profile_hint, session_suffix, without_duplicate_config_args,
+        without_repeated_trust,
     };
     use crate::json::parse_json;
     use muse_msp_client::classify_exit_parts;
@@ -1263,6 +1297,42 @@ mod tests {
         assert_eq!(
             host_env_args(args("--join --trust-workspace"), HostFlags::default()),
             args("--join --trust-workspace")
+        );
+    }
+
+    #[test]
+    fn session_hosts_trust_the_workspace_once_and_never_beside_per_session() {
+        let env =
+            |raw: &str| -> Vec<String> { raw.split_whitespace().map(str::to_string).collect() };
+        assert_eq!(SESSION_HOST_ARGS, [TRUST_WORKSPACE]);
+        assert_eq!(TRUST_WORKSPACE, "--trust-workspace");
+        // No MUSE_SERVE_ARGS: the session host is trusted.
+        assert_eq!(
+            without_repeated_trust(&env(""), SESSION_HOST_ARGS.to_vec()),
+            vec!["--trust-workspace"]
+        );
+        // Other user flags, `--join` included, keep it.
+        assert_eq!(
+            without_repeated_trust(&env("--join --disable-sandbox"), SESSION_HOST_ARGS.to_vec()),
+            vec!["--trust-workspace"]
+        );
+        // The user's own `--trust-workspace` is not repeated.
+        assert_eq!(
+            without_repeated_trust(&env("--trust-workspace"), SESSION_HOST_ARGS.to_vec()),
+            Vec::<&str>::new()
+        );
+        // `muse serve` refuses `--per-session` beside it with exit 2.
+        assert_eq!(
+            without_repeated_trust(&env("--per-session"), SESSION_HOST_ARGS.to_vec()),
+            Vec::<&str>::new()
+        );
+        // Anything else in the list survives.
+        assert_eq!(
+            without_repeated_trust(
+                &env("--per-session"),
+                vec!["--trust-workspace", "-c", "reasoning_effort=\"low\""]
+            ),
+            vec!["-c", "reasoning_effort=\"low\""]
         );
     }
 
