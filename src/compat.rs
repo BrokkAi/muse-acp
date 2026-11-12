@@ -214,6 +214,7 @@ pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_1415_FINGERPRINT;
 /// Since SDK `07e1548` the manifest carries no fingerprint, so the corpus
 /// test pins the bundle bytes instead: a re-pin that forgets to move
 /// [`SDK_MANIFEST_FINGERPRINT`] still fails there.
+#[cfg(test)]
 pub const SDK_SCHEMA_SHA256: &str =
     "66a8840d5768fc2fce6b5ad764aedbdd259da95cd849f587278a206a596537ee";
 
@@ -670,8 +671,8 @@ mod corpus_tests {
         if let Some(fingerprint) = manifest.get("fingerprint") {
             assert_eq!(fingerprint.as_str(), Some(SDK_MANIFEST_FINGERPRINT));
         }
-        let schema = std::fs::read(protocol_path("stable/msp.schema.json"))
-            .expect("vendored schema bundle");
+        let schema =
+            std::fs::read(protocol_path("stable/msp.schema.json")).expect("vendored schema bundle");
         assert_eq!(
             crate::sha256::hex(&schema),
             SDK_SCHEMA_SHA256,

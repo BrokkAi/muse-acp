@@ -420,6 +420,10 @@ pub struct SessionFold {
     /// by absence in MSP, so retain the prior state to send an explicit clear
     /// through ACP `_meta`.
     held_items: std::collections::HashSet<String>,
+    /// Tool items whose last snapshot carried a Muse 1.4.15
+    /// `backgroundTarget`. Absence later means the call left the candidate
+    /// set, which clients that merge `_meta` only see as an explicit null.
+    background_targets: std::collections::HashSet<String>,
 }
 
 /// One child of a running workflow, as the latest workflow item reported it.
@@ -507,6 +511,7 @@ impl SessionFold {
             last_message: None,
             cut_off: std::collections::HashSet::new(),
             held_items: std::collections::HashSet::new(),
+            background_targets: std::collections::HashSet::new(),
         }
     }
 
@@ -999,6 +1004,8 @@ impl SessionFold {
             ("patchSummary", item.get("patchSummary")),
             ("workId", item.get("workId")),
             ("replayHint", item.get("replayHint")),
+            // Muse 1.4.15: the subagent whose own session spawned this child.
+            ("parentSubagentId", item.get("parentSubagentId")),
         ];
         let parts: Vec<String> = fields
             .into_iter()
@@ -1044,10 +1051,31 @@ impl SessionFold {
         } else {
             None
         };
-        Self::merge_muse_fields(
-            held_fields.as_deref(),
-            Self::item_muse_fields(item).as_deref(),
-        )
+        // Muse 1.4.15: the call's live background-target record. Present
+        // means a live candidate; omitted once it settles or unregisters.
+        let target_fields = match item.get("backgroundTarget") {
+            Some(target @ J::Obj(_)) => {
+                self.background_targets.insert(item_id.to_string());
+                Some(format!("\"backgroundTarget\":{}", j_to_string(target)))
+            }
+            _ if self.background_targets.remove(item_id) => {
+                Some("\"backgroundTarget\":null".to_string())
+            }
+            _ => None,
+        };
+        let state = Self::merge_muse_fields(held_fields.as_deref(), target_fields.as_deref());
+        Self::merge_muse_fields(state.as_deref(), Self::item_muse_fields(item).as_deref())
+    }
+
+    /// How a `subagentInput` or `subagentResult` card names its subagent:
+    /// the agent path, else the subagent id, else a generic noun.
+    fn subagent_label(item: &J) -> String {
+        ["agentPath", "subagentId"]
+            .into_iter()
+            .filter_map(|key| item.get(key).and_then(J::as_str))
+            .map(sanitize_one_line)
+            .find(|label| !label.is_empty())
+            .unwrap_or_else(|| "a subagent".to_string())
     }
 
     fn compaction_status(item: &J) -> &'static str {
@@ -1475,6 +1503,25 @@ impl SessionFold {
                     }
                     text.push_str("(output truncated by Muse)");
                 }
+                // Muse 1.4.15 adds the terminal record's exit code and
+                // reason, each absent when the record carries none.
+                let mut facts_lines = Vec::new();
+                // `exitCode` is an `i32`, so it may be negative.
+                if let Some(J::Num(code)) = facts.get("exitCode")
+                    && let Ok(code) = code.parse::<i64>()
+                {
+                    facts_lines.push(format!("Exit code {code}"));
+                }
+                let reason = sanitize_one_line(fact("reason"));
+                if !reason.is_empty() {
+                    facts_lines.push(format!("Reason: {reason}"));
+                }
+                if !facts_lines.is_empty() {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    text.push_str(&facts_lines.join("\n"));
+                }
                 (
                     title,
                     (!text.is_empty()).then_some(text),
@@ -1627,6 +1674,156 @@ impl SessionFold {
                     title,
                     (!lines.is_empty()).then(|| lines.join("\n")),
                     Some(format!("\"scheduledFire\":{{{}}}", fields.join(","))),
+                )
+            }
+            "systemNotice" => {
+                // Muse 1.4.15: a system-chrome notice (Monitor, skills
+                // startup, scheduled fire, incomplete generation, hook, or a
+                // paused workflow checkpoint). The title is the one-line
+                // summary led by the notice's level; the full text is the
+                // content; the routing facts ride `_meta` verbatim. An
+                // absent origin or level stays absent, never inferred.
+                let text = str_field("text");
+                let fallback = str_field("fallbackText");
+                let summary = if fallback.is_empty() {
+                    text.lines()
+                        .find(|line| !line.trim().is_empty())
+                        .unwrap_or("")
+                } else {
+                    fallback
+                };
+                let summary = sanitize_one_line(summary);
+                let title = match (summary.is_empty(), str_field("noticeSeverity")) {
+                    (true, _) => String::new(),
+                    (false, "warning") => format!("Warning: {summary}"),
+                    (false, "error") => format!("Error: {summary}"),
+                    (false, _) => summary.clone(),
+                };
+                let content =
+                    (!text.is_empty() && text.trim() != summary).then(|| text.to_string());
+                let facts: Vec<String> = [
+                    ("origin", item.get("noticeOrigin")),
+                    ("severity", item.get("noticeSeverity")),
+                    ("kind", item.get("noticeKind")),
+                    ("subject", item.get("noticeSubject")),
+                ]
+                .into_iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .filter(|v| !matches!(v, J::Null))
+                        .map(|v| format!("\"{key}\":{}", j_to_string(v)))
+                })
+                .collect();
+                (
+                    title,
+                    content,
+                    Some(format!(
+                        "\"itemKind\":\"systemNotice\",\"systemNotice\":{{{}}}",
+                        facts.join(",")
+                    )),
+                )
+            }
+            "peerMessage" => {
+                // Muse 1.4.15: a message another session sent this one,
+                // consumed by the agent. `senderLabel` already ran the host's
+                // label rule, so it is shown as is (one line); the body is
+                // never cut by the host.
+                let Some(message @ J::Obj(_)) = item.get("peerMessage") else {
+                    let text = str_field("fallbackText");
+                    return (
+                        text.to_string(),
+                        None,
+                        (!text.is_empty()).then(|| format!("\"itemKind\":{}", esc(kind))),
+                    );
+                };
+                let sender =
+                    sanitize_one_line(message.get("senderLabel").and_then(J::as_str).unwrap_or(""));
+                let title = if sender.is_empty() {
+                    "Message from another session".to_string()
+                } else {
+                    format!("Message from {sender}")
+                };
+                let body = message.get("body").and_then(J::as_str).unwrap_or("");
+                (
+                    title,
+                    (!body.is_empty()).then(|| body.to_string()),
+                    Some(format!(
+                        "\"itemKind\":\"peerMessage\",\"peerMessage\":{}",
+                        j_to_string(message)
+                    )),
+                )
+            }
+            "subagentInput" => {
+                // Muse 1.4.15: input the parent queued for, or delivered to,
+                // one of its subagents. The phase vocabulary is open and a
+                // client ignores a phase it does not know, so an unknown one
+                // renders no card.
+                let action = match str_field("inputPhase") {
+                    "queued" => "queued for",
+                    "delivered" => "delivered to",
+                    _ => return (String::new(), None, None),
+                };
+                let agent = Self::subagent_label(item);
+                let title = format!("Input {action} {agent}");
+                let text = str_field("text");
+                let content = if text.is_empty() {
+                    str_field("fallbackText")
+                } else {
+                    text
+                };
+                let facts: Vec<String> = ["inputPhase", "deliveredBeforeTurnEnd", "subagentId"]
+                    .into_iter()
+                    .filter_map(|key| {
+                        item.get(key)
+                            .filter(|v| !matches!(v, J::Null))
+                            .map(|v| format!("\"{key}\":{}", j_to_string(v)))
+                    })
+                    .collect();
+                (
+                    title,
+                    (!content.is_empty()).then(|| content.to_string()),
+                    Some(format!(
+                        "\"itemKind\":\"subagentInput\",\"subagentInput\":{{{}}}",
+                        facts.join(",")
+                    )),
+                )
+            }
+            "subagentResult" => {
+                // Muse 1.4.15: the parent consumed one subagent attempt's
+                // result. `resultStatus` is open and absent when the host
+                // had not seen the attempt's result; an unknown value is
+                // treated as absent.
+                let status = match str_field("resultStatus") {
+                    "completed" => Some("completed"),
+                    "failed" => Some("failed"),
+                    "cancelled" => Some("cancelled"),
+                    _ => None,
+                };
+                let agent = Self::subagent_label(item);
+                let title = match status {
+                    Some(status) => format!("Result from {agent} ({status})"),
+                    None => format!("Result from {agent}"),
+                };
+                let text = str_field("text");
+                let content = if text.is_empty() {
+                    str_field("fallbackText")
+                } else {
+                    text
+                };
+                let mut facts = Vec::new();
+                if let Some(status) = status {
+                    facts.push(format!("\"resultStatus\":{}", esc(status)));
+                }
+                if let Some(id) = item.get("subagentId").filter(|v| !matches!(v, J::Null)) {
+                    facts.push(format!("\"subagentId\":{}", j_to_string(id)));
+                }
+                (
+                    title,
+                    (!content.is_empty()).then(|| content.to_string()),
+                    Some(format!(
+                        "\"itemKind\":\"subagentResult\",\"subagentResult\":{{{}}}",
+                        facts.join(",")
+                    )),
                 )
             }
             _ => {
@@ -3044,6 +3241,40 @@ impl SessionFold {
         })
     }
 
+    /// Seed the monitor inbox from a resume snapshot's Muse 1.4.15
+    /// `SnapshotState.monitorInbox`: each retained admission with its
+    /// newest drain and void stamps. Live inbox notifications only describe
+    /// changes after the resume, so without this a resumed monitor card
+    /// showed no counts. Entries already known keep the later live facts.
+    pub fn seed_monitor_inbox(&mut self, entries: Option<&J>) {
+        let Some(J::Arr(entries)) = entries else {
+            return;
+        };
+        for entry in entries {
+            let Some(item_id) = entry.get("itemId").and_then(J::as_str) else {
+                continue;
+            };
+            if self.monitor_inbox.contains_key(item_id) {
+                continue;
+            }
+            let stamp = |key: &str| {
+                entry
+                    .get(key)
+                    .and_then(J::as_str)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            };
+            self.monitor_inbox.insert(
+                item_id.to_string(),
+                InboxItem {
+                    task_id: stamp("taskId"),
+                    drained_at: stamp("drainedAt"),
+                    voided_at: stamp("voidedAt"),
+                },
+            );
+        }
+    }
+
     /// Muse 1.4.11 monitor inbox lifecycle (`monitor/inboxItemAdmitted`,
     /// `...Drained`, `...Voided`). Each change updates the owning monitor's
     /// card with fresh `_meta.muse.monitorInbox` counts. A void is count-only
@@ -4341,6 +4572,219 @@ mod corpus_tests {
             assert!(fold.seed_async_task("sid", &row, &mut out), "{id}");
         }
         assert_eq!(out.len(), 3, "{out:?}");
+    }
+
+    #[test]
+    fn background_terminal_completions_show_the_1_4_15_exit_code_and_reason() {
+        let fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"btc-4","kind":"backgroundTerminalCompletion","status":"completed","backgroundTerminalCompletion":{"command":"make","output":"boom\n","outputTruncated":false,"terminalStatus":"failed","toolCallId":"call-m","exitCode":-2,"reason":"process exited\twith status 2"}}"#,
+        )
+        .unwrap();
+        let (title, content, meta) = fold.host_card_parts("backgroundTerminalCompletion", &item);
+        assert_eq!(title, "Background command failed: make");
+        assert_eq!(
+            content.as_deref(),
+            Some("boom\nExit code -2\nReason: process exited with status 2")
+        );
+        // The facts ride `_meta` verbatim, the new members included.
+        let meta = meta.unwrap();
+        assert!(meta.contains(r#""exitCode":-2"#), "{meta}");
+        assert!(
+            meta.contains(r#""reason":"process exited\twith status 2""#),
+            "{meta}"
+        );
+
+        // Each is absent when the terminal record carries none.
+        let bare = parse_json(
+            r#"{"itemId":"btc-5","kind":"backgroundTerminalCompletion","status":"completed","backgroundTerminalCompletion":{"command":"make","output":"","outputTruncated":false,"terminalStatus":"completed","toolCallId":"call-n","exitCode":0}}"#,
+        )
+        .unwrap();
+        let (_, content, _) = fold.host_card_parts("backgroundTerminalCompletion", &bare);
+        assert_eq!(content.as_deref(), Some("Exit code 0"));
+    }
+
+    #[test]
+    fn system_notices_render_their_text_level_and_routing_facts() {
+        let fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"n-1","kind":"systemNotice","status":"completed","turnId":null,"revision":1,"text":"2 skills failed to load\nskill-a: bad front matter\nskill-b: missing name","fallbackText":"2 skills failed to load","noticeOrigin":"skillsStartup","noticeSeverity":"warning","noticeKind":"skillLoadFailed","noticeSubject":{"id":"skills"}}"#,
+        )
+        .unwrap();
+        let (title, content, meta) = fold.host_card_parts("systemNotice", &item);
+        assert_eq!(title, "Warning: 2 skills failed to load");
+        assert_eq!(
+            content.as_deref(),
+            Some("2 skills failed to load\nskill-a: bad front matter\nskill-b: missing name")
+        );
+        assert_eq!(
+            meta.as_deref(),
+            Some(
+                r#""itemKind":"systemNotice","systemNotice":{"origin":"skillsStartup","severity":"warning","kind":"skillLoadFailed","subject":{"id":"skills"}}"#
+            )
+        );
+
+        // No level and no origin: neither is inferred, and a one-line text
+        // that is the title is not repeated as content.
+        let plain = parse_json(
+            r#"{"itemId":"n-2","kind":"systemNotice","status":"completed","text":"Monitor stopped"}"#,
+        )
+        .unwrap();
+        let (title, content, meta) = fold.host_card_parts("systemNotice", &plain);
+        assert_eq!(title, "Monitor stopped");
+        assert_eq!(content, None);
+        assert_eq!(
+            meta.as_deref(),
+            Some(r#""itemKind":"systemNotice","systemNotice":{}"#)
+        );
+
+        let error = parse_json(
+            r#"{"itemId":"n-3","kind":"systemNotice","status":"completed","text":"Hook failed","noticeSeverity":"error"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            fold.host_card_parts("systemNotice", &error).0,
+            "Error: Hook failed"
+        );
+
+        // Nothing to say renders no card.
+        let empty =
+            parse_json(r#"{"itemId":"n-4","kind":"systemNotice","status":"completed"}"#).unwrap();
+        assert_eq!(fold.host_card_parts("systemNotice", &empty).0, "");
+    }
+
+    #[test]
+    fn peer_messages_render_the_sender_and_the_whole_body() {
+        let fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"p-1","kind":"peerMessage","status":"completed","fallbackText":"Message from Fix login","peerMessage":{"senderLabel":"Fix login\u001b[31m","senderSessionId":"s-2","remote":false,"body":"Tests pass on my side.\nShip it?"}}"#,
+        )
+        .unwrap();
+        let (title, content, meta) = fold.host_card_parts("peerMessage", &item);
+        // The escape control character becomes a space, never a terminal command.
+        assert_eq!(title, "Message from Fix login [31m");
+        assert_eq!(content.as_deref(), Some("Tests pass on my side.\nShip it?"));
+        assert_eq!(
+            meta.as_deref(),
+            Some(
+                r#""itemKind":"peerMessage","peerMessage":{"senderLabel":"Fix login\u001b[31m","senderSessionId":"s-2","remote":false,"body":"Tests pass on my side.\nShip it?"}"#
+            )
+        );
+        let bare = parse_json(
+            r#"{"itemId":"p-2","kind":"peerMessage","status":"completed","fallbackText":"Peer message"}"#,
+        )
+        .unwrap();
+        assert_eq!(fold.host_card_parts("peerMessage", &bare).0, "Peer message");
+    }
+
+    #[test]
+    fn subagent_inputs_and_results_render_their_phase_and_status() {
+        let fold = SessionFold::new();
+        let delivered = parse_json(
+            r#"{"itemId":"i-1","kind":"subagentInput","status":"completed","subagentId":"sub-1","agentPath":"reviewer","inputPhase":"delivered","deliveredBeforeTurnEnd":true,"text":"Also check the docs."}"#,
+        )
+        .unwrap();
+        let (title, content, meta) = fold.host_card_parts("subagentInput", &delivered);
+        assert_eq!(title, "Input delivered to reviewer");
+        assert_eq!(content.as_deref(), Some("Also check the docs."));
+        assert_eq!(
+            meta.as_deref(),
+            Some(
+                r#""itemKind":"subagentInput","subagentInput":{"inputPhase":"delivered","deliveredBeforeTurnEnd":true,"subagentId":"sub-1"}"#
+            )
+        );
+        let queued = parse_json(
+            r#"{"itemId":"i-2","kind":"subagentInput","status":"completed","subagentId":"sub-1","inputPhase":"queued","fallbackText":"Queued for sub-1"}"#,
+        )
+        .unwrap();
+        let (title, content, _) = fold.host_card_parts("subagentInput", &queued);
+        assert_eq!(title, "Input queued for sub-1");
+        assert_eq!(content.as_deref(), Some("Queued for sub-1"));
+        // A client ignores a phase it does not know.
+        let future = parse_json(
+            r#"{"itemId":"i-3","kind":"subagentInput","status":"completed","inputPhase":"rerouted","fallbackText":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            fold.host_card_parts("subagentInput", &future),
+            (String::new(), None, None)
+        );
+
+        let result = parse_json(
+            r#"{"itemId":"r-1","kind":"subagentResult","status":"completed","subagentId":"sub-1","agentPath":"reviewer","resultStatus":"failed","text":"Could not reach the server."}"#,
+        )
+        .unwrap();
+        let (title, content, meta) = fold.host_card_parts("subagentResult", &result);
+        assert_eq!(title, "Result from reviewer (failed)");
+        assert_eq!(content.as_deref(), Some("Could not reach the server."));
+        assert_eq!(
+            meta.as_deref(),
+            Some(
+                r#""itemKind":"subagentResult","subagentResult":{"resultStatus":"failed","subagentId":"sub-1"}"#
+            )
+        );
+        // An unknown or absent status is treated as absent.
+        let unseen = parse_json(
+            r#"{"itemId":"r-2","kind":"subagentResult","status":"completed","resultStatus":"paused"}"#,
+        )
+        .unwrap();
+        let (title, _, meta) = fold.host_card_parts("subagentResult", &unseen);
+        assert_eq!(title, "Result from a subagent");
+        assert_eq!(
+            meta.as_deref(),
+            Some(r#""itemKind":"subagentResult","subagentResult":{}"#)
+        );
+    }
+
+    #[test]
+    fn a_background_target_rides_the_tool_card_and_is_cleared_when_it_goes() {
+        let mut fold = SessionFold::new();
+        let live = parse_json(
+            r#"{"itemId":"t-1","kind":"toolCall","backgroundTarget":{"toolCallId":"call-1","backgroundRequested":false,"foregroundWaitActive":true,"manualReleaseAdmissible":true}}"#,
+        )
+        .unwrap();
+        let fields = fold.tool_muse_fields("t-1", &live).unwrap();
+        assert!(
+            fields.contains(r#""backgroundTarget":{"toolCallId":"call-1","backgroundRequested":false,"foregroundWaitActive":true,"manualReleaseAdmissible":true}"#),
+            "{fields}"
+        );
+        // Settled: the member is omitted, which clients that merge `_meta`
+        // only see as an explicit null, once.
+        let settled = parse_json(r#"{"itemId":"t-1","kind":"toolCall"}"#).unwrap();
+        let fields = fold.tool_muse_fields("t-1", &settled).unwrap();
+        assert!(fields.contains(r#""backgroundTarget":null"#), "{fields}");
+        let fields = fold.tool_muse_fields("t-1", &settled).unwrap_or_default();
+        assert!(!fields.contains("backgroundTarget"), "{fields}");
+    }
+
+    #[test]
+    fn a_nested_subagent_names_its_parent_subagent() {
+        let item = parse_json(
+            r#"{"itemId":"sa-2","kind":"subagent","subagentId":"sub-2","parentSubagentId":"sub-1"}"#,
+        )
+        .unwrap();
+        let fields = SessionFold::item_muse_fields(&item).unwrap();
+        assert!(fields.contains(r#""parentSubagentId":"sub-1""#), "{fields}");
+    }
+
+    #[test]
+    fn a_resume_snapshot_seeds_the_monitor_inbox_counts() {
+        let mut fold = SessionFold::new();
+        fold.seed_monitor_inbox(Some(
+            &parse_json(
+                r#"[{"itemId":"in-1","taskId":"mon-1","body":"b","summary":"s","eventIndex":1,"eventKind":"line","queuedAt":"2026-11-10T10:00:00Z","showLines":true},
+                    {"itemId":"in-2","taskId":"mon-1","body":"b","summary":"s","eventIndex":2,"eventKind":"line","queuedAt":"2026-11-10T10:00:01Z","showLines":true,"drainedAt":"2026-11-10T10:01:00Z"},
+                    {"itemId":"in-3","taskId":"mon-1","body":"b","summary":"s","eventIndex":3,"eventKind":"line","queuedAt":"2026-11-10T10:00:02Z","showLines":true,"drainedAt":"2026-11-10T10:01:00Z","voidedAt":"2026-11-10T10:02:00Z"}]"#,
+            )
+            .unwrap(),
+        ));
+        assert_eq!(
+            fold.inbox_counts("mon-1").as_deref(),
+            Some(r#""monitorInbox":{"pending":1,"drained":1,"voided":1}"#)
+        );
+        // An older host sends no `monitorInbox`; nothing changes.
+        fold.seed_monitor_inbox(None);
+        assert!(fold.inbox_counts("mon-2").is_none());
     }
 
     #[test]

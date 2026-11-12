@@ -418,6 +418,7 @@ impl AcpSession {
             "attention",
             "resumedByClient",
             "spawnedBy",
+            "probeDegradedReason",
         ]))
     }
 }

@@ -25,12 +25,13 @@ To verify, run the focused fold and adapter tests named below, the full workspac
 - [x] (2026-11-12 18:10Z) Added `HOST_1415_FINGERPRINT`, the `SDK_SCHEMA_SHA256` byte pin, selftest and table rows in `src/compat.rs`; the corpus test no longer requires a manifest fingerprint.
 - [x] (2026-11-12 18:15Z) Added notification rows for `model/completed` and `turn/modelAttemptStarted` to `docs/event-compatibility.md`.
 - [x] (2026-11-12 18:20Z) Added the 1.4.15 builds to `.github/workflows/nightly.yml`.
-- [ ] Update `tests/protocol/PROVENANCE.md`.
-- [ ] Map the new item kinds, takeover approvals, decide errors, background-command exit facts, background target, parent subagent id, model-attempt start, view health, probe-degraded reason, model refusal, and monitor inbox seeding.
-- [ ] Record every 1.4.15 addition in the ROADMAP matrices and `tests/msp_140_field_matrix.rs`.
-- [ ] Fix `reasoning_selector_matches_the_live_model_catalog` for a catalog without the configured model.
-- [ ] Update README, CHANGELOG, and the 1.4.x adoption plan.
-- [ ] Run all gates and the live suite; commit; open the PR.
+- [x] (2026-11-12 18:25Z) Updated `tests/protocol/PROVENANCE.md`; committed milestone 1 as `635a76c`.
+- [x] (2026-11-12 19:10Z) Mapped the new item kinds, takeover approvals, decide errors, background-command exit facts, background target, parent subagent id, model-attempt start, view health, probe-degraded reason, model refusal, and monitor inbox seeding, with fold, main, and fake-host tests.
+- [x] (2026-11-12 19:30Z) Recorded every 1.4.15 addition in the ROADMAP tables and `tests/msp_140_field_matrix.rs`.
+- [x] (2026-11-12 19:35Z) Fixed `reasoning_selector_matches_the_live_model_catalog` for a catalog without the configured model; it passes on 1.4.14 and 1.4.15.
+- [x] (2026-11-12 19:45Z) Updated README, `docs/acp-extensions.md`, CHANGELOG, and the 1.4.x adoption plan.
+- [x] (2026-11-12 20:10Z) Ran fmt, Clippy, the workspace suite, selftest, npm, Python, shell, and smoke gates, and the live suite on 1.4.15 and 1.4.14.
+- [ ] Commit milestone 2, open the PR, and merge when CI is green.
 
 
 ## Surprises & Discoveries
@@ -47,6 +48,12 @@ To verify, run the focused fold and adapter tests named below, the full workspac
 
 - Observation: In this agent environment four live tests always fail for environmental reasons.
   Evidence: `an_approved_shell_command_runs_and_a_rejected_one_does_not`, `a_piped_shell_command_asks_with_every_stage`, `auto_review_decides_a_shell_approval_against_a_real_host`, and `monitor_feed_reaches_a_real_host` fail on 1.4.14 and 1.4.15 alike with `bwrap: Can't mount devpts on /newroot/dev/pts: Permission denied`, because the tool sandbox forbids user namespaces.
+
+- Observation: Two rename live tests fail under full-suite load on 1.4.14 in this environment, before and after this work.
+  Evidence: `rename_drives_a_real_host_across_the_capability_registry` and `real_host_without_generated_pair_keeps_it_unpublished` failed with the host's `commandRejected naming_unavailable` (or `CanonicalRefreshMismatch`) in both of two full runs at `3da2491`, before the workspace-trust change, and pass when run alone on both versions. They passed in every 1.4.15 run.
+
+- Observation: The fold already had the turn-scoped clear the model-attempt start needs.
+  Evidence: `SessionFold::clear_model_retry(acp_sid, Some(turn), out)` withdraws a hint only for that turn, so `turn/modelAttemptStarted` reuses it and no new fold method was added.
 
 - Observation: No live sample of the four new item kinds was obtainable.
   Evidence: none of `systemNotice`, `peerMessage`, `subagentInput`, or `subagentResult` appears in any live run or in the SDK transcripts, and Muse 1.4.15 exposes no session tool that spawns a subagent directly. Their cards are built only from schema-documented fields, with the host's `fallbackText` as the title fallback.
@@ -103,7 +110,11 @@ To verify, run the focused fold and adapter tests named below, the full workspac
 ## Outcomes & Retrospective
 
 
-Not yet complete.
+The adapter now classifies Muse 1.4.15 as tested (`selftest` prints tested `sdk-manifest` and `host-1.4.15` rows for `sha256:ef311d2d...`, and a live 1.4.15 adapter logs `status=tested`), the corpus is SDK `07e1548`, and the nightly matrix carries the 1.4.15 builds. Every 1.4.15 method, notification, error, capability, definition, and field has a disposition, enforced by the notification-matrix test and `tests/msp_140_field_matrix.rs`. Editors get cards for system notices, peer messages, subagent inputs, and consumed subagent results; a takeover prompt that names the holding session; explained takeover decide refusals; an earlier model-retry clear; background-command exit facts; and the new `_meta.muse` facts.
+
+Validation on Rust 1.99.1: 283 adapter unit tests, 464 adapter integration tests, all other workspace suites, 9 field-matrix tests, Clippy with warnings denied, formatting, selftest, 4 npm launcher tests, 43 Python tests (6 platform skips), shell syntax, and npm smoke. Live loopback against 1.4.15-R8339.1: 48 of 52, the four failures being the sandbox-bound shell and monitor tests. Against 1.4.14-R7309.1 the same four fail plus, under load, the two rename tests that fail identically before this work.
+
+What remains: the four new item kinds were mapped from the schema alone, so their cards should be checked against a real 1.4.15 session that produces them; the subagent card still shows its `drained` line beside a `subagentResult` card rather than drawing one or the other.
 
 
 ## Context and Orientation
@@ -192,7 +203,7 @@ Nightly checksums from the release manifest:
 ## Interfaces and Dependencies
 
 
-No new dependency. `src/compat.rs` gains `pub const HOST_1415_FINGERPRINT`, `SDK_MANIFEST_FINGERPRINT` aliases it, and `pub const SDK_SCHEMA_SHA256` pins the bundle bytes. `src/fold.rs` gains `pub fn seed_monitor_inbox(&mut self, entries: &J)` and `pub fn on_model_attempt_started(&mut self, acp_sid: &str, turn_id: &str, out: &mut Vec<Note>)`. The ACP-visible additions are `_meta.muse.systemNotice`, `peerMessage`, `subagentInput`, `subagentResult`, `holder`, `backgroundTarget`, `parentSubagentId`, `probeDegradedReason`, and `modelIdRefusal`.
+No new dependency. `src/compat.rs` gains `pub const HOST_1415_FINGERPRINT`, `SDK_MANIFEST_FINGERPRINT` aliases it, and `pub const SDK_SCHEMA_SHA256` pins the bundle bytes. `src/fold.rs` gains `pub fn seed_monitor_inbox(&mut self, entries: Option<&J>)`; `turn/modelAttemptStarted` reuses the existing `clear_model_retry`. `src/main.rs` gains `takeover_holder_text`, `approval_failure_text`, and `resume_result_meta` (which replaces `blocked_prompt_meta`), and `session_info_row` takes the host row and reads `LIST_ROW_FACTS`. The ACP-visible additions are `_meta.muse.systemNotice`, `peerMessage`, `subagentInput`, `subagentResult`, `holder`, `backgroundTarget`, `parentSubagentId`, `probeDegradedReason`, and `modelIdRefusal`.
 
 
 ## Change Notes

@@ -3186,6 +3186,61 @@ fn reviewer_reason_is_visible_and_preserved_as_permission_metadata() {
 }
 
 #[test]
+fn a_computer_use_takeover_prompt_names_the_holder() {
+    // Muse 1.4.15: the prompt names the session holding Computer Use instead
+    // of the internal `cua_setup` tool, says when it took and last used the
+    // lock, keeps the host's "Take over" / "Keep" choices, and carries the
+    // holder verbatim in metadata.
+    for ver in [1, 2] {
+        let mut c = Client::spawn(
+            "approval",
+            &[
+                ("FAKE_APPROVAL_SUBJECT", "computer-use-takeover"),
+                ("FAKE_DECIDE_ERROR", "resolving"),
+            ],
+        );
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "set up computer use");
+        let perm = c.wait_for("request_permission", Duration::from_secs(15));
+        let reply: serde_json::Value = serde_json::from_str(&perm).expect("permission JSON");
+        let params = &reply["params"];
+        let tool_call = if params["subject"]["toolCall"].is_object() {
+            &params["subject"]["toolCall"]
+        } else {
+            &params["toolCall"]
+        };
+        assert_eq!(
+            tool_call["title"], "Take over Computer Use from Fix login flow",
+            "v{ver}: {perm}"
+        );
+        assert_eq!(
+            tool_call["content"][0]["content"]["text"],
+            "Computer Use is in use by `Fix login flow`. It took Computer Use at 2026-08-07T18:02:11Z and last used it at 2026-08-07T18:40:57Z.",
+            "v{ver}: {perm}"
+        );
+        assert_eq!(
+            tool_call["_meta"]["muse"]["holder"]["sessionLabel"], "Fix login flow",
+            "v{ver}: {perm}"
+        );
+        assert!(
+            perm.contains("Take over") && perm.contains("Keep"),
+            "{perm}"
+        );
+        // Choosing "Take over" while Muse is already resolving the takeover
+        // is refused with -32059; the user is told why.
+        let permission_id = extract_str(&perm, "id").unwrap();
+        c.raw(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":\"{permission_id}\",\"result\":{{\"outcome\":{{\"outcome\":\"selected\",\"optionId\":\"allow_once\"}}}}}}"
+        ));
+        c.wait_for(
+            "Muse is already resolving the Computer Use takeover ap-1, so this decision was not applied.",
+            Duration::from_secs(15),
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn mcp_tool_permission_title_comes_from_the_subject() {
     // #239: Muse 1.4.6 omits top-level toolName/toolCallId for MCP tools;
     // the name is only subject.toolName, and the card is found by itemId.
@@ -4299,6 +4354,44 @@ fn turn_retry_then_completed_settles_once_as_end_turn() {
 }
 
 #[test]
+fn a_model_attempt_start_withdraws_the_retry_hint() {
+    // Muse 1.4.15: the attempt that a scheduled retry waited for has started,
+    // so the backoff hint goes away then, not only at the turn's terminal.
+    // An attempt start with no hint showing changes nothing.
+    let mut c = Client::spawn("model_attempt_after_retry", &[]);
+    let sid = c.new_session(1, "");
+    let pid = c.prompt(&sid, "hi");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let log = c
+        .frames
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .join("\n");
+    let at = |needle: &str| {
+        log.find(needle)
+            .unwrap_or_else(|| panic!("missing {needle}: {log}"))
+    };
+    let hint = at("\"modelRetry\":{\"turnId\":\"turn-1\",\"attempt\":1");
+    let cleared = at("\"modelRetry\":null");
+    let reply = at("second attempt answered");
+    assert!(
+        hint < cleared && cleared < reply,
+        "the hint clears when the retried attempt starts: {log}"
+    );
+    assert_eq!(
+        log.matches("\"modelRetry\":null").count(),
+        1,
+        "one withdrawal, none for the first attempt or the terminal: {log}"
+    );
+    let stderr = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        !stderr.contains("unhandled MSP notification: turn/modelAttemptStarted"),
+        "the event is handled, not unhandled: {stderr}"
+    );
+    c.finish();
+}
+
+#[test]
 fn turn_model_retry_is_surfaced_and_the_turn_still_settles_once() {
     // The 1.4.8 model-layer retry is non-terminal: the prompt stays open
     // while the retry hint reaches the editor, the later completion settles
@@ -5406,10 +5499,15 @@ fn host_session_metadata_populates_rows_and_live_title_updates() {
         "Muse 1.4.14 provenance is preserved on the row: {listed}"
     );
     assert!(
+        listed.contains("\"probeDegradedReason\":\"skippedUntrusted\""),
+        "Muse 1.4.15's probe reason is preserved on the row: {listed}"
+    );
+    assert!(
         !listed.contains("\"driveHolder\"")
             && !listed.contains("\"itemCount\"")
-            && !listed.contains("\"logBytes\""),
-        "metadata-only session sizing and drive-holder facts stay out of ACP rows: {listed}"
+            && !listed.contains("\"logBytes\"")
+            && !listed.contains("\"externalWait\""),
+        "metadata-only session sizing, drive-holder, and external-wait facts stay out of ACP rows: {listed}"
     );
 
     let _pid = c.prompt(&sid, "transcript text must not become a title");
@@ -8876,10 +8974,28 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 }
 
 #[test]
-fn sdk_manifest_fingerprint_is_the_1_4_14_surface() {
-    // The vendored SDK manifest (a45cb67) publishes the Muse 1.4.14 surface,
-    // and the stable 1.4.14-R7309.1 build in the nightly live-host matrix
-    // reports it, so the adapter classifies it as tested.
+fn sdk_manifest_fingerprint_is_the_1_4_15_surface() {
+    // The vendored SDK corpus (07e1548) is the Muse 1.4.15 surface, and the
+    // stable 1.4.15-R8339.1 build in the nightly live-host matrix reports
+    // this digest, so the adapter classifies it as tested.
+    let mut c = Client::spawn(
+        "quiet",
+        &[(
+            "FAKE_FINGERPRINT",
+            "sha256:ef311d2dbf051ed9114556e14ad3980eb515104baa3409306a6817082a61d8cd",
+        )],
+    );
+    c.initialize(1, "");
+    c.wait_stderr("status=tested", Duration::from_secs(10));
+    c.wait_stderr(
+        "validated against live host 1.4.15-R8339.1; the vendored SDK 07e1548 surface",
+        Duration::from_secs(10),
+    );
+    c.finish();
+}
+
+#[test]
+fn the_1_4_14_fingerprint_stays_tested() {
     let mut c = Client::spawn(
         "quiet",
         &[(
@@ -8890,7 +9006,7 @@ fn sdk_manifest_fingerprint_is_the_1_4_14_surface() {
     c.initialize(1, "");
     c.wait_stderr("status=tested", Duration::from_secs(10));
     c.wait_stderr(
-        "validated against live host 1.4.14-R7309.1; the vendored SDK a45cb67 surface",
+        "validated against live host 1.4.14-R7309.1; the previously vendored SDK a45cb67 surface",
         Duration::from_secs(10),
     );
     c.finish();

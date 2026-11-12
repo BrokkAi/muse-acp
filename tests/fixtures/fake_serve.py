@@ -53,6 +53,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   retry_then_completed turn/retryScheduled, then a normal completion
   model_retry_then_completed turn/modelRetryScheduled (unknown errorKind, no
                httpStatus/system), then a normal completion
+  model_attempt_after_retry turn/modelAttemptStarted, a model retry, then
+               the attempt start that ends its backoff (Muse 1.4.15)
   foreground_then_completed turn/foregroundCompleted (background checks hold
                         the turn open), then a normal completion
   message_phase commentary then unknown-phase agentMessage completions,
@@ -387,6 +389,23 @@ if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "computer-use-data":
              "mask": {"prefix": "sk-", "last4": "abcd"}},
         ],
     }
+if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "computer-use-takeover":
+    # Muse 1.4.15's takeover of the Computer Use lock, as the SDK's
+    # computer-use-takeover-approve transcript publishes it.
+    APPROVAL_PARAMS["toolName"] = "cua_setup"
+    APPROVAL_PARAMS["rawArgs"] = json.dumps({"action": "start"})
+    APPROVAL_PARAMS["subject"] = {
+        "kind": "computerUseTakeover", "toolName": "cua_setup",
+        "holder": {"sessionLabel": "Fix login flow",
+                   "acquiredAt": "2026-08-07T18:02:11Z",
+                   "lastActivityAt": "2026-08-07T18:40:57Z"},
+    }
+    APPROVAL_PARAMS["availableChoices"] = [
+        {"choiceId": "allow_once", "label": "Take over",
+         "decision": "approved", "scope": "once"},
+        {"choiceId": "abort", "label": "Keep",
+         "decision": "abort", "scope": "once", "acceptsFeedback": True},
+    ]
 if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "tool-described":
     # A tool subject with no tool name anywhere, only a description.
     APPROVAL_PARAMS.pop("toolName", None)
@@ -756,6 +775,10 @@ def session_obj(session_id=None, workspace_root=None):
                 "driveHolder": {"name": "holder", "version": "1.0"},
                 "itemCount": 9,
                 "logBytes": 12345,
+                # Muse 1.4.15: why the workspace status probe gave no
+                # reading, and a live external wait (read-only member).
+                "probeDegradedReason": "skippedUntrusted",
+                "externalWait": {"reason": "CI run"},
             })
         elif session_id == "msp-sess-old":
             session.update({
@@ -1912,6 +1935,27 @@ def on_turn_start(params):
             "status": "completed", "text": "recovered"}})
         notify("turn/completed", {**base, "terminal": "completed"})
         model_retry(2, "cur-mr-stale")
+    elif SCENARIO == "model_attempt_after_retry":
+        # Muse 1.4.15: `turn/modelAttemptStarted` opens each model attempt.
+        # The first one comes before any retry and changes nothing; the one
+        # after a scheduled retry ends that backoff, so its hint goes away
+        # before the reply streams.
+        def attempt_started(cursor):
+            record = {"id": f"ev-{cursor}", "sequence": 1}
+            notify("turn/modelAttemptStarted", {**base, "viewCursor": cursor,
+                                                "sourceRange": {"first": record,
+                                                                "last": record,
+                                                                "stream": {"id": "st-1",
+                                                                           "kind": "session"}}})
+        attempt_started("cur-ma-1")
+        notify("turn/modelRetryScheduled", {**base, "attempt": 1, "nextAttempt": 2,
+                                           "maxAttempts": 4, "retryDelayMs": 1500,
+                                           "viewCursor": "cur-ma-retry"})
+        attempt_started("cur-ma-2")
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-ma", "kind": "agentMessage",
+            "status": "completed", "text": "second attempt answered"}})
+        notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "foreground_then_completed":
         # Foreground completion is non-terminal: background reminder checks
         # still hold the turn open, so only the later completion settles.
@@ -3376,6 +3420,17 @@ def main():
                                     "data": {"kind": "commandRejected",
                                              "commandId": command,
                                              "reason": reason,
+                                             "retryable": False}}})
+                    continue
+                if (method == "approval/decide"
+                        and os.environ.get("FAKE_DECIDE_ERROR", "") == "resolving"):
+                    # Muse 1.4.15: a takeover already waiting on the
+                    # Computer Use lock broker refuses a further decide.
+                    log_input(msg.get("params", {}))
+                    send({"jsonrpc": "2.0", "id": ident,
+                          "error": {"code": -32059,
+                                    "message": "approval is resolving",
+                                    "data": {"kind": "approvalResolving",
                                              "retryable": False}}})
                     continue
                 if (method == "session/start"
