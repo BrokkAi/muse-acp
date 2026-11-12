@@ -31,7 +31,9 @@ To verify, run the focused fold and adapter tests named below, the full workspac
 - [x] (2026-11-12 19:35Z) Fixed `reasoning_selector_matches_the_live_model_catalog` for a catalog without the configured model; it passes on 1.4.14 and 1.4.15.
 - [x] (2026-11-12 19:45Z) Updated README, `docs/acp-extensions.md`, CHANGELOG, and the 1.4.x adoption plan.
 - [x] (2026-11-12 20:10Z) Ran fmt, Clippy, the workspace suite, selftest, npm, Python, shell, and smoke gates, and the live suite on 1.4.15 and 1.4.14.
-- [ ] Commit milestone 2, open the PR, and merge when CI is green.
+- [x] (2026-11-12 20:20Z) Committed milestone 2 (`696bbc2`) and opened PR #466; CI green.
+- [x] (2026-11-12 21:05Z) Fixed the Windows CRLF schema-hash failure the branch nightly found (`c55c02e`); filed #467-#471 for the remaining work.
+- [ ] Merge PR #466 (needs a maintainer).
 
 
 ## Surprises & Discoveries
@@ -114,7 +116,7 @@ The adapter now classifies Muse 1.4.15 as tested (`selftest` prints tested `sdk-
 
 Validation on Rust 1.99.1: 283 adapter unit tests, 464 adapter integration tests, all other workspace suites, 9 field-matrix tests, Clippy with warnings denied, formatting, selftest, 4 npm launcher tests, 43 Python tests (6 platform skips), shell syntax, and npm smoke. Live loopback against 1.4.15-R8339.1: 48 of 52, the four failures being the sandbox-bound shell and monitor tests. Against 1.4.14-R7309.1 the same four fail plus, under load, the two rename tests that fail identically before this work.
 
-What remains: the four new item kinds were mapped from the schema alone, so their cards should be checked against a real 1.4.15 session that produces them; the subagent card still shows its `drained` line beside a `subagentResult` card rather than drawing one or the other.
+What remains is tracked in issues. A real 1.4.15 `subagentInput` was captured after the PR opened: it carries only `subagentId`, so the card should name the subagent by its known role (#467). Muse's own docs say a `systemNotice` renders `text` and uses `fallbackText` only for an unknown origin (#468). No real 1.4.15 flow tried emits `systemNotice`, `subagentResult`, or `peerMessage` (#469). The subagent card's `drained` line should give way to `subagentResult` cards (#470). The 1.4.14 rename live tests flake under full-suite load, as they did before this work (#471). The Windows nightly found that a CRLF checkout changed the pinned schema hash; the test now hashes the LF bytes.
 
 
 ## Context and Orientation
