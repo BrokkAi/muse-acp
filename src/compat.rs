@@ -671,8 +671,14 @@ mod corpus_tests {
         if let Some(fingerprint) = manifest.get("fingerprint") {
             assert_eq!(fingerprint.as_str(), Some(SDK_MANIFEST_FINGERPRINT));
         }
-        let schema =
-            std::fs::read(protocol_path("stable/msp.schema.json")).expect("vendored schema bundle");
+        // A Windows checkout may turn the bundle's LF line endings into CRLF.
+        // The JSON escapes every carriage return inside a string, so a raw CR
+        // byte only comes from that conversion; hash the upstream LF bytes.
+        let schema: Vec<u8> = std::fs::read(protocol_path("stable/msp.schema.json"))
+            .expect("vendored schema bundle")
+            .into_iter()
+            .filter(|byte| *byte != b'\r')
+            .collect();
         assert_eq!(
             crate::sha256::hex(&schema),
             SDK_SCHEMA_SHA256,
