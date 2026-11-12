@@ -1,0 +1,56 @@
+name: stress-forced-shutdown
+
+# Temporary verification for BrokkAi/muse-acp#463 (not for master): run the
+# acp_serve suite repeatedly on windows-2025, where the forced-shutdown
+# settings-view race failed nightly, before and after BrokkAi/muse-acp#464.
+on:
+  push:
+    branches: ['claude/nifty-cerf-vd2821']
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    name: stress (${{ matrix.label }}, shard ${{ matrix.shard }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: before-fix, ref: 517b12e769e23dc78e79a944ddb16381cec63fa5, shard: 1 }
+          - { label: before-fix, ref: 517b12e769e23dc78e79a944ddb16381cec63fa5, shard: 2 }
+          - { label: before-fix, ref: 517b12e769e23dc78e79a944ddb16381cec63fa5, shard: 3 }
+          - { label: with-fix, ref: 6b1af9047c2324ec60a7c6788e23e489de71f049, shard: 1 }
+          - { label: with-fix, ref: 6b1af9047c2324ec60a7c6788e23e489de71f049, shard: 2 }
+          - { label: with-fix, ref: 6b1af9047c2324ec60a7c6788e23e489de71f049, shard: 3 }
+    runs-on: windows-2025
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - run: cargo test --locked -p muse-acp --test acp_serve --no-run
+      - name: run acp_serve 8 times
+        shell: bash
+        run: |
+          target=0
+          suite=0
+          for i in $(seq 1 8); do
+            cargo test --locked -p muse-acp --test acp_serve > run.log 2>&1 || true
+            if grep -q "auto_review_settings_are_cleaned_up_on_forced_shutdown \.\.\. FAILED" run.log; then
+              target=$((target + 1))
+              grep -A4 "forced shutdown left temporary settings" run.log || true
+            fi
+            if grep -q "^test result: FAILED" run.log; then
+              suite=$((suite + 1))
+              grep -E "^test .* FAILED$" run.log || true
+            fi
+            echo "iteration $i: target failures so far $target, failed suites so far $suite"
+          done
+          echo "${{ matrix.label }} shard ${{ matrix.shard }}: forced-shutdown test failed $target/8; suite failed $suite/8" >> "$GITHUB_STEP_SUMMARY"
+          test "$target" -eq 0
