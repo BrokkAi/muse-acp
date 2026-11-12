@@ -712,6 +712,10 @@ impl Core {
     }
 
     fn terminate(&self) {
+        // Terminating kills the host, so a concurrent `force_stop` must see
+        // the client as closing; otherwise it abandons any settings view
+        // while this kill is still running.
+        self.close_started.store(true, Ordering::SeqCst);
         match &self.end {
             End::Process(process) => kill_and_reap(
                 &mut process.child.lock().unwrap_or_else(|p| p.into_inner()),
@@ -894,6 +898,9 @@ impl Core {
     }
 
     fn force_stop(&self) -> bool {
+        // A forced stop closes the host too, so a concurrent watchdog must
+        // see the client as closing while this kill runs.
+        self.close_started.store(true, Ordering::SeqCst);
         let process = match &self.end {
             End::Process(process) => process,
             End::Custom(terminate) => {
