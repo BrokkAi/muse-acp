@@ -179,17 +179,44 @@ pub const HOST_1413_FINGERPRINT: &str =
 /// surface. Over 1.4.13 it is purely additive, with the method,
 /// notification, request, error, and capability tables unchanged. The stable
 /// 1.4.14-R7309.1 build exports this exact bundle and reports this digest;
-/// both adapter and standalone MSP live suites pass against it.
+/// both adapter and standalone MSP live suites pass against it. The vendored
+/// corpus has since moved to the 1.4.15 surface.
 pub const HOST_1414_FINGERPRINT: &str =
     "sha256:c94c3d1f2f51e6424074b9ec43eac3eedcf532d3dcd77351ec1383a87d3049c6";
 
-/// Fingerprint published by the vendored Muse SDK manifest at revision
-/// `a45cb67` (schema version 1), which describes the Muse 1.4.14 stable
-/// surface. The vendored bundle is the SDK's own stable export for that
-/// release, so the constant aliases [`HOST_1414_FINGERPRINT`]: one table
-/// entry and one match arm cover both the manifest check in `corpus_tests`
-/// and the `sdk-manifest` row in [`selftest_lines`].
-pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_1414_FINGERPRINT;
+/// Stable-surface fingerprint of the Muse 1.4.15 surface (schema version 1).
+/// The SDK's `07e1548` pin (2026-11-10, "remirror: 1.4.15") publishes this
+/// surface, and the stable 1.4.15-R8339.1 build exports a byte-identical
+/// bundle. The SDK manifest no longer carries the digest (the SDK derives it
+/// from the schema bytes at build), so this value is the one a live 1.4.15
+/// handshake reports and the one the official 1.4.15-R8339.1 release
+/// manifest publishes as `msp_schema_fingerprint`. Over 1.4.14 the surface
+/// is purely additive: the `model/complete`, `model/cancel`,
+/// `session/declareExternalWait`, `session/clearExternalWait`, and
+/// `subagent/list` methods, the `model/completed` and
+/// `turn/modelAttemptStarted` notifications, the `approvalBrokerUnavailable`
+/// and `approvalResolving` errors, the `systemNotice`, `peerMessage`,
+/// `subagentInput`, and `subagentResult` item kinds, the Computer Use
+/// takeover approval, and field additions, with nothing removed or newly
+/// required.
+pub const HOST_1415_FINGERPRINT: &str =
+    "sha256:ef311d2dbf051ed9114556e14ad3980eb515104baa3409306a6817082a61d8cd";
+
+/// Fingerprint of the stable surface vendored from the Muse SDK at revision
+/// `07e1548` (schema version 1), the Muse 1.4.15 surface. The vendored
+/// bundle is the SDK's own stable export for that release, so the constant
+/// aliases [`HOST_1415_FINGERPRINT`]: one table entry and one match arm
+/// cover both the corpus check in `corpus_tests` and the `sdk-manifest` row
+/// in [`selftest_lines`].
+pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_1415_FINGERPRINT;
+
+/// SHA-256 of the vendored `tests/protocol/stable/msp.schema.json` bytes.
+/// Since SDK `07e1548` the manifest carries no fingerprint, so the corpus
+/// test pins the bundle bytes instead: a re-pin that forgets to move
+/// [`SDK_MANIFEST_FINGERPRINT`] still fails there.
+#[cfg(test)]
+pub const SDK_SCHEMA_SHA256: &str =
+    "66a8840d5768fc2fce6b5ad764aedbdd259da95cd849f587278a206a596537ee";
 
 /// Fingerprint embedded in the SDK conformance-transcript fixtures. It is
 /// deliberately distinct from every host fingerprint and must never be
@@ -287,7 +314,11 @@ fn table_entry(fingerprint: &str) -> Option<(Status, &'static str)> {
         ),
         HOST_1414_FINGERPRINT => (
             Status::Tested,
-            "validated against live host 1.4.14-R7309.1; the vendored SDK a45cb67 surface",
+            "validated against live host 1.4.14-R7309.1; the previously vendored SDK a45cb67 surface",
+        ),
+        HOST_1415_FINGERPRINT => (
+            Status::Tested,
+            "validated against live host 1.4.15-R8339.1; the vendored SDK 07e1548 surface",
         ),
         TRANSCRIPT_FIXTURE_FINGERPRINT => (
             Status::Fixture,
@@ -359,6 +390,7 @@ pub fn selftest_lines(adapter_version: &str) -> Vec<String> {
         (HOST_1412_FINGERPRINT, "host-1.4.12"),
         (HOST_1413_FINGERPRINT, "host-1.4.13"),
         (HOST_1414_FINGERPRINT, "host-1.4.14"),
+        (HOST_1415_FINGERPRINT, "host-1.4.15"),
         (TRANSCRIPT_FIXTURE_FINGERPRINT, "transcript-fixture"),
     ] {
         let c = classify(Some(SUPPORTED_SCHEMA_VERSION), fp);
@@ -384,16 +416,16 @@ mod tests {
     }
 
     #[test]
-    fn sdk_manifest_surface_is_the_1_4_14_surface() {
-        // The vendored SDK manifest (a45cb67) publishes the Muse 1.4.14
-        // surface, and the stable 1.4.14-R7309.1 build in the live-host
-        // matrix reports this digest, so the surface classifies as tested.
+    fn sdk_manifest_surface_is_the_1_4_15_surface() {
+        // The vendored SDK corpus (07e1548) is the Muse 1.4.15 surface, and
+        // the stable 1.4.15-R8339.1 build in the live-host matrix reports
+        // this digest, so the surface classifies as tested.
         assert_eq!(
             SDK_MANIFEST_FINGERPRINT,
-            "sha256:c94c3d1f2f51e6424074b9ec43eac3eedcf532d3dcd77351ec1383a87d3049c6"
+            "sha256:ef311d2dbf051ed9114556e14ad3980eb515104baa3409306a6817082a61d8cd"
         );
-        assert_eq!(SDK_MANIFEST_FINGERPRINT, HOST_1414_FINGERPRINT);
-        assert_ne!(SDK_MANIFEST_FINGERPRINT, HOST_1413_FINGERPRINT);
+        assert_eq!(SDK_MANIFEST_FINGERPRINT, HOST_1415_FINGERPRINT);
+        assert_ne!(SDK_MANIFEST_FINGERPRINT, HOST_1414_FINGERPRINT);
         let c = classify(Some(1), SDK_MANIFEST_FINGERPRINT);
         assert_eq!(c.status, Status::Tested);
         assert!(!c.is_fatal());
@@ -529,7 +561,18 @@ mod tests {
         assert_eq!(c.status, Status::Tested);
         assert_eq!(
             c.detail,
-            "validated against live host 1.4.14-R7309.1; the vendored SDK a45cb67 surface"
+            "validated against live host 1.4.14-R7309.1; the previously vendored SDK a45cb67 surface"
+        );
+        assert!(!c.is_fatal());
+    }
+
+    #[test]
+    fn host_1415_fingerprint_is_tested() {
+        let c = classify(Some(1), HOST_1415_FINGERPRINT);
+        assert_eq!(c.status, Status::Tested);
+        assert_eq!(
+            c.detail,
+            "validated against live host 1.4.15-R8339.1; the vendored SDK 07e1548 surface"
         );
         assert!(!c.is_fatal());
     }
@@ -577,7 +620,7 @@ mod tests {
         let lines = selftest_lines("0.2.5");
         assert!(lines[0].contains("adapter=0.2.5"));
         assert!(lines[0].contains("host=offline"));
-        assert_eq!(lines.len(), 19);
+        assert_eq!(lines.len(), 20);
         assert!(lines.iter().any(|l| l.contains("kind=sdk-manifest")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.2.1")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.3.0")));
@@ -594,13 +637,14 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.12")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.13")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.14")));
+        assert!(lines.iter().any(|l| l.contains("kind=host-1.4.15")));
         assert!(lines.iter().any(|l| l.contains("kind=transcript-fixture")));
     }
 }
 
 #[cfg(test)]
 mod corpus_tests {
-    use super::{SDK_MANIFEST_FINGERPRINT, SUPPORTED_SCHEMA_VERSION};
+    use super::{SDK_MANIFEST_FINGERPRINT, SDK_SCHEMA_SHA256, SUPPORTED_SCHEMA_VERSION};
     use crate::json::parse_json;
     use std::collections::BTreeSet;
 
@@ -621,11 +665,25 @@ mod corpus_tests {
         let text = std::fs::read_to_string(protocol_path("stable/manifest.json"))
             .expect("vendored manifest");
         let manifest = parse_json(&text).expect("manifest JSON");
-        let fingerprint = manifest
-            .get("fingerprint")
-            .and_then(|v| v.as_str())
-            .expect("manifest fingerprint");
-        assert_eq!(fingerprint, SDK_MANIFEST_FINGERPRINT);
+        // SDK manifests before 07e1548 carried the fingerprint; since then the
+        // SDK derives it from the schema bytes at build. Check it when present,
+        // and always pin the bundle bytes the fingerprint was recorded for.
+        if let Some(fingerprint) = manifest.get("fingerprint") {
+            assert_eq!(fingerprint.as_str(), Some(SDK_MANIFEST_FINGERPRINT));
+        }
+        // A Windows checkout may turn the bundle's LF line endings into CRLF.
+        // The JSON escapes every carriage return inside a string, so a raw CR
+        // byte only comes from that conversion; hash the upstream LF bytes.
+        let schema: Vec<u8> = std::fs::read(protocol_path("stable/msp.schema.json"))
+            .expect("vendored schema bundle")
+            .into_iter()
+            .filter(|byte| *byte != b'\r')
+            .collect();
+        assert_eq!(
+            crate::sha256::hex(&schema),
+            SDK_SCHEMA_SHA256,
+            "the vendored schema changed: re-pin SDK_MANIFEST_FINGERPRINT and SDK_SCHEMA_SHA256"
+        );
         let version = manifest
             .get("schemaVersion")
             .and_then(|v| v.as_u64())

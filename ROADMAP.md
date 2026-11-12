@@ -9,12 +9,14 @@ access, and useful in real editor workflows.
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
-- **Reference snapshots used for this revision:** Muse SDK `a45cb67`
-  (2026-10-29; stable schema version 1, manifest fingerprint
-  `sha256:c94c3d1f2f51e6424074b9ec43eac3eedcf532d3dcd77351ec1383a87d3049c6`,
-  the Muse 1.4.14 stable surface; the SDK's own export, validated against the
-  stable 1.4.14-R7309.1 build and pinned in the live-host matrix, whose own
-  `muse schema generate-json-schema` export is byte-identical to it)
+- **Reference snapshots used for this revision:** Muse SDK `07e1548`
+  (2026-11-10; stable schema version 1, fingerprint
+  `sha256:ef311d2dbf051ed9114556e14ad3980eb515104baa3409306a6817082a61d8cd`,
+  the Muse 1.4.15 stable surface; the SDK's own export, validated against the
+  stable 1.4.15-R8339.1 build and pinned in the live-host matrix, whose own
+  `muse schema generate-json-schema` export is byte-identical to it. The SDK
+  manifest no longer carries the fingerprint; the value is the live
+  handshake's and the release manifest's)
   and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
@@ -101,7 +103,9 @@ the verdict into richer support bundles.
   fingerprint that Muse 1.4.10 carries unchanged, the `22a8a56` pin after
   that published the 1.4.11 fingerprint, the `09d67ec` pin after that
   published the 1.4.12 fingerprint, the `3dce908` pin published the 1.4.13
-  fingerprint, and the current `a45cb67` pin publishes the 1.4.14 fingerprint.
+  fingerprint, the `a45cb67` pin published the 1.4.14 fingerprint, and the
+  current `07e1548` pin publishes the 1.4.15 surface, whose fingerprint
+  the SDK manifest no longer carries.
   Host 1.2.1 reports
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
@@ -248,7 +252,19 @@ the verdict into richer support bundles.
   `1.4.14-R7309.1` binary exports the same bundle, reports the same
   fingerprint, and passes both live suites; its Linux, macOS, and Windows
   artifacts are pinned in the nightly matrix. Every new definition and field
-  has a §9 disposition. Before 1.4.6, the
+  has a §9 disposition.
+  The `07e1548` pin publishes the 1.4.15 surface
+  (`sha256:ef311d2dbf051ed9114556e14ad3980eb515104baa3409306a6817082a61d8cd`,
+  schema version 1). From this pin the SDK derives the fingerprint from the
+  schema bytes at build and no longer writes it into `manifest.json`, so the
+  value comes from a live 1.4.15 handshake and the official release
+  manifest, and `src/compat.rs` also pins the bundle's SHA-256. Over 1.4.14
+  it is purely additive: five methods, two notifications, two errors, four
+  item kinds, a reserved capability, and field additions, with nothing
+  removed or newly required. A stable `1.4.15-R8339.1` binary exports the
+  same bundle and reports the same fingerprint; its Linux, macOS, and
+  Windows artifacts are pinned in the nightly matrix. Every addition has a
+  §9 disposition. Before 1.4.6, the
   Python tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
   `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
   surface while the top-level schema stayed on 1.3.0-R3401.1. Transcript
@@ -284,12 +300,11 @@ The SDK publishes generated MSP types, a schema bundle, and recorded transcripts
 The Rust adapter should consume those artifacts as conformance inputs.
 
 Status: **emissions validated and permission paths replayed.**
-`tests/protocol/` pins SDK revision `a45cb67` (stable manifest, JSON schema
-bundle, 52 golden transcripts) with provenance and license. CI now replays
+`tests/protocol/` pins SDK revision `07e1548` (stable manifest, JSON schema
+bundle, 54 golden transcripts) with provenance and license. CI now replays
 every server-side item event through the notification fold (unknown kinds must
 tolerate), validates every emitted ACP frame with the adapter's own parser,
-fails if the vendored manifest fingerprint drifts from the compatibility
-table, validates every adapter→host request frame against the schema bundle's
+fails if the vendored schema bytes drift from the compatibility table's pin, validates every adapter→host request frame against the schema bundle's
 required fields and property types (via `serde_json`), and replays every corpus
 approval payload through the permission mapping, requiring ordered choices
 plus a deny fallback, and an env-gated `MUSE_ACP_LIVE_HOST=1` smoke test
@@ -364,7 +379,7 @@ their first Windows evidence.
 
 **Work items**
 
-- Pin the SDK revision (currently `a45cb67`, 2026-10-29) and vendor
+- Pin the SDK revision (currently `07e1548`, 2026-11-10) and vendor
   `schema/msp/stable/manifest.json`, `schema/msp/stable/msp.schema.json`, and
   the `schema/msp/transcripts/` corpus under `tests/protocol/`, or fetch that
   locked revision in CI. The corpus already covers approvals, cancellation,
@@ -718,7 +733,7 @@ fold's unknown-method path logs and continues.
 | `session/nameChanged` | Mapped to ACP | Replaces host title facts and publishes changes through `session_info_update`, including name origin and the optional generated short-title metadata. |
 | `session/reasoningEffortChanged` | Mapped to ACP | Updates the standing reasoning default and emits `config_option_update`; negotiated recommendations require a host `default` or `policy` source. |
 | `session/statusChanged` | Mapped to ACP | Publishes host status and attention metadata and ACP v2 state; directs pending-request reconciliation without inventing unknown status values. |
-| `session/viewHealthChanged` | Consumed | Logs the view health and reason with guidance to reattach through resume. |
+| `session/viewHealthChanged` | Consumed | Logs the view health and reason: `unavailable` with guidance to reattach through resume, and Muse 1.4.15's `healthy` as the host's own re-load. |
 | `skill/changed` | Mapped to ACP | Refreshes `skill/list` and the ACP available-command catalog. |
 | `usage/changed` | Mapped to ACP | Broadcasts the host's subscription observation to attached sessions as `_meta.muse.subscriptionUsage` (with the legacy flat alias), separately from cost estimates. |
 | `skillNotFound` | Mapped to ACP | Forwarded as ACP error `-32032` with the host's typed data, keeping the rejected selector visible; slash text naming no listed skill is sent as ordinary text instead. |
@@ -740,12 +755,12 @@ path, preserving the fail-closed policy from §4.
 
 **Muse 1.4.x stable-surface additions**
 
-Muse 1.4.1 through 1.4.14 grew the stable surface well past 1.3.0. The adapter
+Muse 1.4.1 through 1.4.15 grew the stable surface well past 1.3.0. The adapter
 adopts the parts that fit its ACP mapping (workspace roots, reasoning tiers,
 session delete on the hosts that serve it, `feedback/submit`, and
 `session/list` filters) and records an explicit disposition below for the
 rest, with a tracking issue where behavior remains undecided. The pinned
-`a45cb67` bundle is the authority.
+`07e1548` bundle is the authority.
 The rows below record a disposition for the 1.4.x additions the adapter does
 not drive, plus `feedback/submit`, which it does; incoming notifications with
 no adapter arm stay safe because the unknown-method path in the fold logs and
@@ -793,6 +808,16 @@ continues.
 | `monitor/inboxItemAdmitted` | Mapped to ACP | One monitor inbox admission (Muse 1.4.11+). Counted as pending against its monitor task (`taskId`, the monitor card's `monitorId`), and the monitor card's `_meta.muse.monitorInbox {pending, drained, voided}` is refreshed. The delivery text stays with the agent; it is not echoed to the transcript. [#330](https://github.com/BrokkAi/muse-acp/issues/330) |
 | `monitor/inboxItemDrained` | Mapped to ACP | One inbox drain (Muse 1.4.11+): the item counts as drained unless a void of the same item carries a later recorded stamp (drain-vs-void latest-wins on `drainedAt`/`voidedAt`). Refreshes the card's `monitorInbox` counts. [#330](https://github.com/BrokkAi/muse-acp/issues/330) |
 | `monitor/inboxItemVoided` | Mapped to ACP | One wake-missed void (Muse 1.4.11+): count-only by schema design, so it only moves the item to the card's `voided` count (latest-wins against a drain) and never adds a transcript row. [#330](https://github.com/BrokkAi/muse-acp/issues/330) |
+| `turn/modelAttemptStarted` | Mapped to ACP | Muse 1.4.15: a running turn's model attempt is starting, retries and later model steps included. Non-terminal. When a `turn/modelRetryScheduled` hint is showing for that turn, its backoff is over, so the adapter sends `session_info_update._meta.muse.modelRetry: null`; otherwise it changes nothing. |
+| `model/complete` | Intentionally ignored | Muse 1.4.15's sessionless one-shot completion on the host's model. The adapter has no ACP surface that asks for a completion outside a session, so it never sends the method. |
+| `model/cancel` | Intentionally ignored | Cancels the sending connection's own `model/complete`; the adapter never starts one. |
+| `model/completed` | Intentionally ignored | The settlement of a `model/complete`, delivered only to the requesting connection, so none reaches the adapter; a stray copy takes the unhandled-notification path. |
+| `session/declareExternalWait` | Intentionally ignored | Muse 1.4.15 lets a client say a loaded session waits on an external event, so the end-of-turn reminder boundary parks instead of re-verifying. ACP has no such declaration and the adapter does not invent one. |
+| `session/clearExternalWait` | Intentionally ignored | The clearing twin of `session/declareExternalWait`, which the adapter never sends; the next user input clears a declaration anyway. |
+| `subagent/list` | Intentionally ignored | Muse 1.4.15's subagent roster read. The adapter announces and tracks subagents from the item stream (and AIR or RFD subagent updates); a roster read adds no ACP behavior. |
+| `approvalBrokerUnavailable` (-32058) | Mapped to ACP | Muse 1.4.15 refuses an `approval/decide` when the Computer Use lock broker cannot be reached. The ACP prompt has already settled, so the adapter tells the user in one sentence that the decision was not applied and to try again once Computer Use is available. It does not retry the decide. |
+| `approvalResolving` (-32059) | Mapped to ACP | Muse 1.4.15 refuses an `approval/decide` for a Computer Use takeover already marked `resolving` while it waits on the lock broker. The adapter says the takeover is already being resolved and the decision was not applied. |
+| `mxp` capability | Intentionally ignored | Reserved by Muse 1.4.15 (#38644) with no stable method or grant; the adapter does not request it. |
 
 The remaining 1.4.x field-level and vocabulary additions — the `webSearch`
 item kind, `mcpLinkError`, `TurnError.quota`, the retry/retraction detail
@@ -881,6 +906,19 @@ worker/`/new` graph inputs that the ACP adapter does not expose. Every
 definition and field has a matrix row below, and no method, notification,
 request, error, or capability changed.
 
+Muse 1.4.15 adds system notices, peer-session messages, subagent input and
+result rows, the Computer Use takeover approval with its two decide errors,
+model-attempt starts, background-command exit facts and background-target
+records, the nested subagent's parent, the workspace probe's degraded
+reason, retained monitor inbox admissions in resume snapshots, and a fork's
+rewind flag. It also adds sessionless model completions, external-wait
+declarations, a subagent roster read, and read-only session drill-down facts
+that the ACP adapter does not expose. Every method, notification, and error
+has a row above, and every definition and field has a matrix row below. The
+same release withholds a session's MCP servers in an untrusted workspace
+without a wire signal; the adapter trusts the workspaces it serves (see the
+README's "Workspace trust").
+
 **Muse 1.4.x field-level and vocabulary additions**
 
 Muse 1.4.6 grew fields and open vocabularies the adapter's tolerant fold had to
@@ -946,11 +984,11 @@ cannot drop a member without failing CI.
 | `SessionStartParams.recoveryMode` | Intentionally ignored | Decided in [#334](https://github.com/BrokkAi/muse-acp/issues/334): the recovery choice for a new session is never sent; omission keeps legacy behavior, which the schema calls out explicitly. |
 | `ErrorData.recoveryObservation` | Mapped to ACP | A complete observation (all six members non-null) on a host error that reaches the editor, such as a refused resume, load, fork, or prompt, rides the ACP error's `data.recoveryObservation` verbatim and is logged as one `recovery observation` diagnostic line; an approval-decision failure logs it too. An incomplete observation establishes no recovery and is dropped. The qualification is never read as an acceptance receipt. [#334](https://github.com/BrokkAi/muse-acp/issues/334) |
 | `SessionReadResult.recoveryObservation` | Intentionally ignored | The adapter reads sessions only for history (fork points, subagent drill-down), where the observation carries no decision; resumed and re-attached sessions keep their existing behavior. [#334](https://github.com/BrokkAi/muse-acp/issues/334) |
-| `SubagentResult.drained` | Mapped to ACP | The host's parent-consumed join fact (Muse 1.4.11+) rides the subagent card as `_meta.muse.subagent.drained: true` and a "Delivered to the parent agent." line, from the first update that carries it; absent until then and never cleared. Card completion still follows the item's own status: the adapter derives no join of its own, so there is nothing for the flag to disagree with. [#336](https://github.com/BrokkAi/muse-acp/issues/336) |
+| `SubagentResult.drained` | Mapped to ACP | The host's parent-consumed join fact (Muse 1.4.11+) rides the subagent card as `_meta.muse.subagent.drained: true` and a "Delivered to the parent agent." line, from the first update that carries it; absent until then and never cleared. Card completion still follows the item's own status: the adapter derives no join of its own, so there is nothing for the flag to disagree with. From Muse 1.4.15 each consumed result also arrives as its own `subagentResult` card (see `ItemKind.subagentResult`); the flag's line stays on the subagent card. [#336](https://github.com/BrokkAi/muse-acp/issues/336) |
 | `TurnInputPart.source` | Mapped to ACP | On Muse 1.4.11+ a skill part names its picked catalog copy: the adapter keeps a `skill/list` row's `source` when it is in the closed `bundled`/`user`/`project`/`plugin` vocabulary and the catalog holds exactly one copy of that selector, and sends it with the skill part. Two copies of one selector stay ambiguous to an editor command, so they, older hosts, and rows without a valid source keep the bare `(selector)` resolution. [#335](https://github.com/BrokkAi/muse-acp/issues/335) |
 | `ItemKind.backgroundTerminalCompletion` | Mapped to ACP | A finished backgrounded command (Muse 1.4.12+) renders as a "Background command <outcome>: <command>" card, the outcome taken from `terminalStatus` (finished, failed, was cancelled, timed out, was rejected), with the completion output as content. Without the facts it keeps the generic `fallbackText` card. When AIR async tasks are negotiated and the call's AIR task was announced but never settled (its own terminal was missed), the completion settles it from `terminalStatus`, resolving a task seeded from `task/list` (keyed by the host item id) through the tool item that names the call id. The same fallback runs when `session/resume` restores the AIR task set from durable history, so a call the history still shows running beside its completion is settled rather than restored as running; a state the call already reported is never overridden. [#384](https://github.com/BrokkAi/muse-acp/issues/384) |
 | `ItemKind.overdueNotice` | Mapped to ACP | Rendered through the unknown-kind generic card path from `fallbackText` (Muse 1.4.12+), carrying `_meta.muse.itemKind`. The stable schema gives the kind no fields of its own, so there is nothing more to show; decided in [#384](https://github.com/BrokkAi/muse-acp/issues/384). |
-| `Item.backgroundTerminalCompletion` | Mapped to ACP | The five facts (`command`, `output`, `outputTruncated`, `terminalStatus`, `toolCallId`) ride the card's `_meta.muse.backgroundTerminalCompletion` verbatim. The card title uses the sanitized command, the content is the output with a "(output truncated by Muse)" line when `outputTruncated`, and `toolCallId` finds the AIR task to settle (see `ItemKind.backgroundTerminalCompletion`). [#384](https://github.com/BrokkAi/muse-acp/issues/384) |
+| `Item.backgroundTerminalCompletion` | Mapped to ACP | The five facts (`command`, `output`, `outputTruncated`, `terminalStatus`, `toolCallId`) ride the card's `_meta.muse.backgroundTerminalCompletion` verbatim. The card title uses the sanitized command, the content is the output with a "(output truncated by Muse)" line when `outputTruncated`, and `toolCallId` finds the AIR task to settle (see `ItemKind.backgroundTerminalCompletion`). Muse 1.4.15's optional `exitCode` and `reason` ride the same object (see their rows). [#384](https://github.com/BrokkAi/muse-acp/issues/384) |
 | `ApprovalRequestParams.cuaCardFacts` | Mapped to ACP | A computer-use permission prompt (Muse 1.4.12+) shows the card facts as its tool call's text `content`, in the host's words: the page host (with its `xn--` form when it differs), the window title, and each consequential step as `Step N: <action> <roleWord> <label> — <effect>`, a key step naming its chord and only a point step reading "at x,y". The window title, labels, and chords are the app's own text, so they are sanitized to one line, capped at 200 characters, and quoted as Markdown code spans, where no link (including GFM's bare-URL and email autolinks), image, or markup can form; text with nothing printable left is dropped. The facts also ride `_meta.muse.cuaCardFacts` verbatim. The title, kind, and deny-safe choices are unchanged, and other approvals carry no facts. [#385](https://github.com/BrokkAi/muse-acp/issues/385) |
 | `SessionResumeResult.blockedPrompt` | Mapped to ACP | The recall seed for the latest blocked prompt (Muse 1.4.12+) rides the `session/load` and `session/resume` result as `_meta.muse.blockedPrompt: {text}`, the exact submitted text, so an editor can refill its prompt box. ACP has no standard recall surface, and the schema makes the seed data only, so it is never replayed as a user message; an absent or empty seed adds nothing. [#386](https://github.com/BrokkAi/muse-acp/issues/386) |
 | `SessionReadResult.blockedPrompt` | Intentionally ignored | The adapter reads sessions only for history (fork points, subagent drill-down), where a recall seed carries no decision; the resume copy reaches the editor ([#386](https://github.com/BrokkAi/muse-acp/issues/386)). |
@@ -959,7 +997,7 @@ cannot drop a member without failing CI.
 | `TaskListEntry.executionMode` | Mapped to ACP | When `task/list` seeds the AIR async-task inventory after a resume or re-attach, a `foreground` row (Muse 1.4.12+) is skipped: it is the running turn's own work, not a background task. `background`, absent (older hosts list background rows only), and unknown modes, which the schema says to ignore, keep seeding. |
 | `ApprovalCuaCardFacts.data` | Mapped to ACP | Muse 1.4.13 lists the data an approved computer-use call would send as `ApprovalCuaDataFact` rows: an open `kind`, the scanner's open `secretKind` tag, and an `ApprovalCuaMask` (`prefix`, `last4`, `chars`) that never carries the value. The permission prompt shows one `Data: …` line per row, worded from the host's mask and never with the value: a known `secretKind` is worded (`GitHub token`) and given its mask (`ghp_…3f9a`, `password=… (12 chars)`, or the length alone), while `other` and any unknown `kind` or `secretKind` degrade to a generic row (`Data: a value`, `Data: a secret`) instead of being dropped, as the schema requires. The mask is app-derived, so it is sanitized and quoted as one code span like the window title; the verbatim facts still ride `_meta.muse.cuaCardFacts`. A card with any data offers only one-shot choices, which the existing deny-safe choices already are. [#395](https://github.com/BrokkAi/muse-acp/issues/395) |
 | `Item.replayHint` | Mapped to ACP | Muse 1.4.13 attaches the D26 replay hint to a monitor `toolCall`. The adapter uses `afterItemId` as the row anchor when `terminalRowAfterItemId` is absent and preserves the complete `{afterItemId,rowKinds}` object in `_meta.muse.replayHint`. `rowKinds` stays an open verbatim vocabulary rather than being translated or dropped. [#397](https://github.com/BrokkAi/muse-acp/issues/397) |
-| `Item.terminalRowAfterItemId` | Mapped to ACP | Muse 1.4.13 names the item after whose rows a terminal `toolCall` row renders (ADR 56496 D2/D3). A live or replayed row waits when that anchor is still ahead, emits immediately when it is already known, and flushes at its turn boundary if the anchor never arrives. [#397](https://github.com/BrokkAi/muse-acp/issues/397) |
+| `Item.terminalRowAfterItemId` | Mapped to ACP | Muse 1.4.13 names the item after whose rows a terminal `toolCall` row renders (ADR 56496 D2/D3). A live or replayed row waits when that anchor is still ahead, emits immediately when it is already known, and flushes at its turn boundary if the anchor never arrives. Muse 1.4.15 also sets it on a `subagent` whose result drained; the deferral is kind-agnostic, so that card waits the same way. [#397](https://github.com/BrokkAi/muse-acp/issues/397) |
 | `Item.workId` | Mapped to ACP | Muse 1.4.13 carries a ManagedBash Work ID verbatim when registered. It rides the tool card and, for a backgrounded live call, the AIR `async_task_spawned` update as `_meta.muse.workId`. AIR task IDs keep the existing v1 derivation, so absence and stop identity are unchanged. [#396](https://github.com/BrokkAi/muse-acp/issues/396) |
 | `SessionReadResult.queuedInputs` | Intentionally ignored | The inputs still queued for delivery to the read session (Muse 1.4.13+, absent-when-empty) with their log `sequence` and optional join keys. The adapter reads sessions only for history (fork points and subagent drill-down), where a delivery queue carries no decision, and it never renders the read result as a transcript. |
 | `ApprovalRequestParams.reviewerReason` | Mapped to ACP | Muse 1.4.14's bounded reviewer escalation reason is shown as a sanitized `Reviewer concern: …` content line and preserved verbatim in the permission's `_meta.muse.reviewerReason`. It remains a display hint only; titles and choices still drive the decision. |
@@ -974,11 +1012,40 @@ cannot drop a member without failing CI.
 | `Session.resumedByClient` | Mapped to ACP | Muse 1.4.14 provenance from the most recent wire resume is forwarded as `_meta.muse.resumedByClient`; absence retains the last fact and explicit null clears it. |
 | `Session.spawnedBy` | Mapped to ACP | The exact spawning session and optional project/thread labels are forwarded verbatim as `_meta.muse.spawnedBy`, retaining or clearing on the same additive-optional rules. |
 | `SessionReadResult.worktree` | Intentionally ignored | Runtime-worktree facts are served on a child `session/read`. The adapter uses that read only to replay transcript items and has no child ACP session-list or worktree surface. |
-| `SessionResumeParams.modelId` | Mapped to ACP | ACP `session/resume`/`session/load` accepts `_meta.muse.modelId` as a non-empty string and forwards it to MSP `session/resume.modelId`, including the MCP-conflict retry. Explicit null, empty, and non-string values fail locally before the host call. |
+| `SessionResumeParams.modelId` | Mapped to ACP | ACP `session/resume`/`session/load` accepts `_meta.muse.modelId` as a non-empty string and forwards it to MSP `session/resume.modelId`, including the MCP-conflict retry. Explicit null, empty, and non-string values fail locally before the host call. Muse 1.4.15 keeps the recorded model when it refuses the override and, for a connection that opted into `experimentalApi` (this adapter does), returns `modelIdRefusal {modelId, reason}`, which the ACP load/resume response carries verbatim as `_meta.muse.modelIdRefusal` and the adapter logs; the model selector already shows the kept model. |
 | `SessionStartParams.previousSessionId` | Intentionally ignored | The adapter has no `/new` predecessor concept and never links an ACP new session to an outgoing session. |
 | `SessionStartParams.spawnedBy` | Intentionally ignored | Muse worker sessions can name their exact spawner at start, while this adapter's ACP session/new surface has no worker-spawn endpoint or caller-supplied session provenance. |
 | `TurnError.requestDenied` | Mapped to ACP | An exact live `true` adds one provider-refusal sentence to the failed turn's editor message. Absence remains a non-assertion and never implies the request was accepted. |
 | `ViewPageParams.maxBytes` | Intentionally ignored | The caller byte-cap is for Console page sizing. The adapter's internal history and gap paging use the server budget and do not expose a byte-budget selector. |
+| `ItemKind.systemNotice` | Mapped to ACP | Muse 1.4.15 system-chrome notices (Monitor, skills startup, scheduled fire, incomplete generation, hook, paused workflow checkpoint) render as host cards. The title is the one-line summary (`fallbackText`, else the first line of `text`) led by `Warning:` or `Error:` when the host classified the level; the full `text` is the content when it says more; the facts ride `_meta.muse.systemNotice`. A notice with neither text renders no card. |
+| `Item.noticeOrigin` | Mapped to ACP | The producing family rides `_meta.muse.systemNotice.origin` verbatim. Absent stays absent: the adapter never infers an origin, and unknown values pass through. |
+| `Item.noticeSeverity` | Mapped to ACP | `warning` and `error` lead the card title; any value, unknown ones included, rides `_meta.muse.systemNotice.severity`. Absent means unclassified, never `info`. |
+| `Item.noticeKind` | Mapped to ACP | The optional open machine code rides `_meta.muse.systemNotice.kind` verbatim. |
+| `Item.noticeSubject` | Mapped to ACP | The notice's durable subject (`{id, label}`; for `hook`, the hook run's item id) rides `_meta.muse.systemNotice.subject` verbatim. |
+| `ItemKind.peerMessage` | Mapped to ACP | A message another session sent this one renders as a `Message from <sender>` card whose content is the body (see `Item.peerMessage`); without the facts it keeps the generic `fallbackText` card. |
+| `Item.peerMessage` | Mapped to ACP | The four facts (`senderLabel`, `senderSessionId`, `remote`, `body`) ride `_meta.muse.peerMessage` verbatim. `senderLabel` is host-shaped display text, sanitized to one line in the title; the never-cut `body` is the card content. |
+| `ItemKind.subagentInput` | Mapped to ACP | Input the parent queued for or delivered to a subagent renders as an `Input queued for <agent>` or `Input delivered to <agent>` card (agent path, else subagent id), with the item's `text` (else `fallbackText`) as content. An unknown phase renders no card, as the schema directs. |
+| `Item.inputPhase` | Mapped to ACP | `queued` and `delivered` choose the card's wording and ride `_meta.muse.subagentInput.inputPhase`; any other value suppresses the card. |
+| `Item.deliveredBeforeTurnEnd` | Mapped to ACP | Rides `_meta.muse.subagentInput.deliveredBeforeTurnEnd` verbatim when present; absence asserts nothing. |
+| `ItemKind.subagentResult` | Mapped to ACP | Each consumed subagent attempt renders as a `Result from <agent>` card, with the outcome in parentheses when known and the item's `text` (else `fallbackText`) as content. The subagent card's own `drained` line is unchanged. |
+| `Item.resultStatus` | Mapped to ACP | `completed`, `failed`, and `cancelled` name the outcome and ride `_meta.muse.subagentResult.resultStatus`; an unknown value is treated as absent, as the schema directs. |
+| `Item.parentSubagentId` | Mapped to ACP | The subagent whose own session spawned a nested child rides the child's card as `_meta.muse.parentSubagentId` verbatim; absent for a direct child and never derived from `agentPath`. |
+| `Item.backgroundTarget` | Mapped to ACP | A tool call's live background-target record (`toolCallId`, `backgroundRequested`, `foregroundWaitActive`, `manualReleaseAdmissible`) rides the tool card's `_meta.muse.backgroundTarget` verbatim. When a later snapshot omits it (the call settled or unregistered), the card sends one explicit `backgroundTarget: null`, because clients merge `_meta`. The adapter still does not issue `task/background` ([#38](https://github.com/BrokkAi/muse-acp/issues/38)). |
+| `ApprovalSubject.holder` | Mapped to ACP | A Muse 1.4.15 `computerUseTakeover` approval is titled `Take over Computer Use from <session label>` (never the internal `cua_setup` tool), its content says when the holder took and last used Computer Use with the label as a code span, and the holder rides `_meta.muse.holder` verbatim. The host's "Take over" and "Keep" choices are unchanged. |
+| `ApprovalResolvedParams.abortReason` | Consumed | Why an `abort` was not a cancel (`lockEpochEnded`, `brokerUnavailable`, open) is logged with the approval id. The resolution already withdraws any open prompt; ACP has no withdrawal reason to carry it. |
+| `BackgroundTerminalCompletion.exitCode` | Mapped to ACP | The terminal record's exit code adds an `Exit code N` line (negative values included) to the background-command card and rides `_meta.muse.backgroundTerminalCompletion` verbatim; absent when the record carries none. |
+| `BackgroundTerminalCompletion.reason` | Mapped to ACP | The terminal record's reason adds a sanitized `Reason: …` line to the background-command card and rides `_meta.muse.backgroundTerminalCompletion` verbatim. |
+| `ForkProvenance.isRewind` | Mapped to ACP | The adapter forwards `forkedFrom` verbatim as `_meta.muse.forkedFrom`, so the rewind flag reaches the editor unchanged; absent still means unknown, never an ordinary fork. |
+| `Session.probeDegradedReason` | Mapped to ACP | Why the workspace status probe produced no reading rides `_meta.muse.probeDegradedReason` on `session_info_update` and `session/list` rows, verbatim (unknown values included). A lifecycle or pulled row that omits it keeps the last value and an explicit null clears it; a streamed list row that omits it clears it, like `branch`. |
+| `Session.externalWait` | Intentionally ignored | A live external-wait declaration is served only on `session/read`, which the adapter uses for transcript drill-down; it never declares one (see `session/declareExternalWait`). |
+| `SessionReadResult.deliveredInputs` | Intentionally ignored | The inputs a read session delivered to its subagents are a drill-down join for clients that render subagent queues; the adapter reads sessions only for history. |
+| `SessionReadResult.prunedSubagents` | Intentionally ignored | Child sessions pruned below a checkpoint are listed on a read; the adapter's reads replay transcript items only. |
+| `SessionResumeResult.prunedSubagents` | Intentionally ignored | The resume twin of the read member. Pruned children have no transcript to replay and are not running, so the adapter announces no subagent for them. |
+| `RuntimeWorktree.cleanupReason` | Intentionally ignored | Worktree cleanup outcomes ride `SessionReadResult.worktree`, which the adapter already ignores. |
+| `RuntimeWorktree.cleanupDiagnostic` | Intentionally ignored | The recorded cleanup diagnostic rides the same ignored worktree object. |
+| `SnapshotState.monitorInbox` | Mapped to ACP | On resume the retained monitor admissions, with their drain and void stamps, seed the fold's inbox before any replay, so a resumed monitor card shows its `_meta.muse.monitorInbox` counts at once; later live inbox events update them. An older host sends none and nothing changes. |
+| `HistoryNoneReason.projectionRebuildFailed` | Consumed | Push-only on `session/viewHealthChanged` after the host's own re-load of a failed view failed; logged with the existing reattach guidance. |
+| `SessionViewHealth.healthy` | Consumed | Muse 1.4.15 reports a view the host re-loaded; the adapter logs that live delivery resumed instead of the unavailable guidance. |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**

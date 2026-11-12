@@ -12,6 +12,27 @@
   `--trust-workspace` already in `MUSE_SERVE_ARGS` is not repeated, and
   `--per-session`, which `muse serve` refuses beside it, leaves trust to that
   host.
+- Adopt the Muse 1.4.15 stable surface: the vendored corpus is SDK
+  `07e1548`, the 1.4.15 fingerprint classifies as tested, and the nightly
+  matrix runs the 1.4.15 builds. What editors see:
+  - Muse's system notices, peer-session messages, subagent inputs, and
+    consumed subagent results render as their own cards (with their facts in
+    `_meta.muse.systemNotice`, `peerMessage`, `subagentInput`, and
+    `subagentResult`) instead of a one-line summary or nothing.
+  - A Computer Use takeover prompt names the session that holds Computer Use
+    and when it last used it, instead of the internal `cua_setup` tool; the
+    holder rides `_meta.muse.holder`. A decision Muse refuses because the
+    takeover is already resolving (-32059) or the lock broker is unavailable
+    (-32058) is explained in one sentence.
+  - The model-retry hint clears as soon as the retried model attempt starts.
+  - Background-command cards show the exit code and reason.
+  - `_meta.muse.backgroundTarget` on tool cards (cleared with `null`),
+    `parentSubagentId` on nested subagent cards, `probeDegradedReason` on
+    session info and list rows, and `modelIdRefusal` on a load/resume whose
+    requested model Muse refused.
+  - A resumed monitor card shows its inbox counts at once.
+  - The live suite accepts a 1.4.15 model catalog that does not list a
+    configured custom model.
 
 ## 0.21.0
 

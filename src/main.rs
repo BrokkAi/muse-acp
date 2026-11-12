@@ -858,7 +858,7 @@ fn attention_projection(value: Option<&J>, session_id: &str) -> Option<Vec<Strin
 /// protocol says additive-optional attention is not an assertion that nothing
 /// is pending.
 fn adopt_session_projection(s: &mut AcpSession, session: &J) {
-    for key in ["resumedByClient", "spawnedBy"] {
+    for key in ["resumedByClient", "spawnedBy", "probeDegradedReason"] {
         if let Some(value) = session.get(key) {
             if matches!(value, J::Null) {
                 s.remove_session_meta(key);
@@ -911,6 +911,14 @@ fn adopt_streamed_session_row(s: &mut AcpSession, row: &J) {
         s.set_session_meta("branch", branch.to_string());
     } else {
         s.remove_session_meta("branch");
+    }
+    // Muse 1.4.15: the index's last derived probe reason, like `branch`, so
+    // a streamed row that omits it clears it.
+    match row.get("probeDegradedReason") {
+        Some(reason) if !matches!(reason, J::Null) => {
+            s.set_session_meta("probeDegradedReason", j_to_string(reason))
+        }
+        _ => s.remove_session_meta("probeDegradedReason"),
     }
 }
 
@@ -5832,6 +5840,9 @@ fn handle_acp(
                         // instead of having it blanked back to silence.
                         let mut pressure: Option<String> = None;
                         if let Some(state) = snapshot_state(&r) {
+                            // Muse 1.4.15 retained monitor inbox admissions,
+                            // before any replay renders a monitor card.
+                            entry.fold.seed_monitor_inbox(state.get("monitorInbox"));
                             if let Some(cu) = state.get("contextUsage")
                                 && matches!(cu, J::Obj(_))
                             {
@@ -5955,8 +5966,9 @@ fn handle_acp(
                         .unwrap_or_default();
                     // Muse 1.4.12's recall seed for the latest blocked prompt
                     // is data, never history: it rides the result metadata so
-                    // an editor can offer to refill its prompt box.
-                    let blocked_prompt = blocked_prompt_meta(&r);
+                    // an editor can offer to refill its prompt box. Muse
+                    // 1.4.15's refusal of an explicit resume model rides too.
+                    let resume_meta = resume_result_meta(&r);
                     // Both versions report current selectors; v1 also keeps the
                     // legacy mode state for clients which predate config options.
                     let options = acp::config_options(
@@ -5977,7 +5989,7 @@ fn handle_acp(
                         &models,
                     );
                     let meta = out::meta(&format!(
-                        "{{\"mspSessionId\":{}{blocked_prompt}}}",
+                        "{{\"mspSessionId\":{}{resume_meta}}}",
                         esc(&msp_out)
                     ));
                     let skills = skill_catalog(host, &msp_out);
@@ -8066,10 +8078,7 @@ fn handle_acp(
                                     cwd,
                                     title_facts(Some(item)).selected(),
                                     item.get("updatedAt").and_then(J::as_str),
-                                    raw_host_fact(Some(item), "branch").as_deref(),
-                                    raw_host_fact(Some(item), "attention").as_deref(),
-                                    raw_host_fact(Some(item), "resumedByClient").as_deref(),
-                                    raw_host_fact(Some(item), "spawnedBy").as_deref(),
+                                    item,
                                 ));
                             }
                         }
@@ -8741,20 +8750,42 @@ fn reconcile_active_tasks(
     acp::send_fold_lines(stdout, sess, out);
 }
 
-/// `_meta.muse.blockedPrompt` for a `session/load` or `session/resume`
-/// result, as a leading-comma fragment of the result's `_meta`, or empty.
+/// `_meta.muse` facts (`blockedPrompt`, `modelIdRefusal`) for a
+/// `session/load` or `session/resume` result, as a leading-comma fragment of
+/// the result's `_meta`, or empty.
 /// Muse 1.4.12 returns the latest blocked main prompt on `session/resume` as
 /// `{text}`, the exact submitted text, so a client can seed its prompt recall.
 /// The schema says it is data only and never a rendered row, so the adapter
 /// passes it through verbatim and never replays it as a user message.
-fn blocked_prompt_meta(resume_result: &J) -> String {
-    resume_result
+///
+/// Muse 1.4.15 also returns `modelIdRefusal` (experimental; the adapter opts
+/// into `experimentalApi`) when it refused the resume's explicit `modelId`
+/// and kept the session's recorded model. It rides the same `_meta.muse` as
+/// `{modelId, reason}`, verbatim, so the editor can say once why its model
+/// choice did not take; the model selector already shows the kept model.
+fn resume_result_meta(resume_result: &J) -> String {
+    let mut fields = Vec::new();
+    if let Some(text) = resume_result
         .get("blockedPrompt")
         .and_then(|prompt| prompt.get("text"))
         .and_then(J::as_str)
         .filter(|text| !text.is_empty())
-        .map(|text| format!(",\"muse\":{{\"blockedPrompt\":{{\"text\":{}}}}}", esc(text)))
-        .unwrap_or_default()
+    {
+        fields.push(format!("\"blockedPrompt\":{{\"text\":{}}}", esc(text)));
+    }
+    if let Some(refusal @ J::Obj(_)) = resume_result.get("modelIdRefusal") {
+        log(&format!(
+            "session/resume kept the recorded model: refused modelId={} reason={}",
+            fold::sanitize_one_line(refusal.non_empty_str("modelId").unwrap_or("?")),
+            fold::sanitize_one_line(refusal.non_empty_str("reason").unwrap_or("?"))
+        ));
+        fields.push(format!("\"modelIdRefusal\":{}", j_to_string(refusal)));
+    }
+    if fields.is_empty() {
+        String::new()
+    } else {
+        format!(",\"muse\":{{{}}}", fields.join(","))
+    }
 }
 
 /// Seed the AIR async-task inventory from the host's authoritative
@@ -10878,30 +10909,31 @@ fn update_host_session_facts(
     HostTitleUpdate::after(&before, &session.title_facts)
 }
 
-#[allow(clippy::too_many_arguments)]
+/// The `Session` facts a `session/list` row carries in `_meta.muse`, as the
+/// host sent them. Fold-only facts such as `nameOrigin` and `generatedName`
+/// never ride a list row.
+const LIST_ROW_FACTS: [&str; 5] = [
+    "branch",
+    "attention",
+    "resumedByClient",
+    "spawnedBy",
+    // Muse 1.4.15: why the workspace status probe produced no reading.
+    "probeDegradedReason",
+];
+
 fn session_info_row(
     session_id: &str,
     cwd: &str,
     title: Option<&str>,
     updated_at: Option<&str>,
-    branch: Option<&str>,
-    attention: Option<&str>,
-    resumed_by_client: Option<&str>,
-    spawned_by: Option<&str>,
+    host_row: &J,
 ) -> out::SessionRow {
-    let mut muse = Vec::new();
-    if let Some(branch) = branch {
-        muse.push(format!("\"branch\":{branch}"));
-    }
-    if let Some(attention) = attention {
-        muse.push(format!("\"attention\":{attention}"));
-    }
-    if let Some(resumed) = resumed_by_client {
-        muse.push(format!("\"resumedByClient\":{resumed}"));
-    }
-    if let Some(spawned) = spawned_by {
-        muse.push(format!("\"spawnedBy\":{spawned}"));
-    }
+    let muse: Vec<String> = LIST_ROW_FACTS
+        .into_iter()
+        .filter_map(|key| {
+            raw_host_fact(Some(host_row), key).map(|value| format!("\"{key}\":{value}"))
+        })
+        .collect();
     out::SessionRow {
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
@@ -11960,6 +11992,14 @@ fn handle_msp(
                 .get("approvalId")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+            // Muse 1.4.15 says why an `abort` was not a cancel, when it
+            // knows (`lockEpochEnded`, `brokerUnavailable`; open vocabulary).
+            if let Some(reason) = params.non_empty_str("abortReason") {
+                log(&format!(
+                    "approval/resolved approval={approval_id} sess={msp_sid} aborted abortReason={}",
+                    fold::sanitize_one_line(reason)
+                ));
+            }
             // Child-stream approvals open on their owner session, so resolve
             // them through the same routing or the prompt is never withdrawn.
             if let Some((acp_sid, _, _)) = owner_for_msp_session(sessions, msp_sid) {
@@ -12313,6 +12353,31 @@ fn handle_msp(
             }
             send_fold_output(stdout, sessions, &acp_sid, out);
         }
+        "turn/modelAttemptStarted" => {
+            // Muse 1.4.15: one model attempt of a running turn is starting.
+            // Non-terminal. A model-retry hint for that turn describes a
+            // backoff that is now over, so withdraw it; nothing else changes.
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let turn_id = params.get("turnId").and_then(|v| v.as_str()).unwrap_or("");
+            let Some(acp_sid) = find_acp_sid(sessions, msp_sid) else {
+                return;
+            };
+            if turn_id.is_empty() {
+                return;
+            }
+            let mut out = Vec::new();
+            if let Some(s) = sessions
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&acp_sid)
+            {
+                s.fold.clear_model_retry(&acp_sid, Some(turn_id), &mut out);
+            }
+            send_fold_output(stdout, sessions, &acp_sid, out);
+        }
         "session/approvalModeChanged" => {
             // Audit fact of an accepted mode change: refresh the selector.
             let msp_sid = params
@@ -12549,8 +12614,18 @@ fn handle_msp(
                 .and_then(|v| v.as_str())
                 .unwrap_or("unspecified");
             let acp_sid = find_acp_sid(sessions, msp_sid).unwrap_or_else(|| "?".to_string());
+            // Muse 1.4.15 also reports `healthy` once the host re-loaded a
+            // failed view, and `projectionRebuildFailed` when that re-load
+            // failed. The values are open; an unknown one is logged as is.
+            let guidance = match health {
+                "healthy" => "the host re-loaded the view; live delivery resumed",
+                "unavailable" => {
+                    "live view delivery is unavailable, resume will re-attach from the head"
+                }
+                _ => "unrecognized view health",
+            };
             log(&format!(
-                "session/viewHealthChanged session={msp_sid} acp_session={acp_sid} health={health} noneReason={reason}; live view delivery is unavailable, resume will re-attach from the head"
+                "session/viewHealthChanged session={msp_sid} acp_session={acp_sid} health={health} noneReason={reason}; {guidance}"
             ));
         }
         "usage/changed" => {
@@ -12992,6 +13067,39 @@ fn cua_untrusted_text(value: &str) -> Option<String> {
     Some(format!("{fence}{pad}{capped}{pad}{fence}"))
 }
 
+/// The holder of the Computer Use lock a Muse 1.4.15 `computerUseTakeover`
+/// approval would take it from, as permission-prompt text: the holding
+/// session's label (a code span: it is host display text) and when it took
+/// the lock and last acted under it. The host never names the holder's app,
+/// window, or action, so neither does the prompt.
+fn takeover_holder_text(params: &J) -> Option<String> {
+    let subject = params.get("subject")?;
+    if subject.get("kind").and_then(J::as_str) != Some("computerUseTakeover") {
+        return None;
+    }
+    let holder = subject.get("holder")?;
+    let label = holder
+        .non_empty_str("sessionLabel")
+        .and_then(cua_untrusted_text)?;
+    let mut text = format!("Computer Use is in use by {label}.");
+    let stamp = |key: &str| {
+        holder
+            .non_empty_str(key)
+            .map(fold::sanitize_one_line)
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(acquired) = stamp("acquiredAt") {
+        text.push_str(&format!(" It took Computer Use at {acquired}"));
+        match stamp("lastActivityAt") {
+            Some(last) => text.push_str(&format!(" and last used it at {last}.")),
+            None => text.push('.'),
+        }
+    } else if let Some(last) = stamp("lastActivityAt") {
+        text.push_str(&format!(" It last used Computer Use at {last}."));
+    }
+    Some(text)
+}
+
 /// The facts of a computer-use approval card (Muse 1.4.12
 /// `ApprovalRequestParams.cuaCardFacts`) as permission-prompt text, in the
 /// host's words: the page host (with its `xn--` form when it differs, so a
@@ -13155,6 +13263,17 @@ fn approval_title_kind(params: &J) -> (String, &'static str) {
             (None, None) => description.unwrap_or(tool_name).to_string(),
         },
         "network" => target.or(description).unwrap_or(tool_name).to_string(),
+        // Muse 1.4.15: taking Computer Use over from the session that holds
+        // its lock. Name that session, never the internal `cua_setup` tool.
+        "computerUseTakeover" => match subject
+            .get("holder")
+            .and_then(|holder| holder.non_empty_str("sessionLabel"))
+            .map(fold::sanitize_one_line)
+            .filter(|label| !label.is_empty())
+        {
+            Some(label) => format!("Take over Computer Use from {label}"),
+            None => "Take over Computer Use".to_string(),
+        },
         // An editor tool (bridge.rs) names the file or the full command it
         // would run, so the user sees what they approve.
         "tool" => bridge::approval_title(tool_name, params.get("rawArgs").and_then(J::as_str))
@@ -13576,6 +13695,9 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
     if let Some(text) = cua_card_text(params) {
         content.push(out::CardContent::Text(text));
     }
+    if let Some(text) = takeover_holder_text(params) {
+        content.push(out::CardContent::Text(text));
+    }
     if let Some(reason) = params
         .non_empty_str("reviewerReason")
         .and_then(cua_untrusted_text)
@@ -13587,7 +13709,7 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
     if !content.is_empty() {
         card.content = Some(content);
     }
-    let facts: Vec<String> = ["cuaCardFacts", "reviewerReason"]
+    let mut facts: Vec<String> = ["cuaCardFacts", "reviewerReason"]
         .into_iter()
         .filter_map(|key| {
             params
@@ -13600,6 +13722,10 @@ fn open_approval(host: &Arc<Hosts>, stdout: &StdoutShared, sessions: &Sessions, 
                 .map(|value| format!("\"{key}\":{}", j_to_string(value)))
         })
         .collect();
+    // Muse 1.4.15: a takeover names the lock holder by label and times only.
+    if let Some(holder @ J::Obj(_)) = params.get("subject").and_then(|s| s.get("holder")) {
+        facts.push(format!("\"holder\":{}", j_to_string(holder)));
+    }
     card.meta = out::muse_meta(&facts.join(","));
     let (options, choices) = acp::perm_options(params);
     if choices.is_empty() {
@@ -13731,15 +13857,43 @@ fn report_approval_failure(
     ver: u8,
     approval_id: &str,
     included_feedback: bool,
+    error: &J,
 ) {
-    let text = if included_feedback {
-        format!(
-            "Muse rejected the permission decision for {approval_id}; the guidance was not delivered."
-        )
+    send_agent_text(
+        stdout,
+        acp_sid,
+        ver,
+        &approval_failure_text(approval_id, included_feedback, error),
+    );
+}
+
+/// The sentence for an `approval/decide` the host refused. Muse 1.4.15's
+/// Computer Use takeover adds two typed refusals: `approvalResolving`
+/// (-32059), a takeover already waiting on the Computer Use lock broker,
+/// and the retryable `approvalBrokerUnavailable` (-32058).
+fn approval_failure_text(approval_id: &str, included_feedback: bool, error: &J) -> String {
+    let kind = error
+        .get("data")
+        .and_then(|data| data.get("kind"))
+        .and_then(J::as_str)
+        .unwrap_or("");
+    let code = msp::err_code(error);
+    let guidance = if included_feedback {
+        "; the guidance was not delivered"
     } else {
-        format!("Muse rejected the permission decision for {approval_id}.")
+        ""
     };
-    send_agent_text(stdout, acp_sid, ver, &text);
+    if kind == "approvalResolving" || code == -32059 {
+        return format!(
+            "Muse is already resolving the Computer Use takeover {approval_id}, so this decision was not applied{guidance}."
+        );
+    }
+    if kind == "approvalBrokerUnavailable" || code == -32058 {
+        return format!(
+            "Muse could not reach the Computer Use lock broker to decide {approval_id}, so the decision was not applied{guidance}. Try again once Computer Use is available."
+        );
+    }
+    format!("Muse rejected the permission decision for {approval_id}{guidance}.")
 }
 
 struct PermissionDecision {
@@ -13821,6 +13975,7 @@ fn send_permission_decision(
                 decision.ver,
                 &decision.approval_id,
                 included_feedback,
+                &e,
             );
         }
     }
@@ -16678,15 +16833,92 @@ mod tests {
         }
     }
     use super::{
-        CUA_TEXT_MAX_CHARS, CostRate, DriveAnswer, approval_title_kind, cua_card_text,
-        cua_untrusted_text, drive_answer, drive_kept_error, env_flag_enabled, err_code,
-        err_message, friendly_terminal_error, friendly_turn_error, is_network_error,
-        model_retry_scheduled_log_line, parse_rates, quota_reset_phrase, retry_scheduled_log_line,
-        v1_init, v2_init,
+        CUA_TEXT_MAX_CHARS, CostRate, DriveAnswer, approval_failure_text, approval_title_kind,
+        cua_card_text, cua_untrusted_text, drive_answer, drive_kept_error, env_flag_enabled,
+        err_code, err_message, friendly_terminal_error, friendly_turn_error, is_network_error,
+        model_retry_scheduled_log_line, parse_rates, quota_reset_phrase, resume_result_meta,
+        retry_scheduled_log_line, takeover_holder_text, v1_init, v2_init,
     };
     use crate::acp;
     use crate::json::{J, parse_json};
     use std::path::{Path, PathBuf};
+
+    /// The `computerUseTakeover` approval Muse 1.4.15 publishes in its
+    /// `computer-use-takeover-approve` golden transcript.
+    const TAKEOVER: &str = r#"{"approvalId":"ap-1","toolName":"cua_setup","rawArgs":"{\"action\":\"start\"}","subject":{"kind":"computerUseTakeover","toolName":"cua_setup","holder":{"sessionLabel":"Fix login flow","acquiredAt":"2026-08-07T18:02:11Z","lastActivityAt":"2026-08-07T18:40:57Z"}}}"#;
+
+    #[test]
+    fn a_computer_use_takeover_names_the_session_that_holds_it() {
+        let params = parse_json(TAKEOVER).unwrap();
+        assert_eq!(
+            approval_title_kind(&params),
+            (
+                "Take over Computer Use from Fix login flow".to_string(),
+                "other"
+            )
+        );
+        assert_eq!(
+            takeover_holder_text(&params).as_deref(),
+            Some(
+                "Computer Use is in use by `Fix login flow`. It took Computer Use at 2026-08-07T18:02:11Z and last used it at 2026-08-07T18:40:57Z."
+            )
+        );
+        // Without a holder label the title still says what is asked, and
+        // other approval kinds carry no holder text.
+        let unnamed = parse_json(
+            r#"{"toolName":"cua_setup","subject":{"kind":"computerUseTakeover","holder":{"sessionLabel":"","acquiredAt":"x","lastActivityAt":"y"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(approval_title_kind(&unnamed).0, "Take over Computer Use");
+        assert_eq!(takeover_holder_text(&unnamed), None);
+        let shell = parse_json(r#"{"subject":{"kind":"shell","command":"ls"}}"#).unwrap();
+        assert_eq!(takeover_holder_text(&shell), None);
+    }
+
+    #[test]
+    fn refused_takeover_decisions_say_why() {
+        let resolving = parse_json(
+            r#"{"code":-32059,"message":"approval resolving","data":{"kind":"approvalResolving","retryable":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            approval_failure_text("ap-1", false, &resolving),
+            "Muse is already resolving the Computer Use takeover ap-1, so this decision was not applied."
+        );
+        let broker = parse_json(
+            r#"{"code":-32058,"message":"broker unavailable","data":{"kind":"approvalBrokerUnavailable","retryable":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            approval_failure_text("ap-1", true, &broker),
+            "Muse could not reach the Computer Use lock broker to decide ap-1, so the decision was not applied; the guidance was not delivered. Try again once Computer Use is available."
+        );
+        // Any other refusal keeps the existing sentence.
+        let other = parse_json(r#"{"code":-32030,"message":"rejected"}"#).unwrap();
+        assert_eq!(
+            approval_failure_text("ap-1", true, &other),
+            "Muse rejected the permission decision for ap-1; the guidance was not delivered."
+        );
+    }
+
+    #[test]
+    fn a_refused_resume_model_rides_the_resume_meta() {
+        let result = parse_json(
+            r#"{"session":{"sessionId":"s","modelId":"recorded"},"blockedPrompt":{"text":"fix it"},"modelIdRefusal":{"modelId":"model-x","reason":"model-x is not served by this provider"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            resume_result_meta(&result),
+            r#","muse":{"blockedPrompt":{"text":"fix it"},"modelIdRefusal":{"modelId":"model-x","reason":"model-x is not served by this provider"}}"#
+        );
+        let refused_only =
+            parse_json(r#"{"modelIdRefusal":{"modelId":"model-x","reason":"blank"}}"#).unwrap();
+        assert_eq!(
+            resume_result_meta(&refused_only),
+            r#","muse":{"modelIdRefusal":{"modelId":"model-x","reason":"blank"}}"#
+        );
+        assert_eq!(resume_result_meta(&parse_json("{}").unwrap()), "");
+    }
 
     #[test]
     fn approval_titles_show_every_hidden_character() {

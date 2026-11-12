@@ -946,12 +946,12 @@ compatibility table, and reports whether the configured Muse CLI can be invoked
 (`cli-ready` or `cli-unready`). It exits `0` even when Muse is not installed, so
 you can collect output on a machine that is still being set up.
 
-The current vendored SDK surface is Muse 1.4.14
-(`sha256:c94c3d1f2f51e6424074b9ec43eac3eedcf532d3dcd77351ec1383a87d3049c6`).
-The adapter and standalone MSP client live suites pass against
-`1.4.14-R7309.1`, and the 1.4.14 Linux, macOS, and Windows artifacts are pinned
-in the nightly matrix. The nightly live-host support floor is Muse 1.4.11:
-1.4.11 through 1.4.14 run on Linux x86-64 and Windows x64, and the newest
+The current vendored SDK surface is Muse 1.4.15
+(`sha256:ef311d2dbf051ed9114556e14ad3980eb515104baa3409306a6817082a61d8cd`).
+The adapter live suite passes against `1.4.15-R8339.1`, and the 1.4.15 Linux,
+macOS, and Windows artifacts are pinned in the nightly matrix. The nightly
+live-host support floor is Muse 1.4.11:
+1.4.11 through 1.4.15 run on Linux x86-64 and Windows x64, and the newest
 build runs on macOS arm64. Older fingerprints remain recorded as historical
 compatibility evidence but are no longer downloaded for every nightly run.
 

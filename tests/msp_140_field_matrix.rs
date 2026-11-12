@@ -6,8 +6,10 @@
 //! item kinds, goal timestamps, recovery members, and skill source, the
 //! 1.4.12 re-pin's item kinds, approval card facts, recall seed, checkpoint
 //! boundary, and task-list members, the 1.4.13 re-pin's approval data facts,
-//! replay hints, work id, and queued inputs, and the 1.4.14 re-pin's item,
-//! approval, session, resume, and error additions join the same matrix),
+//! replay hints, work id, and queued inputs, the 1.4.14 re-pin's item,
+//! approval, session, resume, and error additions, and the 1.4.15 re-pin's
+//! item kinds, notice and peer facts, takeover holder, background facts,
+//! session, read, resume, and snapshot additions join the same matrix),
 //! whether it earns an ACP mapping or an explicit "Intentionally ignored"
 //! disposition. This test keeps that matrix
 //! honest in two ways: every addition has exactly one disposition row in
@@ -103,6 +105,35 @@ const ADDITIONS: &[&str] = &[
     "SessionStartParams.spawnedBy",
     "TurnError.requestDenied",
     "ViewPageParams.maxBytes",
+    "ItemKind.systemNotice",
+    "Item.noticeOrigin",
+    "Item.noticeSeverity",
+    "Item.noticeKind",
+    "Item.noticeSubject",
+    "ItemKind.peerMessage",
+    "Item.peerMessage",
+    "ItemKind.subagentInput",
+    "Item.inputPhase",
+    "Item.deliveredBeforeTurnEnd",
+    "ItemKind.subagentResult",
+    "Item.resultStatus",
+    "Item.parentSubagentId",
+    "Item.backgroundTarget",
+    "ApprovalSubject.holder",
+    "ApprovalResolvedParams.abortReason",
+    "BackgroundTerminalCompletion.exitCode",
+    "BackgroundTerminalCompletion.reason",
+    "ForkProvenance.isRewind",
+    "Session.probeDegradedReason",
+    "Session.externalWait",
+    "SessionReadResult.deliveredInputs",
+    "SessionReadResult.prunedSubagents",
+    "SessionResumeResult.prunedSubagents",
+    "RuntimeWorktree.cleanupReason",
+    "RuntimeWorktree.cleanupDiagnostic",
+    "SnapshotState.monitorInbox",
+    "HistoryNoneReason.projectionRebuildFailed",
+    "SessionViewHealth.healthy",
 ];
 
 fn matrix() -> String {
@@ -272,6 +303,25 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         enum_has("ItemKind", "earlierHistory"),
         "ItemKind.earlierHistory left the stable surface"
     );
+    for kind in [
+        "systemNotice",
+        "peerMessage",
+        "subagentInput",
+        "subagentResult",
+    ] {
+        assert!(
+            enum_has("ItemKind", kind),
+            "ItemKind.{kind} left the stable surface"
+        );
+    }
+    assert!(
+        enum_has("HistoryNoneReason", "projectionRebuildFailed"),
+        "HistoryNoneReason.projectionRebuildFailed left the stable surface"
+    );
+    assert!(
+        enum_has("SessionViewHealth", "healthy"),
+        "SessionViewHealth.healthy left the stable surface"
+    );
     assert!(
         enum_has("TaskExecutionMode", "foreground"),
         "TaskExecutionMode.foreground left the stable surface"
@@ -352,6 +402,29 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("SessionStartParams", "spawnedBy"),
         ("TurnError", "requestDenied"),
         ("ViewPageParams", "maxBytes"),
+        ("Item", "noticeOrigin"),
+        ("Item", "noticeSeverity"),
+        ("Item", "noticeKind"),
+        ("Item", "noticeSubject"),
+        ("Item", "peerMessage"),
+        ("Item", "inputPhase"),
+        ("Item", "deliveredBeforeTurnEnd"),
+        ("Item", "resultStatus"),
+        ("Item", "parentSubagentId"),
+        ("Item", "backgroundTarget"),
+        ("ApprovalSubject", "holder"),
+        ("ApprovalResolvedParams", "abortReason"),
+        ("BackgroundTerminalCompletion", "exitCode"),
+        ("BackgroundTerminalCompletion", "reason"),
+        ("ForkProvenance", "isRewind"),
+        ("Session", "probeDegradedReason"),
+        ("Session", "externalWait"),
+        ("SessionReadResult", "deliveredInputs"),
+        ("SessionReadResult", "prunedSubagents"),
+        ("SessionResumeResult", "prunedSubagents"),
+        ("RuntimeWorktree", "cleanupReason"),
+        ("RuntimeWorktree", "cleanupDiagnostic"),
+        ("SnapshotState", "monitorInbox"),
     ] {
         assert!(
             has_property(defs, def, member),
@@ -456,6 +529,109 @@ fn one_4_14_definitions_stay_in_the_vendored_bundle() {
         assert!(
             enum_has("HeldFor", value),
             "HeldFor.{value} left the stable surface"
+        );
+    }
+}
+
+#[test]
+fn one_4_15_definitions_stay_in_the_vendored_bundle() {
+    let schema = schema();
+    let defs = schema.get("$defs").expect("$defs");
+    for def in [
+        "BackgroundTarget",
+        "ComputerUseLockHolder",
+        "NoticeOrigin",
+        "NoticeSeverity",
+        "NoticeSubject",
+        "PeerMessage",
+        "SubagentInputPhase",
+        "SubagentResultStatus",
+        "TurnModelAttemptStartedParams",
+        "ProbeDegradedReason",
+        "MonitorInboxSnapshotEntry",
+        "ExternalWaitView",
+        "DeliveredInput",
+        "PrunedSubagent",
+        "RuntimeWorktreeCleanupReason",
+    ] {
+        assert!(defs.get(def).is_some(), "{def} left the stable surface");
+    }
+    let requires = |def: &str, member: &str| {
+        defs.get(def)
+            .and_then(|d| d.get("required"))
+            .and_then(|r| r.as_array())
+            .is_some_and(|members| members.iter().any(|m| m == member))
+    };
+    for (def, members) in [
+        (
+            "BackgroundTarget",
+            &[
+                "backgroundRequested",
+                "foregroundWaitActive",
+                "manualReleaseAdmissible",
+                "toolCallId",
+            ][..],
+        ),
+        (
+            "ComputerUseLockHolder",
+            &["acquiredAt", "lastActivityAt", "sessionLabel"][..],
+        ),
+        ("NoticeSubject", &["id"][..]),
+        ("PeerMessage", &["body", "remote", "senderLabel"][..]),
+        (
+            "TurnModelAttemptStartedParams",
+            &["sessionId", "sourceRange", "turnId", "viewCursor"][..],
+        ),
+        (
+            "MonitorInboxSnapshotEntry",
+            &["itemId", "taskId", "queuedAt"][..],
+        ),
+    ] {
+        for member in members {
+            assert!(
+                requires(def, member),
+                "{def}.{member} left the stable surface"
+            );
+        }
+    }
+    let enum_has = |def: &str, value: &str| {
+        defs.get(def)
+            .and_then(|d| d.get("enum"))
+            .and_then(|e| e.as_array())
+            .is_some_and(|values| values.iter().any(|v| v == value))
+    };
+    for (def, values) in [
+        ("NoticeSeverity", &["info", "warning", "error"][..]),
+        ("SubagentInputPhase", &["queued", "delivered"][..]),
+        (
+            "SubagentResultStatus",
+            &["completed", "failed", "cancelled"][..],
+        ),
+    ] {
+        for value in values {
+            assert!(
+                enum_has(def, value),
+                "{def}.{value} left the stable surface"
+            );
+        }
+    }
+    // The two notifications and decide errors the adapter now handles.
+    for method in ["turn/modelAttemptStarted", "model/completed"] {
+        assert!(
+            schema["notifications"].get(method).is_some(),
+            "{method} left the stable surface"
+        );
+    }
+    let errors = schema["errors"].as_array().expect("errors");
+    for (code, kind) in [
+        (-32058, "approvalBrokerUnavailable"),
+        (-32059, "approvalResolving"),
+    ] {
+        assert!(
+            errors
+                .iter()
+                .any(|e| e["code"] == code && e["kind"] == kind),
+            "{kind} ({code}) left the stable surface"
         );
     }
 }

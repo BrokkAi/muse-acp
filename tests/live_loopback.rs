@@ -1603,13 +1603,13 @@ fn reasoning_selector_matches_the_live_model_catalog() {
         .map(|option| option["value"].as_str().unwrap())
         .collect();
     let catalog = host_catalog(&host);
-    let row = catalog
-        .iter()
-        .find(|row| row["modelId"] == model.as_str())
-        .unwrap_or_else(|| panic!("no catalog row for {model}: {catalog:?}"));
-    let want: Vec<&str> = match row["variants"].as_array() {
+    // Muse 1.4.14 synthesized a row for a configured model outside its
+    // bundled catalog; 1.4.15 lists only the bundled rows, so the loopback
+    // model may have none. The adapter then keeps the current model and,
+    // like a row that cannot describe its tiers, offers the fixed list.
+    let row = catalog.iter().find(|row| row["modelId"] == model.as_str());
+    let want: Vec<&str> = match row.and_then(|row| row["variants"].as_array()) {
         Some(variants) => variants.iter().map(|v| v.as_str().unwrap()).collect(),
-        // A catalog that cannot describe its tiers keeps the fixed list.
         None => vec![
             "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
         ],
