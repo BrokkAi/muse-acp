@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+- Adopt the Muse 1.4.18 stable surface. The Muse SDK has not published
+  1.4.16 through 1.4.18, so the vendored stable bundle is the 1.4.18-R8587.1
+  build's own schema export; its fingerprint classifies as tested and the
+  nightly matrix runs the 1.4.18 builds. No 1.4.16 or 1.4.17 build was
+  available to validate, so those hosts log `status=unknown` and still run.
+  What editors see:
+  - A session waiting for an approval or an answer shows Muse 1.4.18's
+    `needsInput` status, with its reasons in `_meta.muse.needsInputReasons`
+    (also on `session/list` rows), instead of `unknown`; ACP v2 clients get
+    `requires_action`.
+  - Shell tool cards are titled with the model's description of the command
+    (Muse's Bash Title, also in `_meta.muse.bashTitle`) when the host serves
+    one; the command stays in the raw input and the ACP v2 terminal.
+  - A backgrounded call's delivered result renders as a `Background task
+    finished` (or failed, cancelled, timed out, rejected) card with its facts
+    in `_meta.muse.bodyCompletion`, and settles a JetBrains AIR background
+    task.
+  - A subagent card says when a newer attempt superseded its result
+    (`_meta.muse.subagent.superseded`), and the child is not settled from
+    that stale result.
+  - A turn that fails with `contextOverflow` suggests `/compact` or a new
+    session; one that fails with `reasoningReplayRefused` explains that the
+    provider refused to replay earlier reasoning.
+  - A refused workflow stop names Muse's refusal kind.
+  - The log records the experimental-surface fingerprint, any `session/start`
+    or `session/resume` warnings, and `session/activationChanged`.
+
 ## 0.22.0
 
 - Trust every workspace, as claude-agent-acp does: the main and read-only

@@ -7,9 +7,12 @@
 //! 1.4.12 re-pin's item kinds, approval card facts, recall seed, checkpoint
 //! boundary, and task-list members, the 1.4.13 re-pin's approval data facts,
 //! replay hints, work id, and queued inputs, the 1.4.14 re-pin's item,
-//! approval, session, resume, and error additions, and the 1.4.15 re-pin's
+//! approval, session, resume, and error additions, the 1.4.15 re-pin's
 //! item kinds, notice and peer facts, takeover holder, background facts,
-//! session, read, resume, and snapshot additions join the same matrix),
+//! session, read, resume, and snapshot additions, and the 1.4.18 re-pin's
+//! body completion, Bash Title, superseded result, notice origin, error
+//! kinds, stop refusal, experimental fingerprint, developer prompt, and read
+//! additions join the same matrix),
 //! whether it earns an ACP mapping or an explicit "Intentionally ignored"
 //! disposition. This test keeps that matrix
 //! honest in two ways: every addition has exactly one disposition row in
@@ -134,6 +137,17 @@ const ADDITIONS: &[&str] = &[
     "SnapshotState.monitorInbox",
     "HistoryNoneReason.projectionRebuildFailed",
     "SessionViewHealth.healthy",
+    "ItemKind.bodyCompletion",
+    "Item.bodyCompletion",
+    "Item.bashTitle",
+    "SubagentResult.superseded",
+    "NoticeOrigin.continuedChildTools",
+    "TurnErrorKind.contextOverflow",
+    "TurnErrorKind.reasoningReplayRefused",
+    "ErrorData.stopRefusal",
+    "SchemaInfo.experimentalFingerprint",
+    "SessionConfig.developerPrompt",
+    "SessionReadResult.modelTurnRunning",
 ];
 
 fn matrix() -> String {
@@ -425,12 +439,53 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("RuntimeWorktree", "cleanupReason"),
         ("RuntimeWorktree", "cleanupDiagnostic"),
         ("SnapshotState", "monitorInbox"),
+        ("Item", "bodyCompletion"),
+        ("Item", "bashTitle"),
+        ("SubagentResult", "superseded"),
+        ("ErrorData", "stopRefusal"),
+        ("SchemaInfo", "experimentalFingerprint"),
+        ("SessionConfig", "developerPrompt"),
+        ("SessionReadResult", "modelTurnRunning"),
     ] {
         assert!(
             has_property(defs, def, member),
             "{def}.{member} left the stable surface"
         );
     }
+}
+
+#[test]
+fn one_4_18_vocabulary_stays_in_the_vendored_bundle() {
+    let schema = schema();
+    let defs = schema.get("$defs").expect("$defs");
+    let enum_has = |def: &str, value: &str| {
+        defs.get(def)
+            .and_then(|d| d.get("enum"))
+            .and_then(|e| e.as_array())
+            .is_some_and(|values| values.iter().any(|v| v == value))
+    };
+    for (def, value) in [
+        ("ItemKind", "bodyCompletion"),
+        ("NoticeOrigin", "continuedChildTools"),
+        ("TurnErrorKind", "contextOverflow"),
+        ("TurnErrorKind", "reasoningReplayRefused"),
+        ("BodyCompletionCorrelation", "resolved"),
+        ("BodyCompletionCorrelation", "unresolved"),
+    ] {
+        assert!(
+            enum_has(def, value),
+            "{def}.{value} left the stable surface"
+        );
+    }
+    assert!(
+        defs.get("BodyCompletionMembers").is_some(),
+        "BodyCompletionMembers left the stable surface"
+    );
+    // A developer prompt's explicit null is the documented clear.
+    assert!(
+        null_tolerant(defs, "SessionConfig", "developerPrompt"),
+        "SessionConfig.developerPrompt must stay null-tolerant"
+    );
 }
 
 #[test]

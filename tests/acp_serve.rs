@@ -5503,6 +5503,10 @@ fn host_session_metadata_populates_rows_and_live_title_updates() {
         "Muse 1.4.15's probe reason is preserved on the row: {listed}"
     );
     assert!(
+        listed.contains("\"needsInputReasons\":[\"inputPending\"]"),
+        "Muse 1.4.18's input reasons are preserved on the row: {listed}"
+    );
+    assert!(
         !listed.contains("\"driveHolder\"")
             && !listed.contains("\"itemCount\"")
             && !listed.contains("\"logBytes\"")
@@ -8974,10 +8978,28 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 }
 
 #[test]
-fn sdk_manifest_fingerprint_is_the_1_4_15_surface() {
-    // The vendored SDK corpus (07e1548) is the Muse 1.4.15 surface, and the
-    // stable 1.4.15-R8339.1 build in the nightly live-host matrix reports
-    // this digest, so the adapter classifies it as tested.
+fn sdk_manifest_fingerprint_is_the_1_4_18_surface() {
+    // The vendored stable bundle is the 1.4.18-R8587.1 build's own export,
+    // and that build in the nightly live-host matrix reports this digest, so
+    // the adapter classifies it as tested.
+    let mut c = Client::spawn(
+        "quiet",
+        &[(
+            "FAKE_FINGERPRINT",
+            "sha256:77dda18550adef14e257b015fe4e6490b722723f7d526df5ba4867939fff68a3",
+        )],
+    );
+    c.initialize(1, "");
+    c.wait_stderr("status=tested", Duration::from_secs(10));
+    c.wait_stderr(
+        "validated against live host 1.4.18-R8587.1; the vendored 1.4.18 export",
+        Duration::from_secs(10),
+    );
+    c.finish();
+}
+
+#[test]
+fn the_1_4_15_fingerprint_stays_tested() {
     let mut c = Client::spawn(
         "quiet",
         &[(
@@ -8988,7 +9010,7 @@ fn sdk_manifest_fingerprint_is_the_1_4_15_surface() {
     c.initialize(1, "");
     c.wait_stderr("status=tested", Duration::from_secs(10));
     c.wait_stderr(
-        "validated against live host 1.4.15-R8339.1; the vendored SDK 07e1548 surface",
+        "validated against live host 1.4.15-R8339.1; the previously vendored SDK 07e1548 surface",
         Duration::from_secs(10),
     );
     c.finish();
@@ -11046,6 +11068,38 @@ fn status_changed_seeds_and_targets_session_attention() {
     assert!(
         cleared.contains("\"attention\":[]"),
         "cleared attention was not rendered: {cleared}"
+    );
+    c.finish();
+}
+
+#[test]
+fn needs_input_status_reaches_the_editor_with_its_reasons() {
+    let mut c = Client::spawn("needs_input_status", &[]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "ask me something");
+    // Muse 1.4.18 sends the experimental `needsInput` status to this
+    // adapter, which opts into `experimentalApi`. It is a known status, not
+    // the generic `unknown`, and its reasons ride verbatim.
+    let waiting = c.wait_for("\"status\":\"needsInput\"", Duration::from_secs(15));
+    let frame: serde_json::Value = serde_json::from_str(&waiting).unwrap();
+    let muse = &frame["params"]["update"]["_meta"]["muse"];
+    assert_eq!(
+        muse["needsInputReasons"],
+        serde_json::json!(["approvalPending", "futureReason"]),
+        "{waiting}"
+    );
+    let state = c.wait_for("requires_action", Duration::from_secs(15));
+    assert!(state.contains(&sid), "{state}");
+    // The next status event omits the reasons, which clears them.
+    let running = c.wait_for("\"status\":\"running\"", Duration::from_secs(15));
+    let frame: serde_json::Value = serde_json::from_str(&running).unwrap();
+    let muse = &frame["params"]["update"]["_meta"]["muse"];
+    assert!(muse.get("needsInputReasons").is_none(), "{running}");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let log = std::fs::read_to_string(&c.stderr_log).unwrap_or_default();
+    assert!(
+        !log.contains("unknown MSP session status"),
+        "needsInput was treated as unknown: {log}"
     );
     c.finish();
 }

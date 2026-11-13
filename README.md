@@ -946,13 +946,15 @@ compatibility table, and reports whether the configured Muse CLI can be invoked
 (`cli-ready` or `cli-unready`). It exits `0` even when Muse is not installed, so
 you can collect output on a machine that is still being set up.
 
-The current vendored SDK surface is Muse 1.4.15
-(`sha256:ef311d2dbf051ed9114556e14ad3980eb515104baa3409306a6817082a61d8cd`).
-The adapter live suite passes against `1.4.15-R8339.1`, and the 1.4.15 Linux,
-macOS, and Windows artifacts are pinned in the nightly matrix. The nightly
-live-host support floor is Muse 1.4.11:
-1.4.11 through 1.4.15 run on Linux x86-64 and Windows x64, and the newest
-build runs on macOS arm64. Older fingerprints remain recorded as historical
+The current vendored surface is Muse 1.4.18
+(`sha256:77dda18550adef14e257b015fe4e6490b722723f7d526df5ba4867939fff68a3`),
+taken from the 1.4.18 build's own schema export because the Muse SDK has not
+yet published it. The adapter live suite passes against `1.4.18-R8587.1`, and
+the 1.4.18 Linux, macOS, and Windows artifacts are pinned in the nightly
+matrix. The nightly live-host support floor is Muse 1.4.11: 1.4.11 through
+1.4.15 and 1.4.18 run on Linux x86-64 and Windows x64, and the newest build
+runs on macOS arm64. Muse 1.4.16 and 1.4.17 were not available to validate,
+so the adapter logs their fingerprints as `unknown` and still runs. Older fingerprints remain recorded as historical
 compatibility evidence but are no longer downloaded for every nightly run.
 
 At startup the adapter logs whether the host can enforce its sandbox, as

@@ -120,6 +120,8 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   session_list_pagination returns a second page when its cursor is forwarded
   status_flags   session/statusChanged status, attention, open-enum, and null
                  viewCursor handling
+  needs_input_status Muse 1.4.18's experimental needsInput status with its
+                 needsInputReasons, then a running event that clears them
   session_metadata host-authored title candidates, branch/attention metadata,
                    and a live session/nameChanged notification
   session_list_workspace_filter return no host sessions for an unmatched root
@@ -779,6 +781,8 @@ def session_obj(session_id=None, workspace_root=None):
                 # reading, and a live external wait (read-only member).
                 "probeDegradedReason": "skippedUntrusted",
                 "externalWait": {"reason": "CI run"},
+                # Muse 1.4.18 (experimental): why its input is needed.
+                "needsInputReasons": ["inputPending"],
             })
         elif session_id == "msp-sess-old":
             session.update({
@@ -1060,6 +1064,19 @@ def on_turn_start(params):
         notify("session/statusChanged", {
             "sessionId": MSP_SID, "status": "idle",
             "viewCursor": "cur-status-2"})
+        notify("turn/completed", {**base, "terminal": "completed"})
+    elif SCENARIO == "needs_input_status":
+        notify("session/statusChanged", {
+            "sessionId": MSP_SID, "status": "needsInput",
+            "attention": ["approvalPending"],
+            "needsInputReasons": ["approvalPending", "futureReason"],
+            "viewCursor": "cur-needs-input"})
+        notify("session/statusChanged", {
+            "sessionId": MSP_SID, "status": "running", "attention": [],
+            "viewCursor": "cur-needs-input-2"})
+        notify("item/completed", {**base, "item": {
+            "itemId": "it-needs-input", "kind": "agentMessage",
+            "status": "completed", "text": "answered"}})
         notify("turn/completed", {**base, "terminal": "completed"})
     elif SCENARIO == "metadata_patch":
         notify("session/statusChanged", {
