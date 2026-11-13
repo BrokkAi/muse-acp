@@ -815,13 +815,16 @@ fn warn_if_allow_all_mode(session_id: &str, mode: &str) {
     }
 }
 
-/// MSP keeps these values open on the wire. Preserve the three values the
-/// adapter understands and project a future value generically so a new host
-/// does not make the session disappear from the editor.
+/// MSP keeps these values open on the wire. Preserve the values the adapter
+/// understands and project a future value generically so a new host does not
+/// make the session disappear from the editor. Muse 1.4.18 sends
+/// `needsInput` to a connection that opted into `experimentalApi` (this
+/// adapter does) while a loaded session waits for an approval or an answer;
+/// a connection that did not opt in receives `idle` instead.
 fn session_status_projection(raw: Option<&str>) -> Option<String> {
     let raw = raw?;
     Some(match raw {
-        "notLoaded" | "idle" | "running" => raw.to_string(),
+        "notLoaded" | "idle" | "running" | "needsInput" => raw.to_string(),
         _ => {
             log(&format!(
                 "unknown MSP session status {raw:?}; projecting as unknown"
@@ -858,7 +861,14 @@ fn attention_projection(value: Option<&J>, session_id: &str) -> Option<Vec<Strin
 /// protocol says additive-optional attention is not an assertion that nothing
 /// is pending.
 fn adopt_session_projection(s: &mut AcpSession, session: &J) {
-    for key in ["resumedByClient", "spawnedBy", "probeDegradedReason"] {
+    // Muse 1.4.18 (experimental): why the session's input is needed, beside
+    // the `needsInput` status. Absent is a non-assertion, as for `attention`.
+    for key in [
+        "resumedByClient",
+        "spawnedBy",
+        "probeDegradedReason",
+        "needsInputReasons",
+    ] {
         if let Some(value) = session.get(key) {
             if matches!(value, J::Null) {
                 s.remove_session_meta(key);
@@ -906,6 +916,10 @@ fn adopt_streamed_session_row(s: &mut AcpSession, row: &J) {
         s.attention_meta = None;
         s.remove_session_meta("attention");
     }
+    // A streamed row omits `needsInputReasons` when the set is empty.
+    if row.get("needsInputReasons").is_none() {
+        s.remove_session_meta("needsInputReasons");
+    }
     s.branch_meta = raw_host_fact(Some(row), "branch");
     if let Some(branch) = s.branch_meta.as_deref() {
         s.set_session_meta("branch", branch.to_string());
@@ -949,6 +963,14 @@ fn adopt_status_changed(s: &mut AcpSession, params: &J) {
     } else {
         Some(Vec::new())
     };
+    // Muse 1.4.18 (experimental) sends `needsInputReasons` only when the set
+    // is non-empty, so an event without it clears the reasons.
+    match params.get("needsInputReasons") {
+        Some(reasons) if !matches!(reasons, J::Null) => {
+            s.set_session_meta("needsInputReasons", j_to_string(reasons))
+        }
+        _ => s.remove_session_meta("needsInputReasons"),
+    }
 }
 
 /// Send the standard v2 state for known load states or a parked request, plus
@@ -969,7 +991,7 @@ fn send_session_projection(
         s.ver
     };
     if ver == 2 {
-        if attention.is_some_and(|flags| !flags.is_empty()) {
+        if attention.is_some_and(|flags| !flags.is_empty()) || status == Some("needsInput") {
             acp::send_state(stdout, acp_sid, "requires_action", None);
         } else {
             match status {
@@ -2567,6 +2589,7 @@ fn resume_replay_from(replay: &Option<request::Replay>) -> Result<bool, String> 
 /// lacks a snapshot just because the host omitted its folded status.
 fn current_state_snapshot(s: &AcpSession) -> &'static str {
     if s.attention.as_ref().is_some_and(|flags| !flags.is_empty())
+        || s.session_status.as_deref() == Some("needsInput")
         || s.pending_perm.is_some()
         || !s.pending_ui.is_empty()
         || s.pending_feedback.is_some()
@@ -10912,13 +10935,15 @@ fn update_host_session_facts(
 /// The `Session` facts a `session/list` row carries in `_meta.muse`, as the
 /// host sent them. Fold-only facts such as `nameOrigin` and `generatedName`
 /// never ride a list row.
-const LIST_ROW_FACTS: [&str; 5] = [
+const LIST_ROW_FACTS: [&str; 6] = [
     "branch",
     "attention",
     "resumedByClient",
     "spawnedBy",
     // Muse 1.4.15: why the workspace status probe produced no reading.
     "probeDegradedReason",
+    // Muse 1.4.18 (experimental): why the session's input is needed.
+    "needsInputReasons",
 ];
 
 fn session_info_row(
