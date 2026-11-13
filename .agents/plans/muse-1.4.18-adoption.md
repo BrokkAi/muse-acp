@@ -20,11 +20,12 @@ To verify, run the focused tests named below, the full workspace suite, `cargo r
 - [x] (2026-11-13 09:55Z) Confirmed the public SDK has no revision past `07e1548` (1.4.15) and npm `@muse-code/sdk` is still 1.4.15, so the 1.4.18 bundle comes from the binary's own `muse schema generate-json-schema` export.
 - [x] (2026-11-13 10:00Z) Diffed the 1.4.15 and 1.4.18 stable and experimental exports (see Context and Orientation).
 - [x] (2026-11-13 10:20Z) Ran the live loopback suite against 1.4.18 with the current adapter: 52 of 52 pass. Captured the raw MSP stream and confirmed `status: "needsInput"`, `needsInputReasons`, `bashTitle`, and `schema.experimentalFingerprint` on the wire.
-- [ ] Milestone 1: re-pin `tests/protocol/stable` to the 1.4.18 export, add `HOST_1418_FINGERPRINT` and the byte pin, nightly rows, PROVENANCE.
-- [ ] Milestone 2: map `needsInput` and `needsInputReasons`.
-- [ ] Milestone 3: map `bashTitle`, `bodyCompletion`, `SubagentResult.superseded`, the two turn error kinds, `stopRefusal`, `experimentalFingerprint`, and log the experimental load warnings and activation changes.
-- [ ] Milestone 4: dispositions in `ROADMAP.md` and `tests/msp_140_field_matrix.rs`; README, `docs/acp-extensions.md`, `docs/event-compatibility.md`, CHANGELOG, and the 1.4.x adoption log.
-- [ ] Milestone 5: full gates, live suite on 1.4.18 and a 1.4.15 control, PR.
+- [x] (2026-11-13 10:40Z) Milestone 1: re-pinned `tests/protocol/stable` to the 1.4.18 export, added `HOST_1418_FINGERPRINT` and the byte pin, the nightly rows, and PROVENANCE (commit `cc90b5a`).
+- [x] (2026-11-13 11:00Z) Milestone 2: mapped `needsInput` and `needsInputReasons`, including the adapter-owned `session/list` row keys in `src/acp.rs` (commit `89016b7`).
+- [x] (2026-11-13 11:40Z) Milestone 3: mapped `bashTitle`, `bodyCompletion` (card and AIR task settlement), `SubagentResult.superseded`, the two turn error kinds, and `stopRefusal`; logged `experimentalFingerprint`, load warnings, and activation changes (commit `f6ccb91`).
+- [x] (2026-11-13 12:00Z) Milestone 4: dispositions in `ROADMAP.md` and `tests/msp_140_field_matrix.rs`; README, `docs/acp-extensions.md`, `docs/event-compatibility.md`, CHANGELOG, the 1.4.x adoption log, and `.agents/docs/native-muse-acp.md`.
+- [x] (2026-11-13 12:40Z) Milestone 5: fmt, Clippy, the workspace suite, selftest, npm, Python, shell, and smoke gates pass; live loopback 52/52 and the MSP-client live test pass on 1.4.18; the 1.4.15 control passes 48/52 (see Surprises).
+- [ ] Open the PR and merge when CI is green; then run the nightly on master.
 
 
 ## Surprises & Discoveries
@@ -44,6 +45,9 @@ To verify, run the focused tests named below, the full workspace suite, `cargo r
 
 - Observation: All four sandbox-bound live tests now pass in this environment.
   Evidence: `an_approved_shell_command_runs_and_a_rejected_one_does_not`, `a_piped_shell_command_asks_with_every_stage`, `auto_review_decides_a_shell_approval_against_a_real_host`, and `monitor_feed_reaches_a_real_host` passed against 1.4.18 on 2026-11-13, so the earlier `bwrap` limitation no longer applies here.
+
+- Observation: The downloaded 1.4.15 control build cannot sandbox shell commands here, while the installed 1.4.18 can.
+  Evidence: the 1.4.15 control fails the same four shell and monitor tests with `bwrap is missing required capability --ro-bind-symlink` and a refusal of the sandbox root under `/tmp`; 1.4.18 at `~/.local/bin` passes them.
 
 - Observation: The three open "Nightly failure" issues (#472, #473, #474) are not caused by Muse.
   Evidence: every failed job fails compiling `muse-acp` with `duplicated attribute`, which `99ad6fa` ("Remove duplicate Clippy allowance") fixed on master.
@@ -84,7 +88,11 @@ To verify, run the focused tests named below, the full workspace suite, `cargo r
 ## Outcomes & Retrospective
 
 
-(To be written at completion.)
+The adapter classifies Muse 1.4.18 as tested (`--selftest` prints tested `sdk-manifest` and `host-1.4.18` rows for `sha256:77dda185...`), the stable bundle is the 1.4.18 build's own export, and the nightly matrix carries the 1.4.18 builds. The one behavior regression 1.4.18 caused, the `needsInput` status shown as `unknown`, is fixed; every stable addition has a disposition; and the editor-visible additions (Bash Title, background-task receipts, superseded results, the two turn error kinds, stop refusals) are mapped with unit and fake-host tests.
+
+Validation: 293 adapter unit tests, 466 adapter integration tests, 10 field-matrix tests, all other workspace suites, Clippy with warnings denied, formatting, selftest, 4 npm launcher tests, 43 Python tests (6 platform skips), shell syntax, and npm smoke. Live loopback against 1.4.18-R8587.1: 52 of 52; MSP-client live: 1 of 1. Against 1.4.15-R8339.1: 48 of 52, the four failures being the sandbox-bound tests the downloaded build cannot run here.
+
+What remains: ACP `systemPrompt` on top of the now-stable `developerPrompt` (#318); the experimental rewind (`session/rewind*`), `subagent/workStop`, `mcpServer/readStartupNotices`, per-session MCP admission, resume relocation (`workspaceRoot(s)` on resume), and remote nodes have no ACP mapping yet; `bodyCompletion` and the Bash Title were checked against the schema and, for the Bash Title, a live capture, but no live run produced a `bodyCompletion`; and the README does not yet say when to prefer this adapter over Muse's native `muse acp`.
 
 
 ## Context and Orientation

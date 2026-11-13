@@ -128,8 +128,9 @@ the value from the latest frame.
 | --- | --- | --- |
 | `_meta.goal` | object or `null` | Provider-neutral goal display state. `null` is an authoritative clear. Muse 1.4.11+ goals carry `createdAtMs` and `updatedAtMs` (epoch milliseconds) verbatim from the durable goal row; a goal whose producer never recorded them omits them, never reporting zero. |
 | `_meta.muse.branch` | object or `null` | Branch/VCS/workspace observation from the host. |
-| `_meta.muse.status` | string | Host session status. ACP v2 also receives standard `state_update`. |
+| `_meta.muse.status` | string | Host session status: `notLoaded`, `idle`, `running`, Muse 1.4.18's `needsInput` (the session waits for an approval or an answer), or `unknown` for a newer value. ACP v2 also receives standard `state_update`, with `needsInput` as `requires_action`. |
 | `_meta.muse.attention` | array of strings | Known host attention flags. Unknown flags are ignored. |
+| `_meta.muse.needsInputReasons` | array of strings | Muse 1.4.18+: why the session needs its user (`approvalPending`, `inputPending`, or a newer value, verbatim), present while `status` is `needsInput`. Also on `session/list` rows. A status event without it clears it; a lifecycle row that omits it retains it. |
 | `_meta.muse.nameOrigin` | `automatic` or `custom` | Proven title origin. Unknown origins are omitted. |
 | `_meta.muse.generatedName` | string or `null` | Host-generated short title. `null` withdraws a previously published value. |
 | `_meta.muse.sideFrom` | object | Side-chat parent provenance. |
@@ -203,12 +204,13 @@ Muse adds only facts with no standard ACP field:
 | Tool card | `_meta.muse.workId`: Muse 1.4.13+ ManagedBash Work ID, also present on the live AIR `async_task_spawned` update when the call registers one. It is a join key; the AIR `asyncTaskId` keeps its existing derivation. |
 | Tool card | `_meta.muse.replayHint: {afterItemId,rowKinds}` on a Muse 1.4.13+ monitor call. The row waits for `afterItemId` when it is still ahead, and `rowKinds` is passed verbatim as an open vocabulary. |
 | Tool card | `_meta.muse.backgroundTarget: {toolCallId, backgroundRequested, foregroundWaitActive, manualReleaseAdmissible}` (Muse 1.4.15+), verbatim, while the call is a live background candidate. When the host stops sending it the card sends `backgroundTarget: null` once. |
+| Tool card | `_meta.muse.bashTitle` (Muse 1.4.18+): a managed Bash call's Bash Title, the model's description of the command. It is also the card title unless the host sent a `displayLabel`; the command stays in `rawInput` and, on ACP v2, the terminal. |
 | Tool card | `_meta.muse.held` and `heldFor` (Muse 1.4.14+) while a call is held before execution. Non-terminal held calls use ACP status `pending` and a visible waiting title suffix; release sends `held:false` and `heldFor:null`. |
 | Unknown or synthetic host item | `_meta.muse.itemKind`. |
 | Earlier-history card (Muse 1.4.14+) | `_meta.muse.itemKind: "earlierHistory"` plus the complete `_meta.muse.earlierHistory: {messages}`. The card shows only known `user` and `assistant` roles as role-labelled stored transcript text; it never pretends they are new turns. |
 | Monitor card | `_meta.muse.monitorId`, `monitorDescription`, and `truncated`. On Muse 1.4.11+, `monitorInbox: {pending, drained, voided}` counts the monitor's inbox items: admitted and not yet settled, drained to the agent, and voided by a missed wake (a drain and a void of one item settle latest-wins on their recorded stamps). |
 | Subagent card | `_meta.muse.parentSubagentId` (Muse 1.4.15+): the subagent whose own session spawned this nested child, verbatim; absent for a direct child. |
-| Subagent card | `_meta.muse.subagent: {subagentId, childSessionId, controlStatus, depth, drained}`. `drained: true` (Muse 1.4.11+) is the host's fact that the parent consumed the result, also stated in the card text; it is absent until then and never cleared. |
+| Subagent card | `_meta.muse.subagent: {subagentId, childSessionId, controlStatus, depth, drained, superseded}`. `drained: true` (Muse 1.4.11+) is the host's fact that the parent consumed the result, also stated in the card text; it is absent until then and never cleared. `superseded: true` (Muse 1.4.18+) says a newer attempt started after the shown result, also stated in the card text; the child's state then follows `controlStatus`. |
 | Workflow card | `_meta.muse.workflow: {workflowRunId, entryId, scriptId, triggerSource, paused, resumeFromRunId}`. |
 | Hook card | `_meta.muse.hookRun: {hookKey, event, runStatus, reason, handlerKind, enabled}`. |
 | User-shell card | `_meta.muse.userShell: {exitCode, exitSignal}`. |
@@ -223,6 +225,7 @@ Muse adds only facts with no standard ACP field:
 | Peer message card (Muse 1.4.15+) | `_meta.muse.itemKind: "peerMessage"` plus `_meta.muse.peerMessage: {senderLabel, senderSessionId, remote, body}`, verbatim. Titled `Message from <sender>`; the body is the content. |
 | Subagent input card (Muse 1.4.15+) | `_meta.muse.itemKind: "subagentInput"` plus `_meta.muse.subagentInput: {inputPhase, deliveredBeforeTurnEnd, subagentId}` (members the host sent). Titled `Input queued for <agent>` or `Input delivered to <agent>`; an unknown phase renders no card. |
 | Subagent result card (Muse 1.4.15+) | `_meta.muse.itemKind: "subagentResult"` plus `_meta.muse.subagentResult: {resultStatus, subagentId}`. Titled `Result from <agent>`, with `(completed)`, `(failed)`, or `(cancelled)` when known; an unknown status is omitted. |
+| Background-task receipt card (Muse 1.4.18+) | `_meta.muse.itemKind: "bodyCompletion"` plus `_meta.muse.bodyCompletion: {status, resultSummary, correlation, receipt, originCallId}`, verbatim, and `_meta.muse.taskId` when the host sent one. `originCallId` is the backgrounded call's card id. Titled `Background task finished` (or `failed`, `was cancelled`, `timed out`, `was rejected`), with the result summary as content and a line when Muse could not link the result to its call (`correlation: "unresolved"`). |
 | Scheduled-fire card (Muse 1.4.11+) | `_meta.muse.scheduledFire: {jobId, deliveryNumber, scheduledFireAtMs, nextFireAtMs}`, verbatim epochs in milliseconds. |
 
 ### Notices

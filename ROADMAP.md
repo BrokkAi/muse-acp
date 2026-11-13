@@ -9,15 +9,15 @@ access, and useful in real editor workflows.
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
-- **Reference snapshots used for this revision:** Muse SDK `07e1548`
-  (2026-11-10; stable schema version 1, fingerprint
-  `sha256:ef311d2dbf051ed9114556e14ad3980eb515104baa3409306a6817082a61d8cd`,
-  the Muse 1.4.15 stable surface; the SDK's own export, validated against the
-  stable 1.4.15-R8339.1 build and pinned in the live-host matrix, whose own
-  `muse schema generate-json-schema` export is byte-identical to it. The SDK
-  manifest no longer carries the fingerprint; the value is the live
-  handshake's and the release manifest's)
-  and `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
+- **Reference snapshots used for this revision:** the Muse 1.4.18 stable
+  surface (stable schema version 1, fingerprint
+  `sha256:77dda18550adef14e257b015fe4e6490b722723f7d526df5ba4867939fff68a3`),
+  vendored from the stable 1.4.18-R8587.1 build's own
+  `muse schema generate-json-schema` export because the SDK has published
+  nothing past 1.4.15, validated against that build and pinned in the
+  live-host matrix; the fingerprint is the live handshake's and the release
+  manifest's. The transcript corpus is Muse SDK `07e1548` (2026-11-10, the
+  1.4.15 surface). Also `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
 
@@ -103,9 +103,10 @@ the verdict into richer support bundles.
   fingerprint that Muse 1.4.10 carries unchanged, the `22a8a56` pin after
   that published the 1.4.11 fingerprint, the `09d67ec` pin after that
   published the 1.4.12 fingerprint, the `3dce908` pin published the 1.4.13
-  fingerprint, the `a45cb67` pin published the 1.4.14 fingerprint, and the
-  current `07e1548` pin publishes the 1.4.15 surface, whose fingerprint
-  the SDK manifest no longer carries.
+  fingerprint, the `a45cb67` pin published the 1.4.14 fingerprint, the
+  `07e1548` pin published the 1.4.15 surface, whose fingerprint the SDK
+  manifest no longer carries, and the current stable bundle is the 1.4.18
+  build's own export.
   Host 1.2.1 reports
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
@@ -264,7 +265,20 @@ the verdict into richer support bundles.
   removed or newly required. A stable `1.4.15-R8339.1` binary exports the
   same bundle and reports the same fingerprint; its Linux, macOS, and
   Windows artifacts are pinned in the nightly matrix. Every addition has a
-  §9 disposition. Before 1.4.6, the
+  §9 disposition.
+  The 1.4.18 stable bundle is the `1.4.18-R8587.1` build's own export
+  (`sha256:77dda18550adef14e257b015fe4e6490b722723f7d526df5ba4867939fff68a3`,
+  schema version 1), taken because the SDK has not published 1.4.16, 1.4.17,
+  or 1.4.18; the live handshake and the release manifest report the same
+  fingerprint, and `src/compat.rs` pins the bundle's SHA-256. Over 1.4.15 it
+  is purely additive and changes only definitions: a `bodyCompletion` item
+  kind, the Bash Title, a superseded-result mark, a notice origin, two turn
+  error kinds, a workflow stop refusal, the experimental-surface digest, a
+  now-stable developer prompt, and a child read fact, with the method,
+  notification, request, error, and capability tables unchanged. Its Linux,
+  macOS, and Windows artifacts are pinned in the nightly matrix, and every
+  addition has a §9 disposition. No 1.4.16 or 1.4.17 build was available to
+  validate, so those fingerprints stay unclassified. Before 1.4.6, the
   Python tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
   `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
   surface while the top-level schema stayed on 1.3.0-R3401.1. Transcript
@@ -755,7 +769,7 @@ path, preserving the fail-closed policy from §4.
 
 **Muse 1.4.x stable-surface additions**
 
-Muse 1.4.1 through 1.4.15 grew the stable surface well past 1.3.0. The adapter
+Muse 1.4.1 through 1.4.18 grew the stable surface well past 1.3.0. The adapter
 adopts the parts that fit its ACP mapping (workspace roots, reasoning tiers,
 session delete on the hosts that serve it, `feedback/submit`, and
 `session/list` filters) and records an explicit disposition below for the
@@ -919,6 +933,18 @@ same release withholds a session's MCP servers in an untrusted workspace
 without a wire signal; the adapter trusts the workspaces it serves (see the
 README's "Workspace trust").
 
+Muse 1.4.18 changes only definitions on the stable surface: a receipt row
+for a backgrounded call's delivered result, the Bash Title on shell calls, a
+superseded mark on a subagent's earlier result, the continued-child tools
+notice origin, `contextOverflow` and `reasoningReplayRefused` turn failures,
+a workflow stop's refusal kind, the experimental-surface digest in the
+handshake, stable per-session developer instructions, and whether a child
+read session's model turn runs. Every one has a matrix row below. On the
+experimental surface the adapter opts into, a session waiting for its user
+now reports `needsInput` with `needsInputReasons`, which the adapter carries
+as a known status and maps to ACP v2 `requires_action`; start and resume
+warnings and `session/activationChanged` are logged.
+
 **Muse 1.4.x field-level and vocabulary additions**
 
 Muse 1.4.6 grew fields and open vocabularies the adapter's tolerant fold had to
@@ -1046,6 +1072,17 @@ cannot drop a member without failing CI.
 | `SnapshotState.monitorInbox` | Mapped to ACP | On resume the retained monitor admissions, with their drain and void stamps, seed the fold's inbox before any replay, so a resumed monitor card shows its `_meta.muse.monitorInbox` counts at once; later live inbox events update them. An older host sends none and nothing changes. |
 | `HistoryNoneReason.projectionRebuildFailed` | Consumed | Push-only on `session/viewHealthChanged` after the host's own re-load of a failed view failed; logged with the existing reattach guidance. |
 | `SessionViewHealth.healthy` | Consumed | Muse 1.4.15 reports a view the host re-loaded; the adapter logs that live delivery resumed instead of the unavailable guidance. |
+| `ItemKind.bodyCompletion` | Mapped to ACP | Muse 1.4.18's receipt row for a backgrounded call whose result reached the agent renders as a `Background task finished` (or `failed`, `was cancelled`, `timed out`, `was rejected`) card with the bounded result summary as content. For a negotiated JetBrains AIR async task it also settles the task, never overriding a state the call already reported. Without the facts it keeps the generic `fallbackText` card. |
+| `Item.bodyCompletion` | Mapped to ACP | The facts (`status`, `resultSummary`, `correlation`, `receipt`, `originCallId`) ride `_meta.muse.bodyCompletion` verbatim; `originCallId` is the original tool card's ACP id. An `unresolved` correlation adds a line saying Muse could not link the result to its call, naming the item's `taskId`, which also rides `_meta.muse.taskId`. |
+| `Item.bashTitle` | Mapped to ACP | A managed Bash call's Bash Title (the model's `description`, served while the host's own `bash_titles` gate is on) titles the tool card after the host's `displayLabel` and before the command line, sanitized to one line, and rides `_meta.muse.bashTitle`. The command stays in `rawInput`, the ACP v2 terminal, and the approval prompt. |
+| `SubagentResult.superseded` | Mapped to ACP | A result a newer attempt superseded adds `A newer attempt has started since this result.` to the subagent card and `superseded: true` to `_meta.muse.subagent`; a `resultReady` child is never settled from a superseded result, since the child's status comes from `controlStatus`. |
+| `NoticeOrigin.continuedChildTools` | Mapped to ACP | Muse 1.4.18's continued-child tools notice is a `systemNotice` like the others; its origin rides `_meta.muse.systemNotice.origin` verbatim with no special case. |
+| `TurnErrorKind.contextOverflow` | Mapped to ACP | The failed turn's editor message keeps the kind and adds that the conversation no longer fits the model's context window, suggesting `/compact` or a new session. |
+| `TurnErrorKind.reasoningReplayRefused` | Mapped to ACP | The failed turn's editor message keeps the kind and adds that the provider refused to replay earlier reasoning, suggesting the model that produced it or a new session. |
+| `ErrorData.stopRefusal` | Mapped to ACP | A refused `workflow/cancel` behind an AIR async-task stop returns the host message with `(stop refused: <kind>)`, the open refusal kind sanitized to one line. The adapter's other stops do not use `workflow/cancel`. |
+| `SchemaInfo.experimentalFingerprint` | Consumed | The adapter opts into the experimental surface, so the handshake's digest of it is logged beside `schema-compat` as `schema-compat-experimental ... experimental_fingerprint=...`. Absent means unknown; it does not affect classification. |
+| `SessionConfig.developerPrompt` | Unsupported pending protocol decision | Muse 1.4.18 makes per-session developer instructions stable on `session/start` and `session/resume`. They replace the settings-derived developer instructions rather than appending to them, so mapping ACP's unstable `systemPrompt` (`append`/`override`) onto them needs its own design: [#318](https://github.com/BrokkAi/muse-acp/issues/318). |
+| `SessionReadResult.modelTurnRunning` | Intentionally ignored | Whether a child read session's model turn runs is served on a `subagent` session read; the adapter reads sessions only to replay history. |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**
