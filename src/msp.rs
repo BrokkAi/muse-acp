@@ -844,9 +844,14 @@ impl MspHost {
             std::env::var("MUSE_COMMAND_TIMEOUT_MS").ok().as_deref(),
             method,
         );
-        self.client
+        let result = self
+            .client
             .request_with_timeout(method, Params::raw(params_json), timeout)
-            .map_err(|error| self.command_error(error, params_json))
+            .map_err(|error| self.command_error(error, params_json));
+        if let Ok(result) = &result {
+            log_load_warnings(method, result);
+        }
+        result
     }
 
     /// The error object a failed command has always produced: host errors
@@ -961,6 +966,62 @@ fn compatibility(handshake: &Handshake) -> compat::Compatibility {
     )
 }
 
+/// `schema.experimentalFingerprint` (Muse 1.4.18+), read from the raw
+/// `initialize` result.
+fn experimental_fingerprint(handshake: &Handshake) -> Option<&str> {
+    handshake
+        .result
+        .get("schema")
+        .and_then(|schema| schema.get("experimentalFingerprint"))
+        .and_then(J::as_str)
+        .filter(|digest| !digest.is_empty())
+}
+
+/// Muse 1.4.18 (experimental, which this adapter opts into) names on a
+/// successful `session/start` or `session/resume` what the host did not
+/// apply: settings overrides it ignored, or selected plugins the session
+/// cannot have. The command still succeeded, so each warning is logged.
+fn log_load_warnings(method: &str, result: &J) {
+    if !matches!(method, "session/start" | "session/resume") {
+        return;
+    }
+    let Some(J::Arr(warnings)) = result.get("warnings") else {
+        return;
+    };
+    let session = result
+        .get("session")
+        .and_then(|s| s.get("sessionId"))
+        .and_then(J::as_str)
+        .unwrap_or("?");
+    for warning in warnings {
+        log(&load_warning_line(method, session, warning));
+    }
+}
+
+fn load_warning_line(method: &str, session: &str, warning: &J) -> String {
+    let text = |key: &str| warning.get(key).and_then(J::as_str).unwrap_or("");
+    let mut line = format!(
+        "{method} warning sess={session} code={} message={:?}",
+        text("code"),
+        text("message")
+    );
+    if let Some(J::Arr(keys)) = warning.get("keys") {
+        let keys: Vec<&str> = keys.iter().filter_map(J::as_str).collect();
+        line.push_str(&format!(" keys={}", keys.join(",")));
+    }
+    if let Some(J::Arr(items)) = warning.get("items") {
+        let items: Vec<String> = items
+            .iter()
+            .map(|item| {
+                let field = |key: &str| item.get(key).and_then(J::as_str).unwrap_or("?");
+                format!("{}:{}", field("id"), field("reason"))
+            })
+            .collect();
+        line.push_str(&format!(" items={}", items.join(",")));
+    }
+    line
+}
+
 /// Log the `schema-compat` line and refuse an incompatible host before the
 /// handshake closes.
 fn compatibility_check(handshake: &Handshake) -> Result<(), String> {
@@ -971,6 +1032,14 @@ fn compatibility_check(handshake: &Handshake) -> Result<(), String> {
         handshake.server_version.as_deref().unwrap_or("unknown")
     );
     log(&verdict.log_line(env!("CARGO_PKG_VERSION"), &host_label));
+    // Muse 1.4.18 also reports the experimental surface's digest. The
+    // adapter opts into that surface, so the digest identifies what it
+    // actually drives; absence means unknown.
+    if let Some(digest) = experimental_fingerprint(handshake) {
+        log(&format!(
+            "schema-compat-experimental host={host_label} experimental_fingerprint={digest}"
+        ));
+    }
     if verdict.is_fatal() {
         return Err(format!(
             "incompatible host schema: version={} fingerprint={}; upgrade muse-acp",
@@ -2039,5 +2108,44 @@ mod authentication_tests {
         assert!(detail.contains("muse login"), "{detail}");
         assert!(detail.contains("restart"), "{detail}");
         assert!(!detail.contains("secret-sentinel"), "{detail}");
+    }
+}
+
+#[cfg(test)]
+mod muse_1_4_18_tests {
+    use super::*;
+
+    #[test]
+    fn load_warnings_are_logged_with_their_keys_and_items() {
+        let warning = parse_json(
+            r#"{"code":"selection_unavailable","message":"Some plugins are unavailable","items":[{"id":"plugin:lint","reason":"not_installed"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            load_warning_line("session/resume", "s1", &warning),
+            "session/resume warning sess=s1 code=selection_unavailable message=\"Some plugins are unavailable\" items=plugin:lint:not_installed"
+        );
+        let ignored =
+            parse_json(r#"{"code":"setting_ignored","message":"ignored","keys":["a.b","c"]}"#)
+                .unwrap();
+        assert_eq!(
+            load_warning_line("session/start", "s2", &ignored),
+            "session/start warning sess=s2 code=setting_ignored message=\"ignored\" keys=a.b,c"
+        );
+    }
+
+    #[test]
+    fn the_experimental_fingerprint_is_read_when_present() {
+        let with = Handshake::from_result(
+            parse_json(
+                r#"{"serverInfo":{"name":"muse","version":"1.4.18-R8587.1"},"schema":{"version":1,"fingerprint":"sha256:aa","experimentalFingerprint":"sha256:bb"}}"#,
+            )
+            .unwrap(),
+        );
+        assert_eq!(experimental_fingerprint(&with), Some("sha256:bb"));
+        let without = Handshake::from_result(
+            parse_json(r#"{"schema":{"version":1,"fingerprint":"sha256:aa"}}"#).unwrap(),
+        );
+        assert_eq!(experimental_fingerprint(&without), None);
     }
 }

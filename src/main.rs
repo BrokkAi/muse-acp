@@ -667,6 +667,17 @@ fn friendly_terminal_error(terminal: &str, params: &J) -> String {
             ". An MCP server failed to link for this turn: check the server's configuration and credentials, then retry",
         );
     }
+    // Muse 1.4.18 classifies two more model-request failures.
+    if kind == "contextOverflow" {
+        out.push_str(
+            ". The conversation no longer fits the model's context window: run /compact, or start a new session, then retry",
+        );
+    }
+    if kind == "reasoningReplayRefused" {
+        out.push_str(
+            ". The provider refused to replay this conversation's earlier reasoning: switch back to the model that produced it, or start a new session",
+        );
+    }
     // `TurnError.quota` is the quota-class detail the schema tells clients to
     // branch on by presence, never by parsing `message`; surface it as the
     // trailing sentence so an exhausted window is actionable in the editor.
@@ -12625,6 +12636,13 @@ fn handle_msp(
                 }
             }
         }
+        "session/activationChanged" => {
+            // Muse 1.4.18 (experimental): a resume recomposed the session's
+            // skill and plugin selection and it differs from the recorded
+            // one. The resume proceeded; the adapter has no ACP surface for
+            // the selection, so it records what changed.
+            log(&activation_changed_line(params));
+        }
         "session/viewHealthChanged" => {
             let msp_sid = params
                 .get("sessionId")
@@ -14336,6 +14354,62 @@ fn fail_closed_owner_work(
     }
 }
 
+/// One log line for a Muse 1.4.18 `session/activationChanged`: each item of
+/// the recomposed selection as `kind:id=state`, with the reason a selected
+/// item is unavailable.
+fn activation_changed_line(params: &J) -> String {
+    let text = |value: &J, key: &str| {
+        value
+            .get(key)
+            .and_then(J::as_str)
+            .unwrap_or("?")
+            .to_string()
+    };
+    let entries: Vec<String> = match params.get("effective") {
+        Some(J::Arr(entries)) => entries
+            .iter()
+            .map(|entry| {
+                let mut line = format!(
+                    "{}:{}={}",
+                    text(entry, "kind"),
+                    text(entry, "id"),
+                    text(entry, "state")
+                );
+                if let Some(reason) = entry.get("reason").and_then(J::as_str) {
+                    line.push_str(&format!("({reason})"));
+                }
+                line
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    format!(
+        "session/activationChanged sess={} digest={} previous={} effective=[{}]",
+        text(params, "sessionId"),
+        text(params, "digest"),
+        text(params, "previousDigest"),
+        entries.join(", ")
+    )
+}
+
+/// The editor text for a refused `workflow/cancel`. Muse 1.4.18 names the
+/// stop's refusal kind in `ErrorData.stopRefusal` (`stale_revision`,
+/// `policy_rejected`, `control_outcome_uncertain`, and others, an open
+/// vocabulary) when the stop was refused or its settlement read failed.
+fn workflow_stop_error_text(e: &J) -> String {
+    let message = err_message(e);
+    let refusal = e
+        .get("data")
+        .and_then(|data| data.get("stopRefusal"))
+        .and_then(J::as_str)
+        .map(fold::sanitize_one_line)
+        .filter(|refusal| !refusal.is_empty());
+    match refusal {
+        Some(refusal) => format!("{message} (stop refused: {refusal})"),
+        None => message,
+    }
+}
+
 /// Stop one AIR async task through MSP's admission-only task command.
 fn stop_async_task(
     host: &Arc<Hosts>,
@@ -14406,7 +14480,7 @@ fn stop_async_task(
                 stdout,
                 id,
                 msp::acp_error_code(&e, -32603),
-                &err_message(&e),
+                &workflow_stop_error_text(&e),
             ),
         }
         return;
@@ -16858,11 +16932,12 @@ mod tests {
         }
     }
     use super::{
-        CUA_TEXT_MAX_CHARS, CostRate, DriveAnswer, approval_failure_text, approval_title_kind,
-        cua_card_text, cua_untrusted_text, drive_answer, drive_kept_error, env_flag_enabled,
-        err_code, err_message, friendly_terminal_error, friendly_turn_error, is_network_error,
-        model_retry_scheduled_log_line, parse_rates, quota_reset_phrase, resume_result_meta,
-        retry_scheduled_log_line, takeover_holder_text, v1_init, v2_init,
+        CUA_TEXT_MAX_CHARS, CostRate, DriveAnswer, activation_changed_line, approval_failure_text,
+        approval_title_kind, cua_card_text, cua_untrusted_text, drive_answer, drive_kept_error,
+        env_flag_enabled, err_code, err_message, friendly_terminal_error, friendly_turn_error,
+        is_network_error, model_retry_scheduled_log_line, parse_rates, quota_reset_phrase,
+        resume_result_meta, retry_scheduled_log_line, takeover_holder_text, v1_init, v2_init,
+        workflow_stop_error_text,
     };
     use crate::acp;
     use crate::json::{J, parse_json};
@@ -17492,6 +17567,53 @@ mod tests {
         assert!(
             out.contains("MCP server failed to link"),
             "the failure names its remedy: {out}"
+        );
+    }
+
+    #[test]
+    fn muse_1_4_18_model_request_failures_name_their_remedy() {
+        let overflow = parse_json(
+            r#"{"terminal":"failed","error":{"kind":"contextOverflow","message":"context overflow: estimated input exceeds the window","retryable":false}}"#,
+        )
+        .unwrap();
+        let out = friendly_terminal_error("failed", &overflow);
+        assert!(out.contains("contextOverflow"), "kind survives: {out}");
+        assert!(out.contains("run /compact"), "{out}");
+        let replay = parse_json(
+            r#"{"terminal":"failed","error":{"kind":"reasoningReplayRefused","message":"provider refused reasoning replay","retryable":false}}"#,
+        )
+        .unwrap();
+        let out = friendly_terminal_error("failed", &replay);
+        assert!(
+            out.contains("reasoningReplayRefused"),
+            "kind survives: {out}"
+        );
+        assert!(out.contains("refused to replay"), "{out}");
+    }
+
+    #[test]
+    fn a_refused_workflow_stop_names_the_refusal() {
+        let refused = parse_json(
+            r#"{"code":-32020,"message":"workflow stop refused","data":{"kind":"commandRejected","reason":"stop_refused","stopRefusal":"stale_revision"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            workflow_stop_error_text(&refused),
+            "workflow stop refused (stop refused: stale_revision)"
+        );
+        let plain = parse_json(r#"{"code":-32603,"message":"host gone"}"#).unwrap();
+        assert_eq!(workflow_stop_error_text(&plain), "host gone");
+    }
+
+    #[test]
+    fn an_activation_change_is_logged_item_by_item() {
+        let params = parse_json(
+            r#"{"sessionId":"s1","digest":"d2","previousDigest":"d1","effective":[{"id":"lint","kind":"plugin","provenance":"user","state":"on","reason":"not_installed"},{"id":"default","kind":"skill","provenance":"source_default","state":"off"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            activation_changed_line(&params),
+            "session/activationChanged sess=s1 digest=d2 previous=d1 effective=[plugin:lint=on(not_installed), skill:default=off]"
         );
     }
 

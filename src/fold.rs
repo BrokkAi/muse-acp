@@ -1005,6 +1005,8 @@ impl SessionFold {
             ("replayHint", item.get("replayHint")),
             // Muse 1.4.15: the subagent whose own session spawned this child.
             ("parentSubagentId", item.get("parentSubagentId")),
+            // Muse 1.4.18: a managed Bash call's Bash Title.
+            ("bashTitle", item.get("bashTitle")),
         ];
         let parts: Vec<String> = fields
             .into_iter()
@@ -1232,7 +1234,21 @@ impl SessionFold {
                 } else {
                     content
                 };
-                let drained_fact = J::Bool(true);
+                // Muse 1.4.18: a newer attempt of the child started after
+                // this result. The result stays; the child's status comes
+                // from `controlStatus`.
+                let superseded = Self::result_superseded(item);
+                let content = if superseded {
+                    Some(match content {
+                        Some(text) => {
+                            format!("{text}\nA newer attempt has started since this result.")
+                        }
+                        None => "A newer attempt has started since this result.".to_string(),
+                    })
+                } else {
+                    content
+                };
+                let true_fact = J::Bool(true);
                 let meta = meta_obj(
                     "subagent",
                     vec![
@@ -1246,7 +1262,8 @@ impl SessionFold {
                             item.get("controlStatus").unwrap_or(&J::Null),
                         ),
                         ("depth", item.get("depth").unwrap_or(&J::Null)),
-                        ("drained", if drained { &drained_fact } else { &J::Null }),
+                        ("drained", if drained { &true_fact } else { &J::Null }),
+                        ("superseded", if superseded { &true_fact } else { &J::Null }),
                     ],
                 );
                 (title, content, meta)
@@ -1787,6 +1804,56 @@ impl SessionFold {
                     )),
                 )
             }
+            "bodyCompletion" => {
+                // Muse 1.4.18: the receipt row for a backgrounded call whose
+                // result reached the agent. The facts ride `_meta` verbatim;
+                // `originCallId` is the provider call id, which is the ACP
+                // tool call id of the original card.
+                let Some(facts @ J::Obj(_)) = item.get("bodyCompletion") else {
+                    let text = str_field("fallbackText");
+                    return (
+                        text.to_string(),
+                        None,
+                        (!text.is_empty()).then(|| format!("\"itemKind\":{}", esc(kind))),
+                    );
+                };
+                let fact = |key: &str| facts.get(key).and_then(J::as_str).unwrap_or("");
+                let outcome = match fact("status") {
+                    "completed" => "finished",
+                    "failed" => "failed",
+                    "cancelled" => "was cancelled",
+                    "timedOut" => "timed out",
+                    "rejected" => "was rejected",
+                    _ => "ended",
+                };
+                let title = format!("Background task {outcome}");
+                let mut lines = Vec::new();
+                let summary = fact("resultSummary");
+                if !summary.is_empty() {
+                    lines.push(summary.to_string());
+                }
+                // An unresolved join (after compaction) names the task whose
+                // link to the original call did not hold.
+                if fact("correlation") == "unresolved" {
+                    let task = sanitize_one_line(str_field("taskId"));
+                    lines.push(if task.is_empty() {
+                        "Muse could not link this result to the call that started it.".to_string()
+                    } else {
+                        format!(
+                            "Muse could not link this result to the call that started it (task {task})."
+                        )
+                    });
+                }
+                let content = (!lines.is_empty()).then(|| lines.join("\n"));
+                let mut meta = format!(
+                    "\"itemKind\":\"bodyCompletion\",\"bodyCompletion\":{}",
+                    j_to_string(facts)
+                );
+                if let Some(task) = item.get("taskId").filter(|v| !matches!(v, J::Null)) {
+                    meta.push_str(&format!(",\"taskId\":{}", j_to_string(task)));
+                }
+                (title, content, Some(meta))
+            }
             "subagentResult" => {
                 // Muse 1.4.15: the parent consumed one subagent attempt's
                 // result. `resultStatus` is open and absent when the host
@@ -1971,14 +2038,21 @@ impl SessionFold {
         item: &J,
         out: &mut Vec<Note>,
     ) {
-        if kind != "backgroundTerminalCompletion" || !self.air_async_tasks {
+        // Muse 1.4.18's `bodyCompletion` receipt names the same call by its
+        // provider call id, with the same terminal vocabulary.
+        let (call_key, status_key) = match kind {
+            "backgroundTerminalCompletion" => ("toolCallId", "terminalStatus"),
+            "bodyCompletion" => ("originCallId", "status"),
+            _ => return,
+        };
+        if !self.air_async_tasks {
             return;
         }
-        let Some(facts) = item.get("backgroundTerminalCompletion") else {
+        let Some(facts) = item.get(kind) else {
             return;
         };
         let Some(call_id) = facts
-            .get("toolCallId")
+            .get(call_key)
             .and_then(J::as_str)
             .filter(|id| !id.is_empty())
         else {
@@ -2002,7 +2076,7 @@ impl SessionFold {
         if self.async_task_states.contains_key(&task_id) {
             return;
         }
-        let status = facts.get("terminalStatus").cloned().unwrap_or(J::Null);
+        let status = facts.get(status_key).cloned().unwrap_or(J::Null);
         let terminal = J::Obj(vec![("status".to_string(), status)]);
         if let Some(state) = Self::async_task_state(&terminal) {
             self.async_task_state_once(acp_sid, &task_id, state, out);
@@ -2138,6 +2212,14 @@ impl SessionFold {
         }
     }
 
+    /// Whether a subagent's result is from an attempt a newer one replaced
+    /// (Muse 1.4.18 `result.superseded`). Absent asserts nothing.
+    fn result_superseded(item: &J) -> bool {
+        item.get("result")
+            .and_then(|r| r.get("superseded"))
+            .is_some_and(|v| matches!(v, J::Bool(true)))
+    }
+
     fn subagent_state(item: &J) -> Option<&'static str> {
         let status = item.get("status").and_then(|v| v.as_str()).unwrap_or("");
         let control = item
@@ -2155,6 +2237,9 @@ impl SessionFold {
                 // stays in progress until the owner reads or closes it, and
                 // neither is guaranteed to happen (#430). The host closes a
                 // result with `errorKind` as failed, so settle it the same way.
+                // A superseded result is an earlier attempt's: a newer one
+                // started, so it settles nothing.
+                "resultReady" if Self::result_superseded(item) => return None,
                 "resultReady" => {
                     let error = item
                         .get("result")
@@ -2842,10 +2927,22 @@ impl SessionFold {
             .filter(|label| !label.trim().is_empty())
     }
 
+    /// Muse 1.4.18's Bash Title: a managed Bash call's `description`
+    /// argument through the host's normalizer, served only while the host's
+    /// own `bash_titles` gate is on.
+    fn bash_title(item: &J) -> Option<String> {
+        item.get("bashTitle")
+            .and_then(J::as_str)
+            .map(sanitize_one_line)
+            .filter(|title| !title.is_empty())
+    }
+
     fn tool_title(item: &J) -> (String, String) {
         let tool = item.get("tool").and_then(|v| v.as_str()).unwrap_or("tool");
         let mut title = if let Some(label) = Self::tool_display_label(item) {
             label.to_string()
+        } else if let Some(title) = Self::bash_title(item) {
+            title
         } else {
             let top = item
                 .get("commandText")
@@ -4919,6 +5016,40 @@ mod corpus_tests {
     }
 
     #[test]
+    fn a_body_completion_settles_its_announced_task() {
+        // Muse 1.4.18's receipt names the backgrounded call by its provider
+        // call id, with the same terminal vocabulary.
+        let mut fold = SessionFold::new();
+        fold.air_async_tasks = true;
+        let mut out = Vec::new();
+        let started = parse_json(
+            r#"{"itemId":"it-call-d","kind":"toolCall","callId":"call-d","status":"inProgress","revision":1,"tool":"workspace-shell","args":"{}","background":true}"#,
+        )
+        .unwrap();
+        fold.on_item_snapshot("sid", 2, &started, &mut out);
+        let receipt = parse_json(
+            r#"{"item":{"itemId":"bc-d","kind":"bodyCompletion","status":"completed","bodyCompletion":{"status":"failed","resultSummary":"boom","correlation":"resolved","receipt":false,"originCallId":"call-d"}}}"#,
+        )
+        .unwrap();
+        fold.on_item_completed("sid", 2, &receipt, &mut out);
+        let settled: Vec<String> = out
+            .iter()
+            .map(crate::out::Note::line)
+            .filter(|line| {
+                line.contains("async_task_state_update")
+                    && line.contains("\"asyncTaskId\":\"call-d\"")
+            })
+            .collect();
+        assert_eq!(settled.len(), 1, "{out:?}");
+        assert!(settled[0].contains("\"state\":\"failed\""), "{settled:?}");
+        assert!(
+            out.iter()
+                .any(|line| line.contains("Background task failed")),
+            "{out:?}"
+        );
+    }
+
+    #[test]
     fn seeded_async_tasks_keep_their_id_when_the_item_arrives() {
         let mut fold = SessionFold::new();
         fold.air_async_tasks = true;
@@ -5071,6 +5202,115 @@ mod corpus_tests {
             "title should carry the command, not bare tool: {}",
             out[0]
         );
+    }
+
+    #[test]
+    fn a_bash_title_titles_the_shell_card_and_rides_meta() {
+        // Muse 1.4.18 serves a managed Bash call's Bash Title while its own
+        // gate is on; the card takes it instead of the raw command line.
+        let mut fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"it-1","kind":"toolCall","status":"inProgress","tool":"bash","callId":"call-1","args":"{\"command\":\"printf a | tr a b > piped.txt\",\"description\":\"Write the piped artifact\"}","bashTitle":"Write the piped artifact"}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 1, &item, &mut out);
+        assert!(
+            out[0].contains(r#""title":"Write the piped artifact""#),
+            "{}",
+            out[0]
+        );
+        assert!(
+            out[0].contains(r#""bashTitle":"Write the piped artifact""#),
+            "{}",
+            out[0]
+        );
+        // The command itself stays in the raw input.
+        assert!(out[0].contains("printf a | tr a b"), "{}", out[0]);
+        // The host's display label still wins, and a blank title is ignored.
+        let labelled = parse_json(
+            r#"{"itemId":"it-2","kind":"toolCall","status":"inProgress","tool":"bash","callId":"call-2","args":"{\"command\":\"ls\"}","bashTitle":"List files","displayLabel":{"active":"Listing","done":"Listed","neutral":"List"}}"#,
+        )
+        .unwrap();
+        assert_eq!(SessionFold::tool_title(&labelled).0, "Listing");
+        let blank = parse_json(
+            r#"{"itemId":"it-3","kind":"toolCall","status":"inProgress","tool":"bash","callId":"call-3","args":"{\"command\":\"ls\"}","bashTitle":"  "}"#,
+        )
+        .unwrap();
+        assert_eq!(SessionFold::tool_title(&blank).0, "bash: ls");
+    }
+
+    #[test]
+    fn a_body_completion_renders_its_receipt() {
+        let fold = SessionFold::new();
+        let item = parse_json(
+            r#"{"itemId":"bc-1","kind":"bodyCompletion","status":"completed","bodyCompletion":{"status":"failed","resultSummary":"3 tests failed","correlation":"resolved","receipt":false,"originCallId":"call-bg"}}"#,
+        )
+        .unwrap();
+        let (title, content, meta) = fold.host_card_parts("bodyCompletion", &item);
+        assert_eq!(title, "Background task failed");
+        assert_eq!(content.as_deref(), Some("3 tests failed"));
+        assert_eq!(
+            meta.as_deref(),
+            Some(
+                r#""itemKind":"bodyCompletion","bodyCompletion":{"status":"failed","resultSummary":"3 tests failed","correlation":"resolved","receipt":false,"originCallId":"call-bg"}"#
+            )
+        );
+        // An unresolved join names the task whose link did not hold.
+        let unresolved = parse_json(
+            r#"{"itemId":"bc-2","kind":"bodyCompletion","status":"completed","taskId":"task-9","bodyCompletion":{"status":"completed","resultSummary":"","correlation":"unresolved","receipt":true}}"#,
+        )
+        .unwrap();
+        let (title, content, meta) = fold.host_card_parts("bodyCompletion", &unresolved);
+        assert_eq!(title, "Background task finished");
+        assert_eq!(
+            content.as_deref(),
+            Some("Muse could not link this result to the call that started it (task task-9).")
+        );
+        assert!(
+            meta.as_deref().unwrap().ends_with(r#","taskId":"task-9""#),
+            "{meta:?}"
+        );
+        // Without the facts the generic fallback renders.
+        let bare = parse_json(
+            r#"{"itemId":"bc-3","kind":"bodyCompletion","status":"completed","fallbackText":"Task done"}"#,
+        )
+        .unwrap();
+        assert_eq!(fold.host_card_parts("bodyCompletion", &bare).0, "Task done");
+    }
+
+    #[test]
+    fn a_superseded_subagent_result_says_so_and_settles_nothing() {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_completed(
+            "sid",
+            2,
+            &parse_json(
+                r#"{"item":{"itemId":"sa-1","kind":"subagent","status":"completed","subagentId":"sub-1","agentPath":"helper","objective":"check","result":{"summary":"first try","artifactRefs":[],"evidenceRefs":[],"superseded":true}}}"#,
+            )
+            .unwrap(),
+            &mut out,
+        );
+        assert!(
+            out[0]
+                .contains(r#""text":"first try\nA newer attempt has started since this result.""#),
+            "{}",
+            out[0]
+        );
+        assert!(out[0].contains(r#""superseded":true"#), "{}", out[0]);
+        // A `resultReady` child whose result is superseded is not settled
+        // from that result; a fresh result settles as before.
+        let stale = parse_json(
+            r#"{"itemId":"sa-1","kind":"subagent","status":"inProgress","controlStatus":"resultReady","result":{"summary":"first try","artifactRefs":[],"evidenceRefs":[],"superseded":true}}"#,
+        )
+        .unwrap();
+        assert_eq!(SessionFold::subagent_state(&stale), None);
+        let fresh = parse_json(
+            r#"{"itemId":"sa-1","kind":"subagent","status":"inProgress","controlStatus":"resultReady","result":{"summary":"second try","artifactRefs":[],"evidenceRefs":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(SessionFold::subagent_state(&fresh), Some("completed"));
     }
 
     // The literals are Unix paths; Windows resolution is covered by the
