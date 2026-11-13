@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Name the subagent on `subagentInput` and `subagentResult` cards by its
+  spawn role instead of the opaque host id. Muse sends neither `role` nor
+  `agentPath` on those kinds, so the card now reads them from the sibling
+  `subagent` item (role first, then agent path) and falls back to the item's
+  own agent path, its subagent id, and `a subagent` (#467).
+- Title a `systemNotice` from the notice's own `text` when its origin is
+  known, and use `fallbackText` only for an absent or unknown origin, as
+  Muse's item-kind documentation directs. `fallbackText` no longer overrides
+  a known notice's text (#468).
+
 ## 0.23.0
 
 - Adopt the Muse 1.4.18 stable surface. The Muse SDK has not published
