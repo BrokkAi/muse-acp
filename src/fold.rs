@@ -955,7 +955,6 @@ impl SessionFold {
     /// call (subagents, workflows, the user shell, unknown future kinds).
     /// `_meta` carries the MSP facts so support can see the source item.
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn card_line(
         acp_sid: &str,
         ver: u8,

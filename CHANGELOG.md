@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.22.0
 
 - Trust every workspace, as claude-agent-acp does: the main and read-only
   hosts now run `muse serve --trust-workspace`, so Muse loads each
@@ -33,6 +33,12 @@
   - A resumed monitor card shows its inbox counts at once.
   - The live suite accepts a 1.4.15 model catalog that does not list a
     configured custom model.
+- Fail `/recap` promptly when the Muse host acknowledges `recap/request` with
+  any status other than `accepted`, instead of leaving the prompt open until
+  the user stops it.
+- Do not treat a failed or lock-contended forced stop as a completed shutdown.
+  Muse hosts that may still be running retain their settings view, avoiding a
+  cleanup race during shutdown.
 
 ## 0.21.0
 
