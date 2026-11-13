@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.23.1
 
 - Name the subagent on `subagentInput` and `subagentResult` cards by its
   spawn role instead of the opaque host id. Muse sends neither `role` nor
