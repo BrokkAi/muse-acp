@@ -130,9 +130,11 @@ there is no independently published update feed.
 
 The tag run must also complete **Publish npm package with trusted publishing**.
 That step uses `id-token: write` for npm OIDC, publishes stable versions to
-`latest` and prereleases to `next`, and verifies registry integrity. If npm
-publication fails after GitHub succeeds, follow the npm guide and rerun the
-same tag workflow; do not replace the completed GitHub assets or reuse the
+`latest` and prereleases to `next`, and is done once npm accepts the tarball.
+It does not read the version back: npm makes no promise about how soon a new
+version becomes readable, and a lagging read replica is not a failed release.
+If npm publication fails after GitHub succeeds, follow the npm guide and rerun
+the same tag workflow; do not replace the completed GitHub assets or reuse the
 version for different package contents.
 
 ## Preserved partial 0.4.4 release

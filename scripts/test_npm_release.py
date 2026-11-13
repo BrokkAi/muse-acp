@@ -107,35 +107,12 @@ class NpmPackaging(unittest.TestCase):
                 side_effect=urllib.error.HTTPError('url', 404, 'missing', {}, None)):
             self.assertIsNone(npm_release.registry_version('@brokkai/muse-acp', '0.5.0'))
 
-    def test_publish_waits_for_registry_replication_and_uses_next_for_prereleases(self):
+    def test_publish_uses_next_tag_for_prereleases(self):
         manifest = {'name': '@brokkai/muse-acp', 'version': '0.6.0-rc.1'}
-        with patch.object(npm_release, 'registry_version', side_effect=[None, None, {'dist': {'integrity': 'same'}}]), \
-             patch.object(npm_release.subprocess, 'run') as run, \
-             patch.object(npm_release.time, 'sleep') as sleep:
+        with patch.object(npm_release, 'registry_version', return_value=None), \
+             patch.object(npm_release.subprocess, 'run') as run:
             npm_release.publish(Path('package.tgz'), manifest, 'same')
         self.assertIn('--tag=next', run.call_args.args[0])
-        sleep.assert_called_once_with(5)
-
-    def test_publish_allows_several_minutes_for_replication_without_republishing(self):
-        manifest = {'name': '@brokkai/muse-acp', 'version': '0.6.0'}
-        with patch.object(npm_release, 'registry_version', side_effect=[None] * 49 + [{'dist': {'integrity': 'same'}}]), \
-             patch.object(npm_release.subprocess, 'run') as run, \
-             patch.object(npm_release.time, 'sleep') as sleep:
-            npm_release.publish(Path('package.tgz'), manifest, 'same')
-        self.assertEqual(sleep.call_count, 48)
-        run.assert_called_once()
-
-    def test_publish_readback_times_out_and_rejects_mismatched_integrity(self):
-        manifest = {'name': '@brokkai/muse-acp', 'version': '0.6.0'}
-        for responses in [[None] * (npm_release.VERIFY_ATTEMPTS + 1),
-                          [None, {'dist': {'integrity': 'different'}}]]:
-            with self.subTest(responses=len(responses)), \
-                 patch.object(npm_release, 'registry_version', side_effect=responses), \
-                 patch.object(npm_release.subprocess, 'run') as run, \
-                 patch.object(npm_release.time, 'sleep'):
-                with self.assertRaisesRegex(RuntimeError, 'integrity could not be verified'):
-                    npm_release.publish(Path('package.tgz'), manifest, 'same')
-                run.assert_called_once()
 
     def test_automated_publication_requires_a_tag_push(self):
         with patch.dict(npm_release.os.environ, {'GITHUB_ACTIONS': 'true', 'GITHUB_EVENT_NAME': 'workflow_dispatch'}), \

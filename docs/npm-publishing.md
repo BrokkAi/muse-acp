@@ -19,8 +19,10 @@ short-lived publishing credentials through GitHub OIDC; no npm token secret
 is needed. Trusted publishing also generates npm provenance for the public
 repository. A rerun skips an existing npm version only if its tarball integrity
 matches exactly; different contents require a new version. Prereleases use
-the `next` dist-tag. After publishing, verification waits up to five minutes
-for npm's registry metadata to become available without publishing again.
+the `next` dist-tag. Publication ends when npm accepts the tarball: the
+publisher does not read the version back, because a new version's metadata can
+take minutes to reach registry read replicas, and treating that lag as a
+failure reports a completed release as broken.
 
 ## First publication and trusted publisher setup
 
