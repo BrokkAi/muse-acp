@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.23.0
 
 - Adopt the Muse 1.4.18 stable surface. The Muse SDK has not published
   1.4.16 through 1.4.18, so the vendored stable bundle is the 1.4.18-R8587.1
