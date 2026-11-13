@@ -465,6 +465,10 @@ pub struct SubagentObservation {
     pub item_status: String,
     pub control_status: String,
     pub child_session_id: String,
+    /// `subagent` role as spawned; empty when the host sent none.
+    pub role: String,
+    /// `subagent` agent definition path; empty when the host sent none.
+    pub agent_path: String,
 }
 
 impl SessionFold {
@@ -540,6 +544,16 @@ impl SessionFold {
                     .to_string(),
                 child_session_id: item
                     .get("childSessionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                role: item
+                    .get("role")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                agent_path: item
+                    .get("agentPath")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
@@ -1068,12 +1082,23 @@ impl SessionFold {
         Self::merge_muse_fields(state.as_deref(), Self::item_muse_fields(item).as_deref())
     }
 
-    /// How a `subagentInput` or `subagentResult` card names its subagent:
-    /// the agent path, else the subagent id, else a generic noun.
-    fn subagent_label(item: &J) -> String {
-        ["agentPath", "subagentId"]
+    /// How a `subagentInput` or `subagentResult` card names its subagent.
+    /// Muse sends neither a `role` nor an `agentPath` on those kinds, so the
+    /// name comes from the sibling `subagent` item when it was already
+    /// observed: the spawn `role` first, then its `agentPath`. Only then the
+    /// item's own `agentPath`, its `subagentId`, and a generic noun. The
+    /// order keeps an opaque host id off the card whenever a name is known.
+    fn subagent_label(&self, item: &J) -> String {
+        let observed = item
+            .get("subagentId")
+            .and_then(J::as_str)
+            .and_then(|id| self.subagents.get(id));
+        observed
+            .map(|o| o.role.as_str())
             .into_iter()
-            .filter_map(|key| item.get(key).and_then(J::as_str))
+            .chain(observed.map(|o| o.agent_path.as_str()))
+            .chain(item.get("agentPath").and_then(J::as_str))
+            .chain(item.get("subagentId").and_then(J::as_str))
             .map(sanitize_one_line)
             .find(|label| !label.is_empty())
             .unwrap_or_else(|| "a subagent".to_string())
@@ -1695,18 +1720,40 @@ impl SessionFold {
             "systemNotice" => {
                 // Muse 1.4.15: a system-chrome notice (Monitor, skills
                 // startup, scheduled fire, incomplete generation, hook, or a
-                // paused workflow checkpoint). The title is the one-line
-                // summary led by the notice's level; the full text is the
-                // content; the routing facts ride `_meta` verbatim. An
-                // absent origin or level stays absent, never inferred.
+                // paused workflow checkpoint). For an origin this client
+                // knows, the title is the first line of `text`;
+                // `fallbackText` is the summary for a client that does not
+                // know the origin and never overrides a known one. The full
+                // `text` is the content; the routing facts ride `_meta`
+                // verbatim. An absent origin or level stays absent, never
+                // inferred.
                 let text = str_field("text");
                 let fallback = str_field("fallbackText");
-                let summary = if fallback.is_empty() {
+                let known_origin = matches!(
+                    item.get("noticeOrigin").and_then(J::as_str),
+                    Some(
+                        "monitor"
+                            | "skillsStartup"
+                            | "scheduledFire"
+                            | "incompleteGeneration"
+                            | "hook"
+                            | "workflowCheckpoint"
+                            | "continuedChildTools"
+                    )
+                );
+                let first_line = || {
                     text.lines()
                         .find(|line| !line.trim().is_empty())
                         .unwrap_or("")
-                } else {
+                };
+                // Never synthesize a summary: the known origin uses the
+                // host's own text line, everything else the host's fallback.
+                let summary = if known_origin && !text.trim().is_empty() {
+                    first_line()
+                } else if !fallback.is_empty() {
                     fallback
+                } else {
+                    first_line()
                 };
                 let summary = sanitize_one_line(summary);
                 let title = match (summary.is_empty(), str_field("noticeSeverity")) {
@@ -1779,7 +1826,7 @@ impl SessionFold {
                     "delivered" => "delivered to",
                     _ => return (String::new(), None, None),
                 };
-                let agent = Self::subagent_label(item);
+                let agent = self.subagent_label(item);
                 let title = format!("Input {action} {agent}");
                 let text = str_field("text");
                 let content = if text.is_empty() {
@@ -1865,7 +1912,7 @@ impl SessionFold {
                     "cancelled" => Some("cancelled"),
                     _ => None,
                 };
-                let agent = Self::subagent_label(item);
+                let agent = self.subagent_label(item);
                 let title = match status {
                     Some(status) => format!("Result from {agent} ({status})"),
                     None => format!("Result from {agent}"),
@@ -4720,6 +4767,52 @@ mod corpus_tests {
             )
         );
 
+        // A known origin renders the host's own `text`, never a differing
+        // `fallbackText`; the full text stays as content.
+        let known = parse_json(
+            r#"{"itemId":"n-5","kind":"systemNotice","status":"completed","text":"Monitor stopped\nwatcher exited with status 1","fallbackText":"A monitor event happened","noticeOrigin":"monitor"}"#,
+        )
+        .unwrap();
+        let (title, content, _) = fold.host_card_parts("systemNotice", &known);
+        assert_eq!(title, "Monitor stopped");
+        assert_eq!(
+            content.as_deref(),
+            Some("Monitor stopped\nwatcher exited with status 1")
+        );
+
+        // An unknown origin uses `fallbackText`, and an absent one does too.
+        // The text is still the content, never a second summary.
+        let unknown = parse_json(
+            r#"{"itemId":"n-6","kind":"systemNotice","status":"completed","text":"The host did a thing\nand then another","fallbackText":"Host notice","noticeOrigin":"futureOrigin","noticeSeverity":"warning"}"#,
+        )
+        .unwrap();
+        let (title, content, _) = fold.host_card_parts("systemNotice", &unknown);
+        assert_eq!(title, "Warning: Host notice");
+        assert_eq!(
+            content.as_deref(),
+            Some("The host did a thing\nand then another")
+        );
+
+        // An absent origin behaves like an unknown one.
+        let no_origin = parse_json(
+            r#"{"itemId":"n-8","kind":"systemNotice","status":"completed","text":"The host did a thing\nand then another","fallbackText":"Host notice"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            fold.host_card_parts("systemNotice", &no_origin).0,
+            "Host notice"
+        );
+
+        // Muse 1.4.18's continued-child tools origin is known too.
+        let continued = parse_json(
+            r#"{"itemId":"n-9","kind":"systemNotice","status":"completed","text":"Continued child tools are available","fallbackText":"Notice","noticeOrigin":"continuedChildTools"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            fold.host_card_parts("systemNotice", &continued).0,
+            "Continued child tools are available"
+        );
+
         // No level and no origin: neither is inferred, and a one-line text
         // that is the title is not repeated as content.
         let plain = parse_json(
@@ -4733,6 +4826,16 @@ mod corpus_tests {
             meta.as_deref(),
             Some(r#""itemKind":"systemNotice","systemNotice":{}"#)
         );
+
+        // An unknown origin without `fallbackText` still renders the text's
+        // first line rather than nothing.
+        let text_only = parse_json(
+            r#"{"itemId":"n-7","kind":"systemNotice","status":"completed","text":"\n  Hook failed  \nretry skipped","noticeOrigin":"futureOrigin"}"#,
+        )
+        .unwrap();
+        let (title, content, _) = fold.host_card_parts("systemNotice", &text_only);
+        assert_eq!(title, "Hook failed");
+        assert_eq!(content.as_deref(), Some("\n  Hook failed  \nretry skipped"));
 
         let error = parse_json(
             r#"{"itemId":"n-3","kind":"systemNotice","status":"completed","text":"Hook failed","noticeSeverity":"error"}"#,
@@ -4775,27 +4878,53 @@ mod corpus_tests {
 
     #[test]
     fn subagent_inputs_and_results_render_their_phase_and_status() {
-        let fold = SessionFold::new();
+        // A real Muse 1.4.15 capture: the main agent spawned `reviewer`
+        // (agentPath `main/reviewer/1`) and queued it input. The
+        // `subagentInput` item carries neither a role nor an agentPath, so
+        // the card takes its name from the sibling `subagent` item (#467).
+        let mut fold = SessionFold::new();
+        let spawned = parse_json(
+            r#"{"itemId":"sa-1","kind":"subagent","status":"inProgress","subagentId":"subagent-1","agentPath":"main/reviewer/1","role":"reviewer","objective":"review the diff","depth":1}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &spawned, &mut out);
+        assert_eq!(fold.subagents["subagent-1"].role, "reviewer");
+
+        let queued = parse_json(
+            r#"{"commandId":"01a1d09e-19b0-751d-a762-7dba68d3d2de","fallbackText":"Queued input","inputPhase":"queued","itemId":"01a1d09e-1e0f-7182-91e3-975690b1660b","kind":"subagentInput","recordedAt":"2026-11-12T16:36:25.743263Z","revision":1,"status":"completed","subagentId":"subagent-1","text":"subagent input: Also check the README please.","turnId":"01a1d09e-1c5d-7043-aee6-34da3d728e17"}"#,
+        )
+        .unwrap();
+        let (title, content, meta) = fold.host_card_parts("subagentInput", &queued);
+        assert_eq!(title, "Input queued for reviewer");
+        assert_eq!(
+            content.as_deref(),
+            Some("subagent input: Also check the README please.")
+        );
+        assert_eq!(
+            meta.as_deref(),
+            Some(
+                r#""itemKind":"subagentInput","subagentInput":{"inputPhase":"queued","subagentId":"subagent-1"}"#
+            )
+        );
+
         let delivered = parse_json(
-            r#"{"itemId":"i-1","kind":"subagentInput","status":"completed","subagentId":"sub-1","agentPath":"reviewer","inputPhase":"delivered","deliveredBeforeTurnEnd":true,"text":"Also check the docs."}"#,
+            r#"{"itemId":"i-1","kind":"subagentInput","status":"completed","subagentId":"subagent-1","inputPhase":"delivered","deliveredBeforeTurnEnd":true,"text":"subagent follow-up: Also check the docs."}"#,
         )
         .unwrap();
         let (title, content, meta) = fold.host_card_parts("subagentInput", &delivered);
         assert_eq!(title, "Input delivered to reviewer");
-        assert_eq!(content.as_deref(), Some("Also check the docs."));
+        assert_eq!(
+            content.as_deref(),
+            Some("subagent follow-up: Also check the docs.")
+        );
         assert_eq!(
             meta.as_deref(),
             Some(
-                r#""itemKind":"subagentInput","subagentInput":{"inputPhase":"delivered","deliveredBeforeTurnEnd":true,"subagentId":"sub-1"}"#
+                r#""itemKind":"subagentInput","subagentInput":{"inputPhase":"delivered","deliveredBeforeTurnEnd":true,"subagentId":"subagent-1"}"#
             )
         );
-        let queued = parse_json(
-            r#"{"itemId":"i-2","kind":"subagentInput","status":"completed","subagentId":"sub-1","inputPhase":"queued","fallbackText":"Queued for sub-1"}"#,
-        )
-        .unwrap();
-        let (title, content, _) = fold.host_card_parts("subagentInput", &queued);
-        assert_eq!(title, "Input queued for sub-1");
-        assert_eq!(content.as_deref(), Some("Queued for sub-1"));
+
         // A client ignores a phase it does not know.
         let future = parse_json(
             r#"{"itemId":"i-3","kind":"subagentInput","status":"completed","inputPhase":"rerouted","fallbackText":"x"}"#,
@@ -4807,7 +4936,7 @@ mod corpus_tests {
         );
 
         let result = parse_json(
-            r#"{"itemId":"r-1","kind":"subagentResult","status":"completed","subagentId":"sub-1","agentPath":"reviewer","resultStatus":"failed","text":"Could not reach the server."}"#,
+            r#"{"itemId":"r-1","kind":"subagentResult","status":"completed","subagentId":"subagent-1","resultStatus":"failed","text":"Could not reach the server.","turnId":"01a1d09e-1c5d-7043-aee6-34da3d728e17"}"#,
         )
         .unwrap();
         let (title, content, meta) = fold.host_card_parts("subagentResult", &result);
@@ -4816,7 +4945,7 @@ mod corpus_tests {
         assert_eq!(
             meta.as_deref(),
             Some(
-                r#""itemKind":"subagentResult","subagentResult":{"resultStatus":"failed","subagentId":"sub-1"}"#
+                r#""itemKind":"subagentResult","subagentResult":{"resultStatus":"failed","subagentId":"subagent-1"}"#
             )
         );
         // An unknown or absent status is treated as absent.
@@ -4829,6 +4958,86 @@ mod corpus_tests {
         assert_eq!(
             meta.as_deref(),
             Some(r#""itemKind":"subagentResult","subagentResult":{}"#)
+        );
+    }
+
+    #[test]
+    fn a_subagent_card_prefers_the_observed_role_then_the_agent_path() {
+        let mut fold = SessionFold::new();
+        let spawned = parse_json(
+            r#"{"itemId":"sa-1","kind":"subagent","status":"inProgress","subagentId":"subagent-1","agentPath":"main/reviewer/1","role":"reviewer","objective":"review","depth":1}"#,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &spawned, &mut out);
+
+        // The observed role wins over every path and id, including the
+        // item's own agentPath.
+        let own_path = parse_json(
+            r#"{"itemId":"i-1","kind":"subagentInput","status":"completed","subagentId":"subagent-1","agentPath":"item/path","inputPhase":"queued","fallbackText":"Queued input"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            fold.host_card_parts("subagentInput", &own_path).0,
+            "Input queued for reviewer"
+        );
+
+        // Without an observed role, the observed agentPath is next.
+        let path_only = parse_json(
+            r#"{"itemId":"sa-2","kind":"subagent","status":"inProgress","subagentId":"subagent-2","agentPath":"main/helper/1","objective":"help","depth":1}"#,
+        )
+        .unwrap();
+        fold.on_item_snapshot("sid", 2, &path_only, &mut out);
+        let for_helper = parse_json(
+            r#"{"itemId":"i-2","kind":"subagentInput","status":"completed","subagentId":"subagent-2","agentPath":"item/path","inputPhase":"queued"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            fold.host_card_parts("subagentInput", &for_helper).0,
+            "Input queued for main/helper/1"
+        );
+
+        // An unobserved child falls back to the item's own agentPath, then
+        // its subagentId, then the generic noun.
+        let unobserved = parse_json(
+            r#"{"itemId":"i-3","kind":"subagentInput","status":"completed","subagentId":"subagent-9","agentPath":"main/other/1","inputPhase":"queued"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            fold.host_card_parts("subagentInput", &unobserved).0,
+            "Input queued for main/other/1"
+        );
+        let id_only = parse_json(
+            r#"{"itemId":"i-4","kind":"subagentInput","status":"completed","subagentId":"subagent-9","inputPhase":"queued"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            fold.host_card_parts("subagentInput", &id_only).0,
+            "Input queued for subagent-9"
+        );
+        let nameless = parse_json(
+            r#"{"itemId":"i-5","kind":"subagentInput","status":"completed","inputPhase":"queued"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            fold.host_card_parts("subagentInput", &nameless).0,
+            "Input queued for a subagent"
+        );
+
+        // A blank observed role does not shadow the agentPath, and an
+        // unobserved-but-empty id never becomes an empty title.
+        let blank_role = parse_json(
+            r#"{"itemId":"sa-3","kind":"subagent","status":"inProgress","subagentId":"subagent-3","agentPath":"main/blank/1","role":"  ","depth":1}"#,
+        )
+        .unwrap();
+        fold.on_item_snapshot("sid", 2, &blank_role, &mut out);
+        let blank = parse_json(
+            r#"{"itemId":"i-6","kind":"subagentInput","status":"completed","subagentId":"subagent-3","inputPhase":"queued"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            fold.host_card_parts("subagentInput", &blank).0,
+            "Input queued for main/blank/1"
         );
     }
 
