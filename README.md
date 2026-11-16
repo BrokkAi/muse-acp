@@ -356,15 +356,29 @@ error the editor shows if Muse then refuses the profile says why.
 
 ## What's supported
 
+- **System prompts** — on Muse 1.4.18+ the adapter advertises
+  `systemPrompt` in `append` mode and passes the text to Muse as the
+  session's developer prompt. Muse keeps its built-in instructions and adds
+  the text ahead of its workspace context in the developer message. It is
+  applied on `session/new`, `session/load`, `session/resume`, and
+  `session/fork`; Muse stores it with the session, so a load or resume
+  without one keeps the stored prompt, and a fork, which Muse starts without
+  one, is given it by a follow-up resume. `override` and unknown modes,
+  non-text blocks, an empty or blank prompt, and any prompt sent to an
+  older host are refused with `-32602` before the session is touched. A
+  developer prompt from Muse settings, where one is configured, is replaced
+  by the client's for that session.
 - **Sessions** — new, load, resume, list, close, and fork, with durable Muse
   session IDs that survive adapter and host restarts. On Muse 1.4.11+ closing
   a session also releases it in Muse (`session/leave`), so it stops holding
   host resources; it stays listed and a resume reloads it. An ACP v2 resume
   replays history only for `replayFrom: {"type": "start"}`; an omitted or
   `null` cursor reconnects without replay, and an unsupported or malformed
-  cursor is refused with `-32602` before Muse is asked. Every successful v2
-  resume sends the current `idle`, `running`, or `requires_action` state after
-  any replay and before its response. Delete is available on
+  cursor is refused with `-32602` before Muse is asked. A complete replay ends
+  with a `replay_complete` update; when Muse served only part of the history,
+  the marker is withheld, which ACP defines as a truncated replay. Every
+  successful v2 resume sends the current `idle`, `running`, or
+  `requires_action` state after any replay and before its response. Delete is available on
   Muse 1.4.1 and 1.4.2 with durable session logs; Muse 1.4.3 no longer
   serves it, so the adapter does not offer it there. Muse deletes only
   sessions it can prove the running host owns, so a session from an earlier
@@ -946,15 +960,15 @@ compatibility table, and reports whether the configured Muse CLI can be invoked
 (`cli-ready` or `cli-unready`). It exits `0` even when Muse is not installed, so
 you can collect output on a machine that is still being set up.
 
-The current vendored surface is Muse 1.4.18
-(`sha256:77dda18550adef14e257b015fe4e6490b722723f7d526df5ba4867939fff68a3`),
-taken from the 1.4.18 build's own schema export because the Muse SDK has not
-yet published it. The adapter live suite passes against `1.4.18-R8587.1`, and
-the 1.4.18 Linux, macOS, and Windows artifacts are pinned in the nightly
-matrix. The nightly live-host support floor is Muse 1.4.11: 1.4.11 through
-1.4.15 and 1.4.18 run on Linux x86-64 and Windows x64, and the newest build
-runs on macOS arm64. Muse 1.4.16 and 1.4.17 were not available to validate,
-so the adapter logs their fingerprints as `unknown` and still runs. Older fingerprints remain recorded as historical
+The current vendored surface is Muse 1.4.20
+(`sha256:283b1b125dcc9172928fb5d6711a92a353796d030a7c186988ed527a13cf07f0`),
+taken from Muse SDK revision `649ca21`, which is byte-identical to the 1.4.20
+build's own schema export. The adapter live suite passes against
+`1.4.20-R8619.1`, and the 1.4.20 Linux, macOS, and Windows artifacts are pinned
+in the nightly matrix. The nightly live-host support floor is Muse 1.4.11:
+1.4.11 through 1.4.15, 1.4.18, and 1.4.20 run on Linux x86-64 and Windows x64,
+and the newest build runs on macOS arm64. Muse 1.4.16, 1.4.17, and 1.4.19 were
+not available to validate, so the adapter logs their fingerprints as `unknown` and still runs. Older fingerprints remain recorded as historical
 compatibility evidence but are no longer downloaded for every nightly run.
 
 At startup the adapter logs whether the host can enforce its sandbox, as

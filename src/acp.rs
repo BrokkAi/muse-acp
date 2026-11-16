@@ -391,6 +391,12 @@ pub struct AcpSession {
     /// host does not persist them, so a restarted host is sent them again
     /// when it loads the session.
     pub mcp_servers: Option<String>,
+    /// The client's ACP `systemPrompt` text, sent to Muse as
+    /// `config.developerPrompt`, from the latest `session/new`,
+    /// `session/load`, `session/resume`, or `session/fork` that carried one.
+    /// Muse stores it with the session, but a session that never ran a turn
+    /// is not saved, so a restart that starts it again sends it again.
+    pub developer_prompt: Option<String>,
 }
 
 pub type Sessions = Arc<Mutex<HashMap<String, AcpSession>>>;

@@ -27,7 +27,16 @@ pub struct Setup {
     /// ACP v2 `replayFrom` on `session/resume`, and JetBrains AIR's
     /// extension of it to `session/fork`. `None` when absent or `null`.
     pub replay_from: Option<Replay>,
+    /// The client's `systemPrompt`; `None` when absent or `null`.
+    pub system_prompt: Option<SystemPrompt>,
     pub meta: Meta,
+}
+
+/// A client-provided system prompt (ACP `systemPrompt`).
+pub struct SystemPrompt {
+    /// `append`, `override`, or a custom or future mode, as sent.
+    pub mode: String,
+    pub content: Vec<Content>,
 }
 
 /// A history replay cursor.
@@ -272,6 +281,7 @@ pub fn v1(message: V1Message) -> Option<(Option<RequestId>, Request)> {
                         .collect(),
                     mcp_servers: r.mcp_servers.into_iter().map(v1_mcp).collect(),
                     replay_from: None,
+                    system_prompt: r.system_prompt.map(v1_system_prompt),
                     meta: meta(r.meta),
                 }),
                 R::LoadSessionRequest(r) => Request::LoadSession(v1_load(r)),
@@ -285,6 +295,7 @@ pub fn v1(message: V1Message) -> Option<(Option<RequestId>, Request)> {
                         .collect(),
                     mcp_servers: r.mcp_servers.into_iter().map(v1_mcp).collect(),
                     replay_from: None,
+                    system_prompt: r.system_prompt.map(v1_system_prompt),
                     meta: meta(r.meta),
                 }),
                 R::ForkSessionRequest(r) => Request::ForkSession(Setup {
@@ -297,6 +308,7 @@ pub fn v1(message: V1Message) -> Option<(Option<RequestId>, Request)> {
                         .collect(),
                     mcp_servers: r.mcp_servers.into_iter().map(v1_mcp).collect(),
                     replay_from: None,
+                    system_prompt: r.system_prompt.map(v1_system_prompt),
                     meta: meta(r.meta),
                 }),
                 R::PromptRequest(r) => Request::Prompt(Prompt {
@@ -351,6 +363,7 @@ fn v1_load(r: v1::schema::LoadSessionRequest) -> Setup {
         additional_directories: r.additional_directories.iter().map(|p| path(p)).collect(),
         mcp_servers: r.mcp_servers.into_iter().map(v1_mcp).collect(),
         replay_from: None,
+        system_prompt: r.system_prompt.map(v1_system_prompt),
         meta: meta(r.meta),
     }
 }
@@ -394,6 +407,19 @@ pub(crate) fn v1_mcp(server: v1::schema::McpServer) -> McpServer {
             kind: "unknown".to_string(),
             name: None,
         },
+    }
+}
+
+fn v1_system_prompt(prompt: v1::schema::SystemPrompt) -> SystemPrompt {
+    use v1::schema::SystemPromptMode as M;
+    SystemPrompt {
+        mode: match prompt.mode {
+            M::Append => "append".to_string(),
+            M::Override => "override".to_string(),
+            M::Other(mode) => mode,
+            _ => "unknown".to_string(),
+        },
+        content: prompt.content.iter().map(|b| v1_block(b).content).collect(),
     }
 }
 
@@ -470,6 +496,7 @@ pub fn v2(message: V2Message) -> Option<(Option<RequestId>, Request)> {
                         .collect(),
                     mcp_servers: r.mcp_servers.into_iter().map(v2_mcp).collect(),
                     replay_from: None,
+                    system_prompt: r.system_prompt.map(v2_system_prompt),
                     meta: meta(r.meta),
                 }),
                 R::ResumeSessionRequest(r) => Request::ResumeSession(Setup {
@@ -482,6 +509,7 @@ pub fn v2(message: V2Message) -> Option<(Option<RequestId>, Request)> {
                         .collect(),
                     mcp_servers: r.mcp_servers.into_iter().map(v2_mcp).collect(),
                     replay_from: r.replay_from.map(v2_replay),
+                    system_prompt: r.system_prompt.map(v2_system_prompt),
                     meta: meta(r.meta),
                 }),
                 R::ForkSessionRequest(r) => Request::ForkSession(Setup {
@@ -494,6 +522,7 @@ pub fn v2(message: V2Message) -> Option<(Option<RequestId>, Request)> {
                         .collect(),
                     mcp_servers: r.mcp_servers.into_iter().map(v2_mcp).collect(),
                     replay_from: None,
+                    system_prompt: r.system_prompt.map(v2_system_prompt),
                     meta: meta(r.meta),
                 }),
                 R::PromptRequest(r) => Request::Prompt(Prompt {
@@ -590,6 +619,19 @@ pub(crate) fn v2_mcp(server: v2::schema::McpServer) -> McpServer {
             kind: "unknown".to_string(),
             name: None,
         },
+    }
+}
+
+fn v2_system_prompt(prompt: v2::schema::SystemPrompt) -> SystemPrompt {
+    use v2::schema::SystemPromptMode as M;
+    SystemPrompt {
+        mode: match prompt.mode {
+            M::Append => "append".to_string(),
+            M::Override => "override".to_string(),
+            M::Other(mode) => mode,
+            _ => "unknown".to_string(),
+        },
+        content: prompt.content.iter().map(|b| v2_block(b).content).collect(),
     }
 }
 
