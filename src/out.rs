@@ -961,6 +961,15 @@ pub fn state(acp_sid: &str, state: &str, stop: Option<&str>) -> Note {
     Note::v2(acp_sid, s2::SessionUpdate::StateUpdate(update))
 }
 
+/// ACP v2 `replay_complete`: the history replay a `session/resume` with a
+/// `replayFrom` cursor asked for is over, and every later update is live.
+pub fn replay_complete(acp_sid: &str) -> Note {
+    Note::v2(
+        acp_sid,
+        s2::SessionUpdate::ReplayComplete(s2::ReplayComplete::new()),
+    )
+}
+
 /// One todo item of a session plan: its text and ACP entry status
 /// (`pending`, `in_progress`, `completed`), at medium priority.
 pub type PlanEntry = (String, &'static str);

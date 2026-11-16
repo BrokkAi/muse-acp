@@ -17912,3 +17912,235 @@ fn command_prefix_policy_precedes_review_and_preserves_ambiguous_approvals() {
         c.finish();
     }
 }
+
+/// Initialize ACP `ver` against a host reporting `version` and return the
+/// initialize result frame.
+fn initialize_on(c: &mut Client, ver: u64) -> String {
+    let init = c.req("initialize", &initialize_params(ver, ""));
+    let frame = c.wait_for(&format!("\"id\":{init}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "init failed: {frame}");
+    c.notify("initialized", "{}");
+    frame
+}
+
+/// `session/new` with the given `systemPrompt` JSON; returns the response.
+fn new_session_with_system_prompt(c: &mut Client, prompt: &str) -> String {
+    let id = c.req(
+        "session/new",
+        &format!("{{\"cwd\":{},\"systemPrompt\":{prompt}}}", temp_cwd_json()),
+    );
+    c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15))
+}
+
+#[test]
+fn system_prompt_is_advertised_only_on_hosts_that_apply_developer_prompts() {
+    for ver in [1, 2] {
+        for (version, advertised) in [
+            ("1.4.18-R8587.1", true),
+            ("1.4.20", true),
+            ("1.4.15", false),
+        ] {
+            let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", version)]);
+            let init = initialize_on(&mut c, ver);
+            assert_eq!(
+                init.contains("\"systemPrompt\":{}"),
+                advertised,
+                "v{ver} on {version}: {init}"
+            );
+            c.finish();
+        }
+    }
+}
+
+#[test]
+fn an_appended_system_prompt_starts_the_session_with_a_developer_prompt() {
+    for ver in [1, 2] {
+        let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.20")]);
+        initialize_on(&mut c, ver);
+        let frame = new_session_with_system_prompt(
+            &mut c,
+            r#"{"mode":"append","content":[{"type":"text","text":"Answer in French."},{"type":"text","text":"Be brief."}]}"#,
+        );
+        assert!(frame.contains("\"result\""), "v{ver}: {frame}");
+        let start = &host_requests(&c, "session/start")[0];
+        assert_eq!(
+            start["config"]["developerPrompt"], "Answer in French.\n\nBe brief.",
+            "v{ver}: {start}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn a_session_without_a_system_prompt_sends_no_developer_prompt() {
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.20")]);
+    c.new_session(1, "");
+    let start = &host_requests(&c, "session/start")[0];
+    assert!(start.get("config").is_none(), "{start}");
+    c.finish();
+}
+
+#[test]
+fn a_system_prompt_muse_cannot_apply_is_refused_before_the_session_starts() {
+    for (prompt, why) in [
+        (
+            r#"{"mode":"override","content":[{"type":"text","text":"x"}]}"#,
+            "mode `override` is not supported",
+        ),
+        (
+            r#"{"mode":"_custom","content":[{"type":"text","text":"x"}]}"#,
+            "mode `_custom` is not supported",
+        ),
+        (r#"{"mode":"append","content":[]}"#, "must not be empty"),
+        (
+            r#"{"mode":"append","content":[{"type":"text","text":"  \n "}]}"#,
+            "has no text",
+        ),
+        (
+            r#"{"mode":"append","content":[{"type":"resource_link","uri":"file:///x","name":"x"}]}"#,
+            "only text blocks",
+        ),
+    ] {
+        let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.20")]);
+        initialize_on(&mut c, 1);
+        let frame = new_session_with_system_prompt(&mut c, prompt);
+        assert!(
+            frame.contains("\"code\":-32602") && frame.contains(why),
+            "{prompt}: {frame}"
+        );
+        assert!(host_requests(&c, "session/start").is_empty(), "{prompt}");
+        c.finish();
+    }
+}
+
+#[test]
+fn a_system_prompt_sent_to_an_older_host_is_refused() {
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.15")]);
+    initialize_on(&mut c, 1);
+    let frame = new_session_with_system_prompt(
+        &mut c,
+        r#"{"mode":"append","content":[{"type":"text","text":"x"}]}"#,
+    );
+    assert!(
+        frame.contains("\"code\":-32602") && frame.contains("needs Muse 1.4.18"),
+        "{frame}"
+    );
+    assert!(host_requests(&c, "session/start").is_empty());
+    c.finish();
+}
+
+#[test]
+fn load_and_resume_carry_the_system_prompt_and_omission_keeps_the_stored_one() {
+    for method in ["session/load", "session/resume"] {
+        let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.20")]);
+        initialize_on(&mut c, 1);
+        let id = c.req(
+            method,
+            r#"{"sessionId":"msp-sess-old","systemPrompt":{"mode":"append","content":[{"type":"text","text":"Keep it short."}]}}"#,
+        );
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\""), "{method}: {frame}");
+        let id = c.req(method, r#"{"sessionId":"msp-sess-old"}"#);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\""), "{method}: {frame}");
+        let resumes = host_requests(&c, "session/resume");
+        assert_eq!(
+            resumes[0]["config"]["developerPrompt"], "Keep it short.",
+            "{method}: {resumes:?}"
+        );
+        assert!(
+            resumes[1].get("config").is_none(),
+            "{method}: an omitted systemPrompt keeps Muse's stored one: {resumes:?}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
+fn a_fork_with_a_system_prompt_resumes_the_fork_with_it() {
+    let mut c = Client::spawn("quiet", &[("FAKE_SERVER_VERSION", "1.4.20")]);
+    let sid = c.new_session(2, "");
+    let id = c.req(
+        "session/fork",
+        &format!(
+            r#"{{"sessionId":"{sid}","systemPrompt":{{"mode":"append","content":[{{"type":"text","text":"Review only."}}]}}}}"#
+        ),
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "fork failed: {frame}");
+    let fork = &host_requests(&c, "session/fork")[0];
+    assert!(
+        fork.get("config").is_none(),
+        "session/fork takes no config: {fork}"
+    );
+    let resumes = host_requests(&c, "session/resume");
+    let applied = resumes
+        .iter()
+        .find(|r| r["config"]["developerPrompt"] == "Review only.")
+        .unwrap_or_else(|| panic!("no developer prompt resume: {resumes:?}"));
+    assert_ne!(applied["sessionId"], sid.as_str(), "{applied}");
+    assert_eq!(applied["history"], "snapshot", "{applied}");
+    c.finish();
+}
+
+#[test]
+fn v2_resume_marks_the_end_of_a_requested_replay() {
+    for (cursor, marked) in [
+        (None, false),
+        (Some("null"), false),
+        (Some(r#"{"type":"start"}"#), true),
+    ] {
+        let mut c = Client::spawn("quiet", &[]);
+        c.initialize(2, "");
+        let params = match cursor {
+            Some(cursor) => format!(r#"{{"sessionId":"msp-sess-1","replayFrom":{cursor}}}"#),
+            None => r#"{"sessionId":"msp-sess-1"}"#.to_string(),
+        };
+        let id = c.req("session/resume", &params);
+        let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+        assert!(frame.contains("\"result\""), "{cursor:?}: {frame}");
+        let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let response = frames
+            .iter()
+            .position(|f| f.contains(&format!("\"id\":{id}")))
+            .unwrap();
+        let markers: Vec<usize> = frames
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| f.contains("\"replay_complete\""))
+            .map(|(i, _)| i)
+            .collect();
+        if marked {
+            assert_eq!(markers.len(), 1, "exactly one marker: {frames:?}");
+            let replayed = frames
+                .iter()
+                .rposition(|f| f.contains("old answer"))
+                .expect("replayed history");
+            assert!(
+                replayed < markers[0] && markers[0] < response,
+                "the marker follows the replay and precedes the response: {frames:?}"
+            );
+        } else {
+            assert!(markers.is_empty(), "{cursor:?}: {frames:?}");
+        }
+        c.finish();
+    }
+}
+
+#[test]
+fn v2_resume_withholds_the_replay_marker_when_the_host_downgraded_history() {
+    let mut c = Client::spawn("usage_resume", &[]);
+    c.initialize(2, "");
+    let id = c.req(
+        "session/resume",
+        r#"{"sessionId":"msp-sess-1","replayFrom":{"type":"start"}}"#,
+    );
+    let frame = c.wait_for(&format!("\"id\":{id}"), Duration::from_secs(15));
+    assert!(frame.contains("\"result\""), "{frame}");
+    let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert!(
+        !frames.iter().any(|f| f.contains("\"replay_complete\"")),
+        "a downgraded replay is truncated, so it is not marked complete: {frames:?}"
+    );
+    c.finish();
+}

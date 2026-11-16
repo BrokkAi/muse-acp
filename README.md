@@ -356,15 +356,29 @@ error the editor shows if Muse then refuses the profile says why.
 
 ## What's supported
 
+- **System prompts** — on Muse 1.4.18+ the adapter advertises
+  `systemPrompt` in `append` mode and passes the text to Muse as the
+  session's developer prompt. Muse keeps its built-in instructions and adds
+  the text ahead of its workspace context in the developer message. It is
+  applied on `session/new`, `session/load`, `session/resume`, and
+  `session/fork`; Muse stores it with the session, so a load or resume
+  without one keeps the stored prompt, and a fork, which Muse starts without
+  one, is given it by a follow-up resume. `override` and unknown modes,
+  non-text blocks, an empty or blank prompt, and any prompt sent to an
+  older host are refused with `-32602` before the session is touched. A
+  developer prompt from Muse settings, where one is configured, is replaced
+  by the client's for that session.
 - **Sessions** — new, load, resume, list, close, and fork, with durable Muse
   session IDs that survive adapter and host restarts. On Muse 1.4.11+ closing
   a session also releases it in Muse (`session/leave`), so it stops holding
   host resources; it stays listed and a resume reloads it. An ACP v2 resume
   replays history only for `replayFrom: {"type": "start"}`; an omitted or
   `null` cursor reconnects without replay, and an unsupported or malformed
-  cursor is refused with `-32602` before Muse is asked. Every successful v2
-  resume sends the current `idle`, `running`, or `requires_action` state after
-  any replay and before its response. Delete is available on
+  cursor is refused with `-32602` before Muse is asked. A complete replay ends
+  with a `replay_complete` update; when Muse served only part of the history,
+  the marker is withheld, which ACP defines as a truncated replay. Every
+  successful v2 resume sends the current `idle`, `running`, or
+  `requires_action` state after any replay and before its response. Delete is available on
   Muse 1.4.1 and 1.4.2 with durable session logs; Muse 1.4.3 no longer
   serves it, so the adapter does not offer it there. Muse deletes only
   sessions it can prove the running host owns, so a session from an earlier
