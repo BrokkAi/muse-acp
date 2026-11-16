@@ -36,6 +36,13 @@ sees it, and fields the schema does not define are ignored unless this page
 names them. JSON-RPC batches are refused with one `-32600` and none of their
 entries run.
 
+On Muse 1.4.18+ `initialize` advertises `systemPrompt: {}` in the session
+capabilities (ACP v1 `sessionCapabilities`, v2 `session`): `append` mode
+only, text content only. The text becomes Muse's per-session developer
+prompt; see the README's "System prompts". ACP v2 resumes that replay history
+end the replay with `replay_complete`, and withhold it when Muse served only
+part of the history.
+
 
 ## Extension methods
 

@@ -109,6 +109,13 @@ impl HandshakeInfo {
         self.at_least(1, 4, 1)
     }
 
+    /// Stable `config.developerPrompt` on `session/start` and
+    /// `session/resume` (Muse 1.4.18+): per-session developer instructions
+    /// that Muse adds to the developer message ahead of its own context.
+    pub fn supports_developer_prompt(&self) -> bool {
+        self.at_least(1, 4, 18)
+    }
+
     /// Host-computed `cost` and cache totals on cumulative token usage
     /// (Muse 1.4.2+).
     pub fn reports_session_cost(&self) -> bool {

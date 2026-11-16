@@ -2025,8 +2025,10 @@ enum LoopMsg {
 /// it no MCP transport is advertised beyond the stdio support ACP v1 always
 /// implies, and client servers are dropped. `session_delete` is the host's
 /// MSP `session/delete` support (Muse 1.4.1 or 1.4.2, durable); clients
-/// must not call `session/delete` unless it is advertised.
-fn v2_init(session_mcp: bool, session_delete: bool) -> serde_json::Value {
+/// must not call `session/delete` unless it is advertised. `system_prompt`
+/// is the host's developer prompt support (Muse 1.4.18+), advertised as
+/// `systemPrompt` in `append` mode only.
+fn v2_init(session_mcp: bool, session_delete: bool, system_prompt: bool) -> serde_json::Value {
     use agent_client_protocol::{schema::ProtocolVersion, v2::schema as s2};
     let mut session = s2::SessionCapabilities::new()
         .prompt(
@@ -2038,6 +2040,9 @@ fn v2_init(session_mcp: bool, session_delete: bool) -> serde_json::Value {
         .additional_directories(s2::SessionAdditionalDirectoriesCapabilities::new());
     if session_delete {
         session = session.delete(s2::SessionDeleteCapabilities::new());
+    }
+    if system_prompt {
+        session = session.system_prompt(s2::SessionSystemPromptCapabilities::new());
     }
     if session_mcp {
         session = session.mcp(
@@ -2054,7 +2059,7 @@ fn v2_init(session_mcp: bool, session_delete: bool) -> serde_json::Value {
     serde_json::to_value(response).expect("an initialize response serializes")
 }
 
-fn v1_init(session_mcp: bool, session_delete: bool) -> serde_json::Value {
+fn v1_init(session_mcp: bool, session_delete: bool, system_prompt: bool) -> serde_json::Value {
     use agent_client_protocol::{schema::ProtocolVersion, v1::schema as s1};
     let mut session = s1::SessionCapabilities::new()
         .list(s1::SessionListCapabilities::new())
@@ -2064,6 +2069,9 @@ fn v1_init(session_mcp: bool, session_delete: bool) -> serde_json::Value {
         .additional_directories(s1::SessionAdditionalDirectoriesCapabilities::new());
     if session_delete {
         session = session.delete(s1::SessionDeleteCapabilities::new());
+    }
+    if system_prompt {
+        session = session.system_prompt(s1::SessionSystemPromptCapabilities::new());
     }
     let capabilities = s1::AgentCapabilities::new()
         .load_session(true)
@@ -2119,11 +2127,12 @@ fn send_initialize(
     id: &Option<RequestId>,
     session_mcp: bool,
     session_delete: bool,
+    system_prompt: bool,
 ) {
     let response = if negotiated_ver() == 2 {
-        v2_init(session_mcp, session_delete)
+        v2_init(session_mcp, session_delete, system_prompt)
     } else {
-        v1_init(session_mcp, session_delete)
+        v1_init(session_mcp, session_delete, system_prompt)
     };
     acp::send_value(stdout, id, response);
 }
@@ -2138,7 +2147,7 @@ fn serve_without_host(
     reason: &str,
 ) {
     match request.method() {
-        "initialize" => send_initialize(stdout, id, false, false),
+        "initialize" => send_initialize(stdout, id, false, false, false),
         // Auth-required, so clients show the button that installs Muse.
         _ if id.is_some() && MUSE_NOT_INSTALLED.load(Ordering::SeqCst) => {
             let message = if login_method_offered() {
@@ -2809,23 +2818,96 @@ fn session_mcp_servers(
 }
 
 /// `,"config":{"mcpServers":...}` for `session/start` and `session/resume`.
-fn mcp_config_field(servers: Option<&str>) -> String {
-    servers
-        .map(|servers| format!(",\"config\":{{\"mcpServers\":{servers}}}"))
-        .unwrap_or_default()
+/// The MSP `config` member of `session/start` or `session/resume`: the
+/// client's MCP servers and its system prompt as Muse's developer prompt.
+/// Empty when neither is given.
+fn session_config_field(servers: Option<&str>, developer_prompt: Option<&str>) -> String {
+    let mut members = Vec::new();
+    if let Some(servers) = servers {
+        members.push(format!("\"mcpServers\":{servers}"));
+    }
+    if let Some(prompt) = developer_prompt {
+        members.push(format!("\"developerPrompt\":{}", esc(prompt)));
+    }
+    if members.is_empty() {
+        String::new()
+    } else {
+        format!(",\"config\":{{{}}}", members.join(","))
+    }
 }
 
-/// MSP `session/resume` with inline history and the client's MCP servers.
-/// A session this host has already loaded keeps the MCP set it was loaded
-/// with (MSP has no unload), so a different set is rejected as
-/// `session_configuration_conflict`. Retry once without configuration: the
-/// session attaches with the servers it has instead of becoming unusable.
+/// Reads an ACP `systemPrompt` as the text of a Muse developer prompt.
+///
+/// Muse adds a developer prompt to the developer message ahead of its own
+/// workspace and agent context and keeps its built-in instructions, which is
+/// ACP's `append` mode; it has nothing that replaces the built-in
+/// instructions, so `override` and unknown modes are refused, as ACP
+/// requires. Text blocks are joined with a blank line. Muse reads a blank
+/// developer prompt as an explicit clear that also turns off the session's
+/// agent catalog and memory snapshot, so a prompt with no text is refused
+/// instead of being sent.
+fn developer_prompt(prompt: Option<&request::SystemPrompt>) -> Result<Option<String>, String> {
+    let Some(prompt) = prompt else {
+        return Ok(None);
+    };
+    if prompt.mode != "append" {
+        return Err(format!(
+            "systemPrompt mode `{}` is not supported: Muse can only append to its own instructions",
+            prompt.mode
+        ));
+    }
+    if prompt.content.is_empty() {
+        return Err("systemPrompt.content must not be empty".to_string());
+    }
+    let mut texts = Vec::new();
+    for block in &prompt.content {
+        match block {
+            request::Content::Text(text) => texts.push(text.as_str()),
+            _ => {
+                return Err("systemPrompt.content supports only text blocks".to_string());
+            }
+        }
+    }
+    let text = texts.join("\n\n");
+    if text.trim().is_empty() {
+        return Err("systemPrompt has no text".to_string());
+    }
+    Ok(Some(text))
+}
+
+/// Validates a lifecycle request's `systemPrompt` against the host that will
+/// apply it. A host before Muse 1.4.18 ignores the developer prompt, so the
+/// capability is not advertised there, and a prompt sent anyway is refused
+/// rather than silently dropped.
+fn setup_developer_prompt(
+    host: &Arc<Hosts>,
+    setup: &request::Setup,
+) -> Result<Option<String>, String> {
+    let prompt = developer_prompt(setup.system_prompt.as_ref())?;
+    if prompt.is_some() && !host.handshake().supports_developer_prompt() {
+        return Err(format!(
+            "systemPrompt needs Muse 1.4.18 or later; this host is {}",
+            host.handshake().host_label()
+        ));
+    }
+    Ok(prompt)
+}
+
+/// MSP `session/resume` with inline history, the client's MCP servers, and
+/// its system prompt as the developer prompt. A session this host has
+/// already loaded keeps the MCP set it was loaded with (MSP has no unload),
+/// so a different set is rejected as `session_configuration_conflict`. Retry
+/// once without the MCP servers: the session attaches with the servers it
+/// has instead of becoming unusable. The developer prompt is kept on the
+/// retry, since a loaded session takes a new one. Without a developer prompt
+/// Muse keeps the one it stored with the session.
 fn resume_session(
     host: &Arc<Hosts>,
     msp_sid: &str,
     mcp_servers: Option<&str>,
     permission_profile: Option<&str>,
     model_id: Option<&str>,
+    developer_prompt: Option<&str>,
 ) -> Result<J, J> {
     let send = |servers: Option<&str>| {
         let cmd = host.mint_cmd("cmd-");
@@ -2841,7 +2923,7 @@ fn resume_session(
                 "{{\"commandId\":{},\"sessionId\":{},\"history\":\"inline\"{}{profile}{model}}}",
                 esc(&cmd),
                 esc(msp_sid),
-                mcp_config_field(servers)
+                session_config_field(servers, developer_prompt)
             ),
         )
     };
@@ -2854,6 +2936,22 @@ fn resume_session(
         }
         result => result,
     }
+}
+
+/// Gives a loaded session a new developer prompt. A loaded session takes the
+/// `config.developerPrompt` of a repeated `session/resume`; only the
+/// snapshot history is asked for, since nothing is replayed from it.
+fn apply_developer_prompt(host: &Arc<Hosts>, msp_sid: &str, prompt: &str) -> Result<J, J> {
+    let cmd = host.mint_cmd("cmd-");
+    host.command(
+        "session/resume",
+        &format!(
+            "{{\"commandId\":{},\"sessionId\":{},\"history\":\"snapshot\"{}}}",
+            esc(&cmd),
+            esc(msp_sid),
+            session_config_field(None, Some(prompt))
+        ),
+    )
 }
 
 /// Re-attaches a session to the host that owns it now, after that host
@@ -2872,8 +2970,22 @@ fn reattach_session(
     mcp_servers: Option<&str>,
 ) -> Result<(J, bool), J> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    // Muse stored the developer prompt with a saved session; resending it
+    // keeps a session whose prompt changed on another host on this one.
+    let developer_prompt = sessions
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(acp_sid)
+        .and_then(|s| s.developer_prompt.clone());
     let resumed = loop {
-        let attempt = resume_session(hosts, msp_sid, mcp_servers, None, None);
+        let attempt = resume_session(
+            hosts,
+            msp_sid,
+            mcp_servers,
+            None,
+            None,
+            developer_prompt.as_deref(),
+        );
         let held = attempt.as_ref().err().is_some_and(|e| {
             err_code(e) == -32021 || msp::rejection_reason(e) == Some("runtime_busy")
         });
@@ -3002,7 +3114,7 @@ fn restart_unsaved_session(
     msp_sid: &str,
     mcp_servers: Option<&str>,
 ) -> Result<J, J> {
-    let (cwd, roots, approval, model, standing) = sessions
+    let (cwd, roots, approval, model, standing, developer_prompt) = sessions
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(acp_sid)
@@ -3015,6 +3127,7 @@ fn restart_unsaved_session(
                 s.reasoning_effort_source
                     .is_some()
                     .then(|| s.reasoning_effort.clone()),
+                s.developer_prompt.clone(),
             )
         })
         .ok_or_else(|| msp::mk_err(-32602, "unknown sessionId"))?;
@@ -3036,7 +3149,7 @@ fn restart_unsaved_session(
             esc(msp_sid),
             esc(&start_root_text),
             esc(&approval),
-            mcp_config_field(mcp_servers),
+            session_config_field(mcp_servers, developer_prompt.as_deref()),
             workspace_roots_param((!start_roots.is_empty()).then_some(start_roots.as_slice()))
         ),
     )?;
@@ -3229,17 +3342,19 @@ fn selftest() -> i32 {
         ]
         .map(|(v2, mcp, delete)| (air, v2, mcp, delete))
     });
-    for (air, v2, session_mcp, session_delete) in shapes {
+    for ((air, v2, session_mcp, session_delete), system_prompt) in
+        shapes.flat_map(|shape| [(shape, false), (shape, true)])
+    {
         AIR_CLIENT.store(air, Ordering::SeqCst);
         let (response, parsed) = if v2 {
-            let response = v2_init(session_mcp, session_delete);
+            let response = v2_init(session_mcp, session_delete, system_prompt);
             let parsed = serde_json::from_value::<
                 agent_client_protocol::v2::schema::InitializeResponse,
             >(response.clone())
             .map(|_| ());
             (response, parsed)
         } else {
-            let response = v1_init(session_mcp, session_delete);
+            let response = v1_init(session_mcp, session_delete, system_prompt);
             let parsed = serde_json::from_value::<
                 agent_client_protocol::v1::schema::InitializeResponse,
             >(response.clone())
@@ -5217,12 +5332,20 @@ fn handle_acp(
             &id,
             host.handshake().session_mcp,
             host.handshake().supports_session_delete(),
+            host.handshake().supports_developer_prompt(),
         ),
         Request::NewSession(setup) => {
             let ver = negotiated_ver();
             if !validate_session_roots(stdout, &id, &setup) {
                 return;
             }
+            let developer_prompt = match setup_developer_prompt(host, &setup) {
+                Ok(prompt) => prompt,
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
             let cwd = setup.cwd.clone();
             let roots = session_roots(&setup, &cwd)
                 .expect("session roots were validated before starting the session");
@@ -5283,7 +5406,7 @@ fn handle_acp(
                     esc(&cmd),
                     esc(&start_root_text),
                     start_mode,
-                    mcp_config_field(mcp_servers.as_deref()),
+                    session_config_field(mcp_servers.as_deref(), developer_prompt.as_deref()),
                     workspace_roots_param(start_roots.as_deref())
                 ),
             );
@@ -5442,6 +5565,7 @@ fn handle_acp(
                             turn_usage: Vec::new(),
                             skill_selectors: None,
                             mcp_servers,
+                            developer_prompt: developer_prompt.clone(),
                         },
                     );
                     // _meta exposes the host session id: pass it back to
@@ -5560,6 +5684,13 @@ fn handle_acp(
                 );
                 return;
             }
+            let developer_prompt = match setup_developer_prompt(host, &setup) {
+                Ok(prompt) => prompt,
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
             let permission_profile = match resume_permission_profile(&setup.meta) {
                 Ok(profile) => profile,
                 Err(message) => {
@@ -5657,6 +5788,7 @@ fn handle_acp(
                 mcp_servers.as_deref(),
                 permission_profile.as_deref(),
                 model_override.as_deref(),
+                developer_prompt.as_deref(),
             ) {
                 Ok(r) => {
                     // Pending questions/approvals survive reconnects; the host
@@ -5796,6 +5928,7 @@ fn handle_acp(
                             turn_usage: Vec::new(),
                             skill_selectors: None,
                             mcp_servers: None,
+                            developer_prompt: None,
                         });
                         entry.msp_sid = real_msp.clone();
                         entry.ver = ver;
@@ -5808,6 +5941,11 @@ fn handle_acp(
                         // The client's latest set, even when a conflict kept
                         // the loaded one: a restarted host loads this.
                         entry.mcp_servers = mcp_servers;
+                        // Without a new prompt Muse keeps the stored one,
+                        // which a restart's resume keeps too.
+                        if developer_prompt.is_some() {
+                            entry.developer_prompt = developer_prompt;
+                        }
                         if let Some(session) = r.get("session") {
                             adopt_session_projection(entry, session);
                         }
@@ -5921,7 +6059,17 @@ fn handle_acp(
                             // through a fresh fold.
                             let root = entry.fold.workspace_root.clone();
                             entry.fold = fresh_fold(&root);
-                            replay_history(stdout, entry, &r);
+                            let complete = replay_history(stdout, entry, &r);
+                            // ACP v2 marks the end of a requested replay, so
+                            // the editor can tell history from live updates.
+                            // A partial replay is left unmarked, which ACP
+                            // defines as a truncated one.
+                            if ver == 2 && complete {
+                                let acp_sid = entry.acp_sid.clone();
+                                acp::send_note(stdout, out::replay_complete(&acp_sid));
+                            } else if ver == 2 {
+                                log("resume: replay incomplete; replay_complete withheld");
+                            }
                         }
                         reconcile_active_tasks(stdout, entry, &r, replay);
                         acp::send_usage(
@@ -6187,6 +6335,13 @@ fn handle_acp(
                     return;
                 }
             }
+            let developer_prompt = match setup_developer_prompt(host, &setup) {
+                Ok(prompt) => prompt,
+                Err(message) => {
+                    acp::send_error(stdout, &id, -32602, &message);
+                    return;
+                }
+            };
             // MSP session/fork takes no configuration, and the fork is loaded
             // without MCP servers. Keep the client's set on the record so a
             // restarted host loads the fork with it.
@@ -6258,6 +6413,23 @@ fn handle_acp(
                         return;
                     }
                     host.note_owner(&new_msp, fork_host);
+                    // Muse does not carry a developer prompt into a fork, and
+                    // session/fork takes no configuration, so the loaded fork
+                    // is resumed with it.
+                    if let Some(prompt) = developer_prompt.as_deref()
+                        && let Err(e) = apply_developer_prompt(host, &new_msp, prompt)
+                    {
+                        acp::send_error(
+                            stdout,
+                            &id,
+                            -32603,
+                            &format!(
+                                "Muse forked the session as {new_msp} but did not apply the system prompt: {}",
+                                msp::err_message(&e)
+                            ),
+                        );
+                        return;
+                    }
                     modes::save(&new_msp, &fork_mode);
                     if let Some(token) = &bridge_token {
                         bridge::bind(token, &new_msp);
@@ -6388,10 +6560,12 @@ fn handle_acp(
                             turn_usage: Vec::new(),
                             skill_selectors: None,
                             mcp_servers: None,
+                            developer_prompt: None,
                         });
                         entry.msp_sid = new_msp.clone();
                         entry.ver = ver;
                         entry.mcp_servers = mcp_servers;
+                        entry.developer_prompt = developer_prompt;
                         adopt_session_projection(entry, &new_session);
                         entry.fold.workspace_root.clone_from(&restored_cwd);
                         entry.cwd = restored_cwd;
@@ -8693,16 +8867,25 @@ fn collect_history(
     }
 }
 
-fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) {
+/// Replays the history a `session/resume` result served. Returns whether
+/// the replay is complete: the host served the whole history inline, in a
+/// shape the fold reads. A downgraded or unreadable history replays what it
+/// can and answers false.
+fn replay_history(stdout: &StdoutShared, sess: &mut AcpSession, resume_res: &J) -> bool {
     let Some(items) = replay_items(resume_res) else {
         log("resume: unrecognized history shape; resumed without replay");
-        return;
+        return false;
     };
     let mut out = Vec::new();
     let (acp_sid, ver) = (sess.acp_sid.clone(), sess.ver);
     sess.fold
         .replay_history_items(&acp_sid, ver, &items, &mut out);
     acp::send_fold_lines(stdout, sess, out);
+    resume_res
+        .get("history")
+        .and_then(|h| h.get("mode"))
+        .and_then(J::as_str)
+        == Some("inline")
 }
 
 /// Rebuild the observable AIR task set from the durable fold returned by
@@ -17770,14 +17953,14 @@ mod tests {
     #[test]
     fn initialization_payloads_report_the_cargo_version() {
         for payload in [
-            v2_init(true, true),
-            v2_init(true, false),
-            v2_init(false, true),
-            v2_init(false, false),
-            v1_init(true, true),
-            v1_init(true, false),
-            v1_init(false, true),
-            v1_init(false, false),
+            v2_init(true, true, true),
+            v2_init(true, false, true),
+            v2_init(false, true, false),
+            v2_init(false, false, false),
+            v1_init(true, true, true),
+            v1_init(true, false, true),
+            v1_init(false, true, false),
+            v1_init(false, false, false),
         ] {
             let parsed = crate::json::from_value(&payload);
             let version = ["info", "agentInfo"]

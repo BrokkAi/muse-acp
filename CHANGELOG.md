@@ -11,6 +11,16 @@
   still runs. The one stable addition, `session/start`'s `clear` flag, is
   recorded as intentionally ignored: an ACP `session/new` is a plain start,
   and ACP has no clear signal. Nothing an editor sees changes.
+- Move to version 5.3.0 of the ACP Rust SDK (`agent-client-protocol`,
+  schema 1.18.0). Nothing an editor sees changes from the upgrade itself.
+- Accept a client-provided system prompt (ACP `systemPrompt`, `append` mode)
+  on Muse 1.4.18+, applied as the session's Muse developer prompt on new,
+  load, resume, and fork. Muse keeps its own instructions and adds the text
+  to them. `override`, non-text content, and blank prompts are refused with
+  `-32602`, as is a prompt sent to an older host (#318).
+- ACP v2: a `session/resume` that replays history now ends the replay with
+  `replay_complete`, as the v2 schema requires. A replay Muse served only in
+  part is left unmarked, which ACP reads as truncated.
 
 ## 0.23.1
 
