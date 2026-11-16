@@ -7131,6 +7131,10 @@
           ],
           "description": "The session's starting approval mode; server default when omitted or\nexplicit `null` — both spellings select the default (#23468).\nSelect, never create — the value names a mode the host's configuration\nalready defines (tdd SS2.5.1, SS5.12). This is the only surface that\ndeclares a non-interactive run's policy (tdd SS5.11, D-008)."
         },
+        "clear": {
+          "description": "Marks this start as a `/clear` (spec 207 amendment 93195, FR-93195-1,\nADR 93195 D1): `true` starts the new session as a clear, so its\n`SessionStart` hooks get source `clear` instead of `startup`. `false`\nand omitted are the same plain start (source `startup`). It neither\nneeds nor implies `previousSessionId`. Explicit `null` is invalid params.",
+          "type": "boolean"
+        },
         "commandId": {
           "description": "The SS2.5 idempotency handle (UUIDv7). Required; the server never\nmints one.",
           "type": "string"

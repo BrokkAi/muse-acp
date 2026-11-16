@@ -9,15 +9,14 @@ access, and useful in real editor workflows.
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
-- **Reference snapshots used for this revision:** the Muse 1.4.18 stable
+- **Reference snapshots used for this revision:** the Muse 1.4.20 stable
   surface (stable schema version 1, fingerprint
-  `sha256:77dda18550adef14e257b015fe4e6490b722723f7d526df5ba4867939fff68a3`),
-  vendored from the stable 1.4.18-R8587.1 build's own
-  `muse schema generate-json-schema` export because the SDK has published
-  nothing past 1.4.15, validated against that build and pinned in the
-  live-host matrix; the fingerprint is the live handshake's and the release
-  manifest's. The transcript corpus is Muse SDK `07e1548` (2026-11-10, the
-  1.4.15 surface). Also `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
+  `sha256:283b1b125dcc9172928fb5d6711a92a353796d030a7c186988ed527a13cf07f0`),
+  vendored from Muse SDK `649ca21` (2026-11-13), byte-identical to the stable
+  1.4.20-R8619.1 build's own `muse schema generate-json-schema` export,
+  validated against that build and pinned in the live-host matrix; the
+  fingerprint is the live handshake's and the release manifest's. The
+  transcript corpus is the same SDK revision. Also `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
 
 ## Product principles
 
@@ -105,8 +104,8 @@ the verdict into richer support bundles.
   published the 1.4.12 fingerprint, the `3dce908` pin published the 1.4.13
   fingerprint, the `a45cb67` pin published the 1.4.14 fingerprint, the
   `07e1548` pin published the 1.4.15 surface, whose fingerprint the SDK
-  manifest no longer carries, and the current stable bundle is the 1.4.18
-  build's own export.
+  manifest no longer carries, the 1.4.18 stable bundle was that build's own
+  export, and the `649ca21` pin publishes the current 1.4.20 surface.
   Host 1.2.1 reports
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
@@ -278,7 +277,15 @@ the verdict into richer support bundles.
   notification, request, error, and capability tables unchanged. Its Linux,
   macOS, and Windows artifacts are pinned in the nightly matrix, and every
   addition has a §9 disposition. No 1.4.16 or 1.4.17 build was available to
-  validate, so those fingerprints stay unclassified. Before 1.4.6, the
+  validate, so those fingerprints stay unclassified.
+  The `649ca21` pin publishes the 1.4.20 surface
+  (`sha256:283b1b125dcc9172928fb5d6711a92a353796d030a7c186988ed527a13cf07f0`,
+  schema version 1), byte-identical to the `1.4.20-R8619.1` build's own
+  export; the live handshake and the release manifest report the same
+  fingerprint. Over 1.4.18 the only change is the optional
+  `SessionStartParams.clear` flag, which has a §9 disposition. Its Linux,
+  macOS, and Windows artifacts are pinned in the nightly matrix. No 1.4.19
+  build was available to validate. Before 1.4.6, the
   Python tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
   `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
   surface while the top-level schema stayed on 1.3.0-R3401.1. Transcript
@@ -314,7 +321,7 @@ The SDK publishes generated MSP types, a schema bundle, and recorded transcripts
 The Rust adapter should consume those artifacts as conformance inputs.
 
 Status: **emissions validated and permission paths replayed.**
-`tests/protocol/` pins SDK revision `07e1548` (stable manifest, JSON schema
+`tests/protocol/` pins SDK revision `649ca21` (stable manifest, JSON schema
 bundle, 54 golden transcripts) with provenance and license. CI now replays
 every server-side item event through the notification fold (unknown kinds must
 tolerate), validates every emitted ACP frame with the adapter's own parser,
@@ -393,7 +400,7 @@ their first Windows evidence.
 
 **Work items**
 
-- Pin the SDK revision (currently `07e1548`, 2026-11-10) and vendor
+- Pin the SDK revision (currently `649ca21`, 2026-11-13) and vendor
   `schema/msp/stable/manifest.json`, `schema/msp/stable/msp.schema.json`, and
   the `schema/msp/transcripts/` corpus under `tests/protocol/`, or fetch that
   locked revision in CI. The corpus already covers approvals, cancellation,
@@ -769,12 +776,12 @@ path, preserving the fail-closed policy from §4.
 
 **Muse 1.4.x stable-surface additions**
 
-Muse 1.4.1 through 1.4.18 grew the stable surface well past 1.3.0. The adapter
+Muse 1.4.1 through 1.4.20 grew the stable surface well past 1.3.0. The adapter
 adopts the parts that fit its ACP mapping (workspace roots, reasoning tiers,
 session delete on the hosts that serve it, `feedback/submit`, and
 `session/list` filters) and records an explicit disposition below for the
 rest, with a tracking issue where behavior remains undecided. The pinned
-`07e1548` bundle is the authority.
+`649ca21` bundle is the authority.
 The rows below record a disposition for the 1.4.x additions the adapter does
 not drive, plus `feedback/submit`, which it does; incoming notifications with
 no adapter arm stay safe because the unknown-method path in the fold logs and
@@ -945,6 +952,14 @@ now reports `needsInput` with `needsInputReasons`, which the adapter carries
 as a known status and maps to ACP v2 `requires_action`; start and resume
 warnings and `session/activationChanged` are logged.
 
+Muse 1.4.20 adds one optional stable member, `SessionStartParams.clear`,
+which marks a start as a `/clear` for the new session's `SessionStart` hooks;
+the matrix row below records why the adapter does not send it. The
+experimental surface adds the per-session built-in tool restriction
+(`SessionConfig.allowedBuiltInTools` with its `appliedBuiltInTools` echo),
+which the schema declares but the host does not yet enforce, so the adapter
+does not send it.
+
 **Muse 1.4.x field-level and vocabulary additions**
 
 Muse 1.4.6 grew fields and open vocabularies the adapter's tolerant fold had to
@@ -1083,6 +1098,7 @@ cannot drop a member without failing CI.
 | `SchemaInfo.experimentalFingerprint` | Consumed | The adapter opts into the experimental surface, so the handshake's digest of it is logged beside `schema-compat` as `schema-compat-experimental ... experimental_fingerprint=...`. Absent means unknown; it does not affect classification. |
 | `SessionConfig.developerPrompt` | Unsupported pending protocol decision | Muse 1.4.18 makes per-session developer instructions stable on `session/start` and `session/resume`. They replace the settings-derived developer instructions rather than appending to them, so mapping ACP's unstable `systemPrompt` (`append`/`override`) onto them needs its own design: [#318](https://github.com/BrokkAi/muse-acp/issues/318). |
 | `SessionReadResult.modelTurnRunning` | Intentionally ignored | Whether a child read session's model turn runs is served on a `subagent` session read; the adapter reads sessions only to replay history. |
+| `SessionStartParams.clear` | Intentionally ignored | Muse 1.4.20 marks a start as a `/clear`, so the new session's `SessionStart` hooks see source `clear` instead of `startup`. An ACP `session/new` is a plain start, which omission keeps, and ACP has no clear signal. The adapter offers no `/clear` command: an ACP session id names one Muse session, so clearing in place would rebind it to a new Muse session that `session/load` and `session/list` could no longer reach under that id. Editors start a fresh thread with `session/new`. |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**

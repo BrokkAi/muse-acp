@@ -8978,10 +8978,29 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 }
 
 #[test]
-fn sdk_manifest_fingerprint_is_the_1_4_18_surface() {
-    // The vendored stable bundle is the 1.4.18-R8587.1 build's own export,
-    // and that build in the nightly live-host matrix reports this digest, so
-    // the adapter classifies it as tested.
+fn sdk_manifest_fingerprint_is_the_1_4_20_surface() {
+    // The vendored stable bundle is SDK 649ca21's, byte-identical to the
+    // 1.4.20-R8619.1 build's own export, and that build in the nightly
+    // live-host matrix reports this digest, so the adapter classifies it as
+    // tested.
+    let mut c = Client::spawn(
+        "quiet",
+        &[(
+            "FAKE_FINGERPRINT",
+            "sha256:283b1b125dcc9172928fb5d6711a92a353796d030a7c186988ed527a13cf07f0",
+        )],
+    );
+    c.initialize(1, "");
+    c.wait_stderr("status=tested", Duration::from_secs(10));
+    c.wait_stderr(
+        "validated against live host 1.4.20-R8619.1; the vendored SDK 649ca21 surface",
+        Duration::from_secs(10),
+    );
+    c.finish();
+}
+
+#[test]
+fn the_1_4_18_fingerprint_stays_tested() {
     let mut c = Client::spawn(
         "quiet",
         &[(
@@ -8992,7 +9011,7 @@ fn sdk_manifest_fingerprint_is_the_1_4_18_surface() {
     c.initialize(1, "");
     c.wait_stderr("status=tested", Duration::from_secs(10));
     c.wait_stderr(
-        "validated against live host 1.4.18-R8587.1; the vendored 1.4.18 export",
+        "validated against live host 1.4.18-R8587.1; the previously vendored 1.4.18 export",
         Duration::from_secs(10),
     );
     c.finish();
