@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Adopt the Muse 1.4.20 stable surface. The vendored stable bundle and
+  golden transcripts move to Muse SDK `649ca21`, whose bundle is
+  byte-identical to the 1.4.20-R8619.1 build's own export; its fingerprint
+  classifies as tested, and the nightly matrix runs the 1.4.20 builds on
+  Linux, macOS, and Windows. The 1.4.18 fingerprint stays tested. No 1.4.19
+  build was available to validate, so that host logs `status=unknown` and
+  still runs. The one stable addition, `session/start`'s `clear` flag, is
+  recorded as intentionally ignored: an ACP `session/new` is a plain start,
+  and ACP has no clear signal. Nothing an editor sees changes.
+
 ## 0.23.1
 
 - Name the subagent on `subagentInput` and `subagentResult` cards by its
