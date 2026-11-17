@@ -277,6 +277,14 @@ struct InboxItem {
     voided_at: Option<String>,
 }
 
+/// A subagent card last sent saying "Delivered to the parent agent.", kept
+/// as it reads without that line, so the child's first `subagentResult` item
+/// can send it once in its place (#470).
+struct DeliveredLine {
+    subagent_id: String,
+    card: Card,
+}
+
 /// A shell card's command facts, kept for its ACP v2 terminal.
 struct ShellCommand {
     tc_id: String,
@@ -292,6 +300,16 @@ pub struct SessionFold {
     /// this index so a child session id can never become an alternate command
     /// target.
     subagents: HashMap<String, SubagentObservation>,
+    /// Children (`subagentId`s) with at least one Muse 1.4.15
+    /// `subagentResult` item. Each such item's card stands for one consumed
+    /// result, so the child's subagent card no longer says "Delivered to the
+    /// parent agent." and keeps `drained` only in `_meta`. A child with no
+    /// such item keeps the line, as on a host before the kind (#470).
+    subagent_results: std::collections::HashSet<String>,
+    /// Subagent cards whose last update carried the delivered line, by item
+    /// id. A later `subagentResult` item for the child re-sends each once
+    /// without the line.
+    delivered_lines: HashMap<String, DeliveredLine>,
     /// Completed item ids (gap-refill replays must not re-announce).
     done: std::collections::HashSet<String>,
     idc: AtomicU64,
@@ -484,6 +502,8 @@ impl SessionFold {
             terminals: HashMap::new(),
             items: HashMap::new(),
             subagents: HashMap::new(),
+            subagent_results: std::collections::HashSet::new(),
+            delivered_lines: HashMap::new(),
             done: std::collections::HashSet::new(),
             idc: AtomicU64::new(1),
             native_subagents: false,
@@ -557,6 +577,77 @@ impl SessionFold {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string(),
+            },
+        );
+    }
+
+    /// An item's durable child identity, when it names one.
+    fn subagent_id(item: &J) -> Option<&str> {
+        item.get("subagentId")
+            .and_then(J::as_str)
+            .filter(|id| !id.is_empty())
+    }
+
+    /// Record the child of a Muse 1.4.15 `subagentResult` item. Muse draws
+    /// one `Finished` member per consumed result from these items, and from
+    /// `result.drained` only for a child without one, so the child's first
+    /// such item re-sends any subagent card of it that already said
+    /// "Delivered to the parent agent.", once, without the line (#470).
+    fn observe_subagent_result(&mut self, acp_sid: &str, ver: u8, item: &J, out: &mut Vec<Note>) {
+        if item.get("kind").and_then(J::as_str) != Some("subagentResult") {
+            return;
+        }
+        let Some(subagent_id) = Self::subagent_id(item) else {
+            return;
+        };
+        if !self.subagent_results.insert(subagent_id.to_string()) {
+            return;
+        }
+        let mut cards = Vec::new();
+        self.delivered_lines.retain(|item_id, line| {
+            if line.subagent_id != subagent_id {
+                return true;
+            }
+            cards.push((item_id.clone(), std::mem::take(&mut line.card)));
+            false
+        });
+        cards.sort_by(|a, b| a.0.cmp(&b.0));
+        for (_, card) in cards {
+            out.push(card.note(acp_sid, ver, false));
+        }
+    }
+
+    /// Track a subagent card just sent: one that said "Delivered to the
+    /// parent agent." is kept as it reads without the line, for a later
+    /// `subagentResult` item of its child; one sent without the line has
+    /// nothing to take back.
+    fn note_delivered_line(&mut self, item_id: &str, tc_id: &str, status: &'static str, item: &J) {
+        let child = Self::subagent_id(item).filter(|_| self.delivered_line(item));
+        let Some(subagent_id) = child else {
+            self.delivered_lines.remove(item_id);
+            return;
+        };
+        let (title, content, meta) = Self::subagent_card_parts(item, false);
+        let muse_fields =
+            Self::merge_muse_fields(meta.as_deref(), Self::item_muse_fields(item).as_deref());
+        let mut card = Self::card(
+            tc_id,
+            &title,
+            "other",
+            status,
+            content.as_deref(),
+            muse_fields.as_deref(),
+            item.get("truncated")
+                .is_some_and(|v| matches!(v, J::Bool(true))),
+        );
+        // ACP replaces a card's content wholesale, so a card whose only
+        // text was the line is cleared rather than left as it was.
+        card.content.get_or_insert_with(Vec::new);
+        self.delivered_lines.insert(
+            item_id.to_string(),
+            DeliveredLine {
+                subagent_id: subagent_id.to_string(),
+                card,
             },
         );
     }
@@ -981,6 +1072,28 @@ impl SessionFold {
         muse_fields: Option<&str>,
         host_truncated: bool,
     ) -> Note {
+        Self::card(
+            tc_id,
+            title,
+            kind,
+            status,
+            content_text,
+            muse_fields,
+            host_truncated,
+        )
+        .note(acp_sid, ver, create)
+    }
+
+    /// The card `card_line` sends, before it becomes an update.
+    fn card(
+        tc_id: &str,
+        title: &str,
+        kind: &str,
+        status: &str,
+        content_text: Option<&str>,
+        muse_fields: Option<&str>,
+        host_truncated: bool,
+    ) -> Card {
         let mut card = Card::new(tc_id);
         card.title = Some(crate::acp::visible_title(title));
         card.kind = Some(kind.to_string());
@@ -1003,7 +1116,7 @@ impl SessionFold {
             fields.push_str("\"truncated\":{\"source\":\"host\"}");
         }
         card.meta = out::muse_meta(&fields);
-        card.note(acp_sid, ver, create)
+        card
     }
 
     /// Preserve stable host references beside the bounded editor surface.
@@ -1208,91 +1321,119 @@ impl SessionFold {
         }
     }
 
+    /// `"<namespace>":{...}` from the fields that are not null, or `None`
+    /// when every one is.
+    fn namespaced_meta(namespace: &str, fields: Vec<(&str, &J)>) -> Option<String> {
+        let parts: Vec<String> = fields
+            .into_iter()
+            .filter(|(_, v)| !matches!(v, J::Null))
+            .map(|(k, v)| format!("\"{k}\":{}", j_to_string(v)))
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(format!("\"{namespace}\":{{{}}}", parts.join(",")))
+        }
+    }
+
+    /// Whether a subagent's result was consumed by the parent (Muse 1.4.11
+    /// `result.drained`, never cleared once set). Absent asserts nothing.
+    fn result_drained(item: &J) -> bool {
+        item.get("result")
+            .and_then(|r| r.get("drained"))
+            .is_some_and(|v| matches!(v, J::Bool(true)))
+    }
+
+    /// Whether a subagent card says "Delivered to the parent agent.": its
+    /// result drained and its child has no `subagentResult` item. Muse
+    /// 1.4.15's schema has a client that knows that kind draw one
+    /// `Finished` member per consumed result from those items instead, and
+    /// keep drawing from the flag for a child with none, as on a host
+    /// before the kind (#470).
+    fn delivered_line(&self, item: &J) -> bool {
+        Self::result_drained(item)
+            && !Self::subagent_id(item).is_some_and(|id| self.subagent_results.contains(id))
+    }
+
+    /// The (title, content, `_meta`) of a subagent card, saying "Delivered
+    /// to the parent agent." when `delivered_line` is set.
+    fn subagent_card_parts(
+        item: &J,
+        delivered_line: bool,
+    ) -> (String, Option<String>, Option<String>) {
+        let str_field = |key: &str| item.get(key).and_then(|v| v.as_str()).unwrap_or("");
+        let agent = str_field("agentPath");
+        let objective = str_field("objective");
+        let title = match (agent.is_empty(), objective.is_empty()) {
+            (false, false) => format!("{agent}: {objective}"),
+            (false, true) => agent.to_string(),
+            (true, false) => objective.to_string(),
+            (true, true) => str_field("fallbackText").to_string(),
+        };
+        // Muse 1.4.11 says when the parent consumed the result
+        // (`result.drained`, never cleared once set). The card's completion
+        // still follows the item's own status; the join is the host's fact
+        // to report, never derived here. `_meta` always carries the flag;
+        // the text states it only when no `subagentResult` card stands for
+        // the consumed result.
+        let drained = Self::result_drained(item);
+        let content = item
+            .get("result")
+            .and_then(|r| r.get("summary"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| {
+                let failure = str_field("failureReason");
+                (!failure.is_empty()).then_some(failure.to_string())
+            });
+        let content = if delivered_line {
+            Some(match content {
+                Some(text) => format!("{text}\nDelivered to the parent agent."),
+                None => "Delivered to the parent agent.".to_string(),
+            })
+        } else {
+            content
+        };
+        // Muse 1.4.18: a newer attempt of the child started after this
+        // result. The result stays; the child's status comes from
+        // `controlStatus`.
+        let superseded = Self::result_superseded(item);
+        let content = if superseded {
+            Some(match content {
+                Some(text) => format!("{text}\nA newer attempt has started since this result."),
+                None => "A newer attempt has started since this result.".to_string(),
+            })
+        } else {
+            content
+        };
+        let true_fact = J::Bool(true);
+        let meta = Self::namespaced_meta(
+            "subagent",
+            vec![
+                ("subagentId", item.get("subagentId").unwrap_or(&J::Null)),
+                (
+                    "childSessionId",
+                    item.get("childSessionId").unwrap_or(&J::Null),
+                ),
+                (
+                    "controlStatus",
+                    item.get("controlStatus").unwrap_or(&J::Null),
+                ),
+                ("depth", item.get("depth").unwrap_or(&J::Null)),
+                ("drained", if drained { &true_fact } else { &J::Null }),
+                ("superseded", if superseded { &true_fact } else { &J::Null }),
+            ],
+        );
+        (title, content, meta)
+    }
+
     /// Build (title, content, `_meta` JSON) for host-side item kinds that
     /// render as synthetic tool cards. `meta` is a complete JSON object.
     fn host_card_parts(&self, kind: &str, item: &J) -> (String, Option<String>, Option<String>) {
         let str_field = |key: &str| item.get(key).and_then(|v| v.as_str()).unwrap_or("");
-        let meta_obj = |namespace: &str, fields: Vec<(&str, &J)>| {
-            let parts: Vec<String> = fields
-                .into_iter()
-                .filter(|(_, v)| !matches!(v, J::Null))
-                .map(|(k, v)| format!("\"{k}\":{}", j_to_string(v)))
-                .collect();
-            if parts.is_empty() {
-                None
-            } else {
-                Some(format!("\"{namespace}\":{{{}}}", parts.join(",")))
-            }
-        };
+        let meta_obj = Self::namespaced_meta;
         match kind {
-            "subagent" => {
-                let agent = str_field("agentPath");
-                let objective = str_field("objective");
-                let title = match (agent.is_empty(), objective.is_empty()) {
-                    (false, false) => format!("{agent}: {objective}"),
-                    (false, true) => agent.to_string(),
-                    (true, false) => objective.to_string(),
-                    (true, true) => str_field("fallbackText").to_string(),
-                };
-                // Muse 1.4.11 says when the parent consumed the result
-                // (`result.drained`, never cleared once set). The card's
-                // completion still follows the item's own status; the join
-                // is the host's fact to report, never derived here.
-                let drained = item
-                    .get("result")
-                    .and_then(|r| r.get("drained"))
-                    .is_some_and(|v| matches!(v, J::Bool(true)));
-                let content = item
-                    .get("result")
-                    .and_then(|r| r.get("summary"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-                    .or_else(|| {
-                        let failure = str_field("failureReason");
-                        (!failure.is_empty()).then_some(failure.to_string())
-                    });
-                let content = if drained {
-                    Some(match content {
-                        Some(text) => format!("{text}\nDelivered to the parent agent."),
-                        None => "Delivered to the parent agent.".to_string(),
-                    })
-                } else {
-                    content
-                };
-                // Muse 1.4.18: a newer attempt of the child started after
-                // this result. The result stays; the child's status comes
-                // from `controlStatus`.
-                let superseded = Self::result_superseded(item);
-                let content = if superseded {
-                    Some(match content {
-                        Some(text) => {
-                            format!("{text}\nA newer attempt has started since this result.")
-                        }
-                        None => "A newer attempt has started since this result.".to_string(),
-                    })
-                } else {
-                    content
-                };
-                let true_fact = J::Bool(true);
-                let meta = meta_obj(
-                    "subagent",
-                    vec![
-                        ("subagentId", item.get("subagentId").unwrap_or(&J::Null)),
-                        (
-                            "childSessionId",
-                            item.get("childSessionId").unwrap_or(&J::Null),
-                        ),
-                        (
-                            "controlStatus",
-                            item.get("controlStatus").unwrap_or(&J::Null),
-                        ),
-                        ("depth", item.get("depth").unwrap_or(&J::Null)),
-                        ("drained", if drained { &true_fact } else { &J::Null }),
-                        ("superseded", if superseded { &true_fact } else { &J::Null }),
-                    ],
-                );
-                (title, content, meta)
-            }
+            "subagent" => Self::subagent_card_parts(item, self.delivered_line(item)),
             "workflow" => {
                 let entry = str_field("entryId");
                 let script = str_field("scriptId");
@@ -3109,6 +3250,14 @@ impl SessionFold {
         // replay) must not switch live side effects back on for the rest of
         // the outer batch.
         let was_replaying = std::mem::replace(&mut self.replaying, true);
+        // History serves each item at its latest state, so a child's
+        // `subagentResult` item is known before its subagent card replays:
+        // the card renders without the delivered line from the start rather
+        // than sending it and taking it back (#470). A card an earlier batch
+        // or the live stream already sent with the line is re-sent here.
+        for item in items {
+            self.observe_subagent_result(acp_sid, ver, item, out);
+        }
         // Every item id the batch still holds, so a boundary can tell an
         // anchor that will register later (keep waiting for it) from one the
         // batch never carries (flush now). Each item is consumed after its
@@ -3480,6 +3629,7 @@ impl SessionFold {
             None => return,
         };
         self.observe_subagent(item);
+        self.observe_subagent_result(acp_sid, ver, item, out);
         self.observe_workflow(item, false);
         if self.known(&item_id) {
             // A gap-refill replay of a settled item, or a later revision
@@ -3687,6 +3837,9 @@ impl SessionFold {
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
+                    if kind == "subagent" {
+                        self.note_delivered_line(&item_id, &tc_id, msp_status(status), item);
+                    }
                 }
                 if kind == "userShell" {
                     self.note_shell(ver, &item_id, &tc_id, item);
@@ -3976,6 +4129,7 @@ impl SessionFold {
             None => return,
         };
         self.observe_subagent(item);
+        self.observe_subagent_result(acp_sid, ver, item, out);
         self.observe_workflow(item, true);
         if self.known(&item_id) {
             // A gap-refill replay of a settled item, possibly the first to
@@ -4227,6 +4381,9 @@ impl SessionFold {
                         item.get("truncated")
                             .is_some_and(|v| matches!(v, J::Bool(true))),
                     ));
+                    if kind == "subagent" {
+                        self.note_delivered_line(&item_id, &tc_id, msp_status(status), item);
+                    }
                 }
                 if let Some(terminal) = terminal {
                     let mut card = Card::new(&tc_id);
@@ -5959,6 +6116,253 @@ mod corpus_tests {
         );
     }
 
+    // Hand-written from the Muse 1.4.20 stable schema: no host run so far
+    // has emitted a `subagentResult` item (#469).
+
+    /// A `subagent` item of the captured `reviewer` child (#467) at `status`,
+    /// with `result` when one is given.
+    fn reviewer(status: &str, result: Option<&str>) -> J {
+        let result = result
+            .map(|r| format!(r#","controlStatus":"resultReady","result":{r}"#))
+            .unwrap_or_default();
+        parse_json(&format!(
+            r#"{{"itemId":"sa-1","kind":"subagent","status":"{status}","subagentId":"subagent-1","agentPath":"main/reviewer/1","role":"reviewer","objective":"review the diff","depth":1{result}}}"#
+        ))
+        .unwrap()
+    }
+
+    const CONSUMED: &str =
+        r#"{"summary":"No issues found.","artifactRefs":[],"evidenceRefs":[],"drained":true}"#;
+
+    /// One consumed result of `subagent_id`, as `item/completed` params.
+    fn consumed(item_id: &str, subagent_id: &str) -> J {
+        parse_json(&format!(
+            r#"{{"item":{{"itemId":"{item_id}","kind":"subagentResult","status":"completed","subagentId":"{subagent_id}","resultStatus":"completed","text":"No issues found.","turnId":"t-1"}}}}"#
+        ))
+        .unwrap()
+    }
+
+    fn completed(item: J) -> J {
+        J::Obj(vec![("item".to_string(), item)])
+    }
+
+    /// A `_meta.muse.subagent` member as JSON text, empty when absent.
+    fn subagent_meta(update: &J, key: &str) -> String {
+        update
+            .get("_meta")
+            .and_then(|m| m.get("muse"))
+            .and_then(|m| m.get("subagent"))
+            .and_then(|s| s.get(key))
+            .map(j_to_string)
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_subagent_result_after_the_drain_takes_the_delivered_line_back() {
+        // Muse 1.4.15: a client that knows `subagentResult` draws one
+        // Finished member per consumed result from those items, not from
+        // `result.drained` (#470). The drain reached the card first, so the
+        // card is re-sent once without the line when the result item comes.
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &reviewer("inProgress", None), &mut out);
+        fold.on_item_snapshot("sid", 2, &reviewer("inProgress", Some(CONSUMED)), &mut out);
+        let drained = updates(&out).pop().unwrap();
+        assert_eq!(
+            card_text(&drained),
+            "No issues found.\nDelivered to the parent agent."
+        );
+
+        out.clear();
+        fold.on_item_completed("sid", 2, &consumed("r-1", "subagent-1"), &mut out);
+        let sent = updates(&out);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert_eq!(field(&sent[0], "toolCallId"), Some("subagent-sa-1"));
+        assert_eq!(field(&sent[0], "status"), Some("in_progress"));
+        assert_eq!(
+            field(&sent[0], "title"),
+            Some("main/reviewer/1: review the diff")
+        );
+        assert_eq!(card_text(&sent[0]), "No issues found.");
+        assert_eq!(subagent_meta(&sent[0], "drained"), "true");
+        assert_eq!(subagent_meta(&sent[0], "controlStatus"), r#""resultReady""#);
+        assert_eq!(
+            field(&sent[1], "title"),
+            Some("Result from reviewer (completed)")
+        );
+        assert_eq!(card_text(&sent[1]), "No issues found.");
+
+        // Later snapshots of the child stay without the line, and a second
+        // consumed result has nothing left to take back.
+        out.clear();
+        fold.on_item_completed(
+            "sid",
+            2,
+            &completed(reviewer("completed", Some(CONSUMED))),
+            &mut out,
+        );
+        let settled = updates(&out);
+        assert_eq!(settled.len(), 1, "{settled:?}");
+        assert_eq!(field(&settled[0], "status"), Some("completed"));
+        assert_eq!(card_text(&settled[0]), "No issues found.");
+        assert_eq!(subagent_meta(&settled[0], "drained"), "true");
+        out.clear();
+        fold.on_item_completed("sid", 2, &consumed("r-2", "subagent-1"), &mut out);
+        let sent = updates(&out);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(field(&sent[0], "toolCallId"), Some("item-r-2"));
+    }
+
+    #[test]
+    fn a_subagent_result_before_the_drain_keeps_the_line_off_the_card() {
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &reviewer("inProgress", None), &mut out);
+        out.clear();
+        // The result item comes first: only its own card is sent.
+        fold.on_item_completed("sid", 2, &consumed("r-1", "subagent-1"), &mut out);
+        let sent = updates(&out);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert_eq!(
+            field(&sent[0], "title"),
+            Some("Result from reviewer (completed)")
+        );
+
+        out.clear();
+        fold.on_item_snapshot("sid", 2, &reviewer("inProgress", Some(CONSUMED)), &mut out);
+        fold.on_item_completed(
+            "sid",
+            2,
+            &completed(reviewer("completed", Some(CONSUMED))),
+            &mut out,
+        );
+        let sent = updates(&out);
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        for update in &sent {
+            assert_eq!(field(update, "toolCallId"), Some("subagent-sa-1"));
+            assert_eq!(card_text(update), "No issues found.");
+            assert_eq!(subagent_meta(update, "drained"), "true");
+        }
+    }
+
+    #[test]
+    fn a_child_without_a_subagent_result_keeps_the_delivered_line() {
+        // A host before Muse 1.4.15, or a replayed history without the kind,
+        // sends no result item for the child: the flag still draws the line.
+        // Another child's result item, or one that names no child, changes
+        // nothing for it.
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.on_item_snapshot("sid", 2, &reviewer("inProgress", Some(CONSUMED)), &mut out);
+        out.clear();
+        fold.on_item_completed("sid", 2, &consumed("r-1", "subagent-2"), &mut out);
+        fold.on_item_completed(
+            "sid",
+            2,
+            &parse_json(
+                r#"{"item":{"itemId":"r-2","kind":"subagentResult","status":"completed","resultStatus":"completed","text":"Done."}}"#,
+            )
+            .unwrap(),
+            &mut out,
+        );
+        let sent = updates(&out);
+        assert_eq!(sent.len(), 2, "only the two result cards: {sent:?}");
+        assert!(
+            sent.iter()
+                .all(|update| field(update, "toolCallId") != Some("subagent-sa-1")),
+            "{sent:?}"
+        );
+
+        out.clear();
+        fold.on_item_completed(
+            "sid",
+            2,
+            &completed(reviewer("completed", Some(CONSUMED))),
+            &mut out,
+        );
+        let settled = updates(&out).pop().unwrap();
+        assert_eq!(
+            card_text(&settled),
+            "No issues found.\nDelivered to the parent agent."
+        );
+        assert_eq!(subagent_meta(&settled, "drained"), "true");
+    }
+
+    #[test]
+    fn a_superseded_result_keeps_its_own_line_when_the_delivered_line_goes() {
+        // Muse 1.4.18: the drained result stays on the item, marked
+        // superseded, once a newer attempt starts. The result item takes only
+        // the delivered line; the superseded line and both flags stay.
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        let stale = r#"{"summary":"No issues found.","artifactRefs":[],"evidenceRefs":[],"drained":true,"superseded":true}"#;
+        fold.on_item_snapshot("sid", 2, &reviewer("inProgress", Some(stale)), &mut out);
+        assert_eq!(
+            card_text(&updates(&out)[0]),
+            "No issues found.\nDelivered to the parent agent.\nA newer attempt has started since this result."
+        );
+
+        out.clear();
+        fold.on_item_completed("sid", 2, &consumed("r-1", "subagent-1"), &mut out);
+        let resent = &updates(&out)[0];
+        assert_eq!(field(resent, "toolCallId"), Some("subagent-sa-1"));
+        assert_eq!(
+            card_text(resent),
+            "No issues found.\nA newer attempt has started since this result."
+        );
+        assert_eq!(subagent_meta(resent, "drained"), "true");
+        assert_eq!(subagent_meta(resent, "superseded"), "true");
+
+        // The newer attempt's result replaces the whole result. Once it
+        // drains, its own result item stands for it, not the card.
+        out.clear();
+        let newer = r#"{"summary":"Two nits.","artifactRefs":[],"evidenceRefs":[]}"#;
+        fold.on_item_snapshot("sid", 2, &reviewer("inProgress", Some(newer)), &mut out);
+        let newer_drained =
+            r#"{"summary":"Two nits.","artifactRefs":[],"evidenceRefs":[],"drained":true}"#;
+        fold.on_item_snapshot(
+            "sid",
+            2,
+            &reviewer("inProgress", Some(newer_drained)),
+            &mut out,
+        );
+        fold.on_item_completed("sid", 2, &consumed("r-2", "subagent-1"), &mut out);
+        let sent = updates(&out);
+        assert_eq!(sent.len(), 3, "{sent:?}");
+        assert_eq!(card_text(&sent[0]), "Two nits.");
+        assert_eq!(subagent_meta(&sent[0], "superseded"), "");
+        assert_eq!(card_text(&sent[1]), "Two nits.");
+        assert_eq!(subagent_meta(&sent[1], "drained"), "true");
+        assert_eq!(field(&sent[2], "toolCallId"), Some("item-r-2"));
+    }
+
+    #[test]
+    fn a_card_whose_only_text_was_the_delivered_line_is_cleared() {
+        // ACP replaces a card's content wholesale, so the re-send must clear
+        // the line rather than omit `content`.
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        let bare = parse_json(
+            r#"{"itemId":"sa-1","kind":"subagent","status":"inProgress","subagentId":"subagent-1","agentPath":"main/reviewer/1","result":{"artifactRefs":[],"evidenceRefs":[],"drained":true}}"#,
+        )
+        .unwrap();
+        fold.on_item_snapshot("sid", 1, &bare, &mut out);
+        assert_eq!(
+            card_text(&updates(&out)[0]),
+            "Delivered to the parent agent."
+        );
+        out.clear();
+        fold.on_item_completed("sid", 1, &consumed("r-1", "subagent-1"), &mut out);
+        let resent = &updates(&out)[0];
+        assert_eq!(field(resent, "sessionUpdate"), Some("tool_call_update"));
+        assert_eq!(field(resent, "toolCallId"), Some("subagent-sa-1"));
+        assert_eq!(
+            resent.get("content").map(j_to_string).as_deref(),
+            Some("[]")
+        );
+        assert_eq!(subagent_meta(resent, "drained"), "true");
+    }
+
     #[test]
     fn monitor_inbox_counts_ride_the_monitor_card_latest_wins() {
         let mut fold = SessionFold::new();
@@ -7382,6 +7786,62 @@ mod replay_tests {
     }
 
     #[test]
+    fn replay_draws_the_delivered_line_only_for_a_child_without_a_result_item() {
+        // A history batch serves each child at its latest state beside its
+        // `subagentResult` items, so a card replays without the line from the
+        // start rather than sending it and taking it back. A child the batch
+        // holds no result item for keeps the line (#470). The shapes are
+        // hand-written from the stable schema (#469).
+        let items: Vec<J> = [
+            r#"{"itemId":"sa-1","kind":"subagent","status":"completed","subagentId":"subagent-1","agentPath":"main/reviewer/1","role":"reviewer","objective":"review the diff","controlStatus":"resultReady","result":{"summary":"No issues found.","artifactRefs":[],"evidenceRefs":[],"drained":true},"turnId":"t-1"}"#,
+            r#"{"itemId":"sa-2","kind":"subagent","status":"completed","subagentId":"subagent-2","agentPath":"main/helper/1","objective":"check the docs","controlStatus":"resultReady","result":{"summary":"Docs are current.","artifactRefs":[],"evidenceRefs":[],"drained":true},"turnId":"t-1"}"#,
+            r#"{"itemId":"r-1","kind":"subagentResult","status":"completed","subagentId":"subagent-1","resultStatus":"completed","text":"No issues found.","turnId":"t-1"}"#,
+        ]
+        .iter()
+        .map(|raw| parse_json(raw).unwrap())
+        .collect();
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        fold.replay_history_items("sid", 2, &items, &mut out);
+        let cards = framed_cards(&out);
+        assert_eq!(cards.len(), 3, "one frame per item: {cards:?}");
+        assert_eq!(cards[0].0, "main/reviewer/1: review the diff");
+        assert!(cards[0].1.contains(r#""drained":true"#), "{cards:?}");
+        assert_eq!(
+            cards[0].2,
+            r#"[{"type":"content","content":{"type":"text","text":"No issues found."}}]"#
+        );
+        assert!(
+            cards[1]
+                .2
+                .contains(r#""text":"Docs are current.\nDelivered to the parent agent.""#),
+            "{cards:?}"
+        );
+        assert_eq!(cards[2].0, "Result from reviewer (completed)");
+
+        // A fold that already showed the line (a gap refill, or a re-attach
+        // into the live fold) re-sends that card once, without it.
+        let mut live = SessionFold::new();
+        let mut out = Vec::new();
+        live.on_item_completed("sid", 2, &wrap(&items[0]), &mut out);
+        assert!(
+            framed_cards(&out)[0]
+                .2
+                .contains(r#""text":"No issues found.\nDelivered to the parent agent.""#),
+            "{out:?}"
+        );
+        out.clear();
+        live.replay_history_items("sid", 2, &items, &mut out);
+        let cards = framed_cards(&out);
+        assert_eq!(cards.len(), 3, "{cards:?}");
+        assert_eq!(cards[0].0, "main/reviewer/1: review the diff");
+        assert!(!cards[0].2.contains("Delivered"), "{cards:?}");
+        assert!(cards[0].1.contains(r#""drained":true"#), "{cards:?}");
+        assert_eq!(cards[1].0, "main/helper/1: check the docs");
+        assert_eq!(cards[2].0, "Result from reviewer (completed)");
+    }
+
+    #[test]
     fn replay_keeps_silent_kinds_silent() {
         let settled = parse_json(
             r#"{"itemId":"it-rem","kind":"reminderChild","status":"completed","reminderAgentId":"agent-1"}"#,
@@ -7541,6 +8001,42 @@ mod anchor_tests {
             vec!["reminder-rem".to_string(), "c1".to_string()],
             "the monitor row renders after the anchor's rows: {out:?}"
         );
+    }
+
+    #[test]
+    fn a_waiting_drained_subagent_applies_the_delivered_line_rule_when_released() {
+        // Muse sets `terminalRowAfterItemId` on a subagent whose result
+        // drained, so its terminal row waits for the anchor. A result item
+        // that arrives meanwhile already stands for the consumed result, so
+        // the released card has no delivered line (#470).
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        let drained = parse_json(
+            r#"{"itemId":"sa-1","kind":"subagent","status":"completed","subagentId":"subagent-1","agentPath":"main/reviewer/1","objective":"review the diff","result":{"summary":"No issues found.","artifactRefs":[],"evidenceRefs":[],"drained":true},"terminalRowAfterItemId":"msg-1"}"#,
+        )
+        .unwrap();
+        fold.on_item_completed("sid", 2, &wrap(&drained), &mut out);
+        assert!(out.is_empty(), "the row waits for its anchor: {out:?}");
+        let result = parse_json(
+            r#"{"itemId":"r-1","kind":"subagentResult","status":"completed","subagentId":"subagent-1","resultStatus":"completed","text":"No issues found."}"#,
+        )
+        .unwrap();
+        fold.on_item_completed("sid", 2, &wrap(&result), &mut out);
+        let anchor = parse_json(
+            r#"{"itemId":"msg-1","kind":"agentMessage","status":"completed","text":"Review done."}"#,
+        )
+        .unwrap();
+        fold.on_item_completed("sid", 2, &wrap(&anchor), &mut out);
+        assert_eq!(
+            order(&out),
+            vec!["item-r-1".to_string(), "subagent-sa-1".to_string()]
+        );
+        let released = out.last().unwrap().line();
+        assert!(
+            released.contains(r#""text":"No issues found.""#) && !released.contains("Delivered"),
+            "{released}"
+        );
+        assert!(released.contains(r#""drained":true"#), "{released}");
     }
 
     #[test]
