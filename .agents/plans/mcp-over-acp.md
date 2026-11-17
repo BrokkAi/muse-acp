@@ -24,8 +24,9 @@ The work stopped before implementation because of what the research found: the A
 - [x] (2026-11-17 09:40Z) Confirmed the adapter compiles with the SDK's `unstable_mcp_over_acp` feature turned on (`cargo check --locked -p muse-acp --features agent-client-protocol/unstable_mcp_over_acp`), so the SDK can carry the ACP side.
 - [x] (2026-11-17 09:45Z) Probed the local Muse (1.4.23-R8977.1; it self-updated from 1.4.18-R8587.1 earlier the same morning) through the built adapter with a scratch HTTP MCP server, once answering as a legacy server and once as a modern-only server.
 - [x] (2026-11-17 10:10Z) Wrote this plan and stopped. No source, test, or documentation file other than this plan was changed.
-- [ ] Maintainer decision between the options in the Decision Log (legacy gateway, conforming re-export once Muse ships a modern MCP client, or leave #317 blocked upstream).
-- [ ] Milestones 1 to 5 of the Plan of Work, for the chosen option.
+- [x] (2026-11-17) Re-checked against the newest releases: `agent-client-protocol` 5.3.0, schema 1.18.0, and polyfill 5.3.0 are the latest on crates.io; the RFD file `docs/rfds/mcp-over-acp.mdx` last changed on 2026-09-30 (#2265); Muse 1.4.23-R8977.1 is the newest build. Ran two more Muse probes (see Surprises).
+- [x] (2026-11-17) Maintainer decision: stay on the ACP design (option B). #317 stays open and parked until Muse's MCP client speaks MCP 2026-07-28 (modern or dual-era).
+- [ ] Milestones 1 to 5 of the Plan of Work, without the legacy layer, once a Muse build passes the modern-only probe.
 
 
 ## Surprises & Discoveries
@@ -83,6 +84,12 @@ The work stopped before implementation because of what the research found: the A
 
 - Observation: the Muse binary on this machine is 1.4.23-R8977.1, not the 1.4.18 the task assumed; it self-updated at 10:15 local time on 2026-11-17 (`~/.local/bin/.muse-update-notice` reads `1.4.18-R8587.1 1.4.23-R8977.1`). Its MSP schema fingerprint is not in `src/compat.rs`. The binary contains MCP 2026-07-28 type names (`server/discover`, `io.modelcontextprotocol/protocolVersion`, `input_required`), but the session-MCP client the probe exercised still behaves as a 2025-06-18 client.
 
+- Observation: the strictness comes from the ACP binding, not from MCP. MCP 2026-07-28 itself allows a "dual-era" server that answers a legacy `initialize` and serves modern per-request calls on the same endpoint ("Legacy | Dual-era | Works"), and it tells dual-era clients how to detect a server's era over Streamable HTTP. The ACP RFD deliberately narrows its own binding to 2026-07-28 and says the HTTP re-export "must not add a legacy fallback"; its "Native-tool re-export" section describes the same loopback, bearer-per-server endpoint this adapter would build.
+  Evidence: https://modelcontextprotocol.io/specification/2026-07-28/basic/lifecycle, section "Backward Compatibility with Initialization-Based Versions" and its compatibility matrix; the RFD on `main` (`docs/rfds/mcp-over-acp.mdx`), sections "Proxying and HTTP adaptation" and "Native-tool re-export".
+
+- Observation: no Muse setting switches its MCP client to the modern revision, and Muse's own ACP agent does not offer MCP-over-ACP either.
+  Evidence: with an MCP server configured in Muse's `settings.json` as `{"type":"http","url":...,"protocolVersion":"2026-07-28"}` (no ACP-supplied server), Muse 1.4.23-R8977.1 still sent only `initialize` with `mcp-protocol-version: 2025-06-18` to a modern-only server and ran the turn without the tool. `muse mcp add-json` accepts any unknown key (a `bogusKey` entry was saved too), so the key being accepted proves nothing. `muse acp` answers ACP v1 `initialize` with `"mcpCapabilities":{"http":true,"sse":false}`, with no `acp` member.
+
 
 ## Decision Log
 
@@ -109,6 +116,10 @@ The work stopped before implementation because of what the research found: the A
 
   Rationale: see the Surprises above. Option B costs nothing now and avoids building on a deviation; option A delivers the feature at the price of a documented divergence from the protocol design.
   Date/Author: 2026-11-17, Claude.
+
+- Decision: option B. Stay on the ACP design; ship nothing for #317 until Muse's session MCP client speaks MCP 2026-07-28 (modern, or dual-era with era detection). Do not build the legacy gateway.
+  Rationale: the maintainer chose to stay on spec after the re-check against the newest SDK, RFD, and Muse releases. The trigger to resume is a Muse build whose session MCP client, pointed at a modern-only server, sends a request with `params._meta["io.modelcontextprotocol/protocolVersion"]` (or `server/discover`) instead of `initialize`.
+  Date/Author: 2026-11-17, maintainer decision recorded by Claude.
 
 
 ## Outcomes & Retrospective
