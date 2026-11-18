@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.25.0
 
 - Adopt the Muse 1.4.23 stable surface. The vendored stable bundle and
   golden transcripts move to Muse SDK `5fc95e5`, whose bundle is
