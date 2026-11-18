@@ -869,6 +869,45 @@ fn the_host_sandbox_facts_are_recorded_from_a_real_handshake() {
     adapter.finish();
 }
 
+/// The real host's compatibility epoch reaches the `schema-compat` line.
+///
+/// Muse 1.4.23 added `schema.compatibilityEpoch` to the `initialize` reply;
+/// an older host omits it, which must log as absent rather than a guess.
+/// Every pin in the nightly matrix reports a recorded fingerprint, so each
+/// one classifies as tested whatever its epoch.
+#[test]
+fn the_host_compatibility_epoch_is_recorded_from_a_real_handshake() {
+    let test = "the_host_compatibility_epoch_is_recorded_from_a_real_handshake";
+    if !enabled(test) {
+        return;
+    }
+    let host = Host::start(json!({}), None);
+    let adapter = Adapter::launch(&host);
+    let (release, label) = adapter_host_release(&adapter);
+    let log = std::fs::read_to_string(&adapter.log).unwrap();
+    let prefix = format!("schema-compat adapter={} host=", env!("CARGO_PKG_VERSION"));
+    let line = log
+        .lines()
+        .find_map(|line| line.split(&prefix).nth(1))
+        .unwrap_or_else(|| panic!("no {prefix:?} line in:\n{log}"));
+    let epoch = line
+        .split(" compatibility_epoch=")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next())
+        .unwrap_or_else(|| panic!("no compatibility_epoch in {line:?}"));
+    if release < (1, 4, 23) {
+        assert_eq!(epoch, "absent", "{line}");
+    } else {
+        assert!(
+            epoch.parse::<u64>().is_ok(),
+            "a 1.4.23+ host reports its epoch: {line}"
+        );
+    }
+    assert!(line.contains(" status=tested "), "{line}");
+    eprintln!("{test}: {label} reports compatibility_epoch={epoch}");
+    adapter.finish();
+}
+
 /// `/rename` against a real host, across the `sessionRename` registry entry.
 ///
 /// The adapter requests `sessionRename` at `initialize` unconditionally

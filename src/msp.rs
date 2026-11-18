@@ -967,9 +967,10 @@ fn client_options(user_input_dialogs: bool, user_shell: bool, computer_use: bool
 
 /// The adapter's compatibility verdict for a handshake.
 fn compatibility(handshake: &Handshake) -> compat::Compatibility {
-    compat::classify(
+    compat::classify_served(
         handshake.schema_version,
         handshake.fingerprint.as_deref().unwrap_or("?"),
+        handshake.compatibility_epoch,
     )
 }
 

@@ -12,7 +12,9 @@
 //! session, read, resume, and snapshot additions, and the 1.4.18 re-pin's
 //! body completion, Bash Title, superseded result, notice origin, error
 //! kinds, stop refusal, experimental fingerprint, developer prompt, and read
-//! additions, and the 1.4.20 re-pin's clear flag, join the same matrix),
+//! additions, the 1.4.20 re-pin's clear flag, and the 1.4.23 re-pin's
+//! browser notices, before-anchor, and compatibility epoch, join the same
+//! matrix),
 //! whether it earns an ACP mapping or an explicit "Intentionally ignored"
 //! disposition. This test keeps that matrix
 //! honest in two ways: every addition has exactly one disposition row in
@@ -149,6 +151,9 @@ const ADDITIONS: &[&str] = &[
     "SessionConfig.developerPrompt",
     "SessionReadResult.modelTurnRunning",
     "SessionStartParams.clear",
+    "ApprovalCuaCardFacts.browser",
+    "Item.terminalRowBeforeItemId",
+    "SchemaInfo.compatibilityEpoch",
 ];
 
 fn matrix() -> String {
@@ -448,6 +453,11 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("SessionConfig", "developerPrompt"),
         ("SessionReadResult", "modelTurnRunning"),
         ("SessionStartParams", "clear"),
+        ("ApprovalCuaCardFacts", "browser"),
+        ("ApprovalCuaBrowser", "firstUse"),
+        ("ApprovalCuaBrowser", "windowConsent"),
+        ("Item", "terminalRowBeforeItemId"),
+        ("SchemaInfo", "compatibilityEpoch"),
     ] {
         assert!(
             has_property(defs, def, member),

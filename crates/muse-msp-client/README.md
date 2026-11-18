@@ -112,7 +112,9 @@ notification. The default check refuses an envelope schema version other than
 for example to compare the schema fingerprint against builds you have tested.
 
 `Handshake` exposes the server name and version, the schema version and
-fingerprint, the granted capabilities (`granted("sessionMcp")`), the session
+fingerprint, the compatibility epoch (`compatibility_epoch`, Muse 1.4.23+:
+when the fingerprint differs from one you tested, an equal epoch means every
+difference is additive), the granted capabilities (`granted("sessionMcp")`), the session
 durability (`session_durability()`: absent reads as durable, an unknown value
 is not durable), the sandbox facts, `release()`/`at_least()` for version
 gates, and the complete `initialize` result for anything else.

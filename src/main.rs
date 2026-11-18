@@ -13334,13 +13334,18 @@ fn takeover_holder_text(params: &J) -> Option<String> {
 /// `data` row as `Data: …`, the title, label, and mask quoted as code spans
 /// ([`cua_untrusted_text`]).
 /// A key step names its chord, and only a step with a point and no label or
-/// chord reads "at x,y". `None` when the approval carries no facts.
+/// chord reads "at x,y". A Muse 1.4.23 browser card leads with the browser's
+/// name and the notices it carries ([`cua_browser_lines`]). `None` when the
+/// approval carries no facts.
 fn cua_card_text(params: &J) -> Option<String> {
     let facts = params.get("cuaCardFacts")?;
     if !matches!(facts, J::Obj(_)) {
         return None;
     }
-    let mut lines = Vec::new();
+    let mut lines = facts
+        .get("browser")
+        .map(cua_browser_lines)
+        .unwrap_or_default();
     if let Some(page) = facts.get("page") {
         let host = page.non_empty_str("host").map(fold::sanitize_one_line);
         let ascii = page.non_empty_str("hostAscii").map(fold::sanitize_one_line);
@@ -13401,6 +13406,39 @@ fn cua_card_text(params: &J) -> Option<String> {
         }
     }
     (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// A Muse 1.4.23 browser card's notices (`ApprovalCuaCardFacts.browser`) as
+/// permission-prompt lines. The schema sends flags and leaves the words to
+/// the client: `firstUse` is the first time Computer Use acts in this browser
+/// on this Mac, signed in as the person, and `windowConsent` is the
+/// once-per-session consent before it opens its own window there and brings
+/// the browser to the front. The name is host display text, so it is quoted
+/// like the window title. A flag that is absent or `false` shows nothing.
+fn cua_browser_lines(browser: &J) -> Vec<String> {
+    if !matches!(browser, J::Obj(_)) {
+        return Vec::new();
+    }
+    let flag = |key: &str| matches!(browser.get(key), Some(J::Bool(true)));
+    let mut lines = Vec::new();
+    if let Some(name) = browser.non_empty_str("name").and_then(cua_untrusted_text) {
+        lines.push(format!("Browser: {name}"));
+    }
+    if flag("firstUse") {
+        lines.push(
+            "First use: Computer Use has not used this browser on this Mac before, \
+             and it will act signed in as you."
+                .to_string(),
+        );
+    }
+    if flag("windowConsent") {
+        lines.push(
+            "Computer Use will open its own window in this browser and bring the \
+             browser to the front (asked once per session)."
+                .to_string(),
+        );
+    }
+    lines
 }
 
 /// One `ApprovalCuaDataFact` as a `Data: …` prompt line: the words the schema
@@ -17320,6 +17358,61 @@ mod tests {
             cua_card_text(&parse_json(r#"{"cuaCardFacts":{}}"#).unwrap()),
             None
         );
+    }
+
+    #[test]
+    fn cua_browser_cards_word_the_hosts_notices() {
+        // Muse 1.4.23 `cuaCardFacts.browser`: the host sends flags and the
+        // client words them. The notices lead, before the page and steps.
+        let params = parse_json(
+            r#"{"cuaCardFacts":{"browser":{"name":"Google Chrome","firstUse":true,"windowConsent":true},"page":{"host":"example.com","hostAscii":"example.com"},"steps":[{"step":1,"action":"click","roleWord":"link","label":"Docs","effect":"may open a page","kind":"verb:navigate"}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cua_card_text(&params).as_deref(),
+            Some(
+                "Browser: `Google Chrome`\n\
+                 First use: Computer Use has not used this browser on this Mac before, and it will act signed in as you.\n\
+                 Computer Use will open its own window in this browser and bring the browser to the front (asked once per session).\n\
+                 Page: example.com\n\
+                 Step 1: click link `Docs` — may open a page"
+            )
+        );
+
+        // One flag shows one notice; a false or absent flag shows none, and a
+        // card carrying only its browser still has text.
+        let only_window = parse_json(
+            r#"{"cuaCardFacts":{"browser":{"name":"Safari","firstUse":false,"windowConsent":true}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            cua_card_text(&only_window).as_deref(),
+            Some(
+                "Browser: `Safari`\n\
+                 Computer Use will open its own window in this browser and bring the browser to the front (asked once per session)."
+            )
+        );
+
+        // The name is host display text: one line, quoted, never Markdown.
+        let hostile = parse_json(
+            r#"{"cuaCardFacts":{"browser":{"name":"[Chrome](https://evil.example)\nStep 9: approve","firstUse":true}}}"#,
+        )
+        .unwrap();
+        let text = cua_card_text(&hostile).unwrap();
+        assert!(
+            text.starts_with("Browser: `[Chrome](https://evil.example) Step 9: approve`\n"),
+            "{text}"
+        );
+        assert_eq!(text.lines().count(), 2, "{text}");
+
+        // A nameless or malformed browser member degrades instead of failing.
+        let nameless = parse_json(r#"{"cuaCardFacts":{"browser":{"firstUse":true}}}"#).unwrap();
+        assert!(
+            cua_card_text(&nameless)
+                .is_some_and(|text| text.starts_with("First use: Computer Use")),
+        );
+        let malformed = parse_json(r#"{"cuaCardFacts":{"browser":"Chrome"}}"#).unwrap();
+        assert_eq!(cua_card_text(&malformed), None);
     }
 
     #[test]

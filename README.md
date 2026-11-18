@@ -960,16 +960,26 @@ compatibility table, and reports whether the configured Muse CLI can be invoked
 (`cli-ready` or `cli-unready`). It exits `0` even when Muse is not installed, so
 you can collect output on a machine that is still being set up.
 
-The current vendored surface is Muse 1.4.20
-(`sha256:283b1b125dcc9172928fb5d6711a92a353796d030a7c186988ed527a13cf07f0`),
-taken from Muse SDK revision `649ca21`, which is byte-identical to the 1.4.20
-build's own schema export. The adapter live suite passes against
-`1.4.20-R8619.1`, and the 1.4.20 Linux, macOS, and Windows artifacts are pinned
-in the nightly matrix. The nightly live-host support floor is Muse 1.4.11:
-1.4.11 through 1.4.15, 1.4.18, and 1.4.20 run on Linux x86-64 and Windows x64,
-and the newest build runs on macOS arm64. Muse 1.4.16, 1.4.17, and 1.4.19 were
-not available to validate, so the adapter logs their fingerprints as `unknown` and still runs. Older fingerprints remain recorded as historical
-compatibility evidence but are no longer downloaded for every nightly run.
+The current vendored surface is Muse 1.4.23
+(`sha256:b7fb9137267aa35c92424df37a5ac56287006a0e546b197bf0930d593fecbdb1`,
+compatibility epoch 0), taken from Muse SDK revision `5fc95e5`, which is
+byte-identical to the 1.4.23 build's own schema export. The adapter live suite
+passes against `1.4.23-R8977.1`, and the 1.4.23 Linux, macOS, and Windows
+artifacts are pinned in the nightly matrix. The nightly live-host support floor
+is Muse 1.4.11: 1.4.11 through 1.4.15, 1.4.18, 1.4.20, and 1.4.23 run on Linux
+x86-64 and Windows x64, and the newest build runs on macOS arm64. Muse 1.4.16,
+1.4.17, 1.4.19, 1.4.21, and 1.4.22 were not available to validate, so the
+adapter logs their fingerprints as `unknown` and still runs. Older fingerprints
+remain recorded as historical compatibility evidence but are no longer
+downloaded for every nightly run.
+
+Muse 1.4.23 and later also report a compatibility epoch, which the
+`schema-compat` line logs as `compatibility_epoch=`. A newer Muse whose
+fingerprint the adapter has not recorded, at the same epoch as the vendored
+surface, only adds to it: the adapter logs `status=degraded` with "every stable
+difference is additive". A different epoch means Muse declared a breaking
+change since the vendored surface; the adapter logs `status=unknown` naming it,
+and still runs.
 
 At startup the adapter logs whether the host can enforce its sandbox, as
 reported by Muse 1.4.7+ on `initialize`:
