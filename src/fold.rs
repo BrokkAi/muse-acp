@@ -3098,6 +3098,12 @@ impl SessionFold {
     /// soon as its snapshot registers, because a started anchor's rows
     /// already exist — the replay of the live path, where such an anchor
     /// was never deferred at all.
+    ///
+    /// The batch is replayed in [`Self::before_anchor_order`]: an item the
+    /// host asks to render before an earlier item (Muse 1.4.23
+    /// `Item.terminalRowBeforeItemId`) is moved in front of it. A moved item
+    /// does not open or close a turn: it renders inside the region it was
+    /// moved into.
     pub fn replay_history_items(
         &mut self,
         acp_sid: &str,
@@ -3120,9 +3126,10 @@ impl SessionFold {
             }
         }
         let mut turn: Option<String> = None;
-        for item in items {
+        for (index, moved) in Self::before_anchor_order(items) {
+            let item = &items[index];
             let item_turn = item.get("turnId").and_then(J::as_str).map(str::to_string);
-            if item_turn.is_some() && item_turn != turn {
+            if !moved && item_turn.is_some() && item_turn != turn {
                 self.flush_awaiting_anchor_unless(acp_sid, ver, out, |anchor| {
                     upcoming.contains_key(anchor)
                 });
@@ -3259,6 +3266,80 @@ impl SessionFold {
                     .and_then(J::as_str)
                     .filter(|anchor| !anchor.is_empty())
             })
+    }
+
+    /// The item whose rows this item's row renders before (Muse 1.4.23
+    /// `Item.terminalRowBeforeItemId`, set on a `backgroundTerminalCompletion`
+    /// or a terminal `toolCall` that already shows a Finished row). `None`
+    /// when absent, empty, or the item itself.
+    fn row_before_anchor(item: &J) -> Option<&str> {
+        let anchor = item
+            .get("terminalRowBeforeItemId")
+            .and_then(J::as_str)
+            .filter(|anchor| !anchor.is_empty())?;
+        let own = item.get("itemId").and_then(J::as_str);
+        (own != Some(anchor)).then_some(anchor)
+    }
+
+    /// The order to replay a history batch in, as `(index, moved)` pairs
+    /// covering every index once. An item whose before-anchor
+    /// ([`Self::row_before_anchor`]) is an earlier item of the batch is moved
+    /// directly in front of that item's first occurrence; items moved in
+    /// front of the same item keep their batch order, and an item moved in
+    /// front of a moved item travels with it. An anchor later in the batch
+    /// already holds, and one the batch does not carry cannot be honored, so
+    /// both leave the item where it is.
+    ///
+    /// Only replay reorders. A live row arrives after the rows already on the
+    /// editor's screen, and ACP can only append, so a live before-anchor whose
+    /// target has rendered cannot be honored, and one whose target has not
+    /// rendered yet already holds. A row also held for an after-anchor
+    /// (`terminalRowAfterItemId`) still waits for it, in replay as live.
+    ///
+    /// The host's "coalesced region" is the TUI's grouping of adjacent rows;
+    /// the adapter gives each item its own card, so the region is the target
+    /// item's card.
+    fn before_anchor_order(items: &[J]) -> Vec<(usize, bool)> {
+        let mut first: HashMap<&str, usize> = HashMap::new();
+        for (index, item) in items.iter().enumerate() {
+            if let Some(id) = item.get("itemId").and_then(J::as_str) {
+                first.entry(id).or_insert(index);
+            }
+        }
+        let mut movers: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut moved = vec![false; items.len()];
+        for (index, item) in items.iter().enumerate() {
+            let Some(anchor) = Self::row_before_anchor(item) else {
+                continue;
+            };
+            if let Some(&target) = first.get(anchor)
+                && target < index
+            {
+                movers.entry(target).or_default().push(index);
+                moved[index] = true;
+            }
+        }
+        let mut order = Vec::with_capacity(items.len());
+        // Each mover's target has a strictly smaller index, so the walk ends
+        // and places every item exactly once; it keeps its own stack because
+        // a hostile history could chain anchors arbitrarily deep.
+        for root in (0..items.len()).filter(|index| !moved[*index]) {
+            let mut stack = vec![(root, 0usize)];
+            while let Some(top) = stack.last_mut() {
+                let (node, next) = *top;
+                match movers.get(&node).and_then(|list| list.get(next)) {
+                    Some(&mover) => {
+                        top.1 += 1;
+                        stack.push((mover, 0));
+                    }
+                    None => {
+                        order.push((node, moved[node]));
+                        stack.pop();
+                    }
+                }
+            }
+        }
+        order
     }
 
     fn monitor_feed_card(
@@ -7690,6 +7771,124 @@ mod anchor_tests {
             order(&out),
             vec!["c1".to_string(), "c2".to_string()],
             "the held row flushes at its own turn's end: {out:?}"
+        );
+    }
+
+    fn bash(id: &str, call: &str, turn: &str, before: Option<&str>) -> J {
+        let before = before
+            .map(|anchor| format!(r#","terminalRowBeforeItemId":"{anchor}""#))
+            .unwrap_or_default();
+        parse_json(&format!(
+            r#"{{"itemId":"{id}","kind":"toolCall","tool":"bash","callId":"{call}","status":"completed","visibleOutput":"out","turnId":"{turn}"{before},"args":{{"command":"ls"}}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_replayed_row_renders_before_the_earlier_item_the_host_names() {
+        // Muse 1.4.23 `Item.terminalRowBeforeItemId`: a background terminal's
+        // Finished row logged after the rows it belongs in front of.
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        let completion = parse_json(
+            r#"{"itemId":"btc","kind":"backgroundTerminalCompletion","status":"completed","turnId":"t2","terminalRowBeforeItemId":"b","backgroundTerminalCompletion":{"command":"make","output":"built","outputTruncated":false,"terminalStatus":"completed","toolCallId":"call-bg"}}"#,
+        )
+        .unwrap();
+        let items = [
+            bash("a", "c-a", "t1", None),
+            bash("b", "c-b", "t2", None),
+            bash("c", "c-c", "t2", None),
+            completion,
+        ];
+        fold.replay_history_items("sid", 1, &items, &mut out);
+        let order = order(&out);
+        let at = |id: &str| order.iter().position(|x| x == id);
+        let finished = order
+            .iter()
+            .position(|x| !["c-a", "c-b", "c-c"].contains(&x.as_str()))
+            .expect("the completion renders a card");
+        assert!(
+            at("c-a") < Some(finished) && Some(finished) < at("c-b") && at("c-b") < at("c-c"),
+            "the Finished row lands in front of the item it names: {order:?}"
+        );
+    }
+
+    #[test]
+    fn before_anchors_keep_batch_order_and_travel_with_moved_rows() {
+        let items = [
+            bash("a", "c-a", "t1", None),
+            bash("b", "c-b", "t1", None),
+            // Two rows in front of `b`, in batch order.
+            bash("x", "c-x", "t1", Some("b")),
+            bash("y", "c-y", "t1", Some("b")),
+            // In front of `x`, so it travels with `x`.
+            bash("z", "c-z", "t1", Some("x")),
+            // Already in front of its anchor, which comes later.
+            bash("w", "c-w", "t1", Some("v")),
+            bash("v", "c-v", "t1", None),
+            // Missing anchors and self-anchors leave a row in place.
+            bash("m", "c-m", "t1", Some("ghost")),
+            bash("s", "c-s", "t1", Some("s")),
+        ];
+        let ids: Vec<&str> = SessionFold::before_anchor_order(&items)
+            .into_iter()
+            .map(|(index, _)| items[index].get("itemId").and_then(J::as_str).unwrap())
+            .collect();
+        assert_eq!(ids, ["a", "z", "x", "y", "b", "w", "v", "m", "s"]);
+        let moved: Vec<usize> = SessionFold::before_anchor_order(&items)
+            .into_iter()
+            .filter(|(_, moved)| *moved)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(moved, [4, 2, 3]);
+
+        // A batch with no before-anchor is replayed exactly as sent.
+        let plain = [bash("a", "c-a", "t1", None), bash("b", "c-b", "t2", None)];
+        assert_eq!(
+            SessionFold::before_anchor_order(&plain),
+            [(0, false), (1, false)]
+        );
+    }
+
+    #[test]
+    fn a_deep_before_anchor_chain_does_not_recurse() {
+        // Each row names the one before it, so the whole batch reverses; the
+        // walk keeps its own stack, so a hostile history cannot overflow ours.
+        let items: Vec<J> = (0..20_000)
+            .map(|n| {
+                let before = (n > 0).then(|| format!("i{}", n - 1));
+                bash(&format!("i{n}"), &format!("c{n}"), "t1", before.as_deref())
+            })
+            .collect();
+        let order = SessionFold::before_anchor_order(&items);
+        assert_eq!(order.len(), items.len());
+        assert_eq!(order.first(), Some(&(items.len() - 1, true)));
+        assert_eq!(order.last(), Some(&(0, false)));
+    }
+
+    #[test]
+    fn a_moved_row_does_not_end_the_turn_it_is_moved_into() {
+        // A row held for an after-anchor the batch never carries flushes at
+        // the end of its own turn. A row moved into that turn from a later
+        // one must not end the turn early and flush it in front of itself.
+        let mut fold = SessionFold::new();
+        let mut out = Vec::new();
+        let held = parse_json(
+            r#"{"itemId":"mon","kind":"toolCall","tool":"monitor","callId":"c-mon","status":"completed","visibleOutput":"tick","terminalRowAfterItemId":"ghost","turnId":"t1","args":{"description":"Watch the build"}}"#,
+        )
+        .unwrap();
+        let items = [
+            bash("a", "c-a", "t1", None),
+            held,
+            bash("b", "c-b", "t1", None),
+            bash("late", "c-late", "t2", Some("b")),
+            bash("c", "c-c", "t2", None),
+        ];
+        fold.replay_history_items("sid", 1, &items, &mut out);
+        assert_eq!(
+            order(&out),
+            ["c-a", "c-late", "c-b", "c-mon", "c-c"],
+            "the held row still flushes where turn t1 ends: {out:?}"
         );
     }
 

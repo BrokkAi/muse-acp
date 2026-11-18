@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+- Adopt the Muse 1.4.23 stable surface. The vendored stable bundle and
+  golden transcripts move to Muse SDK `5fc95e5`, whose bundle is
+  byte-identical to the 1.4.23-R8977.1 build's own export; its fingerprint
+  classifies as tested, and the nightly matrix runs the 1.4.23 builds on
+  Linux, macOS, and Windows. The 1.4.20 fingerprint stays tested. No 1.4.21
+  or 1.4.22 build was available to validate.
+- Read the compatibility epoch Muse 1.4.23+ reports at `initialize`. The
+  `schema-compat` line now logs `compatibility_epoch=`. A Muse whose
+  fingerprint the adapter has not recorded, at the vendored surface's epoch,
+  differs from it only additively and logs `status=degraded` instead of
+  `unknown`; one at another epoch stays `unknown` and the detail names the
+  declared breaking change. Neither blocks the host. The MSP client crate's
+  `Handshake` gains `compatibility_epoch`.
+- Word the notices on a Muse 1.4.23 Computer Use browser card in its
+  permission prompt: the browser's name, the first-use notice (Computer Use
+  has not used this browser on this Mac before and will act signed in as
+  you), and the once-per-session notice that it will open its own window
+  and bring the browser to the front.
+- History replay places a row the host asks to render before an earlier
+  item (Muse 1.4.23 `terminalRowBeforeItemId`, set on a background
+  terminal's Finished row) in front of that item's card.
+
 ## 0.24.0
 
 - Adopt the Muse 1.4.20 stable surface. The vendored stable bundle and

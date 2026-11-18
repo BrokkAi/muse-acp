@@ -224,7 +224,8 @@ Blocked-prompt recall: FAKE_BLOCKED_PROMPT=<text> adds Muse 1.4.12
 
 Computer-use approvals: FAKE_APPROVAL_SUBJECT=computer-use adds Muse 1.4.12
 `cuaCardFacts` (page, window title with Markdown link syntax, one labeled
-step) to the approval.
+step) to the approval. FAKE_APPROVAL_SUBJECT=computer-use-browser sends a
+Muse 1.4.23 browser card: `cuaCardFacts.browser` with both notices.
 
 Turn steering: `turn/steer` echoes `expectedTurnId` by default.
 FAKE_STEER_ABSORB_TURN=<id> answers with that turn instead, the way a host
@@ -319,12 +320,15 @@ FORK_ITEMS = []
 DELETED_SESSIONS = []
 
 # Compatibility-diagnostics knobs: the fixture defaults to the validated
-# host shape, but tests can present an unknown fingerprint or a future
-# envelope schema version.
+# host shape, but tests can present an unknown fingerprint, a future
+# envelope schema version, or a Muse 1.4.23 compatibility epoch (any JSON
+# value, so a test can also send a malformed one).
 if os.environ.get("FAKE_FINGERPRINT", ""):
     SCHEMA["fingerprint"] = os.environ["FAKE_FINGERPRINT"]
 if os.environ.get("FAKE_SCHEMA_VERSION", ""):
     SCHEMA["version"] = int(os.environ["FAKE_SCHEMA_VERSION"])
+if os.environ.get("FAKE_COMPATIBILITY_EPOCH", ""):
+    SCHEMA["compatibilityEpoch"] = json.loads(os.environ["FAKE_COMPATIBILITY_EPOCH"])
 
 APPROVAL_PARAMS = {
     "sessionId": MSP_SID, "approvalId": "ap-1", "toolCallId": "call-1",
@@ -370,6 +374,16 @@ if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "computer-use":
         "steps": [{"step": 1, "action": "click", "roleWord": "button",
                    "label": "Pay now", "effect": "may submit a payment",
                    "kind": "verb:submit"}],
+    }
+if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "computer-use-browser":
+    # Muse 1.4.23: a browser card carries its notices as flags for the
+    # client to word.
+    APPROVAL_PARAMS["toolName"] = "computer"
+    APPROVAL_PARAMS["subject"] = {"kind": "tool", "toolName": "computer"}
+    APPROVAL_PARAMS["cuaCardFacts"] = {
+        "browser": {"name": "Google Chrome", "firstUse": True,
+                    "windowConsent": True},
+        "page": {"host": "shop.example", "hostAscii": "shop.example"},
     }
 if os.environ.get("FAKE_APPROVAL_SUBJECT", "") == "computer-use-data":
     # Muse 1.4.13 adds `data`: the data the call would send. The mask never
