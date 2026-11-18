@@ -4,7 +4,10 @@
 //! adapter was built against and the one a live host reports is expected.
 //! Every launch classifies the handshake facts once and logs them in a
 //! machine-readable form; unknown fingerprints degrade loudly but do not
-//! block, while an unsupported envelope schema version fails closed.
+//! block, while an unsupported envelope schema version fails closed. Since
+//! Muse 1.4.23 a host also reports its compatibility epoch, which tells an
+//! additive surface the adapter has not seen apart from a declared breaking
+//! one; both still run.
 
 /// Envelope schema version this adapter understands (`InitializeResult.schema.version`).
 pub const SUPPORTED_SCHEMA_VERSION: u64 = 1;
@@ -227,16 +230,40 @@ pub const HOST_1418_FINGERPRINT: &str =
 /// 1.4.20-R8619.1 release manifest publishes it as `msp_schema_fingerprint`.
 /// Over 1.4.18 the only change is the optional `SessionStartParams.clear`
 /// flag; every table and every other definition is unchanged. The 1.4.19
-/// surface is unclassified: no build of it was available to validate.
+/// surface is unclassified: no build of it was available to validate. The
+/// vendored corpus has since moved to the 1.4.23 surface.
 pub const HOST_1420_FINGERPRINT: &str =
     "sha256:283b1b125dcc9172928fb5d6711a92a353796d030a7c186988ed527a13cf07f0";
 
+/// Stable-surface fingerprint of the Muse 1.4.23 surface (schema version 1).
+/// The SDK's `5fc95e5` pin (2026-11-17, "remirror: 1.4.23") publishes this
+/// surface, and the stable 1.4.23-R8977.1 build exports a byte-identical
+/// bundle. A live 1.4.23 handshake reports this digest and the official
+/// 1.4.23-R8977.1 release manifest publishes it as `msp_schema_fingerprint`.
+/// Over 1.4.20 the surface is purely additive and touches only definitions:
+/// the browser notices on a Computer Use card (`ApprovalCuaCardFacts.browser`),
+/// the `Item.terminalRowBeforeItemId` row anchor, and the handshake's
+/// `SchemaInfo.compatibilityEpoch`, which the bundle also records at its
+/// root. The method, notification, request, error, and capability tables are
+/// unchanged. The 1.4.21 and 1.4.22 surfaces are unclassified: no build of
+/// either was available to validate.
+pub const HOST_1423_FINGERPRINT: &str =
+    "sha256:b7fb9137267aa35c92424df37a5ac56287006a0e546b197bf0930d593fecbdb1";
+
 /// Fingerprint of the vendored stable surface (schema version 1), the Muse
-/// 1.4.20 surface of SDK `649ca21`. The constant aliases
-/// [`HOST_1420_FINGERPRINT`]: one table entry and one match arm cover both
+/// 1.4.23 surface of SDK `5fc95e5`. The constant aliases
+/// [`HOST_1423_FINGERPRINT`]: one table entry and one match arm cover both
 /// the corpus check in `corpus_tests` and the `sdk-manifest` row in
 /// [`selftest_lines`].
-pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_1420_FINGERPRINT;
+pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_1423_FINGERPRINT;
+
+/// Compatibility epoch of the vendored stable surface: the count of declared
+/// non-additive advances of the stable surface, recorded at the bundle's root
+/// (`compatibilityEpoch`) since Muse 1.4.23. A host that reports a
+/// fingerprint the table does not know but this epoch differs from the
+/// vendored surface only additively; a different epoch means a declared
+/// breaking change lies between them.
+pub const SDK_COMPATIBILITY_EPOCH: u64 = 0;
 
 /// SHA-256 of the vendored `tests/protocol/stable/msp.schema.json` bytes.
 /// Since SDK `07e1548` the manifest carries no fingerprint, so the corpus
@@ -244,7 +271,7 @@ pub const SDK_MANIFEST_FINGERPRINT: &str = HOST_1420_FINGERPRINT;
 /// [`SDK_MANIFEST_FINGERPRINT`] still fails there.
 #[cfg(test)]
 pub const SDK_SCHEMA_SHA256: &str =
-    "70c917598a6df13762572ad15ab15d3380b11de93432ea16bcdcb6019dcaa110";
+    "b72d5a3f6fd6201affcd45e4e13453a9bfeb10246649ceb6492fb6fe26c8c127";
 
 /// Fingerprint embedded in the SDK conformance-transcript fixtures. It is
 /// deliberately distinct from every host fingerprint and must never be
@@ -281,6 +308,9 @@ impl Status {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Compatibility {
     pub schema_version: Option<u64>,
+    /// The host's `schema.compatibilityEpoch` (Muse 1.4.23+); `None` when it
+    /// sent none.
+    pub compatibility_epoch: Option<u64>,
     pub fingerprint: String,
     pub status: Status,
     pub detail: &'static str,
@@ -295,8 +325,11 @@ impl Compatibility {
     /// One machine-readable log line for support diagnostics.
     pub fn log_line(&self, adapter_version: &str, host: &str) -> String {
         format!(
-            "schema-compat adapter={adapter_version} host={host} schema_version={} fingerprint={} status={} detail={}",
+            "schema-compat adapter={adapter_version} host={host} schema_version={} compatibility_epoch={} fingerprint={} status={} detail={}",
             self.schema_version
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "absent".to_string()),
+            self.compatibility_epoch
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "absent".to_string()),
             self.fingerprint,
@@ -354,7 +387,11 @@ fn table_entry(fingerprint: &str) -> Option<(Status, &'static str)> {
         ),
         HOST_1420_FINGERPRINT => (
             Status::Tested,
-            "validated against live host 1.4.20-R8619.1; the vendored SDK 649ca21 surface",
+            "validated against live host 1.4.20-R8619.1; the previously vendored SDK 649ca21 surface",
+        ),
+        HOST_1423_FINGERPRINT => (
+            Status::Tested,
+            "validated against live host 1.4.23-R8977.1; the vendored SDK 5fc95e5 surface",
         ),
         TRANSCRIPT_FIXTURE_FINGERPRINT => (
             Status::Fixture,
@@ -380,6 +417,7 @@ pub fn classify(schema_version: Option<u64>, fingerprint: &str) -> Compatibility
         Some(v) => {
             return Compatibility {
                 schema_version: Some(v),
+                compatibility_epoch: None,
                 fingerprint,
                 status: Status::Incompatible,
                 detail: "unsupported MSP envelope schema version (fatal)",
@@ -397,16 +435,46 @@ pub fn classify(schema_version: Option<u64>, fingerprint: &str) -> Compatibility
 
     Compatibility {
         schema_version,
+        compatibility_epoch: None,
         fingerprint,
         status,
         detail,
     }
 }
 
+/// Classify a handshake result together with the compatibility epoch the
+/// host reported (Muse 1.4.23+). A recorded fingerprint keeps its verdict
+/// whatever the epoch. An unrecorded one at the vendored epoch differs from
+/// the vendored surface only additively, so it is degraded rather than
+/// unknown; at another epoch a declared breaking change lies between them,
+/// which the detail says. Neither blocks: only the envelope version does. An
+/// absent epoch (every host before 1.4.23) reads as unknown, as before.
+pub fn classify_served(
+    schema_version: Option<u64>,
+    fingerprint: &str,
+    compatibility_epoch: Option<u64>,
+) -> Compatibility {
+    let mut verdict = classify(schema_version, fingerprint);
+    verdict.compatibility_epoch = compatibility_epoch;
+    if verdict.status == Status::Unknown && schema_version == Some(SUPPORTED_SCHEMA_VERSION) {
+        match compatibility_epoch {
+            Some(SDK_COMPATIBILITY_EPOCH) => {
+                verdict.status = Status::Degraded;
+                verdict.detail = "unrecorded fingerprint at the vendored compatibility epoch; every stable difference is additive";
+            }
+            Some(_) => {
+                verdict.detail = "unrecorded fingerprint across a declared non-additive advance: the compatibility epoch differs from the vendored surface's";
+            }
+            None => {}
+        }
+    }
+    verdict
+}
+
 /// Machine-readable rows for `--selftest`; host facts require a live host.
 pub fn selftest_lines(adapter_version: &str) -> Vec<String> {
     let mut lines = vec![format!(
-        "selftest adapter={adapter_version} supported_schema_version={SUPPORTED_SCHEMA_VERSION} host=offline"
+        "selftest adapter={adapter_version} supported_schema_version={SUPPORTED_SCHEMA_VERSION} compatibility_epoch={SDK_COMPATIBILITY_EPOCH} host=offline"
     )];
     for (fp, kind) in [
         (TESTED_FINGERPRINT, "tested-host"),
@@ -429,6 +497,7 @@ pub fn selftest_lines(adapter_version: &str) -> Vec<String> {
         (HOST_1415_FINGERPRINT, "host-1.4.15"),
         (HOST_1418_FINGERPRINT, "host-1.4.18"),
         (HOST_1420_FINGERPRINT, "host-1.4.20"),
+        (HOST_1423_FINGERPRINT, "host-1.4.23"),
         (TRANSCRIPT_FIXTURE_FINGERPRINT, "transcript-fixture"),
     ] {
         let c = classify(Some(SUPPORTED_SCHEMA_VERSION), fp);
@@ -454,16 +523,16 @@ mod tests {
     }
 
     #[test]
-    fn sdk_manifest_surface_is_the_1_4_20_surface() {
-        // The vendored stable bundle is SDK 649ca21's, byte-identical to the
-        // 1.4.20-R8619.1 build's own export, and that build in the live-host
+    fn sdk_manifest_surface_is_the_1_4_23_surface() {
+        // The vendored stable bundle is SDK 5fc95e5's, byte-identical to the
+        // 1.4.23-R8977.1 build's own export, and that build in the live-host
         // matrix reports this digest, so the surface classifies as tested.
         assert_eq!(
             SDK_MANIFEST_FINGERPRINT,
-            "sha256:283b1b125dcc9172928fb5d6711a92a353796d030a7c186988ed527a13cf07f0"
+            "sha256:b7fb9137267aa35c92424df37a5ac56287006a0e546b197bf0930d593fecbdb1"
         );
-        assert_eq!(SDK_MANIFEST_FINGERPRINT, HOST_1420_FINGERPRINT);
-        assert_ne!(SDK_MANIFEST_FINGERPRINT, HOST_1418_FINGERPRINT);
+        assert_eq!(SDK_MANIFEST_FINGERPRINT, HOST_1423_FINGERPRINT);
+        assert_ne!(SDK_MANIFEST_FINGERPRINT, HOST_1420_FINGERPRINT);
         let c = classify(Some(1), SDK_MANIFEST_FINGERPRINT);
         assert_eq!(c.status, Status::Tested);
         assert!(!c.is_fatal());
@@ -632,9 +701,97 @@ mod tests {
         assert_eq!(c.status, Status::Tested);
         assert_eq!(
             c.detail,
-            "validated against live host 1.4.20-R8619.1; the vendored SDK 649ca21 surface"
+            "validated against live host 1.4.20-R8619.1; the previously vendored SDK 649ca21 surface"
         );
         assert!(!c.is_fatal());
+    }
+
+    #[test]
+    fn host_1423_fingerprint_is_tested() {
+        let c = classify(Some(1), HOST_1423_FINGERPRINT);
+        assert_eq!(c.status, Status::Tested);
+        assert_eq!(
+            c.detail,
+            "validated against live host 1.4.23-R8977.1; the vendored SDK 5fc95e5 surface"
+        );
+        assert!(!c.is_fatal());
+    }
+
+    #[test]
+    fn a_recorded_fingerprint_keeps_its_verdict_at_any_epoch() {
+        // Equal fingerprints need no epoch check at all.
+        for epoch in [None, Some(SDK_COMPATIBILITY_EPOCH), Some(7)] {
+            let c = classify_served(Some(1), HOST_1423_FINGERPRINT, epoch);
+            assert_eq!(c.status, Status::Tested, "{epoch:?}");
+            assert_eq!(c.compatibility_epoch, epoch);
+        }
+        let c = classify_served(Some(1), HOST_149_FINGERPRINT, Some(SDK_COMPATIBILITY_EPOCH));
+        assert_eq!(c.status, Status::Degraded);
+        assert_eq!(
+            c.detail,
+            "Muse 1.4.9/1.4.10 surface; byte-identical to the installed 1.4.10 export, pending a pinned CI build"
+        );
+    }
+
+    #[test]
+    fn an_unrecorded_fingerprint_at_the_vendored_epoch_is_additive() {
+        let c = classify_served(Some(1), "sha256:deadbeef", Some(SDK_COMPATIBILITY_EPOCH));
+        assert_eq!(c.status, Status::Degraded);
+        assert_eq!(
+            c.detail,
+            "unrecorded fingerprint at the vendored compatibility epoch; every stable difference is additive"
+        );
+        assert!(!c.is_fatal());
+        assert!(c.log_line("0.25.0", "muse/1.4.24").contains(
+            "schema_version=1 compatibility_epoch=0 fingerprint=sha256:deadbeef status=degraded"
+        ));
+    }
+
+    #[test]
+    fn an_unrecorded_fingerprint_at_another_epoch_names_the_breaking_advance() {
+        let c = classify_served(
+            Some(1),
+            "sha256:deadbeef",
+            Some(SDK_COMPATIBILITY_EPOCH + 1),
+        );
+        assert_eq!(c.status, Status::Unknown);
+        assert!(
+            c.detail.contains("declared non-additive advance"),
+            "{}",
+            c.detail
+        );
+        // Still not fatal: the adapter degrades loudly, like the Muse SDK's
+        // default, and lets the user decide.
+        assert!(!c.is_fatal());
+        assert!(
+            c.log_line("0.25.0", "muse/2.0.0")
+                .contains("compatibility_epoch=1 ")
+        );
+    }
+
+    #[test]
+    fn an_absent_epoch_keeps_the_fingerprint_only_reading() {
+        assert_eq!(
+            classify_served(Some(1), "sha256:deadbeef", None),
+            classify(Some(1), "sha256:deadbeef")
+        );
+        assert!(
+            classify_served(Some(1), "sha256:deadbeef", None)
+                .log_line("0.25.0", "muse/1.4.20")
+                .contains("compatibility_epoch=absent ")
+        );
+        // The epoch only reads an unrecorded fingerprint whose envelope
+        // version is known; it never stands in for a missing one.
+        let c = classify_served(None, "sha256:deadbeef", Some(SDK_COMPATIBILITY_EPOCH));
+        assert_eq!(c.status, Status::Unknown);
+        assert_eq!(c.detail, "schema version absent and fingerprint unknown");
+        let c = classify_served(
+            Some(2),
+            HOST_1423_FINGERPRINT,
+            Some(SDK_COMPATIBILITY_EPOCH),
+        );
+        assert_eq!(c.status, Status::Incompatible);
+        assert!(c.is_fatal());
     }
 
     #[test]
@@ -680,7 +837,8 @@ mod tests {
         let lines = selftest_lines("0.2.5");
         assert!(lines[0].contains("adapter=0.2.5"));
         assert!(lines[0].contains("host=offline"));
-        assert_eq!(lines.len(), 22);
+        assert!(lines[0].contains("compatibility_epoch=0 "));
+        assert_eq!(lines.len(), 23);
         assert!(lines.iter().any(|l| l.contains("kind=sdk-manifest")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.2.1")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.3.0")));
@@ -700,13 +858,17 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.15")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.18")));
         assert!(lines.iter().any(|l| l.contains("kind=host-1.4.20")));
+        assert!(lines.iter().any(|l| l.contains("kind=host-1.4.23")));
         assert!(lines.iter().any(|l| l.contains("kind=transcript-fixture")));
     }
 }
 
 #[cfg(test)]
 mod corpus_tests {
-    use super::{SDK_MANIFEST_FINGERPRINT, SDK_SCHEMA_SHA256, SUPPORTED_SCHEMA_VERSION};
+    use super::{
+        SDK_COMPATIBILITY_EPOCH, SDK_MANIFEST_FINGERPRINT, SDK_SCHEMA_SHA256,
+        SUPPORTED_SCHEMA_VERSION,
+    };
     use crate::json::parse_json;
     use std::collections::BTreeSet;
 
@@ -751,6 +913,21 @@ mod corpus_tests {
             .and_then(|v| v.as_u64())
             .expect("manifest schemaVersion");
         assert_eq!(version, SUPPORTED_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn vendored_bundle_records_the_pinned_compatibility_epoch() {
+        // Muse 1.4.23 bundles record their compatibility epoch at the root. A
+        // re-pin onto a bundle past a declared breaking advance must move
+        // SDK_COMPATIBILITY_EPOCH with it, or an additive host past the new
+        // pin would be read against the wrong epoch.
+        let text = std::fs::read_to_string(protocol_path("stable/msp.schema.json"))
+            .expect("vendored schema bundle");
+        let schema = parse_json(&text).expect("schema bundle JSON");
+        assert_eq!(
+            schema.get("compatibilityEpoch").and_then(|v| v.as_u64()),
+            Some(SDK_COMPATIBILITY_EPOCH)
+        );
     }
 
     #[test]

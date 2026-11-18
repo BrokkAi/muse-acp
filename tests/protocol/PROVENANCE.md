@@ -2,30 +2,35 @@
 
 - **Source:** <https://github.com/meta-models/muse-code-sdk>
 - **Stable bundle (`stable/`):** <https://github.com/meta-models/muse-code-sdk>
-  at `649ca21ee15979c960afc27ad5051156cdb0c87c`'s `schema/msp/stable/`
+  at `5fc95e5bbbedc7944b1729297ca79bcef9627416`'s `schema/msp/stable/`
   (`manifest.json` and `msp.schema.json`, copied byte for byte), taken
-  2026-11-16. The bundle is byte-identical to the stable 1.4.20-R8619.1
+  2026-11-18. The bundle is byte-identical to the stable 1.4.23-R8977.1
   build's own `muse schema generate-json-schema --out DIR` export. The
   fingerprint recorded in `src/compat.rs`
-  (`sha256:283b1b125dcc9172928fb5d6711a92a353796d030a7c186988ed527a13cf07f0`)
-  is the one a live 1.4.20 handshake reports and the official
-  1.4.20-R8619.1 release manifest publishes as `msp_schema_fingerprint`, and
+  (`sha256:b7fb9137267aa35c92424df37a5ac56287006a0e546b197bf0930d593fecbdb1`)
+  is the one a live 1.4.23 handshake reports and the official
+  1.4.23-R8977.1 release manifest publishes as `msp_schema_fingerprint`, and
   `SDK_SCHEMA_SHA256` there pins the bundle bytes it belongs to, so the
-  fingerprint classifies as tested. Over 1.4.18 the only change is the
-  optional `SessionStartParams.clear` member. The previous stable bundle was
-  the 1.4.18-R8587.1 build's own export, and before it SDK `07e1548`'s
-  (Muse 1.4.15).
+  fingerprint classifies as tested. The bundle records its compatibility
+  epoch (`0`) at its root, which `SDK_COMPATIBILITY_EPOCH` pins. Over 1.4.20
+  the changes are `ApprovalCuaCardFacts.browser` with its
+  `ApprovalCuaBrowser` definition, `Item.terminalRowBeforeItemId`, and
+  `SchemaInfo.compatibilityEpoch`; the `stable/manifest.json` bytes are
+  unchanged. The previous stable bundle was SDK `649ca21`'s (Muse 1.4.20),
+  and before it the 1.4.18-R8587.1 build's own export.
 - **Transcripts (`transcripts/`):** <https://github.com/meta-models/muse-code-sdk>
-  at `649ca21ee15979c960afc27ad5051156cdb0c87c`
-  ("remirror: 1.4.20 from the internal source tree (tracked internally)",
-  2026-11-13), the same revision as the stable bundle. Only
+  at `5fc95e5bbbedc7944b1729297ca79bcef9627416`
+  ("remirror: 1.4.23 from the internal source tree (tracked internally)",
+  2026-11-17), the same revision as the stable bundle. Only
   `schema/msp/transcripts/` was copied, without `schema/msp/msp.d.ts` or
   `schema/msp/experimental/`; the revision's `python/`, `clients/`, `rust/`,
-  and `scripts/` trees are not vendored. Over `07e1548` the re-recorded
-  handshakes carry `schema.experimentalFingerprint`, and some manifests carry
-  a `regenerationJustification`; no scenario was added or removed. Since
-  `07e1548` the SDK no longer writes the fingerprint into the transcript
-  manifests; it derives it from the schema bytes at build.
+  and `scripts/` trees are not vendored. Over `649ca21` four scenarios were
+  added (`approval-choice-invalid`, `approval-requirement-stale`,
+  `turn-interrupt-queued-successor`, and
+  `turn-interrupt-queued-successor-burst`), for 58 in all, and the
+  re-recorded handshakes carry `schema.compatibilityEpoch`. Since `07e1548`
+  the SDK no longer writes the fingerprint into the transcript manifests; it
+  derives it from the schema bytes at build.
 - **License:** MIT — see `LICENSE.muse-code-sdk`
 - **Contents:**
   - `stable/manifest.json` — schema version (and, before `07e1548`, the
@@ -46,6 +51,8 @@ Update `stable/` only by re-copying a single source, either an SDK
 revision's `schema/msp/stable/` or a pinned Muse build's own export, and
 `transcripts/` only from a single SDK revision, and record each source here.
 After every update, `compat::SDK_SCHEMA_SHA256` in `src/compat.rs` must match the SHA-256 of
-`stable/msp.schema.json`, and `compat::SDK_MANIFEST_FINGERPRINT` must be the
+`stable/msp.schema.json`, `compat::SDK_MANIFEST_FINGERPRINT` must be the
 fingerprint a live host of that release reports (and `stable/manifest.json`'s
-`fingerprint`, when the manifest carries one).
+`fingerprint`, when the manifest carries one), and
+`compat::SDK_COMPATIBILITY_EPOCH` must be the bundle's root
+`compatibilityEpoch`.

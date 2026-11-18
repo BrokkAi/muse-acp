@@ -22,6 +22,13 @@ pub struct Handshake {
     /// surface. A fingerprint the caller does not know is a warning
     /// condition, not an error.
     pub fingerprint: Option<String>,
+    /// `schema.compatibilityEpoch` (Muse 1.4.23+): the count of declared
+    /// non-additive advances of the stable surface. Compare it with the
+    /// epoch of the bundle you pinned when the fingerprint differs: equal
+    /// means every difference is additive. `None` when the host omits it or
+    /// sends anything but a non-negative integer, which the schema says to
+    /// read as unknown.
+    pub compatibility_epoch: Option<u64>,
     /// `sessionDurability`, verbatim. Read it through
     /// [`Handshake::session_durability`].
     pub durability: Option<String>,
@@ -71,6 +78,9 @@ impl Handshake {
                 .and_then(|schema| schema.get("version"))
                 .and_then(J::as_u64),
             fingerprint: text(schema.and_then(|schema| schema.get("fingerprint"))),
+            compatibility_epoch: schema
+                .and_then(|schema| schema.get("compatibilityEpoch"))
+                .and_then(J::as_u64),
             durability: text(result.get("sessionDurability")),
             granted_capabilities: match result.get("grantedCapabilities") {
                 Some(J::Arr(caps)) => caps
@@ -236,13 +246,14 @@ mod tests {
     fn handshake_facts_are_read_without_filling_gaps() {
         let full = Handshake::from_result(
             parse_json(
-                r#"{"serverInfo":{"name":"muse","version":"1.4.11-R6667.1"},"schema":{"version":1,"fingerprint":"sha256:ab"},"grantedCapabilities":["sessionMcp",7,"feedback"],"experimentalApi":true,"sessionDurability":"ephemeral","sandboxAvailability":"unavailable","sandboxUnavailableReason":"userNamespacesDenied","museHome":"/h"}"#,
+                r#"{"serverInfo":{"name":"muse","version":"1.4.11-R6667.1"},"schema":{"version":1,"fingerprint":"sha256:ab","compatibilityEpoch":0},"grantedCapabilities":["sessionMcp",7,"feedback"],"experimentalApi":true,"sessionDurability":"ephemeral","sandboxAvailability":"unavailable","sandboxUnavailableReason":"userNamespacesDenied","museHome":"/h"}"#,
             )
             .unwrap(),
         );
         assert_eq!(full.server_name.as_deref(), Some("muse"));
         assert_eq!(full.schema_version, Some(1));
         assert_eq!(full.fingerprint.as_deref(), Some("sha256:ab"));
+        assert_eq!(full.compatibility_epoch, Some(0));
         assert_eq!(full.granted_capabilities, ["sessionMcp", "feedback"]);
         assert!(full.granted("feedback") && !full.granted("userShell"));
         assert_eq!(full.session_durability(), SessionDurability::Ephemeral);
@@ -253,6 +264,7 @@ mod tests {
         let empty = Handshake::from_result(parse_json("{}").unwrap());
         assert_eq!(empty.server_name, None);
         assert_eq!(empty.schema_version, None);
+        assert_eq!(empty.compatibility_epoch, None);
         assert!(empty.granted_capabilities.is_empty());
         // Absent durability is durable per the schema; unknown is not.
         assert!(empty.session_durability().is_durable());
@@ -265,6 +277,24 @@ mod tests {
             odd.session_durability(),
             SessionDurability::Other("future".into())
         );
+    }
+
+    #[test]
+    fn a_malformed_compatibility_epoch_reads_as_unknown() {
+        // The schema reads a member that is not a non-negative integer as
+        // absent, never as a guessed value.
+        let epoch = |schema: &str| {
+            Handshake::from_result(parse_json(&format!(r#"{{"schema":{schema}}}"#)).unwrap())
+                .compatibility_epoch
+        };
+        assert_eq!(epoch(r#"{"compatibilityEpoch":3}"#), Some(3));
+        for malformed in ["-1", "1.5", "1e2", "\"1\"", "null", "true", "[]"] {
+            assert_eq!(
+                epoch(&format!(r#"{{"compatibilityEpoch":{malformed}}}"#)),
+                None,
+                "{malformed}"
+            );
+        }
     }
 
     #[test]

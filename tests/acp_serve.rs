@@ -3098,6 +3098,35 @@ fn computer_use_permission_shows_the_card_facts() {
 }
 
 #[test]
+fn computer_use_browser_permission_words_the_hosts_notices() {
+    // Muse 1.4.23 browser cards send `cuaCardFacts.browser` flags and leave
+    // the words to the client: the prompt names the browser and words each
+    // notice, and the flags still ride `_meta` verbatim.
+    for ver in [1, 2] {
+        let mut c = Client::spawn(
+            "approval",
+            &[("FAKE_APPROVAL_SUBJECT", "computer-use-browser")],
+        );
+        let sid = c.new_session(ver, "");
+        let _pid = c.prompt(&sid, "open the shop");
+        let perm = c.wait_for("request_permission", Duration::from_secs(15));
+        assert!(
+            perm.contains(
+                r#""text":"Browser: `Google Chrome`\nFirst use: Computer Use has not used this browser on this Mac before, and it will act signed in as you.\nComputer Use will open its own window in this browser and bring the browser to the front (asked once per session).\nPage: shop.example"}"#
+            ),
+            "browser notices worded as prompt content on v{ver}: {perm}"
+        );
+        assert!(
+            perm.contains(
+                r#""browser":{"name":"Google Chrome","firstUse":true,"windowConsent":true}"#
+            ),
+            "browser facts passed verbatim on v{ver}: {perm}"
+        );
+        c.finish();
+    }
+}
+
+#[test]
 fn computer_use_permission_names_the_data_the_call_would_send() {
     // #395: Muse 1.4.13 adds `cuaCardFacts.data`. A secret the call would
     // send must be visible in the prompt, worded from the host's mask and
@@ -8978,11 +9007,88 @@ fn unknown_schema_fingerprint_degrades_without_blocking() {
 }
 
 #[test]
-fn sdk_manifest_fingerprint_is_the_1_4_20_surface() {
-    // The vendored stable bundle is SDK 649ca21's, byte-identical to the
-    // 1.4.20-R8619.1 build's own export, and that build in the nightly
+fn an_unknown_fingerprint_at_the_vendored_epoch_is_additive() {
+    // Muse 1.4.23 reports its compatibility epoch. A fingerprint the adapter
+    // has not recorded at the vendored epoch differs only additively, so it
+    // degrades instead of reading as unknown, and still runs.
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_FINGERPRINT", "sha256:deadbeefdeadbeef"),
+            ("FAKE_COMPATIBILITY_EPOCH", "0"),
+        ],
+    );
+    let _sid = c.new_session(1, "");
+    c.wait_stderr(
+        "schema_version=1 compatibility_epoch=0 fingerprint=sha256:deadbeefdeadbeef status=degraded detail=unrecorded fingerprint at the vendored compatibility epoch; every stable difference is additive",
+        Duration::from_secs(10),
+    );
+    c.finish();
+}
+
+#[test]
+fn an_unknown_fingerprint_past_a_declared_breaking_advance_is_named() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_FINGERPRINT", "sha256:deadbeefdeadbeef"),
+            ("FAKE_COMPATIBILITY_EPOCH", "1"),
+        ],
+    );
+    // Loud, not fatal: the session still starts.
+    let _sid = c.new_session(1, "");
+    c.wait_stderr("compatibility_epoch=1 ", Duration::from_secs(10));
+    c.wait_stderr(
+        "status=unknown detail=unrecorded fingerprint across a declared non-additive advance",
+        Duration::from_secs(10),
+    );
+    c.finish();
+}
+
+#[test]
+fn a_malformed_compatibility_epoch_reads_as_absent() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            ("FAKE_FINGERPRINT", "sha256:deadbeefdeadbeef"),
+            ("FAKE_COMPATIBILITY_EPOCH", "\"zero\""),
+        ],
+    );
+    c.initialize(1, "");
+    c.wait_stderr(
+        "compatibility_epoch=absent fingerprint=sha256:deadbeefdeadbeef status=unknown detail=no compatibility decision recorded",
+        Duration::from_secs(10),
+    );
+    c.finish();
+}
+
+#[test]
+fn sdk_manifest_fingerprint_is_the_1_4_23_surface() {
+    // The vendored stable bundle is SDK 5fc95e5's, byte-identical to the
+    // 1.4.23-R8977.1 build's own export, and that build in the nightly
     // live-host matrix reports this digest, so the adapter classifies it as
     // tested.
+    let mut c = Client::spawn(
+        "quiet",
+        &[
+            (
+                "FAKE_FINGERPRINT",
+                "sha256:b7fb9137267aa35c92424df37a5ac56287006a0e546b197bf0930d593fecbdb1",
+            ),
+            ("FAKE_COMPATIBILITY_EPOCH", "0"),
+        ],
+    );
+    c.initialize(1, "");
+    c.wait_stderr("status=tested", Duration::from_secs(10));
+    c.wait_stderr(
+        "validated against live host 1.4.23-R8977.1; the vendored SDK 5fc95e5 surface",
+        Duration::from_secs(10),
+    );
+    c.finish();
+}
+
+#[test]
+fn the_1_4_20_fingerprint_stays_tested() {
     let mut c = Client::spawn(
         "quiet",
         &[(
@@ -8993,7 +9099,7 @@ fn sdk_manifest_fingerprint_is_the_1_4_20_surface() {
     c.initialize(1, "");
     c.wait_stderr("status=tested", Duration::from_secs(10));
     c.wait_stderr(
-        "validated against live host 1.4.20-R8619.1; the vendored SDK 649ca21 surface",
+        "validated against live host 1.4.20-R8619.1; the previously vendored SDK 649ca21 surface",
         Duration::from_secs(10),
     );
     c.finish();

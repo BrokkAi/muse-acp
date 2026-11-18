@@ -9,11 +9,11 @@ access, and useful in real editor workflows.
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
-- **Reference snapshots used for this revision:** the Muse 1.4.20 stable
-  surface (stable schema version 1, fingerprint
-  `sha256:283b1b125dcc9172928fb5d6711a92a353796d030a7c186988ed527a13cf07f0`),
-  vendored from Muse SDK `649ca21` (2026-11-13), byte-identical to the stable
-  1.4.20-R8619.1 build's own `muse schema generate-json-schema` export,
+- **Reference snapshots used for this revision:** the Muse 1.4.23 stable
+  surface (stable schema version 1, compatibility epoch 0, fingerprint
+  `sha256:b7fb9137267aa35c92424df37a5ac56287006a0e546b197bf0930d593fecbdb1`),
+  vendored from Muse SDK `5fc95e5` (2026-11-17), byte-identical to the stable
+  1.4.23-R8977.1 build's own `muse schema generate-json-schema` export,
   validated against that build and pinned in the live-host matrix; the
   fingerprint is the live handshake's and the release manifest's. The
   transcript corpus is the same SDK revision. Also `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
@@ -105,7 +105,8 @@ the verdict into richer support bundles.
   fingerprint, the `a45cb67` pin published the 1.4.14 fingerprint, the
   `07e1548` pin published the 1.4.15 surface, whose fingerprint the SDK
   manifest no longer carries, the 1.4.18 stable bundle was that build's own
-  export, and the `649ca21` pin publishes the current 1.4.20 surface.
+  export, the `649ca21` pin published the 1.4.20 surface, and the `5fc95e5`
+  pin publishes the current 1.4.23 surface.
   Host 1.2.1 reports
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
@@ -285,7 +286,17 @@ the verdict into richer support bundles.
   fingerprint. Over 1.4.18 the only change is the optional
   `SessionStartParams.clear` flag, which has a §9 disposition. Its Linux,
   macOS, and Windows artifacts are pinned in the nightly matrix. No 1.4.19
-  build was available to validate. Before 1.4.6, the
+  build was available to validate.
+  The `5fc95e5` pin publishes the 1.4.23 surface
+  (`sha256:b7fb9137267aa35c92424df37a5ac56287006a0e546b197bf0930d593fecbdb1`,
+  schema version 1, compatibility epoch 0), byte-identical to the
+  `1.4.23-R8977.1` build's own export; the live handshake and the release
+  manifest report the same fingerprint. Over 1.4.20 it adds the browser
+  notices on a Computer Use card, the `terminalRowBeforeItemId` row anchor,
+  and the handshake's compatibility epoch, with every table unchanged; each
+  has a §9 disposition. Its Linux, macOS, and Windows artifacts are pinned in
+  the nightly matrix. No 1.4.21 or 1.4.22 build was available to validate.
+  Before 1.4.6, the
   Python tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
   `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
   surface while the top-level schema stayed on 1.3.0-R3401.1. Transcript
@@ -321,8 +332,8 @@ The SDK publishes generated MSP types, a schema bundle, and recorded transcripts
 The Rust adapter should consume those artifacts as conformance inputs.
 
 Status: **emissions validated and permission paths replayed.**
-`tests/protocol/` pins SDK revision `649ca21` (stable manifest, JSON schema
-bundle, 54 golden transcripts) with provenance and license. CI now replays
+`tests/protocol/` pins SDK revision `5fc95e5` (stable manifest, JSON schema
+bundle, 58 golden transcripts) with provenance and license. CI now replays
 every server-side item event through the notification fold (unknown kinds must
 tolerate), validates every emitted ACP frame with the adapter's own parser,
 fails if the vendored schema bytes drift from the compatibility table's pin, validates every adapter→host request frame against the schema bundle's
@@ -400,7 +411,7 @@ their first Windows evidence.
 
 **Work items**
 
-- Pin the SDK revision (currently `649ca21`, 2026-11-13) and vendor
+- Pin the SDK revision (currently `5fc95e5`, 2026-11-17) and vendor
   `schema/msp/stable/manifest.json`, `schema/msp/stable/msp.schema.json`, and
   the `schema/msp/transcripts/` corpus under `tests/protocol/`, or fetch that
   locked revision in CI. The corpus already covers approvals, cancellation,
@@ -776,12 +787,12 @@ path, preserving the fail-closed policy from §4.
 
 **Muse 1.4.x stable-surface additions**
 
-Muse 1.4.1 through 1.4.20 grew the stable surface well past 1.3.0. The adapter
+Muse 1.4.1 through 1.4.23 grew the stable surface well past 1.3.0. The adapter
 adopts the parts that fit its ACP mapping (workspace roots, reasoning tiers,
 session delete on the hosts that serve it, `feedback/submit`, and
 `session/list` filters) and records an explicit disposition below for the
 rest, with a tracking issue where behavior remains undecided. The pinned
-`649ca21` bundle is the authority.
+`5fc95e5` bundle is the authority.
 The rows below record a disposition for the 1.4.x additions the adapter does
 not drive, plus `feedback/submit`, which it does; incoming notifications with
 no adapter arm stay safe because the unknown-method path in the fold logs and
@@ -960,6 +971,28 @@ experimental surface adds the per-session built-in tool restriction
 which the schema declares but the host does not yet enforce, so the adapter
 does not send it.
 
+Muse 1.4.23 adds three optional stable members, each with a matrix row below.
+A Computer Use browser card carries notices as flags for the client to word
+(`ApprovalCuaCardFacts.browser`), which the permission prompt words. An item
+can name the earlier item its row renders before
+(`Item.terminalRowBeforeItemId`), which history replay honors. The handshake
+reports the host's compatibility epoch (`SchemaInfo.compatibilityEpoch`, also
+recorded at the bundle's root), which turns an unrecorded fingerprint at the
+vendored epoch from `unknown` into an additive `degraded` verdict and names a
+declared breaking advance when the epochs differ. On the experimental surface
+the adapter opts into, Muse 1.4.23 adds a client-supplied skill catalog
+(`ClientCapabilities.skillProvider` and the `skillProvider/*` requests), a
+change feed of the host's local projection (`pluginData/subscribe`,
+`pluginData/unsubscribe`, `pluginData/changed`), a worktree ask on
+`session/resume`, the `ceilingKind` of a `limitsAboveMax` refusal, plugin
+origins on `plugin/list` rows, and journal paging cursors. None has an ACP
+counterpart the adapter can feed or serve: ACP editors do not offer agents a
+skill catalog (ACP's unstable agent skills run the other way), the stock
+1.4.23 build refuses `skillProvider` at `initialize` even with
+`experimentalApi`, and the adapter starts no worktrees, sends no `limits`, and
+does not act as a journal store. Plugin origins reach the editor unchanged,
+because `_session/plugins` returns the `plugin/list` result verbatim.
+
 **Muse 1.4.x field-level and vocabulary additions**
 
 Muse 1.4.6 grew fields and open vocabularies the adapter's tolerant fold had to
@@ -1099,6 +1132,9 @@ cannot drop a member without failing CI.
 | `SessionConfig.developerPrompt` | Mapped to ACP | ACP `systemPrompt` (stable since ACP schema 1.16) in `append` mode, advertised on Muse 1.4.18+ and sent as `config.developerPrompt` on `session/start` and `session/resume`, and on a fork by a follow-up `session/resume`, since `session/fork` takes no configuration and Muse does not carry the prompt into a fork. A live capture shows Muse adds it ahead of its developer context and keeps its built-in instructions; `override`, non-text content, and a blank prompt (Muse's explicit clear) are refused with `-32602` ([#318](https://github.com/BrokkAi/muse-acp/issues/318)). |
 | `SessionReadResult.modelTurnRunning` | Intentionally ignored | Whether a child read session's model turn runs is served on a `subagent` session read; the adapter reads sessions only to replay history. |
 | `SessionStartParams.clear` | Intentionally ignored | Muse 1.4.20 marks a start as a `/clear`, so the new session's `SessionStart` hooks see source `clear` instead of `startup`. An ACP `session/new` is a plain start, which omission keeps, and ACP has no clear signal. The adapter offers no `/clear` command: an ACP session id names one Muse session, so clearing in place would rebind it to a new Muse session that `session/load` and `session/list` could no longer reach under that id. Editors start a fresh thread with `session/new`. |
+| `ApprovalCuaCardFacts.browser` | Mapped to ACP | A Muse 1.4.23 Computer Use browser card leads its permission prompt with `Browser: <name>` (host display text, quoted as a code span like the window title) and words each notice the host flags, since the schema leaves the words to the client: `firstUse` adds "First use: Computer Use has not used this browser on this Mac before, and it will act signed in as you.", and `windowConsent` adds "Computer Use will open its own window in this browser and bring the browser to the front (asked once per session)." An absent or `false` flag shows nothing. The facts still ride `_meta.muse.cuaCardFacts` verbatim. |
+| `Item.terminalRowBeforeItemId` | Mapped to ACP | Muse 1.4.23 names the item whose rows a `backgroundTerminalCompletion` or a Finished-row `toolCall` renders before. History replay moves such a row in front of that item when the item comes earlier in the batch; rows moved in front of one item keep their order, a moved row does not open or close a turn, and a row also held by `terminalRowAfterItemId` still waits for that anchor. A live row cannot be moved in front of a card the editor already shows, because ACP only appends, and one whose target has not rendered yet already lands before it. The host's "coalesced region" is its TUI grouping; the adapter gives each item its own card. |
+| `SchemaInfo.compatibilityEpoch` | Consumed | Muse 1.4.23 reports the count of declared non-additive advances of the stable surface; the vendored bundle records its own (0) at its root, pinned by `compat::SDK_COMPATIBILITY_EPOCH`. The `schema-compat` line logs `compatibility_epoch=` (`absent` for older hosts or a value that is not a non-negative integer). A recorded fingerprint keeps its verdict. An unrecorded one at the vendored epoch is `degraded` ("every stable difference is additive") instead of `unknown`; at another epoch it stays `unknown` and the detail names the declared non-additive advance. Neither blocks: only the envelope schema version does. |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**
