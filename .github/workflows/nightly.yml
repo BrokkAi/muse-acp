@@ -12,12 +12,18 @@ on:
 permissions:
   contents: read
 
+env:
+  # The integration tests spend their time waiting on child processes rather
+  # than computing, so libtest's default of one thread per core leaves a hosted
+  # runner mostly idle. An explicit `--test-threads` still takes precedence.
+  RUST_TEST_THREADS: '16'
+
 jobs:
   platform:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-15, windows-2025, windows-11-arm]
+        runner: [windows-2025, windows-11-arm]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 20
     steps:
@@ -78,11 +84,7 @@ jobs:
             runner: ubuntu-24.04
             file: muse-x86-linux
             sha256: 7ca9e16659f759eab3ae6c4b61c6f1e70f5f3fea1ca961ebd49044a1146956f4
-          # macOS arm64 runs only the newest pin.
-          - version: 1.4.23-R8977.1
-            runner: macos-15
-            file: muse-aarch64-macos
-            sha256: 215a6eaac150f5855edc5a1df3b14ddfa504eb03690a4d65449887b396522fa8
+          # macOS arm64 runs only the newest pin, in the `macos` job below.
           # Windows x64 legs cover the workspace-root flows on each supported
           # pinned build: multi-root `session/start`, and the sticky
           # `turn/start` replacement after a mode change and a load/re-attach.
@@ -202,7 +204,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        runner: [macos-15, windows-2025, windows-11-arm]
+        runner: [windows-2025, windows-11-arm]
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 5
     steps:
@@ -215,11 +217,80 @@ jobs:
           package-manager-cache: false
       - run: node --test npm/test/launcher.test.cjs
 
+  # GitHub-hosted macOS runners are limited to five concurrent jobs across the
+  # whole organization, and a queued macOS job can wait most of an hour. macOS
+  # therefore takes one runner a night instead of a leg in each matrix above:
+  # this job runs the platform checks, the npm launcher tests, and the
+  # live-host suite against the newest pinned Muse build. Each stage runs even
+  # when an earlier one failed, so the one job still reports all of them.
+  macos:
+    runs-on: macos-15
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          components: clippy
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+          package-manager-cache: false
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - if: ${{ !cancelled() }}
+        run: cargo test --locked --workspace
+      - if: ${{ !cancelled() }}
+        run: cargo run --locked -- --selftest
+      - if: ${{ !cancelled() }}
+        run: node --test npm/test/launcher.test.cjs
+      - name: Install the pinned Muse build
+        if: ${{ !cancelled() }}
+        env:
+          MUSE_VERSION: 1.4.23-R8977.1
+          MUSE_FILE: muse-aarch64-macos
+          MUSE_SHA256: 215a6eaac150f5855edc5a1df3b14ddfa504eb03690a4d65449887b396522fa8
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/muse"
+          curl --fail --location --silent --show-error --retry 3 \
+            "https://lookaside.facebook.com/lookaside/muse/download/?channel=muse&version=${MUSE_VERSION}&file=${MUSE_FILE}" \
+            --output "$RUNNER_TEMP/muse/muse"
+          echo "${MUSE_SHA256}  $RUNNER_TEMP/muse/muse" | shasum -a 256 --check
+          chmod +x "$RUNNER_TEMP/muse/muse"
+          "$RUNNER_TEMP/muse/muse" --version
+          echo "MUSE_CLI=$RUNNER_TEMP/muse/muse" >> "$GITHUB_ENV"
+      # Temporary. Each live test takes about 38 seconds on this runner and
+      # about one on Linux, which makes the suite below 17 minutes long. This
+      # step records where one Muse launch spends that time and can never fail
+      # the job. Remove it, and `scripts/time_muse_launch.py`, once the cause
+      # is known.
+      - name: Time one Muse launch
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 6
+        env:
+          MUSE_ACP_LOOPBACK: '1'
+          PYTHON: python3
+        run: python3 scripts/time_muse_launch.py
+      - name: Run the live-host suite
+        if: ${{ !cancelled() }}
+        env:
+          MUSE_ACP_LOOPBACK: '1'
+          PYTHON: python3
+        run: |
+          cargo test --locked -p muse-acp --test live_loopback -- --test-threads 2
+          # The MSP client crate on its own, without the adapter.
+          cargo test --locked -p muse-msp-client --test live_muse
+
   # Files one issue per failed job, so each failure gets tracked and fixed. A
   # job that keeps failing gets a comment on its open issue rather than a new
   # issue every night.
   report-failures:
-    needs: [platform, live-host, npm-launcher]
+    needs: [platform, live-host, npm-launcher, macos]
     if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 5
