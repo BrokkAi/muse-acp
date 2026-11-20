@@ -263,6 +263,19 @@ jobs:
           chmod +x "$RUNNER_TEMP/muse/muse"
           "$RUNNER_TEMP/muse/muse" --version
           echo "MUSE_CLI=$RUNNER_TEMP/muse/muse" >> "$GITHUB_ENV"
+      # Temporary. Each live test takes about 38 seconds on this runner and
+      # about one on Linux, which makes the suite below 17 minutes long. This
+      # step records where one Muse launch spends that time and can never fail
+      # the job. Remove it, and `scripts/time_muse_launch.py`, once the cause
+      # is known.
+      - name: Time one Muse launch
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 6
+        env:
+          MUSE_ACP_LOOPBACK: '1'
+          PYTHON: python3
+        run: python3 scripts/time_muse_launch.py
       - name: Run the live-host suite
         if: ${{ !cancelled() }}
         env:
