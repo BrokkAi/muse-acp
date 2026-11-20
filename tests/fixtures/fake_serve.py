@@ -266,9 +266,6 @@ import os
 import sys
 import threading
 import time
-import traceback
-import urllib.error
-import urllib.request
 
 FP = "sha256:03312c213efd14277a0e0a102f70adeae497a469ca4edf7242f479953ed758b7"
 SCHEMA = {"fingerprint": FP, "version": 1}
@@ -965,8 +962,6 @@ def question_params(user_input_id="ui-1"):
 
 
 EDITOR = [None]
-# The bridge is on 127.0.0.1; never route it through an environment proxy.
-BRIDGE_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
 
 def bridge_log(entry):
@@ -977,6 +972,11 @@ def bridge_log(entry):
 
 def bridge_post(entry, body, headers=None, method="POST"):
     """One HTTP exchange with the adapter's editor server: (status, JSON)."""
+    # Imported here rather than at the top: few scenarios talk HTTP, and
+    # loading urllib.request would cost every launch several milliseconds.
+    import urllib.error
+    import urllib.request
+
     data = None if body is None else json.dumps(body).encode()
     request = urllib.request.Request(entry["url"], data=data, method=method)
     for name, value in (entry.get("headers") or {} if headers is None
@@ -984,8 +984,10 @@ def bridge_post(entry, body, headers=None, method="POST"):
         request.add_header(name, value)
     request.add_header("content-type", "application/json")
     request.add_header("accept", "application/json, text/event-stream")
+    # The bridge is on 127.0.0.1; never route it through an environment proxy.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with BRIDGE_OPENER.open(request, timeout=60) as response:
+        with opener.open(request, timeout=60) as response:
             status, raw = response.status, response.read()
     except urllib.error.HTTPError as error:
         status, raw = error.code, error.read()
@@ -1056,6 +1058,8 @@ def editor_bridge_turn_guarded(base):
     try:
         editor_bridge_turn(base)
     except Exception:
+        import traceback
+
         traceback.print_exc()
         notify("turn/completed", {**base, "terminal": "failed", "error": {
             "kind": "internalError",
@@ -4040,4 +4044,7 @@ def main():
         log_method("shutdown-flushed")
 
 
-main()
+# Tests start the host through `fake_serve_launch.py`, which imports this file
+# so Python can reuse its cached bytecode. Running it directly still works.
+if __name__ == "__main__":
+    main()

@@ -2,9 +2,9 @@
 //!
 //! The fake host ([`fixtures/fake_serve.py`]) speaks just enough MSP JSON-RPC
 //! for the adapter handshake, then plays one scripted scenario per run. Each
-//! test points `MUSE_CLI` at the executable Python fixture (the adapter appends
-//! `serve`, which the fixture ignores) and drives ACP over stdio. Requires
-//! `python3` on PATH.
+//! test points `MUSE_CLI` at the executable launcher for that fixture (the
+//! adapter appends `serve`, which the fixture ignores) and drives ACP over
+//! stdio. Requires `python3` on PATH.
 
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -17,19 +17,21 @@ use std::time::{Duration, Instant};
 
 fn fixture() -> String {
     let dir = env!("CARGO_MANIFEST_DIR");
-    let extension = if cfg!(windows) { "cmd" } else { "py" };
-    format!("{dir}/tests/fixtures/fake_serve.{extension}")
+    format!("{dir}/tests/fixtures/{}", fixture_name())
 }
 
 fn temp_cwd_json() -> String {
     serde_json::to_string(&std::env::temp_dir()).expect("serialize temporary path")
 }
 
+/// The file a test runs as `muse`. Both names start `fake_serve_launch.py`,
+/// which imports the host from `fake_serve.py` so that Python compiles those
+/// 4,000 lines once per checkout instead of once per test.
 fn fixture_name() -> &'static str {
     if cfg!(windows) {
         "fake_serve.cmd"
     } else {
-        "fake_serve.py"
+        "fake_serve_launch.py"
     }
 }
 
