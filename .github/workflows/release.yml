@@ -13,12 +13,6 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
-env:
-  # The integration tests spend their time waiting on child processes rather
-  # than computing, so libtest's default of one thread per core leaves a hosted
-  # runner mostly idle. An explicit `--test-threads` still takes precedence.
-  RUST_TEST_THREADS: '16'
-
 jobs:
   build:
     name: build (${{ matrix.target }})

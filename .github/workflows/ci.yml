@@ -17,12 +17,6 @@ concurrency:
   group: ci-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-env:
-  # The integration tests spend their time waiting on child processes rather
-  # than computing, so libtest's default of one thread per core leaves a hosted
-  # runner mostly idle. An explicit `--test-threads` still takes precedence.
-  RUST_TEST_THREADS: '16'
-
 jobs:
   check:
     runs-on: ubuntu-latest

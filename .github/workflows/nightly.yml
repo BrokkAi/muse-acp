@@ -12,12 +12,6 @@ on:
 permissions:
   contents: read
 
-env:
-  # The integration tests spend their time waiting on child processes rather
-  # than computing, so libtest's default of one thread per core leaves a hosted
-  # runner mostly idle. An explicit `--test-threads` still takes precedence.
-  RUST_TEST_THREADS: '16'
-
 jobs:
   platform:
     strategy:
