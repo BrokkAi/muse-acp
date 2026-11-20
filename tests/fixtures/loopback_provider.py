@@ -39,6 +39,7 @@ Standard library only.
 """
 import json
 import re
+import socketserver
 import sys
 import threading
 import time
@@ -273,7 +274,23 @@ class Handler(BaseHTTPRequestHandler):
             "input_tokens": 1, "output_tokens": 1, "total_tokens": 2})})
 
 
-server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-server.daemon_threads = True
+class Server(ThreadingHTTPServer):
+    """The provider's HTTP server, bound without a name lookup."""
+
+    daemon_threads = True
+
+    def server_bind(self):
+        """Bind the socket and skip the standard library's name lookup.
+
+        `HTTPServer.server_bind` also calls `socket.getfqdn`, a reverse DNS
+        lookup of the bind address. On GitHub's macOS runners that lookup takes
+        about 35 seconds, and every live test starts its own provider and waits
+        for the port printed below. Nothing here reads `server_name`.
+        """
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
+server = Server(("127.0.0.1", 0), Handler)
 print(server.server_address[1], flush=True)
 server.serve_forever()
