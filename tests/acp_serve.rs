@@ -439,6 +439,36 @@ impl Client {
             .collect()
     }
 
+    /// Waits until `count` frames each contain every needle. Frames for
+    /// different child sessions arrive in no fixed order, so a test that
+    /// counts one child's frames waits for them here, not for another child's
+    /// last frame.
+    fn wait_for_count(&self, needles: &[&str], count: usize, timeout: Duration) {
+        let start = Instant::now();
+        loop {
+            let seen = self
+                .frames
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .filter(|frame| needles.iter().all(|needle| frame.contains(needle)))
+                .count();
+            if seen >= count {
+                return;
+            }
+            if start.elapsed() > timeout {
+                panic!(
+                    "timed out waiting for {count} frames containing {needles:?}, saw {seen}; got:\n{}",
+                    self.frames
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .join("\n")
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     fn wait_for_elicitation_count(&self, count: usize, timeout: Duration) -> Vec<String> {
         let start = Instant::now();
         loop {
@@ -7983,6 +8013,9 @@ fn steering_injects_into_the_exact_active_turn() {
         "\"type\": \"skill\", \"selector\": \"plan\", \"arguments\": \"prioritize tests\"",
         Duration::from_secs(15),
     );
+    // The echo follows the response, so the response arriving does not mean
+    // the echo has: wait for it before comparing their positions.
+    c.wait_for("/plan prioritize tests", Duration::from_secs(15));
 
     let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner());
     let response_pos = frames
@@ -13595,6 +13628,15 @@ fn a_settled_subagent_that_runs_again_is_shown_running() {
             "\"stopReason\":\"error\""
         };
         c.wait_for_all(&["child-sess-ready-c", failed], Duration::from_secs(15));
+        // Child a's second run can end after c settles: each child's frames
+        // follow its own transcript, so wait for the frames counted below.
+        if air {
+            let generation = "\"subagentSessionId\":\"child-sess-ready-a:generation:2\"";
+            c.wait_for_count(&[generation], 2, Duration::from_secs(15));
+        } else {
+            let child = "\"sessionId\":\"child-sess-ready-a\"";
+            c.wait_for_count(&[child, "\"state\":\"idle\""], 2, Duration::from_secs(15));
+        }
         let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let states: Vec<serde_json::Value> = frames
             .iter()
@@ -13645,6 +13687,15 @@ fn an_air_child_that_runs_again_is_a_new_generation() {
     c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
     c.wait_for_all(
         &["child-sess-ready-c", "\"state\":\"failed\""],
+        Duration::from_secs(15),
+    );
+    // The second generation can fail after c settles: wait for its terminal
+    // frame, which the comparison below expects.
+    c.wait_for_all(
+        &[
+            "\"subagentSessionId\":\"child-sess-ready-a:generation:2\"",
+            "\"state\":\"failed\"",
+        ],
         Duration::from_secs(15),
     );
     let frames = c.frames.lock().unwrap_or_else(|p| p.into_inner()).clone();
