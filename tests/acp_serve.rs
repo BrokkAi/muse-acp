@@ -12075,7 +12075,18 @@ fn workflow_child_control_keys_the_current_attempt() {
         "retry must settle on the admission ack: {frame}"
     );
     c.wait_input("\"action\": \"retry\"", Duration::from_secs(10));
-    c.wait_for("triage issue #1 [c1]: started", Duration::from_secs(15));
+    // The card already says "started" from attempt 1, so waiting for that
+    // text returns at once. Wait for the second card update instead, the one
+    // the host's attempt-2 announcement produces: only after it has the
+    // adapter folded attempt 2.
+    c.wait_for_count(
+        &[
+            "\"toolCallId\":\"workflow-it-wf-control\"",
+            "triage issue #1 [c1]: started",
+        ],
+        2,
+        Duration::from_secs(15),
+    );
 
     // The retry's announced attempt 2 keys the next control.
     let pid = c.prompt(&sid, "/workflow-child skip c1");
