@@ -24,7 +24,10 @@ env:
   RUST_TEST_THREADS: '16'
 
 jobs:
-  check:
+  # `lint` and `test` run side by side, so a pull request waits for the slower
+  # of the two instead of for one after the other. `check` is the status that
+  # branch protection requires, and it passes only when both of them did.
+  lint:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -50,9 +53,38 @@ jobs:
           if ($errors.Count -gt 0) { throw ($errors | Out-String) }
       - run: cargo fmt --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
       - run: cargo test --locked --workspace
       - run: ./target/debug/muse-acp --selftest
       - run: node scripts/smoke_npm.cjs target/debug/muse-acp
+
+  check:
+    needs: [lint, test]
+    # Without this a failed dependency would skip the job, and GitHub counts a
+    # skipped required check as passed.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require lint and test to have passed
+        env:
+          LINT: ${{ needs.lint.result }}
+          TEST: ${{ needs.test.result }}
+        run: |
+          echo "lint: $LINT, test: $TEST"
+          [ "$LINT" = success ] && [ "$TEST" = success ]
 
   msrv:
     runs-on: ubuntu-latest
