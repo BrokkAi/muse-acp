@@ -22,6 +22,9 @@ env:
   # than computing, so libtest's default of one thread per core leaves a hosted
   # runner mostly idle. An explicit `--test-threads` still takes precedence.
   RUST_TEST_THREADS: '16'
+  # A hosted runner starts from a fresh checkout, so incremental compilation
+  # has nothing to reuse; its artifacts would only make the cache below larger.
+  CARGO_INCREMENTAL: '0'
 
 jobs:
   # `lint` and `test` run side by side, so a pull request waits for the slower
@@ -35,8 +38,21 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        id: toolchain
         with:
           components: rustfmt, clippy
+      # Compiled dependencies, keyed on the compiler and Cargo.lock, so a run
+      # rebuilds only this repository's own crates. Only this workflow has a
+      # cache: release.yml and nightly.yml never restore one, so nothing saved
+      # here can reach a published binary.
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-lint-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
@@ -62,6 +78,15 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        id: toolchain
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-test-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '24'
@@ -94,8 +119,17 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        id: toolchain
         with:
           toolchain: 1.88.0
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-msrv-${{ runner.os }}-${{ runner.arch }}-${{ steps.toolchain.outputs.cachekey }}-${{ hashFiles('Cargo.lock') }}
       - run: cargo test --locked --workspace
 
   npm-launcher:
