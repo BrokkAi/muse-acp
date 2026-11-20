@@ -39,10 +39,12 @@ SILENCE = 1.0             # a gap this long is called out in the timeline
 
 
 def say(text=''):
+    """Print a line now, so it lands in order with child output."""
     print(text, flush=True)
 
 
 def heading(title):
+    """Start a section of the report."""
     say()
     say('=== ' + title + ' ===')
 
@@ -71,6 +73,11 @@ def describe(kind, line):
 
 
 def proxy(real, log_dir, args):
+    """Run `real` in our place and log when each line crossed.
+
+    Every byte is forwarded unchanged in both directions. Returns the
+    host's exit status for the caller to exit with.
+    """
     log = open(os.path.join(log_dir, 'launch-%d.jsonl' % os.getpid()), 'a')
     lock = threading.Lock()
 
@@ -87,8 +94,8 @@ def proxy(real, log_dir, args):
         record('signal', signum)
         try:
             child.send_signal(signum)
-        except OSError:
-            pass
+        except OSError as error:
+            record('signal not forwarded', str(error))
 
     signal.signal(signal.SIGTERM, forward)
     signal.signal(signal.SIGINT, forward)
@@ -121,8 +128,8 @@ def proxy(real, log_dir, args):
         if close is not None:
             try:
                 close()
-            except OSError:
-                pass
+            except OSError as error:
+                record(kind + ' close failed', str(error))
 
     # Reading our stdin can block after the host is gone, hence a daemon.
     threading.Thread(target=pump, daemon=True,
@@ -151,23 +158,27 @@ def run_quiet(command, limit=30):
         return '(%s: %s)' % (command[0], error)
 
 
+def parse_record(line):
+    """One log record, or None for a line the proxy is still writing."""
+    try:
+        return json.loads(line)
+    except ValueError:
+        return None
+
+
 def launches(log_dir):
     """Each proxied launch as its list of records, oldest launch first."""
     found = []
     for path in glob.glob(os.path.join(log_dir, 'launch-*.jsonl')):
         with open(path) as handle:
-            records = []
-            for line in handle:
-                try:
-                    records.append(json.loads(line))
-                except ValueError:
-                    pass  # a line still being written
+            records = [record for record in map(parse_record, handle) if record]
         if records:
             found.append(records)
     return sorted(found, key=lambda records: records[0]['t'])
 
 
 def alive(pid):
+    """Whether a process with this pid still exists."""
     try:
         os.kill(pid, 0)
         return True
@@ -176,6 +187,7 @@ def alive(pid):
 
 
 def muse_pids(log_dir):
+    """Pids of the Muse processes the proxy started that are still running."""
     pids = []
     for records in launches(log_dir):
         if records[0]['kind'] == 'launch' and not any(r['kind'] == 'exit' for r in records):
@@ -230,6 +242,7 @@ def sample(log_dir, at):
 
 
 def timeline(records):
+    """Print one launch's records with their offsets and longest silences."""
     start = records[0]['t']
     argv = records[0]['what'].get('argv') if records[0]['kind'] == 'launch' else None
     say('launch: %s' % ' '.join(argv or ['?']))
@@ -254,6 +267,7 @@ def timeline(records):
 
 
 def drive():
+    """Time a bare launch, run the live test through the proxy, and report."""
     muse = os.environ.get('MUSE_CLI') or shutil.which('muse')
     if not muse or not os.path.isfile(muse):
         say('MUSE_CLI does not name a Muse binary; nothing to time.')
@@ -335,6 +349,7 @@ def drive():
 
 
 def main(argv):
+    """Run as the proxy when asked to, otherwise as the driver."""
     if len(argv) >= 4 and argv[0] == '--proxy' and argv[3] == '--':
         return proxy(argv[1], argv[2], argv[4:])
     if argv:
