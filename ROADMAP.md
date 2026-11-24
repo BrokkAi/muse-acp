@@ -4,16 +4,16 @@ This is a living roadmap for `muse-acp`. It records the direction that keeps the
 adapter close to Muse Session Protocol (MSP), safe around approvals and file
 access, and useful in real editor workflows.
 
-- **Last revised:** 2026-10-29
+- **Last revised:** 2026-11-24
 - **Original planning baseline:** `v0.2.5`; current release history is in
   [CHANGELOG.md](CHANGELOG.md).
 - **Protocol sources:** [Muse Code SDK][sdk] and [Muse Code Developer Docs][docs]
 - **Comparable adapter used for feature benchmarking:** [`codex-acp`][codex-acp]
-- **Reference snapshots used for this revision:** the Muse 1.4.23 stable
+- **Reference snapshots used for this revision:** the Muse 1.4.25 stable
   surface (stable schema version 1, compatibility epoch 0, fingerprint
-  `sha256:b7fb9137267aa35c92424df37a5ac56287006a0e546b197bf0930d593fecbdb1`),
-  vendored from Muse SDK `5fc95e5` (2026-11-17), byte-identical to the stable
-  1.4.23-R8977.1 build's own `muse schema generate-json-schema` export,
+  `sha256:6bf518067b065a503ea7d4f081a44fc056b532cf4b362a1894024863b25fb2aa`),
+  vendored from Muse SDK `e6ef4a6` (2026-11-21), byte-identical to the stable
+  1.4.25-R9361.1 build's own `muse schema generate-json-schema` export,
   validated against that build and pinned in the live-host matrix; the
   fingerprint is the live handshake's and the release manifest's. The
   transcript corpus is the same SDK revision. Also `codex-acp` `51d6247` (v1.11.0, 2026-09-10).
@@ -105,8 +105,9 @@ the verdict into richer support bundles.
   fingerprint, the `a45cb67` pin published the 1.4.14 fingerprint, the
   `07e1548` pin published the 1.4.15 surface, whose fingerprint the SDK
   manifest no longer carries, the 1.4.18 stable bundle was that build's own
-  export, the `649ca21` pin published the 1.4.20 surface, and the `5fc95e5`
-  pin publishes the current 1.4.23 surface.
+  export, the `649ca21` pin published the 1.4.20 surface, the `5fc95e5` pin
+  published the 1.4.23 surface, and the `e6ef4a6` pin publishes the current
+  1.4.25 surface.
   Host 1.2.1 reports
   `sha256:c7ff6c5d1e89cd42f803aea1f05b8e72082f2099685802473eb726903484713b`
   (schema version 1; stable surface verified additive against the vendored
@@ -296,6 +297,17 @@ the verdict into richer support bundles.
   and the handshake's compatibility epoch, with every table unchanged; each
   has a §9 disposition. Its Linux, macOS, and Windows artifacts are pinned in
   the nightly matrix. No 1.4.21 or 1.4.22 build was available to validate.
+  The `e6ef4a6` pin publishes the 1.4.25 surface
+  (`sha256:6bf518067b065a503ea7d4f081a44fc056b532cf4b362a1894024863b25fb2aa`,
+  schema version 1, compatibility epoch 0), byte-identical to the
+  `1.4.25-R9361.1` build's own export; the release manifest publishes the
+  same fingerprint. Muse 1.4.24 has no stable-schema change. Over 1.4.23,
+  1.4.25 adds the optional pruned-child identity fields
+  (`PrunedSubagent.parentSubagentId` and `PrunedSubagent.subagentId`) and
+  clarifies two descriptions, with every table and required member unchanged;
+  both additions have a §9 disposition. Its Linux, macOS, and Windows
+  artifacts are pinned in the nightly matrix. Muse 1.4.24 remains
+  unvalidated, so its fingerprint stays unclassified.
   Before 1.4.6, the
   Python tree and PyPI `muse-code-sdk` 1.3.1 published an intermediate
   `sha256:b1e6676d624e116e2c1b150fec3192200d2cbca8ed79898e44f8921759c7872f`
@@ -332,7 +344,7 @@ The SDK publishes generated MSP types, a schema bundle, and recorded transcripts
 The Rust adapter should consume those artifacts as conformance inputs.
 
 Status: **emissions validated and permission paths replayed.**
-`tests/protocol/` pins SDK revision `5fc95e5` (stable manifest, JSON schema
+`tests/protocol/` pins SDK revision `e6ef4a6` (stable manifest, JSON schema
 bundle, 58 golden transcripts) with provenance and license. CI now replays
 every server-side item event through the notification fold (unknown kinds must
 tolerate), validates every emitted ACP frame with the adapter's own parser,
@@ -411,7 +423,7 @@ their first Windows evidence.
 
 **Work items**
 
-- Pin the SDK revision (currently `5fc95e5`, 2026-11-17) and vendor
+- Pin the SDK revision (currently `e6ef4a6`, 2026-11-21) and vendor
   `schema/msp/stable/manifest.json`, `schema/msp/stable/msp.schema.json`, and
   the `schema/msp/transcripts/` corpus under `tests/protocol/`, or fetch that
   locked revision in CI. The corpus already covers approvals, cancellation,
@@ -787,12 +799,12 @@ path, preserving the fail-closed policy from §4.
 
 **Muse 1.4.x stable-surface additions**
 
-Muse 1.4.1 through 1.4.23 grew the stable surface well past 1.3.0. The adapter
+Muse 1.4.1 through 1.4.25 grew the stable surface well past 1.3.0. The adapter
 adopts the parts that fit its ACP mapping (workspace roots, reasoning tiers,
 session delete on the hosts that serve it, `feedback/submit`, and
 `session/list` filters) and records an explicit disposition below for the
 rest, with a tracking issue where behavior remains undecided. The pinned
-`5fc95e5` bundle is the authority.
+`e6ef4a6` bundle is the authority.
 The rows below record a disposition for the 1.4.x additions the adapter does
 not drive, plus `feedback/submit`, which it does; incoming notifications with
 no adapter arm stay safe because the unknown-method path in the fold logs and
@@ -993,6 +1005,24 @@ skill catalog (ACP's unstable agent skills run the other way), the stock
 does not act as a journal store. Plugin origins reach the editor unchanged,
 because `_session/plugins` returns the `plugin/list` result verbatim.
 
+Muse 1.4.25 changes only two stable fields, both on a pruned child below a
+checkpoint boundary: `PrunedSubagent.parentSubagentId` and
+`PrunedSubagent.subagentId`. They reach the adapter only through
+`SessionReadResult.prunedSubagents` and
+`SessionResumeResult.prunedSubagents`, which it intentionally ignores because
+its reads replay transcript items and pruned children have no transcript or
+running state to announce. On the experimental surface the adapter opts into,
+1.4.24 and 1.4.25 add workflow phase-plan facts, a backgrounded shell's
+persistent background status, a plugin-removal lifecycle, a `gate` field on
+experimental method refusals, fork configuration and model selection, client
+record reporting, and internal journal simplifications. The adapter maps
+`plugin/remove` through `/plugin remove <id> [--delete-data]`; ordinary removal
+preserves plugin data, and `plugin/removed` refreshes `skill/list`,
+available commands, and negotiated `hook/list` inventory. `ErrorData.gate`
+keeps its typed data on an ACP error and plugin refusals name the disabled
+gate. The adapter does not report client records and does not act as a journal
+store. Workflow phase plans remain tolerated but unmapped.
+
 **Muse 1.4.x field-level and vocabulary additions**
 
 Muse 1.4.6 grew fields and open vocabularies the adapter's tolerant fold had to
@@ -1135,6 +1165,8 @@ cannot drop a member without failing CI.
 | `ApprovalCuaCardFacts.browser` | Mapped to ACP | A Muse 1.4.23 Computer Use browser card leads its permission prompt with `Browser: <name>` (host display text, quoted as a code span like the window title) and words each notice the host flags, since the schema leaves the words to the client: `firstUse` adds "First use: Computer Use has not used this browser on this Mac before, and it will act signed in as you.", and `windowConsent` adds "Computer Use will open its own window in this browser and bring the browser to the front (asked once per session)." An absent or `false` flag shows nothing. The facts still ride `_meta.muse.cuaCardFacts` verbatim. |
 | `Item.terminalRowBeforeItemId` | Mapped to ACP | Muse 1.4.23 names the item whose rows a `backgroundTerminalCompletion` or a Finished-row `toolCall` renders before. History replay moves such a row in front of that item when the item comes earlier in the batch; rows moved in front of one item keep their order, a moved row does not open or close a turn, and a row also held by `terminalRowAfterItemId` still waits for that anchor. A live row cannot be moved in front of a card the editor already shows, because ACP only appends, and one whose target has not rendered yet already lands before it. The host's "coalesced region" is its TUI grouping; the adapter gives each item its own card. |
 | `SchemaInfo.compatibilityEpoch` | Consumed | Muse 1.4.23 reports the count of declared non-additive advances of the stable surface; the vendored bundle records its own (0) at its root, pinned by `compat::SDK_COMPATIBILITY_EPOCH`. The `schema-compat` line logs `compatibility_epoch=` (`absent` for older hosts or a value that is not a non-negative integer). A recorded fingerprint keeps its verdict. An unrecorded one at the vendored epoch is `degraded` ("every stable difference is additive") instead of `unknown`; at another epoch it stays `unknown` and the detail names the declared non-additive advance. Neither blocks: only the envelope schema version does. |
+| `PrunedSubagent.parentSubagentId` | Intentionally ignored | Muse 1.4.25 can name the nested parent of a child pruned below a checkpoint. It rides `SessionReadResult.prunedSubagents` and `SessionResumeResult.prunedSubagents`, which the adapter already ignores because its reads replay transcript items only and pruned children have no transcript or running state to announce. |
+| `PrunedSubagent.subagentId` | Intentionally ignored | Muse 1.4.25 can add the pruned child's durable subagent id beside the session id. The adapter does not expose the pruned-child roster, so the new optional join key has no ACP surface. |
 <!-- msp-1.4.x-field-matrix:end -->
 
 **Acceptance criteria**

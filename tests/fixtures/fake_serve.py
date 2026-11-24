@@ -82,7 +82,9 @@ Scenarios (TURN_N = incrementing turn id per turn/start):
   task_list_seed task/list seeds async tasks after a resume whose history is
                empty (skipping a 1.4.12 foreground row); the item terminal
                then settles the seeded task
-  plugin_control plugin/list rows and the install/marketplace write receipts
+  plugin_control plugin/list rows, plugin/removed refresh, and the
+               install/remove/marketplace receipts; FAKE_PLUGIN_REMOVE_ERROR=gate
+               or missing refuses removal with the corresponding typed body
   media_upload media/upload chunks reassemble into the video store
   async_task_stop       background task then a targeted task/stop terminal
   async_task_stop_all   background tasks then task/stopAll terminals
@@ -309,6 +311,7 @@ DRIVE_HANDOVER = (SCENARIO in ("drive_taken", "drive_busy")
                   or DRIVE_LOST_AFTER_TURN[0])
 USAGE_READS = [0]
 SKILL_READS = [0]
+PLUGIN_REMOVED = [False]
 # media/upload chunks received per uploadId, with the assembled bytes appended
 # to <FAKE_LOG>.upload for the test to compare.
 UPLOADS = {}
@@ -2313,6 +2316,13 @@ def result_for(method, msg):
             "argumentHint": "what to plan",
             "source": "bundled",
         }]
+        if SCENARIO == "plugin_control" and not PLUGIN_REMOVED[0]:
+            skills.append({
+                "selector": "threejs",
+                "description": "Build three-dimensional scenes",
+                "displayName": "Three.js",
+                "source": "plugin",
+            })
         if SCENARIO == "skill_titles":
             # Muse 1.4.8: `title` is the skill's declared name and is absent
             # when the skill declares none; `displayName` stays required.
@@ -3006,12 +3016,15 @@ def result_for(method, msg):
         return {"uploadId": upload_id}
     if method == "plugin/list":
         log_input(msg.get("params", {}))
-        return {"plugins": [
+        plugins = [
             {"id": "threejs", "version": "1.2.0", "enabled": True,
-             "source": "curated"},
+             "source": "curated", "origin": {"marketplace": "acme"}},
             {"id": "local-tools", "version": "0.1.0", "enabled": False,
-             "source": "nativeLocal"},
-        ]}
+             "source": "nativeLocal", "origin": {"localPath": "/tmp/plugins/local-tools"}},
+        ]
+        if PLUGIN_REMOVED[0]:
+            plugins = [row for row in plugins if row["id"] != "threejs"]
+        return {"plugins": plugins}
     if method == "plugin/install":
         params = msg.get("params", {})
         log_input(params)
@@ -3022,6 +3035,19 @@ def result_for(method, msg):
         return {"commandId": params.get("commandId", ""), "status": "accepted",
                 "id": "threejs", "version": "1.2.0", "enabled": True,
                 "source": "curated", "warning": "restart the session to load it"}
+    if method == "plugin/remove":
+        params = msg.get("params", {})
+        log_input(params)
+        PLUGIN_REMOVED[0] = True
+        notify("plugin/removed", {
+            "sessionId": params.get("sessionId", MSP_SID),
+            "id": params.get("id", "")})
+        result = {"commandId": params.get("commandId", ""),
+                  "status": "accepted", "id": params.get("id", "")}
+        warning = os.environ.get("FAKE_PLUGIN_REMOVE_WARNING", "")
+        if warning:
+            result["warning"] = warning
+        return result
     if method in ("plugin/marketplaceAdd", "plugin/marketplaceUpdate"):
         params = msg.get("params", {})
         log_input(params)
@@ -3564,6 +3590,25 @@ def main():
                                           "reason": reason, "retryable": False}}
                     send({"jsonrpc": "2.0", "id": ident, "error": error})
                     continue
+                if method == "plugin/remove":
+                    failure = os.environ.get("FAKE_PLUGIN_REMOVE_ERROR", "")
+                    if failure == "gate":
+                        log_input(msg.get("params", {}))
+                        send({"jsonrpc": "2.0", "id": ident,
+                              "error": {"code": -32601,
+                                        "message": "Method not found",
+                                        "data": {"kind": "methodNotFound",
+                                                 "gate": "pluginMutations"}}})
+                        continue
+                    if failure == "missing":
+                        params = msg.get("params", {})
+                        log_input(params)
+                        send({"jsonrpc": "2.0", "id": ident,
+                              "error": {"code": -32035,
+                                        "message": "plugin not found",
+                                        "data": {"kind": "pluginNotFound",
+                                                 "id": params.get("id", "")}}})
+                        continue
                 if (method == "session/list" and os.environ.get("FAKE_LIST_REJECT_CURSOR") == "1"
                         and msg.get("params", {}).get("cursor")):
                     send({"jsonrpc": "2.0", "id": ident,

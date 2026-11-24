@@ -13,8 +13,8 @@
 //! body completion, Bash Title, superseded result, notice origin, error
 //! kinds, stop refusal, experimental fingerprint, developer prompt, and read
 //! additions, the 1.4.20 re-pin's clear flag, and the 1.4.23 re-pin's
-//! browser notices, before-anchor, and compatibility epoch, join the same
-//! matrix),
+//! browser notices, before-anchor, and compatibility epoch, and the 1.4.25
+//! re-pin's pruned-child identity fields, join the same matrix),
 //! whether it earns an ACP mapping or an explicit "Intentionally ignored"
 //! disposition. This test keeps that matrix
 //! honest in two ways: every addition has exactly one disposition row in
@@ -154,6 +154,8 @@ const ADDITIONS: &[&str] = &[
     "ApprovalCuaCardFacts.browser",
     "Item.terminalRowBeforeItemId",
     "SchemaInfo.compatibilityEpoch",
+    "PrunedSubagent.parentSubagentId",
+    "PrunedSubagent.subagentId",
 ];
 
 fn matrix() -> String {
@@ -458,6 +460,8 @@ fn every_field_addition_is_still_in_the_vendored_bundle() {
         ("ApprovalCuaBrowser", "windowConsent"),
         ("Item", "terminalRowBeforeItemId"),
         ("SchemaInfo", "compatibilityEpoch"),
+        ("PrunedSubagent", "parentSubagentId"),
+        ("PrunedSubagent", "subagentId"),
     ] {
         assert!(
             has_property(defs, def, member),

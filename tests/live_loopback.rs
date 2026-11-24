@@ -2466,6 +2466,53 @@ fn plugin_inventory_and_typed_refusals_reach_a_real_host() {
             "{response}"
         );
     }
+    if release >= (1, 4, 24) {
+        let id = adapter.request(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{
+                "type": "text",
+                "text": "/plugin list",
+            }]}),
+        );
+        let response = adapter.response(id);
+        assert!(
+            response["result"]["messageId"].is_string()
+                || response["result"]["stopReason"] == json!("end_turn"),
+            "plugin list settles as an ordinary command: {response}"
+        );
+        adapter.wait("the real plugin inventory text", |frame| {
+            frame["method"] == "session/update"
+                && frame["params"]["sessionId"] == json!(session)
+                && frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+                && frame["params"]["update"]["content"]["text"]
+                    .as_str()
+                    .is_some_and(|text| {
+                        text == "No Muse plugins are installed for this session."
+                            || text.starts_with("Installed Muse plugins (")
+                    })
+        });
+
+        let id = adapter.request(
+            "session/prompt",
+            json!({"sessionId": session, "prompt": [{
+                "type": "text",
+                "text": "/plugin remove no-such-muse-acp-plugin",
+            }]}),
+        );
+        let response = adapter.response(id);
+        let error = &response["error"];
+        assert!(
+            (error["code"] == json!(-32035) && error["data"]["kind"] == json!("pluginNotFound"))
+                || (error["code"] == json!(-32601)
+                    && error["data"]["gate"] == json!("pluginMutations"))
+                || (error["code"] == json!(-32603)
+                    && error["message"]
+                        .as_str()
+                        .is_some_and(|message| message
+                            .contains("plugin/remove is not available on this host"))),
+            "a refused removal keeps the host's typed plugin or gate refusal: {response}"
+        );
+    }
     adapter.finish();
 }
 

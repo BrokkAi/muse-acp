@@ -84,6 +84,10 @@ jobs:
             runner: ubuntu-24.04
             file: muse-x86-linux
             sha256: 7ca9e16659f759eab3ae6c4b61c6f1e70f5f3fea1ca961ebd49044a1146956f4
+          - version: 1.4.25-R9361.1
+            runner: ubuntu-24.04
+            file: muse-x86-linux
+            sha256: c1b728fb9732503c5e1869e3ad2f2c9bdb5b2638fb4cf398d6e2c46aa6d8f94a
           # macOS arm64 runs only the newest pin, in the `macos` job below.
           # Windows x64 legs cover the workspace-root flows on each supported
           # pinned build: multi-root `session/start`, and the sticky
@@ -128,6 +132,11 @@ jobs:
             runner: windows-2025
             file: muse-x86-windows.exe
             sha256: 9ff96e49e2c623f35ea002a4aab08c29b08878636cbe218be388f8e0d5f33de1
+            tests: workspace-roots
+          - version: 1.4.25-R9361.1
+            runner: windows-2025
+            file: muse-x86-windows.exe
+            sha256: eb03512b06982dd02481fcf5f090442824d92ff6070607afe5c7228596f3b089
             tests: workspace-roots
     runs-on: ${{ matrix.muse.runner }}
     timeout-minutes: 20
@@ -250,9 +259,9 @@ jobs:
       - name: Install the pinned Muse build
         if: ${{ !cancelled() }}
         env:
-          MUSE_VERSION: 1.4.23-R8977.1
+          MUSE_VERSION: 1.4.25-R9361.1
           MUSE_FILE: muse-aarch64-macos
-          MUSE_SHA256: 215a6eaac150f5855edc5a1df3b14ddfa504eb03690a4d65449887b396522fa8
+          MUSE_SHA256: d8faeec8b3a2507125d97f1a79ae18781d254e8cd376f26531587fb6e043c27d
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/muse"

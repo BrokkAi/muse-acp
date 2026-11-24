@@ -499,10 +499,13 @@ error the editor shows if Muse then refuses the profile says why.
   session: attach it with `session/resume`/`session/load`, and its parent
   link arrives in `session_info_update._meta.muse.sideFrom`.
 - **Plugins** — the opt-in `_session/plugins` extension reads the session's
-  installed plugin rows (`plugin/list`), and `/plugin install <marketplace>
-  <name>` (or `/plugin install <path> [scope]`) plus `/plugin marketplace
-  add|remove|update` drive the host's install and marketplace writes. Change
-  notices are diagnostics; clients re-read the extension instead of a cache.
+  installed plugin rows (`plugin/list`). `/plugin list` provides the same
+  inventory as command text; `/plugin install <marketplace> <name>` (or
+  `/plugin install <path> [scope]`), `/plugin remove <id> [--delete-data]`,
+  and `/plugin marketplace add|remove|update` drive the host's lifecycle
+  writes. Data deletion requires the explicit flag.
+  `plugin/removed` refreshes plugin-provided skills and hooks; clients re-read
+  the extension instead of a cache.
 - **Computer use** — with the client's `_meta.muse.computerUse` opt-in, the
   adapter requests both the per-session `computerUseSetup` and host-wide
   `computerUseHostSetup` grants. `/cua host` reads the host's setup state and
@@ -960,18 +963,18 @@ compatibility table, and reports whether the configured Muse CLI can be invoked
 (`cli-ready` or `cli-unready`). It exits `0` even when Muse is not installed, so
 you can collect output on a machine that is still being set up.
 
-The current vendored surface is Muse 1.4.23
-(`sha256:b7fb9137267aa35c92424df37a5ac56287006a0e546b197bf0930d593fecbdb1`,
-compatibility epoch 0), taken from Muse SDK revision `5fc95e5`, which is
-byte-identical to the 1.4.23 build's own schema export. The adapter live suite
-passes against `1.4.23-R8977.1`, and the 1.4.23 Linux, macOS, and Windows
-artifacts are pinned in the nightly matrix. The nightly live-host support floor
-is Muse 1.4.11: 1.4.11 through 1.4.15, 1.4.18, 1.4.20, and 1.4.23 run on Linux
-x86-64 and Windows x64, and the newest build runs on macOS arm64. Muse 1.4.16,
-1.4.17, 1.4.19, 1.4.21, and 1.4.22 were not available to validate, so the
-adapter logs their fingerprints as `unknown` and still runs. Older fingerprints
-remain recorded as historical compatibility evidence but are no longer
-downloaded for every nightly run.
+The current vendored surface is Muse 1.4.25
+(`sha256:6bf518067b065a503ea7d4f081a44fc056b532cf4b362a1894024863b25fb2aa`,
+compatibility epoch 0), taken from Muse SDK revision `e6ef4a6`, which is
+byte-identical to the 1.4.25 build's own schema export. A real
+`1.4.25-R9361.1` handshake reports the pinned fingerprint, and the 1.4.25
+Linux, macOS, and Windows artifacts are pinned in the nightly matrix. The
+nightly live-host support floor is Muse 1.4.11: 1.4.11 through 1.4.15, 1.4.18,
+1.4.20, 1.4.23, and 1.4.25 run on Linux x86-64 and Windows x64, and the newest
+build runs on macOS arm64. Muse 1.4.16, 1.4.17, 1.4.19, 1.4.21, 1.4.22, and
+1.4.24 remain unvalidated, so the adapter logs their fingerprints as `unknown`
+and still runs. Older fingerprints remain recorded as historical compatibility
+evidence but are no longer downloaded for every nightly run.
 
 Muse 1.4.23 and later also report a compatibility epoch, which the
 `schema-compat` line logs as `compatibility_epoch=`. A newer Muse whose

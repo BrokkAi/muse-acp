@@ -470,6 +470,9 @@ pub fn acp_error_code(error: &J, fallback: i64) -> i64 {
     if auth_failure(&err_message(error)).is_some() {
         return -32000;
     }
+    if error_gate(error).is_some() {
+        return -32601;
+    }
     let kind = error
         .get("data")
         .and_then(|data| data.get("kind"))
@@ -571,27 +574,41 @@ impl fmt::Display for LaunchError {
 
 /// Structured data for the MSP request errors ACP clients need to branch on:
 /// rejected commands and skill selectors, plugin/marketplace write refusals,
-/// and capability-gated methods. The host payload stays visible so a client
-/// sees which command, selector, marketplace, plugin, or capability was
-/// refused.
+/// capability-gated methods, and experimental verbs whose host gate is off.
+/// The host payload stays visible so a client sees which command, selector,
+/// marketplace, plugin, capability, or gate was involved.
 pub fn typed_error_data(error: &J) -> Option<String> {
     let data = error.get("data")?;
     let kind = data
         .get("kind")
         .and_then(|kind| kind.as_str())
         .unwrap_or("");
-    let typed = matches!(
-        kind,
-        "commandRejected"
-            | "skillNotFound"
-            | "marketplaceNotFound"
-            | "pluginNotFound"
-            | "marketplaceAlreadyExists"
-            | "pluginMutationsDisabled"
-            | "computerUseUnavailable"
-            | "capabilityRequired"
-    );
+    let typed = error_gate(error).is_some()
+        || matches!(
+            kind,
+            "commandRejected"
+                | "skillNotFound"
+                | "marketplaceNotFound"
+                | "pluginNotFound"
+                | "marketplaceAlreadyExists"
+                | "pluginMutationsDisabled"
+                | "computerUseUnavailable"
+                | "capabilityRequired"
+        );
     typed.then(|| j_to_string(data))
+}
+
+/// The host gate named by an experimental method's `methodNotFound` refusal.
+///
+/// Old hosts and intentionally disabled features both answer `-32601`;
+/// `ErrorData.gate` is the only fact that distinguishes a disabled gate from
+/// a method the host does not implement.
+pub fn error_gate(error: &J) -> Option<&str> {
+    error
+        .get("data")?
+        .get("gate")?
+        .as_str()
+        .filter(|gate| !gate.trim().is_empty())
 }
 
 /// The host's error shape for one capability-gated method on a connection
@@ -1706,6 +1723,20 @@ mod tests {
         assert_eq!(
             super::typed_error_data(&error).as_deref(),
             Some(r#"{"kind":"commandRejected","reason":"runtime_busy","retryable":false}"#)
+        );
+    }
+
+    #[test]
+    fn a_disabled_experimental_gate_keeps_its_typed_data() {
+        let error = crate::json::parse_json(
+            r#"{"code":-32601,"message":"Method not found","data":{"kind":"methodNotFound","gate":"pluginMutations"}}"#,
+        )
+        .expect("error JSON");
+        assert_eq!(super::error_gate(&error), Some("pluginMutations"));
+        assert_eq!(super::acp_error_code(&error, -32603), -32601);
+        assert_eq!(
+            super::typed_error_data(&error).as_deref(),
+            Some(r#"{"kind":"methodNotFound","gate":"pluginMutations"}"#)
         );
     }
 }
