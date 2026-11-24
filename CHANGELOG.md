@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.26.0
 
 - Complete the slash-command plugin lifecycle with `/plugin list` and
   `/plugin remove <id> [--delete-data]` on hosts that serve Muse 1.4.24+
