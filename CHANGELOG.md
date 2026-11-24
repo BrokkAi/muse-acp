@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Complete the slash-command plugin lifecycle with `/plugin list` and
+  `/plugin remove <id> [--delete-data]` on hosts that serve Muse 1.4.24+
+  `plugin/remove`. Ordinary removal preserves the plugin's data;
+  `--delete-data` opts into deletion. `plugin/removed` refreshes
+  plugin-provided skills and negotiated hook inventory, and experimental
+  gate refusals retain `ErrorData.gate` with an actionable message.
+- Adopt the Muse 1.4.25 stable surface. The vendored stable bundle and
+  transcript corpus move to Muse SDK `e6ef4a6`; the official
+  1.4.25-R9361.1 manifest publishes fingerprint `sha256:6bf518067b065a503ea7d4f081a44fc056b532cf4b362a1894024863b25fb2aa`
+  at compatibility epoch 0. The stable change adds optional pruned-child
+  identity fields the adapter already ignores; methods, notifications,
+  requests, errors, capabilities, and requirements are unchanged. The 1.4.23
+  fingerprint remains tested, and 1.4.25 joins the Linux, macOS, and Windows
+  nightly matrix.
+
 ## 0.25.0
 
 - Adopt the Muse 1.4.23 stable surface. The vendored stable bundle and

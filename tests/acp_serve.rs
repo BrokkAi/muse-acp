@@ -9098,17 +9098,15 @@ fn a_malformed_compatibility_epoch_reads_as_absent() {
 }
 
 #[test]
-fn sdk_manifest_fingerprint_is_the_1_4_23_surface() {
-    // The vendored stable bundle is SDK 5fc95e5's, byte-identical to the
-    // 1.4.23-R8977.1 build's own export, and that build in the nightly
-    // live-host matrix reports this digest, so the adapter classifies it as
-    // tested.
+fn sdk_manifest_fingerprint_is_the_1_4_25_surface() {
+    // The vendored stable bundle is SDK e6ef4a6's, and the official
+    // 1.4.25-R9361.1 release manifest publishes this digest.
     let mut c = Client::spawn(
         "quiet",
         &[
             (
                 "FAKE_FINGERPRINT",
-                "sha256:b7fb9137267aa35c92424df37a5ac56287006a0e546b197bf0930d593fecbdb1",
+                "sha256:6bf518067b065a503ea7d4f081a44fc056b532cf4b362a1894024863b25fb2aa",
             ),
             ("FAKE_COMPATIBILITY_EPOCH", "0"),
         ],
@@ -9116,7 +9114,25 @@ fn sdk_manifest_fingerprint_is_the_1_4_23_surface() {
     c.initialize(1, "");
     c.wait_stderr("status=tested", Duration::from_secs(10));
     c.wait_stderr(
-        "validated against live host 1.4.23-R8977.1; the vendored SDK 5fc95e5 surface",
+        "validated against live host 1.4.25-R9361.1; the vendored SDK e6ef4a6 surface",
+        Duration::from_secs(10),
+    );
+    c.finish();
+}
+
+#[test]
+fn the_1_4_23_fingerprint_stays_tested() {
+    let mut c = Client::spawn(
+        "quiet",
+        &[(
+            "FAKE_FINGERPRINT",
+            "sha256:b7fb9137267aa35c92424df37a5ac56287006a0e546b197bf0930d593fecbdb1",
+        )],
+    );
+    c.initialize(1, "");
+    c.wait_stderr("status=tested", Duration::from_secs(10));
+    c.wait_stderr(
+        "validated against live host 1.4.23-R8977.1; the previously vendored SDK 5fc95e5 surface",
         Duration::from_secs(10),
     );
     c.finish();
@@ -13439,6 +13455,137 @@ fn plugin_commands_map_to_host_writes_and_keep_typed_errors() {
             "{text} keeps the typed refusal: {frame}"
         );
     }
+    c.finish();
+}
+
+#[test]
+fn plugin_lifecycle_lists_removes_and_refreshes_dependents() {
+    let mut c = Client::spawn(
+        "plugin_control",
+        &[("FAKE_PLUGIN_REMOVE_WARNING", "restart required")],
+    );
+    let sid = c.new_session(
+        2,
+        ",\"capabilities\":{\"_meta\":{\"muse\":{\"capabilities\":[\"plugins\",\"hooks\"]}}}",
+    );
+    let initial = c.wait_for("available_commands_update", Duration::from_secs(15));
+    assert!(
+        initial.contains("\"name\":\"threejs\"") && initial.contains("remove <id> [--delete-data]"),
+        "the plugin skill and lifecycle hint start in the catalog: {initial}"
+    );
+    let initial_skill_reads = host_requests(&c, "skill/list").len();
+
+    let pid = c.prompt(&sid, "/plugin list");
+    let response = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(response.contains("messageId"), "{response}");
+    c.wait_for_all(
+        &[
+            "Installed Muse plugins (2):",
+            "- local-tools 0.1.0 [disabled] (nativeLocal; path /tmp/plugins/local-tools)",
+            "- threejs 1.2.0 [enabled] (curated; marketplace acme)",
+        ],
+        Duration::from_secs(15),
+    );
+    let list = host_requests(&c, "plugin/list");
+    let list = list.last().expect("plugin/list request");
+    assert_eq!(list["sessionId"], "msp-sess-1");
+    assert!(
+        list.get("commandId").is_none(),
+        "plugin/list takes no command id: {list}"
+    );
+
+    let pid = c.prompt(&sid, "/plugin remove threejs");
+    let response = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(response.contains("messageId"), "{response}");
+    c.wait_for_all(
+        &["Removed plugin threejs.", "Warning: restart required"],
+        Duration::from_secs(15),
+    );
+    let remove = host_requests(&c, "plugin/remove")
+        .pop()
+        .expect("plugin/remove request");
+    assert_eq!(remove["sessionId"], "msp-sess-1");
+    assert_eq!(remove["id"], "threejs");
+    assert!(
+        remove.get("deleteData").is_none(),
+        "ordinary removal preserves plugin data: {remove}"
+    );
+
+    c.wait_stderr(
+        "skill catalog refreshed after plugin removal",
+        Duration::from_secs(15),
+    );
+    c.wait_log("hook/list", Duration::from_secs(15));
+    assert!(
+        host_requests(&c, "skill/list").len() > initial_skill_reads,
+        "plugin/removed re-reads the skill catalog"
+    );
+    let commands = c
+        .frames
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .rfind(|frame| frame.contains("available_commands_update"))
+        .cloned()
+        .expect("refreshed available commands");
+    assert!(
+        !commands.contains("\"name\":\"threejs\""),
+        "the removed plugin's skill leaves the catalog: {commands}"
+    );
+
+    let pid = c.prompt(&sid, "/plugin list");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    let inventory = c.wait_for_all(
+        &[
+            "Installed Muse plugins (1):",
+            "- local-tools 0.1.0 [disabled]",
+        ],
+        Duration::from_secs(15),
+    );
+    assert!(
+        !inventory.contains("threejs"),
+        "a re-read reflects the removal: {inventory}"
+    );
+
+    let pid = c.prompt(&sid, "/plugin remove local-tools --delete-data");
+    c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    c.wait_for(
+        "Removed plugin local-tools (data deletion requested).",
+        Duration::from_secs(15),
+    );
+    let remove = host_requests(&c, "plugin/remove")
+        .pop()
+        .expect("destructive plugin/remove request");
+    assert_eq!(remove["deleteData"], true, "{remove}");
+
+    c.finish();
+}
+
+#[test]
+fn plugin_removal_refusals_keep_gate_and_typed_data() {
+    let mut c = Client::spawn("plugin_control", &[("FAKE_PLUGIN_REMOVE_ERROR", "gate")]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "/plugin remove threejs");
+    let response = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        response.contains("\"code\":-32601")
+            && response.contains("because the pluginMutations gate is disabled")
+            && response.contains("\"gate\":\"pluginMutations\"")
+            && response.contains("\"kind\":\"methodNotFound\""),
+        "the disabled gate stays structured and actionable: {response}"
+    );
+    c.finish();
+
+    let mut c = Client::spawn("plugin_control", &[("FAKE_PLUGIN_REMOVE_ERROR", "missing")]);
+    let sid = c.new_session(2, "");
+    let pid = c.prompt(&sid, "/plugin remove missing");
+    let response = c.wait_for(&format!("\"id\":{pid}"), Duration::from_secs(15));
+    assert!(
+        response.contains("\"code\":-32035")
+            && response.contains("\"kind\":\"pluginNotFound\"")
+            && response.contains("\"id\":\"missing\""),
+        "a missing plugin keeps the host's typed refusal: {response}"
+    );
     c.finish();
 }
 

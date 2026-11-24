@@ -2,35 +2,34 @@
 
 - **Source:** <https://github.com/meta-models/muse-code-sdk>
 - **Stable bundle (`stable/`):** <https://github.com/meta-models/muse-code-sdk>
-  at `5fc95e5bbbedc7944b1729297ca79bcef9627416`'s `schema/msp/stable/`
+  at `e6ef4a64473d9865d3dfb385688ec2caab09e5dc`'s `schema/msp/stable/`
   (`manifest.json` and `msp.schema.json`, copied byte for byte), taken
-  2026-11-18. The bundle is byte-identical to the stable 1.4.23-R8977.1
+  2026-11-24. The bundle is byte-identical to the stable 1.4.25-R9361.1
   build's own `muse schema generate-json-schema --out DIR` export. The
   fingerprint recorded in `src/compat.rs`
-  (`sha256:b7fb9137267aa35c92424df37a5ac56287006a0e546b197bf0930d593fecbdb1`)
-  is the one a live 1.4.23 handshake reports and the official
-  1.4.23-R8977.1 release manifest publishes as `msp_schema_fingerprint`, and
+  (`sha256:6bf518067b065a503ea7d4f081a44fc056b532cf4b362a1894024863b25fb2aa`)
+  is the one a live 1.4.25 handshake reports and the official
+  1.4.25-R9361.1 release manifest publishes as `msp_schema_fingerprint`, and
   `SDK_SCHEMA_SHA256` there pins the bundle bytes it belongs to, so the
   fingerprint classifies as tested. The bundle records its compatibility
-  epoch (`0`) at its root, which `SDK_COMPATIBILITY_EPOCH` pins. Over 1.4.20
-  the changes are `ApprovalCuaCardFacts.browser` with its
-  `ApprovalCuaBrowser` definition, `Item.terminalRowBeforeItemId`, and
-  `SchemaInfo.compatibilityEpoch`; the `stable/manifest.json` bytes are
-  unchanged. The previous stable bundle was SDK `649ca21`'s (Muse 1.4.20),
-  and before it the 1.4.18-R8587.1 build's own export.
+  epoch (`0`) at its root, which `SDK_COMPATIBILITY_EPOCH` pins. Muse 1.4.24
+  has no stable-schema change. Over 1.4.23, 1.4.25 adds the optional
+  `PrunedSubagent.parentSubagentId` and `PrunedSubagent.subagentId` members
+  and clarifies two field descriptions; methods, notifications, requests,
+  errors, capabilities, and requirements are unchanged. The
+  `stable/manifest.json` bytes are unchanged. The previous stable bundle was
+  SDK `5fc95e5`'s (Muse 1.4.23), and before it SDK `649ca21`'s (Muse 1.4.20).
 - **Transcripts (`transcripts/`):** <https://github.com/meta-models/muse-code-sdk>
-  at `5fc95e5bbbedc7944b1729297ca79bcef9627416`
-  ("remirror: 1.4.23 from the internal source tree (tracked internally)",
-  2026-11-17), the same revision as the stable bundle. Only
+  at `e6ef4a64473d9865d3dfb385688ec2caab09e5dc`
+  ("remirror: 1.4.25 from the internal source tree (tracked internally)",
+  2026-11-21), the same revision as the stable bundle. Only
   `schema/msp/transcripts/` was copied, without `schema/msp/msp.d.ts` or
   `schema/msp/experimental/`; the revision's `python/`, `clients/`, `rust/`,
-  and `scripts/` trees are not vendored. Over `649ca21` four scenarios were
-  added (`approval-choice-invalid`, `approval-requirement-stale`,
-  `turn-interrupt-queued-successor`, and
-  `turn-interrupt-queued-successor-burst`), for 58 in all, and the
-  re-recorded handshakes carry `schema.compatibilityEpoch`. Since `07e1548`
-  the SDK no longer writes the fingerprint into the transcript manifests; it
-  derives it from the schema bytes at build.
+  and `scripts/` trees are not vendored. No transcript scenario or recorded
+  frame changed over 1.4.23; only the transcript README's
+  `regenerationJustification.scope` contract changed. Since `07e1548` the SDK
+  no longer writes the fingerprint into the transcript manifests; it derives
+  it from the schema bytes at build.
 - **License:** MIT — see `LICENSE.muse-code-sdk`
 - **Contents:**
   - `stable/manifest.json` — schema version (and, before `07e1548`, the

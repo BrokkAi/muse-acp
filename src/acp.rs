@@ -1552,8 +1552,10 @@ fn available_commands(skills: &[CatalogSkill], feedback: bool) -> Vec<out::Comma
         ),
         command(
             "plugin",
-            "Install plugins and manage marketplaces",
-            Some("install <marketplace> <name> | marketplace add|remove|update <name>"),
+            "List, install, or remove plugins; manage marketplaces",
+            Some(
+                "list | remove <id> [--delete-data] | install <marketplace> <name> | marketplace add|remove|update <name>",
+            ),
         ),
         command("recap", "Summarize what happened while you were away", None),
         command(

@@ -6845,6 +6845,27 @@ fn handle_acp(
                     }
                     return;
                 }
+                // `/plugin list` and `/plugin remove` are request/result
+                // commands rather than ack-only writes, so they render the
+                // host's response instead of using the generic command path.
+                if let Ok(text) = &line
+                    && let Some(parsed) = parse_plugin_lifecycle_command(text)
+                {
+                    match parsed {
+                        Ok(action) => run_plugin_lifecycle(
+                            host,
+                            stdout,
+                            sessions,
+                            &sid,
+                            ver,
+                            id.clone(),
+                            &acp_content,
+                            action,
+                        ),
+                        Err(message) => acp::send_error(stdout, &id, -32602, &message),
+                    }
+                    return;
+                }
                 let workflow_children = || {
                     sessions
                         .lock()
@@ -9606,6 +9627,8 @@ fn parse_cua_command(text: &str) -> Option<Result<CuaAction, String>> {
 
 /// Parse the `/plugin ...` command family into a host write:
 ///
+/// - `/plugin list` reads the installed plugin inventory;
+/// - `/plugin remove <id> [--delete-data]` removes an installed plugin;
 /// - `/plugin install <marketplace> <name>` installs a named marketplace plugin;
 /// - `/plugin install <path> [default|user|project]` installs from a host path;
 /// - `/plugin marketplace add <name> <source>`, and
@@ -9615,8 +9638,15 @@ fn parse_cua_command(text: &str) -> Option<Result<CuaAction, String>> {
 /// vocabulary and the argument shapes are validated here. Two arguments where
 /// the second is a scope word is the path form, otherwise it is the
 /// marketplace form.
+const PLUGIN_USAGE: &str = "usage: /plugin list | /plugin remove <id> [--delete-data] | /plugin install <marketplace> <name> | /plugin install <path> [default|user|project] | /plugin marketplace add <name> <source> | /plugin marketplace remove <name> | /plugin marketplace update <name>";
+
+#[derive(Debug, PartialEq, Eq)]
+enum PluginLifecycleCommand {
+    List,
+    Remove { id: String, delete_data: bool },
+}
+
 fn parse_plugin_command(text: &str) -> Option<Result<ProtocolCommand, String>> {
-    const USAGE: &str = "usage: /plugin install <marketplace> <name> | /plugin install <path> [default|user|project] | /plugin marketplace add <name> <source> | /plugin marketplace remove <name> | /plugin marketplace update <name>";
     let body = text.strip_prefix('/')?;
     let mut words = body.split_whitespace();
     if words.next()? != "plugin" {
@@ -9659,12 +9689,37 @@ fn parse_plugin_command(text: &str) -> Option<Result<ProtocolCommand, String>> {
                 vec![("name", J::Str(name.to_string()))],
             )));
         }
-        _ => return Some(Err(USAGE.to_string())),
+        _ => return Some(Err(PLUGIN_USAGE.to_string())),
     };
     Some(Ok((
         "plugin/install".to_string(),
         vec![("target", install_target)],
     )))
+}
+
+fn parse_plugin_lifecycle_command(text: &str) -> Option<Result<PluginLifecycleCommand, String>> {
+    let body = text.strip_prefix('/')?;
+    let mut words = body.split_whitespace();
+    if words.next()? != "plugin" {
+        return None;
+    }
+    let rest: Vec<&str> = words.collect();
+    match rest.as_slice() {
+        ["list"] => Some(Ok(PluginLifecycleCommand::List)),
+        ["list", ..] => Some(Err(PLUGIN_USAGE.to_string())),
+        ["remove", id] if !id.starts_with('-') => Some(Ok(PluginLifecycleCommand::Remove {
+            id: (*id).to_string(),
+            delete_data: false,
+        })),
+        ["remove", id, "--delete-data"] if !id.starts_with('-') => {
+            Some(Ok(PluginLifecycleCommand::Remove {
+                id: (*id).to_string(),
+                delete_data: true,
+            }))
+        }
+        ["remove", ..] => Some(Err(PLUGIN_USAGE.to_string())),
+        _ => None,
+    }
 }
 
 /// `remove`/`update` -> `Remove`/`Update` for the MSP method names.
@@ -11425,6 +11480,48 @@ fn find_acp_sid(sessions: &Sessions, msp_sid: &str) -> Option<String> {
     find_acp_session(sessions, msp_sid).map(|(acp_sid, _)| acp_sid)
 }
 
+/// Refresh the host-derived catalog state a plugin removal can change.
+/// Plugin inventory itself is uncached; only the ACP command catalog and the
+/// folded hook labels need rebuilding.
+fn refresh_plugin_dependent_state(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    msp_sid: &str,
+) {
+    let Some((acp_sid, ver)) = find_acp_session(sessions, msp_sid) else {
+        return;
+    };
+    if let Some(skills) = skill_catalog(host, msp_sid) {
+        adopt_skill_catalog(sessions, &acp_sid, Some(&skills));
+        acp::send_available_commands(stdout, &acp_sid, ver, &skills, host.handshake().feedback);
+        log(&format!(
+            "skill catalog refreshed after plugin removal for session {msp_sid}: {} row(s)",
+            skills.len()
+        ));
+    }
+    if HOOKS.load(Ordering::SeqCst) != 0 {
+        match host.command("hook/list", &format!("{{\"sessionId\":{}}}", esc(msp_sid))) {
+            Ok(result) => {
+                if let Some(session) = sessions
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get_mut(&acp_sid)
+                {
+                    session.fold.note_hook_inventory(&result);
+                }
+                log(&format!(
+                    "hook inventory refreshed after plugin removal for session {msp_sid}"
+                ));
+            }
+            Err(error) => log(&format!(
+                "hook/list after plugin removal failed: {}",
+                err_message(&error)
+            )),
+        }
+    }
+}
+
 /// Map a view event back to its owning session. Child view streams are
 /// represented by `child_folds` under the owner; they must never be looked up
 /// as standalone root sessions because that would widen their permission
@@ -11655,6 +11752,20 @@ fn handle_msp(
                 )
             };
             log(&format!("{method} session={msp_sid}: {detail}"));
+        }
+        "plugin/removed" => {
+            let msp_sid = params
+                .get("sessionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let id =
+                fold::sanitize_one_line(params.get("id").and_then(|v| v.as_str()).unwrap_or("?"));
+            log(&format!(
+                "plugin/removed session={msp_sid}: plugin {id}; re-read _session/plugins"
+            ));
+            if !msp_sid.is_empty() {
+                refresh_plugin_dependent_state(host, stdout, sessions, msp_sid);
+            }
         }
         "recap/completed" => {
             // The single settlement of an in-flight `recap/request`,
@@ -15689,6 +15800,208 @@ fn start_recap(
     }
 }
 
+/// Run the plugin inventory and removal commands, which need their host
+/// result rendered rather than the generic command acknowledgement.
+#[allow(clippy::too_many_arguments)]
+fn run_plugin_lifecycle(
+    host: &Arc<Hosts>,
+    stdout: &StdoutShared,
+    sessions: &Sessions,
+    acp_sid: &str,
+    ver: u8,
+    prompt_req: Option<RequestId>,
+    prompt_content: &out::Echo,
+    action: PluginLifecycleCommand,
+) {
+    let msp_sid = match sessions
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(acp_sid)
+    {
+        Some(session) => session.msp_sid.clone(),
+        None => {
+            acp::send_error(stdout, &prompt_req, -32602, "unknown sessionId");
+            return;
+        }
+    };
+    match action {
+        PluginLifecycleCommand::List => {
+            match host.command(
+                "plugin/list",
+                &format!("{{\"sessionId\":{}}}", esc(&msp_sid)),
+            ) {
+                Ok(result) => match plugin_list_text(&result) {
+                    Ok(text) => settle_command_with_text(
+                        stdout,
+                        sessions,
+                        acp_sid,
+                        ver,
+                        &prompt_req,
+                        prompt_content,
+                        &text,
+                    ),
+                    Err(message) => {
+                        acp::send_error(stdout, &prompt_req, -32603, &message);
+                    }
+                },
+                Err(error) => send_host_error(
+                    stdout,
+                    &prompt_req,
+                    &error,
+                    -32603,
+                    &plugin_command_error("plugin/list", &error),
+                ),
+            }
+        }
+        PluginLifecycleCommand::Remove { id, delete_data } => {
+            let cmd = host.mint_cmd("cmd-");
+            let mut params = format!(
+                "{{\"commandId\":{},\"sessionId\":{},\"id\":{}",
+                esc(&cmd),
+                esc(&msp_sid),
+                esc(&id)
+            );
+            if delete_data {
+                params.push_str(",\"deleteData\":true");
+            }
+            params.push('}');
+            match host.command("plugin/remove", &params) {
+                Ok(result) => settle_command_with_text(
+                    stdout,
+                    sessions,
+                    acp_sid,
+                    ver,
+                    &prompt_req,
+                    prompt_content,
+                    &plugin_remove_text(&result, &id, delete_data),
+                ),
+                Err(error) => send_host_error(
+                    stdout,
+                    &prompt_req,
+                    &error,
+                    -32603,
+                    &plugin_command_error("plugin/remove", &error),
+                ),
+            }
+        }
+    }
+}
+
+fn plugin_command_error(method: &str, error: &J) -> String {
+    match msp::error_gate(error) {
+        Some(gate) => format!(
+            "{method} is unavailable because the {} gate is disabled",
+            fold::sanitize_one_line(gate)
+        ),
+        None => format!("{method} failed: {}", err_message(error)),
+    }
+}
+
+/// Render the unordered installed-plugin inventory for a slash-command
+/// client that does not implement `_session/plugins`.
+fn plugin_list_text(result: &J) -> Result<String, String> {
+    let Some(J::Arr(plugins)) = result.get("plugins") else {
+        return Err("plugin/list returned no plugins array".to_string());
+    };
+    let mut rows = Vec::new();
+    for plugin in plugins {
+        let Some(id) = plugin
+            .get("id")
+            .and_then(|value| value.as_str())
+            .filter(|id| !id.is_empty())
+        else {
+            continue;
+        };
+        let id = fold::sanitize_one_line(id);
+        let version = fold::sanitize_one_line(
+            plugin
+                .get("version")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?"),
+        );
+        let source = fold::sanitize_one_line(
+            plugin
+                .get("source")
+                .and_then(|value| value.as_str())
+                .unwrap_or("?"),
+        );
+        let enabled = plugin
+            .get("enabled")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
+        let origin = plugin
+            .get("origin")
+            .and_then(plugin_origin_text)
+            .map(|origin| format!("; {origin}"))
+            .unwrap_or_default();
+        rows.push(format!(
+            "- {id} {version} [{}] ({source}{origin})",
+            if enabled { "enabled" } else { "disabled" }
+        ));
+    }
+    rows.sort();
+    if rows.is_empty() {
+        return Ok("No Muse plugins are installed for this session.".to_string());
+    }
+    Ok(format!(
+        "Installed Muse plugins ({}):\n{}",
+        rows.len(),
+        rows.join("\n")
+    ))
+}
+
+fn plugin_origin_text(origin: &J) -> Option<String> {
+    if let Some(marketplace) = origin
+        .get("marketplace")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(format!(
+            "marketplace {}",
+            fold::sanitize_one_line(marketplace)
+        ));
+    }
+    origin
+        .get("localPath")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(|path| format!("path {}", fold::sanitize_one_line(path)))
+}
+
+fn plugin_remove_text(result: &J, requested_id: &str, delete_data: bool) -> String {
+    let id = fold::sanitize_one_line(
+        result
+            .get("id")
+            .and_then(|value| value.as_str())
+            .unwrap_or(requested_id),
+    );
+    let status = result
+        .get("status")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let mut text = if status == "accepted" {
+        if delete_data {
+            format!("Removed plugin {id} (data deletion requested).")
+        } else {
+            format!("Removed plugin {id}.")
+        }
+    } else {
+        format!(
+            "Plugin {id} removal returned status {}.",
+            fold::sanitize_one_line(status)
+        )
+    };
+    if let Some(warning) = result
+        .get("warning")
+        .and_then(|value| value.as_str())
+        .filter(|warning| !warning.trim().is_empty())
+    {
+        text.push_str("\nWarning: ");
+        text.push_str(&fold::sanitize_one_line(warning));
+    }
+    text
+}
+
 /// Run one `/cua` action against the host. The client's opt-in is always
 /// required; host actions need `computerUseHostSetup`, while session actions
 /// need `computerUseSetup`. The gate's `computerUseUnavailable` refusal stays
@@ -17073,6 +17386,47 @@ mod tests {
         }
         for text in [" /goal stop", "/goals x", "goal x", "/rename x"] {
             assert_eq!(parse(text), None, "{text} is not a /goal command");
+        }
+    }
+
+    #[test]
+    fn plugin_lifecycle_commands_parse_with_explicit_data_deletion() {
+        use super::{PluginLifecycleCommand as Command, parse_plugin_lifecycle_command as parse};
+        assert_eq!(parse("/plugin list"), Some(Ok(Command::List)));
+        assert_eq!(
+            parse("/plugin remove threejs"),
+            Some(Ok(Command::Remove {
+                id: "threejs".to_string(),
+                delete_data: false,
+            }))
+        );
+        assert_eq!(
+            parse("/plugin remove threejs --delete-data"),
+            Some(Ok(Command::Remove {
+                id: "threejs".to_string(),
+                delete_data: true,
+            }))
+        );
+        for text in [
+            "/plugin list extra",
+            "/plugin remove",
+            "/plugin remove --delete-data",
+            "/plugin remove threejs --unknown",
+            "/plugin remove threejs --delete-data extra",
+        ] {
+            let Some(Err(message)) = parse(text) else {
+                panic!("{text} must be a usage error");
+            };
+            assert!(message.contains("/plugin remove <id>"), "{text}: {message}");
+        }
+        for text in [
+            "/plugin install acme threejs",
+            "/plugin marketplace add acme owner/repo",
+            "/plugin",
+            "/other list",
+            " /plugin list",
+        ] {
+            assert_eq!(parse(text), None, "{text} is not a lifecycle command");
         }
     }
 
